@@ -10,6 +10,7 @@
 pub mod admission;
 pub mod agent_server;
 pub mod auth_middleware;
+pub(crate) mod cgroup_cleanup;
 pub mod cluster;
 pub mod container;
 pub mod controller_auth;
@@ -23,6 +24,7 @@ pub mod privdrop;
 pub mod pty;
 pub mod reporter;
 pub mod seccomp;
+pub mod spec;
 pub mod step_completion;
 pub mod stepd;
 pub(crate) mod task_hook;

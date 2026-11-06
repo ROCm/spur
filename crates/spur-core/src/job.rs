@@ -864,6 +864,22 @@ pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
     }
 }
 
+/// A running job that has been warned of preemption and may keep running until
+/// `deadline`. Replicated so every replica, and a new leader, honours the same
+/// grace period instead of restarting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreemptPending {
+    pub signaled_at: DateTime<Utc>,
+    pub deadline: DateTime<Utc>,
+    pub preempted_by: JobId,
+    pub preempt_qos: Option<String>,
+    /// `Cancel` or `Requeue`: how the run ends once the grace is over.
+    pub mode: crate::partition::PreemptMode,
+    pub run_attempt: u32,
+    /// Computed by the leader so a replay re-pends the job with the same hold.
+    pub requeue_hold_secs: u32,
+}
+
 /// One node's completion outcome for a job: the raw process wait status,
 /// split into exit code and terminating signal (0 = none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -957,6 +973,10 @@ pub struct Job {
     /// every replica reads the run as cancelled, not as a plain signal death.
     #[serde(default)]
     pub cancel_signaled_at: Option<DateTime<Utc>>,
+
+    /// Set while the run is inside its preemption grace period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_pending: Option<PreemptPending>,
 
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
@@ -1084,6 +1104,7 @@ impl Job {
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
+            preempt_pending: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -1206,6 +1227,13 @@ impl Job {
         final_state
     }
 
+    /// Whether a node reported the kernel OOM-killing its part of the run.
+    pub fn reported_oom(&self) -> bool {
+        self.node_completions
+            .values()
+            .any(|c| c.signal & OOM_SIGNAL_FLAG != 0)
+    }
+
     pub fn all_nodes_completed(&self) -> bool {
         !self.allocated_nodes.is_empty()
             && self.node_completions.len() == self.allocated_nodes.len()
@@ -1215,6 +1243,23 @@ impl Job {
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
+    }
+
+    /// The preemption grace this run is still inside. A warning recorded for an
+    /// earlier run never counts against the current one.
+    pub fn preempt_grace(&self) -> Option<&PreemptPending> {
+        self.preempt_pending
+            .as_ref()
+            .filter(|pending| pending.run_attempt == self.run_attempt)
+    }
+
+    /// The allocated nodes still charged for this job, in allocation order.
+    pub fn held_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.is_held_on(node))
+            .cloned()
+            .collect()
     }
 
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
@@ -1238,6 +1283,13 @@ impl Job {
     pub fn occupies_resources(&self) -> bool {
         self.state == JobState::Running
             || (self.state == JobState::Pending && self.holds_a_placement())
+    }
+
+    /// A run the controller stopped for a time or inactivity limit that is still
+    /// inside its kill wait. It still holds its allocation, so a singleton or an
+    /// array throttle must keep treating it as running.
+    pub fn is_stopping_for_time_limit(&self) -> bool {
+        self.state == JobState::Completing && self.time_limit_signaled_at.is_some()
     }
 
     /// Earliest time the job may start: `--begin` when it falls after submit.
@@ -1660,6 +1712,33 @@ mod tests {
             !job.occupies_resources(),
             "a node that already reported completion is no longer charged"
         );
+    }
+
+    #[test]
+    fn reported_oom_sees_the_flag_on_any_node() {
+        let mut job = make_job();
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 9 });
+        assert!(!job.reported_oom());
+
+        job.node_completions.insert(
+            "n2".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 9 | OOM_SIGNAL_FLAG,
+            },
+        );
+        assert!(job.reported_oom());
+    }
+
+    #[test]
+    fn held_nodes_leaves_out_the_nodes_that_reported() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
+
+        assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
     }
 
     #[test]
@@ -2092,6 +2171,18 @@ mod tests {
         assert_eq!(signal, 11);
     }
 
+    #[test]
+    fn only_a_completing_run_signalled_for_a_limit_is_stopping_for_the_time_limit() {
+        let mut job = timed_out_job();
+        job.state = JobState::Running;
+        assert!(!job.is_stopping_for_time_limit());
+        job.state = JobState::Completing;
+        assert!(job.is_stopping_for_time_limit());
+        job.time_limit_signaled_at = None;
+        job.cancel_signaled_at = Some(Utc::now());
+        assert!(!job.is_stopping_for_time_limit());
+    }
+
     /// A job whose run the watchdog signalled for exhausting its time limit.
     fn timed_out_job() -> Job {
         let mut job = make_job();
@@ -2206,11 +2297,10 @@ mod tests {
         job.transition(JobState::Cancelled).unwrap();
     }
 
-    // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or
-    // snapshot must still deserialize, or spurctld crashes on restart.
-    #[test]
-    fn job_deserializes_without_cancel_signaled_at_field() {
-        let json = r#"{
+    /// A job as an older controller serialized it, before `cancel_signaled_at` and
+    /// `preempt_pending` existed. Never regenerate: a failure means the new field
+    /// needs a default, not a new fixture.
+    const FROZEN_PRE_GRACE_JOB: &str = r#"{
             "job_id": 7,
             "spec": {
                 "name": "old", "user": "alice", "uid": 0, "gid": 0,
@@ -2255,11 +2345,74 @@ mod tests {
             "time_limit_signaled_at": null,
             "suspended_secs": 0
         }"#;
+
+    // Replay of an older Raft log or snapshot must still deserialize, or
+    // spurctld crashes on restart.
+    #[test]
+    fn job_deserializes_without_cancel_signaled_at_field() {
+        let json = FROZEN_PRE_GRACE_JOB;
         let job: Job = serde_json::from_str(json).unwrap();
         assert_eq!(job.job_id, 7);
         assert_eq!(job.state, JobState::Running);
         assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
         assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[test]
+    fn a_frozen_job_from_before_preempt_pending_has_no_grace() {
+        let job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
+        assert!(job.preempt_pending.is_none());
+        assert!(job.preempt_grace().is_none());
+    }
+
+    #[test]
+    fn a_job_without_a_grace_omits_preempt_pending_when_serialized() {
+        let json = serde_json::to_value(make_job()).unwrap();
+        assert!(json.get("preempt_pending").is_none());
+    }
+
+    #[test]
+    fn a_pending_preemption_round_trips_on_the_job() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let pending = PreemptPending {
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: Some("high".into()),
+            mode: crate::partition::PreemptMode::Requeue,
+            run_attempt: 3,
+            requeue_hold_secs: 30,
+        };
+        let mut job = make_job();
+        job.preempt_pending = Some(pending.clone());
+        let back: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert_eq!(back.preempt_pending, Some(pending));
+    }
+
+    #[test]
+    fn preempt_grace_ignores_a_warning_recorded_for_an_earlier_run() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let mut job = make_job();
+        job.run_attempt = 2;
+        assert!(job.preempt_grace().is_none());
+
+        job.preempt_pending = Some(PreemptPending {
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: None,
+            mode: crate::partition::PreemptMode::Cancel,
+            run_attempt: 1,
+            requeue_hold_secs: 0,
+        });
+        assert!(job.preempt_grace().is_none());
+
+        job.run_attempt = 1;
+        assert_eq!(job.preempt_grace().map(|p| p.preempted_by), Some(9));
     }
 
     #[test]
@@ -2435,6 +2588,17 @@ mod tests {
             JobState::from_proto(JobState::Requeued.to_proto()),
             JobState::Requeued
         );
+    }
+
+    #[test]
+    fn a_running_run_can_end_preempted_and_then_re_pend() {
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+
+        job.transition(JobState::Preempted).unwrap();
+        job.transition(JobState::Pending).unwrap();
+
+        assert_eq!(job.state, JobState::Pending);
     }
 
     #[test]

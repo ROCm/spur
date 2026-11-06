@@ -397,6 +397,11 @@ pub struct QosLimits {
     /// defers to the next level.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+    /// Seconds a job in this QOS is given to wind down after a preemptor
+    /// signals it, before it is cancelled. `None` inherits the partition's
+    /// `grace_time`; `Some(0)` means no grace period.
+    #[serde(default)]
+    pub grace_time: Option<u32>,
 }
 
 impl Default for Account {
@@ -431,6 +436,24 @@ impl Default for Qos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qos_limits_without_grace_time_deserializes() {
+        let limits: QosLimits = serde_json::from_str(
+            r#"{"max_jobs_per_user":null,"max_submit_jobs_per_user":null,"max_tres_per_job":null,"max_tres_per_user":null,"grp_tres":null,"max_wall_minutes":null,"grp_wall_minutes":null}"#,
+        )
+        .unwrap();
+        assert_eq!(limits.grace_time, None);
+    }
+
+    #[test]
+    fn qos_limits_with_numeric_grace_time_still_deserializes() {
+        let limits: QosLimits = serde_json::from_str(
+            r#"{"max_jobs_per_user":null,"max_submit_jobs_per_user":null,"max_tres_per_job":null,"max_tres_per_user":null,"grp_tres":null,"max_wall_minutes":null,"grp_wall_minutes":null,"grace_time":600}"#,
+        )
+        .unwrap();
+        assert_eq!(limits.grace_time, Some(600));
+    }
 
     #[test]
     fn test_tres_format_parse() {

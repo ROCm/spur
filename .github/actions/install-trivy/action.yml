@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# trivy-action's own installer downloads from get.trivy.dev, which no longer
+# resolves. This uses the same pinned Trivy as ROCm's security baseline.
+
+name: Install Trivy
+description: Install the pinned Trivy release from the ROCm third-party mirror and add it to PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and install Trivy
+      shell: bash
+      env:
+        VERSION: "0.71.0"
+        TARBALL_SHA256: 30a3d22b23f88c233f1658f562fb477cae3b3e8b4761109d515b7698daf85814
+      run: | # zizmor: ignore[github-env] appends a fixed RUNNER_TEMP path, no untrusted input
+        set -euo pipefail
+        name="trivy_${VERSION}_Linux-64bit.tar.gz"
+        tarball="${RUNNER_TEMP}/${name}"
+        bin_dir="${RUNNER_TEMP}/trivy-bin"
+        curl -sfL --retry 3 -o "$tarball" "https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/${name}"
+        echo "${TARBALL_SHA256}  ${tarball}" | sha256sum -c -
+        mkdir -p "$bin_dir"
+        tar -xzf "$tarball" -C "$bin_dir" trivy
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        "$bin_dir/trivy" --version

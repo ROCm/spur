@@ -50,6 +50,22 @@ DOCKER_PORT_INSPECT_FMT = (
     '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}'
 )
 
+# Pinned by digest: the mirror intermittently 404s blobs of a re-pushed tag
+# whose index it still serves stale. Every registry serves the same digest.
+POSTGRES_DIGEST = (
+    "sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36"
+)
+POSTGRES_IMAGES = tuple(
+    f"{repo}:16-alpine@{POSTGRES_DIGEST}"
+    for repo in (
+        "mirror.gcr.io/library/postgres",
+        "public.ecr.aws/docker/library/postgres",
+        "docker.io/library/postgres",
+    )
+)
+IMAGE_PULL_ATTEMPTS = 2
+IMAGE_PULL_BACKOFF_SECS = 5
+
 
 def log_tail_is_leader(log: str) -> bool:
     """Whether *log* ends in a "become leader" not yet followed by "quit leader".
@@ -64,6 +80,38 @@ def parse_published_port(inspect_output: str) -> int:
     if not port.isdigit():
         raise RuntimeError(f"no published port in docker inspect output: {inspect_output!r}")
     return int(port)
+
+
+def ensure_docker_image(node: "SshNode", image: str):
+    """Pull *image* on *node* unless already present, retrying transient
+    registry failures (blob timeouts, 5xx) that would otherwise fail the
+    whole fixture."""
+    quoted = shlex.quote(image)
+    if node.exec_with_exit(f"docker image inspect {quoted} >/dev/null 2>&1")[0] == 0:
+        return
+    output = ""
+    for attempt in range(1, IMAGE_PULL_ATTEMPTS + 1):
+        code, output = node.exec_with_exit(f"docker pull -q {quoted}", timeout=300)
+        if code == 0:
+            return
+        logger.warning("docker pull %s failed (attempt %d/%d): %s",
+                       image, attempt, IMAGE_PULL_ATTEMPTS, output.strip())
+        if attempt < IMAGE_PULL_ATTEMPTS:
+            time.sleep(IMAGE_PULL_BACKOFF_SECS * attempt)
+    raise RuntimeError(
+        f"docker pull {image} failed on {node.host} after {IMAGE_PULL_ATTEMPTS} attempts:\n{output}"
+    )
+
+
+def ensure_any_docker_image(node: "SshNode", images: tuple[str, ...]) -> str:
+    """Return the first of *images* that is present or pullable on *node*."""
+    for image in images:
+        try:
+            ensure_docker_image(node, image)
+            return image
+        except RuntimeError as err:
+            logger.warning("%s", err)
+    raise RuntimeError(f"none of {images} could be pulled on {node.host}")
 
 
 def make_remote_dir() -> str:
@@ -104,6 +152,27 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
         yield
     finally:
         controller.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def cut_off_node(cluster: "SpurCluster", node_index: int):
+    """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
+    Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
+    controller = cluster.nodes[0]
+    target = cluster.nodes[node_index].host
+    rules = [
+        f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP",
+        f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP",
+    ]
+    added = []
+    try:
+        for rule in rules:
+            controller.exec(f"sudo iptables -I {rule}")
+            added.append(rule)
+        yield
+    finally:
+        for rule in added:
+            controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
 class SshNode:
@@ -768,26 +837,39 @@ class SpurCluster:
             f"kubectl apply for {what} did not succeed:\n{out}"
         )
 
-    def k8s_active_controllers(self) -> list[str]:
+    def k8s_active_controllers(self, status: str | None = None) -> list[str]:
         """Node names whose `spur k8s status` row is role=controller/single and active."""
+        if status is None:
+            status = self.k8s_status()
         out = []
-        for line in self.k8s_status().splitlines():
+        for line in status.splitlines():
             fields = line.split()
             if len(fields) >= 3 and fields[1] in ("controller", "single") and fields[2] == "active":
                 out.append(fields[0])
         return out
 
-    def wait_k8s_phase(self, phase: str, timeout: int = 600) -> str:
-        """Poll `spur k8s status` until it reports the given phase."""
+    def wait_k8s_phase(self, phase: str, timeout: int = 600, *,
+                       active_controllers: list[str] | None = None) -> str:
+        """Poll for the phase and, optionally, the expected active controller identities."""
         deadline = time.time() + timeout
+        expected = None if active_controllers is None else set(active_controllers)
         last = ""
         while time.time() < deadline:
             last = self.k8s_status()
-            for line in last.splitlines():
-                if line.startswith("phase:") and line.split(":", 1)[1].strip() == phase:
-                    return last
+            phase_reached = any(
+                line.startswith("phase:") and line.split(":", 1)[1].strip() == phase
+                for line in last.splitlines()
+            )
+            # A restored ready phase can precede recovery of live agent probes.
+            if phase_reached and (
+                expected is None or set(self.k8s_active_controllers(last)) == expected
+            ):
+                return last
             time.sleep(5)
-        raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
+        requirement = f"phase {phase}"
+        if active_controllers is not None:
+            requirement += f" with active controllers {active_controllers}"
+        raise TimeoutError(f"k0s did not reach {requirement} within {timeout}s:\n{last}")
 
     def etcd_member_count(self) -> int:
         """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
@@ -1618,21 +1700,7 @@ tar -C "$R" -czf '{local_tar}' .
             "c=$(docker ps -aq --filter name=spur-e2e-pg-); "
             "[ -n \"$c\" ] && docker rm -f $c || true"
         )
-        images = (
-            "mirror.gcr.io/library/postgres:16-alpine",
-            "public.ecr.aws/docker/library/postgres:16-alpine",
-            "docker.io/library/postgres:16-alpine",
-        )
-        for image in images:
-            cached, _ = node.exec_with_exit(f"docker image inspect {image}")
-            if cached == 0:
-                break
-            exit_code, output = node.exec_with_exit(f"docker pull {image}", timeout=300)
-            if exit_code == 0:
-                break
-            logger.warning("Postgres image pull failed from %s: %s", image, output.strip())
-        else:
-            raise RuntimeError("Postgres test image is unavailable from all registries")
+        image = ensure_any_docker_image(node, POSTGRES_IMAGES)
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "

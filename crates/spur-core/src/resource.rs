@@ -48,6 +48,11 @@ pub struct ResourceSet {
     pub fabric_binding_version: u32,
     #[serde(default)]
     pub block_file_revision: Option<String>,
+    /// Agent-reported CPU topology. Belongs in a node's raw report
+    /// (`detected_resources`); `clamped` drops it when deriving schedulable
+    /// resources from that report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<crate::cpu_topology::CpuTopology>,
 }
 
 pub type InventoryFingerprint = (
@@ -57,6 +62,7 @@ pub type InventoryFingerprint = (
     Vec<(String, u64)>,
     u32,
     Option<String>,
+    Option<crate::cpu_topology::CpuTopology>,
 );
 
 /// Tracks consumed resources (per-node or per-job allocation accounting).
@@ -244,22 +250,27 @@ impl ResourceSet {
             generic,
             self.fabric_binding_version,
             self.block_file_revision.clone(),
+            self.topology.clone(),
         )
     }
 
     /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
-    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory.
-    /// The smaller of cap and (detected - reserved) wins; GPUs/generic are unaffected.
+    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory;
+    /// `spec_cpus` (cores set aside for node services) is subtracted from detected
+    /// CPUs before `cpus_cap` is applied. The smaller of cap and (detected - reserved)
+    /// wins; GPUs/generic are unaffected.
     pub fn clamped(
         &self,
         cpus_cap: u32,
         memory_cap_mb: u64,
         reserved_memory_mb: u64,
+        spec_cpus: u32,
     ) -> ResourceSet {
+        let usable = self.cpus.saturating_sub(spec_cpus);
         let cpus = if cpus_cap > 0 {
-            self.cpus.min(cpus_cap)
+            usable.min(cpus_cap)
         } else {
-            self.cpus
+            usable
         };
         let mem_cap = if memory_cap_mb > 0 {
             memory_cap_mb
@@ -275,6 +286,7 @@ impl ResourceSet {
             generation: self.generation,
             fabric_binding_version: self.fabric_binding_version,
             block_file_revision: self.block_file_revision.clone(),
+            topology: None,
         }
     }
 
@@ -576,6 +588,7 @@ mod tests {
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -583,7 +596,7 @@ mod tests {
     fn clamp_no_config_is_identity() {
         // cpus=0, memory_mb=0, reserved=0 means "no limits configured".
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 0);
+        let clamped = detected.clamped(0, 0, 0, 0);
         assert_eq!(clamped.cpus, 64);
         assert_eq!(clamped.memory_mb, 256_000);
         // GPUs and generic pass through untouched.
@@ -593,7 +606,7 @@ mod tests {
     #[test]
     fn clamp_cpus_caps_below_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(32, 0, 0);
+        let clamped = detected.clamped(32, 0, 0, 0);
         assert_eq!(clamped.cpus, 32);
     }
 
@@ -601,28 +614,28 @@ mod tests {
     fn clamp_cpus_over_claim_capped_to_detected() {
         // Config asking for more CPUs than the host has cannot invent hardware.
         let detected = sample_inventory();
-        let clamped = detected.clamped(128, 0, 0);
+        let clamped = detected.clamped(128, 0, 0, 0);
         assert_eq!(clamped.cpus, 64);
     }
 
     #[test]
     fn clamp_memory_cap_below_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 200_000, 0);
+        let clamped = detected.clamped(0, 200_000, 0, 0);
         assert_eq!(clamped.memory_mb, 200_000);
     }
 
     #[test]
     fn clamp_memory_over_claim_capped_to_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 512_000, 0);
+        let clamped = detected.clamped(0, 512_000, 0, 0);
         assert_eq!(clamped.memory_mb, 256_000);
     }
 
     #[test]
     fn clamp_reserved_subtracts_from_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 16_000);
+        let clamped = detected.clamped(0, 0, 16_000, 0);
         assert_eq!(clamped.memory_mb, 240_000);
     }
 
@@ -631,7 +644,7 @@ mod tests {
         // memory_mb cap = 250_000; detected - reserved = 256_000 - 16_000 = 240_000.
         // The smaller (reserved-derived) value wins.
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 250_000, 16_000);
+        let clamped = detected.clamped(0, 250_000, 16_000, 0);
         assert_eq!(clamped.memory_mb, 240_000);
     }
 
@@ -639,8 +652,51 @@ mod tests {
     fn clamp_reserved_saturates_at_zero() {
         // reserved >= detected must floor at 0, never underflow.
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 999_999);
+        let clamped = detected.clamped(0, 0, 999_999, 0);
         assert_eq!(clamped.memory_mb, 0);
+    }
+
+    #[test]
+    fn clamped_removes_spec_cpus_before_the_cap() {
+        let detected = ResourceSet {
+            cpus: 256,
+            memory_mb: 2_000_000,
+            ..Default::default()
+        };
+        assert_eq!(detected.clamped(0, 0, 0, 2).cpus, 254);
+        // The cap limits schedulable CPUs, which already exclude spec CPUs.
+        assert_eq!(detected.clamped(200, 0, 0, 2).cpus, 200);
+        assert_eq!(detected.clamped(0, 0, 0, 300).cpus, 0);
+    }
+
+    #[test]
+    fn clamped_never_copies_the_topology() {
+        let detected = ResourceSet {
+            cpus: 2,
+            topology: Some(crate::cpu_topology::CpuTopology {
+                cores: vec![crate::cpu_topology::CoreInfo {
+                    socket: 0,
+                    numa_node: None,
+                    cpus: vec![0, 1],
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(detected.clamped(0, 0, 0, 0).topology.is_none());
+    }
+
+    #[test]
+    fn a_resource_set_without_topology_keeps_its_old_json_shape() {
+        let set = ResourceSet {
+            cpus: 4,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert!(json.get("topology").is_none(), "{json}");
+        let old = r#"{"cpus":4,"memory_mb":0,"gpus":[],"generic":{}}"#;
+        let decoded: ResourceSet = serde_json::from_str(old).unwrap();
+        assert!(decoded.topology.is_none());
+        assert_eq!(decoded.cpus, 4);
     }
 
     #[test]
@@ -662,6 +718,7 @@ mod tests {
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(avail.can_satisfy(&req));
     }
@@ -690,6 +747,7 @@ mod tests {
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(inventory.can_satisfy_with_allocated(&allocated, &req_one));
 
@@ -779,6 +837,7 @@ mod tests {
             ],
             generic: HashMap::new(),
             generation: 7,
+            topology: None,
         };
         // Nothing allocated: both stable ids are free.
         let free =
@@ -810,6 +869,7 @@ mod tests {
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         assert_eq!(alloc.cpus, 8);
@@ -863,6 +923,7 @@ mod tests {
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let request = ResourceSet {
             fabric_binding_version: 0,
@@ -891,6 +952,7 @@ mod tests {
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         let mut ids = alloc.device_ids("gpu");
@@ -941,6 +1003,7 @@ mod accounting_tests {
             gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
             generic: HashMap::from([("bandwidth".to_string(), 100u64)]),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -1073,6 +1136,7 @@ mod accounting_tests {
             gpus: Vec::new(),
             generic: HashMap::from([("licenses".to_string(), 0u64)]),
             generation: 0,
+            topology: None,
         };
         let alloc = build_exclusive_allocation(&inv, 1024);
 
@@ -1113,6 +1177,7 @@ mod accounting_tests {
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_exclusive_allocation(&inv, 1024);
 
@@ -1195,6 +1260,7 @@ mod accounting_tests {
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         inv.backfill_stable_ids();
         let ids: Vec<u64> = inv.gpus.iter().map(|g| g.stable_id).collect();
@@ -1221,6 +1287,7 @@ mod accounting_tests {
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
         assert_eq!(allocated.allocated_count("gpu", Some("mi300x"), &inv), 1);
@@ -1241,6 +1308,7 @@ mod accounting_tests {
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(
             !inv.can_satisfy_with_allocated(&allocated, &req),

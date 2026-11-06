@@ -27,9 +27,12 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 BINARIES="spur spurctld spurd spurstepd spurauthd"
 SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol"
+MPI_PLUGIN="spur_mpi_pmix.so"
 
 log()  { echo "==> $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
+
+plugin_dir() { echo "$(dirname "${INSTALL_DIR}")/lib/spur"; }
 
 usage() {
     cat <<'EOF'
@@ -42,7 +45,7 @@ VERSION:
     latest          Install the latest stable release (default)
     nightly         Install the latest nightly build
     v0.1.0          Install a specific version
-    uninstall       Remove Spur binaries
+    uninstall       Remove Spur binaries and the MPI plugin
 
 OPTIONS:
     -h, --help      Show this help message
@@ -77,6 +80,15 @@ do_uninstall() {
             removed=$((removed + 1))
         fi
     done
+    local plugin_dir
+    plugin_dir=$(plugin_dir)
+    if [ -e "${plugin_dir}/${MPI_PLUGIN}" ]; then
+        rm -f "${plugin_dir}/${MPI_PLUGIN}"
+        echo "  removed ${plugin_dir}/${MPI_PLUGIN}"
+        removed=$((removed + 1))
+        # rmdir only succeeds when empty, so anything else placed there survives.
+        rmdir "${plugin_dir}" 2>/dev/null || true
+    fi
     if [ "${removed}" -eq 0 ]; then
         log "No Spur files found in ${INSTALL_DIR}/"
     else
@@ -169,22 +181,15 @@ for _bin in ${BINARIES}; do
     if [ -f "${INSTALL_DIR}/${_bin}" ]; then chmod +x "${INSTALL_DIR}/${_bin}"; fi
 done
 
-PLUGIN_DIR="$(dirname "${INSTALL_DIR}")/lib/spur"
-if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then
+PLUGIN_DIR=$(plugin_dir)
+if [ -f "${EXTRACTED}/lib/spur/${MPI_PLUGIN}" ]; then
     mkdir -p "${PLUGIN_DIR}"
-    cp -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" "${PLUGIN_DIR}/"
-    log "Installed MPI plugin to ${PLUGIN_DIR}/spur_mpi_pmix.so"
+    cp -f "${EXTRACTED}/lib/spur/${MPI_PLUGIN}" "${PLUGIN_DIR}/"
+    log "Installed MPI plugin to ${PLUGIN_DIR}/${MPI_PLUGIN}"
 fi
 
 # --- Verify ---
-if ! "${INSTALL_DIR}/spur" --version >/dev/null 2>&1; then
-    # Binary exists but --version may not be implemented yet
-    if [ -x "${INSTALL_DIR}/spur" ]; then
-        log "Binaries installed (version flag not yet supported)"
-    else
-        err "Installation verification failed"
-    fi
-fi
+"${INSTALL_DIR}/spur" --version >/dev/null || err "Installation verification failed"
 
 # --- PATH hint ---
 log "Installed to ${INSTALL_DIR}/"

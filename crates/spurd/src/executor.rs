@@ -113,7 +113,7 @@ pub(crate) fn classify_spool_error(
 use crate::container::ContainerConfig;
 
 /// Cgroup root for slurmd-managed jobs.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
 /// Node-local spool root for spurd's per-job scratch (job script, namespace
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
@@ -1310,8 +1310,8 @@ pub(crate) fn setup_cgroup(
         }
     }
 
-    // Core ids come from a synthesized 0..n range, which can name cores this
-    // cgroup may not hold. Drop those rather than let the whole write fail.
+    // Core ids may name CPUs this cgroup does not hold (offline, or excluded
+    // from the root). Drop those rather than let the whole write fail.
     if !limits.cpuset_cpus.is_empty() {
         match std::fs::read_to_string(cgroup_root.join("cpuset.cpus.effective")) {
             Ok(effective) => {
@@ -2668,8 +2668,7 @@ mod cpuset_tests {
 
     #[test]
     fn drops_cores_the_parent_cgroup_does_not_hold() {
-        // Core ids are synthesized from a count, so a sparse online mask can name
-        // cores that do not exist. Writing one fails ERANGE, leaving it unbounded.
+        // Writing a CPU the parent does not hold fails ERANGE, leaving it unbounded.
         assert_eq!(permitted_cores(&[0, 1, 99], "0-3"), vec![0, 1]);
         assert_eq!(permitted_cores(&[64, 65], "0-63"), Vec::<u32>::new());
     }

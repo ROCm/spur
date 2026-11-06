@@ -210,6 +210,7 @@ mod tests {
                     priority_tier: 1,
                     preempt_mode: String::new(),
                     preempt_exempt_time: None,
+                    grace_time: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),

@@ -10,7 +10,7 @@
 # Extract portable binaries to disk (nightly, release):
 #   DOCKER_BUILDKIT=1 docker build --target dist --output type=local,dest=./dist .
 
-FROM almalinux:8 AS chef
+FROM almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b AS chef
 
 ARG PROTOC_VERSION=25.1
 RUN dnf install -y unzip curl gcc make binutils && dnf clean all && \
@@ -87,9 +87,14 @@ RUN echo "=== Required GLIBC versions ===" && \
         echo "  ${bin}: requires ${MAX:-none}"; \
     done
 
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The base tag lags noble-security by weeks, so take every published fix here.
+# CI rebuilds this stage uncached (no-cache-filters) so the upgrade never goes stale.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     util-linux \
     openssl \

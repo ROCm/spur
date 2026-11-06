@@ -140,6 +140,58 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
     }
 }
 
+/// Map the `grace_time` proto fields to a column patch: `clear` -> NULL
+/// (inherit the partition's), unset -> keep, n -> store n (0 means no grace).
+/// A value together with a clear is ambiguous, so it is refused; so is an `n`
+/// that overflows i32.
+fn grace_time_patch(field: Option<u32>, clear: bool) -> Result<Option<Option<i32>>, Status> {
+    if clear {
+        if field.is_some() {
+            return Err(Status::invalid_argument(
+                "grace_time and clear_grace_time cannot both be set",
+            ));
+        }
+        return Ok(Some(None));
+    }
+    field
+        .map(|n| {
+            i32::try_from(n)
+                .map(Some)
+                .map_err(|_| Status::invalid_argument("grace_time exceeds i32::MAX"))
+        })
+        .transpose()
+}
+
+/// What the audit record shows for a grace patch: the stored seconds, or JSON
+/// null when the value was cleared, so a clear is recorded like any other change.
+fn grace_time_audit(patch: Option<Option<i32>>) -> Option<serde_json::Value> {
+    patch.map(|stored| stored.map_or(serde_json::Value::Null, Into::into))
+}
+
+fn qos_info_from_record(r: db::QosRecord) -> QosInfo {
+    QosInfo {
+        idle_fill_preemptable: r.idle_fill_preemptable,
+        name: r.name,
+        description: r.description,
+        priority: r.priority,
+        preempt_mode: r.preempt_mode,
+        preempt: r.preempt,
+        usage_factor: r.usage_factor,
+        max_jobs_per_user: limit_to_wire(r.max_jobs_per_user),
+        max_wall_minutes: limit_to_wire(r.max_wall_min),
+        max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+        max_submit_jobs_per_user: limit_to_wire(r.max_submit_per_user),
+        max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
+        grp_tres: r.grp_tres.unwrap_or_default(),
+        grp_wall_minutes: limit_to_wire(r.grp_wall_min),
+        preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
+        max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
+        grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
+        flags: r.flags,
+        grace_time: r.grace_time.and_then(|v| u32::try_from(v).ok()),
+    }
+}
+
 /// Validate and canonicalize the QOS `flags` string. Only `DenyOnLimit` is
 /// recognized; an unknown token errors loudly rather than being silently
 /// dropped (a dropped flag reads as "set" but never takes effect).
@@ -189,6 +241,7 @@ struct AccountingInner {
         Option<std::sync::Arc<dyn Fn() -> spur_core::config::AuthConfig + Send + Sync>>,
     >,
     fairshare_halflife_days: std::sync::atomic::AtomicU32,
+    billing_weights: std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>,
 }
 
 impl Clone for AccountingService {
@@ -208,6 +261,9 @@ impl AccountingService {
                 assoc: parking_lot::RwLock::new(None),
                 auth_source: parking_lot::RwLock::new(None),
                 fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
+                billing_weights: std::sync::Arc::new(parking_lot::RwLock::new(
+                    spur_core::config::BillingWeights::default(),
+                )),
             }),
         }
     }
@@ -216,6 +272,20 @@ impl AccountingService {
         self.inner
             .fairshare_halflife_days
             .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn attach_billing_weights(&self, weights: spur_core::config::BillingWeights) {
+        *self.inner.billing_weights.write() = weights;
+    }
+
+    fn billing_weights(&self) -> spur_core::config::BillingWeights {
+        *self.inner.billing_weights.read()
+    }
+
+    pub(crate) fn billing_weights_shared(
+        &self,
+    ) -> std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>> {
+        std::sync::Arc::clone(&self.inner.billing_weights)
     }
 
     fn configured_halflife_days(&self) -> u32 {
@@ -633,6 +703,7 @@ impl SlurmAccounting for AccountingService {
                 suspended_by: String::new(),
                 last_requeue: String::new(),
                 last_requeue_by: String::new(),
+                preempt_time: None,
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
@@ -681,8 +752,12 @@ impl SlurmAccounting for AccountingService {
         let scoped_to = scoped_to_user(&scope);
         let sql_user = match scoped_sql_user(&scope, &req.user) {
             ScopedUser::None => {
+                let w = self.billing_weights();
                 return Ok(Response::new(GetUsageResponse {
                     entries: Vec::new(),
+                    billing_weight_cpu: w.cpu,
+                    billing_weight_gpu: w.gpu,
+                    has_billing_weights: true,
                     scoped_to_user: scoped_to,
                     partial: false,
                 }));
@@ -738,8 +813,12 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
+        let w = self.billing_weights();
         Ok(Response::new(GetUsageResponse {
             entries,
+            billing_weight_cpu: w.cpu,
+            billing_weight_gpu: w.gpu,
+            has_billing_weights: true,
             scoped_to_user: scoped_to,
             partial,
         }))
@@ -1022,6 +1101,100 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(()))
     }
 
+    async fn modify_usage(
+        &self,
+        request: Request<ModifyUsageRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.require_admin(&request, "modify usage")?;
+        let audit = crate::audit::InBand::capture(&request, "ModifyUsage");
+        let pool = self.pool()?;
+        let pool = &pool;
+        let req = request.into_inner();
+        if req.user.is_empty() && req.account.is_empty() {
+            return Err(Status::invalid_argument("user or account required"));
+        }
+        if !req.user.is_empty() && req.account.is_empty() {
+            return Err(Status::invalid_argument(
+                "account= required for user-level usage modification",
+            ));
+        }
+        if req.user.is_empty() && req.raw_usage != 0 {
+            return Err(Status::invalid_argument(
+                "account-level usage adjustment only supports reset to zero",
+            ));
+        }
+        if !req.user.is_empty() {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM associations WHERE user_name = $1 AND account = $2)",
+            )
+            .bind(&req.user)
+            .bind(&req.account)
+            .fetch_one(pool)
+            .await
+            .map_err(internal)?;
+            if !exists {
+                return Err(Status::not_found(format!(
+                    "no association for user '{}' in account '{}'",
+                    req.user, req.account
+                )));
+            }
+        }
+        let halflife_days = self.configured_halflife_days();
+        let weights = self.billing_weights();
+        let mut tx = pool.begin().await.map_err(internal)?;
+
+        let (prev, entity_name) = if req.user.is_empty() {
+            let descendants = db::get_account_descendants(pool, &req.account)
+                .await
+                .map_err(internal)?;
+            let mut total_prev = 0i64;
+            for acct in &descendants {
+                let p = db::modify_usage(&mut tx, "", acct, 0, halflife_days, &weights)
+                    .await
+                    .map_err(internal)?;
+                total_prev += p;
+            }
+            (total_prev, req.account.clone())
+        } else {
+            let p = db::modify_usage(
+                &mut tx,
+                &req.user,
+                &req.account,
+                req.raw_usage,
+                halflife_days,
+                &weights,
+            )
+            .await
+            .map_err(internal)?;
+            let name = format!("{}@{}", req.user, req.account);
+            (p, name)
+        };
+
+        let new_total = if req.raw_usage == 0 {
+            0
+        } else if req.raw_usage < 0 {
+            (prev + req.raw_usage).max(0)
+        } else {
+            req.raw_usage
+        };
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &entity_name,
+                serde_json::json!({
+                    "previous_usage": prev,
+                    "requested_value": req.raw_usage,
+                    "resulting_usage": new_total,
+                }),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        Ok(Response::new(()))
+    }
+
     async fn list_users(
         &self,
         request: Request<ListUsersRequest>,
@@ -1267,6 +1440,7 @@ impl SlurmAccounting for AccountingService {
                     .map_err(Status::invalid_argument)
             })
             .transpose()?;
+        let grace_time = grace_time_patch(req.grace_time, req.clear_grace_time)?;
         let update = db::QosUpdate {
             idle_fill_preemptable: req.idle_fill_preemptable,
             description: req.description.as_deref(),
@@ -1294,6 +1468,7 @@ impl SlurmAccounting for AccountingService {
             } else {
                 req.preempt_exempt_time.map(|v| Some(v as i32))
             },
+            grace_time,
             flags: flags.as_deref(),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
@@ -1311,6 +1486,7 @@ impl SlurmAccounting for AccountingService {
             ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
             ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
+            ("grace_time", grace_time_audit(grace_time)),
             ("flags", flags.map(Into::into)),
         ]);
         write_txn_in_band(
@@ -1356,29 +1532,7 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let qos_list = records
-            .into_iter()
-            .map(|r| QosInfo {
-                idle_fill_preemptable: r.idle_fill_preemptable,
-                name: r.name,
-                description: r.description,
-                priority: r.priority,
-                preempt_mode: r.preempt_mode,
-                preempt: r.preempt,
-                usage_factor: r.usage_factor,
-                max_jobs_per_user: limit_to_wire(r.max_jobs_per_user),
-                max_wall_minutes: limit_to_wire(r.max_wall_min),
-                max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
-                max_submit_jobs_per_user: limit_to_wire(r.max_submit_per_user),
-                max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
-                grp_tres: r.grp_tres.unwrap_or_default(),
-                grp_wall_minutes: limit_to_wire(r.grp_wall_min),
-                preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
-                max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
-                grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
-                flags: r.flags,
-            })
-            .collect();
+        let qos_list = records.into_iter().map(qos_info_from_record).collect();
 
         Ok(Response::new(ListQosResponse { qos_list }))
     }
@@ -1427,7 +1581,8 @@ impl SlurmAccounting for AccountingService {
         }
 
         let pool = self.pool()?;
-        let raw_factors = super::fairshare_factors(&pool, halflife)
+        let weights = self.billing_weights();
+        let raw_factors = super::fairshare_factors(&pool, halflife, &weights)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -2333,6 +2488,85 @@ mod tests {
         let err = nullable_limit(Some(i32::MAX as u32 + 1), "maxsubmit").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("maxsubmit"));
+    }
+
+    #[test]
+    fn grace_time_patch_keeps_when_absent_and_stores_literal_zero() {
+        assert_eq!(grace_time_patch(None, false).unwrap(), None);
+        assert_eq!(grace_time_patch(Some(0), false).unwrap(), Some(Some(0)));
+        assert_eq!(grace_time_patch(Some(600), false).unwrap(), Some(Some(600)));
+    }
+
+    #[test]
+    fn grace_time_patch_clear_writes_null() {
+        assert_eq!(grace_time_patch(None, true).unwrap(), Some(None));
+    }
+
+    #[test]
+    fn grace_time_patch_rejects_a_value_together_with_a_clear() {
+        for value in [0, 600] {
+            let err = grace_time_patch(Some(value), true).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "grace_time and clear_grace_time cannot both be set"
+            );
+        }
+    }
+
+    #[test]
+    fn grace_time_audit_records_a_value_a_clear_and_nothing() {
+        assert_eq!(
+            grace_time_audit(grace_time_patch(None, false).unwrap()),
+            None
+        );
+        assert_eq!(
+            grace_time_audit(grace_time_patch(Some(600), false).unwrap()),
+            Some(serde_json::json!(600))
+        );
+        assert_eq!(
+            grace_time_audit(grace_time_patch(None, true).unwrap()),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn grace_time_patch_rejects_over_i32_max() {
+        let err = grace_time_patch(Some(i32::MAX as u32 + 1), false).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("grace_time"));
+    }
+
+    #[test]
+    fn qos_info_from_record_maps_grace_time_unset_zero_and_negative() {
+        let record = |grace_time| db::QosRecord {
+            name: "preemptible".into(),
+            description: String::new(),
+            priority: 0,
+            preempt_mode: String::new(),
+            preempt: String::new(),
+            usage_factor: 1.0,
+            max_jobs_per_user: None,
+            max_wall_min: None,
+            max_tres_per_job: None,
+            max_submit_per_user: None,
+            max_submit_per_account: None,
+            grp_submit_jobs: None,
+            max_tres_per_user: None,
+            grp_tres: None,
+            grp_wall_min: None,
+            preempt_exempt_time: None,
+            grace_time,
+            idle_fill_preemptable: false,
+            flags: String::new(),
+        };
+        assert_eq!(
+            qos_info_from_record(record(Some(600))).grace_time,
+            Some(600)
+        );
+        assert_eq!(qos_info_from_record(record(Some(0))).grace_time, Some(0));
+        assert_eq!(qos_info_from_record(record(None)).grace_time, None);
+        assert_eq!(qos_info_from_record(record(Some(-1))).grace_time, None);
     }
 
     #[test]
