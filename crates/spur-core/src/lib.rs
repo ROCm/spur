@@ -38,6 +38,7 @@ pub mod node;
 pub mod partition;
 pub mod partition_limits;
 pub mod peer;
+pub mod preemption_usage;
 pub mod privilege;
 pub mod process;
 pub mod qos;

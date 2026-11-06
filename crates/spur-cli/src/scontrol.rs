@@ -2688,6 +2688,20 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_exit(job.derived_exit_code, 0),
         job.priority
     );
+    if let Some(usage) = &job.preemption_usage {
+        let _ = writeln!(
+            out,
+            "   PreemptionsUsed={} PreemptionsUnused={} PreemptionsOpen={}",
+            usage.used, usage.unused, usage.open
+        );
+        for cause in &usage.unused_by_cause {
+            let _ = writeln!(
+                out,
+                "   UnusedPreemptionReason={} Initiator={} Count={}",
+                cause.reason, cause.initiator, cause.count
+            );
+        }
+    }
     if let Some(line) = preemption_line(job) {
         let _ = writeln!(out, "{line}");
     }

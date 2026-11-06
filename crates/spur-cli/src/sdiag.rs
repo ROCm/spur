@@ -221,7 +221,7 @@ fn print_node_statistics(metrics: &NodeMetrics) {
 }
 
 fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         String::new(),
         "Scheduler Statistics:".to_string(),
         format!("  Plugin              : {}", stats.plugin),
@@ -239,7 +239,31 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
         format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
         format!("  Exit end of queue   : {}", stats.exit_end),
         format!("  Exit max depth      : {}", stats.exit_max_depth),
-    ]
+    ];
+    if let Some(usage) = &stats.preemption_usage {
+        lines.push(format!(
+            "  Preemptions (lifetime): used={} unused={} open={}",
+            usage.used, usage.unused, usage.open
+        ));
+        for cause in &usage.unused_by_cause {
+            lines.push(format!(
+                "    Unused: reason={} initiator={} count={}",
+                cause.reason, cause.initiator, cause.count
+            ));
+        }
+        for user in &stats.preemption_users {
+            if let Some(usage) = &user.usage {
+                lines.push(format!(
+                    "    User {}: used={} unused={} open={}",
+                    user.user, usage.used, usage.unused, usage.open
+                ));
+            }
+        }
+        if stats.preemption_users_truncated {
+            lines.push("    User list truncated to 1000 visible users".into());
+        }
+    }
+    lines
 }
 
 fn print_scheduler_statistics(stats: &SchedStats) {
@@ -365,6 +389,9 @@ mod tests {
     #[test]
     fn scheduler_statistics_lines_include_cycle_and_lifecycle_fields() {
         let stats = SchedStats {
+            preemption_usage: None,
+            preemption_users: Vec::new(),
+            preemption_users_truncated: false,
             plugin: "backfill".into(),
             cycles: 5,
             cycle_total_time_us: 2500,
