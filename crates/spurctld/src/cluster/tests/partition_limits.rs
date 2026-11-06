@@ -1125,14 +1125,15 @@ async fn a_job_blocked_only_by_a_full_cap_holds_no_grp_node_quota() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() {
-    let dir = TempDir::new().unwrap();
+/// One 16-CPU node `n1` under partition `cpu` capped at 8 CPUs, preempting in
+/// `mode`, with a `high` QOS allowed to preempt `low`.
+async fn capped_preemption_cluster(dir: &TempDir, mode: PreemptMode) -> Arc<ClusterManager> {
     let mut config = test_config();
     config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
-    let cm = test_cluster_with_config(&dir, config).await;
+    config.scheduler.complete_wait_secs = 600;
+    let cm = test_cluster_with_config(dir, config).await;
     cm.create_partition(Partition {
-        preempt_mode: Some(PreemptMode::Requeue),
+        preempt_mode: Some(mode),
         ..partition("cpu", &[("cpu", 8)])
     })
     .unwrap();
@@ -1148,11 +1149,38 @@ async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() 
         preempt: vec!["low".into()],
         ..Default::default()
     });
-    let in_qos = |qos: &str| JobSpec {
+    cm
+}
+
+fn capped_in_qos(qos: &str, cpus: u32) -> JobSpec {
+    JobSpec {
         qos: Some(qos.into()),
         time_limit: Some(chrono::Duration::hours(1)),
-        ..spec_in("cpu", 8)
-    };
+        ..spec_in("cpu", cpus)
+    }
+}
+
+async fn preempt_for(cm: &Arc<ClusterManager>, preemptors: &[JobId]) {
+    let jobs: Vec<Job> = preemptors
+        .iter()
+        .map(|id| cm.get_job(*id).unwrap())
+        .collect();
+    let refs: Vec<&Job> = jobs.iter().collect();
+    crate::scheduler_loop::try_preempt(
+        cm,
+        &cm.get_partitions(),
+        &cm.get_nodes(),
+        &refs,
+        &cm.config().scheduler,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_preemption_cluster(&dir, PreemptMode::Requeue).await;
+    let in_qos = |qos: &str| capped_in_qos(qos, 8);
     let low = run_on(&cm, in_qos("low"), "n1", 8);
     let high = submit_and_wait(&cm, in_qos("high"));
     assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
@@ -1163,15 +1191,7 @@ async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() 
     );
     assert_eq!(reason(&cm, high).0, PendingReason::PartitionTresLimit);
 
-    let high_job = cm.get_job(high).unwrap();
-    crate::scheduler_loop::try_preempt(
-        &cm,
-        &cm.get_partitions(),
-        &cm.get_nodes(),
-        &[&high_job],
-        &cm.config().scheduler,
-    )
-    .await;
+    preempt_for(&cm, &[high]).await;
     settle(&cm, low, JobState::Pending);
     assert!(
         cap_usage(&cm, "cpu").is_empty(),
@@ -1181,6 +1201,64 @@ async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() 
     assert_eq!(run_pass(&cm), [high]);
     assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
     assert_eq!(cm.get_job(low).unwrap().state, JobState::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_handoff_waits_for_the_draining_victims_cap_share() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_preemption_cluster(&dir, PreemptMode::Cancel).await;
+    let low = run_on(&cm, capped_in_qos("low", 8), "n1", 8);
+    let high = submit_and_wait(&cm, capped_in_qos("high", 8));
+    assert!(run_pass(&cm).is_empty());
+
+    preempt_for(&cm, &[high]).await;
+    settle(&cm, low, JobState::Completing);
+    let pending = cm.pending_jobs();
+    let reservations = cm.get_reservations();
+    assert_eq!(
+        cm.preemption_handoffs(&pending, &cm.get_nodes(), &reservations),
+        HashMap::from([("n1".to_string(), high)])
+    );
+
+    assert!(
+        run_pass(&cm).is_empty(),
+        "8 CPUs are free and handed to the preemptor, but the draining victim fills the cap"
+    );
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
+    assert_eq!(reason(&cm, high).0, PendingReason::PartitionTresLimit);
+
+    let run_attempt = cm.get_job(low).unwrap().run_attempt;
+    cm.node_complete(low, "n1", -1, 15, run_attempt).unwrap();
+    assert!(cap_usage(&cm, "cpu").is_empty());
+    assert_eq!(run_pass(&cm), [high]);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn competing_preemptors_never_fill_a_handed_off_node_past_its_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_preemption_cluster(&dir, PreemptMode::Requeue).await;
+    let victims = [
+        run_on(&cm, capped_in_qos("low", 4), "n1", 4),
+        run_on(&cm, capped_in_qos("low", 4), "n1", 4),
+    ];
+    let first = submit_and_wait(&cm, capped_in_qos("high", 8));
+    let second = submit_and_wait(&cm, capped_in_qos("high", 8));
+    assert!(run_pass(&cm).is_empty());
+
+    preempt_for(&cm, &[first, second]).await;
+    for victim in victims {
+        settle(&cm, victim, JobState::Pending);
+    }
+
+    let mut started = Vec::new();
+    for _ in 0..3 {
+        started.extend(run_pass(&cm));
+        assert!(cap_usage(&cm, "cpu").values().all(|cpus| *cpus <= 8));
+        preempt_for(&cm, &[first, second]).await;
+    }
+    assert_eq!(started, [first], "16 CPUs are free, but the cap holds 8");
+    assert_eq!(reason(&cm, second).0, PendingReason::PartitionTresLimit);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
