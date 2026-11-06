@@ -19,7 +19,7 @@ use spur_proto::proto::{
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::partition_cap::{
-    candidate_partitions, is_capped, job_node_charge, PartitionNodeUsage, RunningCharge,
+    candidate_partitions, is_capped, job_node_charge, PartitionNodeUsage, RunningCharge, TresCharge,
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
@@ -1233,19 +1233,46 @@ pub(crate) fn running_partition_usage(cluster: &ClusterManager) -> PartitionNode
     )
 }
 
+/// What each capped partition's jobs hold on each node at `now`, as backfill
+/// sees it, for callers already holding the job map.
+pub(crate) fn partition_usage_at<'a>(
+    jobs: impl IntoIterator<Item = &'a spur_core::job::Job>,
+    partitions: &[spur_core::partition::Partition],
+    scheduler: &spur_core::config::SchedulerConfig,
+    now: DateTime<Utc>,
+) -> HashMap<String, HashMap<String, TresCharge>> {
+    if !partitions.iter().any(is_capped) {
+        return HashMap::new();
+    }
+    let usage = partition_usage_from_jobs(jobs, partitions, now, ReleaseWaits::of(scheduler));
+    usage
+        .into_iter()
+        .map(|(partition, by_node)| {
+            let held = by_node.into_iter().map(|(node, running)| {
+                let mut total = TresCharge::default();
+                for charge in running.iter().filter(|c| c.until > now) {
+                    total.add(&charge.tres);
+                }
+                (node, total)
+            });
+            (partition, held.collect())
+        })
+        .collect()
+}
+
 /// Pure core of [`running_partition_usage`]. Idle-fill runs are charged like
 /// any other: they hold real cores the cap exists to keep free. A suspended
 /// job keeps its allocation, so it keeps its charge; a node the job already
 /// finished on was released, so it stops charging.
-fn partition_usage_from_jobs(
-    jobs: &[spur_core::job::Job],
+fn partition_usage_from_jobs<'a>(
+    jobs: impl IntoIterator<Item = &'a spur_core::job::Job>,
     partitions: &[spur_core::partition::Partition],
     now: DateTime<Utc>,
     waits: ReleaseWaits,
 ) -> PartitionNodeUsage {
     use spur_core::job::JobState;
     let mut usage = PartitionNodeUsage::new();
-    let holding = jobs.iter().filter(|j| {
+    let holding = jobs.into_iter().filter(|j| {
         j.occupies_resources() || matches!(j.state, JobState::Suspended | JobState::Completing)
     });
     for job in holding {

@@ -1077,8 +1077,10 @@ async fn a_job_blocked_only_by_a_full_cap_holds_no_grp_node_quota() {
     for n in ["n1", "n2", "n3"] {
         register_node(&cm, n, 16, 64 * GIB);
     }
+    // n1's full cap earns `capped` no reuse credit there, so it claims both
+    // nodes of quota left beside n1 and none remains for `fits`.
     let mut grp = TresRecord::new();
-    grp.set(TresType::Node, 2);
+    grp.set(TresType::Node, 3);
     cm.qos_cache().insert(Qos {
         name: "pool".into(),
         limits: spur_core::accounting::QosLimits {
@@ -1512,4 +1514,153 @@ async fn deny_on_limit_sees_a_partitions_default_memory() {
     let msg = submit_err(&cm, in_qos("big"));
     assert!(msg.contains("(QOSMaxMemoryPerJob)"), "{msg}");
     assert!(cm.submit_job(in_qos("big,plain")).is_ok());
+}
+
+fn limit_account_nodes(cm: &ClusterManager, nodes: u64) {
+    let mut grp = TresRecord::new();
+    grp.set(TresType::Node, nodes);
+    cm.association_cache().insert_limits(
+        "testuser",
+        "research",
+        spur_core::accounting::AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        },
+    );
+}
+
+fn placed(cm: &ClusterManager, id: JobId) -> (Vec<String>, Option<String>) {
+    let job = cm.get_job(id).unwrap();
+    (job.allocated_nodes, job.effective_partition)
+}
+
+/// `cpu` capped at 8 CPUs per node on two 16-CPU nodes, with n1's cap filled
+/// by a `research` job that leaves n1 itself half idle.
+async fn n1_cap_full_in_account(dir: &TempDir) -> Arc<ClusterManager> {
+    let cm = cluster_with(
+        dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    run_on(&cm, in_account(spec_in("cpu", 8), "research"), "n1", 8);
+    cm
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_without_a_node_limit_is_not_pinned_to_a_full_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = n1_cap_full_in_account(&dir).await;
+    let id = submit_and_wait(&cm, in_account(spec_in("cpu", 4), "research"));
+
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(placed(&cm, id).0, ["n2"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qos_without_a_node_limit_is_not_pinned_to_a_full_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    cm.qos_cache().insert(Qos {
+        name: "normal".into(),
+        ..Default::default()
+    });
+    let in_qos = |cpus| JobSpec {
+        qos: Some("normal".into()),
+        ..spec_in("cpu", cpus)
+    };
+    run_on(&cm, in_qos(8), "n1", 8);
+    let id = submit_and_wait(&cm, in_qos(4));
+
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(placed(&cm, id).0, ["n2"]);
+}
+
+/// `hi` (tier 5) holds n1 and `lo` holds n2, both capped at 8 CPUs, with a
+/// `research` job already on n2.
+async fn tiered_pair_with_account_on_lo(dir: &TempDir) -> Arc<ClusterManager> {
+    let cm = cluster_with(
+        dir,
+        EnforcePartLimits::No,
+        vec![
+            Partition {
+                nodes: "n1".into(),
+                priority_tier: 5,
+                ..partition("hi", &[("cpu", 8)])
+            },
+            Partition {
+                nodes: "n2".into(),
+                ..partition("lo", &[("cpu", 8)])
+            },
+        ],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    run_on(&cm, in_account(spec_in("lo", 2), "research"), "n2", 2);
+    cm
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_accounts_lower_tier_node_does_not_override_tier_order() {
+    let dir = TempDir::new().unwrap();
+    let cm = tiered_pair_with_account_on_lo(&dir).await;
+    let id = submit_and_wait(&cm, in_account(spec_in("hi,lo", 4), "research"));
+
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(placed(&cm, id), (vec!["n1".into()], Some("hi".into())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_higher_tier_partition_falls_back_to_the_lower_tier() {
+    let dir = TempDir::new().unwrap();
+    let cm = tiered_pair_with_account_on_lo(&dir).await;
+    run_on(&cm, spec_in("hi", 8), "n1", 8);
+    let id = submit_and_wait(&cm, in_account(spec_in("hi,lo", 4), "research"));
+
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(placed(&cm, id), (vec!["n2".into()], Some("lo".into())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_limit_still_credits_a_node_whose_cap_has_room() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    run_on(&cm, in_account(spec_in("cpu", 4), "research"), "n1", 4);
+    limit_account_nodes(&cm, 1);
+    let id = submit_and_wait(&cm, in_account(spec_in("cpu", 4), "research"));
+
+    assert_eq!(run_pass(&cm), [id], "packing onto n1 needs no new node");
+    assert_eq!(placed(&cm, id).0, ["n1"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_limit_does_not_credit_a_node_whose_cap_is_full() {
+    let dir = TempDir::new().unwrap();
+    let cm = n1_cap_full_in_account(&dir).await;
+    limit_account_nodes(&cm, 1);
+    let id = submit_and_wait(&cm, in_account(spec_in("cpu", 4), "research"));
+
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(reason(&cm, id).0, PendingReason::AssocGrpNodeLimit);
+
+    limit_account_nodes(&cm, 2);
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(placed(&cm, id).0, ["n2"]);
 }

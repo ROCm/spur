@@ -247,7 +247,10 @@ each scheduling pass:
    it could start earliest, taking the caps into account. Ties go to the higher
    ``priority_tier``.
 
-The order of names in ``--partition`` is not used.
+The order of names in ``--partition`` is not used. One exception: a job whose
+QOS or account has a ``GrpTRES`` node cap and that can
+:ref:`pack onto nodes its group already occupies <grptres-node-packing>` runs
+on those nodes, whatever their partition's tier.
 
 Nothing is fixed while the job waits. If another candidate partition frees up
 first, the job starts there. The partition is recorded only when the job starts,

@@ -5812,13 +5812,24 @@ impl ClusterManager {
                     None => GateOutcome::Keep,
                 }
             });
-            let (idle_fill_on, borrow_factor, borrow_fraction) = {
+            let (idle_fill_on, borrow_factor, borrow_fraction, cap_usage) = {
                 let cfg = self.config.read();
                 (
                     cfg.scheduler.idle_fill_enabled,
                     cfg.scheduler.idle_fill_max_borrow_factor,
                     cfg.scheduler.idle_fill_max_cluster_fraction,
+                    crate::scheduler_loop::partition_usage_at(
+                        jobs.values(),
+                        &partitions,
+                        &cfg.scheduler,
+                        now,
+                    ),
                 )
+            };
+            let reuse = ReuseView {
+                nodes: &nodes,
+                partitions: &partitions,
+                cap_usage,
             };
             let cluster_nodes = nodes.len() as u64;
             // The borrowed-node counter, per QOS and deliberately separate from the
@@ -5853,7 +5864,7 @@ impl ClusterManager {
                             qos,
                             &self.association_cache,
                             &jobs,
-                            &nodes,
+                            &reuse,
                             &reserved,
                             consumed_wall,
                         );
@@ -10632,7 +10643,7 @@ fn qos_block_with(
     job: &mut Job,
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
-    nodes: &HashMap<String, Node>,
+    reuse: &ReuseView<'_>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
 ) -> Result<u64, QosBlocked> {
@@ -10691,7 +10702,8 @@ fn qos_block_with(
     .into_iter()
     .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
     .collect();
-    let (grp_node_charge, reusable_nodes) = new_distinct_nodes_needed(job, &qos_occupied, nodes);
+    let (grp_node_charge, reusable_nodes) =
+        grp_node_credit(job, qos.limits.grp_tres.as_ref(), &qos_occupied, reuse);
 
     match check_qos_limits_with_grp_node_charge(
         job,
@@ -10747,7 +10759,7 @@ fn account_block_with(
     job: &mut Job,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
-    nodes: &HashMap<String, Node>,
+    reuse: &ReuseView<'_>,
     reserved: &PassReservations,
 ) -> Result<AccountAdmitted, spur_core::job::PendingReason> {
     let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) else {
@@ -10808,7 +10820,7 @@ fn account_block_with(
     .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
     .collect();
     let (grp_node_charge, reusable_nodes) =
-        new_distinct_nodes_needed(job, &account_occupied, nodes);
+        grp_node_credit(job, limits.grp_tres.as_ref(), &account_occupied, reuse);
 
     match check_account_limits_with_grp_node_charge(
         job,
@@ -10913,15 +10925,15 @@ fn quota_gate(
     qos: &Qos,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
-    nodes: &HashMap<String, Node>,
+    reuse: &ReuseView<'_>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
 ) -> QuotaVerdict {
-    let account = match account_block_with(job, assoc_cache, jobs, nodes, reserved) {
+    let account = match account_block_with(job, assoc_cache, jobs, reuse, reserved) {
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
-    match qos_block_with(job, qos, jobs, nodes, reserved, consumed_wall_minutes) {
+    match qos_block_with(job, qos, jobs, reuse, reserved, consumed_wall_minutes) {
         Ok(qos_charge) => QuotaVerdict::Admitted {
             account,
             qos_charge,
@@ -11402,10 +11414,15 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 /// `account_claimed_nodes` on `PassReservations` close this gap within a
 /// single pass; across passes it remains a best-effort accounting, bounded
 /// in practice by real placement being the final authority on node choice.
+///
+/// A node is only credited if one of the job's partitions holding it has room
+/// under its `max_tres_per_node` cap: a credit that covers `num_nodes` becomes
+/// a hard nodelist, so crediting a node whose cap is full would strand the job
+/// there while other nodes sit idle.
 fn new_distinct_nodes_needed(
     job: &Job,
     occupied: &HashSet<String>,
-    nodes: &HashMap<String, Node>,
+    reuse: &ReuseView<'_>,
 ) -> (u64, HashSet<String>) {
     if job.spec.exclusive {
         return (job.spec.num_nodes as u64, HashSet::new());
@@ -11415,13 +11432,14 @@ fn new_distinct_nodes_needed(
     let reusable: HashSet<String> = occupied
         .iter()
         .filter(|name| {
-            nodes.get(*name).is_some_and(|node| {
+            reuse.nodes.get(*name).is_some_and(|node| {
                 placement.allows_name(&node.name)
                     && placement.in_partition(node)
                     && placement.has_features(node)
                     && node.is_schedulable()
                     && !node.is_k0s_reserved()
                     && node.can_satisfy_request(&required)
+                    && reuse.cap_has_room(job, node)
             })
         })
         .cloned()
@@ -11432,6 +11450,73 @@ fn new_distinct_nodes_needed(
         .num_nodes
         .saturating_sub(reusable_count.min(job.spec.num_nodes)) as u64;
     (charge, reusable)
+}
+
+/// Grp-node charge and credited nodes for a group whose aggregate cap is
+/// `grp`. Without a node cap there is no distinct-node count to protect, so
+/// nothing is credited and placement stays free to pick any node or partition.
+fn grp_node_credit(
+    job: &Job,
+    grp: Option<&TresRecord>,
+    occupied: &HashSet<String>,
+    reuse: &ReuseView<'_>,
+) -> (u64, HashSet<String>) {
+    if grp.is_none_or(|grp| grp.get(TresType::Node) == 0) {
+        return (job.spec.num_nodes as u64, HashSet::new());
+    }
+    new_distinct_nodes_needed(job, occupied, reuse)
+}
+
+/// What the grp-node gates consult to decide whether a node a group already
+/// occupies could take a pending job right now.
+struct ReuseView<'a> {
+    nodes: &'a HashMap<String, Node>,
+    partitions: &'a [Partition],
+    /// Partition -> node -> what its jobs hold there now, as backfill sees it.
+    cap_usage: HashMap<String, HashMap<String, spur_sched::partition_cap::TresCharge>>,
+}
+
+impl<'a> ReuseView<'a> {
+    #[cfg(test)]
+    fn uncapped(nodes: &'a HashMap<String, Node>) -> Self {
+        Self {
+            nodes,
+            partitions: &[],
+            cap_usage: HashMap::new(),
+        }
+    }
+
+    /// Whether some partition `job` may run in that holds `node` would admit
+    /// it there under its cap. A node none of them holds has no cap to break.
+    fn cap_has_room(&self, job: &Job, node: &Node) -> bool {
+        let holding: Vec<&Partition> =
+            spur_sched::partition_cap::candidate_partitions(job, self.partitions)
+                .into_iter()
+                .filter(|p| node.partitions.contains(&p.name))
+                .collect();
+        holding.is_empty() || holding.iter().any(|p| self.fits_under_cap(job, p, node))
+    }
+
+    fn fits_under_cap(&self, job: &Job, partition: &Partition, node: &Node) -> bool {
+        use spur_sched::partition_cap::{
+            is_capped, job_in_partition, job_typed_gpu, partition_cap_ok, TresCharge,
+        };
+        if !is_capped(partition) {
+            return true;
+        }
+        let job = job_in_partition(job, partition);
+        let required = spur_sched::backfill::job_resource_request(&job);
+        let typed_gpu = job_typed_gpu(&job);
+        let charge =
+            spur_sched::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
+        let idle = TresCharge::default();
+        let used = self
+            .cap_usage
+            .get(&partition.name)
+            .and_then(|by_node| by_node.get(&node.name))
+            .unwrap_or(&idle);
+        partition_cap_ok(partition, &node.name, used, &charge).is_ok()
+    }
 }
 
 /// The TRES a single job occupies (its scheduling footprint). Shared by the
@@ -40448,7 +40533,7 @@ mod idle_fill_aggregate_tests {
             job,
             qos,
             jobs,
-            &HashMap::new(),
+            &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
         )
@@ -40642,7 +40727,7 @@ mod idle_fill_aggregate_tests {
             job,
             assoc,
             jobs,
-            &HashMap::new(),
+            &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
         )
         .map(|admitted| admitted.charge)
@@ -40808,7 +40893,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &assoc,
             &jobs,
-            &nodes,
+            &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
         .expect("within cap")
@@ -40829,7 +40914,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &assoc,
             &jobs,
-            &nodes,
+            &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
         .expect("within cap")
@@ -41102,7 +41187,7 @@ mod idle_fill_aggregate_tests {
             &mut bob,
             &qos,
             &jobs,
-            &HashMap::new(),
+            &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
         )
@@ -41126,7 +41211,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &qos,
             &jobs,
-            &HashMap::new(),
+            &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
         )
@@ -41160,7 +41245,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &qos,
             &jobs,
-            &HashMap::new(),
+            &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
         )
@@ -41231,7 +41316,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &assoc,
             &jobs,
-            &nodes,
+            &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
         .expect("credited admission");
@@ -41249,7 +41334,7 @@ mod idle_fill_aggregate_tests {
             &mut cand,
             &assoc,
             &jobs,
-            &nodes,
+            &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
         .expect("within cap");
