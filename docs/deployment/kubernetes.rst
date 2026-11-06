@@ -102,6 +102,11 @@ Resolution precedence is: explicit ``controller.node_id`` -> position in
 ``1..=len(peers)``; if a pod's hostname matches no entry (or matches more than
 one), the controller fails fast at startup rather than joining with a wrong ID.
 
+Followers forward writes to the leader's client API at the leader's ``peers``
+host plus the follower's own ``listen_addr`` port, so every replica must serve
+clients on the same port. If replicas use different ports or client hostnames,
+list each one in ``controller.peer_client_addrs``.
+
 Adjust partition definitions to match your cluster hardware. Once the controller
 is running, ``scontrol reconfigure`` applies many sections live, while others
 need a controller or agent restart — see
