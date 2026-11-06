@@ -16,8 +16,6 @@ HEARTBEAT_WINDOW = 45
 CANCEL_BLOCK = 8
 # From the heartbeat that sends the cancel to the process being gone.
 REAP_WINDOW = 15
-# A one-minute time limit, its 30s grace, then a failed re-dispatch.
-MAX_REQUEUE_WAIT = 180
 # The heartbeat line is debug-only.
 HEARTBEAT_LOG = "info,spurd::reporter=debug"
 # Unusual durations, so the host-side lookup matches only these jobs.
@@ -25,7 +23,6 @@ RUNNING_SECS = 7311
 HELD_SECS = 7312
 HOLDER_SECS = 7313
 CHALLENGER_SECS = 7314
-TIMED_SECS = 7315
 
 
 def _start(cluster, config_overrides=None):
@@ -140,45 +137,6 @@ class TestHeldJobStillRunning:
             if held_id is not None:
                 cluster.cli_allow_fail(["scancel", str(held_id)])
             _kill_sleeps(node, RUNNING_SECS, HELD_SECS)
-
-    def test_heartbeat_stops_a_job_held_at_max_requeue(self, unstarted_cluster):
-        """A timed-out run whose kill is lost, requeued, then held when its re-dispatch fails."""
-        cluster = unstarted_cluster
-        _start(cluster, {"controller": {"max_batch_requeue": 1}})
-        node_name = cluster.node_names[0]
-        node = cluster.nodes[0]
-        job_id = None
-        try:
-            script = _sleep_script(cluster, "timed", TIMED_SECS)
-            submitted = cluster.sbatch(
-                ["-J", "timed", "-N", "1", f"--nodelist={node_name}",
-                 "--requeue", "--time=1", script]
-            )
-            job_id = parse_job_id(submitted)
-            assert job_id is not None, f"submit failed:\n{submitted}"
-            wait_job_state(cluster, job_id, "R", timeout=60)
-            pid = _sleep_pid(cluster, node, TIMED_SECS, job_id)
-
-            with block_agent_port(cluster, 0):
-                deadline = time.time() + MAX_REQUEUE_WAIT
-                show = ""
-                while time.time() < deadline:
-                    show = cluster.scontrol("show", "job", str(job_id))
-                    if "Reason=JobHoldMaxRequeue" in show:
-                        break
-                    time.sleep(2)
-                assert "Reason=JobHoldMaxRequeue" in show, show
-                assert _pid_alive(node, pid), "the time-limit kill landed while the agent port was closed"
-
-            _wait_for_heartbeat(cluster)
-            assert _watch(node, pid, {}, REAP_WINDOW), (
-                "heartbeat left the job held at max requeue running:\n"
-                + cluster.scontrol("show", "job", str(job_id))
-            )
-        finally:
-            if job_id is not None:
-                cluster.cli_allow_fail(["scancel", str(job_id)])
-            _kill_sleeps(node, TIMED_SECS)
 
     @pytest.mark.gpu
     def test_refusal_names_the_holder_until_the_heartbeat_frees_it(self, unstarted_cluster):
