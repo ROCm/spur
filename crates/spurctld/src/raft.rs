@@ -162,6 +162,10 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    /// Why a `PartitionUpdate` was left unapplied: its limits, merged into the
+    /// partition's as they stood at apply, were invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_update_rejected: Option<String>,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

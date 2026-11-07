@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::gpu_request::{resolve_gpu_demand, tasks_per_node_counts, GpuDemand};
 use crate::job::JobSpec;
 use crate::partition::{Partition, TRES_CPU};
+use crate::wal::clear_or_set;
 
 /// A partition's resource caps and memory policy, replicated together so a
 /// reconfigure or API update can never leave half of them applied.
@@ -70,6 +71,108 @@ pub fn fold_max_cpus_per_node(
     }
     max_tres_per_node.insert(TRES_CPU.to_string(), u64::from(cpus));
     Ok(max_tres_per_node)
+}
+
+/// A change to a partition's resource caps and memory policy, replicated as is
+/// and merged into the limits the partition holds when it applies, so updates
+/// to different knobs never overwrite each other. A `None` field is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionLimitsUpdate {
+    /// Replaces the whole cap map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tres_per_node: Option<BTreeMap<String, u64>>,
+    /// Sets (`Some`) or clears (`None`) only the `cpu` cap.
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_cpus_per_node: Option<Option<u32>>,
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_mem_per_node: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_mem_per_cpu: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub def_mem_per_node: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub def_mem_per_cpu: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub def_mem_per_gpu: Option<Option<u64>>,
+}
+
+impl PartitionLimitsUpdate {
+    /// An update that sets every cap and knob to `limits`.
+    pub fn replacing(limits: &PartitionResourceLimits) -> Self {
+        Self {
+            max_tres_per_node: Some(limits.max_tres_per_node.clone()),
+            max_cpus_per_node: None,
+            max_mem_per_node: Some(limits.max_mem_per_node),
+            max_mem_per_cpu: Some(limits.max_mem_per_cpu),
+            def_mem_per_node: Some(limits.def_mem_per_node),
+            def_mem_per_cpu: Some(limits.def_mem_per_cpu),
+            def_mem_per_gpu: Some(limits.def_mem_per_gpu),
+        }
+    }
+
+    /// The limits `current` ends up with, validated as a whole; `None` when
+    /// nothing changes so the update leaves the limits untouched.
+    pub fn merged(&self, current: &Partition) -> Result<Option<PartitionResourceLimits>, String> {
+        if *self == Self::default() {
+            return Ok(None);
+        }
+        let mut limits = PartitionResourceLimits::of(current);
+        if let Some(map) = &self.max_tres_per_node {
+            limits.max_tres_per_node = map.clone();
+        }
+        if let Some(cpus) = self.max_cpus_per_node {
+            if let (Some(_), Some(cpus)) = (&self.max_tres_per_node, cpus) {
+                let map = std::mem::take(&mut limits.max_tres_per_node);
+                limits.max_tres_per_node = fold_max_cpus_per_node(map, Some(cpus))?;
+            } else if let Some(cpus) = cpus {
+                limits
+                    .max_tres_per_node
+                    .insert(TRES_CPU.to_string(), u64::from(cpus));
+            } else {
+                limits.max_tres_per_node.remove(TRES_CPU);
+            }
+        }
+        let knobs = [
+            (&mut limits.max_mem_per_node, self.max_mem_per_node),
+            (&mut limits.max_mem_per_cpu, self.max_mem_per_cpu),
+            (&mut limits.def_mem_per_node, self.def_mem_per_node),
+            (&mut limits.def_mem_per_cpu, self.def_mem_per_cpu),
+            (&mut limits.def_mem_per_gpu, self.def_mem_per_gpu),
+        ];
+        for (field, change) in knobs {
+            if let Some(value) = change {
+                *field = value;
+            }
+        }
+        let mut probe = current.clone();
+        limits.apply_to(&mut probe);
+        probe.validate_resource_limits()?;
+        Ok(Some(limits))
+    }
 }
 
 /// The request fields a partition's memory policy may change. Recorded on the
@@ -609,5 +712,27 @@ mod tests {
         PartitionResourceLimits::default().apply_to(&mut p);
         assert!(p.max_tres_per_node.is_empty());
         assert_eq!(p.max_mem_per_cpu, None);
+    }
+
+    #[test]
+    fn a_limits_update_keeps_absent_and_cleared_knobs_apart_on_the_wire() {
+        let update: PartitionLimitsUpdate =
+            serde_json::from_str(r#"{"def_mem_per_cpu":null,"max_cpus_per_node":64}"#).unwrap();
+        let expected = PartitionLimitsUpdate {
+            max_cpus_per_node: Some(Some(64)),
+            def_mem_per_cpu: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(update, expected);
+
+        let wire = serde_json::to_string(&update).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PartitionLimitsUpdate>(&wire).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_str::<PartitionLimitsUpdate>("{}").unwrap(),
+            PartitionLimitsUpdate::default()
+        );
     }
 }

@@ -672,6 +672,101 @@ fn limits_update_merges_validates_and_clears() {
     assert!(bad_key.merged(&current).is_err());
 }
 
+/// A `PartitionUpdate` entry changing only `state` (when set) and the limits.
+fn limits_entry(state: Option<&str>, limits: PartitionLimitsUpdate) -> WalOperation {
+    WalOperation::PartitionUpdate {
+        name: "cpu".into(),
+        nodes: None,
+        selector: None,
+        state: state.map(str::to_string),
+        max_time_minutes: None,
+        default_time_minutes: None,
+        max_nodes: None,
+        min_nodes: None,
+        allow_accounts: None,
+        allow_groups: None,
+        deny_accounts: None,
+        deny_qos: None,
+        allow_qos: None,
+        priority_tier: None,
+        preempt_mode: None,
+        is_default: None,
+        preempt_exempt_time: None,
+        grace_time: None,
+        resource_limits: Some(limits),
+    }
+}
+
+fn limits_of(cm: &ClusterManager) -> Partition {
+    cm.get_partitions()
+        .into_iter()
+        .find(|p| p.name == "cpu")
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interleaved_limits_updates_to_different_knobs_both_apply() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("mem", 4 * GIB)])],
+    )
+    .await;
+    let cpus = limits_entry(
+        None,
+        PartitionLimitsUpdate {
+            max_cpus_per_node: Some(Some(64)),
+            ..Default::default()
+        },
+    );
+    let def_mem = limits_entry(
+        None,
+        PartitionLimitsUpdate {
+            def_mem_per_cpu: Some(Some(1024)),
+            ..Default::default()
+        },
+    );
+
+    cm.apply_operation(&cpus);
+    cm.apply_operation(&def_mem);
+
+    let p = limits_of(&cm);
+    assert_eq!(
+        p.max_tres_per_node,
+        BTreeMap::from([("cpu".into(), 64), ("mem".into(), 4 * GIB)])
+    );
+    assert_eq!(p.def_mem_per_cpu, Some(1024));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_conflicting_with_one_applied_before_it_is_rejected_whole() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(&dir, EnforcePartLimits::No, vec![partition("cpu", &[])]).await;
+    let per_cpu = limits_entry(
+        None,
+        PartitionLimitsUpdate {
+            def_mem_per_cpu: Some(Some(1024)),
+            ..Default::default()
+        },
+    );
+    let per_node = limits_entry(
+        Some("DRAIN"),
+        PartitionLimitsUpdate {
+            def_mem_per_node: Some(Some(4096)),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(cm.apply_operation(&per_cpu).partition_update_rejected, None);
+    let rejected = cm.apply_operation(&per_node).partition_update_rejected;
+
+    assert!(rejected.is_some_and(|e| e.contains("set at most one")));
+    let p = limits_of(&cm);
+    assert_eq!(p.state, spur_core::partition::PartitionState::Up);
+    assert_eq!((p.def_mem_per_cpu, p.def_mem_per_node), (Some(1024), None));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partition_api_rejects_invalid_limits_and_leaves_the_partition_unchanged() {
     let dir = TempDir::new().unwrap();

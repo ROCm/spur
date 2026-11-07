@@ -386,6 +386,11 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
   rejected.
 - ``scontrol reconfigure`` applies the values in ``spur.conf`` again,
   replacing limits changed with ``scontrol``.
+- Updates that change different knobs at the same time, from two
+  ``scontrol`` commands or API calls, both take effect. If an update would
+  break these rules only because of one applied just before it (for example,
+  each sets a different ``DefMemPer*``), it is rejected as a whole with an
+  error naming the partition, and nothing in it is applied.
 
 The REST ``GET /api/v1/partitions`` (and ``/slurm/v0.0.42/partitions``) response
 includes ``max_cpus_per_node``, ``max_tres_per_node``, ``max_mem_per_node``,

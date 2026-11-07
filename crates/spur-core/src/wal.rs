@@ -8,7 +8,7 @@ use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::{NodeSource, NodeState};
 use crate::partition::Partition;
-use crate::partition_limits::{MemoryAdjustment, PartitionResourceLimits};
+use crate::partition_limits::{MemoryAdjustment, PartitionLimitsUpdate};
 use crate::reservation::Reservation;
 use std::collections::HashMap;
 
@@ -21,7 +21,7 @@ fn default_port() -> u16 {
 /// Deserializer for `Option<Option<T>>` patch fields: absent is no change (via
 /// `#[serde(default)]`), `null` clears, a value sets. Pair with
 /// `skip_serializing_if = "Option::is_none"` so a clear is not read back as absent.
-fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -415,9 +415,9 @@ pub enum WalOperation {
             skip_serializing_if = "Option::is_none"
         )]
         grace_time: Option<Option<u32>>,
-        /// Replaces every resource cap and memory knob at once when present.
+        /// Merged into the partition's limits when the entry applies.
         #[serde(default)]
-        resource_limits: Option<PartitionResourceLimits>,
+        resource_limits: Option<PartitionLimitsUpdate>,
     },
     PartitionDelete {
         name: String,

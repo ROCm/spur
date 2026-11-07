@@ -29,7 +29,7 @@ use spur_core::job::{
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::partition_limits::{
-    candidate_requests, fold_max_cpus_per_node, PartitionResourceLimits,
+    candidate_requests, PartitionLimitsUpdate, PartitionResourceLimits,
 };
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
@@ -508,64 +508,6 @@ impl PartitionError {
 
     pub fn raft(msg: impl Into<String>) -> Self {
         Self::Raft(msg.into())
-    }
-}
-
-/// Requested changes to a partition's resource caps and memory policy; a
-/// `None` field is left as it is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PartitionLimitsUpdate {
-    /// Replaces the whole cap map.
-    pub max_tres_per_node: Option<BTreeMap<String, u64>>,
-    /// Sets (`Some`) or clears (`None`) only the `cpu` cap.
-    pub max_cpus_per_node: Option<Option<u32>>,
-    pub max_mem_per_node: Option<Option<u64>>,
-    pub max_mem_per_cpu: Option<Option<u64>>,
-    pub def_mem_per_node: Option<Option<u64>>,
-    pub def_mem_per_cpu: Option<Option<u64>>,
-    pub def_mem_per_gpu: Option<Option<u64>>,
-}
-
-impl PartitionLimitsUpdate {
-    /// The limits `current` ends up with, validated as a whole; `None` when
-    /// nothing changes so the update leaves the limits untouched.
-    pub fn merged(&self, current: &Partition) -> Result<Option<PartitionResourceLimits>, String> {
-        if *self == Self::default() {
-            return Ok(None);
-        }
-        let mut limits = PartitionResourceLimits::of(current);
-        if let Some(map) = &self.max_tres_per_node {
-            limits.max_tres_per_node = map.clone();
-        }
-        if let Some(cpus) = self.max_cpus_per_node {
-            let cpu = spur_core::partition::TRES_CPU;
-            if let (Some(_), Some(cpus)) = (&self.max_tres_per_node, cpus) {
-                let map = std::mem::take(&mut limits.max_tres_per_node);
-                limits.max_tres_per_node = fold_max_cpus_per_node(map, Some(cpus))?;
-            } else if let Some(cpus) = cpus {
-                limits
-                    .max_tres_per_node
-                    .insert(cpu.to_string(), u64::from(cpus));
-            } else {
-                limits.max_tres_per_node.remove(cpu);
-            }
-        }
-        let knobs = [
-            (&mut limits.max_mem_per_node, self.max_mem_per_node),
-            (&mut limits.max_mem_per_cpu, self.max_mem_per_cpu),
-            (&mut limits.def_mem_per_node, self.def_mem_per_node),
-            (&mut limits.def_mem_per_cpu, self.def_mem_per_cpu),
-            (&mut limits.def_mem_per_gpu, self.def_mem_per_gpu),
-        ];
-        for (field, change) in knobs {
-            if let Some(value) = change {
-                *field = value;
-            }
-        }
-        let mut probe = current.clone();
-        limits.apply_to(&mut probe);
-        probe.validate_resource_limits()?;
-        Ok(Some(limits))
     }
 }
 
@@ -6422,7 +6364,8 @@ impl ClusterManager {
                 name
             )));
         };
-        let resource_limits = limits.merged(&current).map_err(PartitionError::invalid)?;
+        limits.merged(&current).map_err(PartitionError::invalid)?;
+        let resource_limits = (limits != PartitionLimitsUpdate::default()).then_some(limits);
 
         let max_time_minutes = if let Some(ref t) = max_time {
             if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
@@ -6455,28 +6398,34 @@ impl ClusterManager {
             max_nodes.map(Some)
         };
 
-        self.propose(WalOperation::PartitionUpdate {
-            name: name.to_string(),
-            nodes,
-            selector,
-            state,
-            max_time_minutes,
-            default_time_minutes,
-            max_nodes: max_nodes_wal,
-            min_nodes,
-            allow_accounts,
-            allow_groups,
-            deny_accounts,
-            deny_qos,
-            allow_qos,
-            priority_tier,
-            preempt_mode,
-            is_default,
-            preempt_exempt_time,
-            grace_time,
-            resource_limits,
-        })
-        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        let applied = self
+            .propose(WalOperation::PartitionUpdate {
+                name: name.to_string(),
+                nodes,
+                selector,
+                state,
+                max_time_minutes,
+                default_time_minutes,
+                max_nodes: max_nodes_wal,
+                min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                allow_qos,
+                priority_tier,
+                preempt_mode,
+                is_default,
+                preempt_exempt_time,
+                grace_time,
+                resource_limits,
+            })
+            .map_err(|e| PartitionError::raft(e.to_string()))?;
+        if let Some(error) = applied.partition_update_rejected {
+            return Err(PartitionError::invalid(format!(
+                "partition '{name}' changed concurrently: {error}"
+            )));
+        }
         self.warn_partition_cap_overcommits_in(name);
         Ok(())
     }
@@ -6664,7 +6613,9 @@ impl ClusterManager {
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
                 grace_time: part.grace_time.map(Some),
-                resource_limits: Some(PartitionResourceLimits::of(part)),
+                resource_limits: Some(PartitionLimitsUpdate::replacing(
+                    &PartitionResourceLimits::of(part),
+                )),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -9657,8 +9608,17 @@ impl ClusterManager {
             } => {
                 {
                     let mut partitions = self.partitions.write();
-                    let set_as_default = *is_default == Some(true);
-                    if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
+                    let mut set_as_default = *is_default == Some(true);
+                    let found = partitions.iter_mut().find(|p| p.name == *name);
+                    let limits = found.as_deref().map(|part| match resource_limits {
+                        Some(update) => update.merged(part),
+                        None => Ok(None),
+                    });
+                    if let Some(Err(error)) = limits {
+                        warn!(name, %error, "partition update rejected at apply");
+                        response.partition_update_rejected = Some(error);
+                        set_as_default = false;
+                    } else if let Some(part) = found {
                         if let Some(n) = new_hostlist {
                             part.nodes = n.clone();
                         }
@@ -9718,7 +9678,7 @@ impl ClusterManager {
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
                         }
-                        if let Some(limits) = resource_limits {
+                        if let Some(Ok(Some(limits))) = limits {
                             limits.apply_to(part);
                         }
                         info!(name, "partition updated");

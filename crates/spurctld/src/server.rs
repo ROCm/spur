@@ -5859,10 +5859,12 @@ fn create_request_limits(
 /// Resource-limit changes an update asks for. A `max_cpus_per_node` or memory
 /// knob of 0 clears it, matching the proto contract; the map is replaced only
 /// when asked to.
-fn update_request_limits(req: &UpdatePartitionRequest) -> crate::cluster::PartitionLimitsUpdate {
+fn update_request_limits(
+    req: &UpdatePartitionRequest,
+) -> spur_core::partition_limits::PartitionLimitsUpdate {
     let clearable = |value: Option<u64>| value.map(|v| (v != 0).then_some(v));
     let replace_map = req.set_max_tres_per_node || !req.max_tres_per_node.is_empty();
-    crate::cluster::PartitionLimitsUpdate {
+    spur_core::partition_limits::PartitionLimitsUpdate {
         max_tres_per_node: replace_map.then(|| req.max_tres_per_node.clone().into_iter().collect()),
         max_cpus_per_node: req.max_cpus_per_node.map(|v| (v != 0).then_some(v)),
         max_mem_per_node: clearable(req.max_mem_per_node),

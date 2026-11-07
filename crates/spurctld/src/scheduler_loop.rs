@@ -9123,7 +9123,7 @@ mod tests {
                 partitions.iter().find(|p| p.name == "p"),
             );
 
-            let raise = crate::cluster::PartitionLimitsUpdate {
+            let raise = spur_core::partition_limits::PartitionLimitsUpdate {
                 def_mem_per_node: Some(Some(8192)),
                 ..Default::default()
             };
