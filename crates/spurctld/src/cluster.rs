@@ -15773,6 +15773,8 @@ state = "UP"
                 srun_step_dispatch: false,
                 run_attempt: 0,
                 idle_fill: false,
+                effective_partition: None,
+                memory_adjustment: None,
                 at: None,
             },
             WalOperation::NodeUpdate {
@@ -24554,6 +24556,8 @@ state = "UP"
             job_id: short,
             nodes: vec!["n1".into()],
             per_node_alloc: HashMap::new(),
+            partition: None,
+            memory_adjustment: None,
         }];
         let partitions = cm.get_partitions();
         let pending = cm.get_job(wide).unwrap();

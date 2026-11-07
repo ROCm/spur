@@ -1217,7 +1217,7 @@ async fn a_cancel_handoff_waits_for_the_draining_victims_cap_share() {
     let reservations = cm.get_reservations();
     assert_eq!(
         cm.preemption_handoffs(&pending, &cm.get_nodes(), &reservations),
-        HashMap::from([("n1".to_string(), high)])
+        HashMap::from([("n1".to_string(), vec![high])])
     );
 
     assert!(
