@@ -51,9 +51,8 @@ pub struct Partition {
     #[serde(default)]
     pub grace_time: Option<u32>,
 
-    /// Cumulative cap per TRES key on what this partition's jobs may hold on
-    /// one node, combined. The config's `max_cpus_per_node` is folded into
-    /// the `cpu` key. Empty means unlimited; a `0` limit forbids the resource.
+    /// Combined per-node cap per TRES key on this partition's jobs; the config's
+    /// `max_cpus_per_node` folds into `cpu`. Empty is unlimited; a `0` limit forbids it.
     #[serde(default)]
     pub max_tres_per_node: BTreeMap<String, u64>,
     /// Per-job memory policy (MiB), Slurm's `MaxMemPerNode`/`MaxMemPerCPU`/
@@ -71,9 +70,8 @@ pub struct Partition {
 }
 
 impl Partition {
-    /// Rejects cap keys the scheduler could never charge and conflicting
-    /// per-job memory knobs. Shared by config load and the partition API so
-    /// both enforce the same rules.
+    /// Rejects uncharged cap keys and conflicting per-job memory knobs; shared by config
+    /// load and the partition API so both enforce the same rules.
     pub fn validate_resource_limits(&self) -> Result<(), String> {
         if let Some(key) = self
             .max_tres_per_node
@@ -111,9 +109,8 @@ impl Partition {
         }
     }
 
-    /// The reason this partition can never run the job (static limits), or
-    /// `None` if it can. Node-count violations report `PartitionConfig`;
-    /// wall-time violations report the more specific `PartitionTimeLimit`.
+    /// Why this partition can never run the job (static limits), or `None` if it can:
+    /// node-count violations report `PartitionConfig`, wall-time `PartitionTimeLimit`.
     pub fn limit_block(&self, spec: &JobSpec) -> Option<PendingReason> {
         // A job never runs on fewer than one node, whatever it asked for.
         let nodes = spec.num_nodes.max(1);
@@ -132,9 +129,8 @@ impl Partition {
         None
     }
 
-    /// Whether the job may start in this partition now: it is Up and none of
-    /// its static limits rule the job out. The controller's pending-reason
-    /// gate and the scheduler's partition choice both use this rule.
+    /// Whether the job may start here now: Up and not ruled out by static limits. Shared
+    /// by the controller's pending-reason gate and the scheduler's partition choice.
     pub fn admits(&self, spec: &JobSpec) -> bool {
         self.state == PartitionState::Up && self.limit_block(spec).is_none()
     }
@@ -154,9 +150,8 @@ pub fn tres_key_gpu_type(key: &str) -> Option<&str> {
     key.strip_prefix(TRES_GPU)?.strip_prefix(':')
 }
 
-/// Whether `key` is a cap key the scheduler can charge: `cpu`, `mem`,
-/// `gres/gpu`, or `gres/gpu:<type>`. Anything else would never be charged, so
-/// a typo must be rejected rather than silently leave the partition uncapped.
+/// Whether `key` is a chargeable cap key (`cpu`, `mem`, `gres/gpu[:<type>]`); anything
+/// else is never charged, so a typo must be rejected rather than leave the partition uncapped.
 pub fn is_valid_partition_tres_key(key: &str) -> bool {
     if matches!(key, TRES_CPU | TRES_MEM | TRES_GPU) {
         return true;

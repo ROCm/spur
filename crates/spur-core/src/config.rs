@@ -623,11 +623,8 @@ impl Default for AccountingConfig {
     }
 }
 
-/// Submit-time enforcement of partition limits (Slurm `EnforcePartLimits`):
-/// wall time, per-job memory limits, and requests a partition's per-node
-/// resource cap could never hold. `No` admits over-limit jobs to pend, `All`
-/// needs all requested partitions to fit, `Any` needs one. A job over a cap
-/// only because of current load always pends.
+/// Slurm `EnforcePartLimits` for limits a partition could never meet: `No` lets such jobs
+/// pend, `All`/`Any` need all/one requested partition to fit. Load alone never rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EnforcePartLimits {

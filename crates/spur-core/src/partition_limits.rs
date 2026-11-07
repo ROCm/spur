@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-partition resource limits as one unit (for replication and the API),
-//! and the per-job memory policy (`def_mem_*`, `max_mem_per_cpu`,
-//! `max_mem_per_node`) a partition applies to a job's request.
+//! Per-partition resource limits as one unit (for replication and the API), and the
+//! per-job memory policy a partition applies to a job's request.
 
 use std::collections::BTreeMap;
 
@@ -54,9 +53,8 @@ impl PartitionResourceLimits {
     }
 }
 
-/// `max_tres_per_node` with the `max_cpus_per_node` alias folded into its
-/// `cpu` key. Setting both is an error: two spellings of one cap would leave
-/// the effective value to a precedence rule an operator cannot see.
+/// `max_tres_per_node` with the `max_cpus_per_node` alias folded into `cpu`. Setting
+/// both is an error: an operator could not see which spelling wins.
 pub fn fold_max_cpus_per_node(
     mut max_tres_per_node: BTreeMap<String, u64>,
     max_cpus_per_node: Option<u32>,
@@ -73,9 +71,8 @@ pub fn fold_max_cpus_per_node(
     Ok(max_tres_per_node)
 }
 
-/// A change to a partition's resource caps and memory policy, replicated as is
-/// and merged into the limits the partition holds when it applies, so updates
-/// to different knobs never overwrite each other. A `None` field is unchanged.
+/// A change to a partition's caps and memory policy, merged into its limits when applied
+/// so updates to different knobs never overwrite each other. `None` fields are unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionLimitsUpdate {
     /// Replaces the whole cap map.
@@ -214,9 +211,8 @@ pub struct CandidateRequest<'a> {
     pub partitions: Vec<&'a str>,
 }
 
-/// The distinct requests the job would run with in `candidates`, in candidate
-/// order; partitions that reshape it the same way share one entry. With no
-/// candidates the job's own request is the only one.
+/// The distinct requests the job would run with in `candidates`, in candidate order;
+/// with no candidates, just the job's own request.
 pub fn candidate_requests<'a>(
     spec: &JobSpec,
     candidates: impl IntoIterator<Item = &'a Partition>,
@@ -273,9 +269,8 @@ pub fn node_memory_mb(spec: &JobSpec, cpus: u64, gpus: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// Largest GPU count on any one node when a GPU total is spread as evenly as
-/// possible. A total may land unevenly, but this spread always exists, and no
-/// split puts fewer on its fullest node.
+/// Largest per-node GPU count at the most even spread of a GPU total: this spread
+/// always exists and no split puts fewer on its fullest node.
 pub fn even_node_gpus(spec: &JobSpec) -> u64 {
     match resolve_gpu_demand(spec) {
         Ok(GpuDemand::PerNode { counts, .. }) => u64::from(counts.into_iter().max().unwrap_or(0)),
@@ -302,10 +297,8 @@ impl Partition {
             || self.def_mem_per_gpu.is_some()
     }
 
-    /// The request as this partition runs it: the `def_mem_*` default when the
-    /// job names no memory, then Slurm's `max_mem_per_cpu` rule, which gives
-    /// the job more CPUs instead of rejecting it. Applying it twice for the
-    /// same partition changes nothing.
+    /// The request as this partition runs it: `def_mem_*` if no memory is named, then
+    /// Slurm's `max_mem_per_cpu` rule (more CPUs, not rejection). Idempotent per partition.
     pub fn memory_adjusted(&self, spec: &JobSpec) -> MemoryAdjustment {
         let mut adjusted = MemoryAdjustment::of(spec);
         // Spur has no whole-node `--mem=0`: the API already reads 0 as "no
@@ -349,9 +342,8 @@ impl Partition {
         (requested > limit).then_some((requested, limit))
     }
 
-    /// Whether one node's share of a job, `memory_mb` with `cpus` CPUs, stays
-    /// within this partition's per-job memory limits. Binds only where the
-    /// share differs per node, as GPUs spread unevenly do.
+    /// Whether one node's share (`memory_mb` over `cpus` CPUs) stays within the per-job
+    /// memory limits; binds only where shares differ per node, as with uneven GPUs.
     pub fn node_memory_allowed(&self, cpus: u64, memory_mb: u64) -> bool {
         let per_node_ok = self.max_mem_per_node.is_none_or(|limit| memory_mb <= limit);
         let per_cpu_ok = self
@@ -362,10 +354,8 @@ impl Partition {
     }
 }
 
-/// Slurm `_valid_pn_min_mem`: `--mem-per-cpu` over the limit multiplies the
-/// CPUs per task by `ceil(mem / limit)` and divides memory per CPU by the same
-/// factor; `--mem` over `cpus × limit` raises the CPUs to `ceil(mem / limit)`.
-/// Per-GPU memory is raised for like `--mem` at its most even GPU spread.
+/// Slurm `_valid_pn_min_mem`: over-limit `--mem-per-cpu` scales CPUs up and memory per CPU
+/// down by `ceil(mem / limit)`; over-limit `--mem` (or per-GPU, evenly spread) raises CPUs.
 fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjustment) {
     let mut probe = spec.clone();
     adjusted.apply_to(&mut probe);

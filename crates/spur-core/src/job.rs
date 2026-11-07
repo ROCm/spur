@@ -354,9 +354,8 @@ pub enum PendingReason {
     Resources,
     PartitionDown,
     PartitionNodeLimit,
-    /// Placing the job would push a partition past its per-node resource cap
-    /// (`max_tres_per_node`). No Slurm counterpart: Slurm has no
-    /// partition-level TRES cap. The numbers go in `pending_reason_desc`.
+    /// Placing the job would push a partition past its `max_tres_per_node` cap. No Slurm
+    /// counterpart; the numbers go in `pending_reason_desc`.
     PartitionTresLimit,
     PartitionTimeLimit,
     Dependency,
@@ -613,11 +612,8 @@ impl PartitionTresOvershoot {
     }
 }
 
-/// `pending_reason_desc` for [`PendingReason::PartitionTresLimit`]: reports the
-/// node closest to fitting (smallest overshoot relative to the limit) and how
-/// many other nodes are also blocked. On that node the first over-limit key in
-/// `cpu`, `mem`, GRES order is named. Entries not actually over their limit are
-/// ignored; `None` when none are.
+/// `pending_reason_desc` for [`PendingReason::PartitionTresLimit`]: the node closest to
+/// fitting, its first over-limit key, and how many others are blocked; `None` if none is over.
 pub fn partition_tres_limit_desc(
     partition: &str,
     overshoots: &[PartitionTresOvershoot],
@@ -911,10 +907,8 @@ impl JobSpec {
     }
 }
 
-/// Total memory (MB) a job of `num_nodes` nodes requests, derived from an
-/// explicit per-node request, or a per-CPU or per-GPU amount applied across
-/// the job's total CPU or GPU count. Falls back to 0 (unconstrained) if none
-/// is set.
+/// Total memory (MB) a job of `num_nodes` nodes requests: per-node, or per-CPU/per-GPU
+/// applied across its total CPUs/GPUs; 0 (unconstrained) if none is set.
 pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
     spec.memory_per_node_mb
         .map(|mem| mem * num_nodes as u64)
@@ -1150,15 +1144,13 @@ pub struct Job {
     #[serde(default)]
     pub idle_fill: bool,
 
-    /// Partition this run is charged to, chosen among the requested ones when
-    /// the job starts; `None` while pending. Partition caps count the run's
-    /// usage against it until the job ends.
+    /// Partition this run is charged to, chosen among the requested ones at start (`None`
+    /// while pending); caps count its usage against it until the job ends.
     #[serde(default)]
     pub effective_partition: Option<String>,
 
-    /// The request as submitted, kept while the spec carries a partition's
-    /// memory-policy adjustment, so a requeued run is re-adjusted from it
-    /// rather than from another partition's result.
+    /// The request as submitted, kept while a partition's memory policy has adjusted the
+    /// spec, so a requeued run is re-adjusted from it rather than another partition's result.
     #[serde(default)]
     pub original_request: Option<crate::partition_limits::MemoryAdjustment>,
 

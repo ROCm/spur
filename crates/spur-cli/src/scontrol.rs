@@ -1975,9 +1975,8 @@ fn partition_update_request(
     })
 }
 
-/// `scontrol show partition` lines for resource caps and memory policy, in
-/// Slurm's spelling: `MaxCPUsPerNode=64 MaxTRESPerNode=cpu=64,mem=131072` and
-/// `DefMemPerCPU=1024 MaxMemPerNode=UNLIMITED`.
+/// `scontrol show partition` lines for resource caps and memory policy, in Slurm's
+/// spelling (e.g. `MaxTRESPerNode=cpu=64,mem=131072`, `MaxMemPerNode=UNLIMITED`).
 fn partition_limit_lines(part: &spur_proto::proto::PartitionInfo) -> [String; 2] {
     let unlimited = |v: Option<String>| v.unwrap_or_else(|| "UNLIMITED".into());
     let mut caps: Vec<_> = part.max_tres_per_node.iter().collect();
@@ -2011,11 +2010,8 @@ fn partition_limit_lines(part: &spur_proto::proto::PartitionInfo) -> [String; 2]
     [caps_line, format!("{def_mem} {max_mem}")]
 }
 
-/// Partition resource caps and memory policy given as Slurm-inline keys:
-/// `MaxCPUsPerNode`, `MaxTRESPerNode=cpu=64,mem=131072,gres/gpu=0`,
-/// `MaxMemPerNode`, `MaxMemPerCPU`, `DefMemPerNode`, `DefMemPerCPU`,
-/// `DefMemPerGPU` (memory in MiB). On update, `UNLIMITED` or 0 clears a knob
-/// and an empty `MaxTRESPerNode=` clears every cap.
+/// Partition resource caps and memory policy as Slurm-inline keys (memory in MiB). On
+/// update, `UNLIMITED` or 0 clears a knob and an empty `MaxTRESPerNode=` clears every cap.
 #[derive(Debug, Default, PartialEq)]
 struct PartitionLimitArgs {
     max_cpus_per_node: Option<u32>,

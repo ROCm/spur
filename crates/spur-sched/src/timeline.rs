@@ -224,11 +224,8 @@ impl NodeTimeline {
                 .is_none()
     }
 
-    /// [`earliest_start`](Self::earliest_start) that also keeps the capped
-    /// partition's cumulative charge on this node within its cap for the
-    /// whole `duration`, counting both running usage and reservations.
-    /// Callers must first drop requests the cap could never admit on an idle
-    /// node: with nothing left to end, the search stops at the last candidate.
+    /// [`earliest_start`](Self::earliest_start), also keeping the partition's charge within
+    /// its cap for `duration`; callers must first drop requests the cap could never admit.
     pub fn earliest_start_capped(
         &self,
         request: &ResourceSet,
@@ -304,9 +301,8 @@ impl NodeTimeline {
         self.intervals.sort_by_key(|i| i.start);
     }
 
-    /// Count running usage against a partition's cap until `end`. Carries no
-    /// resources: the node's aggregate allocation already holds them for
-    /// capacity, and adding them again would double-count.
+    /// Count running usage against a partition's cap until `end`; carries no resources
+    /// since the node's aggregate allocation already holds them (no double-count).
     pub fn charge_running(
         &mut self,
         start: DateTime<Utc>,

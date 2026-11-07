@@ -1269,10 +1269,8 @@ pub(crate) fn partition_usage_at<'a>(
         .collect()
 }
 
-/// Pure core of [`running_partition_usage`]. Idle-fill runs are charged like
-/// any other: they hold real cores the cap exists to keep free. A suspended
-/// job keeps its allocation, so it keeps its charge; a node the job already
-/// finished on was released, so it stops charging.
+/// Pure core of [`running_partition_usage`]. Idle-fill and suspended runs hold real cores,
+/// so they keep charging; a node the job already finished on was released and stops.
 fn partition_usage_from_jobs<'a>(
     jobs: impl IntoIterator<Item = &'a spur_core::job::Job>,
     partitions: &[spur_core::partition::Partition],

@@ -18,10 +18,8 @@ use spur_core::partition::{
 use spur_core::partition_limits::MemoryAdjustment;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 
-/// Amount a placement charges against partition caps, per TRES key (`mem` in
-/// MiB). Kept as TRES counts rather than device allocations because whether a
-/// GPU counts against a typed key depends on how it was requested, not on the
-/// device it landed on.
+/// Partition-cap charge per TRES key (`mem` in MiB). TRES counts, not devices, because
+/// whether a GPU counts against a typed key depends on how it was requested.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TresCharge(BTreeMap<String, u64>);
 
@@ -115,10 +113,8 @@ pub fn is_capped(partition: &Partition) -> bool {
     !partition.max_tres_per_node.is_empty()
 }
 
-/// Whether adding `add` to `usage` keeps `partition` within its cap on `node`.
-/// Returns the first violated key in `cpu`, `mem`, GRES order. A key the
-/// request does not use is not checked, so a cap lowered below current usage
-/// never blocks jobs that would not add to it.
+/// Whether `usage` + `add` fits `partition`'s cap on `node`, else the first violated key.
+/// Keys `add` doesn't use are skipped, so a lowered cap only blocks jobs adding to it.
 pub fn partition_cap_ok(
     partition: &Partition,
     node: &str,
@@ -209,10 +205,8 @@ pub fn planned_memory_adjustment(
     (adjusted != MemoryAdjustment::of(&job.spec)).then_some(adjusted)
 }
 
-/// The job restricted to the requested partitions that admit it now (see
-/// [`Partition::admits`]), so placement never uses a node only an ineligible
-/// partition holds. `None` when every requested partition rules it out. An
-/// unknown name is left to node matching; the controller gates on it already.
+/// The job limited to requested partitions that [`Partition::admits`] now, so placement
+/// never uses a node only an ineligible one holds; `None` if none does.
 pub fn job_in_eligible_partitions<'a>(
     job: &'a Job,
     partitions: &[Partition],
@@ -255,10 +249,8 @@ pub fn candidate_partitions<'a>(job: &Job, partitions: &'a [Partition]) -> Vec<&
         .collect()
 }
 
-/// Ordering key for choosing among candidate partitions, as Slurm does for a
-/// multi-partition request: the highest-tier partition that can start the job
-/// now wins; when none can, the earliest start wins (ties to the higher tier).
-/// Request order is ignored; the name only makes ties deterministic.
+/// Ordering key among candidate partitions, as in Slurm: the highest tier that can start
+/// now wins, else the earliest start (ties to higher tier); the name only breaks ties.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResolutionRank<'a> {
     StartsNow(Reverse<u32>, DateTime<Utc>, &'a str),

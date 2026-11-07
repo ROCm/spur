@@ -5832,9 +5832,8 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
     }
 }
 
-/// Resource caps and memory policy a partition is created with. The
-/// `max_cpus_per_node` alias and a `cpu` map key are rejected together, like
-/// in `spur.conf`.
+/// Resource caps and memory policy a partition is created with; the `max_cpus_per_node`
+/// alias with a `cpu` map key is rejected, as in `spur.conf`.
 fn create_request_limits(
     req: &CreatePartitionRequest,
 ) -> Result<spur_core::partition_limits::PartitionResourceLimits, Status> {
@@ -5856,9 +5855,8 @@ fn create_request_limits(
     })
 }
 
-/// Resource-limit changes an update asks for. A `max_cpus_per_node` or memory
-/// knob of 0 clears it, matching the proto contract; the map is replaced only
-/// when asked to.
+/// Resource-limit changes an update asks for: a `max_cpus_per_node` or memory knob of 0
+/// clears it (proto contract); the map is replaced only when asked to.
 fn update_request_limits(
     req: &UpdatePartitionRequest,
 ) -> spur_core::partition_limits::PartitionLimitsUpdate {

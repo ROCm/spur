@@ -757,9 +757,8 @@ fn remap_node_gpu_allocations(
     node.update_state_from_alloc();
 }
 
-/// Per-node memory (MiB) a controller hook reports: the job's per-node request,
-/// or, when its memory is sized per CPU or per GPU and so differs per node, the
-/// most any one node was allocated.
+/// Per-node memory (MiB) a controller hook reports: the per-node request, or the most any
+/// node was allocated when memory is sized per CPU/GPU and so differs per node.
 pub(crate) fn hook_memory_mb(
     spec: &JobSpec,
     per_node_alloc: &HashMap<String, ResourceAllocations>,
@@ -2835,10 +2834,8 @@ impl ClusterManager {
         )
     }
 
-    /// Charge a placement in Raft before dispatching, so a leader change
-    /// mid-dispatch finds it charged rather than free. What the run is charged
-    /// to travels in the same entry, so it survives restart and replay.
-    /// Returns the run epoch.
+    /// Charge a placement in Raft before dispatching, so a leader change mid-dispatch finds
+    /// it charged; the charged partition rides the same entry. Returns the run epoch.
     pub fn reserve_attributed_placement(
         &self,
         job_id: JobId,
@@ -5829,9 +5826,8 @@ impl ClusterManager {
                         job.allocated_nodes.len() as u64;
                 }
             }
-            // Each candidate partition reshapes the request under its memory
-            // policy, so the gates judge each shape and the job keeps only the
-            // partitions whose shape they admit.
+            // Each candidate partition reshapes the request under its memory policy,
+            // so the gates judge each shape and the job keeps only admitted partitions.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let qos = &qos_by_job[&job.job_id];
                 let consumed_wall = job
@@ -7638,9 +7634,8 @@ impl ClusterManager {
     /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
     /// limits and the association per-job wall deny unconditionally; stand-alone
     /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
-    /// (treated as on when the job has no QOS), and only when the request every
-    /// candidate partition's memory policy gives the job breaches. `incoming` is
-    /// the task count added.
+    /// (treated as on when the job has no QOS), and only if the request breaches under
+    /// every candidate partition's memory policy. `incoming` is the task count added.
     fn enforce_submit_limits(
         &self,
         spec: &JobSpec,
@@ -10465,10 +10460,8 @@ fn node_tres_capacity(resources: &ResourceSet, key: &str) -> u64 {
     }
 }
 
-/// Over-limit keys that keep `partition`'s cap from ever holding the job, as
-/// if every eligible node were idle. `None` when the partition is uncapped,
-/// enough of its nodes would admit the job, or too few nodes are known yet to
-/// tell (more may join).
+/// Over-limit keys that keep `partition`'s cap from ever holding the job, even with every
+/// eligible node idle; `None` if uncapped, enough nodes admit it, or too few are known yet.
 fn partition_cap_never_fits(
     job: &Job,
     partition: &Partition,
@@ -10528,9 +10521,8 @@ fn partition_cap_never_runs(
     Some(cap_never_runs_desc(job, partition, overshoots))
 }
 
-/// "Partition cpu can never run this job as configured: exclusive job needs
-/// 128 CPUs, max_tres_per_node.cpu is 64 on every eligible node". The
-/// `max_cpus_per_node` alias is folded into the map, so the map key is named.
+/// Names the map key, since the `max_cpus_per_node` alias is folded into it, e.g.
+/// "... exclusive job needs 128 CPUs, max_tres_per_node.cpu is 64 on every eligible node".
 fn cap_never_runs_desc(
     job: &Job,
     partition: &Partition,
@@ -10883,9 +10875,8 @@ fn account_block_with(
     }
 }
 
-/// The job as each request it could run with reshapes it, in request order,
-/// each restricted to the requested partitions that admit it and produce that
-/// request. A job that requested none keeps its own partition list.
+/// The job reshaped per request it could run with, in order, each limited to the requested
+/// partitions admitting it with that request; a job that requested none keeps its own list.
 fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
     let requested =
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
@@ -10968,9 +10959,8 @@ fn quota_gate(
     }
 }
 
-/// What a job claims this pass when the gates admit some of its requests: the
-/// most of each TRES and grp-node charge among them, so the claim covers the
-/// request of whichever of their partitions placement picks.
+/// What a job claims this pass when the gates admit some of its requests: the max of each
+/// TRES and grp-node charge among them, covering whichever partition placement picks.
 #[derive(Default)]
 struct QuotaClaim {
     tres: TresRecord,
@@ -11118,10 +11108,8 @@ fn validate_partition_time_limit(
     )))
 }
 
-/// Reject a request a requested partition could never run, per
-/// `EnforcePartLimits` (`All` = all must admit it, `Any` = at least one): its
-/// per-job memory limit, or its resource cap even on an idle node. Current
-/// load never rejects; a job over a cap only because of it waits.
+/// Reject a request a requested partition could never run (`EnforcePartLimits` `All`/`Any`):
+/// per-job memory limit, or cap even on an idle node. Load alone never rejects; it waits.
 fn validate_partition_resource_limits(
     spec: &JobSpec,
     mode: EnforcePartLimits,
@@ -11169,9 +11157,8 @@ fn partition_resource_violation(
     Some(cap_never_runs_desc(job, partition, &overshoots))
 }
 
-/// Partitions whose memory policy a submitted job may run under: the requested
-/// ones its static limits fit, or every requested one when none does (the job
-/// then pends on the partition limit, not on a quota it might never meet).
+/// Partitions whose memory policy a submitted job may run under: requested ones its static
+/// limits fit, or all requested if none (so it pends on the partition limit, not a quota).
 fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a Partition> {
     let requested = spur_core::partition::matched_partitions(spec.partition.as_deref(), partitions);
     let fitting: Vec<&Partition> = requested
@@ -11441,10 +11428,8 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 /// single pass; across passes it remains a best-effort accounting, bounded
 /// in practice by real placement being the final authority on node choice.
 ///
-/// A node is only credited if one of the job's partitions holding it has room
-/// under its `max_tres_per_node` cap: a credit that covers `num_nodes` becomes
-/// a hard nodelist, so crediting a node whose cap is full would strand the job
-/// there while other nodes sit idle.
+/// Only nodes with cap room in one of the job's partitions are credited: a credit covering
+/// `num_nodes` becomes a hard nodelist and would strand the job on a full-cap node.
 fn new_distinct_nodes_needed(
     job: &Job,
     occupied: &HashSet<String>,
@@ -11478,9 +11463,8 @@ fn new_distinct_nodes_needed(
     (charge, reusable)
 }
 
-/// Grp-node charge and credited nodes for a group whose aggregate cap is
-/// `grp`. Without a node cap there is no distinct-node count to protect, so
-/// nothing is credited and placement stays free to pick any node or partition.
+/// Grp-node charge and credited nodes for a group with aggregate cap `grp`. Without a node
+/// cap nothing is credited, so placement may pick any node or partition.
 fn grp_node_credit(
     job: &Job,
     grp: Option<&TresRecord>,

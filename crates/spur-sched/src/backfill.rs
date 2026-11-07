@@ -464,11 +464,8 @@ impl BackfillScheduler {
             .len() as u32
     }
 
-    /// Resolve concrete per-node CPU, GPU, and memory allocations for
-    /// non-uniform demand. CPU counts are positional (aligned to task launch
-    /// order); a GPU total is packed greedily onto the nodes with the most room
-    /// for it, bounded by free devices and by `scope`'s cap headroom and
-    /// per-job memory limits. `None` if it cannot fit at `at_time`.
+    /// Resolve per-node CPU/GPU/memory for non-uniform demand: CPUs positional (task launch
+    /// order), GPUs packed greedily within free devices and `scope`'s limits; `None` if no fit.
     fn plan_per_node_alloc(
         &self,
         job: &Job,
@@ -1174,11 +1171,8 @@ impl ChargeTarget<'_> {
 type PlanResult = Result<PlacementPlan, (UnplacedKind, usize)>;
 
 impl BackfillScheduler {
-    /// Pick the candidate partition the job should run in when any of them is
-    /// capped or reshapes the request: each is planned under its own cap and
-    /// memory policy, and the best by [`resolution_rank`] wins. A partition
-    /// whose cap could never hold the job drops out; a merely full one stays
-    /// and competes on its later start.
+    /// Pick the candidate partition when any is capped or reshapes the request, by
+    /// [`resolution_rank`]; a cap that can never fit drops out, a merely full one competes.
     fn resolve_partition(
         &self,
         job: &Job,
@@ -1220,10 +1214,8 @@ impl BackfillScheduler {
         Err(reported.unwrap_or((UnplacedKind::NoSuitableNodes, 0)))
     }
 
-    /// The cap block to report when a partition cap, not capacity, is what
-    /// keeps the job from starting now: either every candidate's cap can
-    /// never hold it, or the chosen partition could start it now but for its
-    /// cap. `None` otherwise, so other pending reasons are not masked.
+    /// The cap block to report when a partition cap, not capacity, keeps the job from
+    /// starting now; `None` otherwise, so other pending reasons are not masked.
     fn cap_block(
         &self,
         job: &Job,
@@ -1319,9 +1311,8 @@ impl BackfillScheduler {
         }
     }
 
-    /// Plan the job's earliest placement, restricted to `scope`'s partition
-    /// and kept within its cap when given; otherwise over every node the job's
-    /// partition list allows.
+    /// Plan the job's earliest placement, within `scope`'s partition and cap when given,
+    /// otherwise over every node its partition list allows.
     fn plan_placement(
         &self,
         job: &Job,
@@ -1647,9 +1638,8 @@ fn planned_adjustment(
     planned_memory_adjustment(job, partition)
 }
 
-/// The least `job` charges a partition cap on the fullest node it could be
-/// given: like [`placement_charge`], but GPUs at their most even spread, so a
-/// cap that cannot hold this can never hold the job on any split.
+/// Least cap charge `job` could put on its fullest node ([`placement_charge`] with GPUs
+/// evenly spread): a cap that cannot hold this can never hold the job.
 pub fn least_fullest_node_charge(
     job: &Job,
     required: &ResourceSet,

@@ -24,9 +24,8 @@ pub struct Assignment {
     /// Partition the run is charged to, chosen among the job's candidates.
     /// `None` when no requested partition contains the assigned nodes.
     pub partition: Option<String>,
-    /// The request as `partition`'s memory policy reshaped it when this
-    /// placement was sized, so the run starts with what it was planned for.
-    /// `None` when the policy changes nothing.
+    /// The request as `partition`'s memory policy reshaped it when this placement was sized
+    /// (`None` if unchanged), so the run starts with what it was planned for.
     pub memory_adjustment: Option<MemoryAdjustment>,
 }
 
