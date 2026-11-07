@@ -13,6 +13,14 @@ pub struct PreemptionRelease {
     pub job_id: crate::job::JobId,
     pub run_attempt: u32,
     pub released: bool,
+    pub observation_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreemptionClaim {
+    pub observation_id: u64,
+    pub allocations: BTreeMap<String, crate::resource::ResourceAllocations>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

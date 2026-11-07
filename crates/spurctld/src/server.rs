@@ -7643,6 +7643,7 @@ mod tests {
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
         apply(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 52,
             nodes: vec!["n1".into()],
             resources: res,
@@ -7709,6 +7710,7 @@ mod tests {
             let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
             let per_node_alloc = std::collections::HashMap::from([("n1".to_string(), res.clone())]);
             apply(&WalOperation::JobStart {
+                preemption_observation: None,
                 job_id: 60,
                 nodes: vec!["n1".into()],
                 resources: res,
@@ -8109,6 +8111,7 @@ mod tests {
             apply(&WalOperation::JobPreemptSignaled {
                 job_id,
                 pending: PreemptPending {
+                    preemption_claim: None,
                     preemptor_run_attempt: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(60),
@@ -8128,6 +8131,7 @@ mod tests {
                 at: Some(signaled_at),
             });
             apply(&WalOperation::JobPreemptCancel {
+                preemption_claim: None,
                 preemptor_run_attempt: None,
                 job_id,
                 preempted_by: Some(99),
@@ -8250,6 +8254,7 @@ mod tests {
             });
         }
         cluster.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| n.to_string()).collect(),
             resources: res,
@@ -10360,6 +10365,7 @@ mod tests {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
         let signaled_at = Utc::now();
         let pending = spur_core::job::PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
@@ -14174,6 +14180,7 @@ mod tests {
         let signaled_at = Utc::now();
         let deadline = signaled_at + Duration::seconds(60);
         job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at,
             deadline,

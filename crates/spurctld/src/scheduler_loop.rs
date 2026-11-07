@@ -586,13 +586,23 @@ async fn process_assignment(
     assignment: spur_sched::traits::Assignment,
     borrowed: bool,
 ) -> bool {
-    let attempt = cluster
+    let mut attempt = cluster
         .get_job(assignment.job_id)
         .map(|job| job.run_attempt.saturating_add(1));
     let job_id = assignment.job_id;
-    let released = process_assignment_inner(cluster.clone(), assignment, borrowed).await;
+    let observation = cluster.preemption_observation(job_id);
+    let released = process_assignment_inner(
+        cluster.clone(),
+        assignment,
+        borrowed,
+        observation,
+        &mut attempt,
+    )
+    .await;
     if let Some(attempt) = attempt {
-        if let Err(error) = cluster.confirm_preemption_release(job_id, attempt, released) {
+        if let Err(error) =
+            cluster.confirm_preemption_observation(job_id, attempt, observation, released)
+        {
             warn!(job_id, attempt, %error, "could not persist preemption launch outcome");
         }
     }
@@ -603,6 +613,8 @@ async fn process_assignment_inner(
     cluster: Arc<ClusterManager>,
     assignment: spur_sched::traits::Assignment,
     borrowed: bool,
+    observation: Option<u64>,
+    actual_attempt: &mut Option<u32>,
 ) -> bool {
     let job = match cluster.get_job(assignment.job_id) {
         Some(j) => j,
@@ -710,13 +722,14 @@ async fn process_assignment_inner(
     // so a new leader cannot place a second job onto these cores. The run
     // epoch below is the one `reserve_placement` actually persisted, not a
     // value recomputed separately — the two must never be able to diverge.
-    let run_attempt = match cluster.reserve_attributed_placement(
+    let run_attempt = match cluster.reserve_placement_for_observation(
         job_id,
         assignment.nodes.clone(),
         resources.clone(),
         assignment.per_node_alloc.clone(),
         srun_step_dispatch,
         attribution,
+        observation,
     ) {
         Ok(run_attempt) => run_attempt,
         Err(e) => {
@@ -724,6 +737,8 @@ async fn process_assignment_inner(
             return false;
         }
     };
+
+    *actual_attempt = Some(run_attempt);
 
     if spec.srun_job && srun_step_dispatch {
         match register_allocation_on_nodes(
@@ -1728,6 +1743,7 @@ async fn try_preempt_with_handoffs(
         } else {
             None
         };
+        let observation_id = cluster.next_preemption_observation(pending.job_id);
         let mut preempted = false;
         let mut evicted_so_far = Vec::new();
         for (candidate, mode) in eligible.iter().filter(|(j, _)| victims.contains(&j.job_id)) {
@@ -1753,6 +1769,7 @@ async fn try_preempt_with_handoffs(
                 let grace = PreemptionGrace {
                     preemptor: pending.job_id,
                     preemptor_run_attempt: Some(pending.run_attempt.saturating_add(1)),
+                    observation_id: Some(observation_id),
                     preempt_qos: preempt_qos.clone(),
                     mode: *mode,
                     secs: grace_secs,
@@ -1767,6 +1784,7 @@ async fn try_preempt_with_handoffs(
                     pending.job_id,
                     Some(pending.run_attempt.saturating_add(1)),
                     preempt_qos.clone(),
+                    Some(observation_id),
                 )
                 .await
                 .map(|()| PreemptStart::Started)
@@ -1906,6 +1924,7 @@ async fn preempt_victim_now(
     preemptor: spur_core::job::JobId,
     preemptor_run_attempt: Option<u32>,
     preempt_qos: Option<String>,
+    observation_id: Option<u64>,
 ) -> anyhow::Result<()> {
     use crate::cluster::PreemptOutcome;
 
@@ -1923,6 +1942,7 @@ async fn preempt_victim_now(
         preemptor,
         attempt,
         preempt_qos,
+        observation_id,
     ) {
         Ok(PreemptOutcome::Killed) => {
             // Signal 0 = graceful cancel (SIGTERM then SIGKILL). Nodes that
@@ -1959,6 +1979,7 @@ async fn preempt_victim_now(
 
 /// What a grace commits the victim to, fixed when the warning goes out.
 struct PreemptionGrace {
+    observation_id: Option<u64>,
     preemptor: spur_core::job::JobId,
     preemptor_run_attempt: Option<u32>,
     preempt_qos: Option<String>,
@@ -1977,6 +1998,14 @@ async fn start_preemption_grace(
 ) -> anyhow::Result<PreemptStart> {
     let deadline = grace.now + chrono::Duration::seconds(i64::from(grace.secs));
     let pending = spur_core::job::PreemptPending {
+        preemption_claim: Some(
+            cluster.preemption_claim(
+                victim,
+                grace
+                    .observation_id
+                    .unwrap_or_else(|| cluster.next_preemption_observation(grace.preemptor)),
+            ),
+        ),
         preemptor_run_attempt: grace.preemptor_run_attempt,
         signaled_at: grace.now,
         deadline,
@@ -2049,6 +2078,10 @@ async fn finalize_running_grace(cluster: &Arc<ClusterManager>, job: &spur_core::
         pending.preempted_by,
         pending.preemptor_run_attempt,
         pending.preempt_qos.clone(),
+        pending
+            .preemption_claim
+            .as_ref()
+            .map(|claim| claim.observation_id),
     )
     .await
     {
@@ -4913,6 +4946,7 @@ mod tests {
 
     fn in_grace(mut job: Job, deadline: DateTime<Utc>) -> Job {
         job.preempt_pending = Some(spur_core::job::PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at: deadline - chrono::Duration::seconds(60),
             deadline,
@@ -7221,6 +7255,7 @@ mod tests {
                 owner,
                 1,
                 None,
+                None,
             )
             .expect("preemption");
             assert_eq!(cm.preemption_usage().open, 1);
@@ -7755,6 +7790,7 @@ mod tests {
             let victim = run_on(&cm, "victim", "n1");
             let signaled_at = Utc::now();
             let pending = PreemptPending {
+                preemption_claim: None,
                 preemptor_run_attempt: None,
                 signaled_at,
                 deadline: signaled_at + chrono::Duration::seconds(90),
@@ -7766,7 +7802,7 @@ mod tests {
             };
             assert!(cm.signal_preemption(pending, victim.job_id).unwrap());
 
-            let err = preempt_victim_now(&cm, &victim, PreemptMode::Suspend, 7, None, None)
+            let err = preempt_victim_now(&cm, &victim, PreemptMode::Suspend, 7, None, None, None)
                 .await
                 .expect_err("a victim in its grace is not suspended");
 
@@ -8481,8 +8517,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-fail", 1));
             preempt_for_assignment(&cm, job_id);
-            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(!process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await);
             assert_eq!(
                 cm.preemption_usage().unused_count(
                     spur_core::preemption_usage::UnusedReason::LaunchFailed,
@@ -9861,10 +9896,36 @@ mod tests {
                 test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
             let (addr, cancel_calls) = spawn_mock_agent().await;
             register_node_at(&cm, "n1", addr);
+            register_node_at(&cm, "n2", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-slurmctld-batch", 1));
 
-            preempt_for_assignment(&cm, job_id);
+            let victim = submit_and_wait(&cm, batch_spec("draining-victim", 2));
+            let allocation = assignment(victim, &["n1", "n2"]);
+            let victim_attempt = cm
+                .start_job(
+                    victim,
+                    allocation.nodes,
+                    ResourceAllocations::with_scalar(2, 0),
+                    allocation.per_node_alloc,
+                )
+                .expect("victim start");
+            cm.preempt_job_for_attempt(
+                victim,
+                victim_attempt,
+                spur_core::partition::PreemptMode::Cancel,
+                job_id,
+                1,
+                None,
+                None,
+            )
+            .expect("preemption");
+            cm.node_complete(victim, "n1", 0, 0, victim_attempt)
+                .expect("partial release");
+            assert_eq!(cm.preemption_usage().open, 1);
+            let first_observation = cm
+                .preemption_observation(job_id)
+                .expect("first observation");
             let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
             assert_eq!(
                 cm.preemption_usage().unused_count(
@@ -9888,6 +9949,24 @@ mod tests {
                 0,
                 "no node should have been launched when PrologSlurmctld fails pre-dispatch"
             );
+            assert_eq!(cm.get_job(job_id).expect("requester").run_attempt, 0);
+            assert_eq!(
+                cm.get_job(victim).expect("victim").state,
+                JobState::Completing
+            );
+
+            std::fs::write(&script, "#!/bin/bash\nexit 0\n").expect("successful retry prolog");
+            preempt_for_assignment(&cm, job_id);
+            assert!(
+                cm.preemption_observation(job_id)
+                    .expect("retry observation")
+                    > first_observation
+            );
+            assert!(process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await);
+            cm.node_complete(victim, "n2", 0, 0, victim_attempt)
+                .expect("late victim release");
+            let usage = cm.preemption_usage();
+            assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 1, 0));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -10176,6 +10255,7 @@ mod tests {
                 signaled_at: DateTime<Utc>,
             ) -> PreemptPending {
                 PreemptPending {
+                    preemption_claim: None,
                     preemptor_run_attempt: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(600),
@@ -10753,6 +10833,7 @@ mod tests {
             async fn warning_a_victim_already_in_grace_is_superseded_not_an_error() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
                 let grace = PreemptionGrace {
+                    observation_id: None,
                     preemptor_run_attempt: None,
                     preemptor: f.hunter.job_id,
                     preempt_qos: None,
