@@ -61,6 +61,35 @@ impl FabricBinding {
         })
     }
 
+    /// Move the bound ids to a new encoding of the same silicon. A declared
+    /// endpoint is named after its stable_id, so this node's endpoints move with it.
+    pub fn rename_gpus(&mut self, renamed: &std::collections::HashMap<u64, u64>) {
+        let endpoints: std::collections::HashMap<String, String> = match self.file_revision {
+            Some(_) => renamed
+                .iter()
+                .map(|(&from, &to)| {
+                    (
+                        crate::block_file::declared_endpoint(&self.node, from),
+                        crate::block_file::declared_endpoint(&self.node, to),
+                    )
+                })
+                .collect(),
+            None => Default::default(),
+        };
+        let rename_endpoint = |endpoint: &mut String| {
+            if let Some(to) = endpoints.get(endpoint.as_str()) {
+                *endpoint = to.clone();
+            }
+        };
+        for member in &mut self.members {
+            if let Some(&id) = renamed.get(&member.device.stable_id) {
+                member.device.stable_id = id;
+            }
+            rename_endpoint(&mut member.endpoint);
+        }
+        self.active_endpoints.iter_mut().for_each(rename_endpoint);
+    }
+
     /// Placement and dispatch check: the node must still report the exact inventory
     /// generation, block file revision, and vPod endpoint set the binding was made under.
     pub fn validate(
@@ -546,5 +575,32 @@ mod tests {
         assert!(malformed
             .validate("test", "n1", &inventory, &allocation)
             .is_err());
+    }
+
+    #[test]
+    fn a_renamed_binding_validates_against_the_renamed_inventory() {
+        let (mut binding, mut inventory, mut allocation) = fixture();
+        binding.rename_gpus(&[(42, 43)].into());
+        inventory.gpus[0].stable_id = 43;
+        allocation.devices = [("gpu".into(), vec![AllocatedDevice::injectable(43)])].into();
+        assert_eq!(binding.members[0].device.stable_id, 43);
+        assert_eq!(binding.members[0].endpoint, "1");
+        assert!(binding
+            .validate("test", "n1", &inventory, &allocation)
+            .is_ok());
+    }
+
+    #[test]
+    fn renaming_a_declared_binding_moves_this_nodes_endpoints() {
+        let (mut binding, _, _) = fixture();
+        binding.file_revision = Some("r1".into());
+        binding.members[0].endpoint = crate::block_file::declared_endpoint("n1", 42);
+        binding.active_endpoints = vec![
+            crate::block_file::declared_endpoint("n1", 42),
+            crate::block_file::declared_endpoint("n2", 42),
+        ];
+        binding.rename_gpus(&[(42, 43)].into());
+        assert_eq!(binding.members[0].endpoint, "n1/43");
+        assert_eq!(binding.active_endpoints, vec!["n1/43", "n2/42"]);
     }
 }

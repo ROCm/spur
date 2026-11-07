@@ -720,6 +720,40 @@ fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
     sa == sb
 }
 
+fn rename_gpu_ids(alloc: &mut ResourceAllocations, renamed: &HashMap<u64, u64>) {
+    for dev in alloc.devices.get_mut("gpu").into_iter().flatten() {
+        if let Some(&id) = renamed.get(&dev.device_id) {
+            dev.device_id = id;
+        }
+    }
+    // A binding is validated against the slice's ids, so it moves with them.
+    if let Some(binding) = alloc.gpu_binding.as_mut() {
+        binding.rename_gpus(renamed);
+    }
+    if let Some(binding) = alloc.fabric_binding.as_mut() {
+        binding.rename_gpus(renamed);
+    }
+}
+
+/// Carry a node's held GPU ids, and those of the live jobs on it, across a
+/// re-encoding of the same partitions.
+fn remap_node_gpu_allocations(
+    node: &mut Node,
+    jobs: &mut HashMap<JobId, Job>,
+    renamed: &HashMap<u64, u64>,
+) {
+    if renamed.is_empty() {
+        return;
+    }
+    for job in jobs.values_mut().filter(|j| !j.state.is_terminal()) {
+        if let Some(slice) = job.per_node_alloc.get_mut(&node.name) {
+            rename_gpu_ids(slice, renamed);
+        }
+    }
+    rename_gpu_ids(&mut node.alloc_resources, renamed);
+    node.update_state_from_alloc();
+}
+
 pub(crate) struct PendingJobClassification {
     pub(crate) jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
@@ -9101,6 +9135,30 @@ impl ClusterManager {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
                     resources.backfill_stable_ids();
+                    let old: Vec<u64> = node
+                        .detected_resources
+                        .gpus
+                        .iter()
+                        .map(|g| g.stable_id)
+                        .collect();
+                    let new: Vec<u64> = resources.gpus.iter().map(|g| g.stable_id).collect();
+                    // Jobs on a repartitioned GPU keep their ids; the orphan
+                    // guard withholds it.
+                    let renamed = spur_core::gpu_identity::diff_layout(&old, &new).safe_renames();
+                    remap_node_gpu_allocations(node, &mut jobs, &renamed);
+                    let orphaned: Vec<u64> = node
+                        .alloc_resources
+                        .device_ids("gpu")
+                        .into_iter()
+                        .filter(|id| !new.contains(id))
+                        .collect();
+                    if !orphaned.is_empty() {
+                        warn!(
+                            node = %name,
+                            ?orphaned,
+                            "node inventory no longer has gpus allocated to running jobs; its gpus are withheld until the agent reports them"
+                        );
+                    }
                     node.detected_resources = resources;
                     if !hostname.is_empty() {
                         node.hostname = hostname.clone();
@@ -14825,8 +14883,8 @@ state = "UP"
     // The upgrade-divergence proof: alloc_resources holds a running job's stale
     // positional gpu ids [0,1]; the re-registered inventory uses stable_ids
     // [A,B]; the job actually holds [A,B]. Before the heartbeat reconcile the
-    // controller reads both busy GPUs as free (the bug); after it, they are
-    // correctly busy.
+    // ids the node holds are unknown to its inventory, so its GPUs are withheld;
+    // after it, they are correctly busy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_reconcile_converges_stale_positional_gpu_ids() {
         let dir = TempDir::new().unwrap();
@@ -14858,8 +14916,8 @@ state = "UP"
             at: None,
         });
 
-        // Bug reproduction: the stale positional ids match no live stable_id, so
-        // both real GPUs read free.
+        // The stale positional ids match no live stable_id; the real GPUs must
+        // not read free.
         let want_two_gpus = ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
@@ -14873,14 +14931,15 @@ state = "UP"
         {
             let node = cm.get_node("n1").unwrap();
             assert!(
-                node.total_resources
+                !node
+                    .total_resources
                     .can_satisfy_with_allocated(&node.alloc_resources, &want_two_gpus),
-                "before reconcile the held GPUs wrongly read as free"
+                "before reconcile the node's GPUs are withheld"
             );
             assert!(node
                 .total_resources
                 .available_device_ids(&node.alloc_resources, "gpu", None)
-                .contains(&sid_a));
+                .is_empty());
         }
 
         // The upgraded agent heartbeats its translated held set.
@@ -14918,6 +14977,320 @@ state = "UP"
         let mut ids = node.alloc_resources.device_ids("gpu");
         ids.sort_unstable();
         assert_eq!(ids, vec![sid_a, sid_b]);
+    }
+
+    fn gpu_sid(bus: u64, function: u64, rank: u64) -> u64 {
+        (bus << 16) | (function << 8) | rank
+    }
+
+    fn gpu_inventory(ids: &[u64]) -> ResourceSet {
+        ResourceSet {
+            cpus: 8,
+            memory_mb: 16000,
+            gpus: ids
+                .iter()
+                .enumerate()
+                .map(|(i, &sid)| gpu_resource(i as u32, sid))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Register n1 with `old` gpu ids, run job 1 on `held`, then re-report n1
+    /// with `new` gpu ids.
+    fn gpu_id_change_ops(old: &[u64], held: &[u64], new: &[u64]) -> Vec<WalOperation> {
+        let slice = ResourceAllocations::from_device_ids("gpu", held);
+        vec![
+            WalOperation::NodeRegister {
+                name: "n1".into(),
+                hostname: "n1".into(),
+                resources: gpu_inventory(old),
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                capabilities: Vec::new(),
+                source: spur_core::node::NodeSource::NativeHost,
+            },
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("held")),
+            },
+            WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["n1".into()],
+                resources: slice.clone(),
+                per_node_alloc: per_node_for(&["n1"], slice),
+                srun_step_dispatch: false,
+                run_attempt: 0,
+                idle_fill: false,
+                at: None,
+            },
+            WalOperation::NodeUpdate {
+                name: "n1".into(),
+                hostname: "n1".into(),
+                resources: gpu_inventory(new),
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                capabilities: Vec::new(),
+                source: spur_core::node::NodeSource::NativeHost,
+            },
+        ]
+    }
+
+    fn job_gpu_ids(cm: &ClusterManager, job_id: JobId, node: &str) -> Vec<u64> {
+        let mut ids = cm
+            .get_job(job_id)
+            .unwrap()
+            .per_node_alloc
+            .get(node)
+            .unwrap()
+            .device_ids("gpu");
+        ids.sort_unstable();
+        ids
+    }
+
+    fn free_gpu_ids(cm: &ClusterManager, node: &str) -> Vec<u64> {
+        let node = cm.get_node(node).unwrap();
+        node.total_resources
+            .available_device_ids(&node.alloc_resources, "gpu", None)
+    }
+
+    fn legacy_cpx_ids(bus: u64) -> Vec<u64> {
+        (0..8).map(|f| gpu_sid(bus, f, 0)).collect()
+    }
+
+    fn partition_ids(bus: u64, partitions: u64) -> Vec<u64> {
+        (0..partitions).map(|r| gpu_sid(bus, 0, r)).collect()
+    }
+
+    #[test]
+    fn a_re_encoding_moves_a_slice_binding_with_its_gpu_ids() {
+        let (old, new) = (gpu_sid(0x11, 1, 0), gpu_sid(0x11, 0, 1));
+        let mut slice = ResourceAllocations::from_device_ids("gpu", &[old]);
+        slice.gpu_binding = Some(spur_core::gpu_binding::GpuBinding {
+            node: "n1".into(),
+            generation: 1,
+            gpus: vec![spur_core::gpu_binding::BoundGpu {
+                stable_id: old,
+                gpu_type: "mi300x".into(),
+                topology: None,
+            }],
+        });
+        rename_gpu_ids(&mut slice, &HashMap::from([(old, new)]));
+        assert_eq!(slice.device_ids("gpu"), vec![new]);
+        let binding = slice.gpu_binding.expect("binding kept");
+        assert_eq!(binding.gpus[0].stable_id, new);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_update_with_a_re_encoded_cpx_gpu_remaps_job_allocations() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+
+        for op in gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new) {
+            cm.apply_operation(&op);
+        }
+
+        let renamed = gpu_sid(0x11, 0, 1);
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![renamed]);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.alloc_resources.device_ids("gpu"), vec![renamed]);
+        let mut free = free_gpu_ids(&cm, "n1");
+        free.sort_unstable();
+        let mut want: Vec<u64> = new.into_iter().filter(|id| *id != renamed).collect();
+        want.sort_unstable();
+        assert_eq!(free, want);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_update_that_repartitions_a_held_gpu_does_not_remap() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let held = gpu_sid(0x11, 1, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 2), vec![other]].concat();
+
+        for op in gpu_id_change_ops(&old, &[held], &new) {
+            cm.apply_operation(&op);
+        }
+
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![held]);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu"),
+            vec![held]
+        );
+        let free = free_gpu_ids(&cm, "n1");
+        assert!(free.is_empty(), "gpus withheld while orphaned: {free:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_node_update_reproduces_the_remap() {
+        let old = [legacy_cpx_ids(0x11), vec![gpu_sid(0x12, 0, 0)]].concat();
+        let new = [partition_ids(0x11, 8), vec![gpu_sid(0x12, 0, 0)]].concat();
+        let ops = gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new);
+
+        let dir_a = TempDir::new().unwrap();
+        let live = test_cluster(&dir_a).await;
+        let dir_b = TempDir::new().unwrap();
+        let replayed = test_cluster(&dir_b).await;
+        for op in &ops {
+            live.apply_operation(op);
+            replayed.apply_operation(op);
+        }
+        // Re-applying the same update is a no-op once the ids converged.
+        if let Some(update) = ops.last() {
+            replayed.apply_operation(update);
+        }
+
+        assert_eq!(job_gpu_ids(&live, 1, "n1"), job_gpu_ids(&replayed, 1, "n1"));
+        assert_eq!(
+            live.get_node("n1")
+                .unwrap()
+                .alloc_resources
+                .device_ids("gpu"),
+            replayed
+                .get_node("n1")
+                .unwrap()
+                .alloc_resources
+                .device_ids("gpu")
+        );
+        assert_eq!(job_gpu_ids(&replayed, 1, "n1"), vec![gpu_sid(0x11, 0, 1)]);
+    }
+
+    fn bind_held_gpus(ops: &mut [WalOperation]) {
+        for op in ops.iter_mut() {
+            let WalOperation::JobStart { per_node_alloc, .. } = op else {
+                continue;
+            };
+            for (node, slice) in per_node_alloc.iter_mut() {
+                let gpus = slice
+                    .device_ids("gpu")
+                    .into_iter()
+                    .map(|stable_id| spur_core::gpu_binding::BoundGpu {
+                        stable_id,
+                        gpu_type: "mi300x".into(),
+                        topology: None,
+                    })
+                    .collect();
+                slice.gpu_binding = Some(spur_core::gpu_binding::GpuBinding {
+                    node: node.clone(),
+                    generation: 1,
+                    gpus,
+                });
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_update_re_encoding_moves_a_recorded_gpu_binding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let mut ops = gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new);
+        bind_held_gpus(&mut ops);
+
+        for op in &ops {
+            cm.apply_operation(op);
+        }
+
+        let renamed = gpu_sid(0x11, 0, 1);
+        let job = cm.get_job(1).unwrap();
+        let slice = job.per_node_alloc.get("n1").unwrap();
+        assert_eq!(slice.device_ids("gpu"), vec![renamed]);
+        let binding = slice.gpu_binding.as_ref().expect("binding kept");
+        assert_eq!(binding.gpus[0].stable_id, renamed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_on_either_side_of_a_remapping_update_restores_the_same_ids() {
+        let other = gpu_sid(0x12, 0, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let ops = gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new);
+        let (setup, update) = ops.split_at(ops.len() - 1);
+
+        let dir = TempDir::new().unwrap();
+        let live = test_cluster(&dir).await;
+        for op in setup {
+            live.apply_operation(op);
+        }
+        let before = live.snapshot_state().unwrap();
+        live.apply_operation(&update[0]);
+        let after = live.snapshot_state().unwrap();
+
+        let dir_before = TempDir::new().unwrap();
+        let from_before = test_cluster(&dir_before).await;
+        from_before.restore_from_snapshot(&before).unwrap();
+        from_before.apply_operation(&update[0]);
+        let dir_after = TempDir::new().unwrap();
+        let from_after = test_cluster(&dir_after).await;
+        from_after.restore_from_snapshot(&after).unwrap();
+
+        let renamed = vec![gpu_sid(0x11, 0, 1)];
+        for cm in [&live, &from_before, &from_after] {
+            assert_eq!(job_gpu_ids(cm, 1, "n1"), renamed);
+            assert_eq!(
+                cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu"),
+                renamed
+            );
+            let mut free = free_gpu_ids(cm, "n1");
+            free.sort_unstable();
+            let mut want = free_gpu_ids(&live, "n1");
+            want.sort_unstable();
+            assert_eq!(free, want);
+        }
+    }
+
+    // The placement fails closed: the stale id is not in the inventory, so the
+    // node withholds its GPUs instead of offering the silicon twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_start_on_ids_from_before_a_re_encoding_withholds_the_node_gpus() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let stale = gpu_sid(0x11, 1, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let mut ops = gpu_id_change_ops(&old, &[stale], &new);
+        let update = ops.pop().unwrap();
+        let start = ops.pop().unwrap();
+        for op in ops.iter().chain([&update, &start]) {
+            cm.apply_operation(op);
+        }
+
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![stale]);
+        let free = free_gpu_ids(&cm, "n1");
+        assert!(free.is_empty(), "gpus offered under a stale id: {free:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repartition_that_keeps_the_held_id_leaves_it_allocated() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let held = gpu_sid(0x11, 0, 0);
+        let old = [partition_ids(0x11, 8), vec![other]].concat();
+        let new = [partition_ids(0x11, 2), vec![other]].concat();
+        for op in gpu_id_change_ops(&old, &[held], &new) {
+            cm.apply_operation(&op);
+        }
+
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![held]);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu"),
+            vec![held]
+        );
+        assert!(!free_gpu_ids(&cm, "n1").contains(&held));
     }
 
     // An empty reported set (old agent, or a job with no GPUs) leaves the node's

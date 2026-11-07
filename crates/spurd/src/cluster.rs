@@ -599,21 +599,13 @@ async fn write_cdi_spec() -> anyhow::Result<()> {
         info!("no AMD GPUs discovered; not writing a CDI spec");
         return Ok(());
     }
-    tokio::fs::create_dir_all("/etc/cdi").await?;
-    for (i, spec) in specs.iter().enumerate() {
-        spec.validate()
-            .map_err(|e| anyhow::anyhow!("invalid CDI spec: {e}"))?;
-        let final_path = if i == 0 {
-            CDI_SPEC_PATH.to_string()
-        } else {
-            format!("/etc/cdi/amd-{i}.json")
-        };
-        let tmp = format!("{final_path}.tmp");
-        spec.write_json(Path::new(&tmp))
-            .map_err(|e| anyhow::anyhow!("write CDI spec: {e}"))?;
-        tokio::fs::rename(&tmp, &final_path).await?;
-    }
-    info!(count = specs.len(), "wrote AMD GPU CDI spec(s) to /etc/cdi");
+    let count = specs.len();
+    tokio::task::spawn_blocking(move || {
+        crate::cdi_owner::write_specs(Path::new("/etc/cdi"), &specs)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("write CDI spec task failed: {e}"))??;
+    info!(count, "wrote AMD GPU CDI spec(s) to /etc/cdi");
     Ok(())
 }
 

@@ -2289,6 +2289,62 @@ converges to the new device count without restarting ``spurd``.
    GPU-property constraints require automatic discovery or equivalent CDI specs
    containing the requested GPU properties.
 
+.. _gpu-partition-mode-change:
+
+Changing a GPU's partition mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A compute-partition change (SPX/CPX/QPX/DPX, in any direction) or a
+memory-partition change that reshapes the compute partitions is destructive to
+silicon identity. Perform it only on a node with no GPU jobs running.
+
+* ``spurd`` needs no restart: its periodic inventory refresh (see above)
+  picks up the new partitions and re-registers the node, and the controller
+  then schedules against the new layout.
+* With ``auto_detect = true``, ``spurd`` rewrites ``/etc/cdi/amd.json`` to
+  match the new hardware, but only if that file carries the
+  ``spur.amd.com/auto-detected: "true"`` annotation, which ``spur k8s up``
+  writes. A spec written by another tool is left untouched; ``spurd`` logs a
+  warning, and that tool must regenerate the spec itself.
+* If GPU jobs are still running when the partitions change, ``spurd`` keeps
+  reporting each partition they hold under its old id and advertises none of
+  that GPU's new partitions, nor an old partition a finished job released,
+  until every job that held the GPU before the change ends. This holds across
+  a ``spurd`` restart. The jobs themselves are not failed or requeued.
+
+**What an operator sees.** A fenced GPU shows up as fewer GPU GRES in
+``scontrol show node`` than the hardware has, and as an entry in
+``inventory-fences.json`` (below). When the change removes a partition a job
+holds, ``spurd`` also logs
+``allocated device changed; pinning held gpus, converging free pool only``;
+when the held partition keeps its id in the new layout, the fence is applied
+without that warning. If a fence outlasts the warning threshold (one hour),
+``spurd`` warns that a job may be leaking its pre-change partition.
+
+**State on disk.** ``spurd`` keeps two files under ``<state_dir>/runtime/``
+(``state_dir`` defaults to ``/var/spool/spur``):
+
+* ``inventory-baseline.json``: the last inventory the controller acknowledged.
+  A restart compares the fresh discovery against it to tell a re-encoding of
+  the same partitions from a partition change.
+* ``inventory-fences.json``: the fenced GPUs and the partitions their
+  pre-change jobs still hold.
+
+Neither file needs editing. If the baseline is missing, ``spurd`` falls back
+to the legacy id rule and still honours the fence file.
+
+**How a fence clears.** It lifts on its own when the last job that held the
+GPU before the change exits; the next refresh then advertises the new
+partitions. A ``spurd`` restart with no such job still running also drops it.
+To clear one held by a leaked job, cancel that job.
+
+**Known limits.**
+
+* A new ``srun`` step into a job whose GPU stayed fenced across a ``spurd``
+  restart is refused; the job's existing steps keep running.
+* A job already queued when the last holder of a fenced GPU exits can be
+  refused once on the released partition; it runs after the next refresh.
+
 ``[isolation]``
 ---------------
 

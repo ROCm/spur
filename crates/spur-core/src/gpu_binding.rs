@@ -84,6 +84,15 @@ impl GpuBinding {
         Ok(binding)
     }
 
+    /// Move the bound ids to a new encoding of the same silicon.
+    pub fn rename_gpus(&mut self, renamed: &std::collections::HashMap<u64, u64>) {
+        for gpu in &mut self.gpus {
+            if let Some(&id) = renamed.get(&gpu.stable_id) {
+                gpu.stable_id = id;
+            }
+        }
+    }
+
     pub fn validate(
         &self,
         node: &str,
@@ -240,6 +249,19 @@ mod tests {
             .devices
             .insert("gpu".into(), vec![AllocatedDevice::injectable(128)]);
         (inventory, allocation)
+    }
+
+    #[test]
+    fn a_renamed_binding_validates_against_the_renamed_inventory() {
+        let (mut inventory, mut allocation) = fixture();
+        let mut binding = GpuBinding::new("n0", &inventory, &allocation).unwrap();
+        binding.rename_gpus(&[(128, 0x110001)].into());
+        inventory.gpus[0].stable_id = 0x110001;
+        allocation
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(0x110001)]);
+        assert_eq!(binding.gpus[0].stable_id, 0x110001);
+        assert!(binding.validate("n0", &inventory, &allocation).is_ok());
     }
 
     #[test]

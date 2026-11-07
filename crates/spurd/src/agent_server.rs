@@ -629,7 +629,7 @@ fn replayable_allocations(
 /// sole real-world legacy case. The render_minor stable_id scheme only ever
 /// existed unreleased on this branch, so a render_minor-looking id (not a valid
 /// index, not a current stable_id) is left untranslated; not a supported upgrade.
-fn translate_legacy_gpu_ids(
+pub fn translate_legacy_gpu_ids(
     recorded: &[u64],
     current_gpus: &[spur_core::resource::GpuResource],
 ) -> Option<Vec<u64>> {
@@ -662,13 +662,12 @@ fn translate_legacy_gpu_ids(
 /// means the next restart re-translates, which is correct, so it warns and
 /// moves on rather than failing the recovery.
 fn rewrite_descriptor_gpu_ids(
-    state_dir: &std::path::Path,
+    store: &crate::stepd::StepdStore,
     descriptor: &crate::stepd::StepdDescriptor,
     stable_ids: Vec<u64>,
 ) {
     let mut rewritten = descriptor.clone();
     rewritten.resources.gpu_devices = stable_ids;
-    let store = crate::stepd::StepdStore::new(state_dir);
     if let Err(error) = store.publish(&rewritten) {
         warn!(
             job_id = descriptor.job_id,
@@ -678,6 +677,147 @@ fn rewrite_descriptor_gpu_ids(
              translation re-runs next restart"
         );
     }
+}
+
+/// A bound job's ids were validated as stable_ids at dispatch, so only an
+/// unbound recording can be a pre-stable_id positional one.
+pub fn may_record_positional_gpu_ids(resources: &crate::stepd::StepdJobResources) -> bool {
+    resources.fabric_binding.is_none() && resources.gpu_binding.is_none()
+}
+
+/// The gpu ids adopted sessions hold, as replay puts them back on the ledger.
+pub fn startup_held_gpu_ids(
+    descriptors: &[crate::stepd::StepdDescriptor],
+    current_gpus: &[spur_core::resource::GpuResource],
+) -> std::collections::HashSet<u64> {
+    descriptors
+        .iter()
+        .flat_map(|d| {
+            let recorded = &d.resources.gpu_devices;
+            may_record_positional_gpu_ids(&d.resources)
+                .then(|| translate_legacy_gpu_ids(recorded, current_gpus))
+                .flatten()
+                .unwrap_or_else(|| recorded.clone())
+        })
+        .collect()
+}
+
+fn renamed_gpu_ids(recorded: &[u64], renamed: &HashMap<u64, u64>) -> Vec<u64> {
+    recorded
+        .iter()
+        .map(|id| renamed.get(id).copied().unwrap_or(*id))
+        .collect()
+}
+
+/// Carry every supervisor's recorded gpu ids onto their current encoding, so
+/// the next restart's replay names live devices.
+pub fn rename_descriptor_gpu_ids(state_dir: &std::path::Path, renamed: &HashMap<u64, u64>) {
+    if renamed.is_empty() {
+        return;
+    }
+    let store = crate::stepd::StepdStore::new(state_dir);
+    let discovered = match store.discover_live() {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            warn!(
+                ?error,
+                "could not list runtime descriptors to rename gpu ids"
+            );
+            return;
+        }
+    };
+    for descriptor in discovered.live.iter().chain(&discovered.stale) {
+        let mut rewritten = descriptor.clone();
+        let resources = &mut rewritten.resources;
+        rename_job_gpu_ids(
+            &mut resources.gpu_devices,
+            &mut resources.fabric_binding,
+            &mut resources.gpu_binding,
+            renamed,
+        );
+        if rewritten == *descriptor {
+            continue;
+        }
+        if let Err(error) = store.publish(&rewritten) {
+            warn!(
+                job_id = descriptor.job_id,
+                ?error,
+                "could not rewrite a descriptor's renamed gpu ids"
+            );
+        }
+    }
+}
+
+/// A binding names the job's ids too, so it moves with them and stays valid.
+fn rename_job_gpu_ids(
+    gpu_devices: &mut Vec<u64>,
+    fabric_binding: &mut Option<spur_core::fabric_binding::FabricBinding>,
+    gpu_binding: &mut Option<spur_core::gpu_binding::GpuBinding>,
+    renamed: &HashMap<u64, u64>,
+) {
+    *gpu_devices = renamed_gpu_ids(gpu_devices, renamed);
+    if let Some(binding) = fabric_binding {
+        binding.rename_gpus(renamed);
+    }
+    if let Some(binding) = gpu_binding {
+        binding.rename_gpus(renamed);
+    }
+}
+
+/// New steps of a running job resolve its devices from the tracked ids, which
+/// must follow the ledger onto the current encoding.
+pub async fn rename_tracked_gpu_ids(running: &RunningJobs, renamed: &HashMap<u64, u64>) {
+    if renamed.is_empty() {
+        return;
+    }
+    let mut jobs = running.lock().await;
+    for tracked in jobs.values_mut() {
+        rename_job_gpu_ids(
+            &mut tracked.gpu_devices,
+            &mut tracked.fabric_binding,
+            &mut tracked.gpu_binding,
+            renamed,
+        );
+    }
+}
+
+/// Commit a launch's reservation, returning the renames a refresh made since
+/// the reserve; `None` when the reservation is no longer this attempt's.
+fn commit_reservation(
+    allocation: &mut NodeAllocation,
+    job_id: u32,
+    run_attempt: u32,
+    requested: &[u64],
+) -> Option<HashMap<u64, u64>> {
+    if !allocation.commit_job(job_id, run_attempt) {
+        return None;
+    }
+    let held = allocation.owner_gpu_ids(job_id, run_attempt).unwrap_or(&[]);
+    Some(
+        requested
+            .iter()
+            .zip(held)
+            .filter(|(from, to)| from != to)
+            .map(|(&from, &to)| (from, to))
+            .collect(),
+    )
+}
+
+fn follow_ledger_renames(
+    state_dir: &std::path::Path,
+    tracked: &mut TrackedJob,
+    renamed: &HashMap<u64, u64>,
+) {
+    if renamed.is_empty() {
+        return;
+    }
+    rename_job_gpu_ids(
+        &mut tracked.gpu_devices,
+        &mut tracked.fabric_binding,
+        &mut tracked.gpu_binding,
+        renamed,
+    );
+    rename_descriptor_gpu_ids(state_dir, renamed);
 }
 
 /// A descriptor with no recorded cores — a step, or one written before they
@@ -1716,7 +1856,7 @@ fn refuse_allocation(
 }
 
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
-pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
+pub type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
 
 #[derive(Clone)]
 pub struct StepdRecoveryCleanup {
@@ -4422,7 +4562,12 @@ impl AgentService {
 
     /// Put adopted jobs back on the node's ledger, which is built empty — only
     /// correct back when a restart killed every job it could have held.
-    pub async fn replay_adopted_allocations(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
+    pub async fn replay_adopted_allocations(
+        &self,
+        descriptors: &[crate::stepd::StepdDescriptor],
+        renamed: &HashMap<u64, u64>,
+    ) {
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         let mut allocation = self.allocation.lock().await;
         for descriptor in replayable_allocations(descriptors) {
             let resources = &descriptor.resources;
@@ -4442,15 +4587,16 @@ impl AgentService {
                      under-counted until it ends"
                 );
             }
+            // The ledger carries the current encoding for every job, bound or not.
+            let recorded = renamed_gpu_ids(&resources.gpu_devices, renamed);
             // A legacy descriptor holds positional ids that no longer match the
             // BDF-anchored stable_ids; translate through the live inventory so
             // the adopt succeeds instead of leaving the job's GPUs reading free.
-            let translated =
-                if resources.fabric_binding.is_some() || resources.gpu_binding.is_some() {
-                    None
-                } else {
-                    translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus)
-                };
+            let translated = if may_record_positional_gpu_ids(resources) {
+                translate_legacy_gpu_ids(&recorded, &allocation.gpus)
+            } else {
+                None
+            };
             let gpu_ids: Vec<u64> = match &translated {
                 Some(stable_ids) => {
                     info!(
@@ -4461,20 +4607,41 @@ impl AgentService {
                     );
                     stable_ids.clone()
                 }
-                None => resources.gpu_devices.clone(),
+                None => recorded,
             };
-            match allocation.restore_for_job(
+            let restored = allocation.restore_for_job(
                 descriptor.job_id,
                 descriptor.run_attempt,
                 &cpu_ids,
                 resources.memory_mb,
                 &gpu_ids,
-            ) {
-                Ok(_) => {
+            );
+            let restored = match restored {
+                Err(AllocError::GpusUnknown | AllocError::GpusUnavailable) => {
+                    warn!(
+                        job_id = descriptor.job_id,
+                        gpus = ?gpu_ids,
+                        "an adopted job's gpus are not in this node's inventory; \
+                         its cores and memory are restored"
+                    );
+                    allocation
+                        .restore_for_job(
+                            descriptor.job_id,
+                            descriptor.run_attempt,
+                            &cpu_ids,
+                            resources.memory_mb,
+                            &[],
+                        )
+                        .map(|_| Vec::new())
+                }
+                other => other.map(|_| gpu_ids),
+            };
+            match restored {
+                Ok(gpu_ids) => {
                     // Rewrite the descriptor forward so the translation is
                     // one-time; harmless if it fails — restore re-translates.
-                    if let Some(stable_ids) = translated {
-                        rewrite_descriptor_gpu_ids(&self.stepd_state_dir, descriptor, stable_ids);
+                    if let Some(stable_ids) = translated.filter(|_| !gpu_ids.is_empty()) {
+                        rewrite_descriptor_gpu_ids(&store, descriptor, stable_ids);
                     }
                     info!(
                         job_id = descriptor.job_id,
@@ -4495,6 +4662,9 @@ impl AgentService {
                 ),
             }
         }
+        drop(allocation);
+        rename_descriptor_gpu_ids(&self.stepd_state_dir, renamed);
+        rename_tracked_gpu_ids(&self.running, renamed).await;
     }
 
     /// A dead supervisor may still hold an allocation through pending cleanup;
@@ -6845,7 +7015,12 @@ impl SlurmAgent for AgentService {
                 // it is no longer exempt from reconcile. Take the running lock
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
-                let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
+                let committed = commit_reservation(
+                    &mut *self.allocation.lock().await,
+                    job_id,
+                    run_attempt,
+                    &launch_cfg.gpu_devices,
+                );
                 reservation_guard.disarm();
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
@@ -6853,7 +7028,7 @@ impl SlurmAgent for AgentService {
                 // reap, and clean up its cgroup/rootfs/spool (mirroring the
                 // monitor loop's completion teardown, which never runs since the
                 // job never enters `running`), then fail the launch.
-                if !committed {
+                let Some(renamed) = committed else {
                     drop(jobs);
                     warn!(
                         job_id,
@@ -6898,7 +7073,7 @@ impl SlurmAgent for AgentService {
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                     }));
-                }
+                };
 
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let namespaces = launch_namespaces(&launch_cfg, nix::unistd::geteuid().is_root());
@@ -6933,6 +7108,9 @@ impl SlurmAgent for AgentService {
                         cgroup_path: pty_cgroup_path.clone().or(result.cgroup_path),
                     },
                 );
+                if let Some(tracked) = jobs.get_mut(&job_id) {
+                    follow_ledger_renames(&self.stepd_state_dir, tracked, &renamed);
+                }
                 drop(jobs);
                 // The gate stays shut until the controller has committed the
                 // job Running and calls StartJob: a step launched from the
@@ -7513,6 +7691,9 @@ impl SlurmAgent for AgentService {
                     AllocError::GpusUnavailable => Status::resource_exhausted(
                         "controller-allocated GPUs unavailable on this node",
                     ),
+                    AllocError::GpusUnknown => Status::resource_exhausted(
+                        "controller-allocated GPUs are not in this node's gpu inventory",
+                    ),
                     AllocError::DuplicateJob => Status::already_exists(format!(
                         "job {} already registered on this node",
                         req.job_id
@@ -7749,7 +7930,7 @@ impl SlurmAgent for AgentService {
                 gid: req.gid,
                 user: req.user,
                 partition: req.partition,
-                gpu_devices: controller_gpu_ids,
+                gpu_devices: controller_gpu_ids.clone(),
                 cpus,
                 memory_mb,
                 nodelist: req.nodelist,
@@ -7762,12 +7943,16 @@ impl SlurmAgent for AgentService {
         );
         // Commit under `running`, the order commit_job expects, so the job is
         // never committed while absent from the map a reclaim reads.
-        let _ = self
-            .allocation
-            .lock()
-            .await
-            .commit_job(req.job_id, req.run_attempt);
+        let committed = commit_reservation(
+            &mut *self.allocation.lock().await,
+            req.job_id,
+            req.run_attempt,
+            &controller_gpu_ids,
+        );
         reservation_guard.disarm();
+        if let (Some(renamed), Some(tracked)) = (committed, jobs.get_mut(&req.job_id)) {
+            follow_ledger_renames(&self.stepd_state_dir, tracked, &renamed);
+        }
         drop(jobs);
         if let Some(older) = replaced {
             self.interactive_launch_steps
@@ -10281,6 +10466,17 @@ impl AgentService {
                         ));
                     }
                 }
+            }
+            Err(AllocError::GpusUnknown) => {
+                warn!(
+                    job_id,
+                    requested = ?controller_gpu_ids,
+                    "rejecting dispatch: controller-allocated GPUs are not in this \
+                     node's gpu inventory"
+                );
+                return Err(Status::resource_exhausted(
+                    "controller-allocated GPUs are not in this node's gpu inventory",
+                ));
             }
             Err(AllocError::DuplicateJob) => {
                 // A launch is already in flight for this job id (reserved, not
@@ -20325,6 +20521,53 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
+    // A controller-allocated GPU id absent from this node's inventory is a
+    // different failure than one already in use; the message must say so.
+    #[tokio::test]
+    async fn a_dispatch_on_an_unknown_gpu_id_names_the_inventory() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 99,
+                    count: 1,
+                }],
+            },
+        );
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
+            cpus: 1,
+            memory_mb: 0,
+            devices,
+            generation: 0,
+        };
+
+        let res = svc
+            .allocate_local_for_test(100, &spec, Some(&allocated))
+            .await;
+        let err = res.expect_err("must reject: GPU 99 is not in this node's inventory");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("not in this node's gpu inventory"),
+            "got: {}",
+            err.message()
+        );
+    }
+
     // A still-launching conflicting owner is a real duplicate: the reclaim must
     // spare it, so the retry fails and the dispatch stays rejected.
     #[tokio::test]
@@ -23901,7 +24144,8 @@ mod tests {
         let first = descriptor(910, vec![1, 2], 0);
         let second = descriptor(911, vec![2, 3], 1);
 
-        svc.replay_adopted_allocations(&[first, second]).await;
+        svc.replay_adopted_allocations(&[first, second], &HashMap::new())
+            .await;
 
         let mut alloc = svc.allocation.lock().await;
         // Job 911 yields core 2 to job 910, but its GPU and memory stay on.
@@ -24024,7 +24268,7 @@ mod tests {
             .publish(&descriptor)
             .expect("publish legacy descriptor");
 
-        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &HashMap::new())
             .await;
 
         // The job holds the real current stable_ids, so a later dispatch sees
@@ -24168,7 +24412,7 @@ mod tests {
         };
 
         svc.adopt_stepds(std::slice::from_ref(&descriptor)).await;
-        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &HashMap::new())
             .await;
 
         let alloc = svc.allocation.lock().await;
@@ -24218,7 +24462,8 @@ mod tests {
             } else {
                 vec![batch, step]
             };
-            svc.replay_adopted_allocations(&descriptors).await;
+            svc.replay_adopted_allocations(&descriptors, &HashMap::new())
+                .await;
 
             let alloc = svc.allocation.lock().await;
             assert!(
@@ -24264,13 +24509,404 @@ mod tests {
         step.step_id = 0;
         step.socket_path = state.path().join("step.sock");
 
-        svc.replay_adopted_allocations(&[batch.clone(), step]).await;
-        svc.replay_adopted_allocations(&[batch]).await;
+        svc.replay_adopted_allocations(&[batch.clone(), step], &HashMap::new())
+            .await;
+        svc.replay_adopted_allocations(&[batch], &HashMap::new())
+            .await;
 
         let alloc = svc.allocation.lock().await;
         assert_eq!(alloc.free_cpus(), 2);
         assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
         assert_eq!(alloc.allocated_gpu_ids(), vec![0]);
+    }
+
+    fn partition_sid(bus: u64, rank: u64) -> u64 {
+        (bus << 16) | rank
+    }
+
+    fn adopted_gpu_descriptor(
+        state: &std::path::Path,
+        job_id: u32,
+        gpu_devices: Vec<u64>,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.join(format!("runtime/{job_id}.1.batch.sock")),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices,
+            cpu_ids: vec![2, 3],
+            ..Default::default()
+        };
+        descriptor
+    }
+
+    // A partition id re-encoded while the agent was down names the same
+    // silicon, so the adopted job must hold it under its new id.
+    #[tokio::test]
+    async fn a_renamed_descriptor_adopts_onto_the_new_id() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let ids: Vec<u32> = (0..8).map(|r| partition_sid(0x11, r) as u32).collect();
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&ids),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        let old = (0x11 << 16) | (1 << 8);
+        let descriptor = adopted_gpu_descriptor(state.path(), 930, vec![old]);
+        let store = crate::stepd::StepdStore::new(state.path());
+        store.publish(&descriptor).expect("publish descriptor");
+        let renamed = HashMap::from([(old, partition_sid(0x11, 1))]);
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &renamed)
+            .await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.held_job_gpu_ids()[&930], vec![partition_sid(0x11, 1)]);
+        drop(alloc);
+        let reloaded = store
+            .load_descriptor(&store.session_dir(930, 1, spur_core::step::STEP_BATCH))
+            .expect("reload renamed descriptor");
+        assert_eq!(reloaded.resources.gpu_devices, vec![partition_sid(0x11, 1)]);
+    }
+
+    // The job is still running on this node's cores and memory whether or not
+    // its GPU can be named; dropping those would let them be handed out twice.
+    #[tokio::test]
+    async fn an_adopted_job_keeps_its_cores_and_memory_when_its_gpu_is_gone() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        let descriptor = adopted_gpu_descriptor(state.path(), 931, vec![0x0099_0000]);
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &HashMap::new())
+            .await;
+
+        let alloc = svc.allocation.lock().await;
+        assert!(alloc.allocated_gpu_ids().is_empty());
+        assert_eq!(alloc.free_cpus(), 2);
+        assert!(alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+    }
+
+    // A new step resolves its devices from the tracked job, so the adopted job
+    // must name its partition by the id the registry now carries.
+    #[tokio::test]
+    async fn a_renamed_adopted_job_launches_steps_under_the_new_id() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let ids: Vec<u32> = (0..8).map(|r| partition_sid(0x11, r) as u32).collect();
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&ids),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        let old = (0x11 << 16) | (1 << 8);
+        let descriptor = adopted_gpu_descriptor(state.path(), 932, vec![old]);
+        recover_stepds(&svc.running, vec![descriptor.clone()]).await;
+        let renamed = HashMap::from([(old, partition_sid(0x11, 1))]);
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &renamed)
+            .await;
+
+        let running = svc.running.lock().await;
+        let tracked = &running[&932];
+        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x11, 1)]);
+        let allocation = AgentService::tracked_allocation(tracked);
+        let gpus: Vec<u64> = allocation.devices["gpu"]
+            .devices
+            .iter()
+            .map(|d| d.device_id)
+            .collect();
+        assert_eq!(gpus, vec![partition_sid(0x11, 1)]);
+    }
+
+    fn bound(mut descriptor: crate::stepd::StepdDescriptor) -> crate::stepd::StepdDescriptor {
+        descriptor.resources.gpu_binding = Some(spur_core::gpu_binding::GpuBinding {
+            node: "test-node".into(),
+            generation: 1,
+            gpus: Vec::new(),
+        });
+        descriptor
+    }
+
+    // A bound job's ids are inventory ids too: leaving them out of the held
+    // set would offer the partitions of the GPU it still runs on.
+    #[test]
+    fn a_bound_job_fences_its_gpu_repartitioned_across_a_restart() {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let gpu = |stable_id: u64| GpuResource {
+            device_id: 0,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            topology: None,
+            stable_id,
+        };
+        let inventory = |ids: Vec<u64>| ResourceSet {
+            cpus: 4,
+            gpus: ids.into_iter().map(gpu).collect(),
+            ..Default::default()
+        };
+        let spx = inventory(vec![partition_sid(0x11, 0), partition_sid(0x12, 0)]);
+        let mut ids: Vec<u64> = (0..8).map(|r| partition_sid(0x11, r)).collect();
+        ids.push(partition_sid(0x12, 0));
+        let cpx = inventory(ids);
+        let descriptor = bound(adopted_gpu_descriptor(
+            state.path(),
+            960,
+            vec![partition_sid(0x11, 0)],
+        ));
+
+        let held = startup_held_gpu_ids(std::slice::from_ref(&descriptor), &cpx.gpus);
+        let startup = crate::reporter::startup_inventory(
+            &cpx,
+            Some(&spx),
+            &held,
+            &crate::reporter::Fences::default(),
+        );
+
+        let on_gpu: Vec<u64> = startup
+            .reported
+            .gpus
+            .iter()
+            .map(|g| g.stable_id)
+            .filter(|id| id >> 16 == 0x11)
+            .collect();
+        assert_eq!(on_gpu, vec![partition_sid(0x11, 0)]);
+    }
+
+    // A refresh re-encodes a bound job's id; every later restart must still
+    // put its GPU back on the ledger, which only works if the rename stuck.
+    #[tokio::test]
+    async fn a_bound_job_renamed_at_refresh_keeps_its_gpu_across_two_restarts() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let old = (0x11 << 16) | (1 << 8);
+        let new = partition_sid(0x11, 1);
+        let ids: Vec<u32> = (0..8).map(|r| partition_sid(0x11, r) as u32).collect();
+        let mut descriptor = adopted_gpu_descriptor(state.path(), 962, vec![old]);
+        descriptor.resources.gpu_binding = Some(spur_core::gpu_binding::GpuBinding {
+            node: "test-node".into(),
+            generation: 1,
+            gpus: vec![spur_core::gpu_binding::BoundGpu {
+                stable_id: old,
+                gpu_type: "mi300x".into(),
+                topology: None,
+            }],
+        });
+        let store = crate::stepd::StepdStore::new(state.path());
+        store.publish(&descriptor).expect("publish descriptor");
+
+        rename_descriptor_gpu_ids(state.path(), &HashMap::from([(old, new)]));
+
+        for _ in 0..2 {
+            let svc = AgentService::new(
+                test_reporter_with_gpus(&ids),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(DeviceRegistry::new())),
+                spur_core::config::MemlockLimit::Unlimited,
+            )
+            .with_runtime_state_dir(state.path());
+            let inventory = svc.reporter.snapshot_resources();
+            let adopted = store
+                .load_descriptor(&store.session_dir(962, 1, spur_core::step::STEP_BATCH))
+                .expect("reload descriptor");
+            let held = startup_held_gpu_ids(std::slice::from_ref(&adopted), &inventory.gpus);
+            let startup = crate::reporter::startup_inventory(
+                &inventory,
+                Some(&inventory),
+                &held,
+                &crate::reporter::Fences::default(),
+            );
+
+            svc.replay_adopted_allocations(std::slice::from_ref(&adopted), &startup.renamed)
+                .await;
+
+            assert_eq!(svc.allocation.lock().await.allocated_gpu_ids(), vec![new]);
+            let binding = adopted.resources.gpu_binding.expect("binding kept");
+            assert_eq!(binding.gpus[0].stable_id, new);
+        }
+    }
+
+    // The ledger is built from the renamed inventory, so a bound job must be
+    // restored under the new id, and its descriptor must follow.
+    #[tokio::test]
+    async fn a_bound_job_adopts_onto_the_renamed_id_and_renames_its_descriptor() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let ids: Vec<u32> = (0..8).map(|r| partition_sid(0x11, r) as u32).collect();
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&ids),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        let old = (0x11 << 16) | (1 << 8);
+        let descriptor = bound(adopted_gpu_descriptor(state.path(), 961, vec![old]));
+        let store = crate::stepd::StepdStore::new(state.path());
+        store.publish(&descriptor).expect("publish descriptor");
+        let renamed = HashMap::from([(old, partition_sid(0x11, 1))]);
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &renamed)
+            .await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.held_job_gpu_ids()[&961], vec![partition_sid(0x11, 1)]);
+        drop(alloc);
+        let reloaded = store
+            .load_descriptor(&store.session_dir(961, 1, spur_core::step::STEP_BATCH))
+            .expect("reload descriptor");
+        assert_eq!(reloaded.resources.gpu_devices, vec![partition_sid(0x11, 1)]);
+    }
+
+    // A refresh can rename the ledger while a launch sits between its
+    // reservation and its commit; the launch must not publish the old names.
+    #[test]
+    fn a_launch_committed_after_a_rename_publishes_and_tracks_the_new_ids() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let old = (0x11 << 16) | (1 << 8);
+        let new = partition_sid(0x11, 1);
+        let inventory = ResourceSet {
+            cpus: 4,
+            gpus: test_reporter_with_gpus(&[old as u32, partition_sid(0x12, 0) as u32])
+                .snapshot_resources()
+                .gpus,
+            ..Default::default()
+        };
+        let mut allocation = NodeAllocation::new("test-node".into(), &inventory);
+        let requested = vec![partition_sid(0x12, 0), old];
+        allocation
+            .allocate_for_job(970, 1, 1, 0, &requested)
+            .expect("reserve");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = adopted_gpu_descriptor(state.path(), 970, requested.clone());
+        store.publish(&descriptor).expect("publish descriptor");
+        allocation.rename_gpus(&HashMap::from([(old, new)]));
+
+        let renamed = commit_reservation(&mut allocation, 970, 1, &requested)
+            .expect("the reservation is still held");
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.gpu_devices = requested.clone();
+        follow_ledger_renames(state.path(), &mut tracked, &renamed);
+
+        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x12, 0), new]);
+        let reloaded = store
+            .load_descriptor(&store.session_dir(970, 1, spur_core::step::STEP_BATCH))
+            .expect("reload descriptor");
+        assert_eq!(reloaded.resources.gpu_devices, tracked.gpu_devices);
+        assert_eq!(
+            commit_reservation(&mut allocation, 970, 2, &requested),
+            None
+        );
+    }
+
+    fn bound_gpu(stable_id: u64) -> spur_core::gpu_binding::GpuBinding {
+        spur_core::gpu_binding::GpuBinding {
+            node: "test-node".into(),
+            generation: 1,
+            gpus: vec![spur_core::gpu_binding::BoundGpu {
+                stable_id,
+                gpu_type: "mi300x".into(),
+                topology: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_bound_launch_moves_its_binding_with_its_ids() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let old = (0x11 << 16) | (1 << 8);
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.gpu_devices = vec![old];
+        tracked.gpu_binding = Some(bound_gpu(old));
+        follow_ledger_renames(
+            state.path(),
+            &mut tracked,
+            &HashMap::from([(old, partition_sid(0x11, 1))]),
+        );
+        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(tracked.gpu_binding, Some(bound_gpu(partition_sid(0x11, 1))));
+    }
+
+    #[tokio::test]
+    async fn rename_tracked_gpu_ids_moves_bound_jobs_and_their_bindings() {
+        let running = new_running_jobs();
+        let old = (0x11 << 16) | (1 << 8);
+        let mut plain = TrackedJob::allocation_only(None);
+        plain.gpu_devices = vec![old, partition_sid(0x12, 0)];
+        let mut bound = TrackedJob::allocation_only(None);
+        bound.gpu_devices = vec![old];
+        bound.gpu_binding = Some(bound_gpu(old));
+        running.lock().await.extend([(950, plain), (951, bound)]);
+
+        rename_tracked_gpu_ids(&running, &HashMap::from([(old, partition_sid(0x11, 1))])).await;
+
+        let jobs = running.lock().await;
+        assert_eq!(
+            jobs[&950].gpu_devices,
+            vec![partition_sid(0x11, 1), partition_sid(0x12, 0)]
+        );
+        assert_eq!(jobs[&951].gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            jobs[&951].gpu_binding,
+            Some(bound_gpu(partition_sid(0x11, 1)))
+        );
+    }
+
+    #[test]
+    fn rename_descriptor_gpu_ids_rewrites_only_changed_descriptors() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let old = (0x11 << 16) | (1 << 8);
+        let renamed_job = adopted_gpu_descriptor(state.path(), 940, vec![old]);
+        let untouched_job = adopted_gpu_descriptor(state.path(), 941, vec![partition_sid(0x12, 0)]);
+        store.publish(&renamed_job).expect("publish descriptor");
+        store.publish(&untouched_job).expect("publish descriptor");
+        let descriptor_path = |job_id| {
+            store
+                .session_dir(job_id, 1, spur_core::step::STEP_BATCH)
+                .join("descriptor.json")
+        };
+        let inode = |job_id| std::fs::metadata(descriptor_path(job_id)).unwrap().ino();
+        let untouched_inode = inode(941);
+
+        rename_descriptor_gpu_ids(
+            state.path(),
+            &HashMap::from([(old, partition_sid(0x11, 1))]),
+        );
+
+        let load = |job_id| {
+            store
+                .load_descriptor(&store.session_dir(job_id, 1, spur_core::step::STEP_BATCH))
+                .expect("reload descriptor")
+                .resources
+                .gpu_devices
+        };
+        assert_eq!(load(940), vec![partition_sid(0x11, 1)]);
+        assert_eq!(load(941), vec![partition_sid(0x12, 0)]);
+        assert_eq!(
+            inode(941),
+            untouched_inode,
+            "an unchanged descriptor is not republished"
+        );
     }
 
     #[tokio::test]

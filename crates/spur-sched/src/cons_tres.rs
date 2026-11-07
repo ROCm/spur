@@ -122,8 +122,10 @@ impl std::fmt::Display for ReleaseGround {
 /// exhaustion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllocError {
-    /// A controller-allocated GPU is unknown to this node or already in use.
+    /// A controller-allocated GPU is already in use, or fenced, on this node.
     GpusUnavailable,
+    /// A GPU id is not in this node's current inventory.
+    GpusUnknown,
     /// A LaunchJob is already in flight for this job id (its reservation is
     /// still mid-launch, not yet committed or released). A second concurrent
     /// launch would double-count resources, so it is rejected.
@@ -180,6 +182,9 @@ pub struct NodeAllocation {
     /// Reserved but not yet committed, with reserve time. Reconcile spares
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
+    /// Pre-change ids of repartitioned GPUs. One a job released may still
+    /// overlap silicon another pre-change holder uses, so it is never handed out.
+    fenced: HashSet<u64>,
 }
 
 /// The node's real, online CPU IDs, sorted. Without a reported topology (e.g.
@@ -215,6 +220,7 @@ impl NodeAllocation {
             gpus: resources.gpus.clone(),
             owners: HashMap::new(),
             launching: HashMap::new(),
+            fenced: HashSet::new(),
         }
     }
 
@@ -250,6 +256,10 @@ impl NodeAllocation {
             }
         }
         self.mark_cpus_unavailable(spec_cpus);
+    }
+
+    pub fn set_fenced(&mut self, ids: HashSet<u64>) {
+        self.fenced = ids;
     }
 
     /// Apply a freshly-discovered inventory to this node's live allocation.
@@ -323,6 +333,19 @@ impl NodeAllocation {
         CapacityChange::Applied
     }
 
+    /// Move held and free GPU ids to a new encoding of the same silicon.
+    pub fn rename_gpus(&mut self, renamed: &HashMap<u64, u64>) {
+        let current = |id: u64| renamed.get(&id).copied().unwrap_or(id);
+        for gpu in &mut self.gpus {
+            gpu.stable_id = current(gpu.stable_id);
+        }
+        for owned in self.owners.values_mut() {
+            for id in &mut owned.result.gpu_ids {
+                *id = current(*id);
+            }
+        }
+    }
+
     /// Available (unallocated) CPU count.
     pub fn free_cpus(&self) -> u32 {
         self.allocated_cpus.iter().filter(|&&a| !a).count() as u32
@@ -357,6 +380,21 @@ impl NodeAllocation {
             .iter()
             .map(|(job, owned)| (*job, owned.result.gpu_ids.clone()))
             .collect()
+    }
+
+    fn owner_gpu_ids_any(&self, job_id: u32) -> Vec<u64> {
+        self.owners
+            .get(&job_id)
+            .map(|owned| owned.result.gpu_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// GPU ids `run_attempt` of `job_id` holds, in the order it reserved them.
+    pub fn owner_gpu_ids(&self, job_id: u32, run_attempt: u32) -> Option<&[u64]> {
+        self.owners
+            .get(&job_id)
+            .filter(|owned| owned.run_attempt == run_attempt)
+            .map(|owned| owned.result.gpu_ids.as_slice())
     }
 
     /// Stable ids of all currently-allocated GPUs (for diagnostics).
@@ -436,12 +474,13 @@ impl NodeAllocation {
     }
 
     /// Reserve resources for a job, keyed by job id. GPU stable ids are the
-    /// hard gate (unknown or in-use → `GpusUnavailable`); a launch already in
-    /// flight for the same job id → `DuplicateJob`. CPU is best-effort since the
-    /// controller owns placement. Memory is always accounted so release stays
-    /// symmetric. Marked `launching` until `commit_job`/`release_job` so
-    /// reconcile spares an in-flight launch. `run_attempt` is recorded so a
-    /// later `commit_job` for a different (superseded) attempt is rejected.
+    /// hard gate (unknown → `GpusUnknown`, in-use or fenced → `GpusUnavailable`); a
+    /// launch already in flight for the same job id → `DuplicateJob`. CPU is
+    /// best-effort since the controller owns placement. Memory is always
+    /// accounted so release stays symmetric. Marked `launching` until
+    /// `commit_job`/`release_job` so reconcile spares an in-flight launch.
+    /// `run_attempt` is recorded so a later `commit_job` for a different
+    /// (superseded) attempt is rejected.
     pub fn allocate_for_job(
         &mut self,
         job_id: u32,
@@ -463,6 +502,7 @@ impl NodeAllocation {
                 return Err(AllocError::Superseded);
             }
         }
+        let owned_before = self.owner_gpu_ids_any(job_id);
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -471,8 +511,9 @@ impl NodeAllocation {
                 .gpus
                 .iter()
                 .position(|g| g.stable_id == id)
-                .ok_or(AllocError::GpusUnavailable)?;
-            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+                .ok_or(AllocError::GpusUnknown)?;
+            let fenced = self.fenced.contains(&id) && !owned_before.contains(&id);
+            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) || fenced {
                 return Err(AllocError::GpusUnavailable);
             }
             gpu_indices.push(idx);
@@ -563,7 +604,7 @@ impl NodeAllocation {
                 .gpus
                 .iter()
                 .position(|g| g.stable_id == id)
-                .ok_or(AllocError::GpusUnavailable)?;
+                .ok_or(AllocError::GpusUnknown)?;
             if (self.gpu_allocated[idx] && !held_gpus.contains(&id)) || gpu_indices.contains(&idx) {
                 return Err(AllocError::GpusUnavailable);
             }
@@ -1227,6 +1268,62 @@ mod tests {
         assert_eq!(node.free_gpus(None), 1);
         assert_eq!(node.free_cpus(), 6, "rejected replay claimed cores anyway");
         assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn an_id_missing_from_the_table_is_unknown_not_unavailable() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        assert_eq!(
+            node.allocate_for_job(1, 1, 1, 0, &[7]),
+            Err(AllocError::GpusUnknown)
+        );
+        assert_eq!(
+            node.restore_for_job(1, 1, &[0], 0, &[7]),
+            Err(AllocError::GpusUnknown)
+        );
+    }
+
+    #[test]
+    fn owner_gpu_ids_follow_a_rename_and_name_only_the_owning_attempt() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0x110100, 0x120000], "mi300x");
+        node.allocate_for_job(1, 2, 1, 0, &[0x120000, 0x110100])
+            .unwrap();
+        node.rename_gpus(&HashMap::from([(0x110100, 0x110001)]));
+        assert_eq!(node.owner_gpu_ids(1, 2), Some(&[0x120000, 0x110001][..]));
+        assert_eq!(node.owner_gpu_ids(1, 1), None);
+        assert_eq!(node.owner_gpu_ids(2, 2), None);
+    }
+
+    #[test]
+    fn a_fenced_id_is_never_newly_allocated() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0x110000, 0x110001, 0x120000], "mi300x");
+        node.restore_for_job(1, 1, &[], 0, &[0x110000]).unwrap();
+        node.restore_for_job(2, 1, &[], 0, &[0x110001]).unwrap();
+        node.set_fenced([0x110000, 0x110001].into());
+        assert!(node.release_job(1));
+
+        assert_eq!(
+            node.allocate_for_job(3, 1, 1, 0, &[0x110000]),
+            Err(AllocError::GpusUnavailable)
+        );
+        assert!(node.allocate_for_job(4, 1, 1, 0, &[0x120000]).is_ok());
+        // A requeue superseding the job's own stale owner keeps its device.
+        assert!(node.allocate_for_job(2, 2, 1, 0, &[0x110001]).is_ok());
+    }
+
+    #[test]
+    fn rename_gpus_moves_table_and_owner_ids_together() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0x110100, 0x120000], "mi300x");
+        node.allocate_for_job(1, 1, 1, 0, &[0x110100]).unwrap();
+        assert!(node.commit_job(1, 1));
+        node.rename_gpus(&HashMap::from([(0x110100, 0x110001)]));
+        assert_eq!(node.held_job_gpu_ids()[&1], vec![0x110001]);
+        assert_eq!(node.allocated_gpu_ids(), vec![0x110001]);
+        assert_eq!(
+            node.allocate_for_job(2, 1, 1, 0, &[0x110001]),
+            Err(AllocError::GpusUnavailable)
+        );
+        assert!(node.allocate_for_job(3, 1, 1, 0, &[0x120000]).is_ok());
     }
 
     #[test]
