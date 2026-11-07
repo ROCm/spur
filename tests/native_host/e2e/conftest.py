@@ -390,20 +390,16 @@ def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
 
 
 @pytest.fixture
-def gpu_cluster(request, ssh_nodes, remote_bin_dir):
-    """
-    Per-test fixture for GPU tests.
-
-    Skips the entire test if no node has GPU device nodes.
-    Decorate a test with ``@pytest.mark.rootful`` to launch spurd via sudo.
-    """
+def gpu_cluster(request, ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """Per-test GPU fixture. Skips when no GPU device nodes are present."""
     if len(ssh_nodes) < 1:
         pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
     if not _any_node_has_gpu(ssh_nodes):
         pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
 
     as_root = request.node.get_closest_marker("rootful") is not None
-    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root,
+                        config_overrides=cluster_config_overrides)
     yield c
     c.teardown()
 
