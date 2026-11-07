@@ -1775,6 +1775,12 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
      - Memory a job gets in this partition when it requests none. At most one
        of the three may be set.
 
+``max_cpus_per_node`` and the five memory knobs above must be greater than
+``0``; a ``0`` is a load error. Omit the key for no limit. ``scontrol`` and the
+API read ``0`` as "unset", so a ``0`` here would change meaning once shown and
+set again through them. To forbid a resource, set its key to ``0`` in
+``max_tres_per_node``.
+
 ``[[nodes]]``
 -------------
 

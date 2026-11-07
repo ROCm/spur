@@ -67,7 +67,9 @@ limit:
 
 ``max_cpus_per_node`` is shorthand for the ``cpu`` key, matching Slurm's
 ``MaxCPUsPerNode``. Use only one of the two. Setting both is a load error, even
-when the values are the same.
+when the values are the same. In ``spur.conf``, ``max_cpus_per_node = 0`` and
+a ``0`` for any memory knob are load errors, since ``scontrol`` reads ``0`` as
+"unset". Use ``cpu = 0`` in ``max_tres_per_node`` to forbid CPUs.
 
 Example: keep a GPU node free for GPU jobs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

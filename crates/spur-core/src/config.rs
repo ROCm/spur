@@ -1293,6 +1293,26 @@ impl PartitionConfig {
             value: format!("{alias} conflicts with max_tres_per_node.cpu = {cpu} (set only one)"),
         })
     }
+
+    /// `scontrol` and the API read 0 as "unset", so a 0 here would mean
+    /// something else once fed back through them.
+    fn validate_nonzero_limit_knobs(&self) -> Result<(), ConfigError> {
+        let knobs = [
+            ("max_cpus_per_node", self.max_cpus_per_node.map(u64::from)),
+            ("max_mem_per_node", self.max_mem_per_node),
+            ("max_mem_per_cpu", self.max_mem_per_cpu),
+            ("def_mem_per_node", self.def_mem_per_node),
+            ("def_mem_per_cpu", self.def_mem_per_cpu),
+            ("def_mem_per_gpu", self.def_mem_per_gpu),
+        ];
+        let Some((knob, _)) = knobs.into_iter().find(|(_, value)| *value == Some(0)) else {
+            return Ok(());
+        };
+        Err(ConfigError::InvalidValue {
+            field: format!("partitions.{}.{knob}", self.name),
+            value: "0 (omit the key for no limit; to forbid a resource, set it to 0 in max_tres_per_node)".into(),
+        })
+    }
 }
 
 fn default_partition_state() -> String {
@@ -2522,6 +2542,7 @@ impl SlurmConfig {
                 }
             })?;
             pc.validate_cpu_cap_alias()?;
+            pc.validate_nonzero_limit_knobs()?;
         }
         for partition in self.build_partitions() {
             partition
@@ -6050,6 +6071,32 @@ usage_reset_period = "biweekly"
         assert_eq!(per_node.build_partitions()[0].max_mem_per_node, Some(65536));
         let per_cpu = load_partition("max_mem_per_cpu = 2048\n").unwrap();
         assert_eq!(per_cpu.build_partitions()[0].max_mem_per_cpu, Some(2048));
+    }
+
+    #[test]
+    fn a_zero_limit_knob_is_rejected_but_a_zero_tres_cap_is_kept() {
+        let knobs = [
+            "max_cpus_per_node",
+            "max_mem_per_node",
+            "max_mem_per_cpu",
+            "def_mem_per_node",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+        ];
+        for knob in knobs {
+            let err = rejected(&format!("{knob} = 0\n"));
+            for needle in [format!("partitions.cpu.{knob}"), "max_tres_per_node".into()] {
+                assert!(err.contains(&needle), "missing {needle:?} in: {err}");
+            }
+        }
+
+        let parts = load_partition("[partitions.max_tres_per_node]\ncpu = 0\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([("cpu".into(), 0)])
+        );
     }
 
     #[test]
