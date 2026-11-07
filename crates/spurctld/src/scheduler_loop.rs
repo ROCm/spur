@@ -1288,7 +1288,10 @@ fn partition_usage_from_jobs<'a>(
         let Some(partition) = charged_partition(job, partitions).filter(|p| is_capped(p)) else {
             continue;
         };
-        let until = job_expected_end(job, now, waits);
+        // A run overdue to exit still holds its cores, so its charge must not
+        // end at `now` and vanish from the cap.
+        let until = job_expected_end(job, now, waits)
+            .max(now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS));
         let by_node = usage.entry(partition.name.clone()).or_default();
         let held = job
             .per_node_alloc
@@ -5135,6 +5138,25 @@ mod tests {
 
         let usage = partition_usage_from_jobs(&[pending, uncapped], &partitions, now, TEST_WAITS);
         assert!(usage.is_empty(), "{usage:?}");
+    }
+
+    #[test]
+    fn partition_usage_keeps_charging_a_run_overdue_to_exit() {
+        let now = Utc::now();
+        let partitions = [capped("cpu", 1)];
+        let jobs = [holding(
+            "cpu",
+            Some("cpu"),
+            4,
+            now - chrono::Duration::hours(3),
+        )];
+
+        let usage = partition_usage_from_jobs(&jobs, &partitions, now, TEST_WAITS);
+
+        let margin = now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS);
+        assert_eq!(charged(&usage, "cpu"), [(4, margin)]);
+        let held = partition_usage_at(&jobs, &partitions, &Default::default(), now);
+        assert_eq!(held["cpu"]["n1"].get("cpu"), 4);
     }
 
     #[test]
