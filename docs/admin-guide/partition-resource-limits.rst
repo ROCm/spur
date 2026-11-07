@@ -82,6 +82,7 @@ node and no GPUs. The ``gpu`` partition is not capped:
    name = "cpu"
    nodes = "gpu[01-08]"
    max_cpus_per_node = 64
+   def_mem_per_cpu = 8192         # a job naming no memory still charges mem
 
    [partitions.max_tres_per_node]
    mem = 524288
@@ -93,6 +94,10 @@ node and no GPUs. The ``gpu`` partition is not capped:
 
 However many ``cpu`` jobs are queued, 64 CPUs, 512 GiB, and all 8 GPUs on every
 node stay available to the ``gpu`` partition.
+
+A job that requests no memory charges nothing against a ``mem`` cap. Without
+``def_mem_per_cpu`` (or another ``def_mem_*`` knob), ``cpu`` jobs that omit
+``--mem`` could use more than 512 GiB of a node between them.
 
 GPU types
 ~~~~~~~~~
@@ -114,8 +119,9 @@ A GPU request counts against these keys:
 
    A generic GPU request is **not** checked against typed caps. With only
    ``"gres/gpu:a100" = 2`` set, a job that asks for ``--gres=gpu:4`` can still
-   be given four A100 GPUs. Slurm behaves the same way. To put a firm limit on
-   GPUs, also set ``"gres/gpu"``, which every GPU request counts against.
+   be given four A100 GPUs, because a generic request charges ``gres/gpu``
+   only. To put a firm limit on GPUs, also set ``"gres/gpu"``, which every GPU
+   request counts against.
 
 Per-job memory policy
 ---------------------
@@ -142,8 +148,9 @@ These knobs use Slurm's names and meaning (``MaxMemPerNode``,
    ``scontrol show job`` then reports ``MinMemoryNode=0``, the per-GPU amount
    as ``MemPerTres=gpu:<MiB>`` (the ``mem_per_tres`` field of ``JobInfo`` in
    the gRPC API), and the job's total in ``ReqTRES`` ``mem=``, as Slurm does
-   for memory per GPU. ``PrologSlurmctld`` and ``EpilogSlurmctld`` see the
-   most memory any one node of the job was given in ``SPUR_JOB_MEMORY_MB``.
+   for memory per GPU. The ``prolog_slurmctld`` and ``epilog_slurmctld`` hooks
+   see the most memory any one node of the job was given in
+   ``SPUR_JOB_MEMORY_MB``.
 
 .. note::
 
@@ -450,13 +457,8 @@ events.
 Upgrading
 ---------
 
-.. important::
-
-   Upgrade **every** controller replica before you configure any partition
-   cap. Jobs blocked by a cap get a new pending reason that is saved in Raft
-   snapshots, and a controller that has not been upgraded cannot load such a
-   snapshot (``unknown variant `PartitionTresLimit```) — whether on restart or
-   when a leader sends it one.
-
-Existing configurations are not affected: with no limit set, scheduling and
-``enforce_part_limits`` behave as before. See :doc:`/deployment/upgrading`.
+Upgrade every controller replica before you configure any cap or memory
+knob, and remove them before you downgrade. See
+:ref:`upgrading-partition-resource-limits` for the order and the rollback
+steps. Existing configurations are not affected: with no limit set,
+scheduling and ``enforce_part_limits`` behave as before.

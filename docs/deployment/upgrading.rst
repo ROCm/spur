@@ -953,6 +953,8 @@ the nodes, so the protection applies only once the leader runs the new build.
 Victim selection also counts nodes that a draining job has already released,
 which changes ordinary preemption as well.
 
+.. _upgrading-partition-resource-limits:
+
 Partition resource limits
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -963,14 +965,26 @@ behave as before: with no limit set, nothing changes, and
 
 .. warning::
 
-   **Upgrade every controller replica before you configure any partition
-   cap.** A job blocked by a cap carries the new ``PartitionTresLimit``
-   pending reason, which is saved in Raft snapshots; an older controller
-   cannot load such a snapshot, either on restart or when the leader sends
-   it one to catch up. An older replica also ignores the new limit fields, so if it became
-   leader it would schedule without the caps. Because a cap can only be set once the new binary runs, the
-   normal upgrade order is safe as long as no cap is configured until the last
-   controller is upgraded.
+   **Upgrade every controller replica before you configure any cap or memory
+   knob**, whether in ``spur.conf``, with ``scontrol``, or through the API.
+   An older replica ignores the new fields, so it diverges from the leader:
+
+   - It schedules without the caps if it becomes leader.
+   - It ignores the adjusted request a ``def_mem_*`` or ``max_mem_*`` knob
+     records when a job starts, so its copy of the job keeps the original
+     CPU and memory request.
+   - It cannot load a Raft snapshot holding a job blocked by a cap, whose
+     ``PartitionTresLimit`` pending reason it does not know, either on
+     restart or when the leader sends one to catch it up.
+
+**Rolling back.** Once a cap has blocked a job, a controller from an earlier
+release cannot load the snapshot. To downgrade:
+
+#. Remove every cap and memory knob (``spur.conf`` plus ``scontrol
+   reconfigure``, or ``scontrol update``).
+#. Wait until no pending job shows ``PartitionTresLimit`` and a new Raft
+   snapshot has been taken.
+#. Downgrade the controllers.
 
 See Also
 --------
