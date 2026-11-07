@@ -576,6 +576,9 @@ impl std::fmt::Display for PendingReason {
 /// Job specification submitted by the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
+    /// Leader-stamped submission identity; absent in pre-upgrade entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
     pub name: String,
     pub partition: Option<String>,
     pub account: Option<String>,
@@ -723,6 +726,7 @@ pub struct JobSpec {
 impl Default for JobSpec {
     fn default() -> Self {
         Self {
+            submitted_at: None,
             name: String::new(),
             partition: None,
             account: None,
@@ -1088,6 +1092,7 @@ impl Job {
             // before the scheduler has evaluated the job.
             PendingReason::None
         };
+        let submit_time = spec.submitted_at.unwrap_or_else(Utc::now);
         Self {
             preemption_usage: Default::default(),
             preemption_usage_updated_at: None,
@@ -1097,7 +1102,7 @@ impl Job {
             pending_reason,
             pending_reason_desc: None,
             priority,
-            submit_time: Utc::now(),
+            submit_time,
             start_time: None,
             end_time: None,
             allocated_nodes: Vec::new(),
@@ -2378,6 +2383,7 @@ mod tests {
     fn a_frozen_job_from_before_preempt_pending_has_no_grace() {
         let job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
         assert!(job.preempt_pending.is_none());
+        assert!(job.spec.submitted_at.is_none());
         assert!(job.preempt_grace().is_none());
         assert_eq!(job.preemption_usage, Default::default());
     }

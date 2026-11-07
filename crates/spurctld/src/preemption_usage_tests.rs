@@ -130,11 +130,6 @@ fn subset_of_victims_is_counted_individually_and_duplicate_entries_do_not_count_
         1
     );
     assert_eq!(cm.get_job(10).expect("owner").preemption_usage, usage);
-    assert_eq!(
-        cm.user_preemption_usage(|user| user == "owner"),
-        vec![("owner".into(), usage)]
-    );
-    assert!(cm.user_preemption_usage(|user| user == "victim").is_empty());
 }
 
 #[test]
@@ -391,7 +386,7 @@ fn snapshot_restores_open_claims_and_lifetime_totals_survive_job_eviction() {
         .restore_from_snapshot(&restored.snapshot_state().expect("snapshot"))
         .expect("restore");
     assert_eq!(final_cm.preemption_usage().used, 1);
-    assert_eq!(final_cm.user_preemption_usage(|_| true)[0].1.used, 1);
+    assert_eq!(final_cm.preemption_usage().used, 1);
     assert!(final_cm.preemption_usage.read().requests.is_empty());
 }
 
@@ -625,4 +620,118 @@ fn a_controller_ignoring_the_confirmation_cannot_resume_a_suspended_job() {
         JobState::Suspended
     );
     assert_eq!(cm.preemption_usage().used, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounting_acknowledgement_gates_eviction_and_is_not_in_snapshots() {
+    use crate::accounting::preemption::Checkpoint;
+    let (dir, cm) = cluster();
+    let mut cfg = (*cm.config()).clone();
+    cfg.accounting.database_url = "postgres://unused-test".into();
+    cfg.controller.terminal_job_retention_secs = 0;
+    let old = chrono::Utc::now() - chrono::Duration::days(1);
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&cm.snapshot_state().expect("snapshot")).expect("JSON");
+    let mut job = cm.get_job(10).expect("requester");
+    job.state = JobState::Completed;
+    job.end_time = Some(old);
+    job.preemption_usage.used = 3;
+    job.preemption_usage_updated_at = Some(old);
+    snapshot["jobs"] = serde_json::json!([job]);
+    let path = dir.path().join("accounting");
+    let other = std::sync::Arc::new(ClusterManager::new(cfg, &path).expect("cluster"));
+    let handle = crate::raft::start_raft(1, &["[::1]:0".into()], &path, other.clone())
+        .await
+        .expect("Raft");
+    handle
+        .raft
+        .wait(None)
+        .metrics(
+            |metrics| metrics.current_leader == Some(1),
+            "leader elected",
+        )
+        .await
+        .expect("leader");
+    other.set_raft(handle.raft);
+    other
+        .restore_from_snapshot(&serde_json::to_vec(&snapshot).expect("snapshot bytes"))
+        .expect("restore");
+    other.evict_expired_terminal_jobs();
+    assert!(
+        other.get_job(10).is_some(),
+        "an outage must retain the unexported job"
+    );
+    let checkpoint = Checkpoint::from(&other.get_job(10).expect("job"));
+    let mut stale = checkpoint.clone();
+    stale.usage.used = 2;
+    other.acknowledge_preemption_checkpoint(&stale);
+    assert_eq!(other.pending_preemption_checkpoints(100).len(), 1);
+    other.acknowledge_preemption_checkpoint(&checkpoint);
+    assert!(other.pending_preemption_checkpoints(100).is_empty());
+    let (_, restarted) = cluster();
+    restarted
+        .restore_from_snapshot(&other.snapshot_state().expect("snapshot"))
+        .expect("restore");
+    assert_eq!(
+        restarted.pending_preemption_checkpoints(100).len(),
+        1,
+        "restart must recheck PostgreSQL"
+    );
+    other
+        .restore_from_snapshot(&other.snapshot_state().expect("snapshot"))
+        .expect("restore over existing cache");
+    assert_eq!(other.pending_preemption_checkpoints(100).len(), 1);
+    other.acknowledge_preemption_checkpoint(&checkpoint);
+    other.evict_expired_terminal_jobs();
+    assert!(other.get_job(10).is_none());
+    assert!(other.preemption_accounted.read().is_empty());
+}
+
+#[test]
+fn legacy_user_totals_deserialize_without_retaining_a_lifetime_map() {
+    let frozen = br#"{"cluster":{"used":5,"open":1},"users":{"alice":{"used":5,"open":1}},"requests":{},"victims":{}}"#;
+    let ledger: crate::cluster::preemption_usage::UsageLedger =
+        serde_json::from_slice(frozen).expect("legacy ledger");
+    assert_eq!(ledger.cluster.used, 5);
+    assert_eq!(ledger.cluster.open, 1);
+    let saved = serde_json::to_value(ledger).expect("saved ledger");
+    assert!(saved.get("users").is_none());
+}
+
+#[test]
+fn accounting_identity_survives_submission_replay() {
+    use crate::accounting::preemption::Checkpoint;
+    let (_, first) = cluster();
+    let (_, second) = cluster();
+    let mut operation = WalOperation::JobSubmit {
+        job_id: 21,
+        spec: Box::default(),
+    };
+    operation.stamp_occurred_at(chrono::DateTime::UNIX_EPOCH);
+    let replay: WalOperation =
+        serde_json::from_slice(&serde_json::to_vec(&operation).expect("entry")).expect("replay");
+    first.apply_operation(&operation);
+    second.apply_operation(&replay);
+    let first_job = first.get_job(21).expect("job");
+    let second_job = second.get_job(21).expect("job");
+    assert_eq!(first_job.submit_time, chrono::DateTime::UNIX_EPOCH);
+    assert_eq!(first_job.submit_time, second_job.submit_time);
+    assert_eq!(
+        Checkpoint::from(&first_job).incarnation,
+        Checkpoint::from(&second_job).incarnation
+    );
+    let legacy = WalOperation::JobSubmit {
+        job_id: 22,
+        spec: Box::default(),
+    };
+    first.apply_operation(&legacy);
+    second.apply_operation(&legacy);
+    assert_eq!(
+        Checkpoint::from(&first.get_job(22).expect("job")).incarnation,
+        "legacy"
+    );
+    assert_eq!(
+        Checkpoint::from(&second.get_job(22).expect("job")).incarnation,
+        "legacy"
+    );
 }

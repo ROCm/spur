@@ -142,6 +142,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         | "GetAssocMgrInfo"
         | "GetJobHistory"
         | "GetUsage"
+        | "GetPreemptionUsage"
         | "ListAccounts"
         | "ListUsers"
         | "ListCoordinators"

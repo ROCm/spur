@@ -1089,8 +1089,8 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
 Preemption outcomes — ``/metrics/scheduler``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``sdiag`` reports cluster totals and up to 1000 visible users (sorted by name,
-with a truncation notice). ``scontrol show job`` reports a requesting job's
+``sdiag`` reports cluster totals only; user/account detail is available through
+``sreport preemptions`` when PostgreSQL accounting is configured. ``scontrol show job`` reports a requesting job's
 ``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen``. Counts describe
 **victim runs**, not nodes: preempting the same job on two runs counts twice.
 Suspension and idle-fill reclaim without an owner-directed handoff are excluded.
@@ -1152,15 +1152,57 @@ that fail before resource reservation advances the job's run number. Victim
 allocation evidence travels in the preemption entry; requester evidence comes
 from its reservation entry, so replicas use the same identities.
 
-Totals and open observations are persisted through the Raft log and snapshots.
-They start when this feature begins observing events, survive controller restart,
-and are unaffected by ``sdiag --reset``. Per-user totals remain after terminal
-jobs are evicted; user rows respect both ``jobs`` and ``usage`` privacy scopes.
-Per-job totals are also copied to the accounting database at job end and repaired
-by reconciliation, so history may lag the live controller. A terminal job whose
-outcome remained unresolved is closed as ``ended_other`` / ``unknown`` before
-retention removes it, with an additional retention window for accounting repair.
-As with other accounting data, repair requires an available accounting database.
+Cluster totals, active observations, and per-job counts are persisted through
+Raft. They start when this feature begins observing events, survive controller
+restart, and are unaffected by ``sdiag --reset``. Raft does not retain lifetime
+user/account totals. ``scontrol show job`` retains its per-job counters; job-end
+accounting and reconciliation also copy these into job history.
+
+Lifetime user/account reporting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use the accounting service through the controller's gRPC endpoint:
+
+.. code-block:: console
+
+   sreport preemptions
+   sreport preemptions --user alice --parsable
+   sreport preemptions --account research --limit 25
+   sreport preemptions --account research --limit 25 --page-token '["alice","research"]'
+
+Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
+requesting user/account pair; a user's rows across accounts add to that user's
+total. A complete account report requires every page for that account. The CLI
+prints the next-page token on standard error when another page exists. The
+default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
+``--start`` and ``--end`` are rejected because these are lifetime totals rather
+than event-time reports. Pagination uses user/account order, not a frozen
+snapshot; counts can change while pages are read.
+
+The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
+privacy settings, including coordinator visibility. Scoped reports identify
+that restriction and must not be presented as full account or cluster totals.
+The old scheduler-statistics user fields remain on the wire but are empty.
+
+An asynchronous exporter attempts up to 1000 changed jobs every ten seconds.
+PostgreSQL stores durable rollups plus one deduplication checkpoint per job
+incarnation (job ID and leader-stamped submission time; older jobs use a stable
+legacy key). The stamp travels in the existing submission entry. Duplicate or older exports do not
+increment totals; requeued runs accumulate in the same job checkpoint. The
+requesting user/account is fixed at its first export. The rollups and checkpoints
+are independent of job-history rows, account deletion, and fairshare resets.
+Retained accounting history is imported on upgrade; already deleted history
+cannot be reconstructed into user/account totals.
+
+The accounting ``Open`` column is the last exported observation count and can
+lag the live cluster gauge. Database outages or an export backlog increase that
+lag. When accounting is configured, a job with counts awaiting export remains in
+controller history until its current counts are committed; scheduling continues
+without waiting for PostgreSQL. Prolonged outages therefore increase retained
+job state. Controllers recheck persisted checkpoints after restart or failover.
+An unresolved terminal observation closes before retention, and its final
+counts must also be exported. With accounting disabled, only cluster and
+retained per-job counts are available.
 
 The counters piggyback on existing state-machine operations. A requesting launch
 with unresolved tracked preemptions writes at most one additional guarded
@@ -1168,8 +1210,9 @@ release confirmation, regardless of the number of victims or metric buckets.
 Launches without tracked preemptions add no log entry. Open claim storage grows
 with tracked victim allocations; completed claims are removed. Recording a
 partial node completion updates that node's release evidence without copying
-the victim's entire allocation. Aggregate and per-user storage grows with the
-number of users and the fixed cause buckets.
+the victim's entire allocation. Cluster aggregates use fixed cause buckets;
+user/account rollups and historical deduplication storage grow in PostgreSQL.
+Accounting exports, report reads, and export acknowledgements add no Raft writes.
 Controllers from before this feature do not maintain these observations; use a
 uniform controller version when relying on the lifetime totals.
 

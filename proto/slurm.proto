@@ -750,6 +750,7 @@ service SlurmAccounting {
   rpc RecordJobEnd(RecordJobEndRequest) returns (google.protobuf.Empty);
   rpc GetJobHistory(GetJobHistoryRequest) returns (GetJobHistoryResponse);
   rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+  rpc GetPreemptionUsage(GetPreemptionUsageRequest) returns (GetPreemptionUsageResponse);
 
   // Account management (sacctmgr)
   rpc CreateAccount(CreateAccountRequest) returns (google.protobuf.Empty);
@@ -2377,3 +2378,26 @@ message RevokeTokenRequest {
 }
 
 message RevokeTokenResponse {}
+
+// Lifetime totals per requesting user/account. No event-time filtering.
+message GetPreemptionUsageRequest {
+  string user = 1;
+  string account = 2;
+  uint32 limit = 3; // 0 = 100; maximum 1000
+  string page_token = 4;
+}
+
+message PreemptionUsageEntry {
+  string user = 1;
+  string account = 2;
+  uint64 used = 3;
+  uint64 unused = 4;
+  uint64 open = 5;
+}
+
+message GetPreemptionUsageResponse {
+  repeated PreemptionUsageEntry entries = 1;
+  string next_page_token = 2;
+  optional string scoped_to_user = 3;
+  bool partial = 4;
+}

@@ -278,5 +278,5 @@ fn observation_high_water_survives_settlement_until_the_requester_is_evicted() {
     assert!(!cm.preemption_usage.read().high_water.contains_key(&10));
     assert_eq!(cm.preemption_observation(10), None);
     assert_eq!(cm.preemption_usage().used, 1);
-    assert_eq!(cm.user_preemption_usage(|_| true)[0].1.used, 1);
+    assert_eq!(cm.preemption_usage().used, 1);
 }

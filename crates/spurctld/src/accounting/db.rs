@@ -22,6 +22,9 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await?;
     sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
+    sqlx::raw_sql(super::preemption::SCHEMA)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }

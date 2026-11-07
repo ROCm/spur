@@ -2521,24 +2521,9 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
-        let identity = Self::verified_identity(&request);
-        let jobs = job_read_scope(&self.cluster, identity);
-        let usage = usage_read_scope(&self.cluster, identity);
         let mut snapshot = self.sched_stats.snapshot();
         snapshot.preemption_usage = self.cluster.preemption_usage();
-        let mut response = crate::metrics_proto::sched_stats_to_proto(&snapshot);
-        let users = self
-            .cluster
-            .user_preemption_usage(|user| jobs.permits(user) && usage.permits(user));
-        response.preemption_users_truncated = users.len() > 1000;
-        response.preemption_users = users
-            .into_iter()
-            .take(1000)
-            .map(|(user, usage)| UserPreemptionUsage {
-                user,
-                usage: Some(crate::metrics_proto::preemption_usage_to_proto(&usage)),
-            })
-            .collect();
+        let response = crate::metrics_proto::sched_stats_to_proto(&snapshot);
         Ok(Response::new(response))
     }
 
@@ -5013,6 +4998,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
 
     let job_spec = spur_core::job::JobSpec {
+        submitted_at: None,
         name: spec.name,
         partition: if spec.partition.is_empty() {
             None
@@ -8498,7 +8484,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preemption_usage_user_rows_respect_both_privacy_scopes_and_reset_preserves_totals() {
+    async fn preemption_diagnostics_omit_legacy_user_rows_and_reset_preserves_totals() {
         use crate::raft::StateMachineApply;
         for category in ["jobs", "usage"] {
             let dir = tempfile::tempdir().expect("temporary state");
@@ -8517,8 +8503,7 @@ mod tests {
                 .await
                 .expect("stats")
                 .into_inner();
-            assert_eq!(stats.preemption_users.len(), 1);
-            assert_eq!(stats.preemption_users[0].user, "alice");
+            assert!(stats.preemption_users.is_empty());
             assert_eq!(stats.preemption_usage.expect("totals").used, 2);
             let mut reset = Request::new(());
             reset

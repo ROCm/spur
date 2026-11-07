@@ -676,6 +676,7 @@ impl WalOperation {
     /// Replays must date from here, not their own clock. `None` pre-upgrade.
     pub fn occurred_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
+            Self::JobSubmit { spec, .. } => spec.submitted_at,
             Self::EvictTerminalJobs { at, .. }
             | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
@@ -694,8 +695,7 @@ impl WalOperation {
             Self::JobPreemptSignaled { pending, .. } => Some(pending.signaled_at),
             // Exhaustive on purpose: a new variant that dates something a user
             // reads back must be a compile error here, not a silent `None`.
-            Self::JobSubmit { .. }
-            | Self::JobStepComplete { .. }
+            Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
@@ -726,6 +726,7 @@ impl WalOperation {
     /// An entry that already carries one keeps it.
     pub fn stamp_occurred_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
         let slot = match self {
+            Self::JobSubmit { spec, .. } => &mut spec.submitted_at,
             Self::EvictTerminalJobs { at, .. }
             | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
@@ -744,7 +745,6 @@ impl WalOperation {
             | Self::JobTimeLimitExpired { .. }
             | Self::JobPreemptSignaled { .. }
             | Self::JobCancelSignaled { .. }
-            | Self::JobSubmit { .. }
             | Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
