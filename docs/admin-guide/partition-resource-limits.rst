@@ -37,10 +37,13 @@ Per-node caps
    * - ``mem``
      - Memory (MiB) allocated to the partition's jobs on the node.
    * - ``gres/gpu``
-     - GPUs of any type allocated to the partition's jobs on the node.
+     - GPUs of any type allocated to the partition's jobs on the node. An
+       ``--exclusive`` job counts every GPU of the node.
    * - ``gres/gpu:<type>``
      - GPUs of one type, for example ``gres/gpu:mi300x``. GPU types come from
-       the node inventory, so nothing else needs to be declared.
+       the node inventory, so nothing else needs to be declared. An
+       ``--exclusive`` job that asks for this type counts every GPU of the
+       node here, including GPUs of other types, since it holds them all.
 
 Keys are case-sensitive. Any other key (for example ``cpus`` or ``disk``) is a
 config load error, so a typo cannot leave a partition uncapped by mistake. Keys

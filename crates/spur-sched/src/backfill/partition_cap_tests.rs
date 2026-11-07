@@ -1201,3 +1201,73 @@ fn a_gpu_total_is_spread_within_max_mem_per_node_at_the_per_gpu_default() {
     assert_eq!(started(&a), [1]);
     assert_eq!(gpu_counts(&a[0]), [2, 2]);
 }
+
+fn exclusive(mut job: Job) -> Job {
+    job.spec.exclusive = true;
+    job
+}
+
+#[test]
+fn an_exclusive_job_charges_the_whole_node_and_fits_a_cap_that_covers_it() {
+    let fx = |cap| {
+        Fixture::new(
+            vec![node("n1", 16, 64_000, &["cpu"])],
+            vec![partition("cpu", &[("cpu", cap)])],
+        )
+    };
+
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx(16).schedule(&mut sched, &[exclusive(job(1, "cpu", 1, 1))]);
+    assert_eq!(started(&a), [1]);
+
+    let mut sched = BackfillScheduler::new(100);
+    assert!(fx(15)
+        .schedule(&mut sched, &[exclusive(job(1, "cpu", 1, 1))])
+        .is_empty());
+    assert_eq!(
+        outcome(&sched, 1),
+        Some(UnplacedKind::PartitionCapNeverFits)
+    );
+}
+
+#[test]
+fn an_exclusive_job_waits_until_its_partitions_charge_on_the_node_ends() {
+    let fx = Fixture::new(
+        vec![node("n1", 16, 64_000, &["cpu"])],
+        vec![partition("cpu", &[("cpu", 16)])],
+    )
+    .running(
+        "cpu",
+        "n1",
+        ResourceAllocations::default(),
+        TresCharge::new(4, 0, 0, None),
+        hours(2),
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[exclusive(job(1, "cpu", 1, 1))]);
+
+    assert!(a.is_empty());
+    assert_eq!(overshoot(&sched, 1).map(|o| o.used), Some(4));
+    assert_eq!(reserved(&sched, 1), Some((vec!["n1".into()], hours(2))));
+}
+
+#[test]
+fn a_typed_exclusive_job_charges_every_gpu_on_a_mixed_node_to_its_type() {
+    let job = || exclusive(gpu_job(1, "gpu", "gpu:a100:1"));
+    let fx = |cap| {
+        Fixture::new(
+            vec![gpu_node("n1", &["gpu"])],
+            vec![partition("gpu", &[("gres/gpu:a100", cap)])],
+        )
+    };
+
+    let mut sched = BackfillScheduler::new(100);
+    assert!(fx(4).schedule(&mut sched, &[job()]).is_empty());
+    assert_eq!(
+        outcome(&sched, 1),
+        Some(UnplacedKind::PartitionCapNeverFits)
+    );
+
+    let mut sched = BackfillScheduler::new(100);
+    assert_eq!(started(&fx(8).schedule(&mut sched, &[job()])), [1]);
+}
