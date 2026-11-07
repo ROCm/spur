@@ -121,6 +121,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Keep config in sync so downstream code sees the final address.
     config.controller.listen_addr = listen_addr.clone();
+    let addr: std::net::SocketAddr = listen_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid controller listen address {listen_addr:?}: {e}"))?;
 
     // Background update check (non-blocking — does not delay startup)
     spur_update::spawn_startup_check(
@@ -317,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
     let controller = server::build_service(
         cluster.clone(),
         raft_handle.clone(),
+        addr.port(),
         rpc_stats.clone(),
         sched_stats.clone(),
         config.cluster.control_plane_replicas,
@@ -363,8 +367,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start gRPC server
-    let addr: std::net::SocketAddr = listen_addr.parse()?;
-
     // State the authentication posture explicitly at startup: it determines whether the listening
     // port is the trust boundary or merely the transport.
     match config.auth.mode {

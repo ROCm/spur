@@ -210,7 +210,8 @@ pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     leader_proxy: LeaderProxy,
-    /// Node ID → client API address (host:6817) for the x-spur-leader header.
+    /// Node ID → client API address, used to forward to the leader and for the
+    /// x-spur-leader header.
     client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
@@ -4599,29 +4600,71 @@ impl SlurmController for ControllerService {
     }
 }
 
+/// Client API address of every controller, keyed by Raft node id. A
+/// `peer_client_addrs` entry wins; otherwise the peer's Raft host is paired with
+/// this controller's own client port, which assumes controllers share one port.
+fn leader_client_addrs(
+    peers: &BTreeMap<u64, String>,
+    client_port: u16,
+    overrides: &[String],
+) -> BTreeMap<u64, String> {
+    peers
+        .iter()
+        .map(|(&id, raft_addr)| {
+            // Raft ids are 1-based positions in `controller.peers`.
+            let explicit = usize::try_from(id)
+                .ok()
+                .and_then(|id| id.checked_sub(1))
+                .and_then(|index| overrides.get(index));
+            let addr = match explicit {
+                Some(addr) => addr.clone(),
+                None => format!("{}:{client_port}", peer_host(raft_addr)),
+            };
+            (id, addr)
+        })
+        .collect()
+}
+
+/// The host of a Raft peer address, with any scheme kept and a bare IPv6
+/// address bracketed so a port can be appended.
+fn peer_host(raft_addr: &str) -> String {
+    let (scheme, authority) = match raft_addr.find("://") {
+        Some(at) => raft_addr.split_at(at + 3),
+        None => ("", raft_addr),
+    };
+    let host = if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map_or(authority.to_string(), |end| authority[..=end].to_string())
+    } else if authority.matches(':').count() > 1 {
+        format!("[{authority}]")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+            .to_string()
+    };
+    format!("{scheme}{host}")
+}
+
 /// Separate from [`serve`] so `main` can hand a clone to the REST server, which
 /// dispatches into these handlers instead of reaching past them into the cluster.
+#[allow(clippy::too_many_arguments)]
 pub fn build_service(
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
+    client_port: u16,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
     control_plane_replicas: u32,
     jwt_key: String,
     bearer: &spur_core::auth::BearerAuth,
 ) -> ControllerService {
-    let client_addrs: BTreeMap<u64, String> = raft_handle
-        .peers
-        .iter()
-        .map(|(id, raft_addr)| {
-            let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
-                format!("{}:6817", host)
-            } else {
-                format!("{}:6817", raft_addr)
-            };
-            (*id, client_addr)
-        })
-        .collect();
+    let client_addrs = leader_client_addrs(
+        &raft_handle.peers,
+        client_port,
+        &cluster.config().controller.peer_client_addrs,
+    );
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
@@ -6601,6 +6644,67 @@ mod tests {
         let (namespace, sa) = resolve_user_namespace_sa(&cache, "alice").unwrap();
         assert_eq!(namespace, "spur-acct-physics");
         assert_eq!(sa, "spur-user-alice");
+    }
+
+    fn raft_peers(addrs: &[&str]) -> BTreeMap<u64, String> {
+        addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (i as u64 + 1, addr.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn leader_client_addrs_pair_each_peer_host_with_the_local_client_port() {
+        let peers = raft_peers(&["ctrl1:6821", "ctrl2:6821", "ctrl3:6821"]);
+        assert_eq!(
+            leader_client_addrs(&peers, 6817, &[]),
+            raft_peers(&["ctrl1:6817", "ctrl2:6817", "ctrl3:6817"])
+        );
+        assert_eq!(
+            leader_client_addrs(&peers, 7000, &[]),
+            raft_peers(&["ctrl1:7000", "ctrl2:7000", "ctrl3:7000"])
+        );
+    }
+
+    #[test]
+    fn leader_client_addrs_handle_every_peer_address_form() {
+        let peers = raft_peers(&[
+            "[fd00::1]:6821",
+            "fd00::2",
+            "ctrl3",
+            "http://ctrl4:6821",
+            "10.0.0.5:6821",
+        ]);
+        assert_eq!(
+            leader_client_addrs(&peers, 7817, &[]),
+            raft_peers(&[
+                "[fd00::1]:7817",
+                "[fd00::2]:7817",
+                "ctrl3:7817",
+                "http://ctrl4:7817",
+                "10.0.0.5:7817",
+            ])
+        );
+    }
+
+    #[test]
+    fn leader_client_addrs_prefer_the_configured_override() {
+        let peers = raft_peers(&["ctrl1-raft:6821", "ctrl2-raft:6821"]);
+        let overrides = ["ctrl1:7817".to_string(), "http://ctrl2:7818".to_string()];
+        assert_eq!(
+            leader_client_addrs(&peers, 6817, &overrides),
+            raft_peers(&["ctrl1:7817", "http://ctrl2:7818"])
+        );
+    }
+
+    #[test]
+    fn leader_client_addrs_cover_single_node_mode() {
+        let peers = raft_peers(&["[::]:6821"]);
+        assert_eq!(
+            leader_client_addrs(&peers, 7817, &[]),
+            raft_peers(&["[::]:7817"])
+        );
     }
 
     #[test]
