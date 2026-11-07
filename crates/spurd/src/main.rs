@@ -382,6 +382,20 @@ async fn main() -> anyhow::Result<()> {
     }
     // Recording the exit lets replay resume after cleanup or confirmed quarantine.
     for descriptor in &stale_stepds {
+        match stepds.settle_interrupted_epilog(descriptor) {
+            Ok(true) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                "supervisor lost mid-epilog while the agent was down; its completion will drain the node"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "failed to settle an epilog the lost supervisor left unfinished"
+            ),
+        }
         match stepds.record_lost_supervisor_exit(descriptor) {
             Ok(true) => warn!(
                 job_id = descriptor.job_id,

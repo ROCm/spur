@@ -1211,7 +1211,14 @@ async fn run_completion_hooks_and_report(
                 cpus: c.cpus,
                 memory_mb: c.memory_mb,
             };
-            if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+            if let Err(e) = spur_core::hooks::run_hook_bounded(
+                epilog_script,
+                &ctx,
+                hooks.epilog_timeout(),
+                |_| {},
+            )
+            .await
+            {
                 error!(
                     job_id = c.job_id,
                     error = %e,
@@ -1420,13 +1427,15 @@ async fn wait_for_stepd_release(
     }
 }
 
-/// Backstop for a supervisor that's alive but wedged (frozen, deadlocked, or
-/// stuck in a hung hook) rather than exited — `stepd_liveness` reads a
-/// wedged process identically to a healthy one, so nothing gated on it ever
-/// fires here. Comfortably above the existing escalation stack (this
-/// function's own 3s bound, the 5s graceful-cancel grace period, the 10s
-/// stepd-request timeout), so it never fires during ordinary resolution.
-const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop for a supervisor that's alive but wedged (frozen or deadlocked)
+/// rather than exited — `stepd_liveness` reads a wedged process identically
+/// to a healthy one, so nothing gated on it ever fires here. Comfortably
+/// above the existing escalation stack (this function's own 3s bound, the 5s
+/// graceful-cancel grace period, the 10s stepd-request timeout), so it never
+/// fires during ordinary resolution. A supervisor holding an unexpired
+/// teardown lease is busy, not wedged, and is spared until the lease lapses.
+/// The duration is the lease's own slack, so the two cannot drift.
+const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = crate::teardown_lease::LEASE_SLACK;
 
 /// One poll window between kill retries; the ledger only releases once one
 /// of these confirms the stepd is actually gone, never on a bare timeout.
@@ -1501,7 +1510,8 @@ fn spawn_wedged_stepd_force_reclaim(
     active_fence_deadline: tokio::time::Instant,
     context: CompletionListenerContext,
 ) {
-    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
+    let force_window = force_reclaim_timeout();
+    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_window;
     tokio::spawn(async move {
         tokio::time::sleep_until(force_deadline).await;
         // `running` and `stepds` are locked in separate statements, never
@@ -1529,18 +1539,24 @@ fn spawn_wedged_stepd_force_reclaim(
             {
                 continue;
             }
-            warn!(
-                job_id,
-                run_attempt,
-                pid = descriptor.pid,
-                window_secs = force_reclaim_timeout().as_secs(),
-                "stepd still alive past the force-reclaim window; force-reclaiming"
-            );
             // Spawned per descriptor: a sibling step that never confirms dead
             // must not stall fencing of this one, or one wedged step
             // withholds every other step's resources too.
             let context = context.clone();
+            let finish_grace = force_window;
             tokio::spawn(async move {
+                if !await_lease_expiry(&context, &descriptor, job_id, run_attempt, finish_grace)
+                    .await
+                {
+                    return;
+                }
+                warn!(
+                    job_id,
+                    run_attempt,
+                    pid = descriptor.pid,
+                    window_secs = finish_grace.as_secs(),
+                    "stepd still alive past the force-reclaim window; force-reclaiming"
+                );
                 // Never release on an unconfirmed kill — the workload may
                 // still hold its CPUs/GPUs. Retry instead of giving up; a
                 // fresh liveness check before each kill avoids a reused pid.
@@ -1573,6 +1589,122 @@ fn spawn_wedged_stepd_force_reclaim(
             });
         }
     });
+}
+
+/// How often a deferred reclaim re-reads the supervisor's lease and liveness.
+const LEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Holds the force-reclaim while the supervisor's teardown lease is
+/// unexpired: it is busy in a bounded phase, not wedged, and killing it there
+/// would hand the node back with its cleanup or epilog still running.
+///
+/// A lease that disappears after deferring one means the supervisor finished
+/// the phase and is reporting the result. It gets one reclaim window to
+/// exit, polled like the lease itself, so a prompt exit is fenced at the next
+/// poll rather than held for the whole window. Killing it in that gap drops a
+/// failure it already recorded. A lease that is present but expired, or a
+/// supervisor that never wrote one, is reclaimed immediately. A lease that
+/// cannot be read is neither: an absent file and a failed read are different,
+/// and a failed read is retried for one reclaim window before it counts as
+/// wedged.
+///
+/// Returns whether to proceed with the reclaim. `false` means the supervisor
+/// finished or died meanwhile, or the attempt was superseded, so there is
+/// nothing left to kill.
+async fn await_lease_expiry(
+    context: &CompletionListenerContext,
+    descriptor: &crate::stepd::StepdDescriptor,
+    job_id: u32,
+    run_attempt: u32,
+    finish_grace: std::time::Duration,
+) -> bool {
+    use crate::teardown_lease::{reclaim_decision, ReclaimDecision};
+
+    let mut announced = false;
+    let mut deferred = false;
+    let mut finish_deadline: Option<tokio::time::Instant> = None;
+    let mut unreadable_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let read =
+            context
+                .stepds_store
+                .unfinished_teardown_lease(job_id, run_attempt, descriptor.step_id);
+        // An unreadable clock reads as past every deadline: the reclaim is the
+        // pre-lease behavior, not a hold with no end.
+        let now = crate::cgroup_cleanup::unix_ms().unwrap_or(u64::MAX);
+        let hold = match read {
+            Err(error) => {
+                if unreadable_deadline.is_none() {
+                    warn!(job_id, run_attempt, %error, "cannot read the stepd's teardown lease; retrying");
+                }
+                let deadline = *unreadable_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + finish_grace);
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    return true;
+                }
+                left.min(LEASE_POLL_INTERVAL)
+            }
+            Ok(lease) => {
+                unreadable_deadline = None;
+                match reclaim_decision(lease.as_ref(), now) {
+                    ReclaimDecision::Defer(remaining) => {
+                        deferred = true;
+                        // A lease that comes back (a failed read, then a good one)
+                        // is still the bounded phase, not a supervisor that finished.
+                        finish_deadline = None;
+                        if !announced {
+                            announced = true;
+                            info!(
+                                job_id,
+                                run_attempt,
+                                phase = ?lease.as_ref().map(|lease| lease.phase),
+                                remaining_secs = remaining.as_secs(),
+                                "stepd holds a teardown lease; deferring force-reclaim until it finishes or lapses"
+                            );
+                        }
+                        remaining.min(LEASE_POLL_INTERVAL)
+                    }
+                    // The ledger hides the lease once the epilog outcome is recorded,
+                    // which is before the supervisor has reported it.
+                    ReclaimDecision::Reclaim if deferred && lease.is_none() => {
+                        let deadline = *finish_deadline.get_or_insert_with(|| {
+                            info!(
+                                job_id,
+                                run_attempt,
+                                "stepd dropped its teardown lease; waiting for it to report before reclaiming"
+                            );
+                            tokio::time::Instant::now() + finish_grace
+                        });
+                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if left.is_zero() {
+                            return true;
+                        }
+                        left.min(LEASE_POLL_INTERVAL)
+                    }
+                    ReclaimDecision::Reclaim => return true,
+                }
+            }
+        };
+        tokio::time::sleep(hold).await;
+
+        let tracked = context
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt);
+        if !tracked {
+            return false;
+        }
+        match crate::stepd::stepd_liveness(descriptor) {
+            Ok(crate::stepd::StepdLiveness::Stale) => {
+                fence_dead_stepd(context, descriptor.clone()).await;
+                return false;
+            }
+            Ok(crate::stepd::StepdLiveness::Live) | Err(_) => {}
+        }
+    }
 }
 
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
@@ -2356,6 +2488,45 @@ async fn report_runtime_completion(
     true
 }
 
+/// The node epilog is what readies a node for its next job, and one whose
+/// supervisor died mid-run never confirmed; the node must not take another
+/// job until an operator has looked at it.
+fn settle_lost_epilog(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> Option<DrainRequest> {
+    let interrupted = store
+        .settle_interrupted_epilog(descriptor)
+        .unwrap_or_else(|error| {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "failed to settle an epilog the dead stepd left unfinished");
+            false
+        });
+    if interrupted {
+        return Some(DrainRequest {
+            reason: "epilog did not complete before its supervisor was lost".into(),
+        });
+    }
+    // The supervisor can record the failure and be fenced before its report
+    // arrives: the lease is already gone then, so the branch above does not
+    // run, and the recorded result is the only copy of the outcome.
+    match store.epilog_failed(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    ) {
+        Ok(true) => Some(DrainRequest {
+            reason: "epilog script failed".into(),
+        }),
+        Ok(false) => None,
+        Err(error) => {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "cannot read the epilog result a dead stepd recorded");
+            None
+        }
+    }
+}
+
 async fn fence_dead_stepd(
     context: &CompletionListenerContext,
     descriptor: crate::stepd::StepdDescriptor,
@@ -2411,6 +2582,7 @@ async fn fence_dead_stepd(
                 "failed to record synthetic exit for a dead stepd");
         }
     }
+    let epilog_drain = settle_lost_epilog(store, &descriptor);
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
@@ -2423,7 +2595,7 @@ async fn fence_dead_stepd(
             signal,
             run_attempt: descriptor.run_attempt,
             reporting_node: hostname,
-            drain: None,
+            drain: epilog_drain.as_ref(),
             step_id: Some(descriptor.step_id),
             node_token: reporter.node_token(),
             pty_step_id: descriptor.pty_step_id,
@@ -2669,6 +2841,22 @@ async fn replay_runtime_completions(
 ) -> anyhow::Result<Vec<crate::stepd::PendingStepdCompletion>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
+        // Replay reaches a dead supervisor before the liveness watchdog does,
+        // so it must settle that supervisor's epilog itself.
+        let session = store.session_dir(
+            completion.job_id,
+            completion.run_attempt,
+            completion.step_id,
+        );
+        let lost_epilog = store
+            .load_descriptor(&session)
+            .ok()
+            .and_then(|descriptor| settle_lost_epilog(store, &descriptor));
+        let drain = lost_epilog.or_else(|| {
+            completion.epilog_failed.then(|| DrainRequest {
+                reason: "epilog script failed".into(),
+            })
+        });
         if report_runtime_completion(
             store,
             controller_addr,
@@ -2678,9 +2866,7 @@ async fn replay_runtime_completions(
                 signal: completion.signal,
                 run_attempt: completion.run_attempt,
                 reporting_node,
-                drain: completion.epilog_failed.then_some(&DrainRequest {
-                    reason: "epilog script failed".into(),
-                }),
+                drain: drain.as_ref(),
                 step_id: Some(completion.step_id),
                 node_token: node_token.to_string(),
                 pty_step_id: completion.pty_step_id,
@@ -13368,6 +13554,137 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fencing_a_stepd_with_no_teardown_lease_does_not_drain() {
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+
+        fence_against_controller(controller_addr, &store).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].drain_reason.is_empty());
+    }
+
+    // The node epilog readies a node for its next job. A supervisor lost inside
+    // it never confirmed that, and its orphaned script is still touching the node.
+    /// A dead supervisor's session whose node epilog was still running: the
+    /// returned child is that epilog, left behind in its own process group.
+    fn session_lost_mid_epilog(
+        store: &crate::stepd::StepdStore,
+    ) -> (crate::stepd::StepdDescriptor, std::process::Child) {
+        let descriptor = fenced_session(store);
+        let mut orphan = std::process::Command::new("sleep");
+        std::os::unix::process::CommandExt::process_group(&mut orphan, 0);
+        let orphan = orphan.arg("300").spawn().expect("spawn orphaned epilog");
+        store
+            .obligations(42, 7, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record the exit");
+        let lease = crate::teardown_lease::TeardownLease::new(
+            crate::teardown_lease::TeardownPhase::Epilog,
+            std::time::Duration::from_secs(300),
+        )
+        .expect("lease")
+        .with_hook(crate::teardown_lease::HookProcess::of(orphan.id()).expect("identify epilog"));
+        crate::teardown_lease::grant(
+            &store.session_dir(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            ),
+            &lease,
+        )
+        .expect("grant lease");
+        (descriptor, orphan)
+    }
+
+    #[tokio::test]
+    async fn fencing_a_stepd_lost_mid_epilog_kills_the_orphan_and_drains_the_node() {
+        use std::os::unix::process::ExitStatusExt;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let (_descriptor, mut orphan) = session_lost_mid_epilog(&store);
+
+        fence_against_controller(controller_addr, &store).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].drain_reason.contains("epilog"),
+            "unexpected drain reason: {:?}",
+            reports[0].drain_reason
+        );
+        assert_eq!(
+            orphan.wait().expect("reap the orphan").signal(),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    // The supervisor records the failure before it clears the lease and reports.
+    // A fence that lands in that gap must not report the job as clean.
+    #[tokio::test]
+    async fn fencing_a_stepd_that_recorded_a_failed_epilog_drains_without_a_lease() {
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = fenced_session(&store);
+        let obligations = store.obligations(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        );
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 1,
+                signal: 0,
+            })
+            .expect("record the exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the epilog");
+
+        fence_against_controller(controller_addr, &store).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].drain_reason, "epilog script failed");
+    }
+
+    // The replay loop reaches a dead supervisor two seconds in, well before the
+    // liveness watchdog does, so it must not report the job as cleanly done.
+    #[tokio::test]
+    async fn replaying_a_stepd_lost_mid_epilog_kills_the_orphan_and_drains_the_node() {
+        use std::os::unix::process::ExitStatusExt;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let (_descriptor, mut orphan) = session_lost_mid_epilog(&store);
+
+        let replayed = replay_runtime_completions(&store, &controller_addr, "test-node", "")
+            .await
+            .expect("replay completions");
+
+        assert_eq!(replayed.len(), 1);
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].drain_node);
+        assert!(
+            reports[0].drain_reason.contains("epilog"),
+            "unexpected drain reason: {:?}",
+            reports[0].drain_reason
+        );
+        assert_eq!(
+            orphan.wait().expect("reap the orphan").signal(),
+            Some(libc::SIGKILL)
+        );
+    }
+
     // After a restart the replay loop is all that reports a session's exit, so
     // the numbered step has to come back from disk with the rest of it.
     #[tokio::test]
@@ -21755,6 +22072,161 @@ mod tests {
             !child_has_exited(&mut child).await,
             "a stepd session whose job no longer appears in `running` must not \
              be force-killed by a force-reclaim task spawned for that job"
+        );
+    }
+
+    /// A wedged-stepd stand-in whose ledger says teardown began and whose
+    /// lease on it lasts `window`, tracked as a cancelled job would be.
+    async fn leased_wedged_stepd(
+        state: &std::path::Path,
+        job_id: u32,
+        window: std::time::Duration,
+    ) -> (AgentService, tokio::process::Child, std::path::PathBuf) {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state);
+        let (child, descriptor) = spawn_wedged_stepd_stub(job_id, 1).await;
+        let store = crate::stepd::StepdStore::new(state);
+        let session = store
+            .prepare_session_dir(job_id, 1, spur_core::step::STEP_BATCH)
+            .expect("session directory");
+        store
+            .obligations(job_id, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record the exit");
+        grant_test_lease(&session, window);
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+        (svc, child, session)
+    }
+
+    fn grant_test_lease(session: &std::path::Path, window: std::time::Duration) {
+        let lease = crate::teardown_lease::TeardownLease::new(
+            crate::teardown_lease::TeardownPhase::Epilog,
+            window,
+        )
+        .expect("lease");
+        crate::teardown_lease::grant(session, &lease).expect("grant lease");
+    }
+
+    // The bug this guards: a cancelled job's node was handed back while its
+    // supervisor was still busy in the epilog, which was then orphaned.
+    #[tokio::test]
+    async fn force_reclaim_spares_a_supervisor_holding_a_teardown_lease_until_it_lapses() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_millis(200));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        // Outlasts send_explicit_signal's own 3s release wait.
+        let (svc, mut child, session) =
+            leased_wedged_stepd(state.path(), 924, std::time::Duration::from_secs(60)).await;
+
+        svc.send_explicit_signal(924, 0, nix::sys::signal::Signal::SIGKILL as i32)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a supervisor inside its leased epilog must not be force-killed"
+        );
+        assert!(svc.running.lock().await.contains_key(&924));
+
+        grant_test_lease(&session, std::time::Duration::ZERO);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !child_has_exited(&mut child).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            child_has_exited(&mut child).await,
+            "a supervisor that overruns its lease is a wedged one and is reclaimed"
+        );
+        while tokio::time::Instant::now() < deadline && svc.running.lock().await.contains_key(&924)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!svc.running.lock().await.contains_key(&924));
+        assert!(
+            crate::stepd::StepdStore::new(state.path())
+                .epilog_failed(924, 1, spur_core::step::STEP_BATCH)
+                .expect("epilog state"),
+            "the epilog it was cut off in is recorded as failed so the node drains"
+        );
+    }
+
+    // Dropping the lease is the supervisor finishing the phase, which happens
+    // before it reports. Reclaiming in that gap would throw the result away.
+    #[tokio::test]
+    async fn force_reclaim_lets_a_supervisor_report_after_it_drops_its_lease() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_millis(200));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let (svc, mut child, session) =
+            leased_wedged_stepd(state.path(), 926, std::time::Duration::from_secs(60)).await;
+
+        svc.send_explicit_signal(926, 0, nix::sys::signal::Signal::SIGKILL as i32)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !child_has_exited(&mut child).await,
+            "the lease must be deferring the reclaim before this drops it"
+        );
+
+        let store = crate::stepd::StepdStore::new(state.path());
+        store
+            .obligations(926, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the epilog");
+        crate::teardown_lease::clear(&session).expect("drop the lease");
+
+        tokio::time::sleep(force_reclaim_timeout() / 2).await;
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a supervisor that finished its lease must get the reclaim window to report"
+        );
+
+        let deadline = tokio::time::Instant::now()
+            + LEASE_POLL_INTERVAL
+            + force_reclaim_timeout()
+            + FORCE_KILL_CONFIRM_POLL;
+        while tokio::time::Instant::now() < deadline && !child_has_exited(&mut child).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            child_has_exited(&mut child).await,
+            "a supervisor that stays up after dropping its lease is wedged and is reclaimed"
+        );
+        assert!(store
+            .epilog_failed(926, 1, spur_core::step::STEP_BATCH)
+            .expect("epilog state"));
+    }
+
+    #[tokio::test]
+    async fn a_deferred_force_reclaim_stands_down_once_the_job_is_released() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_millis(200));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let (svc, mut child, session) =
+            leased_wedged_stepd(state.path(), 925, std::time::Duration::from_secs(60)).await;
+
+        svc.send_explicit_signal(925, 0, nix::sys::signal::Signal::SIGKILL as i32)
+            .await;
+        // The supervisor finishes and its completion releases the job normally.
+        svc.running.lock().await.remove(&925);
+        tokio::time::sleep(LEASE_POLL_INTERVAL * 3).await;
+        grant_test_lease(&session, std::time::Duration::ZERO);
+        tokio::time::sleep(LEASE_POLL_INTERVAL * 3).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a reclaim that outlived the job's release must not kill what is left"
         );
     }
 
