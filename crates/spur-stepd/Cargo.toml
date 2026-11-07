@@ -11,9 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Reuses spurd's job-launch primitives (executor, container, stepd
-# supervision) as a library, without linking spurd's controller-RPC, k0s, or
-# mesh-networking surface — that surface belongs to the node agent, not to
-# a process supervising a single already-admitted job.
+# supervision) as a library. The spurd lib also carries the agent RPC, k0s,
+# and mesh code, so spurstepd depends on it at build time but never runs it.
 spurd = { path = "../spurd" }
 spur-core = { path = "../spur-core" }
 tokio = { workspace = true }
