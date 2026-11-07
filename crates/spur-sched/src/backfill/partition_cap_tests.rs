@@ -119,6 +119,7 @@ impl Fixture {
             .entry(node.to_string())
             .or_default()
             .push(RunningCharge {
+                job_id: 0,
                 tres: charge,
                 until,
             });

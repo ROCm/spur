@@ -1261,6 +1261,158 @@ async fn competing_preemptors_never_fill_a_handed_off_node_past_its_cap() {
     assert_eq!(reason(&cm, second).0, PendingReason::PartitionTresLimit);
 }
 
+/// Partition `cpu` (capped at 8 CPUs) and uncapped `open`, both over every node.
+async fn capped_and_open_preemption_cluster(dir: &TempDir, nodes: &[&str]) -> Arc<ClusterManager> {
+    let cm = capped_preemption_cluster(dir, PreemptMode::Requeue).await;
+    cm.create_partition(Partition {
+        preempt_mode: Some(PreemptMode::Requeue),
+        ..partition("open", &[])
+    })
+    .unwrap();
+    for node in nodes.iter().filter(|n| **n != "n1") {
+        register_node(&cm, node, 16, 64 * GIB);
+    }
+    cm
+}
+
+fn open_in_qos(qos: &str, cpus: u32) -> JobSpec {
+    JobSpec {
+        partition: Some("open".into()),
+        ..capped_in_qos(qos, cpus)
+    }
+}
+
+/// Submit `spec` and reserve `cpus` on `node` for it without activating, as a
+/// placement still being dispatched.
+fn reserve_on(cm: &ClusterManager, spec: JobSpec, node: &str, cpus: u32) -> JobId {
+    let attribution = RunAttribution {
+        effective_partition: spec.partition.clone(),
+        ..Default::default()
+    };
+    let id = submit_and_wait(cm, spec);
+    let res = scalar_alloc(cpus, GIB);
+    cm.reserve_attributed_placement(
+        id,
+        vec![node.to_string()],
+        res.clone(),
+        per_node_for(&[node], res),
+        false,
+        attribution,
+    )
+    .unwrap();
+    wait_for("placement reserved", || {
+        cm.get_job(id).unwrap().holds_a_placement()
+    });
+    id
+}
+
+fn state_of(cm: &ClusterManager, id: JobId) -> JobState {
+    cm.get_job(id).unwrap().state
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preemption_spares_another_partitions_job_when_a_non_victim_fills_the_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1"]).await;
+    reserve_on(&cm, capped_in_qos("high", 8), "n1", 8);
+    let open = run_on(&cm, open_in_qos("low", 8), "n1", 8);
+    let high = submit_and_wait(&cm, capped_in_qos("high", 4));
+
+    preempt_for(&cm, &[high]).await;
+
+    assert_eq!(state_of(&cm, open), JobState::Running);
+    assert!(run_pass(&cm).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preemption_spares_another_partitions_job_beside_an_unevictable_cap_holder() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1"]).await;
+    let holder = run_on(&cm, capped_in_qos("high", 8), "n1", 8);
+    let open = run_on(&cm, open_in_qos("low", 8), "n1", 8);
+    let high = submit_and_wait(&cm, capped_in_qos("high", 4));
+    assert!(run_pass(&cm).is_empty());
+
+    preempt_for(&cm, &[high]).await;
+
+    assert_eq!(state_of(&cm, holder), JobState::Running);
+    assert_eq!(state_of(&cm, open), JobState::Running);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preempting_a_same_partition_job_frees_the_cap_for_the_preemptor() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1"]).await;
+    let low = run_on(&cm, capped_in_qos("low", 8), "n1", 8);
+    let high = submit_and_wait(&cm, capped_in_qos("high", 4));
+    assert!(run_pass(&cm).is_empty());
+
+    preempt_for(&cm, &[high]).await;
+    settle(&cm, low, JobState::Pending);
+
+    assert_eq!(run_pass(&cm), [high]);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 4)]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preemption_evicts_where_the_cap_frees_not_where_it_stays_full() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1", "n2"]).await;
+    reserve_on(&cm, capped_in_qos("high", 8), "n1", 8);
+    let open = run_on(&cm, open_in_qos("low", 8), "n1", 8);
+    let capped = run_on(&cm, capped_in_qos("low", 8), "n2", 8);
+    let high = submit_and_wait(&cm, capped_in_qos("high", 4));
+
+    preempt_for(&cm, &[high]).await;
+
+    assert_eq!(state_of(&cm, open), JobState::Running);
+    settle(&cm, capped, JobState::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_spares_a_borrowed_run_whose_eviction_leaves_the_cap_full() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1"]).await;
+    cm.qos_cache().insert(Qos {
+        name: "burst".into(),
+        priority: 1,
+        idle_fill_preemptable: true,
+        ..Default::default()
+    });
+    reserve_on(&cm, capped_in_qos("high", 8), "n1", 8);
+    let borrowed = run_on(&cm, open_in_qos("burst", 8), "n1", 8);
+    let high = cm
+        .get_job(submit_and_wait(&cm, capped_in_qos("high", 4)))
+        .unwrap();
+
+    assert!(crate::scheduler_loop::reclaim_for(&cm, &[&high])
+        .await
+        .is_empty());
+    assert_eq!(state_of(&cm, borrowed), JobState::Running);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_frees_a_cap_held_by_a_borrowed_same_partition_run() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_and_open_preemption_cluster(&dir, &["n1"]).await;
+    cm.qos_cache().insert(Qos {
+        name: "burst".into(),
+        priority: 1,
+        idle_fill_preemptable: true,
+        ..Default::default()
+    });
+    let borrowed = run_on(&cm, capped_in_qos("burst", 8), "n1", 8);
+    let high = cm
+        .get_job(submit_and_wait(&cm, capped_in_qos("high", 4)))
+        .unwrap();
+
+    assert_eq!(
+        crate::scheduler_loop::reclaim_for(&cm, &[&high]).await,
+        ["n1"]
+    );
+    settle(&cm, borrowed, JobState::Pending);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn array_tasks_run_up_to_the_cap_and_start_one_per_freed_slot() {
     let dir = TempDir::new().unwrap();

@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use spur_core::gpu_request::resolve_gpu_demand;
-use spur_core::job::{Job, PartitionTresOvershoot};
+use spur_core::job::{Job, JobId, PartitionTresOvershoot};
+use spur_core::node::Node;
 use spur_core::partition::{
     requested_partition_names, tres_key_report_rank, typed_gpu_tres_key, Partition, TRES_CPU,
     TRES_GPU, TRES_MEM,
@@ -28,6 +29,7 @@ pub struct TresCharge(BTreeMap<String, u64>);
 /// own end so another partition's long job cannot stretch this charge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningCharge {
+    pub job_id: JobId,
     pub tres: TresCharge,
     pub until: DateTime<Utc>,
 }
@@ -141,6 +143,33 @@ pub fn partition_cap_ok(
             limit,
         }),
     }
+}
+
+/// Whether `job` can start on `node` under `partition`'s cap with `used` already charged.
+pub fn fits_under_cap(job: &Job, partition: &Partition, node: &Node, used: &TresCharge) -> bool {
+    if !is_capped(partition) {
+        return true;
+    }
+    let job = job_in_partition(job, partition);
+    let required = crate::backfill::job_resource_request(&job);
+    let typed_gpu = job_typed_gpu(&job);
+    let charge = crate::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
+    partition_cap_ok(partition, &node.name, used, &charge).is_ok()
+}
+
+/// Whether some candidate partition holding `node` admits `job` there under its
+/// cap, given what each already holds. A node none of them holds has no cap.
+pub fn cap_admits_on(
+    job: &Job,
+    partitions: &[Partition],
+    node: &Node,
+    used: impl Fn(&Partition) -> TresCharge,
+) -> bool {
+    let mut holding = candidate_partitions(job, partitions)
+        .into_iter()
+        .filter(|p| node.partitions.contains(&p.name))
+        .peekable();
+    holding.peek().is_none() || holding.any(|p| fits_under_cap(job, p, node, &used(p)))
 }
 
 /// GPU type a job's request names, which decides whether its GPUs count

@@ -11552,36 +11552,14 @@ impl<'a> ReuseView<'a> {
         }
     }
 
-    /// Whether some partition `job` may run in that holds `node` would admit
-    /// it there under its cap. A node none of them holds has no cap to break.
     fn cap_has_room(&self, job: &Job, node: &Node) -> bool {
-        let holding: Vec<&Partition> =
-            spur_sched::partition_cap::candidate_partitions(job, self.partitions)
-                .into_iter()
-                .filter(|p| node.partitions.contains(&p.name))
-                .collect();
-        holding.is_empty() || holding.iter().any(|p| self.fits_under_cap(job, p, node))
-    }
-
-    fn fits_under_cap(&self, job: &Job, partition: &Partition, node: &Node) -> bool {
-        use spur_sched::partition_cap::{
-            is_capped, job_in_partition, job_typed_gpu, partition_cap_ok, TresCharge,
-        };
-        if !is_capped(partition) {
-            return true;
-        }
-        let job = job_in_partition(job, partition);
-        let required = spur_sched::backfill::job_resource_request(&job);
-        let typed_gpu = job_typed_gpu(&job);
-        let charge =
-            spur_sched::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
-        let idle = TresCharge::default();
-        let used = self
-            .cap_usage
-            .get(&partition.name)
-            .and_then(|by_node| by_node.get(&node.name))
-            .unwrap_or(&idle);
-        partition_cap_ok(partition, &node.name, used, &charge).is_ok()
+        spur_sched::partition_cap::cap_admits_on(job, self.partitions, node, |partition| {
+            self.cap_usage
+                .get(&partition.name)
+                .and_then(|by_node| by_node.get(&node.name))
+                .cloned()
+                .unwrap_or_default()
+        })
     }
 }
 

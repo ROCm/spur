@@ -19,7 +19,8 @@ use spur_proto::proto::{
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::partition_cap::{
-    candidate_partitions, is_capped, job_node_charge, PartitionNodeUsage, RunningCharge, TresCharge,
+    candidate_partitions, cap_admits_on, is_capped, job_node_charge, PartitionNodeUsage,
+    RunningCharge, TresCharge,
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
@@ -1298,6 +1299,7 @@ fn partition_usage_from_jobs<'a>(
                 .entry(node.clone())
                 .or_default()
                 .push(RunningCharge {
+                    job_id: job.job_id,
                     tres: job_node_charge(job, alloc),
                     until,
                 });
@@ -1453,6 +1455,7 @@ pub(crate) async fn try_preempt_beside(
     let reservations = cluster.get_reservations();
     let handoffs =
         cluster.preemption_handoffs(&cluster.pending_jobs(), cluster_nodes, &reservations);
+    let usage = running_partition_usage(cluster);
     let state = ClusterState {
         nodes: cluster_nodes,
         partitions,
@@ -1461,7 +1464,7 @@ pub(crate) async fn try_preempt_beside(
         fabric: None,
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
-        partition_node_usage: &Default::default(),
+        partition_node_usage: &usage,
     };
     try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
 }
@@ -1487,6 +1490,31 @@ fn node_occupants<'a>(
         }
     }
     occupants
+}
+
+/// Idle-fill reclaim for `unplaced` over the cluster's current state, as the loop runs it.
+#[cfg(test)]
+pub(crate) async fn reclaim_for(
+    cluster: &Arc<ClusterManager>,
+    unplaced: &[&spur_core::job::Job],
+) -> Vec<String> {
+    let nodes = cluster.get_nodes();
+    let partitions = cluster.get_partitions();
+    let reservations = cluster.get_reservations();
+    let usage = running_partition_usage(cluster);
+    let state = ClusterState {
+        nodes: &nodes,
+        partitions: &partitions,
+        reservations: &reservations,
+        topology: None,
+        fabric: None,
+        busy_until: &HashMap::new(),
+        preemption_handoffs: &HashMap::new(),
+        partition_node_usage: &usage,
+    };
+    reclaim_for_unplaced(cluster, unplaced, &HashSet::new(), &state, &[], 0)
+        .await
+        .0
 }
 
 /// The victim search over a given pass state, as the scheduler loop runs it.
@@ -2275,6 +2303,12 @@ fn satisfiable_victim_set(
             && node.total_resources.can_satisfy(&required)
             && state.handoff_allows(reclaimer, &node.name)
     };
+    // Evicting a node frees its partition caps only of what the victims held there.
+    let cap_frees = |node: &spur_core::node::Node, evicted: &[spur_core::job::JobId]| {
+        cap_admits_on(reclaimer, state.partitions, node, |partition| {
+            usage_without(state.partition_node_usage, partition, node, evicted, now)
+        })
+    };
 
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
     let mut have = 0usize;
@@ -2288,14 +2322,15 @@ fn satisfiable_victim_set(
         match pool.occupants.get(node.name.as_str()) {
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
-            None => have += 1,
+            None if cap_frees(node, &[]) => have += 1,
+            None => {}
             Some(on_node)
                 if on_node.iter().all(|id| {
                     pool.evictable.contains(id)
                         && pool
                             .max_priority
                             .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
-                }) =>
+                }) && cap_frees(node, on_node) =>
             {
                 evacuable.push((node.name.as_str(), on_node));
             }
@@ -2326,6 +2361,26 @@ fn satisfiable_victim_set(
     }
 
     (have >= needed && !victims.is_empty()).then_some(victims)
+}
+
+/// What `partition`'s jobs other than `evicted` hold on `node` at `now`.
+fn usage_without(
+    usage: &PartitionNodeUsage,
+    partition: &spur_core::partition::Partition,
+    node: &spur_core::node::Node,
+    evicted: &[spur_core::job::JobId],
+    now: DateTime<Utc>,
+) -> TresCharge {
+    let mut held = TresCharge::default();
+    let charges = usage
+        .get(&partition.name)
+        .and_then(|by_node| by_node.get(&node.name))
+        .into_iter()
+        .flatten();
+    for charge in charges.filter(|c| c.until > now && !evicted.contains(&c.job_id)) {
+        held.add(&charge.tres);
+    }
+    held
 }
 
 /// The pending job a victim is being cleared out for while it still holds its
