@@ -23,7 +23,12 @@ def wide_handoff_cluster(ssh_nodes, remote_bin_dir):
     yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 4)
 
 
-def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
+@pytest.fixture
+def rollup_cluster(ssh_nodes, remote_bin_dir):
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3, retention=0)
+
+
+def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400):
     if len(ssh_nodes) < count:
         pytest.skip(f"this handoff test requires {count} nodes")
     c = SpurCluster(ssh_nodes[:count], make_remote_dir(), remote_bin_dir)
@@ -57,6 +62,7 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
         )
         # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
         c.start({
+            "controller": {"terminal_job_retention_secs": retention},
             "scheduler": {"preempt_type": "qos_priority", "complete_wait_secs": 300},
             "hooks": {"epilog": epilog, "prolog": prolog},
             "auth": {"allow_root_jobs": True},
@@ -349,10 +355,7 @@ def _usage(c, *, used=0, open_count=0, unused=None, jobs=None):
             )
         }
         assert causes == unused, diag
-        if any(totals):
-            username = re.escape(c.nodes[0].user)
-            match = re.search(rf"User {username}: used=(\d+) unused=(\d+) open=(\d+)", diag)
-            assert match and tuple(map(int, match.groups())) == totals, diag
+        assert not re.search(r"User .*: used=", diag), diag
         for job, (job_used, job_open, job_unused) in (jobs or {}).items():
             show = c.scontrol("show", "job", str(job))
             match = re.search(r"PreemptionsUsed=(\d+) PreemptionsUnused=(\d+) PreemptionsOpen=(\d+)", show)
@@ -524,3 +527,78 @@ def test_usage_distinguishes_launch_failure_from_later_application_failure(hando
         assert "ExitCode=7:0" in _state(c, hunter, "FAILED")
         _usage(c, used=1, jobs={hunter: (1, 0, {})})
         _accounted_usage(c, hunter, used=1)
+
+
+def _rollup_report(c, expected, *filters):
+    def check():
+        text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader", *filters])
+        rows = [line.split("|") for line in text.splitlines() if "|" in line]
+        actual = {(row[0], row[1]): tuple(map(int, row[2:])) for row in rows}
+        assert actual == expected, text
+        return True
+
+    wait_until(check, timeout_s=90, interval_s=1, desc="accounting preemption rollup",
+               tolerate=(AssertionError, RuntimeError))
+
+
+def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cluster):
+    c = rollup_cluster
+    user = c.nodes[0].user
+    for account in ("rollup-a", "rollup-b"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    victim = _submit(c, "rollup-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "rollup-hunter", "hunter-a", c.node_names[0], extra=("--account=rollup-a",))
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _usage(c, open_count=1)
+    _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)})
+
+    c.nodes[0].exec(f"docker stop {shlex.quote(c._pg_container)}")
+    try:
+        _launch_gate(c, hunter, [0], False)
+        _usage(c, used=1)
+        c.scancel(str(hunter))
+        assert wait_job(c, hunter, timeout=60) == "CA"
+        c.restart_controller()
+        code, output = c.cli_with_exit(["spur", "sreport", "preemptions"])
+        assert code != 0, output
+        # Zero retention is floored to 120 seconds for accounting repair.
+        time.sleep(130)
+        assert "PreemptionsUsed=1" in c.scontrol("show", "job", str(hunter))
+    finally:
+        c.nodes[0].exec(f"docker start {shlex.quote(c._pg_container)}")
+    _rollup_report(c, {(user, "rollup-a"): (1, 0, 0)})
+    wait_until(lambda: f"JobId={hunter} " not in c.cli_allow_fail(["scontrol", "show", "job", str(hunter)]),
+               timeout_s=90, interval_s=1, desc="exported job leaving controller history")
+    c.psql(f"DELETE FROM jobs WHERE job_id={int(hunter)}")
+    c.restart_controller()
+    _rollup_report(c, {(user, "rollup-a"): (1, 0, 0)})
+
+    victim = _submit(c, "rollup-victim-b", "victim-a", c.node_names[1])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [1], True)
+    hunter = _submit(c, "rollup-hunter-b", "hunter-a", c.node_names[1], extra=("--account=rollup-b",))
+    _wait_epilog(c, victim, [1])
+    c.scancel(str(hunter))
+    _gate(c, victim, [1], False)
+    _usage(c, used=1, unused={("cancelled", "user"): 1})
+    expected = {(user, "rollup-a"): (1, 0, 0), (user, "rollup-b"): (0, 1, 0)}
+    _rollup_report(c, expected, "--user", user)
+    _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b")
+    code, first = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable",
+                                   "--noheader", "--limit", "1"])
+    assert code == 0, first
+    assert f"{user}|rollup-a|1|0|0" in first, first
+    token = re.search(r"Next page token: (.+)", first)
+    assert token, first
+    code, second = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                                    "--limit", "1", "--page-token", token[1]])
+    assert code == 0, second
+    assert f"{user}|rollup-b|0|1|0" in second and "Next page token" not in second, second
+    code, output = c.cli_with_exit(["spur", "sreport", "preemptions", "--start", "now-7days"])
+    assert code != 0 and "lifetime" in output, output

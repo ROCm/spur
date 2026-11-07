@@ -601,6 +601,7 @@ pub struct ClusterManager {
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
     preemption_usage: RwLock<preemption_usage::UsageLedger>,
+    preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -1024,6 +1025,7 @@ impl ClusterManager {
             config_path,
             jobs: RwLock::new(HashMap::new()),
             preemption_usage: RwLock::new(Default::default()),
+            preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -1431,6 +1433,7 @@ impl ClusterManager {
             expand_job_specs(spec, job_id).map_err(|e| SubmitError::invalid(e.to_string()))?;
 
         for mut task_spec in specs {
+            task_spec.submitted_at = None;
             let task_id = if task_spec.array_job_id.is_some() {
                 self.next_job_id.fetch_add(1, Ordering::SeqCst)
             } else {
@@ -6926,6 +6929,45 @@ impl ClusterManager {
         }
     }
 
+    fn preemption_checkpoint_saved(&self, job: &Job) -> bool {
+        let revision = crate::accounting::preemption::revision(&job.preemption_usage);
+        revision == 0
+            || self.preemption_accounted.read().get(&job.job_id)
+                == Some(&(job.submit_time, revision))
+    }
+
+    pub(crate) fn pending_preemption_checkpoints(
+        &self,
+        limit: usize,
+    ) -> Vec<crate::accounting::preemption::Checkpoint> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| !self.preemption_checkpoint_saved(job))
+            .take(limit)
+            .map(crate::accounting::preemption::Checkpoint::from)
+            .collect()
+    }
+
+    pub(crate) fn acknowledge_preemption_checkpoint(
+        &self,
+        checkpoint: &crate::accounting::preemption::Checkpoint,
+    ) {
+        let jobs = self.jobs.read();
+        let Some(job) = jobs.get(&checkpoint.job_id) else {
+            return;
+        };
+        if job.submit_time == checkpoint.submit_time && job.preemption_usage == checkpoint.usage {
+            self.preemption_accounted.write().insert(
+                job.job_id,
+                (
+                    job.submit_time,
+                    crate::accounting::preemption::revision(&job.preemption_usage),
+                ),
+            );
+        }
+    }
+
     /// Evict finished jobs whose end_time is older than the retention window,
     /// bounding controller memory. No-op when nothing has aged out.
     pub fn evict_expired_terminal_jobs(&self) {
@@ -6937,6 +6979,7 @@ impl ClusterManager {
             .terminal_job_retention_secs
             .max(crate::accounting::RECONCILE_INTERVAL_SECS);
         let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        let accounting_enabled = self.accounting_enabled();
         let jobs = self.jobs.read();
         // Spare a target still referenced by a live job's dependency: dropping it
         // makes resolve_target_state return None, which cancels/early-releases dependents.
@@ -6956,6 +6999,7 @@ impl ClusterManager {
                 j.state.is_finalized()
                     && j.end_time.is_some_and(|t| t < before)
                     && j.preemption_usage_updated_at.is_none_or(|t| t < before)
+                    && (!accounting_enabled || self.preemption_checkpoint_saved(j))
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
             })
@@ -9937,6 +9981,9 @@ impl ClusterManager {
                 drop(usage);
                 if !evicted.is_empty() {
                     jobs.retain(|id, _| !evicted.contains(id));
+                    self.preemption_accounted
+                        .write()
+                        .retain(|id, _| !evicted.contains(id));
                     self.steps
                         .write()
                         .retain(|_, s| !evicted.contains(&s.job_id));
@@ -10159,6 +10206,7 @@ impl StateMachineApply for ClusterManager {
         let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
         *self.preemption_usage.write() = snap.preemption_usage;
+        self.preemption_accounted.write().clear();
         jobs.clear();
         for job in snap.jobs {
             next_id = next_id.max(job.job_id + 1);

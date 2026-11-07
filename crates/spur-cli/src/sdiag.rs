@@ -251,17 +251,6 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
                 cause.reason, cause.initiator, cause.count
             ));
         }
-        for user in &stats.preemption_users {
-            if let Some(usage) = &user.usage {
-                lines.push(format!(
-                    "    User {}: used={} unused={} open={}",
-                    user.user, usage.used, usage.unused, usage.open
-                ));
-            }
-        }
-        if stats.preemption_users_truncated {
-            lines.push("    User list truncated to 1000 visible users".into());
-        }
     }
     lines
 }

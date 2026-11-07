@@ -36,7 +36,6 @@ impl From<Outcome> for LaunchOutcome {
 #[serde(default)]
 pub(super) struct UsageLedger {
     pub cluster: PreemptionUsage,
-    pub users: BTreeMap<String, PreemptionUsage>,
     requests: BTreeMap<JobId, BTreeMap<u64, Request>>,
     high_water: BTreeMap<JobId, u64>,
     current: BTreeMap<JobId, u64>,
@@ -52,7 +51,6 @@ struct Request {
     closure_cause: Option<(Reason, Initiator)>,
     run_attempt: Option<u32>,
     reserved: Option<Allocations>,
-    user: String,
     victims: BTreeSet<(JobId, u32)>,
     activated: Option<Allocations>,
     outcome: Option<LaunchOutcome>,
@@ -161,7 +159,6 @@ impl From<&Job> for ObservedJob {
 struct Registration {
     victim: ObservedJob,
     owner: ObservedJob,
-    user: String,
     claim: PreemptionClaim,
 }
 
@@ -186,15 +183,12 @@ impl UsageLedger {
     }
 
     fn count(&mut self, victim: &Victim, jobs: &mut HashMap<JobId, Job>, outcome: Option<Outcome>) {
-        let Some(request) = self.request_mut(victim) else {
+        if self.request_mut(victim).is_none() {
             return;
-        };
-        let user = request.user.clone();
-        for counts in [&mut self.cluster, self.users.entry(user).or_default()] {
-            match outcome {
-                None => counts.open_one(),
-                Some(outcome) => counts.settle(outcome),
-            }
+        }
+        match outcome {
+            None => self.cluster.open_one(),
+            Some(outcome) => self.cluster.settle(outcome),
         }
         if let Some(job) = jobs.get_mut(&victim.owner) {
             if self.at.is_some() {
@@ -211,7 +205,6 @@ impl UsageLedger {
         let Registration {
             victim,
             owner,
-            user,
             claim,
         } = registration;
         let attempt = claim.observation_id;
@@ -234,7 +227,6 @@ impl UsageLedger {
             .or_default()
             .entry(attempt)
             .or_insert_with(|| Request {
-                user,
                 outcome: if owner.state == JobState::Cancelled {
                     Some(LaunchOutcome::Unused(
                         Reason::Cancelled,
@@ -518,20 +510,6 @@ impl ClusterManager {
         self.preemption_usage.read().cluster.clone()
     }
 
-    pub fn user_preemption_usage(
-        &self,
-        permits: impl Fn(&str) -> bool,
-    ) -> Vec<(String, PreemptionUsage)> {
-        self.preemption_usage
-            .read()
-            .users
-            .iter()
-            .filter(|(user, _)| permits(user))
-            .take(1001)
-            .map(|(user, usage)| (user.clone(), usage.clone()))
-            .collect()
-    }
-
     pub(crate) fn confirm_preemption_observation(
         &self,
         job_id: JobId,
@@ -588,7 +566,6 @@ impl ClusterManager {
                 .map(|(v, o)| Registration {
                     victim: v.into(),
                     owner: o.into(),
-                    user: o.spec.user.clone(),
                     claim: preemption_claim.clone().unwrap_or_else(|| PreemptionClaim {
                         observation_id: u64::from(
                             preemptor_run_attempt
@@ -607,7 +584,6 @@ impl ClusterManager {
                     .map(|(v, o)| Registration {
                         victim: v.into(),
                         owner: o.into(),
-                        user: o.spec.user.clone(),
                         claim: pending.preemption_claim.clone().unwrap_or_else(|| {
                             PreemptionClaim {
                                 observation_id: u64::from(

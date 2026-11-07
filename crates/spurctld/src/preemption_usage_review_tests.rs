@@ -111,10 +111,6 @@ fn assert_usage(cm: &ClusterManager, used: u64, unused: u64) {
         unused
     );
     assert_eq!(cm.get_job(10).expect("requester").preemption_usage, usage);
-    assert_eq!(
-        cm.user_preemption_usage(|_| true),
-        vec![("owner".into(), usage)]
-    );
 }
 
 fn ledger_snapshot(cm: &ClusterManager) -> serde_json::Value {

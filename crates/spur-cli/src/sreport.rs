@@ -48,6 +48,19 @@ pub struct SreportArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SreportCommand {
+    /// Lifetime preemption outcomes by requesting user and account
+    Preemptions {
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        /// Rows per page (1-1000)
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+        /// Continue from a previous report's next-page token
+        #[arg(long)]
+        page_token: Option<String>,
+    },
     /// Cluster utilization reports
     Cluster {
         /// Report type: AccountUtilizationByUser, UserUtilizationByAccount
@@ -67,6 +80,11 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SreportArgs>(&args);
 
+    if matches!(args.command, SreportCommand::Preemptions { .. })
+        && (args.start.is_some() || args.end.is_some())
+    {
+        anyhow::bail!("preemption reports are lifetime totals; --start/--end are not supported");
+    }
     let since = args
         .start
         .as_deref()
@@ -79,6 +97,58 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut client = spur_proto::accounting_client(channel);
 
     match &args.command {
+        SreportCommand::Preemptions {
+            user,
+            account,
+            limit,
+            page_token,
+        } => {
+            let mut request = tonic::Request::new(spur_proto::proto::GetPreemptionUsageRequest {
+                user: user.clone().unwrap_or_default(),
+                account: account.clone().unwrap_or_default(),
+                limit: *limit,
+                page_token: page_token.clone().unwrap_or_default(),
+            });
+            request.set_timeout(std::time::Duration::from_secs(15));
+            let response = client
+                .get_preemption_usage(request)
+                .await
+                .context("failed to get preemption report")?
+                .into_inner();
+            if let Some(user) = &response.scoped_to_user {
+                eprintln!("Visible usage for {user} only");
+            }
+            if response.partial {
+                eprintln!("Visible usage only; account totals may be incomplete");
+            }
+            if !args.noheader {
+                if args.parsable {
+                    println!("User|Account|Used|Unused|Open");
+                } else {
+                    println!(
+                        "{:<20} {:<20} {:>12} {:>12} {:>12}",
+                        "User", "Account", "Used", "Unused", "Open"
+                    );
+                }
+            }
+            for entry in response.entries {
+                if args.parsable {
+                    println!(
+                        "{}|{}|{}|{}|{}",
+                        entry.user, entry.account, entry.used, entry.unused, entry.open
+                    );
+                } else {
+                    println!(
+                        "{:<20} {:<20} {:>12} {:>12} {:>12}",
+                        entry.user, entry.account, entry.used, entry.unused, entry.open
+                    );
+                }
+            }
+            if !response.next_page_token.is_empty() {
+                eprintln!("Next page token: {}", response.next_page_token);
+            }
+            Ok(())
+        }
         SreportCommand::Cluster { report_type } => match report_type.to_lowercase().as_str() {
             "accountutilizationbyuser" | "accountutilization" => {
                 report_account_utilization_by_user(&mut client, since, &args).await
@@ -555,6 +625,36 @@ fn account_visible(visible_accounts: &[String], account: &str, has_usage: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preemption_report_page_arguments() {
+        let args = SreportArgs::try_parse_from([
+            "sreport",
+            "preemptions",
+            "--user",
+            "alice",
+            "--account",
+            "research",
+            "--limit",
+            "25",
+            "--parsable",
+        ])
+        .expect("arguments");
+        assert!(matches!(
+            args.command,
+            SreportCommand::Preemptions {
+                limit: 25,
+                user: Some(_),
+                account: Some(_),
+                ..
+            }
+        ));
+        for limit in ["0", "1001"] {
+            assert!(
+                SreportArgs::try_parse_from(["sreport", "preemptions", "--limit", limit]).is_err()
+            );
+        }
+    }
 
     #[test]
     fn partial_utilization_fills_visible_accounts_and_blanks_the_rest() {
