@@ -2313,10 +2313,13 @@ silicon identity. Perform it only on a node with no GPU jobs running.
   a ``spurd`` restart. The jobs themselves are not failed or requeued.
 
 **What an operator sees.** A fenced GPU shows up as fewer GPU GRES in
-``scontrol show node`` than the hardware has, and ``spurd`` logs
-``allocated device changed; pinning held gpus, converging free pool only``.
-If a fence outlasts the warning threshold (one hour), ``spurd`` also warns
-that a job may be leaking its pre-change partition.
+``scontrol show node`` than the hardware has, and as an entry in
+``inventory-fences.json`` (below). When the change removes a partition a job
+holds, ``spurd`` also logs
+``allocated device changed; pinning held gpus, converging free pool only``;
+when the held partition keeps its id in the new layout, the fence is applied
+without that warning. If a fence outlasts the warning threshold (one hour),
+``spurd`` warns that a job may be leaking its pre-change partition.
 
 **State on disk.** ``spurd`` keeps two files under ``<state_dir>/runtime/``
 (``state_dir`` defaults to ``/var/spool/spur``):
