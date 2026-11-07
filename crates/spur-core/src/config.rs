@@ -252,12 +252,19 @@ pub struct RestApiConfig {
 /// All fields are optional — `None` means no hook is configured for that point.
 /// Paths must be fully qualified; no search path is set for security reasons.
 /// Hook lifecycle and failure semantics match Slurm.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
     /// Script run on compute nodes before job launch (Slurm `Prolog`).
     pub prolog: Option<String>,
     /// Script run on compute nodes at job termination (Slurm `Epilog`).
     pub epilog: Option<String>,
+    /// Seconds the compute-node `epilog` may run before its process group is
+    /// killed and the node is drained as an epilog failure. The node stays
+    /// held for the job until the epilog ends or this elapses. Must be at
+    /// least 1; defaults to 300. Slurm's `PrologEpilogTimeout` is unbounded by
+    /// default, but an unbounded epilog would hold the node indefinitely.
+    #[serde(default = "default_epilog_timeout_secs")]
+    pub epilog_timeout_secs: u32,
     /// Script run on the controller at job allocation (Slurm `PrologSlurmctld`).
     pub prolog_slurmctld: Option<String>,
     /// Script run on the controller at job termination (Slurm `EpilogSlurmctld`).
@@ -276,6 +283,38 @@ pub struct HooksConfig {
     /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
     /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
     pub job_submit_lua: Option<String>,
+}
+
+pub fn default_epilog_timeout_secs() -> u32 {
+    300
+}
+
+/// Upper bound for `epilog_timeout_secs`. A node held for longer than a day
+/// for one job's epilog is a hang, not a slow epilog.
+pub const MAX_EPILOG_TIMEOUT_SECS: u32 = 86_400;
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            prolog: None,
+            epilog: None,
+            epilog_timeout_secs: default_epilog_timeout_secs(),
+            prolog_slurmctld: None,
+            epilog_slurmctld: None,
+            task_prolog: None,
+            task_epilog: None,
+            srun_prolog: None,
+            srun_epilog: None,
+            job_submit: None,
+            job_submit_lua: None,
+        }
+    }
+}
+
+impl HooksConfig {
+    pub fn epilog_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.epilog_timeout_secs))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2531,6 +2570,18 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Zero would kill the epilog the instant it starts, draining every node
+        // after every job. Past a day the node is stuck, not waiting out a
+        // slow epilog.
+        if !(1..=MAX_EPILOG_TIMEOUT_SECS).contains(&self.hooks.epilog_timeout_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "hooks.epilog_timeout_secs".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.hooks.epilog_timeout_secs, MAX_EPILOG_TIMEOUT_SECS
+                ),
+            });
+        }
         for pc in &self.partitions {
             crate::partition::parse_preempt_mode(&pc.preempt_mode).map_err(|value| {
                 ConfigError::InvalidValue {
@@ -3281,6 +3332,42 @@ mod tests {
                 toml::from_str(&format!("cleanup_timeout_secs = {seconds}\n")).unwrap();
             assert_eq!(config.cleanup_timeout_secs, seconds);
         }
+    }
+
+    #[test]
+    fn epilog_timeout_defaults_for_old_configs_and_accepts_overrides() {
+        let old: HooksConfig = toml::from_str("epilog = \"/etc/spur/epilog.sh\"\n").unwrap();
+        assert_eq!(old.epilog_timeout_secs, default_epilog_timeout_secs());
+        assert_eq!(
+            HooksConfig::default().epilog_timeout(),
+            Duration::from_secs(300)
+        );
+        let configured: HooksConfig = toml::from_str("epilog_timeout_secs = 45\n").unwrap();
+        assert_eq!(configured.epilog_timeout(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn hooks_config_rejects_an_unusable_epilog_timeout() {
+        for seconds in [0, MAX_EPILOG_TIMEOUT_SECS + 1] {
+            let toml =
+                format!("cluster_name = \"test\"\n[hooks]\nepilog_timeout_secs = {seconds}\n");
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("hooks.epilog_timeout_secs"),
+                "unexpected error for {seconds}: {err}"
+            );
+        }
+        let toml = format!(
+            "cluster_name = \"test\"\n[hooks]\nepilog_timeout_secs = {MAX_EPILOG_TIMEOUT_SECS}\n"
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&toml)
+                .unwrap()
+                .hooks
+                .epilog_timeout_secs,
+            MAX_EPILOG_TIMEOUT_SECS,
+            "the bound itself must be accepted"
+        );
     }
 
     #[test]

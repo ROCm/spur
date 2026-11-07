@@ -2903,6 +2903,53 @@ submitting host on each invocation.
    the config, so a broken submit hook is rejected rather than applied — the
    previous configuration stays in place and the command reports an error.
 
+Epilog timeout
+~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 12 18 36
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``epilog_timeout_secs``
+     - integer
+     - ``300``
+     - Agent restart (new jobs)
+     - Seconds the compute-node ``epilog`` may run, from 1 to 86400. When it
+       elapses, the epilog's whole process group is sent ``SIGTERM`` and, after
+       5 seconds, ``SIGKILL``. A timed-out epilog counts as a failed one: the
+       node is drained with the reason ``epilog script failed``. A running job
+       keeps the value captured at launch.
+
+A cancelled or finished job's node is not released while its epilog is still
+running. The node agent normally force-reclaims a job's supervisor 30 seconds
+after a cancel, but a supervisor inside the cgroup-cleanup wait or the node
+epilog holds a short-lived lease that defers the reclaim. The cleanup lease
+lasts whatever remains of ``[cgroup] cleanup_timeout_secs``, plus 30 seconds.
+When the cgroup is already empty, those 30 seconds are the whole cleanup
+lease, and they cover rootfs and spool removal. The epilog lease lasts
+``epilog_timeout_secs`` plus the 5 second ``SIGTERM`` grace and the 5 second
+``SIGKILL`` grace, then the same 30 seconds for the SPANK exit hooks and the
+completion report. With no epilog script, those 30 seconds are the whole
+epilog lease. Once the supervisor drops the lease, the agent gives it that same 30
+seconds to report before reclaiming. If a supervisor is lost inside the
+epilog regardless (it outlives its lease, or crashes), the agent kills the
+epilog's orphaned process group and drains the node, because the epilog never
+confirmed the node was ready for another job. A failure the supervisor managed
+to record before it was lost drains the node as ``epilog script failed``.
+
+.. note::
+
+   Slurm's ``PrologEpilogTimeout`` is unset by default, so its epilog may run
+   forever; Spur bounds it so a hung epilog cannot hold a node indefinitely.
+   Keep ``[scheduler] complete_wait_secs`` above ``[cgroup] cleanup_timeout_secs``
+   plus ``epilog_timeout_secs``. Otherwise the controller force-finishes the
+   job and quarantines the node before a slow but healthy epilog has finished.
+
 ``[notifications]``
 -------------------
 
