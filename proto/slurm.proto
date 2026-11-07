@@ -494,6 +494,7 @@ message JobInfo {
   // When the job was signaled to start its preemption grace. Set only while
   // the grace runs; `end_time` then carries the grace deadline.
   google.protobuf.Timestamp preempt_time = 90;
+  PreemptionUsage preemption_usage = 91;
 }
 
 message NodeInfo {
@@ -749,6 +750,7 @@ service SlurmAccounting {
   rpc RecordJobEnd(RecordJobEndRequest) returns (google.protobuf.Empty);
   rpc GetJobHistory(GetJobHistoryRequest) returns (GetJobHistoryResponse);
   rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+  rpc GetPreemptionUsage(GetPreemptionUsageRequest) returns (GetPreemptionUsageResponse);
 
   // Account management (sacctmgr)
   rpc CreateAccount(CreateAccountRequest) returns (google.protobuf.Empty);
@@ -1004,6 +1006,24 @@ message RpcStats {
   repeated RpcOperationStats by_operation = 1;
 }
 
+message UnusedPreemptionCount {
+  string reason = 1;
+  string initiator = 2;
+  uint64 count = 3;
+}
+
+message PreemptionUsage {
+  uint64 used = 1;
+  uint64 unused = 2;
+  uint64 open = 3;
+  repeated UnusedPreemptionCount unused_by_cause = 4;
+}
+
+message UserPreemptionUsage {
+  string user = 1;
+  PreemptionUsage usage = 2;
+}
+
 message SchedStats {
   string plugin = 1;
   uint64 cycles = 2;
@@ -1020,6 +1040,9 @@ message SchedStats {
   uint64 exit_end = 13;
   uint64 exit_max_depth = 14;
   uint64 jobs_preempted = 15;
+  PreemptionUsage preemption_usage = 16;
+  repeated UserPreemptionUsage preemption_users = 17;
+  bool preemption_users_truncated = 18;
 }
 
 // What one user holds under a scope, beside the caps governing that user. Counts
@@ -2355,3 +2378,26 @@ message RevokeTokenRequest {
 }
 
 message RevokeTokenResponse {}
+
+// Lifetime totals per requesting user/account. No event-time filtering.
+message GetPreemptionUsageRequest {
+  string user = 1;
+  string account = 2;
+  uint32 limit = 3; // 0 = 100; maximum 1000
+  string page_token = 4;
+}
+
+message PreemptionUsageEntry {
+  string user = 1;
+  string account = 2;
+  uint64 used = 3;
+  uint64 unused = 4;
+  uint64 open = 5;
+}
+
+message GetPreemptionUsageResponse {
+  repeated PreemptionUsageEntry entries = 1;
+  string next_page_token = 2;
+  optional string scoped_to_user = 3;
+  bool partial = 4;
+}

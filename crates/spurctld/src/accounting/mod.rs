@@ -5,6 +5,7 @@ pub(crate) mod db;
 mod fairshare;
 mod grpc;
 mod notifier;
+pub(crate) mod preemption;
 mod reconcile;
 pub(crate) mod txn;
 
@@ -162,6 +163,7 @@ fn activate(
     raft: &Arc<RaftHandle>,
     params: &ActivationParams,
 ) {
+    preemption::spawn_loop(pool.clone(), cluster.clone(), raft.clone());
     service.install_pool(pool.clone());
     cluster.set_accounting(AccountingNotifier::new(pool.clone()));
     cluster.set_billing_weights_handle(service.billing_weights_shared());

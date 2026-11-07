@@ -37,6 +37,7 @@ pub mod native_service;
 pub mod node;
 pub mod partition;
 pub mod peer;
+pub mod preemption_usage;
 pub mod privilege;
 pub mod process;
 pub mod qos;

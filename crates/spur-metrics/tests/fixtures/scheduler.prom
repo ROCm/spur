@@ -1,6 +1,30 @@
 # HELP spur_scheduler_info Active scheduler plugin (value is always 1).
 # TYPE spur_scheduler_info gauge
 spur_scheduler_info{plugin="backfill"} 1
+# HELP spur_scheduler_preemptions_used Victim runs whose released capacity served the requesting launch; durable lifetime total.
+# TYPE spur_scheduler_preemptions_used counter
+spur_scheduler_preemptions_used_total 0
+# HELP spur_scheduler_preemptions_open Victim runs with released capacity awaiting a requesting launch outcome.
+# TYPE spur_scheduler_preemptions_open gauge
+spur_scheduler_preemptions_open 0
+# HELP spur_scheduler_preemptions_unused Victim runs closed without confirmed use by the requesting launch; durable lifetime total.
+# TYPE spur_scheduler_preemptions_unused counter
+spur_scheduler_preemptions_unused_total{reason="cancelled",initiator="admin"} 0
+spur_scheduler_preemptions_unused_total{reason="cancelled",initiator="system"} 0
+spur_scheduler_preemptions_unused_total{reason="cancelled",initiator="unknown"} 0
+spur_scheduler_preemptions_unused_total{reason="cancelled",initiator="user"} 0
+spur_scheduler_preemptions_unused_total{reason="ended_other",initiator="admin"} 0
+spur_scheduler_preemptions_unused_total{reason="ended_other",initiator="system"} 0
+spur_scheduler_preemptions_unused_total{reason="ended_other",initiator="unknown"} 0
+spur_scheduler_preemptions_unused_total{reason="ended_other",initiator="user"} 0
+spur_scheduler_preemptions_unused_total{reason="launch_failed",initiator="admin"} 0
+spur_scheduler_preemptions_unused_total{reason="launch_failed",initiator="system"} 0
+spur_scheduler_preemptions_unused_total{reason="launch_failed",initiator="unknown"} 0
+spur_scheduler_preemptions_unused_total{reason="launch_failed",initiator="user"} 0
+spur_scheduler_preemptions_unused_total{reason="started_elsewhere",initiator="admin"} 0
+spur_scheduler_preemptions_unused_total{reason="started_elsewhere",initiator="system"} 0
+spur_scheduler_preemptions_unused_total{reason="started_elsewhere",initiator="unknown"} 0
+spur_scheduler_preemptions_unused_total{reason="started_elsewhere",initiator="user"} 0
 # HELP spur_scheduler_cycle_last_time_us Most recent scheduling cycle wall time in microseconds.
 # TYPE spur_scheduler_cycle_last_time_us gauge
 spur_scheduler_cycle_last_time_us 600

@@ -576,6 +576,9 @@ impl std::fmt::Display for PendingReason {
 /// Job specification submitted by the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
+    /// Leader-stamped submission identity; absent in pre-upgrade entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
     pub name: String,
     pub partition: Option<String>,
     pub account: Option<String>,
@@ -723,6 +726,7 @@ pub struct JobSpec {
 impl Default for JobSpec {
     fn default() -> Self {
         Self {
+            submitted_at: None,
             name: String::new(),
             partition: None,
             account: None,
@@ -869,6 +873,10 @@ pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
 /// grace period instead of restarting it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreemptPending {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemptor_run_attempt: Option<u32>,
     pub signaled_at: DateTime<Utc>,
     pub deadline: DateTime<Utc>,
     pub preempted_by: JobId,
@@ -891,6 +899,11 @@ pub struct NodeCompletion {
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub preemption_usage: crate::preemption_usage::PreemptionUsage,
+    /// Defer eviction when the last outcome arrives after job completion.
+    #[serde(default)]
+    pub preemption_usage_updated_at: Option<DateTime<Utc>>,
     pub job_id: JobId,
     pub spec: JobSpec,
     pub state: JobState,
@@ -1079,14 +1092,17 @@ impl Job {
             // before the scheduler has evaluated the job.
             PendingReason::None
         };
+        let submit_time = spec.submitted_at.unwrap_or_else(Utc::now);
         Self {
+            preemption_usage: Default::default(),
+            preemption_usage_updated_at: None,
             job_id,
             spec,
             state,
             pending_reason,
             pending_reason_desc: None,
             priority,
-            submit_time: Utc::now(),
+            submit_time,
             start_time: None,
             end_time: None,
             allocated_nodes: Vec::new(),
@@ -2367,7 +2383,9 @@ mod tests {
     fn a_frozen_job_from_before_preempt_pending_has_no_grace() {
         let job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
         assert!(job.preempt_pending.is_none());
+        assert!(job.spec.submitted_at.is_none());
         assert!(job.preempt_grace().is_none());
+        assert_eq!(job.preemption_usage, Default::default());
     }
 
     #[test]
@@ -2382,6 +2400,8 @@ mod tests {
             .expect("fixture instant")
             .with_timezone(&Utc);
         let pending = PreemptPending {
+            preemption_claim: None,
+            preemptor_run_attempt: None,
             signaled_at: at,
             deadline: at + chrono::Duration::seconds(90),
             preempted_by: 9,
@@ -2406,6 +2426,8 @@ mod tests {
         assert!(job.preempt_grace().is_none());
 
         job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
+            preemptor_run_attempt: None,
             signaled_at: at,
             deadline: at + chrono::Duration::seconds(90),
             preempted_by: 9,

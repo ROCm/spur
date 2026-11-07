@@ -22,6 +22,9 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await?;
     sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
+    sqlx::raw_sql(super::preemption::SCHEMA)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -173,6 +176,7 @@ ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grace_time INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preemption_usage JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
@@ -376,6 +380,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             preempted_by = NULL,
             preempt_mode = '',
             preempt_qos = '',
+            preemption_usage = CASE WHEN jobs.submit_time = EXCLUDED.submit_time
+                THEN jobs.preemption_usage ELSE '{}'::jsonb END,
             usage_recorded = FALSE,
             reason = '',
             reason_detail = '',
@@ -424,6 +430,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
 /// reason as `JobStartRecord`.
 #[derive(Debug, Clone)]
 pub struct JobEndRecord {
+    pub preemption_usage: Option<spur_core::preemption_usage::PreemptionUsage>,
     pub job_id: JobId,
     /// Accounting state string; the legacy `RecordJobEnd` RPC maps its own
     /// proto values (including `UNKNOWN`), so this is not a `JobState`.
@@ -490,6 +497,11 @@ impl JobSubmission {
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
 pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
     let sub = rec.submission.as_ref();
+    let preemption_usage = rec
+        .preemption_usage
+        .as_ref()
+        .map(preemption_usage_json)
+        .transpose()?;
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
@@ -497,11 +509,11 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
                           ended_by, ended_by_uid, name, user_name, account, partition_name, qos,
                           num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
-                          submit_time, reservation, time_limit_secs)
+                          submit_time, reservation, time_limit_secs, preemption_usage)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 COALESCE($14, ''), COALESCE($15, ''), COALESCE($16, ''), COALESCE($17, ''),
                 COALESCE($18, ''), COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1),
-                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26)
+                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26, COALESCE($27, '{}'::jsonb))
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -514,7 +526,11 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             reason = $10,
             reason_detail = $11,
             ended_by = $12,
-            ended_by_uid = $13
+            ended_by_uid = $13,
+            preemption_usage = CASE
+                WHEN COALESCE((jobs.preemption_usage->>'revision')::numeric, 0)
+                    <= COALESCE(($27->>'revision')::numeric, 0)
+                THEN COALESCE($27, jobs.preemption_usage) ELSE jobs.preemption_usage END
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
@@ -544,6 +560,7 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(sub.map(|s| s.submit_time))
     .bind(sub.map(|s| &s.reservation))
     .bind(sub.and_then(|s| s.time_limit_secs))
+    .bind(preemption_usage)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -552,8 +569,22 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     Ok(())
 }
 
+fn preemption_usage_json(
+    usage: &spur_core::preemption_usage::PreemptionUsage,
+) -> anyhow::Result<sqlx::types::Json<serde_json::Value>> {
+    let mut value = serde_json::to_value(usage)?;
+    let revision = usage
+        .used
+        .saturating_add(usage.unused_total())
+        .saturating_mul(2)
+        .saturating_add(usage.open);
+    value["revision"] = revision.into();
+    Ok(sqlx::types::Json(value))
+}
+
 /// A job row's accounting state, as seen by the reconciliation pass.
 pub struct AccountingRowState {
+    pub preemption_usage: spur_core::preemption_usage::PreemptionUsage,
     pub state: String,
     /// True when the row is missing metadata that a proper `record_job_start`
     /// would have populated (e.g. `record_job_end` created a bare row from
@@ -576,7 +607,7 @@ pub async fn job_accounting_states(
     }
     let stored: Vec<i64> = job_ids.iter().map(|&id| id as i64).collect();
     let rows = sqlx::query(
-        "SELECT job_id, state, user_name, start_time, total_gpus FROM jobs WHERE job_id = ANY($1)",
+        "SELECT job_id, state, user_name, start_time, total_gpus, preemption_usage FROM jobs WHERE job_id = ANY($1)",
     )
     .bind(&stored)
     .fetch_all(pool)
@@ -590,6 +621,11 @@ pub async fn job_accounting_states(
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let total_gpus = r.get::<i32, _>("total_gpus").max(0) as u32;
             let row = AccountingRowState {
+                preemption_usage: r
+                    .get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
+                        "preemption_usage",
+                    )
+                    .0,
                 state: r.get("state"),
                 needs_start_backfill: user_name.is_empty() || start_time.is_none(),
                 total_gpus,
@@ -687,6 +723,7 @@ async fn update_usage(
 /// Job record returned from history queries.
 #[derive(Debug)]
 pub struct JobRecord {
+    pub preemption_usage: spur_core::preemption_usage::PreemptionUsage,
     pub job_id: JobId,
     pub name: String,
     pub user_name: String,
@@ -769,7 +806,7 @@ fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
          preempted_by, preempt_mode, preempt_qos, idle_fill, total_gpus, time_limit_secs, \
-         reason, reason_detail, ended_by, ended_by_uid \
+         reason, reason_detail, ended_by, ended_by_uid, preemption_usage \
          FROM jobs WHERE 1=1",
     );
 
@@ -818,6 +855,11 @@ pub async fn get_job_history(
     let records = rows
         .iter()
         .map(|row| JobRecord {
+            preemption_usage: row
+                .get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
+                    "preemption_usage",
+                )
+                .0,
             job_id: row.get::<i64, _>("job_id") as JobId,
             name: row.get("name"),
             user_name: row.get("user_name"),
@@ -2322,6 +2364,7 @@ mod job_history_tests {
 
     fn end_record(job_id: JobId, state: &str, end_time: DateTime<Utc>) -> JobEndRecord {
         JobEndRecord {
+            preemption_usage: None,
             job_id,
             state: state.to_string(),
             exit_code: 0,
@@ -2403,6 +2446,42 @@ mod job_history_tests {
             submission: Some(JobSubmission::for_job(job)),
             ..end_record(job.job_id, "CANCELLED", Utc::now())
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn preemption_usage_accounting_preserves_newer_outcomes_against_delayed_end_writes(
+    ) -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = submitted_job(9_800_530);
+        let mut open = spur_core::preemption_usage::PreemptionUsage::default();
+        open.open_one();
+        let mut record = cancel_record(&job);
+        record.preemption_usage = Some(open.clone());
+        record_job_end(&mut tx, &record).await?;
+        let mut settled = open.clone();
+        settled.settle(Some((
+            spur_core::preemption_usage::UnusedReason::Cancelled,
+            spur_core::preemption_usage::PreemptionInitiator::User,
+        )));
+        record.preemption_usage = Some(settled.clone());
+        record_job_end(&mut tx, &record).await?;
+        record.preemption_usage = Some(open);
+        record_job_end(&mut tx, &record).await?;
+        record.preemption_usage = None;
+        record_job_end(&mut tx, &record).await?;
+        let stored = sqlx::query("SELECT preemption_usage FROM jobs WHERE job_id = $1")
+            .bind(i64::from(job.job_id))
+            .fetch_one(&mut *tx)
+            .await?
+            .get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
+                "preemption_usage",
+            )
+            .0;
+        assert_eq!(stored, settled);
+        tx.rollback().await?;
+        Ok(())
     }
 
     #[tokio::test]

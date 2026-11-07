@@ -1050,8 +1050,8 @@ Endpoints
      - Planned
      - Route exists but currently returns an empty body.
    * - ``/metrics/scheduler``
-     - Planned
-     - Route exists but currently returns an empty body.
+     - Live
+     - Scheduler cycle statistics and preemption outcomes.
    * - ``/metrics/k8s``
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
@@ -1085,6 +1085,136 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - Memory (bytes) allocated to running/completing jobs.
    * - ``spur_jobs_gpus_alloc``
      - GPUs allocated to running/completing jobs.
+
+Preemption outcomes — ``/metrics/scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``sdiag`` reports cluster totals only; user/account detail is available through
+``sreport preemptions`` when PostgreSQL accounting is configured. ``scontrol show job`` reports a requesting job's
+``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen``. Counts describe
+**victim runs**, not nodes: preempting the same job on two runs counts twice.
+Suspension and idle-fill reclaim without an owner-directed handoff are excluded.
+A grace warning alone does not increment any count; the first released slice
+opens one observation for that victim run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 48 12 40
+
+   * - Metric
+     - Type
+     - Meaning
+   * - ``spur_scheduler_preemptions_used_total``
+     - Counter
+     - Victim runs with matching released capacity in a confirmed requesting launch.
+   * - ``spur_scheduler_preemptions_unused_total{reason,initiator}``
+     - Counter
+     - Victim runs closed without confirmed use by the requesting launch.
+   * - ``spur_scheduler_preemptions_open``
+     - Gauge
+     - Victim runs that released capacity but whose requesting launch outcome is unresolved.
+
+For example, if a requester preempts A on n1 and B on n2, then launches only
+using B's capacity, used increases by one and unused by one. Partial reports
+and replay do not count a victim run again. A successful launch followed by a
+later application failure remains used. A failed release is a launch failure,
+even if the controller already recorded the job as Running. Native interactive
+allocations count as launched once allocation registration and activation succeed.
+
+``reason`` has four values:
+
+* ``started_elsewhere``: the launch succeeded without matching released capacity.
+* ``launch_failed``: the requesting launch was rejected, held, backed off, or not released.
+* ``cancelled``: cancellation ended the request before use.
+* ``ended_other``: another end or a superseding attempt closed the request,
+  including an outcome that could not be confirmed after controller failure.
+
+``initiator`` is ``user``, ``admin``, ``system``, or ``unknown``. Cancellation
+uses the authenticated cancellation provenance. Scheduler placement and launch
+failures use ``system``. Missing provenance stays ``unknown``. The label records
+the observed operation, not an inferred root cause: a launch rejection caused
+by user-supplied input still has a system launch-failure verdict. The
+``ended_other`` / ``unknown`` bucket is uncertainty, not proof of resource loss.
+No username, job ID, or node name is a Prometheus label.
+
+Device-backed victims require matching node-local device IDs and inventory
+generation; merely using CPU on the same GPU node is insufficient. Legacy
+device allocations without node-local identity cannot establish matching use.
+CPU and memory have no allocation-unit identities, so scalar-only attribution consumes
+a deterministic capacity budget in victim-ID order. This is an approximation,
+not proof that preemption was necessary or a measure of lost GPU-hours. One
+victim using any matching capacity counts once; this does not measure the
+fraction of its allocation used. Capacity released after launch confirmation
+cannot serve that launch.
+
+Each requesting attempt has its own persisted observation ID, including retries
+that fail before resource reservation advances the job's run number. Victim
+allocation evidence travels in the preemption entry; requester evidence comes
+from its reservation entry, so replicas use the same identities.
+
+Cluster totals, active observations, and per-job counts are persisted through
+Raft. They start when this feature begins observing events, survive controller
+restart, and are unaffected by ``sdiag --reset``. Raft does not retain lifetime
+user/account totals. ``scontrol show job`` retains its per-job counters; job-end
+accounting and reconciliation also copy these into job history.
+
+Lifetime user/account reporting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use the accounting service through the controller's gRPC endpoint:
+
+.. code-block:: console
+
+   sreport preemptions
+   sreport preemptions --user alice --parsable
+   sreport preemptions --account research --limit 25
+   sreport preemptions --account research --limit 25 --page-token '["alice","research"]'
+
+Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
+requesting user/account pair; a user's rows across accounts add to that user's
+total. A complete account report requires every page for that account. The CLI
+prints the next-page token on standard error when another page exists. The
+default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
+``--start`` and ``--end`` are rejected because these are lifetime totals rather
+than event-time reports. Pagination uses user/account order, not a frozen
+snapshot; counts can change while pages are read.
+
+The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
+privacy settings, including coordinator visibility. Scoped reports identify
+that restriction and must not be presented as full account or cluster totals.
+The old scheduler-statistics user fields remain on the wire but are empty.
+
+An asynchronous exporter attempts up to 1000 changed jobs every ten seconds.
+PostgreSQL stores durable rollups plus one deduplication checkpoint per job
+incarnation (job ID and leader-stamped submission time; older jobs use a stable
+legacy key). The stamp travels in the existing submission entry. Duplicate or older exports do not
+increment totals; requeued runs accumulate in the same job checkpoint. The
+requesting user/account is fixed at its first export. The rollups and checkpoints
+are independent of job-history rows, account deletion, and fairshare resets.
+Retained accounting history is imported on upgrade; already deleted history
+cannot be reconstructed into user/account totals.
+
+The accounting ``Open`` column is the last exported observation count and can
+lag the live cluster gauge. Database outages or an export backlog increase that
+lag. When accounting is configured, a job with counts awaiting export remains in
+controller history until its current counts are committed; scheduling continues
+without waiting for PostgreSQL. Prolonged outages therefore increase retained
+job state. Controllers recheck persisted checkpoints after restart or failover.
+An unresolved terminal observation closes before retention, and its final
+counts must also be exported. With accounting disabled, only cluster and
+retained per-job counts are available.
+
+The counters piggyback on existing state-machine operations. A requesting launch
+with unresolved tracked preemptions writes at most one additional guarded
+release confirmation, regardless of the number of victims or metric buckets.
+Launches without tracked preemptions add no log entry. Open claim storage grows
+with tracked victim allocations; completed claims are removed. Recording a
+partial node completion updates that node's release evidence without copying
+the victim's entire allocation. Cluster aggregates use fixed cause buckets;
+user/account rollups and historical deduplication storage grow in PostgreSQL.
+Accounting exports, report reads, and export acknowledgements add no Raft writes.
+Controllers from before this feature do not maintain these observations; use a
+uniform controller version when relying on the lifetime totals.
 
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
