@@ -30,6 +30,7 @@ fn reserve(cm: &ClusterManager, id: JobId, attempt: u32, nodes: &[(&str, Resourc
         total.add(a);
     }
     cm.apply_operation(&WalOperation::JobStart {
+        preemption_observation: None,
         job_id: id,
         nodes: nodes.iter().map(|(n, _)| n.to_string()).collect(),
         resources: total,
@@ -63,6 +64,9 @@ fn preempt(
     owner_attempt: u32,
 ) -> WalOperation {
     let op = WalOperation::JobPreemptRequeue {
+        preemption_claim: Some(
+            cm.preemption_claim(&cm.get_job(id).expect("victim"), u64::from(owner_attempt)),
+        ),
         job_id: id,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(owner_attempt),
@@ -75,6 +79,12 @@ fn preempt(
     assert!(cm.apply_operation(&op).preempt_applied);
     op
 }
+
+#[path = "preemption_usage_review_tests.rs"]
+mod review;
+
+#[path = "preemption_usage_attempt_tests.rs"]
+mod attempts;
 
 fn confirm(cm: &ClusterManager, attempt: u32, released: bool) {
     cm.apply_operation(&WalOperation::preemption_release(10, attempt, released));
@@ -215,6 +225,7 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
     let pending = PreemptPending {
+        preemption_claim: None,
         preemptor_run_attempt: Some(1),
         signaled_at: chrono::DateTime::UNIX_EPOCH,
         deadline: chrono::DateTime::UNIX_EPOCH,
@@ -264,6 +275,7 @@ fn capacity_released_after_requester_launch_is_unused() {
     start(&cm, 1, 1, &[("n1", scalar())]);
     assert!(
         cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: 1,
             preempted_by: Some(10),
             preemptor_run_attempt: Some(1),
@@ -297,6 +309,7 @@ fn reclaimed_capacity_without_a_handoff_is_excluded() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptRequeue {
+        preemption_claim: None,
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),
@@ -408,7 +421,7 @@ fn frozen_old_snapshot_and_grace_default_to_no_usage_and_no_request_epoch() {
 #[test]
 fn absent_claims_require_no_raft_write() {
     let (_dir, cm) = cluster();
-    cm.confirm_preemption_release(10, 1, true)
+    cm.confirm_preemption_observation(10, 1, Some(1), true)
         .expect("no Raft handle needed for an untracked launch");
 }
 
@@ -417,6 +430,7 @@ fn success_before_late_release_survives_a_snapshot() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptCancel {
+        preemption_claim: None,
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),
@@ -534,6 +548,7 @@ fn cancelled_requester_is_retained_until_its_warned_victims_release_capacity() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptCancel {
+        preemption_claim: None,
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),

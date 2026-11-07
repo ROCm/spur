@@ -2732,8 +2732,7 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Charge a placement in Raft before dispatching, so a leader change
-    /// mid-dispatch finds it charged rather than free. Returns the run epoch.
+    #[cfg(test)]
     pub fn reserve_placement(
         &self,
         job_id: JobId,
@@ -2742,6 +2741,31 @@ impl ClusterManager {
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
         idle_fill: bool,
+    ) -> anyhow::Result<u32> {
+        let observation = self.preemption_observation(job_id);
+        self.reserve_placement_for_observation(
+            job_id,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            idle_fill,
+            observation,
+        )
+    }
+
+    /// Charge a placement in Raft before dispatching, so a leader change
+    /// mid-dispatch finds it charged rather than free. Returns the run epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_placement_for_observation(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        idle_fill: bool,
+        preemption_observation: Option<u64>,
     ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
@@ -2780,6 +2804,7 @@ impl ClusterManager {
         // the job is still Pending; the transition to Running follows once the
         // dispatch is confirmed (see `activate_job`).
         let resp = self.propose(WalOperation::JobStart {
+            preemption_observation,
             job_id,
             nodes: node_names,
             resources,
@@ -3159,9 +3184,17 @@ impl ClusterManager {
     /// already in a grace, so the caller must not warn it.
     pub fn signal_preemption(
         &self,
-        pending: PreemptPending,
+        mut pending: PreemptPending,
         job_id: JobId,
     ) -> anyhow::Result<bool> {
+        if pending.preemption_claim.is_none() {
+            if let Some(victim) = self.get_job(job_id) {
+                pending.preemption_claim = Some(self.preemption_claim(
+                    &victim,
+                    self.next_preemption_observation(pending.preempted_by),
+                ));
+            }
+        }
         let resp = self.propose(WalOperation::JobPreemptSignaled { job_id, pending })?;
         Ok(resp.preempt_signal_applied)
     }
@@ -3236,9 +3269,11 @@ impl ClusterManager {
             preempt_qos,
             true,
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn preempt_job_for_attempt(
         &self,
         job_id: JobId,
@@ -3247,6 +3282,7 @@ impl ClusterManager {
         preemptor: JobId,
         preemptor_run_attempt: u32,
         preempt_qos: Option<String>,
+        observation_id: Option<u64>,
     ) -> anyhow::Result<PreemptOutcome> {
         self.preempt_job_inner(
             job_id,
@@ -3256,6 +3292,7 @@ impl ClusterManager {
             preempt_qos,
             true,
             Some(preemptor_run_attempt),
+            observation_id,
         )
     }
 
@@ -3280,6 +3317,7 @@ impl ClusterManager {
             preempt_qos,
             false,
             None,
+            None,
         )
     }
 
@@ -3293,8 +3331,9 @@ impl ClusterManager {
         preempt_qos: Option<String>,
         earmark_freed: bool,
         preemptor_run_attempt: Option<u32>,
+        observation_id: Option<u64>,
     ) -> anyhow::Result<PreemptOutcome> {
-        {
+        let preemption_claim = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -3310,7 +3349,12 @@ impl ClusterManager {
                     expected_run_attempt
                 );
             }
-        }
+            preempted_by.filter(|_| earmark_freed).map(|owner| {
+                let observation =
+                    observation_id.unwrap_or_else(|| self.next_preemption_observation(owner));
+                self.preemption_claim(job, observation)
+            })
+        };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
@@ -3336,6 +3380,7 @@ impl ClusterManager {
             }
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
+                    preemption_claim,
                     preemptor_run_attempt,
                     job_id,
                     preempted_by,
@@ -3372,6 +3417,7 @@ impl ClusterManager {
                         .map_or(hold, |user_begin| user_begin.max(hold))
                 };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    preemption_claim,
                     preemptor_run_attempt,
                     handoff: earmark_freed && preempted_by.is_some(),
                     job_id,
@@ -8560,6 +8606,7 @@ impl ClusterManager {
                 }
             }
             WalOperation::JobStart {
+                preemption_observation: _,
                 job_id,
                 nodes: node_names,
                 resources,
@@ -8667,8 +8714,8 @@ impl ClusterManager {
 
                     let grace = job
                         .preempt_grace()
-                        .filter(|_| job.state == JobState::Running)
-                        .cloned();
+                        .filter(|_| job.state == JobState::Running);
+                    let in_grace = grace.is_some();
                     let already_reported = job.node_completions.contains_key(node_name);
                     freed_for_preemptor = if already_reported {
                         None
@@ -8704,7 +8751,13 @@ impl ClusterManager {
                         }
                     }
 
-                    Self::advance_after_node_report(job, grace.as_ref(), timestamp)
+                    // A claim carries every node's allocation; only the final report needs a copy.
+                    if in_grace && !job.all_nodes_completed() {
+                        None
+                    } else {
+                        let grace = job.preempt_grace().filter(|_| in_grace).cloned();
+                        Self::advance_after_node_report(job, grace.as_ref(), timestamp)
+                    }
                 };
 
                 if let Some(preemptor) = freed_for_preemptor {
@@ -13366,6 +13419,7 @@ state = "UP"
         let id = submit_and_wait(&cm, basic_spec("a"));
         let res = scalar_alloc(4, 8000);
         let start = |run_attempt| WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec!["n1".into()],
             resources: res.clone(),
@@ -14708,6 +14762,7 @@ state = "UP"
 
         let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: resources.clone(),
@@ -14909,6 +14964,7 @@ state = "UP"
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0, 1]);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: stale_slice.clone(),
@@ -14996,6 +15052,7 @@ state = "UP"
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0]);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: stale_slice.clone(),
@@ -15028,6 +15085,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
@@ -16083,6 +16141,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -16128,6 +16187,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -16174,6 +16234,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -16247,6 +16308,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -16312,6 +16374,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -16382,6 +16445,7 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
 
         let start = || WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -16494,6 +16558,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
@@ -16550,6 +16615,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -16587,6 +16653,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -16638,6 +16705,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -16683,6 +16751,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -16693,6 +16762,7 @@ state = "UP"
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
@@ -16743,6 +16813,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -16777,6 +16848,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -17210,6 +17282,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -17247,6 +17320,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -17287,6 +17361,7 @@ state = "UP"
         ));
         // Re-dispatched run: current epoch is 2.
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -17328,6 +17403,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -17408,6 +17484,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -17827,6 +17904,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-kind", "worker1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id,
@@ -18053,6 +18131,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id,
@@ -19975,6 +20054,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -19988,6 +20068,7 @@ state = "UP"
 
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
@@ -20029,6 +20110,7 @@ state = "UP"
 
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
@@ -20061,6 +20143,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -20080,6 +20163,7 @@ state = "UP"
 
     fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
@@ -20091,6 +20175,7 @@ state = "UP"
 
     fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
@@ -20637,6 +20722,7 @@ state = "UP"
 
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -20714,6 +20800,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -20729,6 +20816,7 @@ state = "UP"
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
@@ -20755,6 +20843,7 @@ state = "UP"
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
@@ -22888,6 +22977,7 @@ state = "UP"
         let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
         let signaled_at = Utc::now();
         let pending = PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
@@ -23233,6 +23323,7 @@ state = "UP"
         let victim = run_job_on(cm, "victim", "n1");
         let owner = submit_and_wait(cm, basic_spec("owner"));
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
@@ -23255,6 +23346,7 @@ state = "UP"
         }
         let owner = requeue_into_earmark(&cm);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: owner,
             nodes: vec!["n2".into()],
             resources: scalar_alloc(2, 4000),
@@ -23288,6 +23380,7 @@ state = "UP"
         let victim = run_job_on(&cm, "victim", "n1");
         let owner = run_job_on(&cm, "owner", "n2");
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
@@ -32036,6 +32129,7 @@ state = "UP"
             .expect("fixture instant")
             .with_timezone(&Utc);
         PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
@@ -32137,7 +32231,10 @@ state = "UP"
                 spec: Box::new(basic_spec("preemptor")),
             });
         }
-        let mut pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        let victim = cm.get_job(id).expect("grace victim");
+        let mut pending = preempt_pending_for(victim.run_attempt, 90);
+        pending.preemption_claim =
+            Some(cm.preemption_claim(&victim, cm.next_preemption_observation(99)));
         pending.mode = mode;
         let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
             job_id: id,
@@ -32219,7 +32316,13 @@ state = "UP"
         let pending = preempt_pending_for(attempt, 90);
 
         assert!(cm.signal_preemption(pending.clone(), id).unwrap());
-        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(pending));
+        let victim = cm.get_job(id).unwrap();
+        let mut saved = victim.preempt_pending.clone().unwrap();
+        assert_eq!(
+            saved.preemption_claim.take(),
+            Some(cm.preemption_claim(&victim, 1))
+        );
+        assert_eq!(saved, pending);
 
         let again = preempt_pending_for(attempt, 600);
         assert!(!cm.signal_preemption(again, id).unwrap());
@@ -32731,6 +32834,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
@@ -32752,6 +32856,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: false,
             job_id: id,
@@ -33097,13 +33202,18 @@ state = "UP"
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
             let id = run_two_node_job_in_grace(&cm, mode);
+            let pending = cm.get_job(id).unwrap().preempt_pending.unwrap();
+            assert_eq!(
+                pending.preemption_claim.as_ref().unwrap().allocations.len(),
+                2
+            );
 
             let resp = report_node(&cm, id, "n1", grace_exit_at());
 
             assert!(resp.jobs_finalized.is_empty(), "{mode:?}");
             let job = cm.get_job(id).unwrap();
             assert_eq!(job.state, JobState::Running, "{mode:?}");
-            assert!(job.preempt_pending.is_some(), "{mode:?}");
+            assert_eq!(job.preempt_pending, Some(pending), "{mode:?}");
             assert_eq!(job.end_time, None, "{mode:?}");
             assert_eq!(job.cancel_signaled_at, None, "{mode:?}");
             assert_eq!(job.preempted_by, None, "not preempted until the deadline");
@@ -33112,6 +33222,21 @@ state = "UP"
             assert_eq!(cpus_in_use(&cm, "n2"), 1, "the other node is still held");
             assert_eq!(earmark_owner(&cm, "n1"), Some(99), "{mode:?}");
             assert_eq!(earmark_owner(&cm, "n2"), None, "{mode:?}");
+
+            let last = report_node(&cm, id, "n2", grace_exit_at());
+            assert_eq!(last.jobs_finalized.len(), 1, "{mode:?}");
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(
+                job.state,
+                if mode == PreemptMode::Cancel {
+                    JobState::Cancelled
+                } else {
+                    JobState::Pending
+                },
+                "{mode:?}"
+            );
+            assert!(job.preempt_pending.is_none(), "{mode:?}");
+            assert_eq!(cm.preemption_usage().open, 1, "one victim run");
         }
     }
 
@@ -33120,12 +33245,19 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        let pending = cm.get_job(id).unwrap().preempt_pending;
         report_node(&cm, id, "n1", grace_exit_at());
         take_over_node(&cm, "n1");
 
         report_node(&cm, id, "n1", grace_exit_at());
 
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, pending);
+        assert_eq!(
+            cm.preemption_usage().open,
+            1,
+            "replay does not reopen the claim"
+        );
         assert_eq!(cpus_in_use(&cm, "n1"), 1, "only the job that took n1 over");
     }
 
@@ -33166,6 +33298,7 @@ state = "UP"
         take_over_node(&cm, "n1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
@@ -33247,6 +33380,7 @@ state = "UP"
         let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: true,
             job_id: id,
@@ -37948,6 +38082,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
@@ -37966,6 +38101,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
@@ -38749,6 +38885,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
             resources: scalar_alloc(nodes.len() as u32, 1000 * nodes.len() as u64),

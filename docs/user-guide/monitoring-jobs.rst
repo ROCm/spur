@@ -1087,7 +1087,7 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - GPUs allocated to running/completing jobs.
 
 Preemption outcomes — ``/metrics/scheduler``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``sdiag`` reports cluster totals and up to 1000 visible users (sorted by name,
 with a truncation notice). ``scontrol show job`` reports a requesting job's
@@ -1138,13 +1138,19 @@ by user-supplied input still has a system launch-failure verdict. The
 No username, job ID, or node name is a Prometheus label.
 
 Device-backed victims require matching node-local device IDs and inventory
-generation; merely using CPU on the same GPU node is insufficient. CPU and
-memory have no allocation-unit identities, so scalar-only attribution consumes
+generation; merely using CPU on the same GPU node is insufficient. Legacy
+device allocations without node-local identity cannot establish matching use.
+CPU and memory have no allocation-unit identities, so scalar-only attribution consumes
 a deterministic capacity budget in victim-ID order. This is an approximation,
 not proof that preemption was necessary or a measure of lost GPU-hours. One
 victim using any matching capacity counts once; this does not measure the
 fraction of its allocation used. Capacity released after launch confirmation
 cannot serve that launch.
+
+Each requesting attempt has its own persisted observation ID, including retries
+that fail before resource reservation advances the job's run number. Victim
+allocation evidence travels in the preemption entry; requester evidence comes
+from its reservation entry, so replicas use the same identities.
 
 Totals and open observations are persisted through the Raft log and snapshots.
 They start when this feature begins observing events, survive controller restart,
@@ -1160,8 +1166,10 @@ The counters piggyback on existing state-machine operations. A requesting launch
 with unresolved tracked preemptions writes at most one additional guarded
 release confirmation, regardless of the number of victims or metric buckets.
 Launches without tracked preemptions add no log entry. Open claim storage grows
-with tracked victim allocations; completed claims are removed. Aggregate and
-per-user storage grows with the number of users and the fixed cause buckets.
+with tracked victim allocations; completed claims are removed. Recording a
+partial node completion updates that node's release evidence without copying
+the victim's entire allocation. Aggregate and per-user storage grows with the
+number of users and the fixed cause buckets.
 Controllers from before this feature do not maintain these observations; use a
 uniform controller version when relying on the lifetime totals.
 

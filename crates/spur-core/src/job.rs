@@ -870,6 +870,8 @@ pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreemptPending {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preemptor_run_attempt: Option<u32>,
     pub signaled_at: DateTime<Utc>,
     pub deadline: DateTime<Utc>,
@@ -2392,6 +2394,7 @@ mod tests {
             .expect("fixture instant")
             .with_timezone(&Utc);
         let pending = PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at: at,
             deadline: at + chrono::Duration::seconds(90),
@@ -2417,6 +2420,7 @@ mod tests {
         assert!(job.preempt_grace().is_none());
 
         job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at: at,
             deadline: at + chrono::Duration::seconds(90),

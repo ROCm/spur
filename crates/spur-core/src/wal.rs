@@ -64,6 +64,8 @@ pub enum WalOperation {
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemption_observation: Option<u64>,
         job_id: JobId,
         nodes: Vec<String>,
         resources: ResourceAllocations,
@@ -205,6 +207,8 @@ pub enum WalOperation {
     /// the leader-computed absolute instant (already max'd against any user
     /// `--begin`); followers apply it verbatim and re-apply is a NoOp.
     JobPreemptRequeue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
         /// Fix the requesting epoch before the scheduler awaits victim signals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preemptor_run_attempt: Option<u32>,
@@ -235,6 +239,8 @@ pub enum WalOperation {
     /// dependents and arrays resolve. Single atomic entry so a leadership
     /// change cannot strand the job running with its allocations held.
     JobPreemptCancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
         /// Fix the requesting epoch before the scheduler awaits victim signals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preemptor_run_attempt: Option<u32>,
@@ -547,6 +553,7 @@ impl WalOperation {
             before: None,
             at: None,
             preemption_release: Some(crate::preemption_usage::PreemptionRelease {
+                observation_id: None,
                 job_id,
                 run_attempt,
                 released,
@@ -653,6 +660,7 @@ impl WalOperation {
         per_node_alloc: HashMap<String, ResourceAllocations>,
     ) -> Self {
         Self::JobStart {
+            preemption_observation: None,
             job_id,
             nodes,
             resources,
@@ -1236,6 +1244,7 @@ mod tests {
     #[test]
     fn job_start_idle_fill_stamp_round_trips() {
         let op = WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 8,
             nodes: vec!["n1".into()],
             resources: ResourceAllocations::default(),
@@ -1249,7 +1258,10 @@ mod tests {
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobStart {
-                job_id, idle_fill, ..
+                preemption_observation: _,
+                job_id,
+                idle_fill,
+                ..
             } => {
                 assert_eq!(job_id, 8);
                 assert!(idle_fill, "the stamp must survive the WAL round-trip");
@@ -1796,6 +1808,7 @@ mod suspend_wal_tests {
     fn preempt_cancel_op_round_trips() {
         let stamped = chrono::Utc::now();
         let op = WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             job_id: 7,
             preempted_by: Some(3),
@@ -1807,6 +1820,7 @@ mod suspend_wal_tests {
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobPreemptCancel {
+                preemption_claim: _,
                 job_id,
                 preempted_by,
                 preempt_qos,
@@ -1829,6 +1843,7 @@ mod suspend_wal_tests {
         let back: WalOperation = serde_json::from_str(legacy).unwrap();
         match back {
             WalOperation::JobPreemptCancel {
+                preemption_claim: _,
                 job_id,
                 preempted_by,
                 preempt_qos,
@@ -1851,6 +1866,7 @@ mod suspend_wal_tests {
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             handoff: true,
             job_id: 42,
@@ -2072,6 +2088,7 @@ mod suspend_wal_tests {
             r#""run_attempt":2,"requeue_hold_secs":30}}}"#
         );
         let pending = crate::job::PreemptPending {
+            preemption_claim: None,
             preemptor_run_attempt: None,
             signaled_at: at,
             deadline,
