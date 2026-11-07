@@ -1189,6 +1189,7 @@ mod tests {
                 assert!(!spec.pty);
                 assert!(!spec.srun_job);
                 assert!(spec.gpus.is_none());
+                assert_eq!(spec.memory_per_gpu_mb, None);
             }
             _ => panic!("wrong variant"),
         }

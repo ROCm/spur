@@ -15572,15 +15572,26 @@ mod tests {
 
     #[test]
     fn partition_info_without_limits_encodes_no_new_fields() {
+        use prost::encoding::{decode_key, skip_field, DecodeContext};
         use prost::Message;
         let info = partition_to_proto(&spur_core::partition::Partition {
             name: "plain".into(),
             ..Default::default()
         });
-        assert_eq!(info.max_cpus_per_node, None);
-        assert!(info.max_tres_per_node.is_empty());
-        let decoded = PartitionInfo::decode(info.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded, info);
+        let wire = info.encode_to_vec();
+        let mut buf: &[u8] = &wire;
+        let mut tags = Vec::new();
+        while !buf.is_empty() {
+            let (tag, wire_type) = decode_key(&mut buf).unwrap();
+            skip_field(wire_type, tag, &mut buf, DecodeContext::default()).unwrap();
+            tags.push(tag);
+        }
+        let limit_tags = 46..=52;
+        assert!(
+            !tags.iter().any(|tag| limit_tags.contains(tag)),
+            "an older client must see the same bytes, got tags {tags:?}"
+        );
+        assert!(tags.contains(&1), "the name is still encoded: {tags:?}");
     }
 
     // --- register_agent relabeling gate ---
