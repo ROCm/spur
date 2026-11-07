@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.16.0](https://github.com/ROCm/spur/compare/v0.15.0...v0.16.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **auth:** extend private_data to users, accounts, and reservations ([#1186](https://github.com/ROCm/spur/issues/1186))
+* **spurctld:** preemption grace time and configurable kill waits ([#1181](https://github.com/ROCm/spur/issues/1181))
+* **spur-devices:** the stable_id of partitions 1 to 7 of a partitioned GPU changes, and stable_id is the allocation key in the persisted state. Drain nodes that run a GPU in a partitioned mode before you upgrade spurd.
+* **spurctld:** reap abandoned interactive allocations by default ([#1143](https://github.com/ROCm/spur/issues/1143))
+* **deploy:** run spurctld and the operator as UID and GID 10001 ([#1108](https://github.com/ROCm/spur/issues/1108))
+* **spur-cli:** honor ExcNodeList in scontrol update and fail on unknown keys ([#1089](https://github.com/ROCm/spur/issues/1089))
+
+### Features
+
+* **auth:** extend private_data to users, accounts, and reservations ([#1186](https://github.com/ROCm/spur/issues/1186)) ([9ab6fd2](https://github.com/ROCm/spur/commit/9ab6fd2893808fcb9d9a69222b72dc649352795c))
+* **examples:** add multi-tenant GPU node prolog and epilog hooks ([#1184](https://github.com/ROCm/spur/issues/1184)) ([7744aa2](https://github.com/ROCm/spur/commit/7744aa27915a36c586ec630d5f11007c9552258e))
+* **karma:** native Prometheus counters + accounting columns for karma scoring ([#964](https://github.com/ROCm/spur/issues/964)) ([4922fc1](https://github.com/ROCm/spur/commit/4922fc1250627ec809de22a6149eefe2b66a59b7))
+* **spur-cli:** add -p/-P parsable output to sacct ([#1082](https://github.com/ROCm/spur/issues/1082)) ([7eb45e5](https://github.com/ROCm/spur/commit/7eb45e5fd2a44a35640976f39e3a0ab052cd3e08))
+* **spurctld:** add TRESBillingWeights for CPU+GPU fairshare billing ([#1164](https://github.com/ROCm/spur/issues/1164)) ([242662a](https://github.com/ROCm/spur/commit/242662a6f1e6d6249fea82d61a5792ffaf49f73c))
+* **spurctld:** commit placement to Raft before dispatch ([#924](https://github.com/ROCm/spur/issues/924)) ([b050388](https://github.com/ROCm/spur/commit/b050388f877aa2331331a3e67746548979338ec0))
+* **spurctld:** core and memory specialization for node services ([#1162](https://github.com/ROCm/spur/issues/1162)) ([d7f8efc](https://github.com/ROCm/spur/commit/d7f8efce52f4f7cbf95a0964cf854bdb14392786))
+* **spurctld:** preemption grace time and configurable kill waits ([#1181](https://github.com/ROCm/spur/issues/1181)) ([932a4ca](https://github.com/ROCm/spur/commit/932a4cacaa10fc12a6038cc037e5561e2e150f15))
+* **spurctld:** reap abandoned interactive allocations by default ([#1143](https://github.com/ROCm/spur/issues/1143)) ([278cd44](https://github.com/ROCm/spur/commit/278cd442f4935e07b48280b0b4b4b73061215bf7))
+* **spurd:** add durable admission ledger core ([#928](https://github.com/ROCm/spur/issues/928)) ([eb20be7](https://github.com/ROCm/spur/commit/eb20be7d3c79f20bffe2f79bf47ba69c456dd418))
+* **topology:** add read-only rack system discovery and placement ([#1092](https://github.com/ROCm/spur/issues/1092)) ([c84506d](https://github.com/ROCm/spur/commit/c84506dd851221750f45f5fa3698b7ea988af977))
+
+
+### Bug Fixes
+
+* **accounting:** fill sacct rows for jobs cancelled before start and show Reason by default ([#1158](https://github.com/ROCm/spur/issues/1158)) ([18a844d](https://github.com/ROCm/spur/commit/18a844d704c2141359fd0f019116e1e304a3e3a7))
+* **deploy:** run spurctld and the operator as UID and GID 10001 ([#1108](https://github.com/ROCm/spur/issues/1108)) ([f4be460](https://github.com/ROCm/spur/commit/f4be460c9df56e4b6284d4fcd8a5af0db1439801))
+* **install:** remove the pmix plugin on uninstall ([#1196](https://github.com/ROCm/spur/issues/1196)) ([eafa9ce](https://github.com/ROCm/spur/commit/eafa9ce7b48105d3ac5cfa8555cc0f146c1527cc))
+* **runtime:** quarantine nodes when job cgroup cleanup stalls ([#1166](https://github.com/ROCm/spur/issues/1166)) ([6a34116](https://github.com/ROCm/spur/commit/6a34116edb50e4acbc7e26116d78be78264e26da))
+* **sched:** share preemption handoffs between preemptors on one node ([#1163](https://github.com/ROCm/spur/issues/1163)) ([9c6ef42](https://github.com/ROCm/spur/commit/9c6ef42fc3f901242cb61cc6d767e6663c3e95f3))
+* **spur-cli:** accept sbatch --no-requeue ([#1130](https://github.com/ROCm/spur/issues/1130)) ([f8b7cbb](https://github.com/ROCm/spur/commit/f8b7cbb19beedf5d507d40e664e02e52bde03960))
+* **spur-cli:** honor ExcNodeList in scontrol update and fail on unknown keys ([#1089](https://github.com/ROCm/spur/issues/1089)) ([f055a6a](https://github.com/ROCm/spur/commit/f055a6a9175978064090727e561380a4b363d3d4))
+* **spur-cli:** reject invalid -j job ids instead of dropping them ([#1129](https://github.com/ROCm/spur/issues/1129)) ([479cfc4](https://github.com/ROCm/spur/commit/479cfc4aa423f68ff53b4da5f6adcf0669f6aff7))
+* **spur-cli:** scancel --reservation, sacctmgr --help fields, and show association ([#1102](https://github.com/ROCm/spur/issues/1102)) ([fd9ad75](https://github.com/ROCm/spur/commit/fd9ad757c5243cd07f94a29240682e62cf3a4989))
+* **spur-cli:** show preempt and other stored qos fields in sacctmgr show qos ([#1127](https://github.com/ROCm/spur/issues/1127)) ([6ad1909](https://github.com/ROCm/spur/commit/6ad19095b6e5499d607333846c2e745a4d89bfc1))
+* **spur-core:** renumber the HIP device selector for the ROCR-narrowed set ([#915](https://github.com/ROCm/spur/issues/915)) ([953143d](https://github.com/ROCm/spur/commit/953143d610a49522bd6aef24323c84668c61c392))
+* **spur-devices:** decode cpx partitions to the parent pci device ([#942](https://github.com/ROCm/spur/issues/942)) ([f3fc187](https://github.com/ROCm/spur/commit/f3fc18770ae72840f82b078897a6f545f0ff1d68))
+* **spurctld:** bound graceful shutdown to a configurable deadline ([#937](https://github.com/ROCm/spur/issues/937)) ([4bacc3c](https://github.com/ROCm/spur/commit/4bacc3c427931937582f93f998d1d5f0087a5359))
+* **spurctld:** bound raft writes and leader confirmation so the scheduler cannot hang ([#1087](https://github.com/ROCm/spur/issues/1087)) ([905a075](https://github.com/ROCm/spur/commit/905a075b1e9187a05e7ca0518abbcc1c8539a30c))
+* **spurctld:** derive resumed node state from live allocations ([#1107](https://github.com/ROCm/spur/issues/1107)) ([7a930ea](https://github.com/ROCm/spur/commit/7a930eab7d8b730aec99a8c6e83605e29d30e900))
+* **spurctld:** don't let an unplaceable job hold group quota ([#1081](https://github.com/ROCm/spur/issues/1081)) ([c654535](https://github.com/ROCm/spur/commit/c654535abc27badeecbe226d8dd573a0238e9c9d))
+* **spurctld:** finish a standalone srun --pty job when its shell exits ([#1142](https://github.com/ROCm/spur/issues/1142)) ([ce2e818](https://github.com/ROCm/spur/commit/ce2e818000bfbaece1dc1e79ae5b53c34cb38427))
+* **spurctld:** hoist in-flight preemptors to the front of placement ([#1099](https://github.com/ROCm/spur/issues/1099)) ([6d694a2](https://github.com/ROCm/spur/commit/6d694a28dcce0afdcfe477c19219527661b78ed4))
+* **spurctld:** preserve preemption handoffs for competing preemptors and late requeues ([#1141](https://github.com/ROCm/spur/issues/1141)) ([693c0b3](https://github.com/ROCm/spur/commit/693c0b32bf91a0965a63a263206e6e22a3e5a9e9))
+* **spurctld:** record allocated nodes in job accounting ([#1115](https://github.com/ROCm/spur/issues/1115)) ([ea29007](https://github.com/ROCm/spur/commit/ea29007c43973146dbf4952672d253befb50b146))
+* **spurctld:** resolve delayed drains after allocations clear ([#1131](https://github.com/ROCm/spur/issues/1131)) ([8a7a949](https://github.com/ROCm/spur/commit/8a7a949eabe0e215a38bc592354c165d33653f1d))
+* **spurctld:** stop a requeued job's run left on a node that was down ([#1177](https://github.com/ROCm/spur/issues/1177)) ([50cae04](https://github.com/ROCm/spur/commit/50cae04f11d6965a7514c94bf9099af5deb728e9))
+* **spurd:** fail heartbeats over on ResourceExhausted and retry within the beat ([#1151](https://github.com/ROCm/spur/issues/1151)) ([1caf3b6](https://github.com/ROCm/spur/commit/1caf3b67219f1a70c72715e343076fe4a7949399))
+* **spurd:** keep gpu allocations correct across stable_id and partition changes ([#1189](https://github.com/ROCm/spur/issues/1189)) ([9314a5b](https://github.com/ROCm/spur/commit/9314a5bf60b451da9bf371fce0448b8ed4bdeea2))
+* **spurd:** name the jobs holding the GPUs when a dispatch is refused ([#1147](https://github.com/ROCm/spur/issues/1147)) ([a9c6027](https://github.com/ROCm/spur/commit/a9c6027f2434acedbefdb91aad680ae0313f3cb9))
+* **spurd:** stop stepd launch collisions and fast-exit pty failures ([#1020](https://github.com/ROCm/spur/issues/1020)) ([c1274a9](https://github.com/ROCm/spur/commit/c1274a9ba4dcc481878c64a034148fb1828156c4))
+* **steps:** preserve buffered srun results across daemon restarts ([#938](https://github.com/ROCm/spur/issues/938)) ([799f59b](https://github.com/ROCm/spur/commit/799f59bbd12a244af96786b4a6d9191ff48bc698))
+* **steps:** preserve completed results when output replay fails ([#1145](https://github.com/ROCm/spur/issues/1145)) ([09345ed](https://github.com/ROCm/spur/commit/09345ed828ca37938cf9a7fb2b0eba071b9f028d))
+* **submission:** reject empty job bodies before scheduling ([#1133](https://github.com/ROCm/spur/issues/1133)) ([ddfef54](https://github.com/ROCm/spur/commit/ddfef546a0d1bfc12215b3a56b0c40ba04435443))
+
 ## [0.15.0](https://github.com/ROCm/spur/compare/v0.14.0...v0.15.0) (2026-10-16)
 
 

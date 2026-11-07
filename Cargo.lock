@@ -3555,7 +3555,7 @@ dependencies = [
 
 [[package]]
 name = "spur-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3584,7 +3584,7 @@ dependencies = [
 
 [[package]]
 name = "spur-client"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -3595,7 +3595,7 @@ dependencies = [
 
 [[package]]
 name = "spur-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "spur-devices"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "semver",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "spur-ffi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "prost-types",
  "spur-client",
@@ -3646,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "spur-k8s"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "spur-metrics"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "prometheus-client",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "spur-mpi-pmix"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "spur-net"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3711,7 +3711,7 @@ dependencies = [
 
 [[package]]
 name = "spur-proto"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "spur-sched"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "spur-core",
@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "spur-spank"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "libloading",
@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "spur-stepd"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "spur-core",
@@ -3753,7 +3753,7 @@ dependencies = [
 
 [[package]]
 name = "spur-tests"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "jsonwebtoken",
@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "spur-update"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "spurauthd"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "spurctld"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "spurd"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
