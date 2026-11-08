@@ -5792,6 +5792,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         core_spec_count: spec_core_count,
         mem_spec_mb: spec_mem_mb,
         cpu_tot: node.cpu_tot(),
+        not_responding: node.not_responding,
     }
 }
 

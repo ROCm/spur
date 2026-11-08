@@ -4362,6 +4362,8 @@ impl ClusterManager {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
+            // The leader is hearing this node again, so it may take work.
+            node.not_responding = false;
             true
         } else {
             false
@@ -5306,7 +5308,34 @@ impl ClusterManager {
                 HealthAction::Recover { .. } => true,
             }),
         }
+        // Outside the grace window, flag silent nodes NOT_RESPONDING so they take
+        // no new work while the leader cannot hear them, DOWN or not.
+        if !matches!(mark_down, MarkDownPolicy::Suppressed) {
+            self.refresh_not_responding(timeout_secs, Utc::now());
+        }
         self.apply_health_actions(actions)
+    }
+
+    /// Flags a node NOT_RESPONDING when its heartbeat is stale and clears the
+    /// flag on one heard from within the timeout. A node with no heartbeat on
+    /// record (already Down) is left alone. A flagged node keeps its running
+    /// jobs but takes no new work until heartbeats resume (Slurm's `*`).
+    fn refresh_not_responding(&self, timeout_secs: u64, now: DateTime<Utc>) {
+        let threshold = chrono::Duration::seconds(timeout_secs as i64);
+        let mut nodes = self.nodes.write();
+        for node in nodes.values_mut() {
+            if let Some(hb) = node.last_heartbeat {
+                node.not_responding = now - hb > threshold;
+            }
+        }
+    }
+
+    /// Clear NOT_RESPONDING on every node, on leadership (re)gain: a new
+    /// leadership must recompute it from the heartbeats it itself sees.
+    pub(crate) fn clear_not_responding(&self) {
+        for node in self.nodes.write().values_mut() {
+            node.not_responding = false;
+        }
     }
 
     /// The stale nodes a health pass would mark Down, read before anything is
@@ -7381,10 +7410,11 @@ impl ClusterManager {
                 continue;
             }
 
-            // Eligible nodes exist but none are up. is_up() keeps a busy
-            // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
-            // is ReqNodeNotAvail (Slurm parity).
-            if eligible.iter().all(|n| !n.state.is_up()) {
+            // Eligible nodes exist but none can take work. is_up_for_work keeps a
+            // busy `Allocated` cluster out of NodeDown while also treating a
+            // not-responding node as unavailable; a nodelist pin to such nodes is
+            // ReqNodeNotAvail (Slurm parity).
+            if eligible.iter().all(|n| !n.is_up_for_work()) {
                 job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
@@ -22416,6 +22446,39 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_pinned_to_a_not_responding_node_reports_req_node_not_avail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // n1 stays Idle but is not responding, so it takes no new work and a
+        // job pinned to it waits with ReqNodeNotAvail, not Resources.
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.not_responding = true;
+        let nodes = vec![n1];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn additive_nodelist_fill_shortage_reports_resources() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -35709,6 +35772,52 @@ state = "UP"
         let evicted = cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
         assert!(evicted.is_empty());
         assert_eq!(cm.get_node("back").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_flags_a_silent_node_not_responding_and_a_heartbeat_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // Kept alive by the probe (Only with nobody confirmed), but still silent:
+        // the node is flagged and stops taking work, though its state stays up.
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.not_responding);
+        assert!(node.state.is_up() && !node.is_schedulable());
+
+        cm.update_heartbeat("n1", 0, 8000);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_window_does_not_flag_nodes_not_responding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // A just-elected leader has not heard from anyone yet; it must not flag
+        // the whole cluster not-responding during its grace window.
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_not_responding_restores_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        assert!(cm.get_node("n1").unwrap().not_responding);
+
+        cm.clear_not_responding();
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

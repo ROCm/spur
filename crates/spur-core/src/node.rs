@@ -360,6 +360,13 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
+    /// Leader-local: the leader's heartbeats from this node have gone stale, so
+    /// it is given no new work until they resume (Slurm's NOT_RESPONDING, the
+    /// `*` suffix). Its running jobs are untouched. Never persisted; a new leader
+    /// starts it false and recomputes it from heartbeats.
+    #[serde(skip)]
+    pub not_responding: bool,
+
     /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
     /// Agent gRPC listen port.
@@ -446,6 +453,7 @@ impl Node {
             last_busy: None,
             agent_start_time: None,
             last_heartbeat: None,
+            not_responding: false,
             address: None,
             port: 6818,
             wg_pubkey: None,
@@ -489,11 +497,19 @@ impl Node {
         !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
     }
 
-    /// Whether this node can accept new work. A node whose core settings cannot
-    /// yield a valid layout is excluded until the settings are fixed, so jobs
-    /// never land on a node that cannot enforce its spec cores.
+    /// Whether this node can accept new work. A node whose heartbeats have gone
+    /// stale (`not_responding`) takes none until they resume, though its running
+    /// jobs continue; one whose core settings cannot yield a valid layout takes
+    /// none until the settings are fixed, as it could not enforce its spec cores.
     pub fn is_schedulable(&self) -> bool {
-        self.state.is_available() && self.layout_block_reason().is_none()
+        self.state.is_available() && !self.not_responding && self.layout_block_reason().is_none()
+    }
+
+    /// Operationally up and reachable: up by state and currently responding.
+    /// The availability counterpart of [`NodeState::is_up`], used where a stale
+    /// node must read as unavailable (pending reasons, reservation targets).
+    pub fn is_up_for_work(&self) -> bool {
+        self.state.is_up() && !self.not_responding
     }
 
     /// CPUs counted before spec cores are set aside (Slurm `CPUTot`).
@@ -568,6 +584,36 @@ mod tests {
         assert!(n.is_k0s_reserved());
         n.k0s_role = None;
         assert!(!n.is_k0s_reserved());
+    }
+
+    #[test]
+    fn a_not_responding_node_is_up_but_takes_no_new_work() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        n.state = NodeState::Idle;
+        assert!(n.is_schedulable());
+        assert!(n.is_up_for_work());
+
+        n.not_responding = true;
+        // State is still up and its jobs keep running, but no new work lands.
+        assert!(n.state.is_up());
+        assert!(!n.is_schedulable());
+        assert!(!n.is_up_for_work());
+
+        n.not_responding = false;
+        assert!(n.is_schedulable());
+    }
+
+    #[test]
+    fn not_responding_is_never_persisted() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        n.not_responding = true;
+        let value = serde_json::to_value(&n).expect("serialize node");
+        assert!(
+            value.get("not_responding").is_none(),
+            "not_responding is leader-local and must not reach a snapshot"
+        );
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert!(!back.not_responding, "a replayed node starts responding");
     }
 
     #[test]

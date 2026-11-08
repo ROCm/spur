@@ -694,6 +694,11 @@ mod tests {
         }
         for name in ["n1", "n2", "n3"] {
             assert_eq!(state(&cm, name), NodeState::Idle, "{name}");
+            // Kept up, but flagged so they take no new work while silent.
+            assert!(
+                cm.get_node(name).unwrap().not_responding,
+                "{name} should be flagged not-responding"
+            );
         }
         assert!(
             prober.probed().is_empty(),

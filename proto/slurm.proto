@@ -551,6 +551,11 @@ message NodeInfo {
   // An active reservation covers the node. Set even when `active_reservation`
   // is blank because `[auth] private_data = ["reservations"]` hides its name.
   bool in_reservation = 63;
+
+  // The leader's heartbeats from this node have gone stale, so it is given no
+  // new work until they resume (Slurm's NOT_RESPONDING, the `*` suffix). Its
+  // base `state` and running jobs are unaffected. Leader-local, never persisted.
+  bool not_responding = 64;
 }
 
 message PartitionInfo {

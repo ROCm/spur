@@ -67,6 +67,7 @@ pub fn node_to_json(
     serde_json::json!({
         "name": node.name,
         "state": state,
+        "not_responding": node.not_responding,
         "reason": reason,
         "reason_uid": reason_uid,
         "reason_time": reason_time,
