@@ -2637,6 +2637,12 @@ impl SlurmController for ControllerService {
             )
             .map_err(register_node_rpc_status)?;
 
+        // Hold the node's recovery until its first heartbeat enumerates its jobs:
+        // a just-restarted agent may still be adopting runtime supervisors, and a
+        // clean report cannot be assumed before one arrives.
+        self.cluster
+            .record_node_report(&req.hostname, Some(crate::cluster::NodeReport::Unknown));
+
         // Deliver the node's freshly computed layout so the agent can enforce
         // spec cores/memory immediately, before its first heartbeat.
         let delivery = self.cluster.node_layout_delivery(&req.hostname);
@@ -2767,10 +2773,21 @@ impl SlurmController for ControllerService {
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
         // Noted before the heartbeat lands, so a health pass never sees the node
-        // back without also seeing that it still holds jobs the controller ended.
-        let stale_jobs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
-        self.cluster
-            .record_stale_report(&req.hostname, !stale_jobs.is_empty());
+        // back without also seeing it is not a clean report. An incomplete job
+        // list (a contended lock on the agent) is Unknown, not clean, so a busy
+        // read cannot release the hold with jobs still on the node.
+        let stale_runs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
+        let report = if !stale_runs.is_empty() {
+            let mut job_ids: Vec<u32> = stale_runs.iter().map(|r| r.job_id).collect();
+            job_ids.sort_unstable();
+            job_ids.dedup();
+            Some(crate::cluster::NodeReport::StaleJobs(job_ids))
+        } else if req.running_jobs_incomplete {
+            Some(crate::cluster::NodeReport::Unknown)
+        } else {
+            None
+        };
+        self.cluster.record_node_report(&req.hostname, report);
         if self
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
@@ -2791,7 +2808,7 @@ impl SlurmController for ControllerService {
                 self.cluster
                     .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, stale_jobs);
+            self.reclaim_stale_agent_jobs(&req.hostname, stale_runs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
@@ -9643,6 +9660,41 @@ mod tests {
         assert!(svc.cluster.reports_stale_jobs("n1"));
 
         svc.heartbeat(beat(&[])).await.expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
+
+        // An incomplete list (the agent's running-job map was locked) is not a
+        // clean report, even when empty, so it must not release a hold.
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            running_jobs: vec![],
+            running_jobs_incomplete: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_is_not_a_clean_report_until_the_first_heartbeat() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
         assert!(!svc.cluster.reports_stale_jobs("n1"));
     }
 

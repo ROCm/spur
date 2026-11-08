@@ -62,6 +62,7 @@ impl HeartbeatManager {
                             cpu_load: 0,
                             free_memory_mb: 0,
                             running_jobs: vec![],
+                            running_jobs_incomplete: false, // operator nodes hold no agent jobs to list
                             node_token: String::new(),
                             wg_pubkey: String::new(), // virtual agents are not on the mesh
                             k0s_status: None,         // virtual agents run no k0s unit
