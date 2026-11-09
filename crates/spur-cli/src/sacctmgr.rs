@@ -532,7 +532,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .transpose()?
                 .unwrap_or(spur_core::accounting::INFINITE);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
-            let qos = p.get("qos").cloned().unwrap_or_default();
+            let qos = p.get("qos").cloned();
 
             let mut client = connect(addr).await?;
             client
@@ -544,7 +544,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     fairshare_weight: Some(fairshare),
                     max_running_jobs: Some(max_jobs),
                     grp_tres: Some(grp_tres),
-                    allowed_qos: p.get("qos").cloned(),
+                    allowed_qos: qos.clone(),
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -557,8 +557,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 if parent.is_empty() { "root" } else { &parent },
                 fairshare
             );
-            if !qos.is_empty() {
-                println!("  QOS        = {qos}");
+            if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
+                println!("  QOS        = {q}");
             }
             println!(" Account added.");
             Ok(())
@@ -1757,41 +1757,11 @@ fn format_user_row(u: &UserInfo) -> String {
     )
 }
 
-/// One `sacctmgr show association` row. Share is the association's fairshare
-/// weight; QOS is its allow-list; Default is its default QOS (empty when none
-/// is pinned). Partition is blank for an all-partitions association. Takes the
-/// columns as plain values rather than the whole `UserInfo` so the row builder
-/// stays decoupled from the RPC type. `share` is `None` when the controller
-/// does not report a weight (an older controller predating the field) —
-/// rendered blank rather than a misleading `0`; a real stored 0 arrives as
-/// `Some(0)` and renders "0".
-#[cfg(test)]
-fn format_association_row(
-    user: &str,
-    account: &str,
-    partition: &str,
-    share: Option<u32>,
-    qos: &str,
-    default_qos: &str,
-) -> String {
-    let line = AssociationLine {
-        user: user.into(),
-        account: account.into(),
-        partition: partition.into(),
-        share,
-        qos: qos.into(),
-        default_qos: default_qos.into(),
-    };
-    format_engine::format_row(
-        &association_format_fields(None).expect("default association format is valid"),
-        &|spec| resolve_association_field(&line, spec),
-    )
-}
-
 struct AssociationLine {
     user: String,
     account: String,
     partition: String,
+    /// `None` when the controller omits the weight; a stored 0 is `Some(0)`.
     share: Option<u32>,
     qos: String,
     default_qos: String,
@@ -2202,10 +2172,32 @@ mod tests {
         assert!(!SHOW_FIELDS_HELP.contains("no filters"));
     }
 
+    fn render_default_association(
+        user: &str,
+        account: &str,
+        partition: &str,
+        share: Option<u32>,
+        qos: &str,
+        default_qos: &str,
+    ) -> String {
+        let line = AssociationLine {
+            user: user.into(),
+            account: account.into(),
+            partition: partition.into(),
+            share,
+            qos: qos.into(),
+            default_qos: default_qos.into(),
+        };
+        format_engine::format_row(
+            &association_format_fields(None).expect("default association format is valid"),
+            &|spec| resolve_association_field(&line, spec),
+        )
+    }
+
     #[test]
     fn association_row_renders_user_account_share_and_default() {
         // Partition is blank (all-partitions association) and so collapses out.
-        let row = format_association_row("amd", "carbonara", "", Some(1), "", "blocked");
+        let row = render_default_association("amd", "carbonara", "", Some(1), "", "blocked");
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols, vec!["amd", "carbonara", "1", "blocked"]);
     }
@@ -2213,14 +2205,14 @@ mod tests {
     #[test]
     fn association_row_share_blank_when_absent_but_zero_when_present() {
         // An older controller omits the weight (None) -> blank, not a misleading 0.
-        let absent = format_association_row("amd", "aac", "", None, "", "normal");
+        let absent = render_default_association("amd", "aac", "", None, "", "normal");
         assert_eq!(
             absent.split_whitespace().collect::<Vec<_>>(),
             vec!["amd", "aac", "normal"],
             "absent share must collapse out (blank), leaving no Share column value"
         );
         // A real stored 0 is distinct and renders "0".
-        let zero = format_association_row("amd", "aac", "", Some(0), "", "normal");
+        let zero = render_default_association("amd", "aac", "", Some(0), "", "normal");
         assert_eq!(
             zero.split_whitespace().collect::<Vec<_>>(),
             vec!["amd", "aac", "0", "normal"]
@@ -2229,14 +2221,14 @@ mod tests {
 
     #[test]
     fn association_row_shows_partition_when_scoped() {
-        let row = format_association_row("amd", "aac", "gpu", Some(4), "", "normal");
+        let row = render_default_association("amd", "aac", "gpu", Some(4), "", "normal");
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols, vec!["amd", "aac", "gpu", "4", "normal"]);
     }
 
     #[test]
     fn association_row_shows_qos_allow_list() {
-        let row = format_association_row(
+        let row = render_default_association(
             "",
             "amd-collectives",
             "",

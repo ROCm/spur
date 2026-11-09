@@ -2077,6 +2077,9 @@ message UserInfo {
   string admin_level = 3;
   string default_account = 4;
   string default_qos = 5;
+  // Effective allow-list: the user's own list, or the direct account's when
+  // the user has none. Empty when neither is set. Writing this back as
+  // AddUserRequest.allowed_qos would store an inherited list as the user's own.
   string allowed_qos = 6;
   // Per-association limits (read-back of what `sacctmgr add/modify user` set).
   // Numeric fields use the INFINITE sentinel (4294967295) for "no limit"; a

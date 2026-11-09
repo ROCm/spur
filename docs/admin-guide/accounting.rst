@@ -29,7 +29,8 @@ each builds on the one before it:
 - **Account** — a group that owns usage and limits (a project, team, or lab).
   Accounts form a tree: an account may have a **parent** account, and limits and
   fairshare flow down the hierarchy. An account may also carry a QOS allow-list;
-  a user who has no allow-list of their own uses that one.
+  a user who has no allow-list of their own uses their direct account's list.
+  The list is not inherited from parent accounts.
 - **User** — a person who submits jobs. A user is attached to one or more
   accounts.
 - **Association** — the tuple ``(cluster, account, user, partition)`` that binds

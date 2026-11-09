@@ -1988,6 +1988,9 @@ pub struct UserRecord {
     pub admin_level: String,
     pub default_account: Option<String>,
     pub default_qos: Option<String>,
+    /// Effective allow-list: the user's own list, or the direct account's when
+    /// the user has none. Not the stored association cell, so writing it back
+    /// would pin an inherited list as the user's own.
     pub allowed_qos: Option<String>,
     pub max_running_jobs: Option<i32>,
     pub max_submit_jobs: Option<i32>,
@@ -4576,6 +4579,95 @@ mod job_history_tests {
         sqlx::query("DELETE FROM users WHERE name IN ($1, $2)")
             .bind(&matching_user)
             .bind(&other_user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_inherits_account_qos_unless_the_user_sets_one() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qosinherit_user_{pid}");
+        let account = format!("spur_qosinherit_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some("acct-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let inherited = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(Some("user-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let own = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(own[0].allowed_qos.as_deref(), Some("user-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let cleared = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(cleared[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
             .execute(&pool)
             .await?;
         sqlx::query("DELETE FROM accounts WHERE name = $1")

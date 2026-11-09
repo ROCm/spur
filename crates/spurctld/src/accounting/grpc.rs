@@ -923,13 +923,7 @@ impl SlurmAccounting for AccountingService {
             fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
-            allowed_qos: allowed_qos_normalized.as_deref().map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            }),
+            allowed_qos: nullable_str(&allowed_qos_normalized),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
         let result = db::upsert_account(&mut tx, &req.name, update)
@@ -1109,13 +1103,7 @@ impl SlurmAccounting for AccountingService {
             admin_level,
             is_default: req.is_default,
             default_qos: nullable_str(&req.default_qos),
-            allowed_qos: allowed_qos_normalized.as_deref().map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            }),
+            allowed_qos: nullable_str(&allowed_qos_normalized),
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             max_submit_jobs: nullable_limit(req.max_submit_jobs, "max_submit_jobs")?,
             grp_submit_jobs: nullable_limit(req.grp_submit_jobs, "grp_submit_jobs")?,
