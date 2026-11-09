@@ -1413,7 +1413,8 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        alone.
        ``sreport`` utilization leaves those same cells blank.
        A coordinator also sees usage for the accounts they coordinate; those
-       rows are filled in, and cluster totals stay blank.
+       rows are filled in, and cluster totals stay blank. A coordinator keeps
+       their own rows in other accounts too.
        ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
        ``"users"`` also drops other users from ``sshare``.
    * - ``"users"``
