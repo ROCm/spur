@@ -6348,19 +6348,13 @@ impl ClusterManager {
         grace_time: Option<Option<u32>>,
         limits: PartitionLimitsUpdate,
     ) -> Result<(), PartitionError> {
-        let Some(current) = self
-            .partitions
-            .read()
-            .iter()
-            .find(|p| p.name == name)
-            .cloned()
-        else {
+        if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
                 "partition '{}' not found",
                 name
             )));
-        };
-        limits.merged(&current).map_err(PartitionError::invalid)?;
+        }
+        limits.validate().map_err(PartitionError::invalid)?;
         let resource_limits = (limits != PartitionLimitsUpdate::default()).then_some(limits);
 
         let max_time_minutes = if let Some(ref t) = max_time {
@@ -6394,34 +6388,28 @@ impl ClusterManager {
             max_nodes.map(Some)
         };
 
-        let applied = self
-            .propose(WalOperation::PartitionUpdate {
-                name: name.to_string(),
-                nodes,
-                selector,
-                state,
-                max_time_minutes,
-                default_time_minutes,
-                max_nodes: max_nodes_wal,
-                min_nodes,
-                allow_accounts,
-                allow_groups,
-                deny_accounts,
-                deny_qos,
-                allow_qos,
-                priority_tier,
-                preempt_mode,
-                is_default,
-                preempt_exempt_time,
-                grace_time,
-                resource_limits,
-            })
-            .map_err(|e| PartitionError::raft(e.to_string()))?;
-        if let Some(error) = applied.partition_update_rejected {
-            return Err(PartitionError::invalid(format!(
-                "partition '{name}' changed concurrently: {error}"
-            )));
-        }
+        self.propose(WalOperation::PartitionUpdate {
+            name: name.to_string(),
+            nodes,
+            selector,
+            state,
+            max_time_minutes,
+            default_time_minutes,
+            max_nodes: max_nodes_wal,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            deny_accounts,
+            deny_qos,
+            allow_qos,
+            priority_tier,
+            preempt_mode,
+            is_default,
+            preempt_exempt_time,
+            grace_time,
+            resource_limits,
+        })
+        .map_err(|e| PartitionError::raft(e.to_string()))?;
         self.warn_partition_cap_overcommits_in(name);
         Ok(())
     }
@@ -9603,17 +9591,8 @@ impl ClusterManager {
             } => {
                 {
                     let mut partitions = self.partitions.write();
-                    let mut set_as_default = *is_default == Some(true);
-                    let found = partitions.iter_mut().find(|p| p.name == *name);
-                    let limits = found.as_deref().map(|part| match resource_limits {
-                        Some(update) => update.merged(part),
-                        None => Ok(None),
-                    });
-                    if let Some(Err(error)) = limits {
-                        warn!(name, %error, "partition update rejected at apply");
-                        response.partition_update_rejected = Some(error);
-                        set_as_default = false;
-                    } else if let Some(part) = found {
+                    let set_as_default = *is_default == Some(true);
+                    if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
                         if let Some(n) = new_hostlist {
                             part.nodes = n.clone();
                         }
@@ -9673,7 +9652,8 @@ impl ClusterManager {
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
                         }
-                        if let Some(Ok(Some(limits))) = limits {
+                        if let Some(limits) = resource_limits.as_ref().and_then(|u| u.merged(part))
+                        {
                             limits.apply_to(part);
                         }
                         info!(name, "partition updated");

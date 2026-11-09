@@ -638,19 +638,18 @@ fn typed_gpu_capacity_counts_only_that_type() {
 }
 
 #[test]
-fn limits_update_merges_validates_and_clears() {
+fn limits_update_merges_and_clears() {
     let current = Partition {
         max_mem_per_node: Some(GIB),
         ..partition("p", &[("cpu", 8), ("mem", 4 * GIB)])
     };
-    assert_eq!(PartitionLimitsUpdate::default().merged(&current), Ok(None));
+    assert_eq!(PartitionLimitsUpdate::default().merged(&current), None);
 
     let cpu_only = PartitionLimitsUpdate {
         max_cpus_per_node: Some(Some(16)),
         ..Default::default()
     }
     .merged(&current)
-    .unwrap()
     .unwrap();
     assert_eq!(cpu_only.max_tres_per_node["cpu"], 16);
     assert_eq!(cpu_only.max_tres_per_node["mem"], 4 * GIB);
@@ -662,7 +661,6 @@ fn limits_update_merges_validates_and_clears() {
         ..Default::default()
     }
     .merged(&current)
-    .unwrap()
     .unwrap();
     assert!(!cleared.max_tres_per_node.contains_key("cpu"));
     assert_eq!(cleared.max_mem_per_node, None);
@@ -673,37 +671,97 @@ fn limits_update_merges_validates_and_clears() {
         ..Default::default()
     }
     .merged(&current)
-    .unwrap()
     .unwrap();
     assert_eq!(
         replaced.max_tres_per_node,
         BTreeMap::from([("cpu".to_string(), 4), ("gres/gpu".to_string(), 0)])
     );
+}
 
-    let conflict = PartitionLimitsUpdate {
-        max_tres_per_node: Some(BTreeMap::from([("cpu".to_string(), 4)])),
-        max_cpus_per_node: Some(Some(4)),
+#[test]
+fn setting_one_memory_knob_replaces_its_sibling() {
+    let current = Partition {
+        max_mem_per_node: Some(GIB),
+        def_mem_per_cpu: Some(512),
+        ..partition("p", &[])
+    };
+    let update = PartitionLimitsUpdate {
+        max_mem_per_cpu: Some(Some(2048)),
+        def_mem_per_gpu: Some(Some(8192)),
         ..Default::default()
     };
-    assert!(conflict
-        .merged(&current)
-        .unwrap_err()
-        .contains("max_cpus_per_node"));
+    assert_eq!(update.validate(), Ok(()));
 
-    let both_max = PartitionLimitsUpdate {
-        max_mem_per_cpu: Some(Some(GIB)),
-        ..Default::default()
-    };
-    assert!(
-        both_max.merged(&current).is_err(),
-        "max_mem_per_node is already set"
+    let merged = update.merged(&current).unwrap();
+    assert_eq!(
+        (merged.max_mem_per_node, merged.max_mem_per_cpu),
+        (None, Some(2048))
     );
+    assert_eq!(
+        (merged.def_mem_per_cpu, merged.def_mem_per_gpu),
+        (None, Some(8192))
+    );
+    let mut probe = current.clone();
+    merged.apply_to(&mut probe);
+    assert_eq!(probe.validate_resource_limits(), Ok(()));
+}
 
-    let bad_key = PartitionLimitsUpdate {
-        max_tres_per_node: Some(BTreeMap::from([("cpus".to_string(), 4)])),
-        ..Default::default()
+#[test]
+fn a_limits_update_rejects_only_what_the_request_itself_gets_wrong() {
+    let rejects = |update: PartitionLimitsUpdate, needle: &str| {
+        let err = update.validate().unwrap_err();
+        assert!(err.contains(needle), "{err}");
     };
-    assert!(bad_key.merged(&current).is_err());
+    let cpu_map = || Some(BTreeMap::from([("cpu".to_string(), 4)]));
+    rejects(
+        PartitionLimitsUpdate {
+            max_tres_per_node: cpu_map(),
+            max_cpus_per_node: Some(Some(4)),
+            ..Default::default()
+        },
+        "max_cpus_per_node (4) conflicts",
+    );
+    rejects(
+        PartitionLimitsUpdate {
+            max_tres_per_node: cpu_map(),
+            max_cpus_per_node: Some(None),
+            ..Default::default()
+        },
+        "max_cpus_per_node (cleared) conflicts",
+    );
+    rejects(
+        PartitionLimitsUpdate {
+            max_mem_per_node: Some(Some(GIB)),
+            max_mem_per_cpu: Some(Some(GIB)),
+            ..Default::default()
+        },
+        "set at most one",
+    );
+    rejects(
+        PartitionLimitsUpdate {
+            def_mem_per_node: Some(Some(1)),
+            def_mem_per_gpu: Some(Some(1)),
+            ..Default::default()
+        },
+        "set at most one",
+    );
+    rejects(
+        PartitionLimitsUpdate {
+            max_tres_per_node: Some(BTreeMap::from([("cpus".to_string(), 4)])),
+            ..Default::default()
+        },
+        "unknown key",
+    );
+    assert_eq!(
+        PartitionLimitsUpdate {
+            max_mem_per_node: Some(Some(GIB)),
+            max_mem_per_cpu: Some(None),
+            ..Default::default()
+        }
+        .validate(),
+        Ok(()),
+        "setting one knob while clearing its sibling is fine"
+    );
 }
 
 /// A `PartitionUpdate` entry changing only `state` (when set) and the limits.
@@ -774,7 +832,7 @@ async fn interleaved_limits_updates_to_different_knobs_both_apply() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_update_conflicting_with_one_applied_before_it_is_rejected_whole() {
+async fn interleaved_updates_to_one_memory_group_apply_in_log_order() {
     let dir = TempDir::new().unwrap();
     let cm = cluster_with(&dir, EnforcePartLimits::No, vec![partition("cpu", &[])]).await;
     let per_cpu = limits_entry(
@@ -792,13 +850,12 @@ async fn an_update_conflicting_with_one_applied_before_it_is_rejected_whole() {
         },
     );
 
-    assert_eq!(cm.apply_operation(&per_cpu).partition_update_rejected, None);
-    let rejected = cm.apply_operation(&per_node).partition_update_rejected;
+    cm.apply_operation(&per_cpu);
+    cm.apply_operation(&per_node);
 
-    assert!(rejected.is_some_and(|e| e.contains("set at most one")));
     let p = limits_of(&cm);
-    assert_eq!(p.state, spur_core::partition::PartitionState::Up);
-    assert_eq!((p.def_mem_per_cpu, p.def_mem_per_node), (Some(1024), None));
+    assert_eq!(p.state, spur_core::partition::PartitionState::Drain);
+    assert_eq!((p.def_mem_per_cpu, p.def_mem_per_node), (None, Some(4096)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

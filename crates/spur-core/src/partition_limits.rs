@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gpu_request::{resolve_gpu_demand, tasks_per_node_counts, GpuDemand};
 use crate::job::JobSpec;
-use crate::partition::{Partition, TRES_CPU};
+use crate::partition::{is_valid_partition_tres_key, Partition, TRES_CPU};
 use crate::wal::clear_or_set;
 
 /// A partition's resource caps and memory policy, replicated together so a
@@ -131,44 +131,102 @@ impl PartitionLimitsUpdate {
         }
     }
 
-    /// The limits `current` ends up with, validated as a whole; `None` when
-    /// nothing changes so the update leaves the limits untouched.
-    pub fn merged(&self, current: &Partition) -> Result<Option<PartitionResourceLimits>, String> {
+    /// Rejects what the request alone gets wrong: unknown cap keys, both spellings of the
+    /// CPU cap, or two knobs of one memory group set together.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(map) = &self.max_tres_per_node {
+            if let Some(key) = map.keys().find(|key| !is_valid_partition_tres_key(key)) {
+                return Err(format!(
+                    "max_tres_per_node: unknown key {key:?} (expected cpu, mem, gres/gpu, or gres/gpu:<type>)"
+                ));
+            }
+            if let (Some(cpus), Some(cpu)) = (self.max_cpus_per_node, map.get(TRES_CPU)) {
+                let alias = cpus.map_or("cleared".to_string(), |c| c.to_string());
+                return Err(format!(
+                    "max_cpus_per_node ({alias}) conflicts with max_tres_per_node.cpu = {cpu} (set only one)"
+                ));
+            }
+        }
+        let groups = [
+            vec![
+                ("max_mem_per_node", self.max_mem_per_node),
+                ("max_mem_per_cpu", self.max_mem_per_cpu),
+            ],
+            vec![
+                ("def_mem_per_node", self.def_mem_per_node),
+                ("def_mem_per_cpu", self.def_mem_per_cpu),
+                ("def_mem_per_gpu", self.def_mem_per_gpu),
+            ],
+        ];
+        for group in groups {
+            let set: Vec<String> = group
+                .into_iter()
+                .filter_map(|(name, change)| change.flatten().map(|v| format!("{name} = {v}")))
+                .collect();
+            if set.len() > 1 {
+                return Err(format!("{} (set at most one)", set.join(", ")));
+            }
+        }
+        Ok(())
+    }
+
+    /// The limits `current` ends up with; `None` when nothing changes. Setting one
+    /// knob of a memory group clears the others, as in Slurm, so a merge of a
+    /// [`validate`](Self::validate)d update into valid limits is always valid.
+    pub fn merged(&self, current: &Partition) -> Option<PartitionResourceLimits> {
         if *self == Self::default() {
-            return Ok(None);
+            return None;
         }
         let mut limits = PartitionResourceLimits::of(current);
         if let Some(map) = &self.max_tres_per_node {
             limits.max_tres_per_node = map.clone();
         }
-        if let Some(cpus) = self.max_cpus_per_node {
-            if let (Some(_), Some(cpus)) = (&self.max_tres_per_node, cpus) {
-                let map = std::mem::take(&mut limits.max_tres_per_node);
-                limits.max_tres_per_node = fold_max_cpus_per_node(map, Some(cpus))?;
-            } else if let Some(cpus) = cpus {
+        match self.max_cpus_per_node {
+            Some(Some(cpus)) => {
                 limits
                     .max_tres_per_node
                     .insert(TRES_CPU.to_string(), u64::from(cpus));
-            } else {
+            }
+            Some(None) => {
                 limits.max_tres_per_node.remove(TRES_CPU);
             }
+            None => {}
         }
-        let knobs = [
-            (&mut limits.max_mem_per_node, self.max_mem_per_node),
-            (&mut limits.max_mem_per_cpu, self.max_mem_per_cpu),
-            (&mut limits.def_mem_per_node, self.def_mem_per_node),
-            (&mut limits.def_mem_per_cpu, self.def_mem_per_cpu),
-            (&mut limits.def_mem_per_gpu, self.def_mem_per_gpu),
-        ];
-        for (field, change) in knobs {
-            if let Some(value) = change {
-                *field = value;
+        set_one_of(
+            &mut [&mut limits.max_mem_per_node, &mut limits.max_mem_per_cpu],
+            [self.max_mem_per_node, self.max_mem_per_cpu],
+        );
+        set_one_of(
+            &mut [
+                &mut limits.def_mem_per_node,
+                &mut limits.def_mem_per_cpu,
+                &mut limits.def_mem_per_gpu,
+            ],
+            [
+                self.def_mem_per_node,
+                self.def_mem_per_cpu,
+                self.def_mem_per_gpu,
+            ],
+        );
+        Some(limits)
+    }
+}
+
+/// Apply changes to mutually exclusive knobs: a knob set to a value clears the others.
+fn set_one_of<const N: usize>(
+    fields: &mut [&mut Option<u64>; N],
+    changes: [Option<Option<u64>>; N],
+) {
+    for (i, change) in changes.iter().enumerate() {
+        let Some(value) = change else { continue };
+        *fields[i] = *value;
+        if value.is_some() {
+            for (j, field) in fields.iter_mut().enumerate() {
+                if j != i {
+                    **field = None;
+                }
             }
         }
-        let mut probe = current.clone();
-        limits.apply_to(&mut probe);
-        probe.validate_resource_limits()?;
-        Ok(Some(limits))
     }
 }
 
