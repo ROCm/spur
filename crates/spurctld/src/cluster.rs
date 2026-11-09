@@ -15832,6 +15832,7 @@ state = "UP"
                 idle_fill: false,
                 effective_partition: None,
                 memory_adjustment: None,
+                preemption_observation: None,
                 at: None,
             },
             WalOperation::NodeUpdate {
