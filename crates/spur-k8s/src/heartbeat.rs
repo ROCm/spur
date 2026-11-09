@@ -122,6 +122,8 @@ mod tests {
             join_token: String::new(),
             topology: None,
             capabilities: vec![],
+            boot_time: None,
+            no_held_jobs: None,
         }
     }
 

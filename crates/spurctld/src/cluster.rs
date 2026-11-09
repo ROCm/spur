@@ -4007,8 +4007,7 @@ impl ClusterManager {
             .clone()
     }
 
-    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
-    /// node (see `sync_node_labels`); first registration never needs it.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
@@ -4024,6 +4023,42 @@ impl ClusterManager {
         capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
+        self.register_node_with_status(
+            name,
+            hostname,
+            resources,
+            address,
+            port,
+            wg_pubkey,
+            version,
+            source,
+            labels,
+            capabilities,
+            caller_privileged,
+            None,
+            None,
+        )
+    }
+
+    /// Register a node, preserving holds unless its reported status permits recovery.
+    /// Relabeling an existing node requires a privileged caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_node_with_status(
+        &self,
+        name: String,
+        hostname: String,
+        resources: ResourceSet,
+        address: String,
+        port: u16,
+        wg_pubkey: String,
+        version: String,
+        source: NodeSource,
+        labels: HashMap<String, String>,
+        capabilities: Vec<String>,
+        caller_privileged: bool,
+        boot_time: Option<DateTime<Utc>>,
+        no_held_jobs: Option<bool>,
+    ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
@@ -4035,6 +4070,23 @@ impl ClusterManager {
         let node_lock = self.node_registration_lock(&name);
         let _registration = node_lock.lock();
 
+        let return_to_service = self.config().controller.return_to_service;
+        let recovery_down_since = self.get_node(&name).and_then(|n| n.down_since);
+        let recovery_validated = matches!(return_to_service, Some(1 | 2))
+            && no_held_jobs == Some(true)
+            && self.get_node(&name).is_some_and(|mut node| {
+                if node.state != NodeState::Down {
+                    return false;
+                }
+                node.detected_resources = resources.clone();
+                node.labels = labels.clone();
+                node.source = source.clone();
+                self.apply_node_config_policy(&mut node);
+                node.layout_error.is_none()
+                    && node.layout_enforce_error.is_none()
+                    && node.total_resources.cpus > 0
+                    && node.total_resources.memory_mb > 0
+            });
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -4045,7 +4097,9 @@ impl ClusterManager {
                 debug!(node = %name, "node unchanged, skipping");
                 self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(existing) = self.get_node(&name) {
-                    let needs_update = existing.address.as_deref() != Some(address.as_str())
+                    let needs_update = existing.boot_time != boot_time
+                        || (existing.state == NodeState::Down && return_to_service.is_some())
+                        || existing.address.as_deref() != Some(address.as_str())
                         || existing.hostname != hostname
                         || existing.port != port
                         || (!wg_pubkey.is_empty()
@@ -4055,6 +4109,10 @@ impl ClusterManager {
                         || existing.capabilities != capabilities;
                     if needs_update {
                         self.propose(WalOperation::NodeUpdate {
+                            boot_time,
+                            return_to_service,
+                            recovery_validated,
+                            recovery_down_since,
                             name: name.clone(),
                             hostname: hostname.clone(),
                             // Resend the raw detected report: NodeUpdate apply stores
@@ -4079,7 +4137,12 @@ impl ClusterManager {
                 }
             }
             RegistrationAction::Update => {
+                self.sync_node_labels(&name, labels, caller_privileged)?;
                 self.propose(WalOperation::NodeUpdate {
+                    boot_time,
+                    return_to_service,
+                    recovery_validated,
+                    recovery_down_since,
                     name: name.clone(),
                     hostname: hostname.clone(),
                     resources,
@@ -4091,7 +4154,6 @@ impl ClusterManager {
                     capabilities,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
-                self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                 }
@@ -4099,6 +4161,7 @@ impl ClusterManager {
             }
             RegistrationAction::Register => {
                 self.propose(WalOperation::NodeRegister {
+                    boot_time,
                     name: name.clone(),
                     hostname: hostname.clone(),
                     resources,
@@ -4154,11 +4217,36 @@ impl ClusterManager {
         Ok(())
     }
 
+    pub fn return_registration_needed(&self, name: &str) -> bool {
+        let mode = self.config().controller.return_to_service;
+        let Some(node) = self.get_node(name) else {
+            return false;
+        };
+        if node.state != NodeState::Down
+            || node.down_from_drain == Some(true)
+            || (node.admin_locked && node.down_from_drain.is_none())
+        {
+            return false;
+        }
+        match mode {
+            Some(1) => {
+                !node.admin_locked
+                    && node.state_reason.as_deref() == Some("Not responding")
+                    && node
+                        .boot_time
+                        .zip(node.last_response_before_down)
+                        .is_none_or(|(boot, response)| boot < response)
+            }
+            Some(2) => true,
+            _ => false,
+        }
+    }
+
     /// Update node heartbeat telemetry (load, memory, timestamp).
     ///
     /// Returns `true` if the node was found, `false` if unknown.
-    /// State recovery is handled separately by `check_node_health`, which
-    /// detects the fresh `last_heartbeat` and proposes a WAL-backed transition.
+    /// Recovery is decided separately by health checks in legacy mode or by
+    /// accepted registration when an explicit ReturnToService policy is set.
     pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) -> bool {
         let mut nodes = self.nodes.write();
         if let Some(node) = nodes.get_mut(name) {
@@ -4883,6 +4971,7 @@ impl ClusterManager {
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
 
         self.propose(WalOperation::NodeStateChange {
+            last_response: None,
             name: name.to_string(),
             old_state,
             new_state: effective_state,
@@ -5089,6 +5178,9 @@ impl ClusterManager {
             let refs: Vec<&Node> = nodes.values().collect();
             evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
+        if self.config().controller.return_to_service.is_some() {
+            actions.retain(|a| !matches!(a, HealthAction::Recover { .. }));
+        }
         if mark_down == MarkDownPolicy::Suppressed {
             let before = actions.len();
             actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
@@ -5118,6 +5210,7 @@ impl ClusterManager {
                         Some("Not responding".into()),
                     );
                     match self.propose(WalOperation::NodeStateChange {
+                        last_response: self.get_node(&name).and_then(|n| n.last_heartbeat),
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
@@ -5142,6 +5235,9 @@ impl ClusterManager {
                     }
                 }
                 HealthAction::Recover { name, old_state } => {
+                    if self.config().controller.return_to_service.is_some() {
+                        continue;
+                    }
                     let node = self.get_node(&name);
                     let admin_locked = node.as_ref().is_some_and(|n| n.admin_locked);
                     let recovered_state = recovered_node_state(node.as_ref());
@@ -5154,6 +5250,7 @@ impl ClusterManager {
                     };
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                        last_response: None,
                         name,
                         old_state,
                         new_state: recovered_state,
@@ -5209,6 +5306,7 @@ impl ClusterManager {
         };
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
         self.propose(WalOperation::NodeStateChange {
+            last_response: None,
             name: name.to_string(),
             old_state,
             new_state: target_state,
@@ -5266,6 +5364,7 @@ impl ClusterManager {
             )
         };
         let resp = self.propose(WalOperation::NodeStateChange {
+            last_response: None,
             name: name.to_string(),
             old_state,
             new_state: NodeState::Down,
@@ -9056,6 +9155,7 @@ impl ClusterManager {
                 }
             }
             WalOperation::NodeRegister {
+                boot_time,
                 name,
                 hostname,
                 resources,
@@ -9071,6 +9171,7 @@ impl ClusterManager {
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
                 let mut node = Node::new(name.clone(), resources);
+                node.boot_time = *boot_time;
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -9121,6 +9222,10 @@ impl ClusterManager {
                 return ClientResponse::default();
             }
             WalOperation::NodeUpdate {
+                boot_time,
+                return_to_service,
+                recovery_validated,
+                recovery_down_since,
                 name,
                 hostname,
                 resources,
@@ -9179,7 +9284,23 @@ impl ClusterManager {
                     node.last_heartbeat = Some(Utc::now());
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
+                    node.boot_time = *boot_time;
                     self.apply_node_config_policy(node);
+                    if *recovery_validated
+                        && node.down_since == *recovery_down_since
+                        && registration_can_recover(node, *return_to_service)
+                    {
+                        node.state = NodeState::Idle;
+                        node.admin_locked = false;
+                        node.state_reason = None;
+                        node.reason_uid = None;
+                        node.reason_time = None;
+                        node.last_response_before_down = None;
+                        node.down_from_drain = None;
+                        node.down_since = None;
+                        node.update_state_from_alloc();
+                        info!(node = %name, mode = ?return_to_service, "node returned to service after registration");
+                    }
                 }
             }
             WalOperation::NodeStateChange {
@@ -9187,11 +9308,25 @@ impl ClusterManager {
                 new_state,
                 reason,
                 admin_locked,
+                last_response,
+                at,
                 reason_uid,
                 reason_time,
                 ..
             } => {
                 if let Some(node) = nodes.get_mut(name) {
+                    if *new_state == NodeState::Down {
+                        node.down_since = *at;
+                        if node.state != NodeState::Down {
+                            node.down_from_drain =
+                                Some(matches!(node.state, NodeState::Drain | NodeState::Draining));
+                            node.last_response_before_down = *last_response;
+                        }
+                    } else {
+                        node.down_since = None;
+                        node.down_from_drain = None;
+                        node.last_response_before_down = None;
+                    }
                     node.state = *new_state;
                     // A proposal can wait behind the final deallocation in Raft.
                     if new_state.is_up() || *new_state == NodeState::Draining {
@@ -11160,6 +11295,30 @@ fn down_reason_attribution(
     }
 }
 
+fn registration_can_recover(node: &Node, mode: Option<u8>) -> bool {
+    if node.state != NodeState::Down
+        || node.alloc_resources.cpus > 0
+        || node.alloc_resources.memory_mb > 0
+        || node.alloc_resources.has_devices()
+        || node.down_from_drain == Some(true)
+        || (node.admin_locked && node.down_from_drain.is_none())
+    {
+        return false;
+    }
+    match mode {
+        Some(1) => {
+            !node.admin_locked
+                && node.state_reason.as_deref() == Some("Not responding")
+                && node
+                    .boot_time
+                    .zip(node.last_response_before_down)
+                    .is_some_and(|(boot, response)| boot < response)
+        }
+        Some(2) => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     let Some(node) = node else {
         return NodeState::Idle;
@@ -12783,6 +12942,224 @@ state = "UP"
         )
     }
 
+    fn return_test_down(cm: &ClusterManager, reason: &str, admin: bool) {
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some(reason.into()),
+            admin_locked: admin,
+            reason_uid: Some(0),
+            reason_time: Some(DateTime::from_timestamp(1_700_000_100, 0).unwrap()),
+            last_response: Some(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            at: Some(DateTime::from_timestamp(1_700_000_100, 0).unwrap()),
+        });
+    }
+
+    fn return_test_register(cm: &ClusterManager, boot: Option<i64>, empty: Option<bool>) {
+        cm.register_node_with_status(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "test".into(),
+            NodeSource::NativeHost,
+            HashMap::new(),
+            vec![],
+            true,
+            boot.and_then(|seconds| DateTime::from_timestamp(seconds, 0)),
+            empty,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_registration_policy_and_boot_matrix() {
+        for (mode, admin, boot, empty, expected) in [
+            (0, false, Some(1_600_000_000), Some(true), NodeState::Down),
+            (0, true, Some(1_600_000_000), Some(true), NodeState::Down),
+            (1, false, Some(1_600_000_000), Some(true), NodeState::Idle),
+            (1, false, Some(1_700_000_001), Some(true), NodeState::Down),
+            (1, false, Some(1_700_000_000), Some(true), NodeState::Down),
+            (1, false, None, Some(true), NodeState::Down),
+            (1, true, Some(1_600_000_000), Some(true), NodeState::Down),
+            (2, true, Some(1_700_000_001), Some(true), NodeState::Idle),
+            (2, false, None, Some(true), NodeState::Idle),
+            (2, true, None, None, NodeState::Down),
+            (2, true, None, Some(false), NodeState::Down),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut config = config_with_nodes(vec![]);
+            config.controller.return_to_service = Some(mode);
+            let cm = test_cluster_with_config(&dir, config).await;
+            register_node(&cm, "n1", 4, 8000);
+            return_test_down(&cm, if admin { "retired" } else { "Not responding" }, admin);
+            return_test_register(&cm, boot, empty);
+            let node = cm.get_node("n1").unwrap();
+            assert_eq!(
+                node.state, expected,
+                "mode={mode} admin={admin} boot={boot:?} empty={empty:?}"
+            );
+            if expected == NodeState::Idle {
+                assert!(!node.admin_locked);
+                assert_eq!(node.state_reason, None);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_preserves_drains_and_ambiguous_old_holds() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_with_nodes(vec![]);
+        config.controller.return_to_service = Some(2);
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.drain_node("n1", Some("retired".into()), Some(1000))
+            .unwrap();
+        return_test_register(&cm, None, Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Drain);
+        return_test_down(&cm, "retired", true);
+        return_test_register(&cm, None, Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        cm.nodes.write().get_mut("n1").unwrap().down_from_drain = None;
+        return_test_register(&cm, None, Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        cm.update_node_state("n1", NodeState::Idle, None, Some(1000))
+            .unwrap();
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_heartbeat_alone_never_recovers_explicit_modes() {
+        for mode in 0..=2 {
+            let dir = TempDir::new().unwrap();
+            let mut config = config_with_nodes(vec![]);
+            config.controller.return_to_service = Some(mode);
+            let cm = test_cluster_with_config(&dir, config).await;
+            register_node(&cm, "n1", 4, 8000);
+            return_test_down(&cm, "Not responding", false);
+            cm.update_heartbeat("n1", 0, 8000);
+            cm.check_node_health(90, MarkDownPolicy::Allowed);
+            assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_timeout_captures_response_and_reconfigure_applies() {
+        let dir = TempDir::new().unwrap();
+        let (cm, path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[controller]\nreturn_to_service = 0\n",
+        )
+        .await;
+        register_node(&cm, "n1", 4, 8000);
+        let last_response = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        cm.nodes.write().get_mut("n1").unwrap().last_heartbeat = Some(last_response);
+        cm.check_node_health(90, MarkDownPolicy::Allowed);
+        assert_eq!(
+            cm.get_node("n1").unwrap().last_response_before_down,
+            Some(last_response)
+        );
+        return_test_register(&cm, Some(1_600_000_000), Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        std::fs::write(
+            path,
+            "cluster_name = \"test\"\n[controller]\nreturn_to_service = 1\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.return_registration_needed("n1"));
+        return_test_register(&cm, Some(1_600_000_000), Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_rejects_inventory_holds_and_unauthorized_relabel() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_with_nodes(vec![]);
+        config.controller.return_to_service = Some(2);
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 4, 8000);
+        return_test_down(&cm, "retired", true);
+        let error = cm
+            .register_node_with_status(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                "test".into(),
+                NodeSource::NativeHost,
+                HashMap::from([("pool".into(), "changed".into())]),
+                vec![],
+                false,
+                None,
+                Some(true),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RegisterNodeError::PermissionDenied(_)));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        assert_eq!(cm.get_node("n1").unwrap().detected_resources.cpus, 4);
+        cm.nodes.write().get_mut("n1").unwrap().alloc_resources.cpus = 1;
+        return_test_register(&cm, None, Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        cm.nodes.write().get_mut("n1").unwrap().alloc_resources.cpus = 0;
+        cm.nodes.write().get_mut("n1").unwrap().layout_enforce_error = Some("not enforced".into());
+        return_test_register(&cm, None, Some(true));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_replay_obeys_leader_validation_and_later_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_nodes(vec![])).await;
+        register_node(&cm, "n1", 4, 8000);
+        return_test_down(&cm, "retired", true);
+        let update = WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "test".into(),
+            source: NodeSource::NativeHost,
+            capabilities: vec![],
+            boot_time: None,
+            return_to_service: Some(2),
+            recovery_validated: true,
+            recovery_down_since: cm.get_node("n1").unwrap().down_since,
+        };
+        cm.update_node_state("n1", NodeState::Down, Some("new hold".into()), Some(1000))
+            .unwrap();
+        cm.apply_operation(&update);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        return_test_down(&cm, "retired", true);
+        let replayed: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&update).unwrap()).unwrap();
+        cm.apply_operation(&replayed);
+        assert_eq!(
+            cm.get_node("n1").unwrap().state,
+            NodeState::Idle,
+            "leader-validated event replays independently of local legacy policy"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn register_node_records_capabilities() {
         use spur_core::node::CAP_SIGNAL_JOB;
@@ -13722,6 +14099,7 @@ state = "UP"
             .expect("reserve");
 
         cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
@@ -15002,6 +15380,7 @@ state = "UP"
         let slice = ResourceAllocations::from_device_ids("gpu", held);
         vec![
             WalOperation::NodeRegister {
+                boot_time: None,
                 name: "n1".into(),
                 hostname: "n1".into(),
                 resources: gpu_inventory(old),
@@ -15028,6 +15407,10 @@ state = "UP"
                 at: None,
             },
             WalOperation::NodeUpdate {
+                boot_time: None,
+                return_to_service: None,
+                recovery_validated: false,
+                recovery_down_since: None,
                 name: "n1".into(),
                 hostname: "n1".into(),
                 resources: gpu_inventory(new),
@@ -15947,6 +16330,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -15983,6 +16367,7 @@ state = "UP"
 
         register_node(&cm, "n1", 4, 8000);
         cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
@@ -17409,6 +17794,7 @@ state = "UP"
         cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -18254,6 +18640,7 @@ state = "UP"
         run_job_on(&cm, "node-down", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -18280,6 +18667,7 @@ state = "UP"
         run_job_on(&cm, "admin-down", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -18327,6 +18715,7 @@ state = "UP"
         cm.cancel_job(job_id, &owner).unwrap();
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -29899,6 +30288,7 @@ state = "UP"
 
         // NodeFail would also auto-requeue a job the user already cancelled.
         cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -29929,6 +30319,7 @@ state = "UP"
         )
         .unwrap();
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "worker1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -32454,6 +32845,7 @@ state = "UP"
 
     fn lose_node(cm: &ClusterManager, name: &str) {
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: name.into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -32803,6 +33195,7 @@ state = "UP"
         report_node(&cm, id, "n1", grace_exit_at());
 
         cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
@@ -34988,6 +35381,7 @@ state = "UP"
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, basic_spec("allocation-race"));
         let pending_resume = WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Drain,
             new_state: NodeState::Idle,
@@ -35011,6 +35405,7 @@ state = "UP"
         cm.complete_job(id, 0, JobState::Completed).unwrap();
         for requested in [NodeState::Idle, NodeState::Mixed, NodeState::Allocated] {
             let late_recovery = WalOperation::NodeStateChange {
+                last_response: None,
                 name: "n1".into(),
                 old_state: NodeState::Down,
                 new_state: requested,
@@ -35043,6 +35438,7 @@ state = "UP"
         settle(&cm, id, JobState::Running);
 
         let pending_drain = WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Mixed,
             new_state: NodeState::Draining,
@@ -35088,6 +35484,7 @@ state = "UP"
             }
 
             cm.apply_operation(&WalOperation::NodeStateChange {
+                last_response: None,
                 name: "n1".into(),
                 old_state: cm.get_node("n1").unwrap().state,
                 new_state: NodeState::Unknown,
@@ -37933,6 +38330,7 @@ state = "UP"
         let cm = test_cluster_with_config(&dir, cfg).await;
 
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "worker1".into(),
             hostname: "worker1".into(),
             resources: ResourceSet {
@@ -37977,6 +38375,7 @@ state = "UP"
 
         // Register a node directly via WAL apply
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -38029,6 +38428,7 @@ state = "UP"
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -38081,6 +38481,7 @@ state = "UP"
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "cpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -38264,6 +38665,7 @@ state = "UP"
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -38307,6 +38709,7 @@ state = "UP"
         assert!(cm.get_job(id).unwrap().holds_a_placement());
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -38337,6 +38740,7 @@ state = "UP"
         register_node(&cm, "n1", 4, 8000);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
@@ -38563,6 +38967,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::NodeRegister {
+            boot_time: None,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -38581,6 +38986,7 @@ state = "UP"
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 
         cm.apply_operation(&WalOperation::NodeStateChange {
+            last_response: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,

@@ -1206,6 +1206,75 @@ alone is not enough. An agent without them logs a warning and runs the job with 
 device isolation, unless ``[cgroup] required`` is set, which refuses the job instead. See
 :ref:`cgroup-containment-gaps`.
 
+.. _return-to-service:
+
+Returning nodes and administrative holds
+----------------------------------------
+
+A host that registers with an existing node name updates that node's inventory.
+Reusing a name does not itself discard its DOWN state, drain, or partition
+membership. Configure the recovery policy on the controller:
+
+.. code-block:: toml
+
+   [controller]
+   return_to_service = 0
+
+Upgrade all controllers and agents before enabling an explicit policy. Apply
+changes with ``scontrol reconfigure``. Distribute the same configuration to
+all controllers; the setting is read by the current leader and a future leader
+uses its own configuration.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Value
+     - Behavior
+   * - Unset
+     - Preserve Spur's existing behavior: a fresh heartbeat can recover a system
+       DOWN node; administrative DOWN and DRAIN remain held.
+   * - ``0``
+     - Require an administrative resume for every DOWN node, even if it registers
+       again. This is Slurm's default.
+   * - ``1``
+     - Permit recovery only from heartbeat timeout (``Not responding``). The
+       registering agent must report a boot time earlier than the last response
+       captured before DOWN. A replacement host booted after that response stays
+       DOWN. Administrative DOWN and orderly agent shutdown do not qualify.
+   * - ``2``
+     - Permit recovery from any DOWN reason, including administrative DOWN and a
+       replacement host's newer boot. DRAIN remains held, including a drain that
+       became DOWN when the agent disappeared.
+
+For explicit ``1`` and ``2``, recovery requires a fresh accepted registration,
+usable resources and core layout, no controller allocations, and a complete empty
+allocation inventory reported by the agent. The agent reports recovered job
+supervisors too; a failed inventory lookup or surviving work keeps the node DOWN.
+Heartbeats request another registration while recovery is eligible, allowing the
+existing stale-job reclamation path to finish first. Upgrade ``spurd`` before
+enabling these modes: older agents and the Kubernetes operator do not certify an
+empty registration inventory and therefore remain DOWN until resumed manually.
+Mode ``1`` also requires the boot time reported from Linux ``/proc/stat`` and a
+stored response from before DOWN. A DOWN record predating that response metadata
+needs an administrative resume.
+
+An administrative DOWN restored from an older snapshot may not distinguish a
+plain DOWN from an earlier drain. Such an ambiguous hold remains DOWN in mode
+``2`` until an administrator resumes it. Explicitly resume a node with:
+
+.. code-block:: bash
+
+   scontrol update NodeName=worker1 State=RESUME
+
+The three settings follow Slurm's `ReturnToService policy
+<https://slurm.schedmd.com/slurm.conf.html#OPT_ReturnToService>`_. Spur keeps its
+existing default when the setting is omitted. Slurm validates hardware against
+its static node definitions; Spur continues to treat ``[[nodes]]`` resource
+values as caps and validates the reported inventory and core layout without
+turning caps into minimum hardware requirements. Neither recovery policy changes
+partition membership or permanently bans a deleted node name.
+
 See Also
 --------
 

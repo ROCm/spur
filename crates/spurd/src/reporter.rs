@@ -18,6 +18,16 @@ use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+fn boot_time_from_stat(stat: &str) -> Option<prost_types::Timestamp> {
+    let seconds = stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "btime")
+            .then(|| fields.next()?.parse::<i64>().ok())
+            .flatten()
+    })?;
+    (seconds > 0).then_some(prost_types::Timestamp { seconds, nanos: 0 })
+}
+
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
 /// controller connection. A caller with its own config (spurd's `[spurd]` section) should
 /// build this from it; [`Default`] reproduces today's fixed values for tests and any
@@ -68,9 +78,15 @@ pub trait HeldRun {
 /// controller decides from its own authoritative state whether any is stale.
 pub trait HeldJobs: Send + Sync {
     fn held_jobs(&self) -> Vec<(u32, u32)>;
+    fn no_held_jobs(&self) -> Option<bool> {
+        None
+    }
 }
 
 impl<T: HeldRun + Send> HeldJobs for Mutex<HashMap<u32, T>> {
+    fn no_held_jobs(&self) -> Option<bool> {
+        self.try_lock().ok().map(|jobs| jobs.is_empty())
+    }
     fn held_jobs(&self) -> Vec<(u32, u32)> {
         match self.try_lock() {
             Ok(jobs) => jobs
@@ -100,6 +116,7 @@ pub struct NodeReporter {
     /// peers were persisted by `spur net add-peer` and exempt them from the k0s reconcile's prune.
     pub wg_config_dir: std::path::PathBuf,
     node_token: RwLock<String>,
+    boot_time: Option<prost_types::Timestamp>,
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
@@ -160,6 +177,9 @@ impl NodeReporter {
             wg_iface,
             wg_config_dir,
             node_token: RwLock::new(String::new()),
+            boot_time: std::fs::read_to_string("/proc/stat")
+                .ok()
+                .and_then(|stat| boot_time_from_stat(&stat)),
             held_jobs,
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
@@ -495,6 +515,8 @@ impl NodeReporter {
 
         RegisterAgentRequest {
             hostname: self.hostname.clone(),
+            boot_time: self.boot_time,
+            no_held_jobs: self.held_jobs.no_held_jobs(),
             resources: Some(resource_to_proto(resources)),
             version: env!("CARGO_PKG_VERSION").into(),
             address: self.node_address.ip.clone(),
@@ -2584,6 +2606,41 @@ mod tests {
             Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
             ReporterTimeouts::default(),
         )
+    }
+
+    #[test]
+    fn registration_reports_boot_and_certifies_only_an_empty_inventory() {
+        let mut reporter = test_reporter(rset(8, 1024, vec![]));
+        reporter.boot_time = boot_time_from_stat("cpu 1 2 3\nbtime 1700000000\nprocesses 9\n");
+        let request = reporter.registration_request(&reporter.snapshot_resources());
+        assert_eq!(
+            request.boot_time,
+            Some(prost_types::Timestamp {
+                seconds: 1700000000,
+                nanos: 0
+            })
+        );
+        assert_eq!(request.no_held_jobs, Some(true));
+        for stat in ["", "btime invalid", "btime 0", "btime -1"] {
+            assert_eq!(boot_time_from_stat(stat), None);
+        }
+    }
+
+    #[test]
+    fn busy_or_nonempty_held_inventory_cannot_certify_recovery() {
+        struct Run;
+        impl HeldRun for Run {
+            fn run_attempt(&self) -> u32 {
+                1
+            }
+        }
+        let jobs = Mutex::new(HashMap::<u32, Run>::new());
+        assert_eq!(jobs.no_held_jobs(), Some(true));
+        let mut guard = jobs.try_lock().unwrap();
+        assert_eq!(jobs.no_held_jobs(), None);
+        guard.insert(7, Run);
+        drop(guard);
+        assert_eq!(jobs.no_held_jobs(), Some(false));
     }
 
     #[test]

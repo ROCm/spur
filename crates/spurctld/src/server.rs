@@ -2597,6 +2597,17 @@ impl SlurmController for ControllerService {
         let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
 
         let req = request.into_inner();
+        let boot_time = req
+            .boot_time
+            .map(|ts| {
+                if ts.nanos < 0 || ts.nanos >= 1_000_000_000 || ts.seconds <= 0 {
+                    return Err(Status::invalid_argument("invalid boot_time"));
+                }
+                chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                    .filter(|boot| *boot <= Utc::now())
+                    .ok_or_else(|| Status::invalid_argument("invalid boot_time"))
+            })
+            .transpose()?;
         let mut resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
         // Carry the agent's reported CPU topology into the inventory so the
         // controller can compute this node's core layout. Absent
@@ -2619,7 +2630,7 @@ impl SlurmController for ControllerService {
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
-            .register_node(
+            .register_node_with_status(
                 // NodeName and NodeHostname are the same until agents can supply both.
                 req.hostname.clone(),
                 req.hostname.clone(),
@@ -2632,6 +2643,8 @@ impl SlurmController for ControllerService {
                 req.labels,
                 req.capabilities,
                 caller_privileged,
+                boot_time,
+                req.no_held_jobs,
             )
             .map_err(register_node_rpc_status)?;
 
@@ -2793,7 +2806,10 @@ impl SlurmController for ControllerService {
                 req.core_layout_fingerprint,
                 &req.spec_enforcement_error,
             );
-            Ok(Response::new(HeartbeatResponse { reregister }))
+            let return_registration = self.cluster.return_registration_needed(&req.hostname);
+            Ok(Response::new(HeartbeatResponse {
+                reregister: reregister || return_registration,
+            }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -8848,6 +8864,91 @@ mod tests {
         assert!(token.is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_registration_respects_admission_in_each_mode() {
+        for token_required in [false, true] {
+            for mode in 0..=2 {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = step_test_config();
+                config.controller.return_to_service = Some(mode);
+                if token_required {
+                    config.admission.mode = spur_core::config::AdmissionMode::Token;
+                }
+                let svc = test_service_with(&dir, config).await;
+                let join_token = if token_required {
+                    svc.cluster.create_token(None).unwrap().1
+                } else {
+                    String::new()
+                };
+                let request = RegisterAgentRequest {
+                    hostname: "return-node".into(),
+                    address: "127.0.0.1".into(),
+                    resources: Some(spur_proto::proto::ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    }),
+                    boot_time: Some(prost_types::Timestamp {
+                        seconds: 1_600_000_000,
+                        nanos: 0,
+                    }),
+                    no_held_jobs: Some(true),
+                    join_token,
+                    ..Default::default()
+                };
+                svc.register_agent(Request::new(request.clone()))
+                    .await
+                    .unwrap();
+                svc.cluster
+                    .update_node_state(
+                        "return-node",
+                        spur_core::node::NodeState::Down,
+                        Some("retired".into()),
+                        Some(1000),
+                    )
+                    .unwrap();
+                if token_required {
+                    let mut rejected = request.clone();
+                    rejected.join_token.clear();
+                    assert!(svc.register_agent(Request::new(rejected)).await.is_err());
+                    assert_eq!(
+                        svc.cluster.get_node("return-node").unwrap().state,
+                        spur_core::node::NodeState::Down
+                    );
+                }
+                svc.register_agent(Request::new(request)).await.unwrap();
+                let expected = if mode == 2 {
+                    spur_core::node::NodeState::Idle
+                } else {
+                    spur_core::node::NodeState::Down
+                };
+                assert_eq!(
+                    svc.cluster.get_node("return-node").unwrap().state,
+                    expected,
+                    "mode={mode} token={token_required}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_boot_time_is_rejected_before_registration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        for (seconds, nanos) in [(0, 0), (-1, 0), (1, -1), (1, 1_000_000_000), (i64::MAX, 0)] {
+            let response = svc
+                .register_agent(Request::new(RegisterAgentRequest {
+                    hostname: "invalid-boot".into(),
+                    address: "127.0.0.1".into(),
+                    boot_time: Some(prost_types::Timestamp { seconds, nanos }),
+                    ..Default::default()
+                }))
+                .await;
+            assert_eq!(response.unwrap_err().code(), tonic::Code::InvalidArgument);
+            assert!(svc.cluster.get_node("invalid-boot").is_none());
+        }
+    }
+
     // Token mode without a signing key issues no credential, so demanding one on
     // every later call would drop each node minutes after it registered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9107,7 +9208,8 @@ mod tests {
 
         let operations = logged_operations(dir.path());
         let drain = operations.iter().position(|(_, op)| matches!(op,
-            WalOperation::NodeStateChange { name, new_state: NodeState::Draining, admin_locked: true, .. }
+            WalOperation::NodeStateChange {
+                last_response: None, name, new_state: NodeState::Draining, admin_locked: true, .. }
                 if name == "n1"
         )).expect("durable quarantine");
         let completion = operations
@@ -9149,7 +9251,8 @@ mod tests {
 
         let operations = logged_operations(dir.path());
         let drain = operations.iter().position(|(_, op)| matches!(op,
-            WalOperation::NodeStateChange { name, new_state: NodeState::Draining, admin_locked: true, .. }
+            WalOperation::NodeStateChange {
+                last_response: None, name, new_state: NodeState::Draining, admin_locked: true, .. }
                 if name == "n1"
         )).expect("durable quarantine");
         let completion = operations.iter().position(|(_, op)| matches!(op,

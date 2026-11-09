@@ -1115,6 +1115,9 @@ message RegisterAgentRequest {
   // Optional agent features (e.g. "signal-job"), so the controller can avoid
   // calling RPCs an older agent does not implement.
   repeated string capabilities = 10;
+  google.protobuf.Timestamp boot_time = 11;
+  // Absent if the agent cannot certify a complete, empty allocation inventory.
+  optional bool no_held_jobs = 12;
 }
 
 message RegisterAgentResponse {
