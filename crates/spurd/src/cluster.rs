@@ -155,6 +155,8 @@ pub struct ClusterSupervisor {
     cfg: ClusterConfig,
     /// systemd unit directory (overridable in tests; `/etc/systemd/system` in production).
     unit_dir: PathBuf,
+    /// Overridable so tests never call the host systemd, which asks a desktop user for a password.
+    systemctl: PathBuf,
 }
 
 impl ClusterSupervisor {
@@ -162,6 +164,7 @@ impl ClusterSupervisor {
         Self {
             cfg,
             unit_dir: PathBuf::from("/etc/systemd/system"),
+            systemctl: PathBuf::from("systemctl"),
         }
     }
 
@@ -268,7 +271,7 @@ impl ClusterSupervisor {
     }
 
     async fn systemd_available(&self) -> bool {
-        Command::new("systemctl")
+        Command::new(&self.systemctl)
             .arg("--version")
             .output()
             .await
@@ -288,7 +291,7 @@ impl ClusterSupervisor {
     }
 
     async fn systemctl(&self, args: &[&str]) -> anyhow::Result<()> {
-        let out = Command::new("systemctl").args(args).output().await?;
+        let out = Command::new(&self.systemctl).args(args).output().await?;
         if !out.status.success() {
             anyhow::bail!(
                 "systemctl {:?} failed: {}",
@@ -305,7 +308,7 @@ impl ClusterSupervisor {
         let unit = self.unit_file_name();
         let mut args: Vec<&str> = verb.to_vec();
         args.push(&unit);
-        Command::new("systemctl")
+        Command::new(&self.systemctl)
             .args(&args)
             .output()
             .await
@@ -316,7 +319,7 @@ impl ClusterSupervisor {
     /// systemd active-state of the unit ("active"/"inactive"/"failed"/"activating"/"unknown").
     async fn component_state(&self) -> String {
         let unit = self.unit_file_name();
-        Command::new("systemctl")
+        Command::new(&self.systemctl)
             .args(["show", &unit, "-p", "ActiveState", "--value"])
             .output()
             .await
@@ -329,7 +332,7 @@ impl ClusterSupervisor {
     /// systemd `NRestarts` for the unit (cumulative auto-restarts); 0 when unknown/unavailable.
     async fn unit_restart_count(&self) -> u64 {
         let unit = self.unit_file_name();
-        Command::new("systemctl")
+        Command::new(&self.systemctl)
             .args(["show", &unit, "-p", "NRestarts", "--value"])
             .output()
             .await
@@ -342,7 +345,7 @@ impl ClusterSupervisor {
     /// so a same-named unit installed elsewhere is judged by its own file.
     async fn unit_owner(&self) -> UnitOwner {
         let unit = self.unit_file_name();
-        let Ok(out) = Command::new("systemctl")
+        let Ok(out) = Command::new(&self.systemctl)
             .args(["show", &unit, "-p", "FragmentPath", "--value"])
             .output()
             .await
@@ -682,6 +685,7 @@ pub struct K0sAgent {
     /// `[cluster].enabled` from this node's config. When false, `start()` refuses to touch
     /// systemd/k0s — the documented contract for the flag ([`ClusterConfig::enabled`]).
     enabled: bool,
+    systemctl: PathBuf,
     active: Mutex<Option<ClusterSupervisor>>,
     status: Arc<K0sNodeState>,
 }
@@ -697,6 +701,7 @@ impl K0sAgent {
             storage_provisioner: cfg.storage_provisioner.clone(),
             local_path_dir: cfg.local_path_dir.clone(),
             enabled: cfg.enabled,
+            systemctl: PathBuf::from("systemctl"),
             active: Mutex::new(None),
             status: Arc::new(K0sNodeState::new()),
         }
@@ -710,13 +715,20 @@ impl K0sAgent {
     /// A bare `ClusterSupervisor` for `role` (no config/token) — used to probe/stop the actual
     /// spurd-owned units by name when there is no tracked component.
     fn probe_supervisor(&self, role: ClusterRole) -> ClusterSupervisor {
-        ClusterSupervisor::new(ClusterConfig {
+        self.supervisor(ClusterConfig {
             role,
             k0s_binary: self.k0s_binary.clone(),
             k0s_config: None,
             join_token_file: None,
             node_ip: None,
         })
+    }
+
+    fn supervisor(&self, cfg: ClusterConfig) -> ClusterSupervisor {
+        ClusterSupervisor {
+            systemctl: self.systemctl.clone(),
+            ..ClusterSupervisor::new(cfg)
+        }
     }
 
     /// Re-adopt an already-running spurd-owned k0s unit at startup. A spurd restart leaves the k0s
@@ -743,7 +755,7 @@ impl K0sAgent {
             match probe.read_cfg_from_unit().await {
                 Ok(cfg) => {
                     let role = cfg.role;
-                    *self.active.lock().await = Some(ClusterSupervisor::new(cfg));
+                    *self.active.lock().await = Some(self.supervisor(cfg));
                     info!(
                         role = role.as_str(),
                         "adopted already-running k0s unit on startup"
@@ -842,7 +854,7 @@ impl K0sAgent {
                 warn!(error = %e, "failed to write local-path storage manifest (continuing)");
             }
         }
-        let sup = ClusterSupervisor::new(cfg);
+        let sup = self.supervisor(cfg);
         sup.reconcile_once().await?;
         let state = sup.component_state().await;
         self.status.set_unit_active(state == "active");
@@ -1221,6 +1233,24 @@ mod tests {
         assert_eq!(install, 0.0);
     }
 
+    /// A `systemctl` stand-in that appends each call's arguments to `<dir>/systemctl.calls`.
+    fn recording_systemctl(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("systemctl");
+        let calls = dir.join("systemctl.calls");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn recorded_systemctl_calls(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("systemctl.calls")).unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn purge_unit_removes_unit_file_and_token() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1238,6 +1268,7 @@ mod tests {
                 node_ip: None,
             },
             unit_dir: unit_dir.clone(),
+            systemctl: recording_systemctl(dir.path()),
         };
         // Simulate the installed unit file.
         let unit_path = unit_dir.join(sup.unit_file_name());
@@ -1252,6 +1283,11 @@ mod tests {
         assert!(
             !token.exists(),
             "purge_unit must remove the join token so the node can't rejoin"
+        );
+        assert_eq!(
+            recorded_systemctl_calls(dir.path()),
+            "daemon-reload\n",
+            "purge_unit must reload through the supervisor's systemctl, not the host's"
         );
     }
 
@@ -1452,8 +1488,8 @@ mod tests {
         // fails (e.g. a broken/half-installed k0s binary). A surviving token was minted against the
         // torn-down CA, so the node fails its next join with a kubernetes-ca verification error. The
         // reset failure must still be surfaced (Err), but only AFTER the purge. Drives
-        // `reset_and_purge` directly so no systemd/k0s host state is touched (`k0s reset` fails via a
-        // non-existent binary; `purge_unit`'s trailing daemon-reload is best-effort/ignored).
+        // `reset_and_purge` directly with a stand-in systemctl so no systemd/k0s host state is
+        // touched (`k0s reset` fails via a non-existent binary).
         let dir = tempfile::TempDir::new().unwrap();
         let unit_dir = dir.path().join("systemd");
         tokio::fs::create_dir_all(&unit_dir).await.unwrap();
@@ -1470,6 +1506,7 @@ mod tests {
                 node_ip: None,
             },
             unit_dir: unit_dir.clone(),
+            systemctl: recording_systemctl(dir.path()),
         };
         let unit_path = unit_dir.join(sup.unit_file_name());
         tokio::fs::write(&unit_path, b"[Unit]\n").await.unwrap();
@@ -1492,7 +1529,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_clears_unit_active_even_with_no_tracked_supervisor() {
-        let agent = K0sAgent::from_config(&spur_core::config::ClusterConfig::default());
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut agent = K0sAgent::from_config(&spur_core::config::ClusterConfig::default());
+        agent.systemctl = recording_systemctl(dir.path());
         agent.status.set_unit_active(true);
 
         agent.stop(false).await.unwrap();
