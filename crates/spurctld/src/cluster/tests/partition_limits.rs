@@ -162,6 +162,31 @@ async fn an_uneven_task_split_whose_busiest_node_exceeds_the_cap_never_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn any_rejects_a_job_each_candidate_refuses_for_a_different_limit() {
+    let dir = TempDir::new().unwrap();
+    let short = Partition {
+        max_time_minutes: Some(10),
+        ..partition("short", &[])
+    };
+    let small = Partition {
+        max_mem_per_node: Some(GIB),
+        ..partition("small", &[])
+    };
+    let cm = cluster_with(&dir, EnforcePartLimits::Any, vec![short, small]).await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    let spec = |minutes, mem| JobSpec {
+        time_limit: Some(chrono::Duration::minutes(minutes)),
+        memory_per_node_mb: Some(mem),
+        ..spec_in("short,small", 1)
+    };
+
+    let err = submit_err(&cm, spec(60, 2 * GIB));
+    assert!(err.contains("exceeds MaxTime"), "{err}");
+    assert!(cm.submit_job(spec(5, 2 * GIB)).is_ok(), "short admits it");
+    assert!(cm.submit_job(spec(60, GIB)).is_ok(), "small admits it");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_runnable_per_node_request_pends_under_no() {
     let dir = TempDir::new().unwrap();
     let cm = cluster_with(

@@ -1355,21 +1355,14 @@ impl ClusterManager {
         // Slurm, instead of accepting a job that would pend forever.
         self.validate_partition_node_bounds(&spec, &partitions)?;
 
-        // Reject an over-MaxTime wall-time at submit when EnforcePartLimits is on
-        // (default off keeps Slurm's admit-and-pend behavior). Only a
-        // user-requested `-t` is enforced; an auto-filled default never rejects.
-        if user_requested_time {
-            validate_partition_time_limit(
-                &spec,
-                config.scheduler.enforce_part_limits,
-                &partitions,
-            )?;
-        }
+        // Under EnforcePartLimits (default off keeps Slurm's admit-and-pend), only a
+        // user-requested `-t` counts toward MaxTime; an auto-filled default never rejects.
         if config.scheduler.enforce_part_limits != EnforcePartLimits::No {
-            validate_partition_resource_limits(
+            validate_partition_limits(
                 &spec,
                 config.scheduler.enforce_part_limits,
                 &partitions,
+                user_requested_time,
                 &self.nodes.read(),
                 &self.get_reservations(),
             )?;
@@ -11043,64 +11036,43 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     })
 }
 
-/// Reject a user-requested wall-time exceeding a requested partition's `MaxTime`,
-/// per `EnforcePartLimits` (`All` = all must fit, `Any` = at least one).
+/// Reject an over-`MaxTime` request per `EnforcePartLimits`, the only limit a job update
+/// can newly break. Every requested partition counts regardless of state (Slurm parity).
 fn validate_partition_time_limit(
     spec: &JobSpec,
     mode: EnforcePartLimits,
     partitions: &[Partition],
 ) -> Result<(), SubmitError> {
-    if mode == EnforcePartLimits::No {
-        return Ok(());
-    }
-    let Some(time_limit) = spec.time_limit.as_ref() else {
-        return Ok(());
-    };
-    let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
-        return Ok(());
-    };
-
-    // Check every requested partition regardless of state (Slurm parity), so the
-    // outcome doesn't depend on transient Down/Drain. Existence checked upstream.
-    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
-    if requested.is_empty() {
-        return Ok(());
-    }
-
-    let allows = |part: &&Partition| part.time_allows(Some(time_limit));
-    let satisfied = if mode == EnforcePartLimits::All {
-        requested.iter().all(allows)
-    } else {
-        requested.iter().any(allows)
-    };
-    if satisfied {
-        return Ok(());
-    }
-
-    let offending = requested
-        .iter()
-        .find(|p| !allows(p))
-        .unwrap_or(&requested[0]);
-    let requested_str =
-        spur_core::config::format_time_seconds(Some(time_limit.num_seconds().max(0)));
-    let max_str = spur_core::config::format_time_seconds(
-        offending.max_time_minutes.map(|m| i64::from(m) * 60),
-    );
-    Err(SubmitError::invalid(format!(
-        "Requested time limit is invalid (missing or exceeds some limit): \
-         {requested_str} exceeds MaxTime {max_str} of partition '{}'",
-        offending.name
-    )))
+    enforce_per_partition(spec, mode, partitions, |p| {
+        partition_time_violation(spec, p)
+    })
 }
 
-/// Reject a request a requested partition could never run (`EnforcePartLimits` `All`/`Any`):
-/// per-job memory limit, or cap even on an idle node. Load alone never rejects; it waits.
-fn validate_partition_resource_limits(
+/// Reject at submit per `EnforcePartLimits` (`All`: any requested partition violated, `Any`:
+/// every one), weighing each partition's wall time and resource limits together. Load
+/// alone never rejects; it waits.
+fn validate_partition_limits(
     spec: &JobSpec,
     mode: EnforcePartLimits,
     partitions: &[Partition],
+    check_time: bool,
     nodes: &HashMap<String, Node>,
     reservations: &[Reservation],
+) -> Result<(), SubmitError> {
+    let job = Job::new(0, spec.clone());
+    enforce_per_partition(spec, mode, partitions, |p| {
+        check_time
+            .then(|| partition_time_violation(spec, p))
+            .flatten()
+            .or_else(|| partition_resource_violation(&job, p, nodes, reservations))
+    })
+}
+
+fn enforce_per_partition(
+    spec: &JobSpec,
+    mode: EnforcePartLimits,
+    partitions: &[Partition],
+    violation: impl Fn(&Partition) -> Option<String>,
 ) -> Result<(), SubmitError> {
     if mode == EnforcePartLimits::No {
         return Ok(());
@@ -11109,11 +11081,7 @@ fn validate_partition_resource_limits(
     if requested.is_empty() {
         return Ok(());
     }
-    let job = Job::new(0, spec.clone());
-    let violations: Vec<String> = requested
-        .iter()
-        .filter_map(|p| partition_resource_violation(&job, p, nodes, reservations))
-        .collect();
+    let violations: Vec<String> = requested.iter().filter_map(|p| violation(p)).collect();
     let rejected = match mode {
         EnforcePartLimits::All => !violations.is_empty(),
         _ => violations.len() == requested.len(),
@@ -11122,6 +11090,23 @@ fn validate_partition_resource_limits(
         Some(violation) if rejected => Err(SubmitError::invalid(violation)),
         _ => Ok(()),
     }
+}
+
+/// Why the requested wall time exceeds `partition`'s `MaxTime`, if it does.
+fn partition_time_violation(spec: &JobSpec, partition: &Partition) -> Option<String> {
+    let time_limit = spec.time_limit.as_ref()?;
+    if partition.time_allows(Some(time_limit)) {
+        return None;
+    }
+    let requested = spur_core::config::format_time_seconds(Some(time_limit.num_seconds().max(0)));
+    let max = spur_core::config::format_time_seconds(
+        partition.max_time_minutes.map(|m| i64::from(m) * 60),
+    );
+    Some(format!(
+        "Requested time limit is invalid (missing or exceeds some limit): \
+         {requested} exceeds MaxTime {max} of partition '{}'",
+        partition.name
+    ))
 }
 
 /// Why `partition` could never run the job, regardless of current load.
