@@ -5393,10 +5393,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         state_reason: job.state_reason(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
-        end_time: job
-            .end_time
-            .or(job.preempt_grace().map(|p| p.deadline))
-            .map(datetime_to_proto),
+        end_time: job.reported_end_time().map(datetime_to_proto),
         preempt_time: job
             .preempt_grace()
             .map(|p| datetime_to_proto(p.signaled_at)),

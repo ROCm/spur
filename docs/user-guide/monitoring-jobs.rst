@@ -840,7 +840,9 @@ fields:
 While a job is inside its preemption grace period, ``scontrol show job`` instead
 prints a line holding only ``PreemptTime=<timestamp>``, the moment the job was
 signaled to wind down, and ``EndTime`` shows when the grace ends. ``PreemptTime``
-is omitted for a job that is not in a grace.
+is omitted for a job that is not in a grace. The REST job object
+(``GET /job/<id>``, ``GET /jobs``) reports the same as ``preempt_time`` (Unix
+seconds, ``null`` outside a grace) and ``end_time``.
 
 .. _preemption-grace-user:
 

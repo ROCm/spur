@@ -1375,6 +1375,13 @@ impl Job {
             .filter(|pending| pending.run_attempt == self.run_attempt)
     }
 
+    /// The `EndTime` every job API reports: when the job ended or, while it is
+    /// inside a preemption grace, the grace deadline.
+    pub fn reported_end_time(&self) -> Option<DateTime<Utc>> {
+        self.end_time
+            .or(self.preempt_grace().map(|pending| pending.deadline))
+    }
+
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
         self.allocated_nodes
