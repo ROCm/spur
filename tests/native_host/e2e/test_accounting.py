@@ -159,8 +159,9 @@ class TestSacctUnstartedMetadata:
         c.scancel(job_id)
         assert _wait_end(c.cli, job_id)["reason"] == "UserCancel"
 
+        # job_id is the int sbatch returned; psql() has no parameter binding.
         row = c.psql(
-            "SELECT name,user_name,account,partition_name,state,num_nodes,num_tasks,"
+            "SELECT name,user_name,account,partition_name,state,num_nodes,num_tasks,"  # nosec B608
             "cpus_per_task,memory_mb,start_time IS NULL,reason,usage_recorded,"
             "time_limit_secs,to_char(submit_time AT TIME ZONE 'UTC',"
             "'YYYY-MM-DD\"T\"HH24:MI:SS') "

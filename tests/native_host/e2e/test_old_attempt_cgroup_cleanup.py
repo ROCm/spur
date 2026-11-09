@@ -22,7 +22,8 @@ def attempt_cleanup_image(ssh_nodes, remote_bin_dir):
     if code or output.strip() != "2":
         pytest.skip("attempt cleanup tests require Docker access with cgroup v2")
     token = uuid.uuid4().hex
-    directory = f"/tmp/spur-attempt-cleanup-{token}"
+    # A path on the test node, made unguessable by the uuid4 token.
+    directory = f"/tmp/spur-attempt-cleanup-{token}"  # nosec B108
     image = f"spur-attempt-cleanup:{token}"
     support = Path(__file__).with_name("attempt_cleanup")
     try:
