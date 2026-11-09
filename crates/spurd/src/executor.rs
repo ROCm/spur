@@ -2634,18 +2634,17 @@ fn dri_rocr(cfg: &JobLaunchConfig, env: &HashMap<String, String>, is_root: bool)
 }
 
 /// `ROCR_VISIBLE_DEVICES` as ROCr reads it behind the /dev/dri tmpfs. ROCr
-/// numbers only the GPUs it can open, in node order, so a staged GPU id becomes
-/// its rank among the staged ones. Any other token names what it named before.
+/// numbers only the GPUs it can open, in the order of `staged_gpu_ids`, so a
+/// staged GPU id becomes its position there. Any other token names what it
+/// named before.
 fn isolated_rocr_visible_devices(rocr: &str, staged_gpu_ids: &[u32]) -> String {
-    let mut staged = staged_gpu_ids.to_vec();
-    staged.sort_unstable();
     rocr.split(',')
         .map(|token| {
             token
                 .trim()
                 .parse::<u32>()
                 .ok()
-                .and_then(|id| staged.binary_search(&id).ok())
+                .and_then(|id| staged_gpu_ids.iter().position(|&staged| staged == id))
                 .map_or_else(|| token.to_string(), |rank| rank.to_string())
         })
         .collect::<Vec<_>>()
@@ -4012,8 +4011,17 @@ mod tests {
     #[test]
     fn rocr_visible_devices_become_ranks_of_the_staged_gpus() {
         assert_eq!(isolated_rocr_visible_devices("2", &[2]), "0");
-        assert_eq!(isolated_rocr_visible_devices("2,5", &[5, 2]), "0,1");
+        assert_eq!(isolated_rocr_visible_devices("2,5", &[2, 5]), "0,1");
         assert_eq!(isolated_rocr_visible_devices("6,5", &[4, 5, 6, 7]), "2,1");
+    }
+
+    /// ROCr numbers the GPUs in KFD topology order, which need not follow the
+    /// GPU ids: on some nodes GPU 2 comes before GPU 1.
+    #[test]
+    fn rocr_ranks_follow_the_order_of_the_staged_gpus() {
+        assert_eq!(isolated_rocr_visible_devices("1,2", &[2, 1]), "1,0");
+        assert_eq!(isolated_rocr_visible_devices("1", &[2, 1]), "1");
+        assert_eq!(isolated_rocr_visible_devices("2", &[2, 1]), "0");
     }
 
     /// A `--gpu-bind=map_gpu` id outside the allocation is not staged; ROCr

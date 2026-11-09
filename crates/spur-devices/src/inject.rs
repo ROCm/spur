@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::cdi::discovery::kfd_nodes_by_render_minor;
 use crate::cdi::spec::{ContainerEdits, DeviceNode, Mount};
 use crate::registry::entry::DeviceEntry;
 
@@ -90,7 +91,8 @@ pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,
     pub device_paths: Vec<String>,
-    /// GPU ids whose device nodes `visible_devices` stages.
+    /// GPU ids whose device nodes `visible_devices` stages, in the order ROCr
+    /// numbers them.
     #[serde(default)]
     pub gpu_ids: Vec<u32>,
 }
@@ -122,6 +124,38 @@ pub(crate) fn device_ids_for_gres(devices: &[&DeviceEntry], gres_name: &str) -> 
         .collect()
 }
 
+/// The ids of the `gres_name` GPUs in the order ROCr numbers them, which is the
+/// order of their KFD topology nodes under `sysfs`. If that order is not known
+/// for each of them, the ids are in ascending order.
+pub(crate) fn rocr_ordered_gpu_ids(
+    devices: &[&DeviceEntry],
+    gres_name: &str,
+    sysfs: &Path,
+) -> Vec<u32> {
+    let kfd_nodes = kfd_nodes_by_render_minor(sysfs);
+    let by_kfd_node: Option<Vec<(u32, u32)>> = devices
+        .iter()
+        .filter(|d| d.gres_name == gres_name)
+        .map(|d| Some((*kfd_nodes.get(&render_minor(d)?)?, d.device_id)))
+        .collect();
+    let Some(mut by_kfd_node) = by_kfd_node else {
+        let mut ids = device_ids_for_gres(devices, gres_name);
+        ids.sort_unstable();
+        return ids;
+    };
+    by_kfd_node.sort_unstable();
+    by_kfd_node.into_iter().map(|(_, id)| id).collect()
+}
+
+fn render_minor(device: &DeviceEntry) -> Option<u32> {
+    device.device_edits.device_nodes.iter().find_map(|node| {
+        node.effective_host_path()
+            .strip_prefix("/dev/dri/renderD")?
+            .parse()
+            .ok()
+    })
+}
+
 fn format_device_id_list(ids: &[u32]) -> String {
     ids.iter()
         .map(|id| id.to_string())
@@ -149,6 +183,7 @@ pub fn build_injection_plans(
     let edits = merge_edits_from_devices(devices);
     let gpu_ids = device_ids_for_gres(devices, "gpu");
     let mut host_plan = HostInjector::plan(&edits, &gpu_ids);
+    host_plan.gpu_ids = rocr_ordered_gpu_ids(devices, "gpu", Path::new("/sys"));
     let mut container_plan = ContainerInjector::plan(&edits, &gpu_ids, job_uid, job_gid);
     apply_spur_job_device_env(&mut host_plan.env, devices);
     apply_spur_job_device_env(&mut container_plan.env, devices);
@@ -294,7 +329,6 @@ impl HostInjector {
         }
 
         apply_gpu_visibility(&mut plan.env, &edits.inject_actions, device_ids);
-        plan.gpu_ids = device_ids.to_vec();
 
         plan.visible_devices = edits
             .device_edits
@@ -599,7 +633,72 @@ mod tests {
             .device_paths
             .contains(&"/dev/dri/renderD129".to_string()));
         assert!(plan.device_paths.contains(&"/dev/kfd".to_string()));
-        assert_eq!(plan.gpu_ids, vec![0, 1]);
+    }
+
+    /// A GPU with render node `renderD{128 + 8 * id}`, as on an 8-GPU node.
+    fn gpu_with_render_node(device_id: u32) -> DeviceEntry {
+        let mut entry = gpu_device_entry(device_id);
+        entry.device_edits.device_nodes.push(DeviceNode {
+            path: format!("/dev/dri/renderD{}", 128 + 8 * device_id),
+            host_path: None,
+            r#type: None,
+            major: None,
+            minor: None,
+            file_mode: None,
+            permissions: None,
+            uid: None,
+            gid: None,
+        });
+        entry
+    }
+
+    /// Writes a KFD topology with two CPU nodes, then the GPU render minors
+    /// in the order of `render_minors`, from node 2 on.
+    fn write_kfd_topology(sysfs: &Path, render_minors: &[u32]) {
+        let nodes = sysfs.join("class/kfd/kfd/topology/nodes");
+        let cpu = "cpu_cores_count 96\nsimd_count 0\nvendor_id 0\n".to_string();
+        let gpu = |minor| {
+            format!("cpu_cores_count 0\nsimd_count 304\nvendor_id 4098\ndrm_render_minor {minor}\n")
+        };
+        let properties = [cpu.clone(), cpu]
+            .into_iter()
+            .chain(render_minors.iter().map(gpu));
+        for (node, text) in properties.enumerate() {
+            let dir = nodes.join(node.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("properties"), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn rocr_order_follows_the_kfd_nodes_not_the_gpu_ids() {
+        let sysfs = tempfile::tempdir().unwrap();
+        write_kfd_topology(sysfs.path(), &[144, 152, 160, 168, 176, 184, 128, 136]);
+        let gpus: Vec<DeviceEntry> = (0..8).map(gpu_with_render_node).collect();
+        let all: Vec<&DeviceEntry> = gpus.iter().collect();
+
+        let order = rocr_ordered_gpu_ids(&all, "gpu", sysfs.path());
+        assert_eq!(order, [2, 3, 4, 5, 6, 7, 0, 1]);
+        let order = rocr_ordered_gpu_ids(&[&gpus[1], &gpus[2]], "gpu", sysfs.path());
+        assert_eq!(order, [2, 1]);
+        let order = rocr_ordered_gpu_ids(&[&gpus[3], &gpus[2]], "gpu", sysfs.path());
+        assert_eq!(order, [2, 3]);
+    }
+
+    #[test]
+    fn rocr_order_is_the_id_order_without_a_kfd_node_for_each_gpu() {
+        let gpus: Vec<DeviceEntry> = (0..3).map(gpu_with_render_node).collect();
+        let no_topology = tempfile::tempdir().unwrap();
+        let order = rocr_ordered_gpu_ids(&[&gpus[2], &gpus[1]], "gpu", no_topology.path());
+        assert_eq!(order, [1, 2]);
+
+        let partial = tempfile::tempdir().unwrap();
+        write_kfd_topology(partial.path(), &[144, 128]);
+        let order = rocr_ordered_gpu_ids(&[&gpus[2], &gpus[1]], "gpu", partial.path());
+        assert_eq!(order, [1, 2]);
+
+        let order = rocr_ordered_gpu_ids(&[&gpu_device_entry(1), &gpus[0]], "gpu", partial.path());
+        assert_eq!(order, [0, 1]);
     }
 
     #[test]

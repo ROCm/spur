@@ -20,6 +20,7 @@ const KFD_AMD_VENDOR_ID: u32 = 4098; // 0x1002
 const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
 const GPU_SUPPLEMENTARY_GROUPS: [&str; 2] = ["video", "render"];
+const KFD_TOPOLOGY_NODES: &str = "class/kfd/kfd/topology/nodes";
 
 pub fn discover_to_cdi() -> Vec<CdiSpec> {
     let gpus = discover_amd_gpus();
@@ -149,6 +150,21 @@ fn discover_kfd_gpus_from_root(root: &Path) -> Vec<KfdGpuNode> {
 
     gpus.sort_by_key(|g| g.render_minor);
     gpus
+}
+
+/// The KFD topology node of each AMD GPU, by render minor. ROCr numbers the
+/// GPUs that it can open in the order of these nodes.
+pub(crate) fn kfd_nodes_by_render_minor(sysfs: &Path) -> HashMap<u32, u32> {
+    let root = sysfs.join(KFD_TOPOLOGY_NODES);
+    // A node without AMD GPUs has no topology; skip the discovery warning,
+    // which each launch would repeat.
+    if !root.exists() {
+        return HashMap::new();
+    }
+    discover_kfd_gpus_from_root(&root)
+        .into_iter()
+        .map(|node| (node.render_minor, node.node_id))
+        .collect()
 }
 
 fn is_amd_gpu_node(props: &HashMap<String, String>) -> bool {
@@ -474,7 +490,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
 }
 
 fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
-    let kfd_nodes = discover_kfd_gpus_from_root(&sysfs.join("class/kfd/kfd/topology/nodes"));
+    let kfd_nodes = discover_kfd_gpus_from_root(&sysfs.join(KFD_TOPOLOGY_NODES));
     if kfd_nodes.is_empty() {
         return Vec::new();
     }

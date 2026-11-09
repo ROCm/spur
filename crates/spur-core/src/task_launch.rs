@@ -1339,6 +1339,12 @@ mod tests {
             seen,
             ["0 ROCR=0,1 HIP=0,1 CUDA=4,5", "1 ROCR=2,3 HIP=0,1 CUDA=6,7"]
         );
+        let kfd_order =
+            per_task_gpu_env(&[("SPUR_JOB_GPUS", "1,2"), ("ROCR_VISIBLE_DEVICES", "1,0")]);
+        assert_eq!(
+            kfd_order,
+            ["0 ROCR=1 HIP=0 CUDA=1", "1 ROCR=0 HIP=0 CUDA=2"]
+        );
     }
 
     #[test]
