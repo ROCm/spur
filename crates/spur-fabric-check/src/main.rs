@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Per-node RDMA fabric health check, meant to be named as the `program` of a
-//! `[[health.checks]]` entry. Exit 0 on pass or skip, 1 when a check fails.
+//! `[[health.checks]]` entry. Exit 0 on pass or skip, 1 when a check fails, 127
+//! when the tx probe command could not run. The health framework does not drain
+//! on 127, so a missing probe binary cannot take a whole fleet out of service.
 
 mod checks;
 mod sysfs;
@@ -42,15 +44,20 @@ fn main() -> ExitCode {
         match_gpus: !args.no_gpu_match,
     };
     let mut findings = evaluate(&inv, &opts);
+    let mut probe_unrunnable = false;
     if let (false, Some(devices)) = (args.tx_probe.is_empty(), &inv.rdma) {
         findings.push(tx_probe(&args.root, devices, |dev, port| {
-            run_probe_command(&args.tx_probe, dev, port)
+            let result = run_probe_command(&args.tx_probe, dev, port);
+            probe_unrunnable |= result.is_err();
+            result
         }));
     }
     for f in &findings {
         print_finding(f);
     }
-    if has_failures(&findings) {
+    if probe_unrunnable {
+        ExitCode::from(127)
+    } else if has_failures(&findings) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -69,10 +76,16 @@ fn print_finding(f: &Finding) {
 fn run_probe_command(argv: &[String], dev: &str, port: u32) -> std::io::Result<bool> {
     let port = port.to_string();
     let expand = |a: &String| a.replace("{dev}", dev).replace("{port}", &port);
-    Command::new(expand(&argv[0]))
+    let status = Command::new(expand(&argv[0]))
         .args(argv[1..].iter().map(expand))
-        .status()
-        .map(|s| s.success())
+        .status()?;
+    // 126/127: a shell or wrapper could not find or execute the real command.
+    if matches!(status.code(), Some(126 | 127)) {
+        return Err(std::io::Error::other(format!(
+            "command could not run ({status})"
+        )));
+    }
+    Ok(status.success())
 }
 
 #[cfg(test)]

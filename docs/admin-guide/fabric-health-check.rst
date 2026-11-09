@@ -4,8 +4,9 @@ RDMA Fabric Health Check
 ``spur-fabric-check`` is a small program meant to be named as the ``program`` of
 a ``[[health.checks]]`` entry (see ``examples/spur.conf``). It inspects the
 node's RDMA devices through sysfs and exits non-zero when the fabric looks
-degraded, which makes the health framework drain the node with the check's
-output as the reason. It is vendor-neutral: it reads the generic
+degraded, which makes the health framework drain the node. The drain reason
+names the program and exit code, not the failing device, and the drain stays
+until an operator clears it. It is vendor-neutral: it reads the generic
 ``/sys/class/infiniband`` interface, so it covers ``ionic``, ``bnxt_re``, and
 ``mlx5`` devices alike.
 
@@ -48,7 +49,9 @@ value could not be read (for example, a provider that does not expose a rate)
 and never fails the node. On a host without ``/sys/class/infiniband`` the whole
 program reports ``SKIP`` and exits 0, so it is safe to run on mixed fleets.
 
-Exit status is ``0`` when nothing failed and ``1`` otherwise.
+Exit status is ``0`` when nothing failed and ``1`` when a check failed. It is
+``127`` when the probe command could not run; the framework logs that as a
+deployment error and does not drain the node.
 
 Options
 -------
@@ -71,6 +74,8 @@ A NIC can report ``ACTIVE`` while its control path is dead and it sends nothing.
 The probe catches this: for each ``ACTIVE`` port it reads the transmit counters,
 runs the command you supply, and reads them again. A port whose counters did not
 advance is reported as failed, as is a traffic command that exits non-zero.
+The command must bound its own run time: a hang runs into ``timeout_secs``, and
+the framework drains the node on a timeout.
 
 An idle node sends no traffic by itself, so the command is what exercises the
 port. ``{dev}`` and ``{port}`` in the arguments are replaced with the device

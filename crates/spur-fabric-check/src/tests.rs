@@ -306,3 +306,25 @@ fn tx_counters_use_whichever_the_provider_exposes() {
     let counters = read_tx_counters(dir.path(), "bnxt_re0", 1);
     assert_eq!(counters, vec![("hw_counters/tx_pkts", 7)]);
 }
+
+fn argv(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn probe_command_that_cannot_start_is_an_error() {
+    let cmd = argv(&["/nonexistent/probe"]);
+    assert!(crate::run_probe_command(&cmd, "ionic_0", 1).is_err());
+}
+
+#[test]
+fn wrapper_that_cannot_find_its_command_is_an_error() {
+    let cmd = argv(&["sh", "-c", "exit 127"]);
+    assert!(crate::run_probe_command(&cmd, "ionic_0", 1).is_err());
+}
+
+#[test]
+fn traffic_failure_is_not_an_error() {
+    let cmd = argv(&["sh", "-c", "exit 1"]);
+    assert!(!crate::run_probe_command(&cmd, "ionic_0", 1).unwrap());
+}
