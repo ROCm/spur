@@ -8,6 +8,7 @@ use crate::timefmt::format_timestamp as format_ts;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spur_core::accounting::TresRecord;
+use spur_core::partition::{typed_gpu_tres_key, TRES_CPU, TRES_GPU, TRES_MEM};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
 /// Administrative control commands.
@@ -1504,6 +1505,7 @@ fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreatePar
     if parsed.name.is_empty() {
         anyhow::bail!("scontrol create: PartitionName= is required");
     }
+    parsed.limits.drop_redundant_cpu_alias();
     Ok(parsed)
 }
 
@@ -1934,6 +1936,7 @@ fn partition_update_request(
     if grace_time.is_some() && clear_grace_time {
         bail!("scontrol update: GraceTime= cannot be combined with ClearGraceTime=yes");
     }
+    limits.drop_redundant_cpu_alias();
 
     // An ACL is applied only when its key appeared; an empty value clears it.
     Ok(spur_proto::proto::UpdatePartitionRequest {
@@ -2041,7 +2044,12 @@ impl PartitionLimitArgs {
                 return Ok(true);
             }
             "maxtrespernode" => {
-                self.max_tres_per_node = Some(parse_tres_caps(value).map_err(|_| invalid())?);
+                let caps = if value.trim().eq_ignore_ascii_case("UNLIMITED") {
+                    HashMap::new()
+                } else {
+                    parse_tres_caps(value).map_err(|_| invalid())?
+                };
+                self.max_tres_per_node = Some(caps);
                 return Ok(true);
             }
             "maxmempernode" => &mut self.max_mem_per_node,
@@ -2053,6 +2061,20 @@ impl PartitionLimitArgs {
         };
         *field = Some(count(value)?);
         Ok(true)
+    }
+
+    /// Drop `MaxCPUsPerNode` when the map carries the same `cpu` cap: `show partition`
+    /// prints both, and pasting that back must not trip the "set only one" check.
+    fn drop_redundant_cpu_alias(&mut self) {
+        let cpu_cap = self
+            .max_tres_per_node
+            .as_ref()
+            .and_then(|caps| caps.get(TRES_CPU));
+        if let (Some(cpus), Some(&cap)) = (self.max_cpus_per_node, cpu_cap) {
+            if u64::from(cpus) == cap {
+                self.max_cpus_per_node = None;
+            }
+        }
     }
 }
 
@@ -2070,9 +2092,26 @@ fn parse_tres_caps(value: &str) -> Result<HashMap<String, u64>> {
                 .trim()
                 .parse()
                 .with_context(|| format!("'{entry}' has a non-numeric limit"))?;
-            Ok((key.trim().to_string(), limit))
+            Ok((normalize_tres_key(key.trim()), limit))
         })
         .collect()
+}
+
+/// Lowercase the `cpu`/`mem`/`gres/gpu` prefix but keep a GPU type's case, since
+/// types match the node's GRES names exactly. Unknown keys pass through for the
+/// controller to reject.
+fn normalize_tres_key(key: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    if [TRES_CPU, TRES_MEM, TRES_GPU].contains(&lower.as_str()) {
+        return lower;
+    }
+    let prefix_len = TRES_GPU.len() + 1;
+    match key.get(..prefix_len) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(&format!("{TRES_GPU}:")) => {
+            typed_gpu_tres_key(&key[prefix_len..])
+        }
+        _ => key.to_string(),
+    }
 }
 
 /// Update a node's state via the controller.
@@ -4165,5 +4204,122 @@ mod tests {
                 "DefMemPerCPU=1024 MaxMemPerCPU=2048".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn max_tres_per_node_unlimited_clears_every_cap() {
+        for value in ["UNLIMITED", "unlimited", ""] {
+            let req = partition_update_request(&p(&[
+                "PartitionName=gpu",
+                &format!("MaxTRESPerNode={value}"),
+            ]))
+            .unwrap();
+            assert!(req.set_max_tres_per_node, "{value}");
+            assert!(req.max_tres_per_node.is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn max_tres_per_node_keys_are_case_insensitive_but_keep_the_gpu_type() {
+        let mut limits = PartitionLimitArgs::default();
+        limits
+            .parse_key(
+                "maxtrespernode",
+                "CPU=64,Mem=1024,GRES/GPU=8,Gres/Gpu:MI300X=4,License=1",
+            )
+            .unwrap();
+        assert_eq!(
+            limits.max_tres_per_node,
+            Some(HashMap::from([
+                ("cpu".to_string(), 64),
+                ("mem".to_string(), 1024),
+                ("gres/gpu".to_string(), 8),
+                ("gres/gpu:MI300X".to_string(), 4),
+                ("License".to_string(), 1),
+            ]))
+        );
+    }
+
+    #[test]
+    fn max_cpus_per_node_equal_to_the_map_cpu_cap_is_dropped() {
+        let req = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "MaxCPUsPerNode=64",
+            "MaxTRESPerNode=cpu=64,mem=1024",
+        ]))
+        .unwrap();
+        assert_eq!(req.max_cpus_per_node, None);
+        assert_eq!(req.max_tres_per_node.get("cpu"), Some(&64));
+
+        let created = parse_partition_create_params(&p(&[
+            "PartitionName=gpu",
+            "MaxTRESPerNode=CPU=64",
+            "MaxCPUsPerNode=64",
+        ]))
+        .unwrap();
+        assert_eq!(created.limits.max_cpus_per_node, None);
+    }
+
+    #[test]
+    fn max_cpus_per_node_differing_from_the_map_cpu_cap_is_still_rejected() {
+        let req = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "MaxCPUsPerNode=32",
+            "MaxTRESPerNode=cpu=64",
+        ]))
+        .unwrap();
+        assert_eq!(req.max_cpus_per_node, Some(32));
+        let err = spur_core::partition_limits::fold_max_cpus_per_node(
+            req.max_tres_per_node.into_iter().collect(),
+            req.max_cpus_per_node,
+        )
+        .unwrap_err();
+        assert!(err.contains("set only one"), "{err}");
+    }
+
+    #[test]
+    fn show_partition_limit_lines_parse_back_to_the_same_limits() {
+        let part = spur_proto::proto::PartitionInfo {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: HashMap::from([
+                ("cpu".to_string(), 64),
+                ("mem".to_string(), 131_072),
+                ("gres/gpu:MI300X".to_string(), 4),
+            ]),
+            def_mem_per_cpu: Some(1024),
+            max_mem_per_cpu: Some(2048),
+            ..Default::default()
+        };
+        let mut params = vec!["PartitionName=gpu".to_string()];
+        params.extend(
+            partition_limit_lines(&part)
+                .iter()
+                .flat_map(|line| line.split_whitespace().map(str::to_string)),
+        );
+
+        let req = partition_update_request(&params).unwrap();
+        assert!(req.set_max_tres_per_node);
+        assert_eq!(req.max_tres_per_node, part.max_tres_per_node);
+        assert_eq!(req.max_cpus_per_node, None);
+        assert_eq!(req.def_mem_per_cpu, Some(1024));
+        assert_eq!(req.max_mem_per_cpu, Some(2048));
+
+        let created = parse_partition_create_params(&params).unwrap();
+        assert_eq!(
+            created.limits.max_tres_per_node,
+            Some(part.max_tres_per_node.clone())
+        );
+        assert_eq!(created.limits.max_cpus_per_node, None);
+
+        let mut plain = vec!["PartitionName=gpu".to_string()];
+        plain.extend(
+            partition_limit_lines(&spur_proto::proto::PartitionInfo::default())
+                .iter()
+                .flat_map(|line| line.split_whitespace().map(str::to_string)),
+        );
+        let cleared = partition_update_request(&plain).unwrap();
+        assert!(cleared.set_max_tres_per_node);
+        assert!(cleared.max_tres_per_node.is_empty());
+        assert_eq!(cleared.max_cpus_per_node, Some(0));
     }
 }

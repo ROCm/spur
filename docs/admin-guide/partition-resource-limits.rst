@@ -377,7 +377,8 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
    scontrol update PartitionName=cpu MaxMemPerCPU=2048 DefMemPerGPU=8192
 
 - ``MaxTRESPerNode=`` replaces the whole cap table. ``MaxTRESPerNode=`` with an
-  empty value removes every cap.
+  empty value or ``UNLIMITED`` removes every cap. Its ``cpu``, ``mem``, and
+  ``gres/gpu`` names are case-insensitive; a GPU type keeps the case given.
 - ``UNLIMITED`` or ``0`` leaves ``MaxCPUsPerNode``, ``MaxMemPerNode``,
   ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, or ``DefMemPerGPU``
   unset on create and clears it on update. To forbid a resource, use
@@ -386,7 +387,8 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
   leave a key out to make it unlimited.
 - The same rules as in ``spur.conf`` apply: unknown keys, ``MaxCPUsPerNode``
   and a ``cpu`` key in the same command, and conflicting memory knobs are
-  rejected.
+  rejected. The one exception is a ``MaxCPUsPerNode`` equal to the ``cpu``
+  key, so the ``show partition`` lines can be pasted back as they are.
 - ``scontrol reconfigure`` applies the values in ``spur.conf`` again,
   replacing limits changed with ``scontrol``.
 - Updates that change different knobs at the same time, from two
