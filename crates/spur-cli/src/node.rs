@@ -79,7 +79,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             node,
             force,
             reason,
-        } => cmd_remove(&controller, node, force, reason).await,
+        } => remove_nodes(&controller, node, force, reason).await,
     }
 }
 
@@ -204,13 +204,16 @@ async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String
     Ok(())
 }
 
-async fn cmd_remove(
+pub(crate) async fn remove_nodes(
     controller: &str,
     node_pattern: String,
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
     let nodes = expand_node_pattern(&node_pattern)?;
+    if nodes.as_ref().is_some_and(Vec::is_empty) {
+        bail!("invalid node name pattern: no nodes specified");
+    }
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
     let nodes = if let Some(nodes) = nodes {
         nodes

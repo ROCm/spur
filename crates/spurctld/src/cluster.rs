@@ -2928,11 +2928,11 @@ impl ClusterManager {
             memory_adjustment: attribution.memory_adjustment,
             at: None,
         })?;
-        // The read-then-propose above is not atomic: a second reservation or a new
-        // exclusion can apply first, so the apply's refusal is the answer that counts.
+        // A reservation, exclusion, or node removal can commit after the precheck;
+        // only the apply response proves that this placement was charged.
         if !resp.job_started {
             anyhow::bail!(
-                "job {} lost a concurrent reservation race or now excludes a chosen node",
+                "job {} lost a concurrent reservation race or a chosen node is removed or excluded",
                 job_id
             );
         }
@@ -5503,8 +5503,12 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::NodeRemove {
             name: name.to_string(),
             reason,
+            force: Some(force),
             at: None,
         })?;
+        if let Some(error) = &resp.node_remove_error {
+            anyhow::bail!("{error}");
+        }
         self.k8s_metrics
             .remove_node(&self.config().cluster_name, name);
         self.run_all_finalized_side_effects(&resp);
@@ -8935,6 +8939,10 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
+                if let Some(name) = node_names.iter().find(|name| !nodes.contains_key(*name)) {
+                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto a removed node");
+                    return ClientResponse::default();
+                }
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
                 // second propose for the same job must not double-charge nodes.
                 // Not gated on job state — a legitimate JobStart can apply against
@@ -9641,7 +9649,28 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason, .. } => {
+            WalOperation::NodeRemove {
+                name,
+                reason,
+                force,
+                ..
+            } => {
+                if *force == Some(false)
+                    && jobs.values().any(|job| {
+                        matches!(
+                            job.state,
+                            JobState::Pending
+                                | JobState::Running
+                                | JobState::Completing
+                                | JobState::Suspended
+                        ) && job.is_held_on(name)
+                    })
+                {
+                    response.node_remove_error = Some(format!(
+                        "node '{name}' has active jobs; use --force to evict them"
+                    ));
+                    return response;
+                }
                 let failure = NodeFailure {
                     node: name.clone(),
                     reason: reason.clone().unwrap_or_default(),
@@ -12369,6 +12398,50 @@ fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<J
             task_spec
         })
         .collect())
+}
+
+#[cfg(test)]
+pub(crate) mod node_test_fixtures {
+    use super::ClusterManager;
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+
+    pub(crate) fn register(cluster: &ClusterManager, names: &[&str]) {
+        for name in names {
+            if cluster.get_node(name).is_some() {
+                continue;
+            }
+            cluster.apply_operation(&WalOperation::NodeRegister {
+                name: (*name).into(),
+                hostname: (*name).into(),
+                resources: spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 1,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: Default::default(),
+                source: Default::default(),
+                capabilities: Vec::new(),
+            });
+        }
+    }
+
+    pub(crate) fn restore_without_node(cluster: &ClusterManager, name: &str) {
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&cluster.snapshot_state().unwrap()).unwrap();
+        snapshot["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|node| node["name"] != name);
+        cluster
+            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
+            .unwrap();
+        assert!(cluster.get_node(name).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -19242,6 +19315,7 @@ state = "UP"
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
             name: "worker1".into(),
             reason: Some("decommissioned".into()),
+            force: Some(true),
             at: None,
         });
 
@@ -39415,6 +39489,7 @@ state = "UP"
         cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
             reason: Some("decommission".into()),
+            force: Some(true),
             at: None,
         });
         assert!(cm.get_node("n1").is_none());
@@ -39432,6 +39507,7 @@ state = "UP"
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
             reason: None,
+            force: Some(true),
             at: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -39473,6 +39549,149 @@ state = "UP"
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Drain)
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_node_rechecks_placements_before_committing() {
+        let dir = TempDir::new().unwrap();
+        let (cm, recorder) = recording_cluster(&dir, |cm, op| {
+            if matches!(op, WalOperation::NodeRemove { .. }) {
+                start_job_on(cm, 1, "n1");
+            }
+        })
+        .await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("racing-start"));
+        assert_eq!(id, 1);
+        assert!(!cm.node_has_running_jobs("n1"));
+
+        let err = cm.remove_node("n1", false, None).unwrap_err();
+
+        assert!(err.to_string().contains("has active jobs"), "{err}");
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        assert!(recorder.ops.lock().iter().any(|op| matches!(
+            op,
+            WalOperation::NodeRemove {
+                force: Some(false),
+                ..
+            }
+        )));
+    }
+
+    fn node_removal_fixture(dir: &TempDir, state: JobState) -> ClusterManager {
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.nodes.write().insert(
+            "n1".into(),
+            Node::new(
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+            ),
+        );
+        let mut job = Job::new(1, basic_spec("removal"));
+        job.state = state;
+        cm.jobs.write().insert(1, job);
+        let response = cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            idle_fill: false,
+            at: None,
+        });
+        assert!(response.job_started);
+        cm
+    }
+
+    #[test]
+    fn node_remove_apply_preserves_active_placements_without_force() {
+        for state in [
+            JobState::Pending,
+            JobState::Running,
+            JobState::Completing,
+            JobState::Suspended,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = node_removal_fixture(&dir, state);
+            let response = cm.apply_operation(&WalOperation::NodeRemove {
+                name: "n1".into(),
+                reason: None,
+                force: Some(false),
+                at: None,
+            });
+
+            assert!(response.node_remove_error.is_some(), "{state:?}");
+            assert!(response.jobs_finalized.is_empty());
+            assert_eq!(cm.get_job(1).unwrap().state, state);
+            assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        }
+    }
+
+    #[test]
+    fn node_remove_frozen_payload_still_evicts_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = node_removal_fixture(&dir, JobState::Running);
+        let legacy =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
+                .unwrap();
+
+        let response = cm.apply_operation(&legacy);
+
+        assert!(response.node_remove_error.is_none());
+        assert_eq!(response.jobs_finalized.len(), 1);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::NodeFail);
+        assert!(cm.get_node("n1").is_none());
+    }
+
+    #[test]
+    fn job_start_refuses_placement_after_node_removal() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        for name in ["n1", "n2"] {
+            cm.nodes.write().insert(
+                name.into(),
+                Node::new(
+                    name.into(),
+                    ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        cm.jobs
+            .write()
+            .insert(1, Job::new(1, basic_spec("stale-placement")));
+        let placement = WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n2".into(), "n1".into()],
+            resources: scalar_alloc(2, 2000),
+            per_node_alloc: per_node_for(&["n1", "n2"], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            idle_fill: false,
+            at: None,
+        };
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: None,
+            force: Some(false),
+            at: None,
+        });
+
+        let response = cm.apply_operation(&placement);
+
+        assert!(!response.job_started);
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+        assert!(!cm.get_job(1).unwrap().holds_a_placement());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1491,6 +1491,37 @@ An allocated node reports ``DRAINING`` until its last CPU or device allocation
 is released, then reports ``DRAINED`` in ``scontrol show node`` while keeping
 the administrative reason. An empty node enters ``DRAINED`` immediately.
 
+To remove a departed node's record, use either command below. Removal works
+even when its agent or container no longer exists:
+
+.. code-block:: bash
+
+   scontrol delete NodeName=gpu001
+   spur node remove gpu001
+
+Both commands use the same removal operation and refuse nodes with active
+jobs, including placements reserved while a job is launching. The guard is
+checked when removal commits, so a concurrently scheduled job cannot be
+evicted without force. ``NodeName=`` accepts a hostname, a comma-separated list, a hostlist
+such as ``gpu[001-004]``, or ``ALL`` for every registered node. A failed
+removal is reported per node; remaining nodes are still attempted, and the
+command exits unsuccessfully if any removal fails. An empty cluster with
+``ALL`` is also an error.
+
+``scontrol delete`` accepts exactly one of ``NodeName=``, ``PartitionName=``,
+or ``ReservationName=``. For a removal reason or to evict active jobs, use
+``spur node remove <hostlist> --reason "decommissioned"`` or its ``--force``
+option. Force removal fails running jobs with ``NODE_FAIL`` and releases
+unconfirmed launch reservations. Node removal requires Administrator when
+the caller has a verified identity; see
+:ref:`privileged-operations`.
+
+Removal does not stop the agent or change ``spur.conf``. An agent that
+registers again can recreate the node record. Slurm restricts this command
+to dynamic nodes without running jobs or reservation membership; Spur uses
+its native registered-node removal rules and does not currently guard
+reservation membership.
+
 .. note::
 
    Partitions can also be created, updated, and deleted at runtime with

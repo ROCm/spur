@@ -380,6 +380,9 @@ pub enum WalOperation {
     NodeRemove {
         name: String,
         reason: Option<String>,
+        /// None preserves eviction when replaying entries predating the force guard.
+        #[serde(default)]
+        force: Option<bool>,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -1483,17 +1486,32 @@ mod deregistration_wal_tests {
         let op = WalOperation::NodeRemove {
             name: "gpu01".into(),
             reason: Some("decommission".into()),
+            force: Some(false),
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::NodeRemove { name, reason, .. } => {
+            WalOperation::NodeRemove {
+                name,
+                reason,
+                force,
+                ..
+            } => {
                 assert_eq!(name, "gpu01");
                 assert_eq!(reason.as_deref(), Some("decommission"));
+                assert_eq!(force, Some(false));
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn node_remove_frozen_payload_preserves_legacy_force() {
+        let op: WalOperation =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
+                .unwrap();
+        assert!(matches!(op, WalOperation::NodeRemove { force: None, .. }));
     }
 
     #[test]
@@ -1798,6 +1816,7 @@ mod deregistration_wal_tests {
         let op = WalOperation::NodeRemove {
             name: "n0".into(),
             reason: None,
+            force: Some(true),
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();

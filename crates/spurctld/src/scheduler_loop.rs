@@ -7994,6 +7994,7 @@ mod tests {
             let (addr, _) = spawn_mock_agent().await;
             register_node_at(&cm, "n1", addr);
             register_node_at(&cm, "n2", addr);
+            register_node_at(&cm, "missing-node", addr);
             let job_id = submit_and_wait(
                 &cm,
                 JobSpec {
@@ -8021,6 +8022,7 @@ mod tests {
                     per_node_allocs,
                 )
                 .unwrap();
+            crate::cluster::node_test_fixtures::restore_without_node(&cm, "missing-node");
             cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Completing);

@@ -7284,6 +7284,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7608,6 +7609,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7688,6 +7690,7 @@ mod tests {
             .await
             .unwrap();
         cluster.set_raft(handle.raft);
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7773,6 +7776,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7934,6 +7938,7 @@ mod tests {
                 op,
             );
         };
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let cancelled_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
@@ -7991,6 +7996,7 @@ mod tests {
         config.scheduler.kill_wait_secs = 5;
         config.scheduler.timeout_kill_wait_secs = 30;
         let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -8060,6 +8066,7 @@ mod tests {
         let mut config = test_slurm_config();
         config.scheduler.kill_wait_secs = 30;
         let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1", "n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -8222,6 +8229,7 @@ mod tests {
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
+        crate::cluster::node_test_fixtures::register(cluster, nodes);
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
         if cluster.get_job(id).is_none() {
@@ -9289,6 +9297,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
+        crate::cluster::node_test_fixtures::register(&svc.cluster, &["n1"]);
         let job_id = svc
             .cluster
             .submit_job(spur_core::job::JobSpec {
@@ -9308,6 +9317,7 @@ mod tests {
                 [("n1".into(), resources)].into_iter().collect(),
             )
             .unwrap();
+        crate::cluster::node_test_fixtures::restore_without_node(&svc.cluster, "n1");
         assert!(svc.cluster.get_node("n1").is_none());
 
         let error = svc
@@ -11241,7 +11251,7 @@ mod tests {
         };
         spec.srun_job = true;
         let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
-        // Allocate to a real node plus a ghost node that is never registered.
+        crate::cluster::node_test_fixtures::register(&svc.cluster, &["ghost"]);
         let res = ResourceAllocations::with_scalar(2, 4000);
         let per_node: std::collections::HashMap<_, _> = [
             ("n1".to_string(), res.clone()),
@@ -11259,6 +11269,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
+        crate::cluster::node_test_fixtures::restore_without_node(&svc.cluster, "ghost");
         let steps_before = svc.cluster.get_steps(job_id).len();
         // Simulate the client's retry loop: each attempt returns retryable Unavailable and must
         // leave the step count unchanged (the pre-fix bug created one step per attempt).

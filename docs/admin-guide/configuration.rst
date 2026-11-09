@@ -1513,7 +1513,7 @@ These control-plane mutations define cluster tenancy and require
 
 * partitions;
 * node state and labels — ``scontrol update NodeName=``, ``spur node drain``,
-  ``spur node remove``;
+  ``spur node remove``, ``scontrol delete NodeName=``;
 * ``scontrol reconfigure``;
 * admission tokens;
 * the k0s cluster manager.

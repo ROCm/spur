@@ -130,12 +130,14 @@ impl JobFinalized {
 pub struct ClientResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs_finalized: Vec<JobFinalized>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_remove_error: Option<String>,
     #[serde(default)]
     pub reservation_created: bool,
     #[serde(default)]
     pub partition_created: bool,
-    /// False when a `JobStart` apply hit the duplicate-reservation backstop
-    /// instead of actually charging the placement.
+    /// False when a `JobStart` cannot charge the placement, including a
+    /// duplicate reservation or a removed/excluded node.
     #[serde(default)]
     pub job_started: bool,
     /// False when a `JobStateChange` carrying `expected_run_attempt` was
@@ -1398,6 +1400,15 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn client_response_frozen_payload_defaults_node_remove_error() {
+        let response: ClientResponse = serde_json::from_str(
+            r#"{"jobs_finalized":[],"reservation_created":false,"partition_created":false}"#,
+        )
+        .unwrap();
+        assert!(response.node_remove_error.is_none());
+    }
 
     struct NoopApplier;
     impl StateMachineApply for NoopApplier {
