@@ -356,8 +356,9 @@ the first in the order ``cpu``, ``mem``, ``gres`` is named.
 Setting limits at runtime
 -------------------------
 
-``scontrol show partition`` prints the limits on two lines, in Slurm's
-spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
+``scontrol show partition`` prints the limits on two lines, in Slurm-style
+``CamelCase`` (``MaxTRESPerNode`` is a Spur partition key; in Slurm it exists
+only for QOS and associations), with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
 ``cpu`` cap however it was set. The second line names the ``DefMemPer*`` and
 ``MaxMemPer*`` knobs that are set, or reads
 ``DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED`` when none is:
@@ -376,8 +377,9 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
    scontrol update PartitionName=cpu MaxTRESPerNode=cpu=64,mem=131072,gres/gpu:a100=2
    scontrol update PartitionName=cpu MaxMemPerCPU=2048 DefMemPerGPU=8192
 
-- ``MaxTRESPerNode=`` replaces the whole cap table. ``MaxTRESPerNode=`` with an
-  empty value or ``UNLIMITED`` removes every cap. Its ``cpu``, ``mem``, and
+- ``MaxTRESPerNode=`` replaces the whole cap table, including a ``cpu`` cap set
+  through ``MaxCPUsPerNode``. ``MaxTRESPerNode=`` with an empty value or
+  ``UNLIMITED`` removes every cap. Its ``cpu``, ``mem``, and
   ``gres/gpu`` names are case-insensitive; a GPU type keeps the case given.
 - ``UNLIMITED`` or ``0`` leaves ``MaxCPUsPerNode``, ``MaxMemPerNode``,
   ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, or ``DefMemPerGPU``
@@ -385,17 +387,21 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
   ``MaxTRESPerNode`` with a ``0`` limit, for example
   ``MaxTRESPerNode=gres/gpu=0``. ``MaxTRESPerNode`` entries take numbers only;
   leave a key out to make it unlimited.
-- The same rules as in ``spur.conf`` apply: unknown keys, ``MaxCPUsPerNode``
-  and a ``cpu`` key in the same command, and conflicting memory knobs are
-  rejected. The one exception is a ``MaxCPUsPerNode`` equal to the ``cpu``
-  key, so the ``show partition`` lines can be pasted back as they are.
+- As in Slurm, ``MaxMemPerNode`` and ``MaxMemPerCPU`` are one setting, and so
+  are the three ``DefMemPer*`` knobs: setting one replaces the other, so
+  ``MaxMemPerCPU=2048`` on a partition with ``MaxMemPerNode`` switches it to a
+  per-CPU limit.
+- Unknown keys, ``MaxCPUsPerNode`` (including ``MaxCPUsPerNode=0``) together
+  with a ``cpu`` key in ``MaxTRESPerNode``, and two knobs of one memory setting
+  in the same command are rejected. The one exception is a ``MaxCPUsPerNode``
+  equal to the ``cpu`` key, so the ``show partition`` lines can be pasted back
+  as they are.
 - ``scontrol reconfigure`` applies the values in ``spur.conf`` again,
   replacing limits changed with ``scontrol``.
 - Updates that change different knobs at the same time, from two
-  ``scontrol`` commands or API calls, both take effect. If an update would
-  break these rules only because of one applied just before it (for example,
-  each sets a different ``DefMemPer*``), it is rejected as a whole with an
-  error naming the partition, and nothing in it is applied.
+  ``scontrol`` commands or API calls, both take effect. Two updates to the same
+  memory setting apply in the order the controller commits them, so the later
+  one wins.
 
 The REST ``GET /api/v1/partitions`` (and ``/slurm/v0.0.42/partitions``) response
 includes ``max_cpus_per_node``, ``max_tres_per_node``, ``max_mem_per_node``,
