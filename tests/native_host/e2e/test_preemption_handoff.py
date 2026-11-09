@@ -465,6 +465,7 @@ def test_usage_cancelled_request_counts_each_victim_including_late_release(hando
     cause = {("cancelled", "user"): 2}
     _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
     _accounted_usage(c, hunter, unused={"cancelled": {"user": 2}})
+    _scenario_report(c, unused={("cancelled", "user"): 2})
 
 
 def test_usage_started_elsewhere_and_cancelled_have_distinct_causes(handoff_cluster):
@@ -485,6 +486,7 @@ def test_usage_started_elsewhere_and_cancelled_have_distinct_causes(handoff_clus
     assert wait_job(c, flexible, timeout=60) == "CA"
     _usage(c, unused={**cancelled, **elsewhere})
     _accounted_usage(c, flexible, unused={"started_elsewhere": {"system": 1}})
+    _scenario_report(c, unused={**cancelled, **elsewhere})
 
 
 @pytest.mark.parametrize("failure", ["launch", "application"])
@@ -520,6 +522,7 @@ def test_usage_distinguishes_launch_failure_from_later_application_failure(hando
         wait_job(c, hunter, timeout=60)
         _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
         _accounted_usage(c, hunter, unused={"launch_failed": {"system": 1}})
+        _scenario_report(c, unused=cause)
     else:
         _usage(c, used=1, jobs={hunter: (1, 0, {})})
         c.nodes[0].exec(f"touch {shlex.quote(finish)}")
@@ -527,23 +530,60 @@ def test_usage_distinguishes_launch_failure_from_later_application_failure(hando
         assert "ExitCode=7:0" in _state(c, hunter, "FAILED")
         _usage(c, used=1, jobs={hunter: (1, 0, {})})
         _accounted_usage(c, hunter, used=1)
+        _scenario_report(c, used=1)
 
 
-def _rollup_report(c, expected, *filters):
+def _rollup_report(c, expected, *filters, causes=None):
     def check():
-        text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader", *filters])
+        detail_flags = ["--by-cause"] if causes is not None else []
+        text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                      *detail_flags, *filters])
         rows = [line.split("|") for line in text.splitlines() if "|" in line]
-        actual = {(row[0], row[1]): tuple(map(int, row[2:])) for row in rows}
-        assert actual == expected, text
+        assert all(len(row) == (8 if causes is not None else 5) for row in rows), text
+        summaries = [row for row in rows if row[2]]
+        actual = {(row[0], row[1]): tuple(map(int, row[2:5])) for row in summaries}
+        assert len(actual) == len(summaries) and actual == expected, text
+        if causes is not None:
+            details = [row for row in rows if not row[2]]
+            assert all(row[2:5] == ["", "", ""] for row in details), text
+            assert all(row[5:] == ["", "", ""] for row in summaries), text
+            actual_causes = {(row[0], row[1], row[5], row[6]): int(row[7]) for row in details}
+            assert len(actual_causes) == len(details) and actual_causes == causes, text
+            for pair, (_, unused, _) in actual.items():
+                assert sum(n for key, n in actual_causes.items() if key[:2] == pair) == unused, text
         return True
 
     wait_until(check, timeout_s=90, interval_s=1, desc="accounting preemption rollup",
                tolerate=(AssertionError, RuntimeError))
 
 
-def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cluster):
+def _scenario_report(c, used=0, unused=None):
+    unused = unused or {}
+    user = c.nodes[0].user
+    # Resolve the default association from the actual report, including an empty account.
+    wait_until(lambda: "|" in c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader"]),
+               timeout_s=90, interval_s=1, desc="first accounting rollup")
+    text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader"])
+    pairs = [tuple(row.split("|")[:2]) for row in text.splitlines() if "|" in row]
+    assert len(pairs) == 1 and pairs[0][0] == user, text
+    pair = pairs[0]
+    expected = {pair: (used, sum(unused.values()), 0)}
+    causes = {(*pair, reason, initiator): count for (reason, initiator), count in unused.items()}
+    _rollup_report(c, expected)
+    _rollup_report(c, expected, causes=causes)
+    c.restart_controller()
+    _rollup_report(c, expected, causes=causes)
+
+
+@pytest.mark.parametrize("outcome", ["used", "launch_failed"])
+def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cluster, outcome):
     c = rollup_cluster
     user = c.nodes[0].user
+    used = int(outcome == "used")
+    first_unused = {} if used else {("launch_failed", "system"): 1}
+    first_totals = (used, sum(first_unused.values()), 0)
+    first_causes = {(user, "rollup-a", reason, initiator): n
+                    for (reason, initiator), n in first_unused.items()}
     for account in ("rollup-a", "rollup-b"):
         c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
         c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
@@ -556,13 +596,15 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _gate(c, victim, [0], False)
     _wait_prolog(c, hunter, [0])
     _usage(c, open_count=1)
-    _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)})
+    _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)}, causes={})
 
     # Pause preserves the ephemeral published port that the controller is configured to use.
     c.nodes[0].exec(f"docker pause {shlex.quote(c._pg_container)}")
     try:
+        if not used:
+            c.nodes[0].exec(f"touch {shlex.quote(f'{c.remote_dir}/launch-{hunter}.fail')}")
         _launch_gate(c, hunter, [0], False)
-        _usage(c, used=1)
+        _usage(c, used=used, unused=first_unused)
         c.scancel(str(hunter))
         assert wait_job(c, hunter, timeout=60) == "CA"
         c.restart_controller()
@@ -570,16 +612,16 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
         assert code != 0, output
         # Zero retention is floored to 120 seconds for accounting repair.
         time.sleep(130)
-        assert "PreemptionsUsed=1" in c.scontrol("show", "job", str(hunter))
+        assert f"PreemptionsUsed={used} PreemptionsUnused={sum(first_unused.values())}" in c.scontrol("show", "job", str(hunter))
     finally:
         c.nodes[0].exec(f"docker unpause {shlex.quote(c._pg_container)}")
     c._wait_pg(c.nodes[0])
-    _rollup_report(c, {(user, "rollup-a"): (1, 0, 0)})
+    _rollup_report(c, {(user, "rollup-a"): first_totals}, causes=first_causes)
     wait_until(lambda: f"JobId={hunter} " not in c.cli_allow_fail(["scontrol", "show", "job", str(hunter)]),
                timeout_s=90, interval_s=1, desc="exported job leaving controller history")
     c.psql(f"DELETE FROM jobs WHERE job_id={int(hunter)}")
     c.restart_controller()
-    _rollup_report(c, {(user, "rollup-a"): (1, 0, 0)})
+    _rollup_report(c, {(user, "rollup-a"): first_totals}, causes=first_causes)
 
     victim = _submit(c, "rollup-victim-b", "victim-a", c.node_names[1])
     wait_job_state(c, victim, "R", timeout=60)
@@ -588,19 +630,33 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _wait_epilog(c, victim, [1])
     c.scancel(str(hunter))
     _gate(c, victim, [1], False)
-    _usage(c, used=1, unused={("cancelled", "user"): 1})
-    expected = {(user, "rollup-a"): (1, 0, 0), (user, "rollup-b"): (0, 1, 0)}
+    _usage(c, used=used, unused={**first_unused, ("cancelled", "user"): 1})
+    expected = {(user, "rollup-a"): first_totals, (user, "rollup-b"): (0, 1, 0)}
     _rollup_report(c, expected, "--user", user)
     _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b")
-    code, first = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable",
-                                   "--noheader", "--limit", "1"])
-    assert code == 0, first
-    assert f"{user}|rollup-a|1|0|0" in first, first
-    token = re.search(r"Next page token: (.+)", first)
-    assert token, first
-    code, second = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable", "--noheader",
-                                    "--limit", "1", "--page-token", token[1]])
-    assert code == 0, second
-    assert f"{user}|rollup-b|0|1|0" in second and "Next page token" not in second, second
+    causes = {**first_causes,
+              (user, "rollup-b", "cancelled", "user"): 1}
+    _rollup_report(c, expected, "--user", user, causes=causes)
+    _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b",
+                   causes={(user, "rollup-b", "cancelled", "user"): 1})
+    human = c.cli(["spur", "sreport", "preemptions", "--by-cause"])
+    assert ("Unused: reason=launch_failed initiator=system count=1" in human) == (not used), human
+    assert "Unused: reason=cancelled initiator=user count=1" in human, human
+    for flags in ([], ["--by-cause"]):
+        code, first = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable",
+                                       "--noheader", "--limit", "1", *flags])
+        assert code == 0, first
+        assert f"{user}|rollup-a|{used}|{sum(first_unused.values())}|0" in first and "rollup-b" not in first, first
+        if flags:
+            assert (f"{user}|rollup-a||||launch_failed|system|1" in first) == (not used), first
+        token = re.search(r"Next page token: (.+)", first)
+        assert token, first
+        code, second = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                                        "--limit", "1", "--page-token", token[1], *flags])
+        assert code == 0, second
+        assert f"{user}|rollup-b|0|1|0" in second and "Next page token" not in second, second
+        assert "rollup-a" not in second, second
+        if flags:
+            assert f"{user}|rollup-b||||cancelled|user|1" in second, second
     code, output = c.cli_with_exit(["spur", "sreport", "preemptions", "--start", "now-7days"])
     assert code != 0 and "lifetime" in output, output

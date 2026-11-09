@@ -2425,6 +2425,7 @@ message GetPreemptionUsageRequest {
   string account = 2;
   uint32 limit = 3; // 0 = 100; maximum 1000
   string page_token = 4;
+  bool by_cause = 5;
 }
 
 message PreemptionUsageEntry {
@@ -2433,6 +2434,8 @@ message PreemptionUsageEntry {
   uint64 used = 3;
   uint64 unused = 4;
   uint64 open = 5;
+  repeated UnusedPreemptionCount unused_by_cause = 6;
+  uint64 unclassified_unused = 7;
 }
 
 message GetPreemptionUsageResponse {
@@ -2440,4 +2443,5 @@ message GetPreemptionUsageResponse {
   string next_page_token = 2;
   optional string scoped_to_user = 3;
   bool partial = 4;
+  bool causes_included = 5;
 }

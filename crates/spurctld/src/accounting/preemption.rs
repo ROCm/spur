@@ -1,15 +1,17 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use spur_core::job::{Job, JobId};
-use spur_core::preemption_usage::PreemptionUsage;
+use spur_core::preemption_usage::{PreemptionInitiator, PreemptionUsage, UnusedReason};
 use spur_core::rbac::ReadScope;
 use spur_proto::proto::{
     GetPreemptionUsageRequest, GetPreemptionUsageResponse, PreemptionUsageEntry,
+    UnusedPreemptionCount,
 };
 use sqlx::{PgConnection, PgPool, Row};
 
@@ -37,6 +39,15 @@ CREATE TABLE IF NOT EXISTS preemption_rollups (
 );
 CREATE INDEX IF NOT EXISTS idx_preemption_rollups_account
     ON preemption_rollups(account, user_name);
+ALTER TABLE preemption_checkpoints ADD COLUMN IF NOT EXISTS unused_by_cause JSONB NOT NULL DEFAULT '{}';
+CREATE TABLE IF NOT EXISTS preemption_cause_rollups (
+    user_name TEXT NOT NULL,
+    account TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('started_elsewhere', 'launch_failed', 'cancelled', 'ended_other')),
+    initiator TEXT NOT NULL CHECK (initiator IN ('user', 'admin', 'system', 'unknown')),
+    count NUMERIC(40,0) NOT NULL CHECK (count >= 0),
+    PRIMARY KEY (user_name, account, reason, initiator)
+);
 
 CREATE TABLE IF NOT EXISTS preemption_migrations (name TEXT PRIMARY KEY);
 
@@ -45,16 +56,27 @@ WITH migration AS (
     INSERT INTO preemption_migrations VALUES ('retained_jobs')
     ON CONFLICT DO NOTHING RETURNING name
 ), imported AS (
-    INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, used, unused, open)
+    INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, used, unused, open, unused_by_cause)
     SELECT job_id, 'legacy', user_name, account,
         COALESCE((preemption_usage->>'used')::numeric, 0),
         COALESCE((SELECT SUM(count.value::numeric)
             FROM jsonb_each(COALESCE(preemption_usage->'unused', '{}'::jsonb)) reason,
                  jsonb_each_text(reason.value) count), 0),
-        COALESCE((preemption_usage->>'open')::numeric, 0)
+        COALESCE((preemption_usage->>'open')::numeric, 0),
+        COALESCE(preemption_usage->'unused', '{}'::jsonb)
     FROM jobs WHERE EXISTS (SELECT 1 FROM migration) AND COALESCE((preemption_usage->>'revision')::numeric, 0) > 0
     ON CONFLICT DO NOTHING
-    RETURNING user_name, account, used, unused, open
+    RETURNING user_name, account, used, unused, open, unused_by_cause
+), imported_causes AS (
+    INSERT INTO preemption_cause_rollups (user_name, account, reason, initiator, count)
+    SELECT user_name, account, reason.key, initiator.key, SUM(initiator.value::numeric)
+    FROM imported,
+         jsonb_each(unused_by_cause) reason,
+         jsonb_each_text(reason.value) initiator
+    GROUP BY user_name, account, reason.key, initiator.key
+    ON CONFLICT (user_name, account, reason, initiator) DO UPDATE SET
+        count = preemption_cause_rollups.count + EXCLUDED.count
+    RETURNING user_name
 )
 INSERT INTO preemption_rollups (user_name, account, used, unused, open)
 SELECT user_name, account, SUM(used), SUM(unused), SUM(open)
@@ -96,6 +118,34 @@ pub(crate) fn revision(usage: &PreemptionUsage) -> u128 {
     2 * (u128::from(usage.used) + u128::from(usage.unused_total())) + u128::from(usage.open)
 }
 
+type CauseCounts = BTreeMap<UnusedReason, BTreeMap<PreemptionInitiator, u64>>;
+
+fn cause_deltas(old: &CauseCounts, new: &CauseCounts) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut deltas = Vec::new();
+    for reason in UnusedReason::ALL {
+        for initiator in PreemptionInitiator::ALL {
+            let count = |counts: &CauseCounts| {
+                counts
+                    .get(&reason)
+                    .and_then(|counts| counts.get(&initiator))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let delta = count(new)
+                .checked_sub(count(old))
+                .ok_or_else(|| anyhow::anyhow!("preemption cause count regressed"))?;
+            if delta > 0 {
+                deltas.push(serde_json::json!({
+                    "reason": reason.as_str(),
+                    "initiator": initiator.as_str(),
+                    "count": delta.to_string(),
+                }));
+            }
+        }
+    }
+    Ok(deltas)
+}
+
 // The caller owns the transaction, including the checkpoint and rollup deltas.
 pub(super) async fn write(conn: &mut PgConnection, checkpoint: &Checkpoint) -> anyhow::Result<()> {
     if revision(&checkpoint.usage) == 0 {
@@ -104,16 +154,22 @@ pub(super) async fn write(conn: &mut PgConnection, checkpoint: &Checkpoint) -> a
     sqlx::query("INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(i64::from(checkpoint.job_id)).bind(&checkpoint.incarnation)
         .bind(&checkpoint.user).bind(&checkpoint.account).execute(&mut *conn).await?;
-    let old = sqlx::query("SELECT user_name, account, used::text, unused::text, open::text FROM preemption_checkpoints WHERE job_id=$1 AND incarnation=$2 FOR UPDATE")
+    let old = sqlx::query("SELECT user_name, account, used::text, unused::text, open::text, unused_by_cause FROM preemption_checkpoints WHERE job_id=$1 AND incarnation=$2 FOR UPDATE")
         .bind(i64::from(checkpoint.job_id)).bind(&checkpoint.incarnation).fetch_one(&mut *conn).await?;
     let used: u64 = old.try_get::<String, _>("used")?.parse()?;
     let unused: u64 = old.try_get::<String, _>("unused")?.parse()?;
     let open: u64 = old.try_get::<String, _>("open")?.parse()?;
     let old_revision = 2 * (u128::from(used) + u128::from(unused)) + u128::from(open);
-    if old_revision >= revision(&checkpoint.usage) {
+    let old_causes = old
+        .try_get::<sqlx::types::Json<CauseCounts>, _>("unused_by_cause")?
+        .0;
+    if old_revision > revision(&checkpoint.usage)
+        || (old_revision == revision(&checkpoint.usage) && old_causes == checkpoint.usage.unused)
+    {
         return Ok(());
     }
     let new = &checkpoint.usage;
+    let deltas = cause_deltas(&old_causes, &new.unused)?;
     // Retain the requesting association captured by the first export.
     sqlx::query(
         "INSERT INTO preemption_rollups (user_name, account) VALUES ($1,$2) ON CONFLICT DO NOTHING",
@@ -128,9 +184,15 @@ pub(super) async fn write(conn: &mut PgConnection, checkpoint: &Checkpoint) -> a
         .bind((i128::from(new.unused_total())-i128::from(unused)).to_string())
         .bind((i128::from(new.open)-i128::from(open)).to_string())
         .execute(&mut *conn).await?;
-    sqlx::query("UPDATE preemption_checkpoints SET used=$3::text::numeric, unused=$4::text::numeric, open=$5::text::numeric WHERE job_id=$1 AND incarnation=$2")
+    if !deltas.is_empty() {
+        sqlx::query("INSERT INTO preemption_cause_rollups (user_name, account, reason, initiator, count) SELECT $1,$2,cause.reason,cause.initiator,cause.count::numeric FROM jsonb_to_recordset($3) AS cause(reason text, initiator text, count text) ON CONFLICT (user_name, account, reason, initiator) DO UPDATE SET count=preemption_cause_rollups.count+EXCLUDED.count")
+        .bind(old.try_get::<String, _>("user_name")?).bind(old.try_get::<String, _>("account")?)
+        .bind(sqlx::types::Json(deltas)).execute(&mut *conn).await?;
+    }
+    sqlx::query("UPDATE preemption_checkpoints SET used=$3::text::numeric, unused=$4::text::numeric, open=$5::text::numeric, unused_by_cause=$6 WHERE job_id=$1 AND incarnation=$2")
         .bind(i64::from(checkpoint.job_id)).bind(&checkpoint.incarnation)
         .bind(new.used.to_string()).bind(new.unused_total().to_string()).bind(new.open.to_string())
+        .bind(sqlx::types::Json(&new.unused))
         .execute(&mut *conn).await?;
     Ok(())
 }
@@ -201,7 +263,15 @@ pub(super) async fn report(
     page: Page,
     scope: &ReadScope,
 ) -> anyhow::Result<GetPreemptionUsageResponse> {
-    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT user_name, account, used::text, unused::text, open::text FROM preemption_rollups WHERE TRUE");
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT user_name, account, used::text, unused::text, open::text, ",
+    );
+    if req.by_cause {
+        query.push("COALESCE((SELECT jsonb_agg(jsonb_build_object('reason', c.reason, 'initiator', c.initiator, 'count', c.count::text) ORDER BY c.reason, c.initiator) FROM preemption_cause_rollups c WHERE c.user_name=preemption_rollups.user_name AND c.account=preemption_rollups.account AND c.count > 0), '[]'::jsonb)");
+    } else {
+        query.push("'[]'::jsonb");
+    }
+    query.push(" AS unused_by_cause FROM preemption_rollups WHERE TRUE");
     if !req.user.is_empty() {
         query.push(" AND user_name=").push_bind(&req.user);
     }
@@ -239,12 +309,44 @@ pub(super) async fn report(
         .into_iter()
         .take(page.limit as usize)
         .map(|row| {
+            #[derive(serde::Deserialize)]
+            struct Cause {
+                reason: String,
+                initiator: String,
+                count: String,
+            }
+            let unused: u64 = row.try_get::<String, _>("unused")?.parse()?;
+            let mut classified = 0u64;
+            let unused_by_cause = row
+                .try_get::<sqlx::types::Json<Vec<Cause>>, _>("unused_by_cause")?
+                .0
+                .into_iter()
+                .map(|cause| {
+                    let count = cause.count.parse()?;
+                    classified = classified
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow::anyhow!("preemption cause total overflow"))?;
+                    Ok(UnusedPreemptionCount {
+                        reason: cause.reason,
+                        initiator: cause.initiator,
+                        count,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(PreemptionUsageEntry {
                 user: row.try_get("user_name")?,
                 account: row.try_get("account")?,
                 used: row.try_get::<String, _>("used")?.parse()?,
-                unused: row.try_get::<String, _>("unused")?.parse()?,
+                unused,
                 open: row.try_get::<String, _>("open")?.parse()?,
+                unused_by_cause,
+                unclassified_unused: if req.by_cause {
+                    unused
+                        .checked_sub(classified)
+                        .ok_or_else(|| anyhow::anyhow!("preemption causes exceed unused total"))?
+                } else {
+                    0
+                },
             })
         })
         .collect::<anyhow::Result<_>>()?;
@@ -253,6 +355,7 @@ pub(super) async fn report(
         None => String::new(),
     };
     Ok(GetPreemptionUsageResponse {
+        causes_included: req.by_cause,
         entries,
         next_page_token,
         scoped_to_user: match scope {
@@ -305,7 +408,11 @@ mod tests {
             .connect(&url)
             .await?;
         super::super::db::migrate(&pool).await?;
-        let result = exercise(&pool).await;
+        let result = async {
+            exercise(&pool).await?;
+            exercise_causes(&pool).await
+        }
+        .await;
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
@@ -468,7 +575,10 @@ mod tests {
                 auth
             });
             for (user, admin, expected) in [("bob", false, 1), ("bob", true, 3), ("", false, 0)] {
-                let mut request = tonic::Request::new(GetPreemptionUsageRequest::default());
+                let mut request = tonic::Request::new(GetPreemptionUsageRequest {
+                    by_cause: true,
+                    ..Default::default()
+                });
                 request.extensions_mut().insert(spur_core::auth::Identity {
                     user: user.into(),
                     uid: 1000,
@@ -478,6 +588,11 @@ mod tests {
                 });
                 let reply = service.get_preemption_usage(request).await?.into_inner();
                 assert_eq!(reply.entries.len(), expected);
+                assert!(reply.causes_included);
+                for entry in &reply.entries {
+                    let expected_causes = if entry.user == "alice" { 1 } else { 0 };
+                    assert_eq!(entry.unused_by_cause.len(), expected_causes);
+                }
             }
         }
 
@@ -493,6 +608,7 @@ mod tests {
             pool,
             GetPreemptionUsageRequest {
                 user: "dan".into(),
+                by_cause: true,
                 ..Default::default()
             },
             ReadScope::All,
@@ -506,6 +622,7 @@ mod tests {
             ),
             (2, 3, 1)
         );
+        assert_causes(&backfill.entries[0], &[("cancelled", "user", 3)], 0);
         sqlx::query("DELETE FROM jobs").execute(pool).await?;
         save(pool, &open).await?;
         save(pool, &alice).await?;
@@ -519,6 +636,153 @@ mod tests {
             ),
             (5, 1, 0)
         );
+        Ok(())
+    }
+
+    fn assert_causes(
+        entry: &PreemptionUsageEntry,
+        expected: &[(&str, &str, u64)],
+        unclassified: u64,
+    ) {
+        let actual: Vec<_> = entry
+            .unused_by_cause
+            .iter()
+            .map(|cause| (cause.reason.as_str(), cause.initiator.as_str(), cause.count))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(entry.unclassified_unused, unclassified);
+        assert_eq!(
+            entry.unused,
+            actual.iter().map(|cause| cause.2).sum::<u64>() + unclassified
+        );
+    }
+
+    async fn exercise_causes(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        // An older exporter saved the total but no cause checkpoint.
+        sqlx::query("INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, unused) VALUES (10,'legacy','alice','research',3)")
+            .execute(pool).await?;
+        sqlx::query("INSERT INTO preemption_rollups (user_name, account, unused) VALUES ('alice','research',3)")
+            .execute(pool).await?;
+        let detailed = GetPreemptionUsageRequest {
+            by_cause: true,
+            ..Default::default()
+        };
+        let before = query(pool, detailed.clone(), ReadScope::All).await?;
+        assert_causes(&before.entries[0], &[], 3);
+        let mut checkpoint = Checkpoint {
+            job_id: 10,
+            submit_time: DateTime::UNIX_EPOCH,
+            incarnation: "legacy".into(),
+            user: "alice".into(),
+            account: "research".into(),
+            usage: PreemptionUsage::default(),
+        };
+        for cause in [
+            (UnusedReason::Cancelled, PreemptionInitiator::User),
+            (UnusedReason::Cancelled, PreemptionInitiator::User),
+            (UnusedReason::LaunchFailed, PreemptionInitiator::System),
+        ] {
+            checkpoint.usage.open_one();
+            checkpoint.usage.settle(Some(cause));
+        }
+        let (a, b) = tokio::join!(save(pool, &checkpoint), save(pool, &checkpoint));
+        a?;
+        b?;
+        let enriched = query(pool, detailed.clone(), ReadScope::All).await?;
+        assert_causes(
+            &enriched.entries[0],
+            &[("cancelled", "user", 2), ("launch_failed", "system", 1)],
+            0,
+        );
+        let stale = checkpoint.clone();
+        // Later association edits must not move cause deltas to a different owner.
+        checkpoint.user = "bob".into();
+        checkpoint.account = "other".into();
+        checkpoint.usage.open_one();
+        checkpoint
+            .usage
+            .settle(Some((UnusedReason::Cancelled, PreemptionInitiator::Admin)));
+        let mut tx = pool.begin().await?;
+        write(&mut tx, &checkpoint).await?;
+        tx.rollback().await?;
+        let rolled_back = query(pool, detailed.clone(), ReadScope::All).await?;
+        assert_eq!(rolled_back, enriched);
+        save(pool, &checkpoint).await?;
+        save(pool, &stale).await?;
+        let settled = query(pool, detailed.clone(), ReadScope::All).await?;
+        assert_eq!(settled.entries.len(), 1);
+        assert_eq!(settled.entries[0].user, "alice");
+        assert_causes(
+            &settled.entries[0],
+            &[
+                ("cancelled", "admin", 1),
+                ("cancelled", "user", 2),
+                ("launch_failed", "system", 1),
+            ],
+            0,
+        );
+        // Reused job IDs have their own deduplication key and requesting association.
+        checkpoint.incarnation = DateTime::UNIX_EPOCH.to_rfc3339();
+        save(pool, &checkpoint).await?;
+        let filtered = GetPreemptionUsageRequest {
+            account: "other".into(),
+            ..detailed.clone()
+        };
+        let bob = query(pool, filtered.clone(), ReadScope::Caller("bob".into())).await?;
+        assert_eq!(bob.entries.len(), 1);
+        assert_causes(
+            &bob.entries[0],
+            &[
+                ("cancelled", "admin", 1),
+                ("cancelled", "user", 2),
+                ("launch_failed", "system", 1),
+            ],
+            0,
+        );
+        assert!(query(pool, filtered, ReadScope::Caller("alice".into()))
+            .await?
+            .entries
+            .is_empty());
+        let first = query(
+            pool,
+            GetPreemptionUsageRequest {
+                limit: 1,
+                ..detailed.clone()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        assert_eq!(first.entries, settled.entries);
+        let second = query(
+            pool,
+            GetPreemptionUsageRequest {
+                limit: 1,
+                page_token: first.next_page_token,
+                ..detailed.clone()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        assert_eq!(second.entries, bob.entries);
+        assert!(second.next_page_token.is_empty());
+        let summary = query(pool, Default::default(), ReadScope::All).await?;
+        assert!(!summary.causes_included);
+        assert!(summary
+            .entries
+            .iter()
+            .all(|e| e.unused_by_cause.is_empty() && e.unclassified_unused == 0));
+        // Re-running schema setup and exports after history deletion cannot add counts.
+        sqlx::query("DELETE FROM jobs").execute(pool).await?;
+        super::super::db::migrate(pool).await?;
+        save(pool, &checkpoint).await?;
+        save(pool, &stale).await?;
+        let retained = query(pool, detailed, ReadScope::All).await?;
+        assert_eq!(retained.entries, [settled.entries, bob.entries].concat());
         Ok(())
     }
 }

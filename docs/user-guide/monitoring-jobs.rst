@@ -1171,6 +1171,7 @@ Use the accounting service through the controller's gRPC endpoint:
    sreport preemptions
    sreport preemptions --user alice --parsable
    sreport preemptions --account research --limit 25
+   sreport preemptions --account research --by-cause
    sreport preemptions --account research --limit 25 --page-token '["alice","research"]'
 
 Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
@@ -1181,6 +1182,27 @@ default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
 ``--start`` and ``--end`` are rejected because these are lifetime totals rather
 than event-time reports. Pagination uses user/account order, not a frozen
 snapshot; counts can change while pages are read.
+
+Add ``--by-cause`` to show nonzero unused counts by ``reason`` and ``initiator``
+below each user/account summary. These use the same values as the scheduler
+metrics and count victim runs, not nodes. For example:
+
+.. code-block:: text
+
+   User                 Account                      Used       Unused         Open
+   alice                research                        2            3            0
+     Unused: reason=cancelled initiator=user count=2
+     Unused: reason=launch_failed initiator=system count=1
+
+With ``--parsable --by-cause``, the columns are
+``User|Account|Used|Unused|Open|Reason|Initiator|Count``. Summary rows leave the
+last three columns empty; detail rows repeat the user/account and leave
+``Used``, ``Unused``, and ``Open`` empty. Detail counts sum to the summary's
+``Unused``; do not add them to that total again. Pagination still limits
+user/account pairs and keeps their details together, with at most 16 cause
+buckets per pair. Without ``--by-cause``, the existing five-column output is
+unchanged. The new CLI reports an error when the controller lacks detailed-report
+support instead of silently displaying incomplete details.
 
 The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
 privacy settings, including coordinator visibility. Scoped reports identify
@@ -1196,6 +1218,15 @@ requesting user/account is fixed at its first export. The rollups and checkpoint
 are independent of job-history rows, account deletion, and fairshare resets.
 Retained accounting history is imported on upgrade; already deleted history
 cannot be reconstructed into user/account totals.
+
+Cause rollups and their deduplication checkpoints also live in PostgreSQL,
+updated in the same transaction as the summary totals. This breakdown adds no
+Raft operations. Older aggregate-only checkpoints retain their totals and show
+any missing cause detail as ``unclassified`` with initiator ``unknown`` until
+a retained controller job re-exports its cause counts. This is a historical
+data gap, not an event reason. It may remain permanently when the controller
+no longer retains that job. Reports omit zero cause buckets and can show one
+additional row for this unclassified remainder.
 
 The accounting ``Open`` column is the last exported observation count and can
 lag the live cluster gauge. Database outages or an export backlog increase that
