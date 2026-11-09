@@ -316,9 +316,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             );
         }
 
-        // User rows follow the same accounts. A quiet coordinated account still
-        // lists its users; an account outside the reply does not.
-        if totals || in_scope {
+        if user_rows_shown(&scope, in_scope) {
             let members: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
             for user in &members {
                 // Filter by user if specified
@@ -412,6 +410,13 @@ fn report_usage_scope(
         .with_partial([usage_partial, factors_partial])
 }
 
+/// A pinned caller keeps their own rows even where they have no usage, as
+/// Slurm's `sshare` does. A coordinator's partial reply lists users only in
+/// accounts it covers.
+fn user_rows_shown(scope: &UsageScope, in_scope: bool) -> bool {
+    scope.totals_visible() || scope.is_single_user() || in_scope
+}
+
 fn account_usage_shown(account_rows: bool, totals: bool, in_scope: bool) -> bool {
     account_rows && (totals || in_scope)
 }
@@ -473,6 +478,19 @@ mod tests {
     fn short_h_means_noheader() {
         let args = SshareArgs::try_parse_from(["sshare", "-h"]).expect("-h is accepted");
         assert!(args.noheader);
+    }
+
+    #[test]
+    fn a_pinned_caller_keeps_their_rows_in_an_account_they_have_not_used() {
+        let pinned = report_usage_scope(Some("alice"), None, false, false, false, false);
+        assert!(user_rows_shown(&pinned, false));
+    }
+
+    #[test]
+    fn a_partial_reply_omits_users_of_accounts_outside_it() {
+        let partial = report_usage_scope(None, None, true, false, false, false);
+        assert!(!user_rows_shown(&partial, false));
+        assert!(user_rows_shown(&partial, true));
     }
 
     #[test]

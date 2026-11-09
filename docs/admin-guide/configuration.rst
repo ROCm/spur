@@ -1406,9 +1406,11 @@ Slurm's ``PrivateData`` and narrows what a User sees.
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is
        replaced with their own name. ``Grp*`` totals still include every user's
-       jobs. ``sshare`` omits other users' rows. Account rows stay, and their
-       raw usage, account and cluster totals, ``NormUsage``, and ``% of Tot``
-       are left blank rather than computed from the User's rows alone.
+       jobs. ``sshare`` omits other users' rows and keeps the User's own,
+       showing zero usage in an account they have not used. Account rows stay,
+       and their raw usage, account and cluster totals, ``NormUsage``, and
+       ``% of Tot`` are left blank rather than computed from the User's rows
+       alone.
        ``sreport`` utilization leaves those same cells blank.
        A coordinator also sees usage for the accounts they coordinate; those
        rows are filled in, and cluster totals stay blank.
