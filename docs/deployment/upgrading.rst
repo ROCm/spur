@@ -963,6 +963,10 @@ This release adds per-partition resource caps and memory limits (see
 behave as before: with no limit set, nothing changes, and
 ``enforce_part_limits`` keeps its meaning for wall time.
 
+Jobs already running when you upgrade have no recorded partition. Once a cap
+is set, each one is charged to the highest-``priority_tier`` partition it
+requested, which is the partition it ran in unless it listed several.
+
 .. warning::
 
    **Upgrade every controller replica before you configure any cap or memory
@@ -982,8 +986,16 @@ release cannot load the snapshot. To downgrade:
 
 #. Remove every cap and memory knob (``spur.conf`` plus ``scontrol
    reconfigure``, or ``scontrol update``).
-#. Wait until no pending job shows ``PartitionTresLimit`` and a new Raft
-   snapshot has been taken.
+#. Wait until no job carries the ``PartitionTresLimit`` reason. A job keeps
+   its last pending reason after it ends, so this includes finished jobs:
+   wait until no pending job shows the reason, then at least
+   ``controller.terminal_job_retention_secs`` (default one hour) more, so
+   finished jobs that had it are evicted.
+#. Wait for a new Raft snapshot: on every controller,
+   ``<state_dir>/raft/snapshot.json`` must be newer than the end of the
+   previous step. A snapshot is taken every 5000 Raft log entries, so on a
+   quiet cluster this can take a while; job submissions and completions
+   move it along.
 #. Downgrade the controllers.
 
 See Also
