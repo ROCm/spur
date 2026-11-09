@@ -2285,8 +2285,8 @@ Controls which nodes may register with the controller.
      - string[]
      - unset
      - Optional authoritative node roster, expressed as node names or Slurm
-       hostlists. Applies in both admission modes. Omitted preserves dynamic
-       registration; an explicit empty list permits no nodes.
+       hostlist expressions. Applies in both admission modes. Omitted preserves
+       dynamic registration; an explicit empty list permits no nodes.
 
 .. _configured-node-roster:
 
@@ -2322,10 +2322,10 @@ records: each permitted agent must register. A token is still required when
 mixed static/dynamic inventory mode.
 
 ``node_names = []`` deliberately deletes every removable registered node and
-rejects every new registration. Removing the field and reconfiguring restores
-dynamic registration without recreating deleted records. Names support letters,
-digits, dots, underscores, and hyphens; hostlists are bounded to 100,000 distinct
-names of at most 255 bytes each. Wildcards and label selectors belong in the
+rejects every new registration. Removing the field and running
+``scontrol reconfigure`` restores dynamic registration without recreating deleted
+records. Names support letters, digits, dots, underscores, and hyphens; the roster
+is bounded to 100,000 distinct names of at most 255 bytes each. Wildcards and label selectors belong in the
 existing policy sections, not this roster.
 
 The first permitted registration on a cluster with an explicit roster commits
