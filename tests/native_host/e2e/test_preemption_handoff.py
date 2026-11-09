@@ -612,7 +612,9 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
         assert code != 0, output
         # Zero retention is floored to 120 seconds for accounting repair.
         time.sleep(130)
-        assert f"PreemptionsUsed={used} PreemptionsUnused={sum(first_unused.values())}" in c.scontrol("show", "job", str(hunter))
+        assert f"PreemptionsUsed={used} PreemptionsUnused={sum(first_unused.values())}" in c.scontrol(
+            "show", "job", str(hunter)
+        )
     finally:
         c.nodes[0].exec(f"docker unpause {shlex.quote(c._pg_container)}")
     c._wait_pg(c.nodes[0])
