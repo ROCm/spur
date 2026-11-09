@@ -1267,7 +1267,7 @@ plain DOWN from an earlier drain. Such an ambiguous hold remains DOWN in mode
 
    scontrol update NodeName=worker1 State=RESUME
 
-The three settings follow Slurm's `ReturnToService policy
+The three settings follow Slurm's `return to service policy
 <https://slurm.schedmd.com/slurm.conf.html#OPT_ReturnToService>`_. Spur keeps its
 existing default when the setting is omitted. Slurm validates hardware against
 its static node definitions; Spur continues to treat ``[[nodes]]`` resource
