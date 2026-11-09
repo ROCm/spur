@@ -1872,6 +1872,11 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Read the job map in place, for a pass that keeps few of its jobs.
+    pub(crate) fn with_jobs<R>(&self, read: impl FnOnce(&HashMap<JobId, Job>) -> R) -> R {
+        read(&self.jobs.read())
+    }
+
     /// Get jobs matching filters.
     pub fn get_jobs(&self, filter: &JobFilter) -> Vec<Job> {
         // Built once per call so the per-job node check is O(allocated_nodes)

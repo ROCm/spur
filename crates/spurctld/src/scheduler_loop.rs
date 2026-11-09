@@ -19,7 +19,7 @@ use spur_proto::proto::{
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::partition_cap::{
-    candidate_partitions, cap_admits_on, is_capped, job_node_charge, PartitionNodeUsage,
+    candidate_partitions, cap_admits_on, is_capped, job_typed_gpu, PartitionNodeUsage,
     RunningCharge, TresCharge,
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
@@ -1225,21 +1225,9 @@ pub(crate) fn running_partition_usage(cluster: &ClusterManager) -> PartitionNode
     if !partitions.iter().any(is_capped) {
         return PartitionNodeUsage::new();
     }
-    let jobs = cluster.get_jobs(&JobFilter {
-        states: &[
-            spur_core::job::JobState::Running,
-            spur_core::job::JobState::Suspended,
-            spur_core::job::JobState::Completing,
-            spur_core::job::JobState::Pending,
-        ],
-        ..Default::default()
-    });
-    partition_usage_from_jobs(
-        &jobs,
-        &partitions,
-        Utc::now(),
-        ReleaseWaits::of(&cluster.config().scheduler),
-    )
+    let waits = ReleaseWaits::of(&cluster.config().scheduler);
+    cluster
+        .with_jobs(|jobs| partition_usage_from_jobs(jobs.values(), &partitions, Utc::now(), waits))
 }
 
 /// What each capped partition's jobs hold on each node at `now`, as backfill
@@ -1290,6 +1278,7 @@ fn partition_usage_from_jobs<'a>(
         // end at `now` and vanish from the cap.
         let until = job_expected_end(job, now, waits)
             .max(now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS));
+        let typed_gpu = job_typed_gpu(job);
         let by_node = usage.entry(partition.name.clone()).or_default();
         let held = job
             .per_node_alloc
@@ -1301,7 +1290,7 @@ fn partition_usage_from_jobs<'a>(
                 .or_default()
                 .push(RunningCharge {
                     job_id: job.job_id,
-                    tres: job_node_charge(job, alloc),
+                    tres: TresCharge::from_allocation(alloc, typed_gpu.as_deref()),
                     until,
                 });
         }

@@ -183,11 +183,6 @@ pub fn job_typed_gpu(job: &Job) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What a running job's allocation on one node charges to its partition.
-pub fn job_node_charge(job: &Job, alloc: &ResourceAllocations) -> TresCharge {
-    TresCharge::from_allocation(alloc, job_typed_gpu(job).as_deref())
-}
-
 /// The job as `partition` would run it, with its memory policy applied to
 /// the request. Borrowed when the policy changes nothing.
 pub fn job_in_partition<'a>(job: &'a Job, partition: &Partition) -> Cow<'a, Job> {
@@ -450,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn job_node_charge_uses_the_request_type() {
+    fn an_allocation_is_charged_to_the_requests_gpu_type() {
         let mut alloc = ResourceAllocations::with_scalar(4, 512);
         alloc.devices.insert(
             "gpu".into(),
@@ -458,9 +453,10 @@ mod tests {
                 .map(spur_core::resource::AllocatedDevice::injectable)
                 .collect(),
         );
-        let typed = job_node_charge(&job_with(None, &["gpu:a100:2"]), &alloc);
+        let charge = |job: Job| TresCharge::from_allocation(&alloc, job_typed_gpu(&job).as_deref());
+        let typed = charge(job_with(None, &["gpu:a100:2"]));
         assert_eq!(typed, TresCharge::new(4, 512, 2, Some("a100")));
-        let generic = job_node_charge(&job_with(None, &["gpu:2"]), &alloc);
+        let generic = charge(job_with(None, &["gpu:2"]));
         assert_eq!(generic, TresCharge::new(4, 512, 2, None));
     }
 
