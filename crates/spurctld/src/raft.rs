@@ -162,6 +162,10 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    #[serde(default)]
+    pub node_inventory_error: Option<String>,
+    #[serde(default)]
+    pub node_registration_rejected: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

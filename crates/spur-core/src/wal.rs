@@ -384,6 +384,12 @@ pub enum WalOperation {
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
 
+    NodeInventoryUpdate {
+        inventory: crate::config::NodeInventory,
+        #[serde(default)]
+        initialize: bool,
+    },
+
     // Admission token operations
     TokenCreate {
         token: AdmissionToken,
@@ -698,6 +704,7 @@ impl WalOperation {
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
             | Self::NodeLabelsUpdate { .. }
+            | Self::NodeInventoryUpdate { .. }
             | Self::TokenCreate { .. }
             | Self::TokenRevoke { .. }
             | Self::PartitionCreate { .. }
@@ -748,6 +755,7 @@ impl WalOperation {
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
             | Self::NodeLabelsUpdate { .. }
+            | Self::NodeInventoryUpdate { .. }
             | Self::TokenCreate { .. }
             | Self::TokenRevoke { .. }
             | Self::PartitionCreate { .. }
@@ -769,6 +777,25 @@ impl WalOperation {
 
 #[cfg(test)]
 mod job_state_change_wal_tests {
+    #[test]
+    fn node_inventory_has_stable_wire_form_and_optional_initialization() {
+        let op: super::WalOperation =
+            serde_json::from_str(r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]}}}"#)
+                .unwrap();
+        let super::WalOperation::NodeInventoryUpdate {
+            inventory,
+            initialize,
+        } = op
+        else {
+            panic!("inventory operation");
+        };
+        assert!(!initialize);
+        assert_eq!(
+            inventory.names.unwrap(),
+            ["n1".to_string()].into_iter().collect()
+        );
+    }
+
     use super::*;
 
     /// A reason's variant name is its wire form in the Raft log, and a controller

@@ -1899,12 +1899,58 @@ pub struct DevicesGresEntry {
 pub struct AdmissionConfig {
     #[serde(default)]
     pub mode: AdmissionMode,
+    /// An explicit roster; absence preserves dynamic node admission.
+    #[serde(default)]
+    pub node_names: Option<Vec<String>>,
+}
+
+/// The committed roster remains authoritative across controller restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct NodeInventory {
+    #[serde(default)]
+    pub names: Option<BTreeSet<String>>,
+}
+
+impl AdmissionConfig {
+    pub fn node_inventory(&self) -> Result<NodeInventory, ConfigError> {
+        let Some(patterns) = &self.node_names else {
+            return Ok(NodeInventory::default());
+        };
+        let invalid = |value: String| ConfigError::InvalidValue {
+            field: "admission.node_names".into(),
+            value,
+        };
+        let mut names = BTreeSet::new();
+        for pattern in patterns {
+            let expanded = crate::hostlist::expand_bounded(pattern, 100_000, 255)
+                .map_err(|error| invalid(error.to_string()))?;
+            if expanded.is_empty() {
+                return Err(invalid(
+                    "empty entries are not node names; use [] for an empty roster".into(),
+                ));
+            }
+            for name in expanded {
+                if !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                {
+                    return Err(invalid(format!("invalid node name: {name}")));
+                }
+                names.insert(name);
+                if names.len() > 100_000 {
+                    return Err(invalid("roster exceeds 100000 nodes".into()));
+                }
+            }
+        }
+        Ok(NodeInventory { names: Some(names) })
+    }
 }
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             mode: AdmissionMode::Open,
+            node_names: None,
         }
     }
 }
@@ -2505,6 +2551,7 @@ impl SlurmConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.admission.node_inventory()?;
         if let Some(external) = self
             .topology
             .as_ref()
@@ -3348,6 +3395,51 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_inventory_is_opt_in_and_expands_hostlists() {
+        let old: super::AdmissionConfig = serde_json::from_str(r#"{"mode":"open"}"#).unwrap();
+        assert_eq!(old.node_inventory().unwrap().names, None);
+        let config = super::SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+[admission]
+node_names = ["n[01-02]", "n01", "service-a"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.admission.node_inventory().unwrap().names.unwrap(),
+            ["n01", "n02", "service-a"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        let empty = super::SlurmConfig::load_from_str(
+            "cluster_name = 'test'\n[admission]\nnode_names = []",
+        )
+        .unwrap();
+        assert_eq!(
+            empty.admission.node_inventory().unwrap().names,
+            Some(Default::default())
+        );
+    }
+
+    #[test]
+    fn node_inventory_rejects_invalid_and_unbounded_names() {
+        for names in [
+            r#"["n[2-1]"]"#,
+            r#"[""]"#,
+            r#"["node*"]"#,
+            r#"["n[1-100001]"]"#,
+        ] {
+            let input = format!("cluster_name = 'test'\n[admission]\nnode_names = {names}");
+            assert!(
+                super::SlurmConfig::load_from_str(&input).is_err(),
+                "{names}"
+            );
+        }
+    }
+
     use super::*;
     use std::io::Write;
 
