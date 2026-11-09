@@ -591,6 +591,7 @@ impl SlurmAgent for VirtualAgent {
                         empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
                             medium: Some("Memory".into()),
                             size_limit: Some(Quantity(spec.shm_size.clone())),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     });
