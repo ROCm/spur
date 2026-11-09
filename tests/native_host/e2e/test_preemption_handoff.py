@@ -558,7 +558,8 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _usage(c, open_count=1)
     _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)})
 
-    c.nodes[0].exec(f"docker stop {shlex.quote(c._pg_container)}")
+    # Pause preserves the ephemeral published port that the controller is configured to use.
+    c.nodes[0].exec(f"docker pause {shlex.quote(c._pg_container)}")
     try:
         _launch_gate(c, hunter, [0], False)
         _usage(c, used=1)
@@ -571,7 +572,8 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
         time.sleep(130)
         assert "PreemptionsUsed=1" in c.scontrol("show", "job", str(hunter))
     finally:
-        c.nodes[0].exec(f"docker start {shlex.quote(c._pg_container)}")
+        c.nodes[0].exec(f"docker unpause {shlex.quote(c._pg_container)}")
+    c._wait_pg(c.nodes[0])
     _rollup_report(c, {(user, "rollup-a"): (1, 0, 0)})
     wait_until(lambda: f"JobId={hunter} " not in c.cli_allow_fail(["scontrol", "show", "job", str(hunter)]),
                timeout_s=90, interval_s=1, desc="exported job leaving controller history")
