@@ -160,7 +160,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         factors_partial,
         accounts_reply.partial,
         users_reply.partial,
-    );
+    )
+    .with_caller(usage.partial_caller.as_deref());
 
     let account_fairshare: HashMap<&str, f64> = {
         let mut sums: HashMap<&str, (f64, usize)> = HashMap::new();
@@ -316,80 +317,68 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             );
         }
 
-        // User rows follow the same accounts. A quiet coordinated account still
-        // lists its users; an account outside the reply does not.
-        if totals || in_scope {
-            let members: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
-            for user in &members {
-                // Filter by user if specified
-                if let Some(ref filter_user) = args.user {
-                    if &user.name != filter_user {
-                        continue;
-                    }
-                }
-                // Hidden users stay in `members`, so a visible user's NormShares is
-                // still their fraction of the account. Slurm omits the hidden rows.
-                if !scope.user_visible(&user.name) {
+        let members: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
+        for user in &members {
+            // Filter by user if specified
+            if let Some(ref filter_user) = args.user {
+                if &user.name != filter_user {
                     continue;
                 }
+            }
+            // Hidden users stay in `members`, so a visible user's NormShares is
+            // still their fraction of the account. Slurm omits the hidden rows.
+            if !user_row_shown(&scope, in_scope, &user.name) {
+                continue;
+            }
 
-                let user_usage = user_account_billing
-                    .get(&(user.name.as_str(), account.name.as_str()))
-                    .copied()
-                    .unwrap_or(0.0);
-                let user_norm_usage = user_usage / cluster_usage;
-                // Each user within an account gets an equal sub-share
-                let user_count = members.len().max(1) as f64;
-                let user_norm_shares = norm_shares / user_count;
-                let user_factor = fairshare_map
-                    .get(&(user.name.clone(), account.name.clone()))
-                    .copied();
-                let user_fair_share = user_factor.unwrap_or_else(|| {
-                    if user_norm_usage > 0.001 {
-                        (user_norm_shares / user_norm_usage).min(10.0)
-                    } else {
-                        (user_norm_shares / 0.001).min(10.0)
-                    }
-                });
-
-                let user_cpu = user_account_cpu_secs
-                    .get(&(user.name.as_str(), account.name.as_str()))
-                    .copied()
-                    .unwrap_or(0.0);
-                let user_gpu = user_account_gpu_secs
-                    .get(&(user.name.as_str(), account.name.as_str()))
-                    .copied()
-                    .unwrap_or(0.0);
-
-                let mine = scope.user_visible(&user.name);
-                let fair_shown = user_fair_shown(mine, user_factor.is_some(), totals, shares_open);
-                let raw_long = cell(mine, 12, || format!("{user_usage:>12.1}"));
-                let raw_short = cell(mine, 12, || format!("{user_usage:>12.0}"));
-                let user_shares = cell(shares_open, 12, || format!("{user_norm_shares:>12.6}"));
-                let norm = cell(mine && totals, 12, || format!("{user_norm_usage:>12.6}"));
-                let fair = cell(fair_shown, 12, || format!("{user_fair_share:>12.6}"));
-                let cpu = cell(mine, 12, || format!("{user_cpu:>12.1}"));
-                let gpu = cell(mine, 12, || format!("{user_gpu:>12.1}"));
-
-                if args.long {
-                    println!(
-                        " {:<14} {:<15} {:>12} {} {} {} {} {} {}",
-                        "",
-                        user.name,
-                        raw_shares as u32,
-                        user_shares,
-                        raw_long,
-                        norm,
-                        fair,
-                        cpu,
-                        gpu,
-                    );
+            let user_usage = user_account_billing
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
+            let user_norm_usage = user_usage / cluster_usage;
+            // Each user within an account gets an equal sub-share
+            let user_count = members.len().max(1) as f64;
+            let user_norm_shares = norm_shares / user_count;
+            let user_factor = fairshare_map
+                .get(&(user.name.clone(), account.name.clone()))
+                .copied();
+            let user_fair_share = user_factor.unwrap_or_else(|| {
+                if user_norm_usage > 0.001 {
+                    (user_norm_shares / user_norm_usage).min(10.0)
                 } else {
-                    println!(
-                        " {:<14} {:<15} {:>12} {} {} {} {}",
-                        "", user.name, raw_shares as u32, user_shares, raw_short, norm, fair,
-                    );
+                    (user_norm_shares / 0.001).min(10.0)
                 }
+            });
+
+            let user_cpu = user_account_cpu_secs
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
+            let user_gpu = user_account_gpu_secs
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
+
+            let mine = scope.user_visible(&user.name);
+            let fair_shown = user_fair_shown(mine, user_factor.is_some(), totals, shares_open);
+            let raw_long = cell(mine, 12, || format!("{user_usage:>12.1}"));
+            let raw_short = cell(mine, 12, || format!("{user_usage:>12.0}"));
+            let user_shares = cell(shares_open, 12, || format!("{user_norm_shares:>12.6}"));
+            let norm = cell(mine && totals, 12, || format!("{user_norm_usage:>12.6}"));
+            let fair = cell(fair_shown, 12, || format!("{user_fair_share:>12.6}"));
+            let cpu = cell(mine, 12, || format!("{user_cpu:>12.1}"));
+            let gpu = cell(mine, 12, || format!("{user_gpu:>12.1}"));
+
+            if args.long {
+                println!(
+                    " {:<14} {:<15} {:>12} {} {} {} {} {} {}",
+                    "", user.name, raw_shares as u32, user_shares, raw_long, norm, fair, cpu, gpu,
+                );
+            } else {
+                println!(
+                    " {:<14} {:<15} {:>12} {} {} {} {}",
+                    "", user.name, raw_shares as u32, user_shares, raw_short, norm, fair,
+                );
             }
         }
     }
@@ -410,6 +399,12 @@ fn report_usage_scope(
 ) -> UsageScope {
     UsageScope::from_replies([usage_scoped, factors_scoped])
         .with_partial([usage_partial, factors_partial])
+}
+
+/// The caller keeps their own rows even where they have no usage, as Slurm's
+/// `sshare` does. Anyone else needs an account the reply covers.
+fn user_row_shown(scope: &UsageScope, in_scope: bool, user: &str) -> bool {
+    scope.user_visible(user) && (scope.totals_visible() || in_scope || scope.is_caller(user))
 }
 
 fn account_usage_shown(account_rows: bool, totals: bool, in_scope: bool) -> bool {
@@ -473,6 +468,28 @@ mod tests {
     fn short_h_means_noheader() {
         let args = SshareArgs::try_parse_from(["sshare", "-h"]).expect("-h is accepted");
         assert!(args.noheader);
+    }
+
+    #[test]
+    fn a_pinned_caller_keeps_their_rows_in_an_account_they_have_not_used() {
+        let pinned = report_usage_scope(Some("alice"), None, false, false, false, false);
+        assert!(user_row_shown(&pinned, false, "alice"));
+        assert!(!user_row_shown(&pinned, true, "bob"));
+    }
+
+    #[test]
+    fn a_partial_reply_omits_users_of_accounts_outside_it() {
+        let partial = report_usage_scope(None, None, true, false, false, false);
+        assert!(!user_row_shown(&partial, false, "bob"));
+        assert!(user_row_shown(&partial, true, "bob"));
+    }
+
+    #[test]
+    fn a_coordinator_keeps_their_own_rows_outside_the_accounts_they_coordinate() {
+        let carol =
+            report_usage_scope(None, None, true, false, false, false).with_caller(Some("carol"));
+        assert!(user_row_shown(&carol, false, "carol"));
+        assert!(!user_row_shown(&carol, false, "bob"));
     }
 
     #[test]

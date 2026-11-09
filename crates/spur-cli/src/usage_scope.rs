@@ -14,6 +14,8 @@ pub(crate) struct UsageScope {
     /// A coordinator's accounts: every returned row is real, and sums are not
     /// the cluster.
     partial: bool,
+    /// The coordinator a partial reply was built for.
+    caller: Option<String>,
 }
 
 impl UsageScope {
@@ -22,7 +24,22 @@ impl UsageScope {
         Self {
             pinned: scoped.into_iter().flatten().next().map(str::to_string),
             partial: false,
+            caller: None,
         }
+    }
+
+    pub(crate) fn with_caller(mut self, caller: Option<&str>) -> Self {
+        self.caller = caller.map(str::to_string);
+        self
+    }
+
+    /// `user` made this request, so a missing row of theirs is a real zero in
+    /// any account.
+    pub(crate) fn is_caller(&self, user: &str) -> bool {
+        [&self.pinned, &self.caller]
+            .into_iter()
+            .flatten()
+            .any(|me| me == user)
     }
 
     pub(crate) fn with_partial(mut self, partial: impl IntoIterator<Item = bool>) -> Self {

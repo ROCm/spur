@@ -59,6 +59,15 @@ fn usage_visible_accounts(scope: &spur_core::rbac::ReadScope, partial: bool) -> 
     names
 }
 
+/// Lets the client keep a coordinator's own rows in accounts they do not
+/// coordinate, which `visible_accounts` alone would hide.
+fn usage_partial_caller(scope: &spur_core::rbac::ReadScope, partial: bool) -> Option<String> {
+    match scope {
+        spur_core::rbac::ReadScope::Coordinated { user, .. } if partial => Some(user.clone()),
+        _ => None,
+    }
+}
+
 /// The user predicate a private read hands to SQL.
 #[derive(Debug)]
 enum ScopedUser {
@@ -776,6 +785,7 @@ impl SlurmAccounting for AccountingService {
                     scoped_to_user: scoped_to,
                     partial: false,
                     visible_accounts: usage_visible_accounts(&scope, false),
+                    partial_caller: usage_partial_caller(&scope, false),
                 }));
             }
             ScopedUser::Query(user) => user,
@@ -838,6 +848,7 @@ impl SlurmAccounting for AccountingService {
             scoped_to_user: scoped_to,
             partial,
             visible_accounts: usage_visible_accounts(&scope, partial),
+            partial_caller: usage_partial_caller(&scope, partial),
         }))
     }
 
@@ -2129,6 +2140,24 @@ mod tests {
         assert!(
             usage_visible_accounts(&spur_core::rbac::ReadScope::Caller("alice".into()), true)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn usage_names_the_coordinator_only_on_their_partial_reply() {
+        let carol = spur_core::rbac::ReadScope::Coordinated {
+            user: "carol".into(),
+            accounts: vec!["physics".into()],
+        };
+        assert_eq!(usage_partial_caller(&carol, true).as_deref(), Some("carol"));
+        assert_eq!(usage_partial_caller(&carol, false), None);
+        assert_eq!(
+            usage_partial_caller(&spur_core::rbac::ReadScope::Caller("alice".into()), true),
+            None
+        );
+        assert_eq!(
+            usage_partial_caller(&spur_core::rbac::ReadScope::All, true),
+            None
         );
     }
 

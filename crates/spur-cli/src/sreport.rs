@@ -202,8 +202,7 @@ async fn report_account_utilization_by_user(
         );
     }
 
-    let scope =
-        UsageScope::from_replies([usage.scoped_to_user.as_deref()]).with_partial([usage.partial]);
+    let scope = utilization_scope(&usage);
     for account in &accounts {
         let &(acct_cpu, acct_gpu, acct_jobs) = acct_agg
             .get(account.name.as_str())
@@ -308,8 +307,7 @@ async fn report_user_utilization_by_account(
         );
     }
 
-    let scope =
-        UsageScope::from_replies([usage.scoped_to_user.as_deref()]).with_partial([usage.partial]);
+    let scope = utilization_scope(&usage);
     for user in &users {
         let &(cpu, gpu, jobs) = user_agg
             .get(&(user.name.as_str(), user.account.as_str()))
@@ -529,18 +527,23 @@ async fn report_job_sizes_by_user(
     Ok(())
 }
 
+fn utilization_scope(usage: &spur_proto::proto::GetUsageResponse) -> UsageScope {
+    UsageScope::from_replies([usage.scoped_to_user.as_deref()])
+        .with_partial([usage.partial])
+        .with_caller(usage.partial_caller.as_deref())
+}
+
 /// An account total is real on a complete reply, and on a coordinator's own
 /// accounts when the reply is partial. A single-user pin has no account total.
 fn account_utilization_shown(scope: &UsageScope, account_visible: bool) -> bool {
     scope.account_rows_visible() && (scope.totals_visible() || account_visible)
 }
 
-/// A user cell is real for the pinned caller, for every user on a complete
-/// reply, and for users in a coordinator's accounts. Anyone else stays blank:
-/// a missing row there is hidden usage, not a zero.
+/// A user cell is real for the caller, for every user on a complete reply,
+/// and for users in a coordinator's accounts. Anyone else stays blank: a
+/// missing row there is hidden usage, not a zero.
 fn user_utilization_shown(scope: &UsageScope, user: &str, account_visible: bool) -> bool {
-    scope.user_visible(user)
-        && (scope.totals_visible() || scope.is_single_user() || account_visible)
+    scope.user_visible(user) && (scope.totals_visible() || scope.is_caller(user) || account_visible)
 }
 
 /// `visible_accounts` is what makes a missing row a true zero. A usage entry
@@ -574,6 +577,18 @@ mod tests {
         let open = UsageScope::from_replies([None]);
         assert!(account_utilization_shown(&open, false));
         assert!(user_utilization_shown(&open, "bob", false));
+    }
+
+    #[test]
+    fn a_coordinator_keeps_their_own_zero_outside_the_accounts_they_coordinate() {
+        let carol = utilization_scope(&spur_proto::proto::GetUsageResponse {
+            partial: true,
+            visible_accounts: vec!["physics".into()],
+            partial_caller: Some("carol".into()),
+            ..Default::default()
+        });
+        assert!(user_utilization_shown(&carol, "carol", false));
+        assert!(!user_utilization_shown(&carol, "bob", false));
     }
 
     #[test]

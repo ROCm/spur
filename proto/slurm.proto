@@ -1829,6 +1829,9 @@ message GetUsageResponse {
   // it is not visible, and a client that printed 0 would be claiming the
   // account went unused. Empty unless `partial` is set.
   repeated string visible_accounts = 7;
+  // The coordinator this partial reply was built for. Their own rows are real
+  // in every account, including ones outside `visible_accounts`.
+  optional string partial_caller = 8;
 }
 
 message ModifyUsageRequest {
