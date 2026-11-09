@@ -20,7 +20,9 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Pushed with GITHUB_TOKEN, so CI does not run on the PR automatically.
       # A maintainer reviews the TODO entries, pushes the fix and that triggers CI.
@@ -49,6 +51,8 @@ jobs:
           git switch -c "${BRANCH}"
           git add "${CATALOG}"
           git commit -m "feat(spur-devices): name new AMD GPU device IDs"
+          # The checkout stores no token, so git gets GH_TOKEN from gh for this push.
+          gh auth setup-git
           git push --force origin "${BRANCH}"
           gh pr create --base main --head "${BRANCH}" \
             --title "feat(spur-devices): name new AMD GPU device IDs from the GPU operator rule" \
