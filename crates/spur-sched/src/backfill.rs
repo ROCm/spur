@@ -1649,7 +1649,9 @@ pub fn least_fullest_node_charge(
     if job.spec.exclusive {
         return placement_charge(job, required, node, typed_gpu);
     }
-    let cpus = u64::from(required.cpus);
+    // `required` floors an uneven task split; the busiest node gets the largest share.
+    let busiest = node_cpu_counts(&job.spec).into_iter().max().unwrap_or(1);
+    let cpus = u64::from(required.cpus.max(busiest));
     let gpus = even_node_gpus(&job.spec);
     TresCharge::new(cpus, node_memory_mb(&job.spec, cpus, gpus), gpus, typed_gpu)
 }

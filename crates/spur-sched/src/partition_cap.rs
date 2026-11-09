@@ -149,7 +149,8 @@ pub fn fits_under_cap(job: &Job, partition: &Partition, node: &Node, used: &Tres
     let job = job_in_partition(job, partition);
     let required = crate::backfill::job_resource_request(&job);
     let typed_gpu = job_typed_gpu(&job);
-    let charge = crate::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
+    let charge =
+        crate::backfill::least_fullest_node_charge(&job, &required, node, typed_gpu.as_deref());
     partition_cap_ok(partition, &node.name, used, &charge).is_ok()
 }
 
@@ -161,11 +162,15 @@ pub fn cap_admits_on(
     node: &Node,
     used: impl Fn(&Partition) -> TresCharge,
 ) -> bool {
-    let mut holding = candidate_partitions(job, partitions)
+    let holding: Vec<&Partition> = candidate_partitions(job, partitions)
         .into_iter()
         .filter(|p| node.partitions.contains(&p.name))
-        .peekable();
-    holding.peek().is_none() || holding.any(|p| fits_under_cap(job, p, node, &used(p)))
+        .collect();
+    holding.is_empty()
+        || holding
+            .into_iter()
+            .filter(|p| p.admits(&job_in_partition(job, p).spec))
+            .any(|p| fits_under_cap(job, p, node, &used(p)))
 }
 
 /// GPU type a job's request names, which decides whether its GPUs count

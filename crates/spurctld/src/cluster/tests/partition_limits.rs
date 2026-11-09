@@ -127,6 +127,40 @@ async fn never_runnable_jobs_are_rejected_at_submit_under_all() {
     assert!(cm.submit_job(spec_in("cpu", 4)).is_ok());
 }
 
+fn uneven_in(partition: &str) -> JobSpec {
+    JobSpec {
+        num_nodes: 2,
+        num_tasks: 7,
+        ..spec_in(partition, 1)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uneven_task_split_whose_busiest_node_exceeds_the_cap_never_runs() {
+    let dir = TempDir::new().unwrap();
+    for mode in [EnforcePartLimits::All, EnforcePartLimits::No] {
+        let dir = TempDir::new_in(dir.path()).unwrap();
+        let cm = cluster_with(&dir, mode, vec![partition("cpu", &[("cpu", 3)])]).await;
+        register_node(&cm, "n1", 16, 64 * GIB);
+        register_node(&cm, "n2", 16, 64 * GIB);
+        if mode == EnforcePartLimits::All {
+            let err = submit_err(&cm, uneven_in("cpu"));
+            assert!(err.contains("job needs 4 CPUs"), "{err}");
+            continue;
+        }
+        let id = submit_and_wait(&cm, uneven_in("cpu"));
+        assert!(!schedulable(&cm, id));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::PartitionTresLimit);
+        assert!(
+            job.state_reason_display()
+                .contains("can never run this job as configured"),
+            "{}",
+            job.state_reason_display()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_runnable_per_node_request_pends_under_no() {
     let dir = TempDir::new().unwrap();

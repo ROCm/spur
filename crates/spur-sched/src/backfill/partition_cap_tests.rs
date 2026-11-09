@@ -807,9 +807,15 @@ fn heterogeneous_shares_are_checked_against_the_cap() {
 
     let tight = Fixture::new(nodes(), vec![partition("cpu", &[("cpu", 3)])]);
     let mut sched = BackfillScheduler::new(100);
-    assert!(
-        tight.schedule(&mut sched, &[uneven(1)]).is_empty(),
-        "the 4-CPU share exceeds a cap of 3"
+    assert!(tight.schedule(&mut sched, &[uneven(1)]).is_empty());
+    assert_eq!(
+        outcome(&sched, 1),
+        Some(UnplacedKind::PartitionCapNeverFits),
+        "the busiest node's 4-CPU share can never fit a cap of 3"
+    );
+    assert_eq!(
+        overshoot(&sched, 1).map(|o| (o.resource.as_str(), o.requested)),
+        Some(("cpu", 4))
     );
 
     let fits = Fixture::new(nodes(), vec![partition("cpu", &[("cpu", 4)])]);
@@ -1270,4 +1276,41 @@ fn a_typed_exclusive_job_charges_every_gpu_on_a_mixed_node_to_its_type() {
 
     let mut sched = BackfillScheduler::new(100);
     assert_eq!(started(&fx(8).schedule(&mut sched, &[job()])), [1]);
+}
+
+#[test]
+fn eviction_counts_a_node_only_if_the_gpu_totals_busiest_share_fits() {
+    use crate::partition_cap::cap_admits_on;
+    let n1 = gpu_node("n1", &["gpu"]);
+    let partitions = [partition("gpu", &[("gres/gpu", 4)])];
+    let held = |gpus| move |_: &Partition| TresCharge::new(0, 0, gpus, None);
+
+    let job = total_gpu_job(1, "gpu", 2, 8, None);
+    assert!(
+        !cap_admits_on(&job, &partitions, &n1, held(2)),
+        "8 GPUs over 2 nodes needs 4 on n1; 2 held + 4 > 4"
+    );
+    assert!(cap_admits_on(&job, &partitions, &n1, held(0)));
+}
+
+#[test]
+fn eviction_ignores_a_partition_that_does_not_admit_the_job() {
+    use crate::partition_cap::cap_admits_on;
+    use spur_core::partition::PartitionState;
+    let n1 = node("n1", 64, 256_000, &["cpu", "down"]);
+    let partitions = [
+        partition("cpu", &[("cpu", 4)]),
+        Partition {
+            state: PartitionState::Down,
+            ..partition("down", &[])
+        },
+    ];
+    let mut job = job(1, "cpu,down", 2, 1);
+    job.spec.num_tasks = 1;
+    let full = |p: &Partition| TresCharge::new(if p.name == "cpu" { 4 } else { 0 }, 0, 0, None);
+
+    assert!(
+        !cap_admits_on(&job, &partitions, &n1, full),
+        "an uncapped but Down partition cannot run the job, so the full cap still blocks it"
+    );
 }
