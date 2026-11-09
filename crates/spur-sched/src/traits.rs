@@ -43,7 +43,7 @@ pub struct ClusterState<'a> {
     /// Node name -> pending preemptors whose victims freed or are freeing it.
     pub preemption_handoffs: &'a HashMap<String, Vec<JobId>>,
     /// What each partition's running jobs hold per node, charged against the
-    /// partition's `max_tres_per_node` until the node's `busy_until`.
+    /// partition's `max_tres_per_node` until each charge's own `until`.
     pub partition_node_usage: &'a PartitionNodeUsage,
 }
 

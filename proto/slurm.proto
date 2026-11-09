@@ -2291,7 +2291,7 @@ message UpdatePartitionRequest {
   // Sets max_tres_per_node["cpu"]; 0 = clear that key. Conflicts with a "cpu"
   // key in max_tres_per_node when that map is applied.
   optional uint32 max_cpus_per_node = 28;
-  map<string, uint64> max_tres_per_node = 29;  // replaces the whole map when set_max_tres_per_node
+  map<string, uint64> max_tres_per_node = 29;  // replaces the whole map when non-empty or set_max_tres_per_node
   bool set_max_tres_per_node = 30;             // true = apply max_tres_per_node (even if empty, to clear)
   // Per-job memory policy (MiB). Absent = no change; 0 = clear.
   optional uint64 max_mem_per_node = 31;

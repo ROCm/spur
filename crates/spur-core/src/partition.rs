@@ -110,7 +110,7 @@ impl Partition {
     }
 
     /// Why this partition can never run the job (static limits), or `None` if it can:
-    /// node-count violations report `PartitionConfig`, wall-time `PartitionTimeLimit`.
+    /// node count and `max_mem_per_node` report `PartitionConfig`, wall time `PartitionTimeLimit`.
     pub fn limit_block(&self, spec: &JobSpec) -> Option<PendingReason> {
         // A job never runs on fewer than one node, whatever it asked for.
         let nodes = spec.num_nodes.max(1);
