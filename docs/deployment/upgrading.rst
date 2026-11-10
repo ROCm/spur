@@ -1,5 +1,5 @@
 Upgrading Spur
-==============
+=======
 
 This page covers upgrading Spur binaries, whether on a single host or across a whole
 cluster. It describes the ``spur self-update`` self-updater, re-running ``install.sh``,
@@ -43,6 +43,21 @@ Rollups survive job-history cleanup and fairshare resets. Accounting outages
 keep affected finished jobs in the controller, up to 24 hours past
 ``terminal_job_retention_secs``, which can increase controller memory and
 snapshot size. See :ref:`preemption-outcome-export`.
+
+Job timestamps across controller restarts
+-----------------------------------------
+
+Controllers with submission-timestamp support record submission time in the
+replicated log, alongside activation and completion times. Replaying these entries preserves job timestamps, elapsed
+runtime, and the timestamps used for scheduling age and time-limit calculations.
+
+Older log entries remain readable, but timestamps absent from those entries cannot
+be reconstructed by this change. Such entries retain the recovery-time fallback;
+this does not repair previously reset timestamps. Existing snapshots preserve the
+times they contain. During a rolling upgrade, a controller without
+submission-timestamp support still writes unstamped submissions when leading and
+reconstructs submission times from its own clock when replaying. Timestamp
+preservation requires all controllers to support submission timestamps.
 
 Single-Host: ``spur self-update``
 ---------------------------------
