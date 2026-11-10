@@ -3767,7 +3767,7 @@ mod tests {
             "--controller",
             &format!("http://{addr}"),
             "delete",
-            "nOdEnAmE=n[01-02],n04",
+            "nOdEnAmE=n[01-02],n04,[1-2]gpu[0-1]",
         ]))
         .await
         .unwrap();
@@ -3777,7 +3777,11 @@ mod tests {
             vec![
                 ("n01".into(), false),
                 ("n02".into(), false),
-                ("n04".into(), false)
+                ("n04".into(), false),
+                ("1gpu0".into(), false),
+                ("1gpu1".into(), false),
+                ("2gpu0".into(), false),
+                ("2gpu1".into(), false)
             ]
         );
     }
@@ -3799,6 +3803,29 @@ mod tests {
         assert_eq!(
             capture.deregister_node_calls(),
             vec![("n1".into(), false), ("n2".into(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn scontrol_delete_overlapping_targets_preserves_first_occurrence_order() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(p(&[
+            "scontrol",
+            "--controller",
+            &format!("http://{addr}"),
+            "delete",
+            "NodeName=n2,n[1-3],n1",
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            capture.deregister_node_calls(),
+            vec![
+                ("n2".into(), false),
+                ("n1".into(), false),
+                ("n3".into(), false)
+            ]
         );
     }
 
@@ -3872,7 +3899,23 @@ mod tests {
             );
         }
 
-        for pattern in ["NodeName=n[", "NodeName=,"] {
+        for pattern in [
+            "NodeName=n[",
+            "NodeName=,",
+            "NodeName=gpu[]",
+            "NodeName=gpu[1,]",
+            "NodeName=gpu[,1]",
+            "NodeName=gpu[1,,2]",
+            "NodeName=gpu[ ]",
+            "NodeName=gpu[1, ]",
+            "NodeName=,gpu1",
+            "NodeName=gpu1,",
+            "NodeName=gpu1,,gpu2",
+            "NodeName=gpu1, ,gpu2",
+            "NodeName=rack[1-2]gpu[]",
+            "NodeName=gpu]",
+            "NodeName=gpu[[1]]",
+        ] {
             let err = main_with_args(p(&[
                 "scontrol",
                 "--controller",

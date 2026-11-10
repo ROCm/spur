@@ -2912,10 +2912,8 @@ impl ClusterManager {
             }
             job.run_attempt.saturating_add(1)
         };
-        // `JobStart`'s apply has no state guard, so it charges the slice while
-        // the job is still Pending; the transition to Running follows once the
-        // dispatch is confirmed (see `activate_job`).
-        let resp = self.propose(WalOperation::JobStart {
+        // Reservation charges a Pending job; activation follows confirmed dispatch.
+        let resp = self.propose(WalOperation::JobStartChecked {
             preemption_observation,
             job_id,
             nodes: node_names,
@@ -5500,10 +5498,10 @@ impl ClusterManager {
             );
         }
 
-        let resp = self.propose(WalOperation::NodeRemove {
+        let resp = self.propose(WalOperation::NodeRemoveChecked {
             name: name.to_string(),
             reason,
-            force: Some(force),
+            force,
             at: None,
         })?;
         if let Some(error) = &resp.node_remove_error {
@@ -8938,8 +8936,25 @@ impl ClusterManager {
                 effective_partition,
                 memory_adjustment,
                 at: _,
+            }
+            | WalOperation::JobStartChecked {
+                preemption_observation: _,
+                job_id,
+                nodes: node_names,
+                resources,
+                per_node_alloc,
+                srun_step_dispatch,
+                run_attempt,
+                idle_fill,
+                effective_partition,
+                memory_adjustment,
+                at: _,
             } => {
-                if let Some(name) = node_names.iter().find(|name| !nodes.contains_key(*name)) {
+                if let Some(name) = node_names
+                    .iter()
+                    .find(|name| !nodes.contains_key(*name))
+                    .filter(|_| matches!(op, WalOperation::JobStartChecked { .. }))
+                {
                     warn!(job_id = *job_id, node = %name, "refusing a JobStart onto a removed node");
                     return ClientResponse::default();
                 }
@@ -9649,13 +9664,9 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove {
-                name,
-                reason,
-                force,
-                ..
-            } => {
-                if *force == Some(false)
+            WalOperation::NodeRemove { name, reason, .. }
+            | WalOperation::NodeRemoveChecked { name, reason, .. } => {
+                if matches!(op, WalOperation::NodeRemoveChecked { force: false, .. })
                     && jobs.values().any(|job| {
                         matches!(
                             job.state,
@@ -14270,7 +14281,7 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
         let id = submit_and_wait(&cm, basic_spec("a"));
         let res = scalar_alloc(4, 8000);
-        let start = |run_attempt| WalOperation::JobStart {
+        let start = |run_attempt| WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: id,
             nodes: vec!["n1".into()],
@@ -15629,7 +15640,7 @@ state = "UP"
         });
 
         let resources = scalar_alloc(4, 8000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
@@ -15833,7 +15844,7 @@ state = "UP"
             spec: Box::new(basic_spec("held")),
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0, 1]);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -15948,7 +15959,7 @@ state = "UP"
                 job_id: 1,
                 spec: Box::new(basic_spec("held")),
             },
-            WalOperation::JobStart {
+            WalOperation::JobStartChecked {
                 job_id: 1,
                 nodes: vec!["n1".into()],
                 resources: slice.clone(),
@@ -16101,7 +16112,7 @@ state = "UP"
 
     fn bind_held_gpus(ops: &mut [WalOperation]) {
         for op in ops.iter_mut() {
-            let WalOperation::JobStart { per_node_alloc, .. } = op else {
+            let WalOperation::JobStartChecked { per_node_alloc, .. } = op else {
                 continue;
             };
             for (node, slice) in per_node_alloc.iter_mut() {
@@ -16241,7 +16252,7 @@ state = "UP"
             spec: Box::new(basic_spec("held")),
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0]);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -16276,7 +16287,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(4, 8000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
@@ -17334,7 +17345,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -17382,7 +17393,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -17431,7 +17442,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
@@ -17507,7 +17518,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -17575,7 +17586,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -17648,7 +17659,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
 
-        let start = || WalOperation::JobStart {
+        let start = || WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -17763,7 +17774,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
@@ -17822,7 +17833,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -17862,7 +17873,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -17916,7 +17927,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
@@ -17964,7 +17975,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18027,7 +18038,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18064,7 +18075,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18500,7 +18511,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18540,7 +18551,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18583,7 +18594,7 @@ state = "UP"
             JobState::Running,
         ));
         // Re-dispatched run: current epoch is 2.
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -18627,7 +18638,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
@@ -18710,7 +18721,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
@@ -19312,10 +19323,10 @@ state = "UP"
         register_node(&cm, "worker1", 8, 16000);
         run_job_on(&cm, "node-removed", "worker1");
 
-        let resp = cm.apply_operation(&WalOperation::NodeRemove {
+        let resp = cm.apply_operation(&WalOperation::NodeRemoveChecked {
             name: "worker1".into(),
             reason: Some("decommissioned".into()),
-            force: Some(true),
+            force: true,
             at: None,
         });
 
@@ -21283,7 +21294,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -21372,7 +21383,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -21951,7 +21962,7 @@ state = "UP"
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
 
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -22031,7 +22042,7 @@ state = "UP"
             JobState::Running,
         ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
@@ -24589,7 +24600,7 @@ state = "UP"
             register_node(&cm, node, 8, 16000);
         }
         let owner = requeue_into_earmark(&cm);
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: owner,
             nodes: vec!["n2".into()],
@@ -39345,7 +39356,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
@@ -39366,7 +39377,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
@@ -39486,10 +39497,10 @@ state = "UP"
         register_node(&cm, "n1", 4, 8000);
         assert!(cm.get_node("n1").is_some());
 
-        cm.apply_operation(&WalOperation::NodeRemove {
+        cm.apply_operation(&WalOperation::NodeRemoveChecked {
             name: "n1".into(),
             reason: Some("decommission".into()),
-            force: Some(true),
+            force: true,
             at: None,
         });
         assert!(cm.get_node("n1").is_none());
@@ -39504,10 +39515,10 @@ state = "UP"
         let id = submit_and_wait(&cm, basic_spec("j"));
         start_job_on(&cm, id, "n1");
 
-        let resp = cm.apply_operation(&WalOperation::NodeRemove {
+        let resp = cm.apply_operation(&WalOperation::NodeRemoveChecked {
             name: "n1".into(),
             reason: None,
-            force: Some(true),
+            force: true,
             at: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -39555,7 +39566,7 @@ state = "UP"
     async fn remove_node_rechecks_placements_before_committing() {
         let dir = TempDir::new().unwrap();
         let (cm, recorder) = recording_cluster(&dir, |cm, op| {
-            if matches!(op, WalOperation::NodeRemove { .. }) {
+            if matches!(op, WalOperation::NodeRemoveChecked { .. }) {
                 start_job_on(cm, 1, "n1");
             }
         })
@@ -39570,13 +39581,11 @@ state = "UP"
         assert!(err.to_string().contains("has active jobs"), "{err}");
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
         assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
-        assert!(recorder.ops.lock().iter().any(|op| matches!(
-            op,
-            WalOperation::NodeRemove {
-                force: Some(false),
-                ..
-            }
-        )));
+        assert!(recorder
+            .ops
+            .lock()
+            .iter()
+            .any(|op| matches!(op, WalOperation::NodeRemoveChecked { force: false, .. })));
     }
 
     fn node_removal_fixture(dir: &TempDir, state: JobState) -> ClusterManager {
@@ -39595,7 +39604,10 @@ state = "UP"
         let mut job = Job::new(1, basic_spec("removal"));
         job.state = state;
         cm.jobs.write().insert(1, job);
-        let response = cm.apply_operation(&WalOperation::JobStart {
+        let response = cm.apply_operation(&WalOperation::JobStartChecked {
+            preemption_observation: None,
+            effective_partition: None,
+            memory_adjustment: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(1, 1000),
@@ -39619,10 +39631,10 @@ state = "UP"
         ] {
             let dir = TempDir::new().unwrap();
             let cm = node_removal_fixture(&dir, state);
-            let response = cm.apply_operation(&WalOperation::NodeRemove {
+            let response = cm.apply_operation(&WalOperation::NodeRemoveChecked {
                 name: "n1".into(),
                 reason: None,
-                force: Some(false),
+                force: false,
                 at: None,
             });
 
@@ -39650,6 +39662,44 @@ state = "UP"
     }
 
     #[test]
+    fn job_start_frozen_payload_preserves_removed_node_placement_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        node_test_fixtures::register(&cm, &["n1", "n2"]);
+        cm.jobs
+            .write()
+            .insert(1, Job::new(1, basic_spec("legacy-placement")));
+        let removal =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
+                .unwrap();
+        let placement = serde_json::from_str(
+            r#"{"JobStart":{"job_id":1,"nodes":["n1","n2"],"resources":{"cpus":2,"memory_mb":2000,"devices":{}},"per_node_alloc":{"n1":{"cpus":1,"memory_mb":1000,"devices":{}},"n2":{"cpus":1,"memory_mb":1000,"devices":{}}},"run_attempt":1}}"#,
+        )
+        .unwrap();
+
+        cm.apply_operation(&removal);
+        let response = cm.apply_operation(&placement);
+
+        assert!(response.job_started);
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
+        assert_eq!(cm.get_job(1).unwrap().allocated_nodes, vec!["n1", "n2"]);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
+        let completion = serde_json::from_str(
+            r#"{"JobComplete":{"job_id":1,"exit_code":0,"state":"COMPLETED"}}"#,
+        )
+        .unwrap();
+        cm.apply_operation(&completion);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[test]
     fn job_start_refuses_placement_after_node_removal() {
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
@@ -39669,7 +39719,10 @@ state = "UP"
         cm.jobs
             .write()
             .insert(1, Job::new(1, basic_spec("stale-placement")));
-        let placement = WalOperation::JobStart {
+        let placement = WalOperation::JobStartChecked {
+            preemption_observation: None,
+            effective_partition: None,
+            memory_adjustment: None,
             job_id: 1,
             nodes: vec!["n2".into(), "n1".into()],
             resources: scalar_alloc(2, 2000),
@@ -39679,10 +39732,10 @@ state = "UP"
             idle_fill: false,
             at: None,
         };
-        cm.apply_operation(&WalOperation::NodeRemove {
+        cm.apply_operation(&WalOperation::NodeRemoveChecked {
             name: "n1".into(),
             reason: None,
-            force: Some(false),
+            force: false,
             at: None,
         });
 
@@ -40297,7 +40350,7 @@ state = "UP"
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| (*n).to_string()).collect(),

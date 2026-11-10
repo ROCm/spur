@@ -1502,10 +1502,14 @@ even when its agent or container no longer exists:
 Both commands use the same removal operation and refuse nodes with active
 jobs, including placements reserved while a job is launching. The guard is
 checked when removal commits, so a concurrently scheduled job cannot be
-evicted without force. ``NodeName=`` accepts a hostname, a comma-separated list, a hostlist
-such as ``gpu[001-004]``, or ``ALL`` for every registered node. A failed
-removal is reported per node; remaining nodes are still attempted, and the
-command exits unsuccessfully if any removal fails. An empty cluster with
+evicted without force. ``NodeName=`` accepts a hostname, a comma-separated
+list, a hostlist such as ``gpu[001-004]``, or ``ALL`` for every registered
+node. A malformed hostlist with an empty component, such as ``gpu[]`` or
+``gpu[1,]``, is rejected
+before connecting. Overlapping targets are removed once, in the order of
+their first appearance. A failed removal is reported per node; remaining
+nodes are still attempted, and the command exits unsuccessfully if any
+removal fails. An empty cluster with
 ``ALL`` is also an error.
 
 ``scontrol delete`` accepts exactly one of ``NodeName=``, ``PartitionName=``,
@@ -1521,6 +1525,11 @@ registers again can recreate the node record. Slurm restricts this command
 to dynamic nodes without running jobs or reservation membership; Spur uses
 its native registered-node removal rules and does not currently guard
 reservation membership.
+
+Node removal and new placements use distinct guarded log operations while
+historical entries retain their original replay behavior. Upgrade controllers
+with the leader last; see :ref:`node-removal-upgrade-notes` for mixed-version
+replication requirements.
 
 .. note::
 

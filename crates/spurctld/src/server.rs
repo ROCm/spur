@@ -7632,7 +7632,7 @@ mod tests {
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
-        apply(&WalOperation::JobStart {
+        apply(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: 52,
             nodes: vec!["n1".into()],
@@ -7700,7 +7700,7 @@ mod tests {
         let start_on_n1 = |run_attempt: u32| {
             let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
             let per_node_alloc = std::collections::HashMap::from([("n1".to_string(), res.clone())]);
-            apply(&WalOperation::JobStart {
+            apply(&WalOperation::JobStartChecked {
                 preemption_observation: None,
                 job_id: 60,
                 nodes: vec!["n1".into()],
@@ -8247,7 +8247,7 @@ mod tests {
                 }),
             });
         }
-        cluster.apply_operation(&WalOperation::JobStart {
+        cluster.apply_operation(&WalOperation::JobStartChecked {
             preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| n.to_string()).collect(),
