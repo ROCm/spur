@@ -273,8 +273,11 @@ Common reasons include ``Priority`` (waiting its turn), ``Resources`` (waiting
 for nodes to free up), ``Dependency`` (waiting on another job), ``Reservation``
 (waiting for a reservation window), ``Preempted`` (requeue-preempted and held
 until its eligibility window reopens), ``JobArrayTaskLimit`` (held back by the
-array's own ``%N`` concurrency cap, see :ref:`submit-arrays`), and various QOS
-or association limit reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
+array's own ``%N`` concurrency cap, see :ref:`submit-arrays`),
+``PartitionTresLimit`` (held back by a partition's per-node resource cap; the
+column shows a description with the numbers, see
+:doc:`/admin-guide/partition-resource-limits`), and various QOS or association
+limit reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
 
 View Nodes & Partitions — ``sinfo``
 -----------------------------------

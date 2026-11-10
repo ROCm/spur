@@ -7,15 +7,21 @@ use chrono::{Duration, Utc};
 use tracing::{debug, info};
 
 use spur_core::gpu_request::{distribute_total, resolve_gpu_demand, GpuDemand};
-use spur_core::job::{Job, JobId};
+use spur_core::job::{Job, JobId, PartitionTresOvershoot};
 use spur_core::node::Node;
+use spur_core::partition::Partition;
+use spur_core::partition_limits::{even_node_gpus, node_cpu_counts, node_memory_mb};
 use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{
     build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
 };
 
 use crate::node_match::NodePlacement;
-use crate::timeline::{NodeTimeline, UNLIMITED_JOB_DURATION};
+use crate::partition_cap::{
+    candidate_partitions, is_capped, job_in_eligible_partitions, job_in_partition, job_typed_gpu,
+    partition_cap_ok, planned_memory_adjustment, resolution_rank, TresCharge,
+};
+use crate::timeline::{CapCheck, NodeTimeline, PartitionCharge, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
 
 /// Backfill scheduler.
@@ -38,10 +44,20 @@ pub struct BackfillScheduler {
     report_unplaced: bool,
     /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
     released_handoffs: Vec<(String, JobId)>,
+    /// Jobs the last pass did not start now while a partition cap was exceeded.
+    cap_blocks: HashMap<JobId, PartitionCapBlock>,
 }
 
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
 pub type PlannedJobStarts = HashMap<JobId, (Vec<String>, chrono::DateTime<Utc>)>;
+
+/// A pending job that its partition's `max_tres_per_node` keeps from starting
+/// now: the first over-limit key on each eligible node of `partition`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionCapBlock {
+    pub partition: String,
+    pub overshoots: Vec<PartitionTresOvershoot>,
+}
 
 /// Why the backfill pass did not start a job now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +77,9 @@ enum UnplacedKind {
     NoCapacityAtStart,
     /// Placeable, but only in a future slot, which is now held for the job.
     FutureSlotReserved,
+    /// Every candidate partition's cap is below what the job needs on a node,
+    /// even with the partition idle there.
+    PartitionCapNeverFits,
 }
 
 impl UnplacedKind {
@@ -73,6 +92,7 @@ impl UnplacedKind {
             Self::TooFewCandidates => "too_few_candidates",
             Self::NoCapacityAtStart => "no_capacity_at_start",
             Self::FutureSlotReserved => "future_slot_reserved",
+            Self::PartitionCapNeverFits => "partition_cap_never_fits",
         }
     }
 }
@@ -185,6 +205,7 @@ impl BackfillScheduler {
             last_outcome: HashMap::new(),
             report_unplaced: true,
             released_handoffs: Vec::new(),
+            cap_blocks: HashMap::new(),
         }
     }
 
@@ -202,6 +223,12 @@ impl BackfillScheduler {
             .filter(|(_, outcome)| outcome.kind == UnplacedKind::FabricUnavailable)
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Jobs the last `schedule()` left pending while their partition cap was
+    /// exceeded on the eligible nodes. Call immediately after `schedule()`.
+    pub fn partition_cap_blocks(&self) -> &HashMap<JobId, PartitionCapBlock> {
+        &self.cap_blocks
     }
 
     /// Discard the logged-outcome memory so the next cycle re-reports every
@@ -296,6 +323,34 @@ impl BackfillScheduler {
         by_job
     }
 
+    /// Charge each running job's usage to its partition until that job's
+    /// expected end.
+    fn seed_partition_usage(&mut self, cluster: &ClusterState, now: chrono::DateTime<Utc>) {
+        let index: HashMap<&str, usize> = cluster
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.as_str(), i))
+            .collect();
+        for (partition, by_node) in cluster.partition_node_usage {
+            for (node, running) in by_node {
+                let Some(&ni) = index.get(node.as_str()) else {
+                    continue;
+                };
+                for charge in running {
+                    self.timelines[ni].charge_running(
+                        now,
+                        charge.until,
+                        PartitionCharge {
+                            partition: partition.clone(),
+                            tres: charge.tres.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     /// Initialize or reset timelines from current cluster state.
     fn init_timelines(&mut self, nodes: &[Node]) {
         self.timelines = nodes
@@ -327,13 +382,14 @@ impl BackfillScheduler {
             .max()
     }
 
-    /// Earliest time `node` is free of both resource and reservation
-    /// conflicts for `duration`, searching forward from `floor`.
+    /// Earliest time `node` is free of resource, partition-cap, and
+    /// reservation conflicts for `duration`, searching forward from `floor`.
     fn earliest_valid_start(
         &self,
         ni: usize,
         res_check: ReservationCheck<'_>,
         request: &ResourceSet,
+        cap: Option<CapCheck<'_>>,
         duration: chrono::Duration,
         floor: chrono::DateTime<Utc>,
     ) -> chrono::DateTime<Utc> {
@@ -343,7 +399,7 @@ impl BackfillScheduler {
             if candidate > max_check {
                 return max_check;
             }
-            candidate = self.timelines[ni].earliest_start(request, duration, candidate);
+            candidate = self.timelines[ni].earliest_start_capped(request, cap, duration, candidate);
             match Self::reservation_blocker(res_check, candidate, duration) {
                 Some(end) => candidate = end,
                 None => return candidate,
@@ -408,79 +464,114 @@ impl BackfillScheduler {
             .len() as u32
     }
 
-    /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
-    /// CPU counts are positional (aligned to task launch order); a GPU total is
-    /// packed greedily onto the most-available nodes. `None` if it cannot fit at `at_time`.
+    /// Resolve per-node CPU/GPU/memory for non-uniform demand: CPUs positional (task launch
+    /// order), GPUs packed greedily within free devices and `scope`'s limits; `None` if no fit.
     fn plan_per_node_alloc(
         &self,
         job: &Job,
         demand: &GpuDemand,
         assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
         nodes: &[Node],
-        at_time: chrono::DateTime<Utc>,
+        window: (chrono::DateTime<Utc>, chrono::Duration),
+        scope: Option<PartitionScope<'_>>,
     ) -> Option<HashMap<String, ResourceAllocations>> {
+        let (at_time, duration) = window;
         let base = base_node_request(job);
-        let cpu_counts = cpu_per_node_counts(job);
+        let cpu_counts = node_cpu_counts(&job.spec);
         let gpu_type = demand.gpu_type();
+        let request = |idx: usize, gpus: u32| {
+            let mut req = base.clone();
+            req.cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
+            req.memory_mb = node_memory_mb(&job.spec, u64::from(req.cpus), u64::from(gpus));
+            req.gpus = placeholder_gpus(gpus, gpu_type);
+            req
+        };
+        let fits = |ni: usize, req: &ResourceSet| {
+            let current = self.timelines[ni].accumulated_at(at_time);
+            nodes[ni]
+                .total_resources
+                .can_satisfy_with_allocated(&current, req)
+                && self.scope_admits(ni, req, scope, at_time, duration)
+        };
 
-        // Per-node GPU target keyed by node index.
-        let gpu_targets: HashMap<usize, u32> = match demand {
-            GpuDemand::None => HashMap::new(),
+        let gpu_targets: Vec<u32> = match demand {
+            GpuDemand::None => vec![0; assigned_nodes.len()],
             GpuDemand::PerNode { counts, .. } => {
                 if counts.len() != assigned_nodes.len() {
                     return None;
                 }
-                assigned_nodes
-                    .iter()
-                    .zip(counts.iter())
-                    .map(|((ni, _), &c)| (*ni, c))
-                    .collect()
+                counts.clone()
             }
             GpuDemand::Total { count, .. } => {
-                // Capacity-sorted greedy: pack GPUs onto most-available nodes.
-                let mut caps: Vec<(usize, u32)> = assigned_nodes
+                // A node's room is the most GPUs its whole share still fits
+                // with, so the greedy split never picks one a limit rejects.
+                let rooms: Vec<u32> = assigned_nodes
                     .iter()
-                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time)))
+                    .enumerate()
+                    .map(|(idx, (ni, _))| {
+                        let free = self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time);
+                        (1..=free)
+                            .rev()
+                            .find(|&gpus| fits(*ni, &request(idx, gpus)))
+                            .unwrap_or(0)
+                    })
                     .collect();
-                caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
-                let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
-                let targets = distribute_total(*count, &cap_values)?;
-                caps.iter()
-                    .zip(targets)
-                    .map(|((ni, _), give)| (*ni, give))
-                    .collect()
+                let mut order: Vec<usize> = (0..assigned_nodes.len()).collect();
+                order.sort_by_key(|&idx| std::cmp::Reverse(rooms[idx]));
+                let caps: Vec<u32> = order.iter().map(|&idx| rooms[idx]).collect();
+                let mut targets = vec![0; assigned_nodes.len()];
+                for (idx, give) in order.into_iter().zip(distribute_total(*count, &caps)?) {
+                    targets[idx] = give;
+                }
+                targets
             }
         };
 
         let mut per_node_alloc = HashMap::new();
-        for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
-            let node = &nodes[*ni];
-            let current = self.timelines[*ni].accumulated_at(at_time);
-
-            let mut req = base.clone();
-            let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
-            req.cpus = cpus;
-            // A per-CPU memory request scales with this node's CPU share.
-            if let Some(mem_per_cpu) = job.spec.memory_per_cpu_mb {
-                req.memory_mb = mem_per_cpu * cpus as u64;
-            }
-            req.gpus = placeholder_gpus(gpu_targets.get(ni).copied().unwrap_or(0), gpu_type);
-
-            // Exact per-node feasibility against current free capacity; if a node
-            // cannot hold its share the whole placement is deferred.
-            if !node
-                .total_resources
-                .can_satisfy_with_allocated(&current, &req)
-            {
+        for (idx, ((ni, _), gpus)) in assigned_nodes.iter().zip(gpu_targets).enumerate() {
+            let req = request(idx, gpus);
+            // If a node cannot hold its exact share the whole placement is deferred.
+            if !fits(*ni, &req) {
                 return None;
             }
-
+            let node = &nodes[*ni];
+            let current = self.timelines[*ni].accumulated_at(at_time);
             per_node_alloc.insert(
                 node.name.clone(),
                 build_node_allocation(&node.total_resources, &current, &req),
             );
         }
         Some(per_node_alloc)
+    }
+
+    /// Whether one node's share stays within `scope`'s per-job memory limits
+    /// and, when its cap is enforced, within the cap for the whole run.
+    fn scope_admits(
+        &self,
+        ni: usize,
+        req: &ResourceSet,
+        scope: Option<PartitionScope<'_>>,
+        start: chrono::DateTime<Utc>,
+        duration: chrono::Duration,
+    ) -> bool {
+        let Some(scope) = scope else {
+            return true;
+        };
+        if !scope
+            .partition
+            .node_memory_allowed(u64::from(req.cpus), req.memory_mb)
+        {
+            return false;
+        }
+        if !scope.enforce_cap || !is_capped(scope.partition) {
+            return true;
+        }
+        let charge = TresCharge::from_request(req, scope.typed_gpu);
+        let cap = CapCheck {
+            partition: scope.partition,
+            charge: &charge,
+        };
+        self.timelines[ni].cap_admits(cap, start, duration)
     }
 }
 
@@ -590,6 +681,7 @@ impl BackfillScheduler {
                     fabric: None,
                     busy_until: cluster.busy_until,
                     preemption_handoffs: cluster.preemption_handoffs,
+                    partition_node_usage: cluster.partition_node_usage,
                 };
                 let mut floor = now;
                 loop {
@@ -599,6 +691,7 @@ impl BackfillScheduler {
                         last_outcome: HashMap::new(),
                         report_unplaced: false,
                         released_handoffs: Vec::new(),
+                        cap_blocks: HashMap::new(),
                     };
                     for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
                         timeline.total = node.total_resources.clone();
@@ -622,6 +715,7 @@ impl BackfillScheduler {
                         handoffs.clone(),
                     );
                     let mut start = None;
+                    let mut partition = None;
                     let mut allocations = HashMap::new();
                     for timeline in &trial.timelines {
                         if let Some(interval) = timeline
@@ -630,6 +724,7 @@ impl BackfillScheduler {
                             .find(|interval| interval.job_id == Some(job.job_id))
                         {
                             start = Some(interval.start);
+                            partition = interval.charge.as_ref().map(|c| c.partition.clone());
                             allocations
                                 .insert(timeline.node_name.clone(), interval.resources.clone());
                         }
@@ -739,11 +834,15 @@ impl BackfillScheduler {
                                     .map(|node| node.name.clone())
                                     .collect()
                             });
+                        let memory_adjustment =
+                            planned_adjustment(job, partition.as_deref(), cluster.partitions);
                         best = Some((
                             Assignment {
                                 job_id: job.job_id,
                                 nodes: node_names,
                                 per_node_alloc: allocations,
+                                partition,
+                                memory_adjustment,
                             },
                             start,
                         ));
@@ -806,6 +905,7 @@ impl BackfillScheduler {
                     "node allocation state"
                 );
             }
+            self.seed_partition_usage(cluster, now);
         }
 
         // Identify het job groups: collect sets of jobs linked by het_job_id.
@@ -841,9 +941,10 @@ impl BackfillScheduler {
 
         let mut assignments = Vec::new();
         let mut unplaced: HashMap<JobId, Unplaced> = HashMap::new();
+        let mut cap_blocks: HashMap<JobId, PartitionCapBlock> = HashMap::new();
         let limit = pending.len().min(self.max_jobs);
 
-        'jobs: for (job_idx, job) in pending.iter().enumerate().take(limit) {
+        for (job_idx, job) in pending.iter().enumerate().take(limit) {
             let mut note = |kind: UnplacedKind, candidates: usize, planned_start| {
                 unplaced.insert(
                     job.job_id,
@@ -862,8 +963,12 @@ impl BackfillScheduler {
                 if checked_groups.insert(*group) {
                     let indices = &het_groups[group];
                     let all_have_nodes = indices.iter().all(|&idx| {
-                        let member = &pending[idx];
-                        let suitable = self.find_suitable_nodes(member, cluster, &handoffs, now);
+                        let Some(member) =
+                            job_in_eligible_partitions(&pending[idx], cluster.partitions)
+                        else {
+                            return false;
+                        };
+                        let suitable = self.find_suitable_nodes(&member, cluster, &handoffs, now);
                         suitable.len() >= member.spec.num_nodes as usize
                     });
                     if !all_have_nodes {
@@ -875,6 +980,11 @@ impl BackfillScheduler {
                 note(UnplacedKind::HetGroupIncomplete, 0, None);
                 continue;
             }
+            let Some(job) = job_in_eligible_partitions(job, cluster.partitions) else {
+                note(UnplacedKind::NoSuitableNodes, 0, None);
+                continue;
+            };
+            let job = &*job;
             if spur_core::constraints::validate(&job.spec).is_err()
                 || (spur_core::constraints::requires_gpu_properties(&job.spec)
                     && cluster.fabric.is_none())
@@ -891,6 +1001,11 @@ impl BackfillScheduler {
                         let picked = |node: &str| assignment.nodes.iter().any(|n| n == node);
                         handoffs.owner_planned(job.job_id, picked, start, now);
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+                        let typed_gpu = job_typed_gpu(job);
+                        let charge = ChargeTarget {
+                            partition: assignment.partition.as_deref(),
+                            typed_gpu: typed_gpu.as_deref(),
+                        };
                         for (node, allocation) in &assignment.per_node_alloc {
                             if let Some(index) = cluster.nodes.iter().position(|n| n.name == *node)
                             {
@@ -899,6 +1014,7 @@ impl BackfillScheduler {
                                     start + duration,
                                     allocation.clone(),
                                     Some(job.job_id),
+                                    charge.charge_for(allocation),
                                 );
                             }
                         }
@@ -916,291 +1032,79 @@ impl BackfillScheduler {
                 }
                 continue;
             }
-            let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
-            if suitable.is_empty() {
-                note(UnplacedKind::NoSuitableNodes, 0, None);
-                continue;
-            }
-
-            let placement = NodePlacement::new(job);
-            let listed_suitable = suitable
-                .iter()
-                .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
-                .count();
-            let required = job_resource_request(job);
-            let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
-            let needed_nodes = (job.spec.num_nodes as usize).max(1);
-
-            let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
-            let gpu_type = demand.gpu_type().map(str::to_string);
-            // Per-node GPU counts (--gpus total, uneven --gpus-per-task) or an
-            // uneven per-node CPU split (e.g. -N2 -n7 -> [4,3]) need per-node
-            // counts resolved against actual free capacity; a fully uniform
-            // request rides the exact-per-node fast path.
-            let heterogeneous = !job.spec.exclusive
-                && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
-
-            let timing_request = |ni: usize| -> &ResourceSet {
-                if job.spec.exclusive {
-                    &cluster.nodes[ni].total_resources
-                } else {
-                    &required
-                }
-            };
-
-            // Earliest start per node, folding resource and reservation
-            // conflicts into one search. Exclusive jobs time against the
-            // node's full capacity, not their own modest share.
-            let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
-                .iter()
-                .map(|&ni| {
-                    let node = &cluster.nodes[ni].name;
-                    let res_check = ReservationCheck {
-                        job,
-                        node,
-                        reservations: cluster.reservations,
-                    };
-                    let floor = handoffs.floor(job, node, now);
-                    let start = self.earliest_valid_start(
-                        ni,
-                        res_check,
-                        timing_request(ni),
-                        duration,
-                        floor,
-                    );
-                    debug!(
-                        job_id = job.job_id,
-                        node = %cluster.nodes[ni].name,
-                        earliest_start = %start,
-                        is_now = (start <= now),
-                        "earliest start for node"
-                    );
-                    (ni, start)
-                })
-                .collect();
-
-            // Free GPUs per candidate, evaluated at each node's own
-            // earliest_start (not `now`, which can be stale by then).
-            let free_gpu: HashMap<usize, u32> = if demand.is_none() {
-                HashMap::new()
-            } else {
-                node_starts
+            let typed_gpu = job_typed_gpu(job);
+            let candidates = candidate_partitions(job, cluster.partitions);
+            let capped = candidates.iter().any(|p| is_capped(p));
+            let per_partition = capped
+                || candidates
                     .iter()
-                    .map(|&(ni, start)| {
-                        (
-                            ni,
-                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), start),
-                        )
+                    .any(|p| p.has_memory_policy() || p.max_mem_per_node.is_some());
+            let resolved = if per_partition {
+                self.resolve_partition(
+                    job,
+                    cluster,
+                    &handoffs,
+                    now,
+                    &candidates,
+                    typed_gpu.as_deref(),
+                )
+            } else {
+                self.plan_placement(job, cluster, &handoffs, now, None)
+                    .map(|plan| {
+                        let partition =
+                            attributed_partition(&candidates, cluster.nodes, &plan.nodes);
+                        (plan, partition)
                     })
-                    .collect()
             };
-
-            if placement.nodelist_is_additive()
-                && node_starts
-                    .iter()
-                    .filter(|(ni, _)| placement.is_listed(&cluster.nodes[*ni].name))
-                    .count()
-                    < listed_suitable
-            {
-                note(
-                    UnplacedKind::RequestedNodesUnavailable,
-                    suitable.len(),
-                    None,
-                );
-                continue;
-            }
-
-            let allocated_cpus_at_start: HashMap<usize, u32> = node_starts
-                .iter()
-                .map(|(ni, start)| (*ni, self.timelines[*ni].accumulated_at(*start).cpus))
-                .collect();
-
-            // For --spread-job, sort by least-loaded (ascending alloc) so we
-            // prefer nodes with the most available resources. For normal jobs,
-            // sort by earliest start time, then more free GPUs (so GPU jobs pack
-            // onto the largest nodes), then higher weight, then least load.
-            let free_of = |ni: usize| free_gpu.get(&ni).copied().unwrap_or(0);
-            if job.spec.spread_job {
-                node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
-                    // Primary: earliest start time
-                    a_t.cmp(b_t)
-                        // Secondary: most free GPUs (descending)
-                        .then_with(|| free_of(*b_ni).cmp(&free_of(*a_ni)))
-                        // Tertiary: least allocated CPUs (ascending = most free)
-                        .then_with(|| {
-                            allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni])
-                        })
-                });
-            } else {
-                // Default: sort by time, then more free GPUs, then higher weight,
-                // then least load.
-                node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
-                    a_t.cmp(b_t)
-                        .then_with(|| free_of(*b_ni).cmp(&free_of(*a_ni)))
-                        .then_with(|| {
-                            cluster.nodes[*b_ni]
-                                .weight
-                                .cmp(&cluster.nodes[*a_ni].weight)
-                        })
-                        .then_with(|| {
-                            allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni])
-                        })
-                });
-            }
-
-            if node_starts.len() < needed_nodes {
-                note(UnplacedKind::TooFewCandidates, node_starts.len(), None);
-                continue;
-            }
-
-            // Topology-aware reordering for multi-node jobs
-            if needed_nodes > 1 {
-                if let Some(topo) = &cluster.topology {
-                    let wants_topo = job.spec.topology.as_deref();
-                    if matches!(wants_topo, Some("tree") | Some("block")) {
-                        let candidate_names: Vec<&str> = node_starts
-                            .iter()
-                            .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
-                            .collect();
-                        let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
-
-                        // Rebuild node_starts ordered by topology locality
-                        let mut reordered = Vec::with_capacity(needed_nodes);
-                        for name in &local_order {
-                            if let Some(pos) = node_starts
-                                .iter()
-                                .position(|(ni, _)| cluster.nodes[*ni].name == *name)
-                            {
-                                reordered.push(node_starts.remove(pos));
-                            }
-                        }
-                        // Append any remaining (shouldn't happen, but safety)
-                        reordered.extend(node_starts);
-                        node_starts = reordered;
-                    }
+            if capped {
+                let block = self.cap_block(job, cluster, &handoffs, now, &candidates, &resolved);
+                if let Some(block) = block {
+                    cap_blocks.insert(job.job_id, block);
                 }
             }
-
-            if placement.nodelist_is_additive() {
-                node_starts.sort_by_key(|(ni, _)| !placement.is_listed(&cluster.nodes[*ni].name));
-            }
-
-            let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
-                node_starts.into_iter().take(needed_nodes).collect();
-
-            // Converge on a start every assigned node is simultaneously free
-            // at — an independently-computed per-node start can be stale
-            // once shifted forward to match the slowest node in the set.
-            let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
-            let common_horizon = now + chrono::Duration::days(365);
-            let mut per_node_alloc = HashMap::new();
-            loop {
-                let next = assigned_nodes
-                    .iter()
-                    .map(|&(ni, _)| {
-                        let res_check = ReservationCheck {
-                            job,
-                            node: &cluster.nodes[ni].name,
-                            reservations: cluster.reservations,
-                        };
-                        self.earliest_valid_start(
-                            ni,
-                            res_check,
-                            timing_request(ni),
-                            duration,
-                            earliest,
-                        )
-                    })
-                    .max()
-                    .unwrap_or(earliest);
-                // Advance before checking the horizon: the horizon only
-                // bounds iteration count, it must never discard a freshly
-                // computed (more accurate) value.
-                let converged = next == earliest;
-                earliest = next;
-                if !converged && earliest < common_horizon {
+            let (plan, partition) = match resolved {
+                Ok(resolved) => resolved,
+                Err((kind, candidates)) => {
+                    note(kind, candidates, None);
                     continue;
                 }
-                if !heterogeneous {
-                    break;
-                }
-                if let Some(allocations) =
-                    self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, earliest)
-                {
-                    per_node_alloc = allocations;
-                    break;
-                }
-
-                // Per-node timing floors can fit before the full GPU total or
-                // uneven CPU share does. Recheck after the next resource release.
-                let next_release = assigned_nodes
-                    .iter()
-                    .flat_map(|(ni, _)| &self.timelines[*ni].intervals)
-                    .map(|interval| interval.end)
-                    .filter(|end| *end > earliest && *end < common_horizon)
-                    .min();
-                match next_release {
-                    Some(release) => earliest = release,
-                    None => {
-                        note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
-                        continue 'jobs;
-                    }
-                }
-            }
-
-            if !heterogeneous {
-                for (ni, _) in &assigned_nodes {
-                    let node = &cluster.nodes[*ni];
-                    let node_alloc = if job.spec.exclusive {
-                        build_exclusive_allocation(&node.total_resources, required.memory_mb)
-                    } else {
-                        let current = self.timelines[*ni].accumulated_at(earliest);
-                        build_node_allocation(&node.total_resources, &current, &required)
-                    };
-                    per_node_alloc.insert(node.name.clone(), node_alloc);
-                }
-            }
-
-            let picked = |node: &str| {
-                assigned_nodes
-                    .iter()
-                    .any(|(ni, _)| cluster.nodes[*ni].name == node)
             };
+
+            let picked = |node: &str| plan.nodes.iter().any(|ni| cluster.nodes[*ni].name == node);
             // A borrower that cannot start now reserves no future slot, so it must not
             // release or hold nodes on the strength of one.
-            if earliest <= now || !job.idle_fill {
-                handoffs.owner_planned(job.job_id, picked, earliest, now);
+            if plan.start <= now || !job.idle_fill {
+                handoffs.owner_planned(job.job_id, picked, plan.start, now);
             }
 
-            if earliest <= now {
-                let node_names: Vec<String> = assigned_nodes
+            let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+            let charge = ChargeTarget {
+                partition: partition.as_deref(),
+                typed_gpu: typed_gpu.as_deref(),
+            };
+            if plan.start <= now {
+                self.reserve_plan(job, cluster, &plan, now, duration, charge);
+                let node_names: Vec<String> = plan
+                    .nodes
                     .iter()
-                    .map(|(ni, _)| cluster.nodes[*ni].name.clone())
+                    .map(|ni| cluster.nodes[*ni].name.clone())
                     .collect();
-
-                for (ni, _) in &assigned_nodes {
-                    let node_alloc = per_node_alloc
-                        .get(&cluster.nodes[*ni].name)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.timelines[*ni].reserve_for_job(
-                        now,
-                        now + duration,
-                        node_alloc,
-                        Some(job.job_id),
-                    );
-                }
-
                 debug!(
                     job_id = job.job_id,
                     nodes = ?node_names,
+                    partition = ?partition,
                     "scheduling job"
                 );
-
                 assignments.push(Assignment {
                     job_id: job.job_id,
                     nodes: node_names,
-                    per_node_alloc,
+                    per_node_alloc: plan.per_node_alloc,
+                    memory_adjustment: planned_adjustment(
+                        job,
+                        partition.as_deref(),
+                        cluster.partitions,
+                    ),
+                    partition,
                 });
             } else if job.idle_fill {
                 // A borrowed job that cannot start now should simply not start. It has
@@ -1208,24 +1112,13 @@ impl BackfillScheduler {
                 // StartTime and SchedNodeList for a job that simultaneously reports
                 // being over quota — contradictory, and it buys nothing, since the only
                 // jobs behind a borrow candidate are other borrow candidates (D15).
-                note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
+                note(UnplacedKind::NoCapacityAtStart, plan.nodes.len(), None);
             } else {
-                for (ni, _) in &assigned_nodes {
-                    let node_alloc = per_node_alloc
-                        .get(&cluster.nodes[*ni].name)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.timelines[*ni].reserve_for_job(
-                        earliest,
-                        earliest + duration,
-                        node_alloc,
-                        Some(job.job_id),
-                    );
-                }
+                self.reserve_plan(job, cluster, &plan, plan.start, duration, charge);
                 note(
                     UnplacedKind::FutureSlotReserved,
-                    assigned_nodes.len(),
-                    Some(earliest),
+                    plan.nodes.len(),
+                    Some(plan.start),
                 );
             }
         }
@@ -1237,9 +1130,544 @@ impl BackfillScheduler {
                 .iter()
                 .map(|(node, owner)| (node.to_string(), *owner))
                 .collect();
+            self.cap_blocks = cap_blocks;
         }
         assignments
     }
+}
+
+/// A placement computed for one job in one scope, not yet committed.
+struct PlacementPlan {
+    nodes: Vec<usize>,
+    start: chrono::DateTime<Utc>,
+    per_node_alloc: HashMap<String, ResourceAllocations>,
+}
+
+/// Partition a placement is restricted to and checked against.
+#[derive(Clone, Copy)]
+struct PartitionScope<'a> {
+    partition: &'a Partition,
+    typed_gpu: Option<&'a str>,
+    /// Off only to ask whether the cap is what delays a placement.
+    enforce_cap: bool,
+}
+
+/// Partition a committed placement is charged to.
+#[derive(Clone, Copy)]
+struct ChargeTarget<'a> {
+    partition: Option<&'a str>,
+    typed_gpu: Option<&'a str>,
+}
+
+impl ChargeTarget<'_> {
+    fn charge_for(&self, alloc: &ResourceAllocations) -> Option<PartitionCharge> {
+        self.partition.map(|partition| PartitionCharge {
+            partition: partition.to_string(),
+            tres: TresCharge::from_allocation(alloc, self.typed_gpu),
+        })
+    }
+}
+
+type PlanResult = Result<PlacementPlan, (UnplacedKind, usize)>;
+
+impl BackfillScheduler {
+    /// Pick the candidate partition when any is capped or reshapes the request, by
+    /// [`resolution_rank`]; a cap that can never fit drops out, a merely full one competes.
+    fn resolve_partition(
+        &self,
+        job: &Job,
+        cluster: &ClusterState,
+        handoffs: &HandoffGate,
+        now: chrono::DateTime<Utc>,
+        candidates: &[&Partition],
+        typed_gpu: Option<&str>,
+    ) -> Result<(PlacementPlan, Option<String>), (UnplacedKind, usize)> {
+        let mut best: Option<(PlacementPlan, &Partition)> = None;
+        let mut errors = Vec::new();
+        for &partition in candidates {
+            let scope = PartitionScope {
+                partition,
+                typed_gpu,
+                enforce_cap: true,
+            };
+            match self.plan_placement(job, cluster, handoffs, now, Some(scope)) {
+                Ok(plan) => {
+                    let better = best.as_ref().is_none_or(|(held, held_partition)| {
+                        resolution_rank(partition, plan.start, now)
+                            < resolution_rank(held_partition, held.start, now)
+                    });
+                    if better {
+                        best = Some((plan, partition));
+                    }
+                }
+                Err(err) => errors.push(err),
+            }
+        }
+        if let Some((plan, partition)) = best {
+            return Ok((plan, Some(partition.name.clone())));
+        }
+        let reported = errors
+            .iter()
+            .find(|(kind, _)| *kind != UnplacedKind::PartitionCapNeverFits)
+            .or(errors.first())
+            .copied();
+        Err(reported.unwrap_or((UnplacedKind::NoSuitableNodes, 0)))
+    }
+
+    /// The cap block to report when a partition cap, not capacity, keeps the job from
+    /// starting now; `None` otherwise, so other pending reasons are not masked.
+    fn cap_block(
+        &self,
+        job: &Job,
+        cluster: &ClusterState,
+        handoffs: &HandoffGate,
+        now: chrono::DateTime<Utc>,
+        candidates: &[&Partition],
+        resolved: &Result<(PlacementPlan, Option<String>), (UnplacedKind, usize)>,
+    ) -> Option<PartitionCapBlock> {
+        let typed_gpu = job_typed_gpu(job);
+        let typed_gpu = typed_gpu.as_deref();
+        let chosen = match resolved {
+            Err((UnplacedKind::PartitionCapNeverFits, _)) => {
+                return candidates
+                    .iter()
+                    .filter(|p| is_capped(p))
+                    .find_map(|p| self.cap_overshoots(job, cluster, handoffs, now, p, typed_gpu));
+            }
+            Ok((plan, Some(name))) if plan.start > now => {
+                candidates.iter().copied().find(|p| p.name == *name)?
+            }
+            _ => return None,
+        };
+        if !is_capped(chosen) {
+            return None;
+        }
+        let uncapped = PartitionScope {
+            partition: chosen,
+            typed_gpu,
+            enforce_cap: false,
+        };
+        let starts_without_cap = self
+            .plan_placement(job, cluster, handoffs, now, Some(uncapped))
+            .is_ok_and(|plan| plan.start <= now);
+        if !starts_without_cap {
+            return None;
+        }
+        self.cap_overshoots(job, cluster, handoffs, now, chosen, typed_gpu)
+    }
+
+    /// Over-limit key at `now` on each of `partition`'s eligible nodes.
+    fn cap_overshoots(
+        &self,
+        job: &Job,
+        cluster: &ClusterState,
+        handoffs: &HandoffGate,
+        now: chrono::DateTime<Utc>,
+        partition: &Partition,
+        typed_gpu: Option<&str>,
+    ) -> Option<PartitionCapBlock> {
+        let job = &*job_in_partition(job, partition);
+        let required = job_resource_request(job);
+        let overshoots: Vec<PartitionTresOvershoot> = self
+            .find_suitable_nodes(job, cluster, handoffs, now)
+            .into_iter()
+            .filter(|ni| in_partition(&cluster.nodes[*ni], partition))
+            .filter_map(|ni| {
+                let node = &cluster.nodes[ni];
+                let charge = least_fullest_node_charge(job, &required, node, typed_gpu);
+                let used = self.timelines[ni].charged_at(&partition.name, now);
+                partition_cap_ok(partition, &node.name, &used, &charge).err()
+            })
+            .collect();
+        (!overshoots.is_empty()).then(|| PartitionCapBlock {
+            partition: partition.name.clone(),
+            overshoots,
+        })
+    }
+
+    fn reserve_plan(
+        &mut self,
+        job: &Job,
+        cluster: &ClusterState,
+        plan: &PlacementPlan,
+        start: chrono::DateTime<Utc>,
+        duration: chrono::Duration,
+        charge: ChargeTarget<'_>,
+    ) {
+        for &ni in &plan.nodes {
+            let node_alloc = plan
+                .per_node_alloc
+                .get(&cluster.nodes[ni].name)
+                .cloned()
+                .unwrap_or_default();
+            let node_charge = charge.charge_for(&node_alloc);
+            self.timelines[ni].reserve_for_job(
+                start,
+                start + duration,
+                node_alloc,
+                Some(job.job_id),
+                node_charge,
+            );
+        }
+    }
+
+    /// Plan the job's earliest placement, within `scope`'s partition and cap when given,
+    /// otherwise over every node its partition list allows.
+    fn plan_placement(
+        &self,
+        job: &Job,
+        cluster: &ClusterState,
+        handoffs: &HandoffGate,
+        now: chrono::DateTime<Utc>,
+        scope: Option<PartitionScope<'_>>,
+    ) -> PlanResult {
+        let adjusted = scope.map(|s| job_in_partition(job, s.partition));
+        let job = adjusted.as_deref().unwrap_or(job);
+        let required = job_resource_request(job);
+        let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+        let needed_nodes = (job.spec.num_nodes as usize).max(1);
+
+        let mut suitable = self.find_suitable_nodes(job, cluster, handoffs, now);
+        let capped_scope = scope.filter(|s| s.enforce_cap && is_capped(s.partition));
+        if let Some(scope) = scope {
+            suitable.retain(|ni| in_partition(&cluster.nodes[*ni], scope.partition));
+        }
+        if suitable.is_empty() {
+            return Err((UnplacedKind::NoSuitableNodes, 0));
+        }
+
+        // Each node's charge against the scope's cap. Nodes the cap could
+        // never admit even when idle are not candidates in this partition.
+        let mut cap_charges: HashMap<usize, TresCharge> = HashMap::new();
+        if let Some(scope) = capped_scope {
+            let considered = suitable.len();
+            suitable.retain(|&ni| {
+                let node = &cluster.nodes[ni];
+                let charge = placement_charge(job, &required, node, scope.typed_gpu);
+                let least = least_fullest_node_charge(job, &required, node, scope.typed_gpu);
+                let ever_fits =
+                    partition_cap_ok(scope.partition, &node.name, &TresCharge::default(), &least)
+                        .is_ok();
+                if ever_fits {
+                    cap_charges.insert(ni, charge);
+                }
+                ever_fits
+            });
+            if suitable.len() < needed_nodes {
+                return Err((UnplacedKind::PartitionCapNeverFits, considered));
+            }
+        }
+        let cap_for = |ni: usize| {
+            let scope = capped_scope?;
+            Some(CapCheck {
+                partition: scope.partition,
+                charge: cap_charges.get(&ni)?,
+            })
+        };
+
+        let placement = NodePlacement::new(job);
+        let listed_suitable = suitable
+            .iter()
+            .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
+            .count();
+
+        let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
+        let gpu_type = demand.gpu_type().map(str::to_string);
+        // Per-node GPU counts (--gpus total, uneven --gpus-per-task) or an
+        // uneven per-node CPU split (e.g. -N2 -n7 -> [4,3]) need per-node
+        // counts resolved against actual free capacity; a fully uniform
+        // request rides the exact-per-node fast path.
+        let heterogeneous = !job.spec.exclusive
+            && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
+
+        let timing_request = |ni: usize| -> &ResourceSet {
+            if job.spec.exclusive {
+                &cluster.nodes[ni].total_resources
+            } else {
+                &required
+            }
+        };
+
+        // Earliest start per node, folding resource and reservation
+        // conflicts into one search. Exclusive jobs time against the
+        // node's full capacity, not their own modest share.
+        let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
+            .iter()
+            .map(|&ni| {
+                let node = &cluster.nodes[ni].name;
+                let res_check = ReservationCheck {
+                    job,
+                    node,
+                    reservations: cluster.reservations,
+                };
+                let floor = handoffs.floor(job, node, now);
+                let start = self.earliest_valid_start(
+                    ni,
+                    res_check,
+                    timing_request(ni),
+                    cap_for(ni),
+                    duration,
+                    floor,
+                );
+                debug!(
+                    job_id = job.job_id,
+                    node = %cluster.nodes[ni].name,
+                    earliest_start = %start,
+                    is_now = (start <= now),
+                    "earliest start for node"
+                );
+                (ni, start)
+            })
+            .collect();
+
+        // Free GPUs per candidate, evaluated at each node's own
+        // earliest_start (not `now`, which can be stale by then).
+        let free_gpu: HashMap<usize, u32> = if demand.is_none() {
+            HashMap::new()
+        } else {
+            node_starts
+                .iter()
+                .map(|&(ni, start)| {
+                    (
+                        ni,
+                        self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), start),
+                    )
+                })
+                .collect()
+        };
+
+        if placement.nodelist_is_additive()
+            && node_starts
+                .iter()
+                .filter(|(ni, _)| placement.is_listed(&cluster.nodes[*ni].name))
+                .count()
+                < listed_suitable
+        {
+            return Err((UnplacedKind::RequestedNodesUnavailable, suitable.len()));
+        }
+
+        let allocated_cpus_at_start: HashMap<usize, u32> = node_starts
+            .iter()
+            .map(|(ni, start)| (*ni, self.timelines[*ni].accumulated_at(*start).cpus))
+            .collect();
+
+        // For --spread-job, sort by least-loaded (ascending alloc) so we
+        // prefer nodes with the most available resources. For normal jobs,
+        // sort by earliest start time, then more free GPUs (so GPU jobs pack
+        // onto the largest nodes), then higher weight, then least load.
+        let free_of = |ni: usize| free_gpu.get(&ni).copied().unwrap_or(0);
+        if job.spec.spread_job {
+            node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
+                // Primary: earliest start time
+                a_t.cmp(b_t)
+                    // Secondary: most free GPUs (descending)
+                    .then_with(|| free_of(*b_ni).cmp(&free_of(*a_ni)))
+                    // Tertiary: least allocated CPUs (ascending = most free)
+                    .then_with(|| allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni]))
+            });
+        } else {
+            // Default: sort by time, then more free GPUs, then higher weight,
+            // then least load.
+            node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
+                a_t.cmp(b_t)
+                    .then_with(|| free_of(*b_ni).cmp(&free_of(*a_ni)))
+                    .then_with(|| {
+                        cluster.nodes[*b_ni]
+                            .weight
+                            .cmp(&cluster.nodes[*a_ni].weight)
+                    })
+                    .then_with(|| allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni]))
+            });
+        }
+
+        if node_starts.len() < needed_nodes {
+            return Err((UnplacedKind::TooFewCandidates, node_starts.len()));
+        }
+
+        // Topology-aware reordering for multi-node jobs
+        if needed_nodes > 1 {
+            if let Some(topo) = &cluster.topology {
+                let wants_topo = job.spec.topology.as_deref();
+                if matches!(wants_topo, Some("tree") | Some("block")) {
+                    let candidate_names: Vec<&str> = node_starts
+                        .iter()
+                        .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
+                        .collect();
+                    let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
+
+                    // Rebuild node_starts ordered by topology locality
+                    let mut reordered = Vec::with_capacity(needed_nodes);
+                    for name in &local_order {
+                        if let Some(pos) = node_starts
+                            .iter()
+                            .position(|(ni, _)| cluster.nodes[*ni].name == *name)
+                        {
+                            reordered.push(node_starts.remove(pos));
+                        }
+                    }
+                    // Append any remaining (shouldn't happen, but safety)
+                    reordered.extend(node_starts);
+                    node_starts = reordered;
+                }
+            }
+        }
+
+        if placement.nodelist_is_additive() {
+            node_starts.sort_by_key(|(ni, _)| !placement.is_listed(&cluster.nodes[*ni].name));
+        }
+
+        let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
+            node_starts.into_iter().take(needed_nodes).collect();
+
+        // Converge on a start every assigned node is simultaneously free
+        // at — an independently-computed per-node start can be stale
+        // once shifted forward to match the slowest node in the set.
+        let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
+        let common_horizon = now + chrono::Duration::days(365);
+        let mut per_node_alloc = HashMap::new();
+        loop {
+            let next = assigned_nodes
+                .iter()
+                .map(|&(ni, _)| {
+                    let res_check = ReservationCheck {
+                        job,
+                        node: &cluster.nodes[ni].name,
+                        reservations: cluster.reservations,
+                    };
+                    self.earliest_valid_start(
+                        ni,
+                        res_check,
+                        timing_request(ni),
+                        cap_for(ni),
+                        duration,
+                        earliest,
+                    )
+                })
+                .max()
+                .unwrap_or(earliest);
+            // Advance before checking the horizon: the horizon only
+            // bounds iteration count, it must never discard a freshly
+            // computed (more accurate) value.
+            let converged = next == earliest;
+            earliest = next;
+            if !converged && earliest < common_horizon {
+                continue;
+            }
+            if !heterogeneous {
+                break;
+            }
+            if let Some(allocations) = self.plan_per_node_alloc(
+                job,
+                &demand,
+                &assigned_nodes,
+                cluster.nodes,
+                (earliest, duration),
+                scope,
+            ) {
+                per_node_alloc = allocations;
+                break;
+            }
+
+            // Per-node timing floors can fit before the full GPU total or
+            // uneven CPU share does. Recheck after the next resource release.
+            let next_release = assigned_nodes
+                .iter()
+                .flat_map(|(ni, _)| &self.timelines[*ni].intervals)
+                .map(|interval| interval.end)
+                .filter(|end| *end > earliest && *end < common_horizon)
+                .min();
+            match next_release {
+                Some(release) => earliest = release,
+                None => return Err((UnplacedKind::NoCapacityAtStart, assigned_nodes.len())),
+            }
+        }
+
+        if !heterogeneous {
+            for (ni, _) in &assigned_nodes {
+                let node = &cluster.nodes[*ni];
+                let node_alloc = if job.spec.exclusive {
+                    build_exclusive_allocation(&node.total_resources, required.memory_mb)
+                } else {
+                    let current = self.timelines[*ni].accumulated_at(earliest);
+                    build_node_allocation(&node.total_resources, &current, &required)
+                };
+                per_node_alloc.insert(node.name.clone(), node_alloc);
+            }
+        }
+
+        Ok(PlacementPlan {
+            nodes: assigned_nodes.into_iter().map(|(ni, _)| ni).collect(),
+            start: earliest,
+            per_node_alloc,
+        })
+    }
+}
+
+fn in_partition(node: &Node, partition: &Partition) -> bool {
+    node.partitions.contains(&partition.name)
+}
+
+/// What a job's placement on `node` charges against a partition cap. An
+/// exclusive job holds the whole node, so it is charged the whole node.
+pub fn placement_charge(
+    job: &Job,
+    required: &ResourceSet,
+    node: &Node,
+    typed_gpu: Option<&str>,
+) -> TresCharge {
+    if !job.spec.exclusive {
+        return TresCharge::from_request(required, typed_gpu);
+    }
+    let total = &node.total_resources;
+    TresCharge::new(
+        u64::from(total.cpus),
+        required.memory_mb,
+        total.gpus.len() as u64,
+        typed_gpu,
+    )
+}
+
+/// The memory policy of the partition named `partition` applied to the job,
+/// from the same partition snapshot its placement was planned against.
+fn planned_adjustment(
+    job: &Job,
+    partition: Option<&str>,
+    partitions: &[Partition],
+) -> Option<spur_core::partition_limits::MemoryAdjustment> {
+    let partition = partition.and_then(|name| partitions.iter().find(|p| p.name == name));
+    planned_memory_adjustment(job, partition)
+}
+
+/// Least cap charge `job` could put on its fullest node ([`placement_charge`] with GPUs
+/// evenly spread): a cap that cannot hold this can never hold the job.
+pub fn least_fullest_node_charge(
+    job: &Job,
+    required: &ResourceSet,
+    node: &Node,
+    typed_gpu: Option<&str>,
+) -> TresCharge {
+    if job.spec.exclusive {
+        return placement_charge(job, required, node, typed_gpu);
+    }
+    // `required` floors an uneven task split; the busiest node gets the largest share.
+    let busiest = node_cpu_counts(&job.spec).into_iter().max().unwrap_or(1);
+    let cpus = u64::from(required.cpus.max(busiest));
+    let gpus = even_node_gpus(&job.spec);
+    TresCharge::new(cpus, node_memory_mb(&job.spec, cpus, gpus), gpus, typed_gpu)
+}
+
+/// Partition an uncapped placement is attributed to: the highest-tier
+/// candidate that contains every assigned node.
+fn attributed_partition(
+    candidates: &[&Partition],
+    nodes: &[Node],
+    assigned: &[usize],
+) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|p| assigned.iter().all(|ni| in_partition(&nodes[*ni], p)))
+        .min_by_key(|p| (std::cmp::Reverse(p.priority_tier), p.name.as_str()))
+        .map(|p| p.name.clone())
 }
 
 impl Scheduler for BackfillScheduler {
@@ -1264,11 +1692,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
     }
     .max(1);
 
-    let memory = job
-        .spec
-        .memory_per_node_mb
-        .or_else(|| job.spec.memory_per_cpu_mb.map(|m| m * cpus as u64))
-        .unwrap_or(0);
+    let memory = node_memory_mb(&job.spec, u64::from(cpus), 0);
 
     let mut generic = HashMap::new();
     for gres in &job.spec.gres {
@@ -1334,24 +1758,13 @@ fn homogeneous_per_node(demand: &GpuDemand) -> Option<u32> {
     }
 }
 
-/// Per-node CPU counts honoring the task distribution (e.g. `-N2 -n7` ->
-/// `[4, 3]`), positionally aligned to the assigned nodes. Floors each node at
-/// one CPU.
-pub fn cpu_per_node_counts(job: &Job) -> Vec<u32> {
-    let cpt = job.spec.cpus_per_task.max(1);
-    spur_core::gpu_request::tasks_per_node_counts(&job.spec, job.spec.num_nodes.max(1))
-        .into_iter()
-        .map(|tasks| (tasks * cpt).max(1))
-        .collect()
-}
-
 /// Whether a job's per-node CPU demand is non-uniform, so it must take the
 /// heterogeneous allocation path rather than the uniform fast path.
 fn cpu_is_heterogeneous(job: &Job) -> bool {
     if job.spec.exclusive {
         return false;
     }
-    let counts = cpu_per_node_counts(job);
+    let counts = node_cpu_counts(&job.spec);
     counts.iter().min() != counts.iter().max()
 }
 
@@ -1366,6 +1779,7 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
     // homogeneous demand carries its exact per-node count.
     let per_node = homogeneous_per_node(&demand).unwrap_or(1);
     rs.gpus = placeholder_gpus(per_node, demand.gpu_type());
+    rs.memory_mb = node_memory_mb(&job.spec, u64::from(rs.cpus), u64::from(per_node));
     rs
 }
 
@@ -1435,6 +1849,7 @@ mod tests {
             topology: None,
             busy_until: &HashMap::new(),
             preemption_handoffs: &handoffs,
+            partition_node_usage: &Default::default(),
         };
         let mut scheduler = BackfillScheduler::new(100);
         assert!(!state.handoff_allows(&competitor, "node001"));
@@ -1457,6 +1872,7 @@ mod tests {
             topology: None,
             busy_until: &HashMap::new(),
             preemption_handoffs: &owned(&[("node001", 1)]),
+            partition_node_usage: &Default::default(),
         };
         let mut scheduler = BackfillScheduler::new(100);
         assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
@@ -1476,6 +1892,8 @@ mod tests {
         busy_until: &'a HashMap<String, chrono::DateTime<Utc>>,
         handoffs: &'a HashMap<String, Vec<JobId>>,
     ) -> ClusterState<'a> {
+        static NO_USAGE: std::sync::LazyLock<crate::partition_cap::PartitionNodeUsage> =
+            std::sync::LazyLock::new(Default::default);
         ClusterState {
             fabric: None,
             nodes,
@@ -1484,6 +1902,7 @@ mod tests {
             topology: None,
             busy_until,
             preemption_handoffs: handoffs,
+            partition_node_usage: &NO_USAGE,
         }
     }
 
@@ -1730,6 +2149,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1755,6 +2175,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1780,6 +2201,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1919,6 +2341,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1954,6 +2377,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1980,6 +2404,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2019,6 +2444,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2069,6 +2495,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2129,6 +2556,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2173,6 +2601,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2251,6 +2680,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2323,6 +2753,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2349,6 +2780,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2379,6 +2811,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2404,6 +2837,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2443,6 +2877,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2488,6 +2923,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2516,6 +2952,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2548,6 +2985,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2584,6 +3022,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2630,6 +3069,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2668,6 +3108,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2717,6 +3158,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2767,6 +3209,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2826,6 +3269,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],
@@ -2864,6 +3308,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2905,6 +3350,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2938,6 +3384,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2972,6 +3419,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3033,6 +3481,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3058,6 +3507,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3085,6 +3535,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3116,6 +3567,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3146,6 +3598,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3190,6 +3643,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3219,6 +3673,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3244,6 +3699,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3274,6 +3730,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3307,6 +3764,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3340,6 +3798,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -3379,6 +3838,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -3404,6 +3864,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3429,6 +3890,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3464,6 +3926,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3494,6 +3957,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3523,6 +3987,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3548,6 +4013,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3572,6 +4038,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3599,6 +4066,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3644,6 +4112,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3681,6 +4150,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3730,6 +4200,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3766,6 +4237,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3806,6 +4278,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3833,6 +4306,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3871,6 +4345,7 @@ mod tests {
                 fabric: None,
                 preemption_handoffs: &std::collections::HashMap::new(),
                 busy_until: &std::collections::HashMap::new(),
+                partition_node_usage: &Default::default(),
                 nodes: &nodes,
                 partitions: &partitions,
                 reservations: &[],
@@ -3914,6 +4389,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3964,6 +4440,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4001,6 +4478,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4038,6 +4516,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4077,6 +4556,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -4118,6 +4598,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -4167,6 +4648,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],
@@ -4225,6 +4707,7 @@ mod tests {
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],
@@ -4298,7 +4781,7 @@ mod tests {
     fn base_node_request_uneven_uses_lightest_share() {
         // 3 tasks over 2 nodes -> [2,1] tasks; the base is the lightest node's
         // share (1 task * 2 cpus = 2). The exact per-node counts come from
-        // cpu_per_node_counts; feasibility must not exclude the lighter node.
+        // node_cpu_counts; feasibility must not exclude the lighter node.
         assert_eq!(cpu_request(2, 3, 2), 2);
         // 7 tasks over 2 nodes -> [4,3]; lightest share is 3.
         assert_eq!(cpu_request(2, 7, 1), 3);
@@ -4311,7 +4794,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_per_node_counts_splits_uneven_tasks() {
+    fn node_cpu_counts_splits_uneven_tasks() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4322,12 +4805,12 @@ mod tests {
             },
         );
         // Block distribution: 4 tasks on node 0, 3 on node 1.
-        assert_eq!(cpu_per_node_counts(&job), vec![4, 3]);
+        assert_eq!(node_cpu_counts(&job.spec), vec![4, 3]);
         assert!(cpu_is_heterogeneous(&job));
     }
 
     #[test]
-    fn cpu_per_node_counts_scales_cpus_per_task_and_sums_to_total() {
+    fn node_cpu_counts_scales_cpus_per_task_and_sums_to_total() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4338,13 +4821,13 @@ mod tests {
             },
         );
         // [4,3] tasks * 2 cpus/task = [8,6], summing to num_tasks*cpus = 14.
-        let counts = cpu_per_node_counts(&job);
+        let counts = node_cpu_counts(&job.spec);
         assert_eq!(counts, vec![8, 6]);
         assert_eq!(counts.iter().sum::<u32>(), 7 * 2);
     }
 
     #[test]
-    fn cpu_per_node_counts_uniform_is_homogeneous() {
+    fn node_cpu_counts_uniform_is_homogeneous() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4354,7 +4837,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(cpu_per_node_counts(&job), vec![6, 6]);
+        assert_eq!(node_cpu_counts(&job.spec), vec![6, 6]);
         assert!(!cpu_is_heterogeneous(&job));
     }
 
@@ -4400,3 +4883,6 @@ mod tests {
 
 #[cfg(test)]
 mod fabric_tests;
+
+#[cfg(test)]
+mod partition_cap_tests;

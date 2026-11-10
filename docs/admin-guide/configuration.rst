@@ -560,10 +560,14 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - string
      - ``NO``
      - Live
-     - Whether partition wall-time limits are enforced at submit. ``NO`` admits
-       over-limit jobs and lets them pend with a ``PartitionTimeLimit`` reason.
-       ``ALL`` rejects unless the job fits every requested partition; ``ANY``
-       rejects only when it fits none. Mirrors Slurm's ``EnforcePartLimits``.
+     - Whether partition limits are enforced at submit: wall time,
+       ``max_mem_per_node``, and requests a partition's per-node resource cap
+       could never hold (see :doc:`partition-resource-limits`). ``NO`` admits
+       over-limit jobs and lets them pend (``PartitionTimeLimit``,
+       ``PartitionConfig``, or ``PartitionTresLimit``). ``ALL`` rejects unless
+       the job fits every requested partition; ``ANY`` rejects only when it fits
+       none. A job over a cap only because of current load always pends,
+       whatever the setting. Mirrors Slurm's ``EnforcePartLimits``.
    * - ``complete_wait_secs``
      - integer
      - ``300``
@@ -1745,6 +1749,40 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        ``scontrol update PartitionName=<name> GraceTime=<secs>`` and revert it with
        ``scontrol update PartitionName=<name> ClearGraceTime=yes``. See
        :ref:`preemption grace time <qos-preempt-grace>`.
+   * - ``max_tres_per_node``
+     - table<string, integer>
+     - ``{}`` (unlimited)
+     - Cumulative cap on what all of this partition's jobs together may hold on
+       one node. Keys: ``cpu``, ``mem`` (MiB), ``"gres/gpu"``,
+       ``"gres/gpu:<type>"``; any other key is a load error. A missing key is
+       unlimited; ``0`` forbids that resource. Binds even on an idle node. See
+       :doc:`partition-resource-limits`.
+   * - ``max_cpus_per_node``
+     - integer
+     - unset (unlimited)
+     - Shorthand for ``max_tres_per_node.cpu`` (Slurm ``MaxCPUsPerNode``).
+       Setting both is a load error, even when the values agree.
+   * - ``max_mem_per_node``
+     - integer (MiB)
+     - unset
+     - Largest memory one job may use on one node (per job, not cumulative).
+       Mutually exclusive with ``max_mem_per_cpu``.
+   * - ``max_mem_per_cpu``
+     - integer (MiB)
+     - unset
+     - Largest memory per allocated CPU. A job asking for more is given more
+       CPUs rather than rejected. Mutually exclusive with ``max_mem_per_node``.
+   * - ``def_mem_per_node`` / ``def_mem_per_cpu`` / ``def_mem_per_gpu``
+     - integer (MiB)
+     - unset
+     - Memory a job gets in this partition when it requests none. At most one
+       of the three may be set.
+
+``max_cpus_per_node`` and the five memory knobs above must be greater than
+``0``; a ``0`` is a load error. Omit the key for no limit. ``scontrol`` and the
+API read ``0`` as "unset", so a ``0`` here would change meaning once shown and
+set again through them. To forbid a resource, set its key to ``0`` in
+``max_tres_per_node``.
 
 ``[[nodes]]``
 -------------

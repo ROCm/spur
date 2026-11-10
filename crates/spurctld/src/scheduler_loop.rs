@@ -18,6 +18,10 @@ use spur_proto::proto::{
     LaunchJobRequest, RegisterJobAllocationRequest, SignalTarget, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
+use spur_sched::partition_cap::{
+    candidate_partitions, cap_admits_on, is_capped, job_typed_gpu, PartitionNodeUsage,
+    RunningCharge, TresCharge,
+};
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
 use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
@@ -228,6 +232,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             .map(|config| config.plugin.as_str()),
         "scheduler loop started (event-driven wake enabled)"
     );
+    cluster.warn_partition_cap_overcommits();
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
@@ -362,6 +367,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let partition_node_usage = running_partition_usage(&cluster);
         let config = cluster.config();
         let view = cluster.fabric_view(chrono::Utc::now());
         let topology = config
@@ -377,6 +383,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             topology: topology.as_ref(),
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
+            partition_node_usage: &partition_node_usage,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -436,6 +443,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+                cluster
+                    .annotate_partition_cap_pending(&unscheduled, scheduler.partition_cap_blocks());
                 cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
             }
 
@@ -585,7 +594,13 @@ async fn process_assignment(
     let resources = compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
 
     let job_id = assignment.job_id;
-    let spec = job.spec.clone();
+    let attribution = crate::cluster::RunAttribution::for_assignment(&assignment, borrowed);
+    // Dispatch and the prolog must see the request the placement was sized
+    // for, not one recomputed from a memory policy changed since.
+    let mut spec = job.spec.clone();
+    if let Some(adjustment) = &attribution.memory_adjustment {
+        adjustment.apply_to(&mut spec);
+    }
     let all_nodes = assignment.nodes.clone();
     let per_node_allocs = assignment.per_node_alloc.clone();
     let dispatch_nodes = all_nodes.clone();
@@ -624,8 +639,8 @@ async fn process_assignment(
             nodelist: assignment.nodes.join(","),
             script_context: "prolog_slurmctld".into(),
             gpu_devices: Vec::new(),
-            cpus: job.spec.cpus_per_task,
-            memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
+            cpus: spec.cpus_per_task,
+            memory_mb: crate::cluster::hook_memory_mb(&spec, &per_node_allocs),
         };
         if let Err(e) = spur_core::hooks::run_hook(&prolog_ctld, &ctx).await {
             error!(
@@ -677,13 +692,13 @@ async fn process_assignment(
     // so a new leader cannot place a second job onto these cores. The run
     // epoch below is the one `reserve_placement` actually persisted, not a
     // value recomputed separately — the two must never be able to diverge.
-    let run_attempt = match cluster.reserve_placement(
+    let run_attempt = match cluster.reserve_attributed_placement(
         job_id,
         assignment.nodes.clone(),
         resources.clone(),
         assignment.per_node_alloc.clone(),
         srun_step_dispatch,
-        borrowed,
+        attribution,
     ) {
         Ok(run_attempt) => run_attempt,
         Err(e) => {
@@ -996,6 +1011,7 @@ pub(crate) fn trial_placement(
     let partitions = cluster.get_partitions();
     let reservations = cluster.get_reservations();
     let busy_until = running_jobs_busy_until(cluster);
+    let partition_node_usage = running_partition_usage(cluster);
     let config = cluster.config();
     let view = cluster.fabric_view(Utc::now());
     let topology = config
@@ -1012,6 +1028,7 @@ pub(crate) fn trial_placement(
         topology: topology.as_ref(),
         busy_until: &busy_until,
         preemption_handoffs: &handoffs,
+        partition_node_usage: &partition_node_usage,
     };
     let mut list = classification.jobs.clone();
     list.extend(
@@ -1103,6 +1120,24 @@ pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<Strin
 /// Slack past a grace deadline's kill wait before backfill counts the nodes free.
 const BUSY_UNTIL_MARGIN_SECS: i64 = 5;
 
+/// The waits that bound how long a stopping job keeps its nodes.
+#[derive(Clone, Copy, Debug)]
+struct ReleaseWaits {
+    complete_wait_secs: u32,
+    kill_wait_secs: u32,
+    timeout_kill_wait_secs: u32,
+}
+
+impl ReleaseWaits {
+    fn of(scheduler: &spur_core::config::SchedulerConfig) -> Self {
+        Self {
+            complete_wait_secs: scheduler.complete_wait_secs,
+            kill_wait_secs: scheduler.effective_kill_wait_secs(),
+            timeout_kill_wait_secs: scheduler.effective_timeout_kill_wait_secs(),
+        }
+    }
+}
+
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
 /// without a full `ClusterManager` harness.
 fn busy_until_from_running_jobs(
@@ -1111,61 +1146,15 @@ fn busy_until_from_running_jobs(
     kill_wait_secs: u32,
     timeout_kill_wait_secs: u32,
 ) -> HashMap<String, DateTime<Utc>> {
-    use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
-
+    let waits = ReleaseWaits {
+        complete_wait_secs,
+        kill_wait_secs,
+        timeout_kill_wait_secs,
+    };
     let now = Utc::now();
-    let far_future = now + UNLIMITED_FALLBACK;
     let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
     for job in running {
-        // A job tearing down is bounded by the completing timeout, not by its
-        // own time limit — an unlimited one would otherwise read as a year out.
-        if job.state == spur_core::job::JobState::Completing {
-            let since = job.end_time.unwrap_or(now);
-            let end = since
-                .checked_add_signed(chrono::Duration::seconds(complete_wait_secs as i64))
-                .unwrap_or(far_future)
-                .max(now);
-            for node in job.held_nodes() {
-                busy_until
-                    .entry(node)
-                    .and_modify(|e| *e = (*e).max(end))
-                    .or_insert(end);
-            }
-            continue;
-        }
-        let start = job.start_time.unwrap_or(now);
-        let mut suspended = job.suspended_secs;
-        if let Some(since) = job.suspended_at {
-            suspended = suspended.saturating_add((now - since).num_seconds().max(0));
-        }
-        // Saturating i64 math, clamped once at the end: avoids the panicking
-        // Duration + Duration path (a huge suspended_secs alone can overflow it).
-        let time_limit_secs = job
-            .spec
-            .time_limit
-            .map(|d| d.num_seconds())
-            .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
-        let slack_secs = time_limit_secs
-            .saturating_add(suspended)
-            .saturating_add(timeout_kill_wait_secs as i64)
-            .min(UNLIMITED_FALLBACK.num_seconds());
-        // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
-        // compute an `end` already in the past, producing a backwards interval.
-        let mut end = start
-            .checked_add_signed(chrono::Duration::seconds(slack_secs))
-            .unwrap_or(far_future);
-        // A job in its grace is killed at the deadline, so its nodes free by then
-        // even when its time limit is further out.
-        if let Some(pending) = job.preempt_grace() {
-            let free_after_kill = pending
-                .deadline
-                .checked_add_signed(chrono::Duration::seconds(
-                    kill_wait_secs as i64 + BUSY_UNTIL_MARGIN_SECS,
-                ))
-                .unwrap_or(far_future);
-            end = end.min(free_after_kill);
-        }
-        let end = end.max(now);
+        let end = job_expected_end(job, now, waits);
         for node in job.held_nodes() {
             busy_until
                 .entry(node)
@@ -1174,6 +1163,153 @@ fn busy_until_from_running_jobs(
         }
     }
     busy_until
+}
+
+/// When a running job is expected to release its nodes. Never before `now`.
+fn job_expected_end(
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+    waits: ReleaseWaits,
+) -> DateTime<Utc> {
+    use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
+
+    let far_future = now + UNLIMITED_FALLBACK;
+    // A job tearing down is bounded by the completing timeout, not by its
+    // own time limit — an unlimited one would otherwise read as a year out.
+    if job.state == spur_core::job::JobState::Completing {
+        let since = job.end_time.unwrap_or(now);
+        return since
+            .checked_add_signed(chrono::Duration::seconds(waits.complete_wait_secs as i64))
+            .unwrap_or(far_future)
+            .max(now);
+    }
+    let start = job.start_time.unwrap_or(now);
+    let mut suspended = job.suspended_secs;
+    if let Some(since) = job.suspended_at {
+        suspended = suspended.saturating_add((now - since).num_seconds().max(0));
+    }
+    // Saturating i64 math, clamped once at the end: avoids the panicking
+    // Duration + Duration path (a huge suspended_secs alone can overflow it).
+    let time_limit_secs = job
+        .spec
+        .time_limit
+        .map(|d| d.num_seconds())
+        .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
+    let slack_secs = time_limit_secs
+        .saturating_add(suspended)
+        .saturating_add(waits.timeout_kill_wait_secs as i64)
+        .min(UNLIMITED_FALLBACK.num_seconds());
+    // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
+    // compute an `end` already in the past, producing a backwards interval.
+    let mut end = start
+        .checked_add_signed(chrono::Duration::seconds(slack_secs))
+        .unwrap_or(far_future);
+    // A job in its grace is killed at the deadline, so its nodes free by then
+    // even when its time limit is further out.
+    if let Some(pending) = job.preempt_grace() {
+        let free_after_kill = pending
+            .deadline
+            .checked_add_signed(chrono::Duration::seconds(
+                waits.kill_wait_secs as i64 + BUSY_UNTIL_MARGIN_SECS,
+            ))
+            .unwrap_or(far_future);
+        end = end.min(free_after_kill);
+    }
+    end.max(now)
+}
+
+/// What each capped partition's running jobs hold per node, so backfill can
+/// keep new placements within `max_tres_per_node`.
+pub(crate) fn running_partition_usage(cluster: &ClusterManager) -> PartitionNodeUsage {
+    let partitions = cluster.get_partitions();
+    if !partitions.iter().any(is_capped) {
+        return PartitionNodeUsage::new();
+    }
+    let waits = ReleaseWaits::of(&cluster.config().scheduler);
+    cluster
+        .with_jobs(|jobs| partition_usage_from_jobs(jobs.values(), &partitions, Utc::now(), waits))
+}
+
+/// What each capped partition's jobs hold on each node at `now`, as backfill
+/// sees it, for callers already holding the job map.
+pub(crate) fn partition_usage_at<'a>(
+    jobs: impl IntoIterator<Item = &'a spur_core::job::Job>,
+    partitions: &[spur_core::partition::Partition],
+    scheduler: &spur_core::config::SchedulerConfig,
+    now: DateTime<Utc>,
+) -> HashMap<String, HashMap<String, TresCharge>> {
+    if !partitions.iter().any(is_capped) {
+        return HashMap::new();
+    }
+    let usage = partition_usage_from_jobs(jobs, partitions, now, ReleaseWaits::of(scheduler));
+    usage
+        .into_iter()
+        .map(|(partition, by_node)| {
+            let held = by_node.into_iter().map(|(node, running)| {
+                let mut total = TresCharge::default();
+                for charge in running.iter().filter(|c| c.until > now) {
+                    total.add(&charge.tres);
+                }
+                (node, total)
+            });
+            (partition, held.collect())
+        })
+        .collect()
+}
+
+/// Pure core of [`running_partition_usage`]. Idle-fill and suspended runs hold real cores,
+/// so they keep charging; a node the job already finished on was released and stops.
+fn partition_usage_from_jobs<'a>(
+    jobs: impl IntoIterator<Item = &'a spur_core::job::Job>,
+    partitions: &[spur_core::partition::Partition],
+    now: DateTime<Utc>,
+    waits: ReleaseWaits,
+) -> PartitionNodeUsage {
+    use spur_core::job::JobState;
+    let mut usage = PartitionNodeUsage::new();
+    let holding = jobs.into_iter().filter(|j| {
+        j.occupies_resources() || matches!(j.state, JobState::Suspended | JobState::Completing)
+    });
+    for job in holding {
+        let Some(partition) = charged_partition(job, partitions).filter(|p| is_capped(p)) else {
+            continue;
+        };
+        // A run overdue to exit still holds its cores, so its charge must not
+        // end at `now` and vanish from the cap.
+        let until = job_expected_end(job, now, waits)
+            .max(now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS));
+        let typed_gpu = job_typed_gpu(job);
+        let by_node = usage.entry(partition.name.clone()).or_default();
+        let held = job
+            .per_node_alloc
+            .iter()
+            .filter(|(node, _)| job.is_held_on(node));
+        for (node, alloc) in held {
+            by_node
+                .entry(node.clone())
+                .or_default()
+                .push(RunningCharge {
+                    job_id: job.job_id,
+                    tres: TresCharge::from_allocation(alloc, typed_gpu.as_deref()),
+                    until,
+                });
+        }
+    }
+    usage
+}
+
+/// Partition a running job is charged to: the one recorded at start, or for
+/// a run started before that was recorded, its highest-tier requested one.
+fn charged_partition<'a>(
+    job: &spur_core::job::Job,
+    partitions: &'a [spur_core::partition::Partition],
+) -> Option<&'a spur_core::partition::Partition> {
+    if let Some(name) = job.effective_partition.as_deref() {
+        return partitions.iter().find(|p| p.name == name);
+    }
+    candidate_partitions(job, partitions)
+        .into_iter()
+        .min_by_key(|p| (std::cmp::Reverse(p.priority_tier), p.name.as_str()))
 }
 
 /// Resolve the effective PreemptMode for a job: an explicit QOS mode (including
@@ -1309,6 +1445,7 @@ pub(crate) async fn try_preempt_beside(
     let reservations = cluster.get_reservations();
     let handoffs =
         cluster.preemption_handoffs(&cluster.pending_jobs(), cluster_nodes, &reservations);
+    let usage = running_partition_usage(cluster);
     let state = ClusterState {
         nodes: cluster_nodes,
         partitions,
@@ -1317,6 +1454,7 @@ pub(crate) async fn try_preempt_beside(
         fabric: None,
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
+        partition_node_usage: &usage,
     };
     try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
 }
@@ -1342,6 +1480,31 @@ fn node_occupants<'a>(
         }
     }
     occupants
+}
+
+/// Idle-fill reclaim for `unplaced` over the cluster's current state, as the loop runs it.
+#[cfg(test)]
+pub(crate) async fn reclaim_for(
+    cluster: &Arc<ClusterManager>,
+    unplaced: &[&spur_core::job::Job],
+) -> Vec<String> {
+    let nodes = cluster.get_nodes();
+    let partitions = cluster.get_partitions();
+    let reservations = cluster.get_reservations();
+    let usage = running_partition_usage(cluster);
+    let state = ClusterState {
+        nodes: &nodes,
+        partitions: &partitions,
+        reservations: &reservations,
+        topology: None,
+        fabric: None,
+        busy_until: &HashMap::new(),
+        preemption_handoffs: &HashMap::new(),
+        partition_node_usage: &usage,
+    };
+    reclaim_for_unplaced(cluster, unplaced, &HashSet::new(), &state, &[], 0)
+        .await
+        .0
 }
 
 /// The victim search over a given pass state, as the scheduler loop runs it.
@@ -2130,6 +2293,12 @@ fn satisfiable_victim_set(
             && node.total_resources.can_satisfy(&required)
             && state.handoff_allows(reclaimer, &node.name)
     };
+    // Evicting a node frees its partition caps only of what the victims held there.
+    let cap_frees = |node: &spur_core::node::Node, evicted: &[spur_core::job::JobId]| {
+        cap_admits_on(reclaimer, state.partitions, node, |partition| {
+            usage_without(state.partition_node_usage, partition, node, evicted, now)
+        })
+    };
 
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
     let mut have = 0usize;
@@ -2143,14 +2312,15 @@ fn satisfiable_victim_set(
         match pool.occupants.get(node.name.as_str()) {
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
-            None => have += 1,
+            None if cap_frees(node, &[]) => have += 1,
+            None => {}
             Some(on_node)
                 if on_node.iter().all(|id| {
                     pool.evictable.contains(id)
                         && pool
                             .max_priority
                             .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
-                }) =>
+                }) && cap_frees(node, on_node) =>
             {
                 evacuable.push((node.name.as_str(), on_node));
             }
@@ -2181,6 +2351,26 @@ fn satisfiable_victim_set(
     }
 
     (have >= needed && !victims.is_empty()).then_some(victims)
+}
+
+/// What `partition`'s jobs other than `evicted` hold on `node` at `now`.
+fn usage_without(
+    usage: &PartitionNodeUsage,
+    partition: &spur_core::partition::Partition,
+    node: &spur_core::node::Node,
+    evicted: &[spur_core::job::JobId],
+    now: DateTime<Utc>,
+) -> TresCharge {
+    let mut held = TresCharge::default();
+    let charges = usage
+        .get(&partition.name)
+        .and_then(|by_node| by_node.get(&node.name))
+        .into_iter()
+        .flatten();
+    for charge in charges.filter(|c| c.until > now && !evicted.contains(&c.job_id)) {
+        held.add(&charge.tres);
+    }
+    held
 }
 
 /// The pending job a victim is being cleared out for while it still holds its
@@ -4848,6 +5038,131 @@ mod tests {
         );
     }
 
+    fn capped(name: &str, tier: u32) -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: name.into(),
+            priority_tier: tier,
+            max_tres_per_node: [("cpu".to_string(), 64)].into(),
+            ..Default::default()
+        }
+    }
+
+    fn holding(partition: &str, effective: Option<&str>, cpus: u32, start: DateTime<Utc>) -> Job {
+        let mut job = running_job_on("n1", start, 60);
+        job.spec.partition = Some(partition.into());
+        job.effective_partition = effective.map(str::to_string);
+        job.per_node_alloc = [("n1".to_string(), ResourceAllocations::with_scalar(cpus, 0))].into();
+        job
+    }
+
+    const TEST_WAITS: ReleaseWaits = ReleaseWaits {
+        complete_wait_secs: 300,
+        kill_wait_secs: TEST_KILL_WAIT_SECS,
+        timeout_kill_wait_secs: TEST_TIMEOUT_KILL_WAIT_SECS,
+    };
+
+    fn charged(usage: &PartitionNodeUsage, partition: &str) -> Vec<(u64, DateTime<Utc>)> {
+        usage
+            .get(partition)
+            .and_then(|by_node| by_node.get("n1"))
+            .map(|charges| {
+                charges
+                    .iter()
+                    .map(|c| (c.tres.get("cpu"), c.until))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn partition_usage_charges_each_run_to_its_effective_partition_until_its_own_end() {
+        let now = Utc::now();
+        let partitions = [capped("cpu", 1), capped("gpu", 1)];
+        let mut borrowed = holding("cpu,gpu", Some("gpu"), 2, now);
+        borrowed.idle_fill = true;
+        let jobs = [holding("cpu,gpu", Some("cpu"), 4, now), borrowed];
+
+        let usage = partition_usage_from_jobs(&jobs, &partitions, now, TEST_WAITS);
+        let end = now
+            + chrono::Duration::minutes(60)
+            + chrono::Duration::seconds(TEST_TIMEOUT_KILL_WAIT_SECS.into());
+        assert_eq!(charged(&usage, "cpu"), [(4, end)]);
+        assert_eq!(
+            charged(&usage, "gpu"),
+            [(2, end)],
+            "an idle-fill run counts toward its partition's cap"
+        );
+    }
+
+    #[test]
+    fn partition_usage_falls_back_to_the_highest_tier_requested_partition() {
+        let now = Utc::now();
+        let partitions = [capped("low", 1), capped("high", 5)];
+        let usage = partition_usage_from_jobs(
+            &[holding("low,high", None, 3, now)],
+            &partitions,
+            now,
+            TEST_WAITS,
+        );
+        assert_eq!(charged(&usage, "high").len(), 1);
+        assert!(charged(&usage, "low").is_empty());
+    }
+
+    #[test]
+    fn partition_usage_skips_uncapped_partitions_and_jobs_holding_nothing() {
+        let now = Utc::now();
+        let partitions = [
+            capped("cpu", 1),
+            spur_core::partition::Partition {
+                name: "free".into(),
+                ..Default::default()
+            },
+        ];
+        let mut pending = holding("cpu", Some("cpu"), 4, now);
+        pending.state = spur_core::job::JobState::Pending;
+        pending.allocated_nodes.clear();
+        let uncapped = holding("free", Some("free"), 4, now);
+
+        let usage = partition_usage_from_jobs(&[pending, uncapped], &partitions, now, TEST_WAITS);
+        assert!(usage.is_empty(), "{usage:?}");
+    }
+
+    #[test]
+    fn partition_usage_keeps_charging_a_run_overdue_to_exit() {
+        let now = Utc::now();
+        let partitions = [capped("cpu", 1)];
+        let jobs = [holding(
+            "cpu",
+            Some("cpu"),
+            4,
+            now - chrono::Duration::hours(3),
+        )];
+
+        let usage = partition_usage_from_jobs(&jobs, &partitions, now, TEST_WAITS);
+
+        let margin = now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS);
+        assert_eq!(charged(&usage, "cpu"), [(4, margin)]);
+        let held = partition_usage_at(&jobs, &partitions, &Default::default(), now);
+        assert_eq!(held["cpu"]["n1"].get("cpu"), 4);
+    }
+
+    #[test]
+    fn partition_usage_charges_a_job_in_its_grace_until_it_is_killed() {
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(120);
+        let job = in_grace(holding("cpu", Some("cpu"), 4, now), deadline);
+
+        let usage = partition_usage_from_jobs(&[job], &[capped("cpu", 1)], now, TEST_WAITS);
+
+        let killed = deadline
+            + chrono::Duration::seconds(i64::from(TEST_KILL_WAIT_SECS) + BUSY_UNTIL_MARGIN_SECS);
+        assert_eq!(
+            charged(&usage, "cpu"),
+            [(4, killed)],
+            "the cap stays charged through the grace, ending with the busy_until free time"
+        );
+    }
+
     #[test]
     fn busy_until_accounts_for_currently_suspended_time() {
         let now = Utc::now();
@@ -5623,6 +5938,7 @@ mod tests {
                 topology: None,
                 busy_until: &HashMap::new(),
                 preemption_handoffs: handoffs,
+                partition_node_usage: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, Utc::now())
         }
@@ -5642,6 +5958,7 @@ mod tests {
                 topology: None,
                 busy_until: &HashMap::new(),
                 preemption_handoffs: &HashMap::new(),
+                partition_node_usage: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, now)
         }
@@ -6655,6 +6972,13 @@ mod tests {
                     preempt_mode: String::new(),
                     preempt_exempt_time: None,
                     grace_time: None,
+                    max_tres_per_node: Default::default(),
+                    max_cpus_per_node: None,
+                    max_mem_per_node: None,
+                    max_mem_per_cpu: None,
+                    def_mem_per_node: None,
+                    def_mem_per_cpu: None,
+                    def_mem_per_gpu: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),
@@ -8709,6 +9033,8 @@ mod tests {
                 job_id,
                 nodes: nodes.iter().map(|n| n.to_string()).collect(),
                 per_node_alloc,
+                partition: None,
+                memory_adjustment: None,
             }
         }
 
@@ -8754,6 +9080,49 @@ mod tests {
                 job.idle_fill,
                 "reserve_placement/activate_job must thread `borrowed` through as idle_fill"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_starts_the_request_its_placement_was_planned_for() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            cm.create_partition(spur_core::partition::Partition {
+                name: "p".into(),
+                nodes: "ALL".into(),
+                def_mem_per_node: Some(4096),
+                ..Default::default()
+            })
+            .unwrap();
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    partition: Some("p".into()),
+                    ..batch_spec("planned-memory", 1)
+                },
+            );
+            let partitions = cm.get_partitions();
+            let mut planned = assignment(job_id, &["n1"]);
+            planned.partition = Some("p".into());
+            planned.memory_adjustment = spur_sched::partition_cap::planned_memory_adjustment(
+                &cm.get_job(job_id).unwrap(),
+                partitions.iter().find(|p| p.name == "p"),
+            );
+
+            let raise = spur_core::partition_limits::PartitionLimitsUpdate {
+                def_mem_per_node: Some(Some(8192)),
+                ..Default::default()
+            };
+            cm.update_partition(
+                "p", None, None, None, None, None, None, None, false, None, None, None, None, None,
+                None, None, None, None, None, raise,
+            )
+            .unwrap();
+            assert!(process_assignment(cm.clone(), planned, false).await);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.spec.memory_per_node_mb, Some(4096));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9341,6 +9710,28 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn prolog_slurmctld_sees_the_memory_a_per_gpu_job_was_allocated() {
+            let script = make_script(r#"test "$SPUR_JOB_MEMORY_MB" = 4096"#);
+            let dir = TempDir::new().unwrap();
+            let cm =
+                test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("per-gpu-memory", 1));
+            let mut planned = assignment(job_id, &["n1"]);
+            planned.per_node_alloc =
+                [("n1".to_string(), ResourceAllocations::with_scalar(1, 4096))].into();
+            planned.memory_adjustment = Some(spur_core::partition_limits::MemoryAdjustment {
+                cpus_per_task: 1,
+                memory_per_node_mb: None,
+                memory_per_cpu_mb: None,
+                memory_per_gpu_mb: Some(2048),
+            });
+
+            assert!(process_assignment(cm.clone(), planned, false).await);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn process_assignment_cancels_interactive_job_when_prolog_slurmctld_fails() {
             use spur_core::job::JobState;
 
@@ -9821,6 +10212,48 @@ mod tests {
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_victim_in_its_grace_charges_the_partition_cap_until_its_kill_deadline() {
+                let dir = TempDir::new().unwrap();
+                let mut config = preempting_config("cancel");
+                config.partitions[0].max_tres_per_node = [("cpu".to_string(), 1)].into();
+                let cm = test_cluster_with_config(&dir, config).await;
+                let (addr, _cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                let pending = cm
+                    .get_job(victim.job_id)
+                    .unwrap()
+                    .preempt_pending
+                    .expect("the grace is recorded");
+                let killed =
+                    pending.deadline + chrono::Duration::seconds(5 + BUSY_UNTIL_MARGIN_SECS);
+                let usage = running_partition_usage(&cm);
+                let charges: Vec<_> = usage["default"]["n1"]
+                    .iter()
+                    .map(|charge| (charge.tres.get("cpu"), charge.until))
+                    .collect();
+                assert_eq!(charges, [(1, killed)], "the victim keeps its cap share");
+                assert_eq!(
+                    running_jobs_busy_until(&cm)["n1"],
+                    killed,
+                    "the cap share frees when the node does"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn a_multi_partition_victim_gets_the_grace_of_the_partition_it_runs_in() {
                 let dir = TempDir::new().unwrap();
                 let mut config = preempting_config("cancel");
@@ -9999,6 +10432,7 @@ mod tests {
                 let partitions = cm.get_partitions();
                 let reservations = cm.get_reservations();
                 let busy_until = HashMap::new();
+                let partition_node_usage = PartitionNodeUsage::new();
                 let state = ClusterState {
                     nodes: &nodes,
                     partitions: &partitions,
@@ -10007,6 +10441,7 @@ mod tests {
                     fabric: None,
                     busy_until: &busy_until,
                     preemption_handoffs: &HashMap::new(),
+                    partition_node_usage: &partition_node_usage,
                 };
 
                 let (freed, freed_for) =

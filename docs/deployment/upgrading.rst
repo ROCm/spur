@@ -953,6 +953,51 @@ the nodes, so the protection applies only once the leader runs the new build.
 Victim selection also counts nodes that a draining job has already released,
 which changes ordinary preemption as well.
 
+.. _upgrading-partition-resource-limits:
+
+Partition resource limits
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds per-partition resource caps and memory limits (see
+:doc:`/admin-guide/partition-resource-limits`). Existing ``spur.conf`` files
+behave as before: with no limit set, nothing changes, and
+``enforce_part_limits`` keeps its meaning for wall time.
+
+Jobs already running when you upgrade have no recorded partition. Once a cap
+is set, each one is charged to the highest-``priority_tier`` partition it
+requested, which is the partition it ran in unless it listed several.
+
+.. warning::
+
+   **Upgrade every controller replica before you configure any cap or memory
+   knob**, whether in ``spur.conf``, with ``scontrol``, or through the API.
+   An older replica ignores the new fields, so it diverges from the leader:
+
+   - It schedules without the caps if it becomes leader.
+   - It ignores the adjusted request a ``def_mem_*`` or ``max_mem_*`` knob
+     records when a job starts, so its copy of the job keeps the original
+     CPU and memory request.
+   - It cannot load a Raft snapshot holding a job blocked by a cap, whose
+     ``PartitionTresLimit`` pending reason it does not know, either on
+     restart or when the leader sends one to catch it up.
+
+**Rolling back.** Once a cap has blocked a job, a controller from an earlier
+release cannot load the snapshot. To downgrade:
+
+#. Remove every cap and memory knob (``spur.conf`` plus ``scontrol
+   reconfigure``, or ``scontrol update``).
+#. Wait until no job carries the ``PartitionTresLimit`` reason. A job keeps
+   its last pending reason after it ends, so this includes finished jobs:
+   wait until no pending job shows the reason, then at least
+   ``controller.terminal_job_retention_secs`` (default one hour) more, so
+   finished jobs that had it are evicted.
+#. Wait for a new Raft snapshot: on every controller,
+   ``<state_dir>/raft/snapshot.json`` must be newer than the end of the
+   previous step. A snapshot is taken every 5000 Raft log entries, so on a
+   quiet cluster this can take a while; job submissions and completions
+   move it along.
+#. Downgrade the controllers.
+
 See Also
 --------
 

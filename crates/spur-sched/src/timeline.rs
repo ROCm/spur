@@ -5,7 +5,10 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use chrono::{DateTime, Duration, Utc};
+use spur_core::partition::Partition;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+use crate::partition_cap::{partition_cap_ok, TresCharge};
 
 /// Assumed occupancy for a job with no explicit time limit, shared by
 /// backfill sizing and spurctld's running-job busy_until estimate.
@@ -31,29 +34,56 @@ pub struct Interval {
     /// The job this reservation belongs to, if attributable to exactly one
     /// (e.g. `None` for the aggregate "current allocation" seed interval).
     pub job_id: Option<u32>,
+    /// What this interval counts against its partition's cap, if attributed
+    /// to a partition.
+    pub charge: Option<PartitionCharge>,
+}
+
+/// An interval's contribution to one partition's cumulative usage on the node.
+#[derive(Debug, Clone)]
+pub struct PartitionCharge {
+    pub partition: String,
+    pub tres: TresCharge,
+}
+
+/// A partition cap that a request must fit under in addition to node capacity.
+#[derive(Debug, Clone, Copy)]
+pub struct CapCheck<'a> {
+    pub partition: &'a Partition,
+    pub charge: &'a TresCharge,
 }
 
 /// Incremental sweep over sorted interval start/end events.
 ///
 /// Maintains the sum of resources active at the current sweep time `t`
-/// (half-open intervals: `start <= t < end`).
+/// (half-open intervals: `start <= t < end`), and the charge of the tracked
+/// partition's intervals among them.
 struct AllocationSweep<'a> {
     intervals: &'a [Interval],
+    partition: Option<&'a str>,
     used: ResourceAllocations,
+    charged: TresCharge,
     next_start: usize,
     ending: BinaryHeap<Reverse<(DateTime<Utc>, usize)>>,
 }
 
 impl<'a> AllocationSweep<'a> {
-    fn new(intervals: &'a [Interval], time: DateTime<Utc>) -> Self {
+    fn new(intervals: &'a [Interval], partition: Option<&'a str>, time: DateTime<Utc>) -> Self {
         let mut sweep = Self {
             intervals,
+            partition,
             used: ResourceAllocations::default(),
+            charged: TresCharge::default(),
             next_start: 0,
             ending: BinaryHeap::new(),
         };
         sweep.advance_to(time);
         sweep
+    }
+
+    fn tracked_charge(&self, interval: &'a Interval) -> Option<&'a TresCharge> {
+        let charge = interval.charge.as_ref()?;
+        (Some(charge.partition.as_str()) == self.partition).then_some(&charge.tres)
     }
 
     fn advance_to(&mut self, time: DateTime<Utc>) {
@@ -63,6 +93,9 @@ impl<'a> AllocationSweep<'a> {
             let idx = self.next_start;
             let interval = &self.intervals[idx];
             self.used.add(&interval.resources);
+            if let Some(tres) = self.tracked_charge(interval) {
+                self.charged.add(tres);
+            }
             self.ending.push(Reverse((interval.end, idx)));
             self.next_start += 1;
         }
@@ -70,7 +103,11 @@ impl<'a> AllocationSweep<'a> {
         while let Some(Reverse((end, idx))) = self.ending.peek().copied() {
             if end <= time {
                 self.ending.pop();
-                self.used.subtract(&self.intervals[idx].resources);
+                let interval = &self.intervals[idx];
+                self.used.subtract(&interval.resources);
+                if let Some(tres) = self.tracked_charge(interval) {
+                    self.charged.subtract(tres);
+                }
             } else {
                 break;
             }
@@ -79,6 +116,10 @@ impl<'a> AllocationSweep<'a> {
 
     fn used(&self) -> &ResourceAllocations {
         &self.used
+    }
+
+    fn charged(&self) -> &TresCharge {
+        &self.charged
     }
 
     /// Earliest end among intervals active at the current sweep time.
@@ -106,12 +147,27 @@ impl NodeTimeline {
         self.intervals.partition_point(|i| i.start < window_end)
     }
 
+    /// Whether `request` fits beside the sweep's current allocations, and
+    /// within `cap` beside the capped partition's current charge.
+    fn fits(
+        &self,
+        sweep: &AllocationSweep<'_>,
+        request: Option<&ResourceSet>,
+        cap: Option<CapCheck<'_>>,
+    ) -> bool {
+        request.is_none_or(|r| self.total.can_satisfy_with_allocated(sweep.used(), r))
+            && cap.is_none_or(|c| {
+                partition_cap_ok(c.partition, &self.node_name, sweep.charged(), c.charge).is_ok()
+            })
+    }
+
     /// Return the end time of an interval whose start within `[start, start + duration)`
-    /// is the first point where cumulative allocations block `request`.
+    /// is the first point where cumulative allocations block `request` or `cap`.
     fn duration_blocker(
         &self,
         sweep: &mut AllocationSweep<'_>,
-        request: &ResourceSet,
+        request: Option<&ResourceSet>,
+        cap: Option<CapCheck<'_>>,
         start: DateTime<Utc>,
         duration: Duration,
     ) -> Option<DateTime<Utc>> {
@@ -121,7 +177,7 @@ impl NodeTimeline {
                 continue;
             }
             sweep.advance_to(interval.start);
-            if !self.total.can_satisfy_with_allocated(sweep.used(), request) {
+            if !self.fits(sweep, request, cap) {
                 return Some(interval.end);
             }
         }
@@ -154,9 +210,34 @@ impl NodeTimeline {
         duration: Duration,
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
+        self.earliest_start_capped(request, None, duration, after)
+    }
+
+    /// Whether `cap` admits its charge throughout `[start, start + duration)`,
+    /// ignoring node capacity.
+    pub fn cap_admits(&self, cap: CapCheck<'_>, start: DateTime<Utc>, duration: Duration) -> bool {
+        let partition = Some(cap.partition.name.as_str());
+        let mut sweep = AllocationSweep::new(&self.intervals, partition, start);
+        self.fits(&sweep, None, Some(cap))
+            && self
+                .duration_blocker(&mut sweep, None, Some(cap), start, duration)
+                .is_none()
+    }
+
+    /// [`earliest_start`](Self::earliest_start), also keeping the partition's charge within
+    /// its cap for `duration`; callers must first drop requests the cap could never admit.
+    pub fn earliest_start_capped(
+        &self,
+        request: &ResourceSet,
+        cap: Option<CapCheck<'_>>,
+        duration: Duration,
+        after: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let request = Some(request);
         let mut candidate = after;
         let max_check = after + Duration::days(365);
-        let mut sweep = AllocationSweep::new(&self.intervals, after);
+        let partition = cap.map(|c| c.partition.name.as_str());
+        let mut sweep = AllocationSweep::new(&self.intervals, partition, after);
 
         loop {
             if candidate > max_check {
@@ -165,8 +246,9 @@ impl NodeTimeline {
 
             sweep.advance_to(candidate);
 
-            if self.total.can_satisfy_with_allocated(sweep.used(), request) {
-                if let Some(jump) = self.duration_blocker(&mut sweep, request, candidate, duration)
+            if self.fits(&sweep, request, cap) {
+                if let Some(jump) =
+                    self.duration_blocker(&mut sweep, request, cap, candidate, duration)
                 {
                     candidate = jump;
                     continue;
@@ -181,6 +263,13 @@ impl NodeTimeline {
         }
     }
 
+    /// Cumulative charge of `partition`'s intervals active at `time`.
+    pub fn charged_at(&self, partition: &str, time: DateTime<Utc>) -> TresCharge {
+        AllocationSweep::new(&self.intervals, Some(partition), time)
+            .charged()
+            .clone()
+    }
+
     /// Reserve resources on this node for a time window.
     pub fn reserve(
         &mut self,
@@ -188,25 +277,45 @@ impl NodeTimeline {
         end: DateTime<Utc>,
         resources: ResourceAllocations,
     ) {
-        self.reserve_for_job(start, end, resources, None);
+        self.reserve_for_job(start, end, resources, None, None);
     }
 
     /// Like [`reserve`](Self::reserve), attributing the interval to a job so
-    /// callers can later report which pending job a future reservation is for.
+    /// callers can later report which pending job a future reservation is for,
+    /// and to the partition whose cap it counts against.
     pub fn reserve_for_job(
         &mut self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         resources: ResourceAllocations,
         job_id: Option<u32>,
+        charge: Option<PartitionCharge>,
     ) {
         self.intervals.push(Interval {
             start,
             end,
             resources,
             job_id,
+            charge,
         });
         self.intervals.sort_by_key(|i| i.start);
+    }
+
+    /// Count running usage against a partition's cap until `end`; carries no resources
+    /// since the node's aggregate allocation already holds them (no double-count).
+    pub fn charge_running(
+        &mut self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        charge: PartitionCharge,
+    ) {
+        self.reserve_for_job(
+            start,
+            end,
+            ResourceAllocations::default(),
+            None,
+            Some(charge),
+        );
     }
 
     /// Remove a reservation (when a job completes or is cancelled).
@@ -526,7 +635,7 @@ mod tests {
         event_times.sort();
         event_times.dedup();
 
-        let mut sweep = AllocationSweep::new(&tl.intervals, base);
+        let mut sweep = AllocationSweep::new(&tl.intervals, None, base);
         for time in event_times {
             sweep.advance_to(time);
             let expected = tl.accumulated_at(time);
@@ -744,5 +853,141 @@ mod tests {
         let got = tl.earliest_start(&req, duration, base);
         let want = brute_earliest_start(&tl, &req, duration, base);
         assert_eq!(got, want);
+    }
+
+    fn capped_partition(name: &str, cpu_cap: u64) -> Partition {
+        Partition {
+            name: name.into(),
+            max_tres_per_node: [("cpu".to_string(), cpu_cap)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn cpu_charge(partition: &str, cpus: u64) -> PartitionCharge {
+        PartitionCharge {
+            partition: partition.into(),
+            tres: TresCharge::new(cpus, 0, 0, None),
+        }
+    }
+
+    fn cpu_request(cpus: u32) -> ResourceSet {
+        ResourceSet {
+            cpus,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn earliest_start_capped_returns_a_time_the_cap_admits() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+        tl.charge_running(base, base + Duration::hours(2), cpu_charge("cpu", 4));
+
+        let p = capped_partition("cpu", 8);
+        let charge = TresCharge::new(8, 0, 0, None);
+        let cap = CapCheck {
+            partition: &p,
+            charge: &charge,
+        };
+        let req = cpu_request(8);
+        assert_eq!(tl.earliest_start(&req, Duration::hours(1), base), base);
+        assert_eq!(
+            tl.earliest_start_capped(&req, Some(cap), Duration::hours(1), base),
+            base + Duration::hours(2)
+        );
+    }
+
+    #[test]
+    fn capped_start_avoids_a_reserved_window_of_the_same_partition() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+        tl.reserve_for_job(
+            base + Duration::hours(2),
+            base + Duration::hours(3),
+            ResourceAllocations::with_scalar(8, 0),
+            Some(1),
+            Some(cpu_charge("cpu", 8)),
+        );
+        let p = capped_partition("cpu", 8);
+        let charge = TresCharge::new(4, 0, 0, None);
+        let cap = CapCheck {
+            partition: &p,
+            charge: &charge,
+        };
+        let req = cpu_request(4);
+        assert_eq!(
+            tl.earliest_start_capped(&req, Some(cap), Duration::hours(2), base),
+            base
+        );
+        assert_eq!(
+            tl.earliest_start_capped(&req, Some(cap), Duration::hours(3), base),
+            base + Duration::hours(3)
+        );
+    }
+
+    #[test]
+    fn other_partitions_charges_do_not_count_against_a_cap() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+        tl.charge_running(base, base + Duration::hours(2), cpu_charge("gpu", 32));
+        let p = capped_partition("cpu", 8);
+        let charge = TresCharge::new(8, 0, 0, None);
+        let cap = CapCheck {
+            partition: &p,
+            charge: &charge,
+        };
+        assert_eq!(
+            tl.earliest_start_capped(&cpu_request(8), Some(cap), Duration::hours(1), base),
+            base
+        );
+        assert_eq!(tl.charged_at("gpu", base).get("cpu"), 32);
+        assert!(tl.charged_at("cpu", base).is_empty());
+        assert!(tl.charged_at("gpu", base + Duration::hours(2)).is_empty());
+    }
+
+    #[test]
+    fn charging_running_usage_does_not_consume_node_capacity() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+        tl.charge_running(base, base + Duration::hours(2), cpu_charge("cpu", 64));
+        assert!(tl.accumulated_at(base).is_empty());
+        assert!(tl.can_satisfy_at(base, &cpu_request(64)));
+    }
+
+    #[test]
+    fn cap_admits_checks_the_whole_window_and_ignores_node_capacity() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+        tl.reserve(
+            base,
+            base + Duration::hours(5),
+            ResourceAllocations::with_scalar(64, 0),
+        );
+        tl.charge_running(base, base + Duration::hours(1), cpu_charge("cpu", 6));
+        let p = capped_partition("cpu", 8);
+        let charge = TresCharge::new(4, 0, 0, None);
+        let cap = CapCheck {
+            partition: &p,
+            charge: &charge,
+        };
+        assert!(!tl.cap_admits(cap, base, Duration::hours(1)));
+        assert!(tl.cap_admits(cap, base + Duration::hours(1), Duration::hours(1)));
+
+        let never = TresCharge::new(9, 0, 0, None);
+        let over = CapCheck {
+            partition: &p,
+            charge: &never,
+        };
+        assert!(!tl.cap_admits(over, base + Duration::hours(2), Duration::hours(1)));
+
+        tl.charge_running(
+            base + Duration::hours(3),
+            base + Duration::hours(4),
+            cpu_charge("cpu", 6),
+        );
+        assert!(
+            !tl.cap_admits(cap, base + Duration::hours(2), Duration::hours(2)),
+            "usage starting inside the window counts"
+        );
     }
 }

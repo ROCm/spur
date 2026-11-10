@@ -494,6 +494,12 @@ message JobInfo {
   // When the job was signaled to start its preemption grace. Set only while
   // the grace runs; `end_time` then carries the grace deadline.
   google.protobuf.Timestamp preempt_time = 90;
+  // Partition the run is charged to for partition caps, chosen among the
+  // requested ones at start. Empty while pending.
+  string effective_partition = 91;
+  // Memory per allocated GPU ("gpu:8192", MiB), as a partition's
+  // def_mem_per_gpu set it. Empty when memory is not sized per GPU.
+  string mem_per_tres = 92;
 }
 
 message NodeInfo {
@@ -572,6 +578,16 @@ message PartitionInfo {
   uint32 priority_tier = 41;
   optional uint32 preempt_exempt_time = 44;   // absent = unset (inherits global default); 0 = no exemption
   optional uint32 grace_time = 45;            // absent = unset; 0 = explicitly no grace
+  // Per-node cumulative cap on this partition's jobs. max_cpus_per_node
+  // mirrors max_tres_per_node["cpu"]; absent / no key = unlimited.
+  optional uint32 max_cpus_per_node = 46;
+  map<string, uint64> max_tres_per_node = 47;  // keys: cpu, mem (MiB), gres/gpu, gres/gpu:<type>
+  // Per-job memory policy (MiB); absent = unset.
+  optional uint64 max_mem_per_node = 48;
+  optional uint64 max_mem_per_cpu = 49;
+  optional uint64 def_mem_per_node = 50;
+  optional uint64 def_mem_per_cpu = 51;
+  optional uint64 def_mem_per_gpu = 52;
 }
 
 // ============================================================
@@ -2226,6 +2242,16 @@ message CreatePartitionRequest {
   // Seconds a preempted job gets to wind down before it is killed. Used when the
   // victim's QOS leaves its grace_time unset. 0 = no grace. Absent = unset.
   optional uint32 grace_time = 18;
+  // Shorthand for max_tres_per_node["cpu"]; absent or 0 = unset (a "cpu"
+  // map entry of 0 forbids CPUs). Setting both is rejected.
+  optional uint32 max_cpus_per_node = 19;
+  map<string, uint64> max_tres_per_node = 20;  // keys: cpu, mem (MiB), gres/gpu, gres/gpu:<type>
+  // Per-job memory policy (MiB); absent or 0 = unset.
+  optional uint64 max_mem_per_node = 21;
+  optional uint64 max_mem_per_cpu = 22;
+  optional uint64 def_mem_per_node = 23;
+  optional uint64 def_mem_per_cpu = 24;
+  optional uint64 def_mem_per_gpu = 25;
 }
 
 message UpdatePartitionRequest {
@@ -2265,6 +2291,17 @@ message UpdatePartitionRequest {
   // Set to true to clear grace_time back to unset. Setting it together with
   // grace_time is rejected as INVALID_ARGUMENT.
   bool clear_grace_time = 27;
+  // Sets max_tres_per_node["cpu"]; 0 = clear that key. Conflicts with a "cpu"
+  // key in max_tres_per_node when that map is applied.
+  optional uint32 max_cpus_per_node = 28;
+  map<string, uint64> max_tres_per_node = 29;  // replaces the whole map when non-empty or set_max_tres_per_node
+  bool set_max_tres_per_node = 30;             // true = apply max_tres_per_node (even if empty, to clear)
+  // Per-job memory policy (MiB). Absent = no change; 0 = clear.
+  optional uint64 max_mem_per_node = 31;
+  optional uint64 max_mem_per_cpu = 32;
+  optional uint64 def_mem_per_node = 33;
+  optional uint64 def_mem_per_cpu = 34;
+  optional uint64 def_mem_per_gpu = 35;
 }
 
 message DeletePartitionRequest {

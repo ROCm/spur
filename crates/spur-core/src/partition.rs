@@ -1,9 +1,11 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
+
+use crate::job::{JobSpec, PendingReason};
 
 /// Partition (queue) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,127 @@ pub struct Partition {
     /// `Some(0)` means no grace. Used when the victim's QOS leaves its grace unset.
     #[serde(default)]
     pub grace_time: Option<u32>,
+
+    /// Combined per-node cap per TRES key on this partition's jobs; the config's
+    /// `max_cpus_per_node` folds into `cpu`. Empty is unlimited; a `0` limit forbids it.
+    #[serde(default)]
+    pub max_tres_per_node: BTreeMap<String, u64>,
+    /// Per-job memory policy (MiB), Slurm's `MaxMemPerNode`/`MaxMemPerCPU`/
+    /// `DefMemPer*`. Never accumulated across jobs.
+    #[serde(default)]
+    pub max_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub max_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_gpu: Option<u64>,
+}
+
+impl Partition {
+    /// Rejects uncharged cap keys and conflicting per-job memory knobs; shared by config
+    /// load and the partition API so both enforce the same rules.
+    pub fn validate_resource_limits(&self) -> Result<(), String> {
+        if let Some(key) = self
+            .max_tres_per_node
+            .keys()
+            .find(|key| !is_valid_partition_tres_key(key))
+        {
+            return Err(format!(
+                "max_tres_per_node: unknown key {key:?} (expected cpu, mem, gres/gpu, or gres/gpu:<type>)"
+            ));
+        }
+        if let (Some(per_node), Some(per_cpu)) = (self.max_mem_per_node, self.max_mem_per_cpu) {
+            return Err(format!(
+                "max_mem_per_node = {per_node} conflicts with max_mem_per_cpu = {per_cpu} (set only one)"
+            ));
+        }
+        let def_mem: Vec<String> = [
+            ("def_mem_per_node", self.def_mem_per_node),
+            ("def_mem_per_cpu", self.def_mem_per_cpu),
+            ("def_mem_per_gpu", self.def_mem_per_gpu),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| format!("{name} = {v}")))
+        .collect();
+        if def_mem.len() > 1 {
+            return Err(format!("{} (set at most one)", def_mem.join(", ")));
+        }
+        Ok(())
+    }
+
+    /// Whether a wall-time request fits `MaxTime`; no request or no limit fits.
+    pub fn time_allows(&self, time_limit: Option<&chrono::Duration>) -> bool {
+        match (self.max_time_minutes, time_limit) {
+            (Some(max_mins), Some(tl)) => tl.num_seconds() <= i64::from(max_mins) * 60,
+            _ => true,
+        }
+    }
+
+    /// Why this partition can never run the job (static limits), or `None` if it can:
+    /// node count and `max_mem_per_node` report `PartitionConfig`, wall time `PartitionTimeLimit`.
+    pub fn limit_block(&self, spec: &JobSpec) -> Option<PendingReason> {
+        // A job never runs on fewer than one node, whatever it asked for.
+        let nodes = spec.num_nodes.max(1);
+        if self.max_nodes.is_some_and(|max| nodes > max) {
+            return Some(PendingReason::PartitionConfig);
+        }
+        if nodes < self.min_nodes {
+            return Some(PendingReason::PartitionConfig);
+        }
+        if !self.time_allows(spec.time_limit.as_ref()) {
+            return Some(PendingReason::PartitionTimeLimit);
+        }
+        if self.max_mem_per_node_exceeded(spec).is_some() {
+            return Some(PendingReason::PartitionConfig);
+        }
+        None
+    }
+
+    /// Whether the job may start here now: Up and not ruled out by static limits. Shared
+    /// by the controller's pending-reason gate and the scheduler's partition choice.
+    pub fn admits(&self, spec: &JobSpec) -> bool {
+        self.state == PartitionState::Up && self.limit_block(spec).is_none()
+    }
+}
+
+pub const TRES_CPU: &str = "cpu";
+pub const TRES_MEM: &str = "mem";
+pub const TRES_GPU: &str = "gres/gpu";
+
+/// Cap key for one GPU type, e.g. `gres/gpu:a100`.
+pub fn typed_gpu_tres_key(gpu_type: &str) -> String {
+    format!("{TRES_GPU}:{gpu_type}")
+}
+
+/// GPU type named by a `gres/gpu:<type>` key; `None` for any other key.
+pub fn tres_key_gpu_type(key: &str) -> Option<&str> {
+    key.strip_prefix(TRES_GPU)?.strip_prefix(':')
+}
+
+/// Whether `key` is a chargeable cap key (`cpu`, `mem`, `gres/gpu[:<type>]`); anything
+/// else is never charged, so a typo must be rejected rather than leave the partition uncapped.
+pub fn is_valid_partition_tres_key(key: &str) -> bool {
+    if matches!(key, TRES_CPU | TRES_MEM | TRES_GPU) {
+        return true;
+    }
+    tres_key_gpu_type(key).is_some_and(|ty| {
+        !ty.is_empty()
+            && !ty
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, ':' | ',' | '='))
+    })
+}
+
+/// Order in which over-limit keys are reported: `cpu`, then `mem`, then GRES.
+pub fn tres_key_report_rank(key: &str) -> u8 {
+    match key {
+        TRES_CPU => 0,
+        TRES_MEM => 1,
+        _ => 2,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +314,12 @@ impl Default for Partition {
             priority_tier: 1,
             preempt_exempt_time: None,
             grace_time: None,
+            max_tres_per_node: BTreeMap::new(),
+            max_mem_per_node: None,
+            max_mem_per_cpu: None,
+            def_mem_per_node: None,
+            def_mem_per_cpu: None,
+            def_mem_per_gpu: None,
         }
     }
 }
@@ -198,6 +327,54 @@ impl Default for Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admits_requires_up_and_every_static_limit() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            time_limit: Some(chrono::Duration::minutes(60)),
+            memory_per_node_mb: Some(2048),
+            ..Default::default()
+        };
+        assert!(Partition::default().admits(&spec));
+        let ruled_out = [
+            Partition {
+                state: PartitionState::Down,
+                ..Default::default()
+            },
+            Partition {
+                state: PartitionState::Drain,
+                ..Default::default()
+            },
+            Partition {
+                max_time_minutes: Some(59),
+                ..Default::default()
+            },
+            Partition {
+                max_nodes: Some(1),
+                ..Default::default()
+            },
+            Partition {
+                min_nodes: 3,
+                ..Default::default()
+            },
+            Partition {
+                max_mem_per_node: Some(1024),
+                ..Default::default()
+            },
+        ];
+        for partition in ruled_out {
+            assert!(!partition.admits(&spec), "{partition:?}");
+        }
+        assert_eq!(
+            Partition {
+                max_time_minutes: Some(59),
+                ..Default::default()
+            }
+            .limit_block(&spec),
+            Some(PendingReason::PartitionTimeLimit)
+        );
+    }
 
     #[test]
     fn preempt_mode_parses_unset_off_and_actions() {
@@ -274,5 +451,126 @@ mod tests {
         let parts = vec![partition_with_tier("gpu", 5)];
         assert_eq!(max_priority_tier(None, &parts), 1);
         assert_eq!(max_priority_tier(Some("nope"), &parts), 1);
+    }
+
+    #[test]
+    fn typed_gpu_key_round_trips_through_its_type() {
+        let key = typed_gpu_tres_key("mi300x");
+        assert_eq!(key, "gres/gpu:mi300x");
+        assert_eq!(tres_key_gpu_type(&key), Some("mi300x"));
+        assert_eq!(tres_key_gpu_type(TRES_GPU), None);
+        assert_eq!(tres_key_gpu_type(TRES_CPU), None);
+        assert_eq!(tres_key_gpu_type("gres/gpux:a100"), None);
+    }
+
+    #[test]
+    fn partition_tres_keys_accept_only_chargeable_shapes() {
+        for key in ["cpu", "mem", "gres/gpu", "gres/gpu:a100", "gres/gpu:MI300X"] {
+            assert!(is_valid_partition_tres_key(key), "{key} must be valid");
+        }
+        for key in [
+            "",
+            "cpus",
+            "CPU",
+            "memory",
+            "gres",
+            "gres/",
+            "gres/gpu:",
+            "gres/gpu::a100",
+            "gres/gpu:a 100",
+            "gres/gpu:a=1",
+            "gres/gpu:a,b",
+            "gres/nic",
+            "disk",
+            "node",
+        ] {
+            assert!(!is_valid_partition_tres_key(key), "{key:?} must be invalid");
+        }
+    }
+
+    #[test]
+    fn tres_report_rank_orders_cpu_then_mem_then_gres() {
+        assert!(tres_key_report_rank(TRES_CPU) < tres_key_report_rank(TRES_MEM));
+        assert!(tres_key_report_rank(TRES_MEM) < tres_key_report_rank(TRES_GPU));
+        assert_eq!(
+            tres_key_report_rank(TRES_GPU),
+            tres_key_report_rank("gres/gpu:a100")
+        );
+    }
+
+    #[test]
+    fn partition_resource_limits_validate_independently_of_config() {
+        assert_eq!(Partition::default().validate_resource_limits(), Ok(()));
+
+        let bad_key = Partition {
+            max_tres_per_node: BTreeMap::from([("cpus".to_string(), 4)]),
+            ..Default::default()
+        };
+        assert!(bad_key
+            .validate_resource_limits()
+            .unwrap_err()
+            .contains("\"cpus\""));
+
+        let both_max = Partition {
+            max_mem_per_node: Some(1),
+            max_mem_per_cpu: Some(1),
+            ..Default::default()
+        };
+        assert!(both_max.validate_resource_limits().is_err());
+
+        let two_defaults = Partition {
+            def_mem_per_cpu: Some(1),
+            def_mem_per_gpu: Some(1),
+            ..Default::default()
+        };
+        assert!(two_defaults.validate_resource_limits().is_err());
+
+        let valid = Partition {
+            max_tres_per_node: BTreeMap::from([
+                ("cpu".to_string(), 0),
+                ("gres/gpu:a100".to_string(), 2),
+            ]),
+            max_mem_per_cpu: Some(2048),
+            def_mem_per_node: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(valid.validate_resource_limits(), Ok(()));
+    }
+
+    #[test]
+    fn a_partition_snapshot_without_resource_caps_still_deserializes() {
+        let mut value = serde_json::to_value(Partition::default()).expect("serialize partition");
+        let fields = value
+            .as_object_mut()
+            .expect("partition serializes as an object");
+        for field in [
+            "max_tres_per_node",
+            "max_mem_per_node",
+            "max_mem_per_cpu",
+            "def_mem_per_node",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+        ] {
+            assert!(fields.remove(field).is_some(), "{field} must serialize");
+        }
+        let back: Partition = serde_json::from_value(value).expect("deserialize partition");
+        assert!(back.max_tres_per_node.is_empty());
+        assert_eq!(back.max_mem_per_cpu, None);
+        assert_eq!(back.def_mem_per_gpu, None);
+    }
+
+    #[test]
+    fn partition_resource_caps_round_trip_through_serde() {
+        let p = Partition {
+            max_tres_per_node: BTreeMap::from([("mem".to_string(), 131072)]),
+            max_mem_per_node: Some(65536),
+            def_mem_per_cpu: Some(1024),
+            ..Default::default()
+        };
+        let back: Partition = serde_json::from_str(&serde_json::to_string(&p).expect("serialize"))
+            .expect("deserialize");
+        assert_eq!(back.max_tres_per_node, p.max_tres_per_node);
+        assert_eq!(back.max_mem_per_node, Some(65536));
+        assert_eq!(back.def_mem_per_cpu, Some(1024));
     }
 }

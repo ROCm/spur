@@ -8,6 +8,7 @@ use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::{NodeSource, NodeState};
 use crate::partition::Partition;
+use crate::partition_limits::{MemoryAdjustment, PartitionLimitsUpdate};
 use crate::reservation::Reservation;
 use std::collections::HashMap;
 
@@ -20,7 +21,7 @@ fn default_port() -> u16 {
 /// Deserializer for `Option<Option<T>>` patch fields: absent is no change (via
 /// `#[serde(default)]`), `null` clears, a value sets. Pair with
 /// `skip_serializing_if = "Option::is_none"` so a clear is not read back as absent.
-fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -81,6 +82,14 @@ pub enum WalOperation {
         /// `Job` field is what survives snapshot and failover.
         #[serde(default)]
         idle_fill: bool,
+        /// Partition the run is charged to for partition caps. `None` in
+        /// pre-upgrade entries.
+        #[serde(default)]
+        effective_partition: Option<String>,
+        /// The request as that partition's memory policy adjusted it, when it
+        /// changed anything.
+        #[serde(default)]
+        memory_adjustment: Option<MemoryAdjustment>,
         /// Stamped on the leader so a replay dates the run from the dispatch
         /// rather than from its own clock. `None` in pre-upgrade entries.
         #[serde(default)]
@@ -406,6 +415,9 @@ pub enum WalOperation {
             skip_serializing_if = "Option::is_none"
         )]
         grace_time: Option<Option<u32>>,
+        /// Merged into the partition's limits when the entry applies.
+        #[serde(default)]
+        resource_limits: Option<PartitionLimitsUpdate>,
     },
     PartitionDelete {
         name: String,
@@ -633,6 +645,8 @@ impl WalOperation {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         }
     }
@@ -1175,6 +1189,7 @@ mod tests {
                 assert!(!spec.pty);
                 assert!(!spec.srun_job);
                 assert!(spec.gpus.is_none());
+                assert_eq!(spec.memory_per_gpu_mb, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1216,6 +1231,8 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: true,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1226,6 +1243,82 @@ mod tests {
             } => {
                 assert_eq!(job_id, 8);
                 assert!(idle_fill, "the stamp must survive the WAL round-trip");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_effective_partition_and_memory_adjustment_round_trip() {
+        let adjustment = MemoryAdjustment {
+            cpus_per_task: 4,
+            memory_per_node_mb: None,
+            memory_per_cpu_mb: Some(1536),
+            memory_per_gpu_mb: None,
+        };
+        let op = WalOperation::JobStart {
+            job_id: 9,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::default(),
+            per_node_alloc: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            idle_fill: false,
+            effective_partition: Some("cpu".into()),
+            memory_adjustment: Some(adjustment),
+            at: None,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::JobStart {
+                effective_partition,
+                memory_adjustment,
+                ..
+            } => {
+                assert_eq!(effective_partition.as_deref(), Some("cpu"));
+                assert_eq!(memory_adjustment, Some(adjustment));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen PartitionUpdate entry from before partition resource limits; it
+    // must still replay, leaving the limits untouched.
+    #[test]
+    fn partition_update_pre_resource_limits_payload_still_deserializes() {
+        const PARTITION_UPDATE_PRE_LIMITS: &str = r#"{"PartitionUpdate":{"name":"cpu","nodes":null,"selector":null,"state":"UP","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null}}"#;
+        let op: WalOperation = serde_json::from_str(PARTITION_UPDATE_PRE_LIMITS)
+            .expect("pre-limits PartitionUpdate must deserialize");
+        match op {
+            WalOperation::PartitionUpdate {
+                name,
+                resource_limits,
+                ..
+            } => {
+                assert_eq!(name, "cpu");
+                assert_eq!(resource_limits, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen JobStart entry from before partition limits. Never regenerate.
+    #[test]
+    fn job_start_pre_partition_limits_payload_still_deserializes() {
+        const JOB_START_PRE_LIMITS: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1,"idle_fill":false,"at":null}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_LIMITS)
+            .expect("pre-limits JobStart must deserialize");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                effective_partition,
+                memory_adjustment,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert_eq!(effective_partition, None);
+                assert_eq!(memory_adjustment, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1551,6 +1644,7 @@ mod deregistration_wal_tests {
             is_default: None,
             preempt_exempt_time: None,
             grace_time,
+            resource_limits: None,
         }
     }
 
