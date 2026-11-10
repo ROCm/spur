@@ -154,6 +154,10 @@ pub struct StepRunsAs<'a> {
     pub gid: u32,
 }
 
+pub fn mints_step_credentials() -> bool {
+    EXEC.get().cloned().flatten().is_some()
+}
+
 pub fn sign_step_credential(
     cluster_id: &str,
     job: &spur_core::job::Job,
@@ -163,9 +167,29 @@ pub fn sign_step_credential(
     container_image: &str,
     runs_as: Option<StepRunsAs<'_>>,
 ) -> Result<String, spur_core::native_cred::CredentialError> {
-    if EXEC.get().cloned().flatten().is_none() {
+    if !mints_step_credentials() {
         return Ok(String::new());
     }
+    sign_job_credential(step_credential(
+        cluster_id,
+        job,
+        step_id,
+        command,
+        nodes,
+        container_image,
+        runs_as,
+    ))
+}
+
+fn step_credential(
+    cluster_id: &str,
+    job: &spur_core::job::Job,
+    step_id: u32,
+    command: &[String],
+    nodes: &[String],
+    container_image: &str,
+    runs_as: Option<StepRunsAs<'_>>,
+) -> ExecutionCredential {
     let mut resources_by_node: Vec<_> = nodes
         .iter()
         .map(|name| {
@@ -174,7 +198,7 @@ pub fn sign_step_credential(
         })
         .collect();
     resources_by_node.sort_by(|a, b| a.node.cmp(&b.node));
-    sign_job_credential(ExecutionCredential {
+    ExecutionCredential {
         kind: CredentialKind::Step,
         cluster_id: cluster_id.to_string(),
         key_id: String::new(),
@@ -195,5 +219,51 @@ pub fn sign_step_credential(
         not_before: 0,
         expires_at: 0,
         credential_id: [0u8; CREDENTIAL_ID_LEN],
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job() -> spur_core::job::Job {
+        spur_core::job::Job::new(
+            7,
+            spur_core::job::JobSpec {
+                user: "alice".into(),
+                uid: 1000,
+                gid: 1000,
+                account: Some("research".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_step_credential_runs_as_the_owner_unless_a_joiner_started_it() {
+        let job = job();
+        let nodes = ["n1".to_string()];
+        let owner = step_credential("c", &job, 2, &[], &nodes, "", None);
+        assert_eq!(
+            (owner.user.as_str(), owner.uid, owner.gid),
+            ("alice", 1000, 1000)
+        );
+
+        let joiner = StepRunsAs {
+            user: "bob",
+            uid: 1001,
+            gid: 2001,
+        };
+        let joined = step_credential("c", &job, 2, &[], &nodes, "", Some(joiner));
+        assert_eq!(
+            (joined.user.as_str(), joined.uid, joined.gid),
+            ("bob", 1001, 2001)
+        );
+        assert_eq!(joined.kind, CredentialKind::Step);
+        assert_eq!((joined.job_id, joined.step_id), (7, 2));
+        assert_eq!(
+            joined.account, "research",
+            "the job's account still bounds the step"
+        );
+    }
 }

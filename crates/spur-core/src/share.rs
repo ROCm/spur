@@ -227,6 +227,36 @@ mod tests {
             Err(JoinGrantError::Expired)
         );
         assert!(sign_join_grant(&grant(), b"", now()).is_err());
+        assert!(matches!(
+            verify_join_grant(&token, b""),
+            Err(JoinGrantError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn join_grant_rejects_same_shape_claims_of_another_kind() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let claims = JoinGrantClaims {
+            kind: "spur-other".into(),
+            job: 7,
+            step: 3,
+            attempt: 1,
+            user: "bob".into(),
+            uid: 1001,
+            gid: 1001,
+            iat: now(),
+            exp: now() + JOIN_GRANT_TTL_SECS,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_join_grant(&token, b"secret"),
+            Err(JoinGrantError::Invalid("not a join grant".into()))
+        );
     }
 
     #[test]
