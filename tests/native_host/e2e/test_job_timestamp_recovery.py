@@ -38,7 +38,8 @@ def test_job_timestamps_survive_controller_log_recovery(cluster):
     )
     running = _submit(cluster, "timestamps-running", "-t", "00:05:00", "-o", output, script)
     wait_job_state(cluster, running, "R")
-    cluster.wait_output(output, "READY")
+    content = cluster.wait_output(output, "READY")
+    assert content.splitlines() == ["READY"], content
     jobs = (pending, running, completed)
     before = {job_id: _job_fields(cluster, job_id) for job_id in jobs}
     assert [before[job_id]["JobState"] for job_id in jobs] == [
