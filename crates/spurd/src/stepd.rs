@@ -773,6 +773,8 @@ pub struct Stepd {
     cgroup_path: Mutex<Option<PathBuf>>,
     snapshot: Arc<Mutex<StepdSnapshot>>,
     teardown_started: AtomicBool,
+    /// Written only under the `job` lock.
+    sigterm_delivered: AtomicBool,
     launch_gate: Mutex<()>,
     pty_handoff: std::sync::OnceLock<Arc<PtyHandoff>>,
 }
@@ -799,6 +801,7 @@ impl Stepd {
                 cgroup_path: String::new(),
             })),
             teardown_started: AtomicBool::new(false),
+            sigterm_delivered: AtomicBool::new(false),
             launch_gate: Mutex::new(()),
             pty_handoff: std::sync::OnceLock::new(),
         }
@@ -897,11 +900,25 @@ impl Stepd {
         Ok(())
     }
 
+    /// Marks the teardown and SIGTERMs the workload, once: a repeat request
+    /// while it is stopping must not re-signal a job that is checkpointing.
     pub async fn begin_teardown(&self) {
         let launch_gate = self.launch_gate.lock().await;
         self.teardown_started.store(true, Ordering::Release);
         drop(launch_gate);
+        // Held across the check and the signal so concurrent requests cannot
+        // both see an undelivered SIGTERM.
         let job = self.job.lock().await;
+        if self.sigterm_delivered.load(Ordering::Acquire) {
+            return;
+        }
+        let delivered = self.send_sigterm(&job).await;
+        self.sigterm_delivered.store(delivered, Ordering::Release);
+    }
+
+    /// Whether the SIGTERM reached a process. An attempt that found none leaves
+    /// the next request free to try again once one exists.
+    async fn send_sigterm(&self, job: &RunningJob) -> bool {
         let sigterm = nix::sys::signal::Signal::SIGTERM;
         let cgroup_signaled = self
             .cgroup_path
@@ -910,11 +927,14 @@ impl Stepd {
             .as_deref()
             .and_then(|path| crate::executor::cgroup_signal(path, sigterm).ok())
             .is_some_and(|count| count > 0);
-        if !cgroup_signaled {
-            if let Err(error) = job.kill_signal(sigterm) {
-                tracing::warn!(%error, "failed to terminate stepd process during teardown");
-            }
+        if cgroup_signaled {
+            return true;
         }
+        if let Err(error) = job.kill_signal(sigterm) {
+            tracing::warn!(%error, "failed to terminate stepd process during teardown");
+            return false;
+        }
+        job.has_live_process()
     }
 }
 
@@ -6739,6 +6759,143 @@ mod tests {
             session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
         session.begin_teardown().await;
         assert!(session.may_exit(std::time::Duration::ZERO));
+    }
+
+    /// Counts what a workload saw: one line in `term` per SIGTERM and one in
+    /// `beat` per loop pass. A pending trap runs before the shell's next
+    /// command, so two beats after a signal was sent prove it has been handled.
+    struct SignalRecorder(tempfile::TempDir);
+
+    impl SignalRecorder {
+        async fn spawn() -> (Self, tokio::process::Child) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let script = format!(
+                "trap 'echo >> {dir}/term' TERM; \
+                 while :; do echo >> {dir}/beat; sleep 0.02; done",
+                dir = dir.path().display()
+            );
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn recorder");
+            let recorder = Self(dir);
+            recorder.wait_for("beat", 1).await;
+            (recorder, child)
+        }
+
+        fn lines(&self, name: &str) -> usize {
+            std::fs::read_to_string(self.0.path().join(name))
+                .map(|contents| contents.lines().count())
+                .unwrap_or(0)
+        }
+
+        async fn wait_for(&self, name: &str, lines: usize) {
+            while self.lines(name) < lines {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn settle(&self) {
+            self.wait_for("beat", self.lines("beat") + 2).await;
+        }
+
+        fn sigterms(&self) -> usize {
+            self.lines("term")
+        }
+    }
+
+    fn session_over(child: tokio::process::Child) -> Stepd {
+        Stepd::new(
+            RunningJob::Managed { child },
+            7,
+            1,
+            spur_core::step::STEP_BATCH,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_repeated_teardown_sends_one_sigterm() {
+        let (recorder, child) = SignalRecorder::spawn().await;
+        let session = session_over(child);
+
+        session.begin_teardown().await;
+        recorder.wait_for("term", 1).await;
+        session.begin_teardown().await;
+        session.begin_teardown().await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_teardown_that_reached_nothing_does_not_suppress_the_next() {
+        let (recorder, child) = SignalRecorder::spawn().await;
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("empty cgroup.procs");
+        let session = Stepd::new(
+            RunningJob::AllocationOnly,
+            7,
+            1,
+            spur_core::step::STEP_BATCH,
+        );
+        session
+            .adopt_cgroup(Some(cgroup.path().to_path_buf()))
+            .await;
+
+        session.begin_teardown().await;
+        session.poll_completion().await.expect("poll");
+        recorder.settle().await;
+        assert_eq!(recorder.sigterms(), 0);
+        assert!(
+            !session.snapshot().await.active,
+            "an allocation placeholder still completes on the first teardown"
+        );
+
+        let pid = child.id().expect("recorder pid");
+        std::fs::write(cgroup.path().join("cgroup.procs"), pid.to_string())
+            .expect("a process joins the cgroup");
+        session.begin_teardown().await;
+        recorder.wait_for("term", 1).await;
+        session.begin_teardown().await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_sigterm_after_teardown_is_still_delivered() {
+        let (recorder, child) = SignalRecorder::spawn().await;
+        let session = session_over(child);
+
+        session.begin_teardown().await;
+        recorder.wait_for("term", 1).await;
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("explicit signal");
+        recorder.wait_for("term", 2).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_warning_sigterm_does_not_stand_in_for_the_teardown_sigterm() {
+        let (recorder, child) = SignalRecorder::spawn().await;
+        let session = session_over(child);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("warning signal");
+        recorder.wait_for("term", 1).await;
+        session.begin_teardown().await;
+        recorder.wait_for("term", 2).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 2);
     }
 
     #[tokio::test]
