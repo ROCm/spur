@@ -702,6 +702,10 @@ pub struct ClusterManager {
     /// sweep can tell an abandoned reservation from one still being dispatched.
     /// Leader-local, never persisted: a new leader has issued no launches yet.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
+    /// Stops this controller delivered to agents, so the heartbeat reclaim does
+    /// not re-send one a run is still working through. Leader-local, never
+    /// persisted: a new leader may re-send once, which the agent absorbs.
+    recent_stops: crate::recent_stops::RecentStops,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -1080,6 +1084,7 @@ impl ClusterManager {
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
+            recent_stops: crate::recent_stops::RecentStops::default(),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -3155,6 +3160,10 @@ impl ClusterManager {
     /// The launches this controller currently has on the wire.
     pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
         &self.dispatch_tracker
+    }
+
+    pub(crate) fn recent_stops(&self) -> &crate::recent_stops::RecentStops {
+        &self.recent_stops
     }
 
     /// Record completion from one allocated node (multi-node COMPLETING flow).

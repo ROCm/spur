@@ -4250,8 +4250,10 @@ pub async fn send_cancel_to_nodes(
     signal: i32,
 ) {
     let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+    for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(
+            cluster.clone(),
+            node.name,
             agent_addr,
             job_id,
             run_attempt,
@@ -4305,8 +4307,10 @@ pub async fn cancel_job_on_nodes(
 ) {
     let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
     let mut set = tokio::task::JoinSet::new();
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+    for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(
+            cluster.clone(),
+            node.name,
             agent_addr,
             job_id,
             run_attempt,
@@ -4461,10 +4465,13 @@ fn resolve_agents(
     agents
 }
 
-/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
-/// timeouts are logged, never propagated: a cancel is best-effort cleanup and
-/// must not block the caller past the timeout.
+/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`, and remember a
+/// delivery so the heartbeat reclaim does not repeat it. Errors and timeouts are
+/// logged, never propagated: a cancel is best-effort cleanup and must not block
+/// the caller past the timeout.
 async fn cancel_one_agent(
+    cluster: Arc<ClusterManager>,
+    node: String,
     agent_addr: String,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
@@ -4472,28 +4479,8 @@ async fn cancel_one_agent(
     kill_wait_secs: u32,
 ) {
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone()).await {
-            Ok(mut client) => {
-                if let Err(e) = client
-                    .cancel_job(AgentCancelJobRequest {
-                        job_id,
-                        signal,
-                        run_attempt,
-                        kill_wait_secs,
-                    })
-                    .await
-                {
-                    warn!(
-                        job_id,
-                        signal,
-                        agent = %agent_addr,
-                        error = %e,
-                        "CancelJob RPC failed"
-                    );
-                } else {
-                    info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
-                }
-            }
+        let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+            Ok(client) => client,
             Err(e) => {
                 warn!(
                     job_id,
@@ -4501,19 +4488,58 @@ async fn cancel_one_agent(
                     error = %e,
                     "failed to connect to agent for cancel"
                 );
+                return false;
             }
+        };
+        let request = AgentCancelJobRequest {
+            job_id,
+            signal,
+            run_attempt,
+            kill_wait_secs,
+        };
+        if let Err(e) = client.cancel_job(request).await {
+            warn!(
+                job_id,
+                signal,
+                agent = %agent_addr,
+                error = %e,
+                "CancelJob RPC failed"
+            );
+            return false;
         }
+        info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
+        true
     };
-    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
-        .await
-        .is_err()
-    {
-        warn!(
+    match tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt).await {
+        Ok(true) => record_stop_delivered(&cluster, job_id, run_attempt, &node),
+        Ok(false) => {}
+        Err(_) => warn!(
             job_id,
             agent = %agent_addr,
             "CancelJob RPC timed out"
-        );
+        ),
     }
+}
+
+/// Remember a delivered stop, keeping it only as long as any reclaim window
+/// could still consult it (the longer of the two kill waits).
+fn record_stop_delivered(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node: &str,
+) {
+    let sched = &cluster.config().scheduler;
+    let longest_wait = sched
+        .effective_kill_wait_secs()
+        .max(sched.effective_timeout_kill_wait_secs());
+    cluster.recent_stops().record(
+        job_id,
+        run_attempt,
+        node,
+        chrono::Utc::now(),
+        crate::server::cancel_reclaim_grace(longest_wait),
+    );
 }
 
 /// Deliver `signals`, in order, to every node in `node_names` without any of the
@@ -7452,6 +7478,89 @@ pub(crate) mod tests {
             crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report]).await;
 
             assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
+        fn stop_recorded(cm: &ClusterManager, job: &spur_core::job::Job, node: &str) -> bool {
+            cm.recent_stops().delivered_within(
+                job.job_id,
+                job.run_attempt,
+                node,
+                chrono::Duration::hours(1),
+                chrono::Utc::now(),
+            )
+        }
+
+        /// The run stays reported through its kill wait, so every heartbeat names it again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_heartbeat_reclaim_does_not_resend_a_stop_the_node_just_received() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+            cm.requeue_job_by_user(job.job_id, "", true, true).unwrap();
+            settle(&cm, job.job_id, spur_core::job::JobState::Pending);
+            let report = spur_proto::proto::RunningJobStatus {
+                job_id: job.job_id,
+                run_attempt: job.run_attempt,
+                ..Default::default()
+            };
+
+            for _ in 0..3 {
+                crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report.clone()])
+                    .await;
+            }
+
+            assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_delivered_cancel_is_recorded_for_its_run_and_node_whatever_the_signal() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "graceful", "n1");
+            let other = run_on(&cm, "other", "n1");
+            assert!(!stop_recorded(&cm, &job, "n1"));
+
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 9).await;
+
+            assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+            assert!(stop_recorded(&cm, &job, "n1"));
+            assert!(!stop_recorded(&cm, &job, "n2"));
+            assert!(!stop_recorded(&cm, &other, "n1"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_fire_and_forget_cancel_is_recorded_once_delivered() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "graceful", "n1");
+
+            send_cancel_to_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 0).await;
+
+            wait_for("the cancel is delivered and recorded", || {
+                stop_recorded(&cm, &job, "n1")
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_never_reached_the_agent_is_not_recorded() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let unreachable = TcpIncoming::bind("127.0.0.1:0".parse().unwrap())
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            register_node_at(&cm, "n1", unreachable);
+            let job = run_on(&cm, "graceful", "n1");
+
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 0).await;
+
+            assert!(!stop_recorded(&cm, &job, "n1"));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
