@@ -373,9 +373,11 @@ def _usage(c, *, used=0, open_count=0, unused=None, jobs=None):
         for job, (job_used, job_open, job_unused) in (jobs or {}).items():
             show = c.scontrol("show", "job", str(job))
             match = re.search(r"PreemptionsUsed=(\d+) PreemptionsUnused=(\d+) PreemptionsOpen=(\d+)", show)
-            assert match and tuple(map(int, match.groups())) == (
-                job_used, sum(job_unused.values()), job_open
-            ), show
+            job_totals = (job_used, sum(job_unused.values()), job_open)
+            if any(job_totals):
+                assert match and tuple(map(int, match.groups())) == job_totals, show
+            else:
+                assert "PreemptionsUsed=" not in show, show
             causes = {
                 (reason, initiator): int(count)
                 for reason, initiator, count in re.findall(
