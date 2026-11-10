@@ -8,18 +8,33 @@ supervisor busy in the node epilog was reclaimed the same as a frozen one:
 the node went back to the scheduler with the epilog still running, orphaned
 from its supervisor, and the epilog's SPANK exit hooks never ran.
 
-A supervisor in its epilog now holds a lease that defers the reclaim, the
-epilog is bounded by ``[hooks] epilog_timeout_secs``, and a supervisor that is
-lost mid-epilog anyway has its orphaned epilog killed and its node drained.
+A supervisor in a long cgroup wait or in its epilog now holds a lease that
+defers the reclaim, the epilog is bounded by ``[hooks] epilog_timeout_secs``,
+and a supervisor lost after the job's exit but before its epilog finished has
+any orphaned epilog killed and its node drained.
 """
 
+import re
+import time
+
+import pytest
+
 from cluster import parse_job_id, wait_job, wait_job_state, wait_node_state, wait_until
+
+EPILOG_FAILED = "epilog script failed"
+TEARDOWN_INTERRUPTED = "job teardown did not complete before its supervisor was lost"
 
 # Longer than the 30s force-reclaim window, so a reclaim that ignored the
 # lease would hand the node back well before the epilog ends.
 SLOW_EPILOG_SECS = 45
 
 TIMEOUT_EPILOG_SECS = 5
+
+# Past the 30s force-reclaim window, and inside the cleanup timeout below.
+CLEANUP_PINNED_SECS = 40
+CLEANUP_TIMEOUT_SECS = 90
+# Unique sleep duration so the cleanup pkill matches only this suite's processes.
+PINNER_MARKER = 161803
 
 SLOW_EPILOG = """\
 #!/bin/bash
@@ -37,6 +52,33 @@ mkdir -p "{RD}/hook-out"
 date +%s%N > "{RD}/hook-out/epilog-start-$SPUR_JOB_ID"
 sleep {MARKER} &
 wait
+"""
+
+
+QUICK_EPILOG = """\
+#!/bin/bash
+mkdir -p "{RD}/hook-out"
+date +%s%N > "{RD}/hook-out/epilog-start-$SPUR_JOB_ID"
+"""
+
+
+# Refills the job's cgroup faster than the reap's poll can empty it, so the reap
+# outlasts the force-reclaim window. Reaping without blocking keeps the refill
+# rate steady; a shell loop slows as its background jobs pile up.
+PINNER = f"""\
+import os, signal
+while not os.path.exists("{{stop}}"):
+    pid = os.posix_spawn("/bin/sleep", ["sleep", "{PINNER_MARKER}"], os.environ)
+    try:
+        with open("{{procs}}", "w") as procs:
+            procs.write(str(pid))
+    except OSError:
+        os.kill(pid, signal.SIGKILL)
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass
 """
 
 
@@ -58,6 +100,11 @@ def _wait_marker(cluster, name: str, timeout_s: int = 60) -> str:
         interval_s=1,
         desc=f"marker {name}",
     )
+
+
+def _node_reason(cluster, name: str) -> str:
+    match = re.search(r"Reason=(.*)", cluster.scontrol_show_node(name))
+    return match.group(1) if match else ""
 
 
 def _surviving(cluster, marker: str) -> str:
@@ -132,6 +179,7 @@ class TestEpilogTimeout:
         assert state in ("CD", "GONE"), f"expected the job to complete, got {state}"
 
         wait_node_state(cluster, node, ("drain",), timeout=60)
+        assert EPILOG_FAILED in _node_reason(cluster, node)
         assert not _surviving(cluster, marker), (
             "the timed-out epilog's children must die with its process group"
         )
@@ -159,8 +207,70 @@ class TestSupervisorLostMidEpilog:
         )
 
         wait_node_state(cluster, node, ("drain",), timeout=90)
+        assert TEARDOWN_INTERRUPTED in _node_reason(cluster, node)
         assert not _surviving(cluster, marker), (
             "the agent must kill the epilog its lost supervisor left running"
         )
         state = wait_job(cluster, job_id, timeout=60)
         assert state in ("CD", "GONE", "F"), f"the job must still resolve, got {state}"
+
+
+class TestCleanupHoldsTheNode:
+    def test_a_supervisor_in_a_long_cgroup_wait_still_runs_its_epilog(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        node = cluster.nodes[0]
+        name = cluster.node_names[0]
+        fstype = node.exec_allow_fail("stat -fc %T /sys/fs/cgroup").strip()
+        if "cgroup2fs" not in fstype:
+            pytest.skip(f"node 0 is not running cgroup v2 (/sys/fs/cgroup is {fstype!r})")
+        if not node.exec_allow_fail("command -v python3").strip():
+            pytest.skip("node 0 has no python3 to run the cgroup pinner")
+        sudo = cluster._sudo_prefix()
+        overrides = _install_epilog(cluster, QUICK_EPILOG)
+        # A root agent only runs a root-owned hook.
+        for each in cluster.nodes:
+            each.exec(f"{sudo}chown root:root {cluster.remote_dir}/hooks/epilog.sh")
+        overrides["cgroup"] = {"cleanup_timeout_secs": CLEANUP_TIMEOUT_SECS}
+        cluster.start(overrides, agent_as_root=True)
+
+        cg_file = f"{cluster.remote_dir}/pinned-cgroup.path"
+        script = cluster.write_file(
+            "pinned-cleanup.sh",
+            "#!/bin/bash\n"
+            "while IFS= read -r line; do\n"
+            f'  case "$line" in 0::*) echo "${{line#0::}}" > {cg_file} ;; esac\n'
+            "done < /proc/self/cgroup\n"
+            "sleep 600\n",
+        )
+        job_id = parse_job_id(cluster.sbatch(["-J", "pinned-cleanup", "-w", name, script]))
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+        cgroup = wait_until(
+            lambda: node.exec_allow_fail(f"cat {cg_file} 2>/dev/null").strip(),
+            timeout_s=30, desc="job cgroup path",
+        )
+
+        stop = f"{cluster.remote_dir}/pinner.stop"
+        pinner = cluster.write_file(
+            "pinner.py",
+            PINNER.format(procs=f"/sys/fs/cgroup{cgroup}/cgroup.procs", stop=stop),
+        )
+        try:
+            node.exec(f"{sudo}setsid nohup python3 {pinner} > /dev/null 2>&1 &")
+            cluster.scancel(job_id)
+            time.sleep(CLEANUP_PINNED_SECS)
+            assert node.exec_allow_fail("pgrep -x spurstepd || true").strip(), (
+                "a supervisor still inside its cleanup timeout must not be reclaimed"
+            )
+            node.exec(f"touch {stop}")
+
+            _wait_marker(cluster, f"epilog-start-{job_id}", timeout_s=60)
+            assert wait_job(cluster, job_id, timeout=60) in ("CA", "GONE")
+            state = cluster.sinfo_nodes()[name]
+            assert not state.startswith("drain"), (
+                "a cleanup that finishes within its timeout must not drain the node: "
+                f"{state} ({_node_reason(cluster, name)})"
+            )
+        finally:
+            node.exec_allow_fail(f"touch {stop}")
+            node.exec_allow_fail(f"{sudo}pkill -f '[s]leep {PINNER_MARKER}' || true")

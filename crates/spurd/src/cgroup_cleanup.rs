@@ -41,7 +41,7 @@ impl PendingCleanup {
     }
 }
 
-pub(crate) fn unix_ms() -> io::Result<u64> {
+fn unix_ms() -> io::Result<u64> {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?;

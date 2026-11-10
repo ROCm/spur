@@ -259,10 +259,8 @@ pub struct HooksConfig {
     /// Script run on compute nodes at job termination (Slurm `Epilog`).
     pub epilog: Option<String>,
     /// Seconds the compute-node `epilog` may run before its process group is
-    /// killed and the node is drained as an epilog failure. The node stays
-    /// held for the job until the epilog ends or this elapses. Must be at
-    /// least 1; defaults to 300. Slurm's `PrologEpilogTimeout` is unbounded by
-    /// default, but an unbounded epilog would hold the node indefinitely.
+    /// killed and the node drained. Bounded, unlike Slurm's `PrologEpilogTimeout`,
+    /// because the node is held for the job until the epilog ends.
     #[serde(default = "default_epilog_timeout_secs")]
     pub epilog_timeout_secs: u32,
     /// Script run on the controller at job allocation (Slurm `PrologSlurmctld`).
@@ -285,8 +283,10 @@ pub struct HooksConfig {
     pub job_submit_lua: Option<String>,
 }
 
+/// Leaves the default `scheduler.complete_wait_secs` above
+/// [`SlurmConfig::complete_wait_floor_secs`] with the other defaults.
 pub fn default_epilog_timeout_secs() -> u32 {
-    300
+    120
 }
 
 /// Upper bound for `epilog_timeout_secs`. A node held for longer than a day
@@ -2468,15 +2468,17 @@ impl SlurmConfig {
         Ok(config)
     }
 
-    /// Seconds a node can need after SIGTERM before it reports completion:
-    /// the longer kill wait, then the cgroup cleanup spurd waits out first.
+    /// Seconds a node can need after SIGTERM before it reports completion: the
+    /// longer kill wait, the cgroup cleanup, then the bounded node epilog.
     /// `scheduler.complete_wait_secs` should exceed this.
     pub fn complete_wait_floor_secs(&self) -> u32 {
-        // Counted even when `cgroup.enabled` is false: nodes read their own
-        // config, so the controller's flag says nothing about theirs.
+        // Counted even when cgroups are disabled or no epilog is set here:
+        // nodes read their own config, so the controller's says nothing about theirs.
+        let epilog_ceiling = crate::hooks::bounded_hook_ceiling(self.hooks.epilog_timeout());
         self.scheduler
             .longest_effective_kill_wait_secs()
             .saturating_add(self.cgroup.cleanup_timeout_secs)
+            .saturating_add(u32::try_from(epilog_ceiling.as_secs()).unwrap_or(u32::MAX))
     }
 
     /// Whether `scheduler.complete_wait_secs` would drain healthy nodes that
@@ -3340,7 +3342,7 @@ mod tests {
         assert_eq!(old.epilog_timeout_secs, default_epilog_timeout_secs());
         assert_eq!(
             HooksConfig::default().epilog_timeout(),
-            Duration::from_secs(300)
+            Duration::from_secs(120)
         );
         let configured: HooksConfig = toml::from_str("epilog_timeout_secs = 45\n").unwrap();
         assert_eq!(configured.epilog_timeout(), Duration::from_secs(45));
@@ -4995,6 +4997,10 @@ inactive_limit_secs = 20
         SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
     }
 
+    /// What a [`config_with_waits`] fixture's 1 s epilog timeout adds to the
+    /// floor: the timeout, two 5 s kill graces, and the 1 s stderr drain.
+    const FIXTURE_EPILOG_SECS: u32 = 12;
+
     fn config_with_waits(
         kill_wait_secs: u32,
         timeout_kill_wait_secs: u32,
@@ -5008,29 +5014,31 @@ inactive_limit_secs = 20
              timeout_kill_wait_secs = {timeout_kill_wait_secs}\n\
              complete_wait_secs = {complete_wait_secs}\n\
              [cgroup]\n\
-             cleanup_timeout_secs = {cleanup_timeout_secs}\n"
+             cleanup_timeout_secs = {cleanup_timeout_secs}\n\
+             [hooks]\n\
+             epilog_timeout_secs = 1\n"
         ))
         .expect("fixture config must load")
     }
 
     #[test]
     fn complete_wait_too_short_flags_a_wait_not_above_kill_wait_plus_cleanup() {
-        let defaults = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
-        assert!(!defaults.complete_wait_too_short());
-        assert!(config_with_waits(30, 0, 0, 30).complete_wait_too_short());
-        assert!(!config_with_waits(30, 0, 0, 31).complete_wait_too_short());
-        assert!(config_with_waits(30, 0, 60, 90).complete_wait_too_short());
-        assert!(!config_with_waits(30, 0, 60, 91).complete_wait_too_short());
+        let epilog = FIXTURE_EPILOG_SECS;
+        assert!(config_with_waits(30, 0, 0, 30 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 0, 31 + epilog).complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 60, 90 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 60, 91 + epilog).complete_wait_too_short());
         // The effective floor of 5 applies, so a configured 0 still counts as 5.
-        assert!(config_with_waits(0, 0, 0, 5).complete_wait_too_short());
-        assert!(!config_with_waits(0, 0, 0, 6).complete_wait_too_short());
+        assert!(config_with_waits(0, 0, 0, 5 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(0, 0, 0, 6 + epilog).complete_wait_too_short());
     }
 
     #[test]
     fn complete_wait_too_short_uses_the_larger_kill_wait() {
-        assert!(config_with_waits(5, 40, 0, 35).complete_wait_too_short());
-        assert!(!config_with_waits(5, 40, 0, 41).complete_wait_too_short());
-        assert!(config_with_waits(40, 5, 0, 35).complete_wait_too_short());
+        let epilog = FIXTURE_EPILOG_SECS;
+        assert!(config_with_waits(5, 40, 0, 35 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(5, 40, 0, 41 + epilog).complete_wait_too_short());
+        assert!(config_with_waits(40, 5, 0, 35 + epilog).complete_wait_too_short());
     }
 
     #[test]
@@ -5038,17 +5046,42 @@ inactive_limit_secs = 20
         // A kill wait of 270 alone fits under 300, but a SIGKILLed job with a
         // 35 s teardown does not.
         assert!(config_with_waits(5, 270, 35, 300).complete_wait_too_short());
-        assert!(!config_with_waits(5, 270, 29, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 17, 300).complete_wait_too_short());
         assert!(!config_with_waits(5, 270, 0, 300).complete_wait_too_short());
+    }
+
+    #[test]
+    fn the_fixture_epilog_term_matches_the_hook_ceiling() {
+        let ceiling = crate::hooks::bounded_hook_ceiling(Duration::from_secs(1));
+        assert_eq!(ceiling, Duration::from_secs(FIXTURE_EPILOG_SECS.into()));
+    }
+
+    #[test]
+    fn the_default_complete_wait_covers_the_default_kill_cleanup_and_epilog() {
+        let defaults = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        // 30 s timeout kill wait, 60 s cleanup, 120 s epilog plus its 11 s kill sequence.
+        assert_eq!(defaults.complete_wait_floor_secs(), 221);
+        assert_eq!(defaults.scheduler.complete_wait_secs, 300);
+        assert!(!defaults.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_floor_counts_the_epilog_timeout() {
+        let toml = "cluster_name = \"test\"\n\
+                    [hooks]\nepilog_timeout_secs = 250\n";
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.complete_wait_floor_secs(), 30 + 60 + 261);
+        assert!(config.complete_wait_too_short());
     }
 
     #[test]
     fn complete_wait_floor_counts_cleanup_even_with_cgroups_disabled() {
         let toml = "cluster_name = \"test\"\n\
                     [scheduler]\nkill_wait_secs = 30\ncomplete_wait_secs = 90\n\
-                    [cgroup]\nenabled = false\ncleanup_timeout_secs = 60\n";
+                    [cgroup]\nenabled = false\ncleanup_timeout_secs = 60\n\
+                    [hooks]\nepilog_timeout_secs = 1\n";
         let config = SlurmConfig::load_from_str(toml).unwrap();
-        assert_eq!(config.complete_wait_floor_secs(), 90);
+        assert_eq!(config.complete_wait_floor_secs(), 90 + FIXTURE_EPILOG_SECS);
         assert!(config.complete_wait_too_short());
     }
 

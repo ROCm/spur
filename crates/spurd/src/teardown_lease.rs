@@ -2,14 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A supervisor's claim on its node while it runs teardown work the agent must
-//! not cut short.
-//!
-//! The agent force-reclaims a supervisor that outlives a cancel by a fixed
-//! window, and reads a supervisor busy in a long cgroup reap or node epilog the
-//! same as a frozen one. The lease is how the supervisor says "busy, until
-//! this instant": the agent defers the reclaim while it is unexpired. A
-//! supervisor that never writes one, or that stays up after its lease is gone,
-//! is reclaimed on that same window.
+//! not cut short. The agent defers its force-reclaim while the lease is
+//! unexpired; without one, the supervisor is reclaimed on the usual window.
 
 use std::fs;
 use std::io;
@@ -20,21 +14,17 @@ use serde::{Deserialize, Serialize};
 
 const LEASE_FILE: &str = "teardown.lease";
 
-/// Headroom beyond a bounded phase for the work around it: the SPANK exit
-/// hooks, rootfs and spool removal, and the completion report. The agent's
-/// force-reclaim window is this same duration, so a supervisor that writes
-/// no lease is not reclaimed sooner than one whose lease just ran out, and
-/// a lease never grants less headroom than that window.
+/// Headroom past a bounded phase for SPANK exit hooks, rootfs and spool
+/// removal, and the completion report. Also the agent's reclaim window, so no
+/// lease grants less time than a supervisor without one already gets.
 pub(crate) const LEASE_SLACK: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TeardownPhase {
-    /// Waiting for the job cgroup to empty. Cut short, the cgroup cleanup
-    /// record still quarantines the node on its own.
+    /// The cgroup reap, then rootfs and spool removal.
     Cleanup,
-    /// The node epilog and SPANK exit hooks. Cut short, the epilog may be
-    /// orphaned or never have run, and nothing else would drain the node.
+    /// The node epilog, then the SPANK exit hooks.
     Epilog,
 }
 
@@ -59,19 +49,18 @@ impl HookProcess {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TeardownLease {
     pub phase: TeardownPhase,
-    /// Wall clock, because the agent reads it from another process and across
-    /// its own restarts.
-    pub deadline_unix_ms: u64,
+    /// On [`boot_ms`]'s clock, which both processes share and which a
+    /// wall-clock step cannot move.
+    pub deadline_boot_ms: u64,
     #[serde(default)]
     pub hook: Option<HookProcess>,
 }
 
 impl TeardownLease {
     pub(crate) fn new(phase: TeardownPhase, window: Duration) -> io::Result<Self> {
-        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
         Ok(Self {
             phase,
-            deadline_unix_ms: crate::cgroup_cleanup::unix_ms()?.saturating_add(window_ms),
+            deadline_boot_ms: boot_ms()?.saturating_add(millis(window)),
             hook: None,
         })
     }
@@ -82,6 +71,42 @@ impl TeardownLease {
     }
 }
 
+/// Milliseconds since boot, counting suspend. A reboot also ends the
+/// supervisor, so the clock restarting with it never matters.
+pub(crate) fn boot_ms() -> io::Result<u64> {
+    let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)?;
+    Ok(millis(Duration::from(now)))
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The cleanup lease's window. `remaining` is what is left of the reap's
+/// budget, or `None` when there is no cgroup left to wait for.
+pub(crate) fn cleanup_window(remaining: Option<Duration>) -> Duration {
+    remaining.unwrap_or_default().saturating_add(LEASE_SLACK)
+}
+
+/// The epilog lease's window. Without a script it covers only the SPANK exit
+/// hooks and the report, which the slack already budgets for.
+pub(crate) fn epilog_window(runs_script: bool, timeout: Duration) -> Duration {
+    let script = if runs_script {
+        spur_core::hooks::bounded_hook_ceiling(timeout)
+    } else {
+        Duration::ZERO
+    };
+    script.saturating_add(LEASE_SLACK)
+}
+
+/// The longest a supervisor's leases can legitimately defer its reclaim, since
+/// the agent does not know the epilog timeout the supervisor started with.
+/// Anything longer is a corrupt or runaway lease.
+pub(crate) fn longest_hold(cleanup_timeout: Duration) -> Duration {
+    let max_epilog_timeout = Duration::from_secs(spur_core::config::MAX_EPILOG_TIMEOUT_SECS.into());
+    cleanup_window(Some(cleanup_timeout)).saturating_add(epilog_window(true, max_epilog_timeout))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReclaimDecision {
     Reclaim,
@@ -89,10 +114,10 @@ pub(crate) enum ReclaimDecision {
 }
 
 /// Whether the agent may force-reclaim a supervisor that holds `lease`.
-pub(crate) fn reclaim_decision(lease: Option<&TeardownLease>, now_unix_ms: u64) -> ReclaimDecision {
+pub(crate) fn reclaim_decision(lease: Option<&TeardownLease>, now_boot_ms: u64) -> ReclaimDecision {
     match lease {
-        Some(lease) if lease.deadline_unix_ms > now_unix_ms => {
-            ReclaimDecision::Defer(Duration::from_millis(lease.deadline_unix_ms - now_unix_ms))
+        Some(lease) if lease.deadline_boot_ms > now_boot_ms => {
+            ReclaimDecision::Defer(Duration::from_millis(lease.deadline_boot_ms - now_boot_ms))
         }
         _ => ReclaimDecision::Reclaim,
     }
@@ -119,13 +144,13 @@ pub(crate) fn clear(session_dir: &Path) -> io::Result<()> {
     }
 }
 
-/// SIGKILLs the process group of a hook whose supervisor is gone. Returns
-/// whether the signal was delivered. A leader that has exited, or whose pid
-/// now belongs to something else, is left alone.
+/// SIGKILLs what is left of the process group of a hook whose supervisor is
+/// gone, including children that outlived the hook itself. Returns whether
+/// any process received the signal.
 pub(crate) fn kill_orphaned_hook(hook: &HookProcess) -> bool {
     // Pid 0 and 1 would address the caller's own group and init. The pid
     // comes from the lease file, not from a process this function spawned.
-    if hook.pid <= 1 || !crate::stepd::process_is_live(hook.pid, hook.start_ticks) {
+    if hook.pid <= 1 || !names_the_hooks_group(hook) {
         return false;
     }
     let Ok(pgid) = i32::try_from(hook.pid) else {
@@ -136,6 +161,7 @@ pub(crate) fn kill_orphaned_hook(hook: &HookProcess) -> bool {
         nix::sys::signal::Signal::SIGKILL,
     ) {
         Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
         Err(error) => {
             tracing::warn!(pid = hook.pid, %error, "failed to kill an orphaned epilog process group");
             false
@@ -143,16 +169,27 @@ pub(crate) fn kill_orphaned_hook(hook: &HookProcess) -> bool {
     }
 }
 
+/// Whether the hook's pid still identifies its process group. Linux does not
+/// hand out a pid while a group of that id has members, so once the leader is
+/// gone the id can only name the hook's leftover children, or nothing.
+fn names_the_hooks_group(hook: &HookProcess) -> bool {
+    match crate::stepd::process_start_ticks(hook.pid) {
+        Ok(start_ticks) => start_ticks == hook.start_ticks,
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
 
-    fn lease_expiring_at(deadline_unix_ms: u64) -> TeardownLease {
+    fn lease_expiring_at(deadline_boot_ms: u64) -> TeardownLease {
         TeardownLease {
             phase: TeardownPhase::Epilog,
-            deadline_unix_ms,
+            deadline_boot_ms,
             hook: None,
         }
     }
@@ -176,6 +213,42 @@ mod tests {
             );
         }
         assert_eq!(reclaim_decision(None, 0), ReclaimDecision::Reclaim);
+    }
+
+    #[test]
+    fn a_new_lease_expires_one_window_from_now_since_boot() {
+        let before = boot_ms().unwrap();
+        let lease = TeardownLease::new(TeardownPhase::Cleanup, Duration::from_secs(60)).unwrap();
+        let after = boot_ms().unwrap();
+        assert!((before + 60_000..=after + 60_000).contains(&lease.deadline_boot_ms));
+    }
+
+    #[test]
+    fn the_epilog_window_budgets_a_script_only_when_one_runs() {
+        let timeout = Duration::from_secs(120);
+        assert_eq!(epilog_window(false, timeout), Duration::from_secs(30));
+        // 120s timeout, 5s per kill signal, 1s output drain, 30s slack.
+        assert_eq!(epilog_window(true, timeout), Duration::from_secs(161));
+    }
+
+    #[test]
+    fn the_cleanup_window_keeps_its_slack_when_the_cgroup_is_already_gone() {
+        assert_eq!(
+            cleanup_window(Some(Duration::from_secs(40))),
+            Duration::from_secs(70)
+        );
+        assert_eq!(cleanup_window(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_longest_hold_covers_a_full_reap_and_the_longest_allowed_epilog() {
+        let cleanup_timeout = Duration::from_secs(60);
+        let max_epilog_timeout =
+            Duration::from_secs(spur_core::config::MAX_EPILOG_TIMEOUT_SECS.into());
+        assert_eq!(
+            longest_hold(cleanup_timeout),
+            cleanup_window(Some(cleanup_timeout)) + epilog_window(true, max_epilog_timeout)
+        );
     }
 
     #[test]
@@ -211,35 +284,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join(LEASE_FILE),
-            br#"{"phase":"epilog","deadline_unix_ms":5}"#,
+            br#"{"phase":"epilog","deadline_boot_ms":5}"#,
         )
         .unwrap();
         assert_eq!(read(dir.path()).unwrap(), Some(lease_expiring_at(5)));
     }
 
-    fn spawn_group_leader() -> Child {
-        Command::new("sleep")
-            .arg("300")
+    fn spawn_group_leader(script: &str) -> Child {
+        Command::new("sh")
+            .args(["-c", script])
             .process_group(0)
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap()
     }
 
+    fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
+        std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
+    }
+
     #[test]
     fn killing_an_orphaned_hook_ends_its_whole_group() {
-        let mut leader = spawn_group_leader();
+        let mut leader = spawn_group_leader("exec sleep 300");
         let hook = HookProcess::of(leader.id()).unwrap();
         assert!(kill_orphaned_hook(&hook));
-        let status = leader.wait().unwrap();
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(libc::SIGKILL)
-        );
+        assert!(killed_by_sigkill(leader.wait().unwrap()));
+    }
+
+    #[test]
+    fn a_hook_whose_leader_exited_still_has_its_children_killed() {
+        let mut leader = spawn_group_leader("sleep 300 &");
+        let hook = HookProcess::of(leader.id()).unwrap();
+        let mut held_by_child = leader.stdout.take().unwrap();
+        leader.wait().unwrap();
+
+        assert!(kill_orphaned_hook(&hook));
+        // The backgrounded sleep inherited stdout, so EOF means it died.
+        let mut rest = Vec::new();
+        held_by_child.read_to_end(&mut rest).unwrap();
     }
 
     #[test]
     fn a_recycled_pid_is_not_mistaken_for_the_hook() {
-        let mut stranger = spawn_group_leader();
+        let mut stranger = spawn_group_leader("exec sleep 300");
         let hook = HookProcess {
             start_ticks: HookProcess::of(stranger.id()).unwrap().start_ticks + 1,
             ..HookProcess::of(stranger.id()).unwrap()
@@ -251,8 +338,8 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_that_already_exited_is_not_signalled() {
-        let mut leader = spawn_group_leader();
+    fn a_hook_whose_whole_group_is_gone_is_not_signalled() {
+        let mut leader = spawn_group_leader("exec sleep 300");
         let hook = HookProcess::of(leader.id()).unwrap();
         leader.kill().unwrap();
         leader.wait().unwrap();

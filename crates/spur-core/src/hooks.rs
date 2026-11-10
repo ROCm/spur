@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -64,10 +63,16 @@ impl HookContext {
 /// Grace between SIGTERM and SIGKILL when a bounded hook outlives its limit.
 pub const HOOK_KILL_GRACE: Duration = Duration::from_secs(5);
 
-/// The longest [`run_hook_bounded`] can take with `timeout`: the limit itself,
-/// then [`HOOK_KILL_GRACE`] for SIGTERM, then the same grace to observe SIGKILL.
+/// How long a hook's stderr is still logged after the hook exits. A child it
+/// left running can hold the pipe open indefinitely, and must not hold the
+/// caller with it.
+pub const HOOK_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// The longest [`run_hook_bounded`] can take with `timeout`: the limit, a
+/// [`HOOK_KILL_GRACE`] for SIGTERM, another to observe SIGKILL, then the
+/// stderr drain.
 pub fn bounded_hook_ceiling(timeout: Duration) -> Duration {
-    timeout + HOOK_KILL_GRACE + HOOK_KILL_GRACE
+    timeout + HOOK_KILL_GRACE + HOOK_KILL_GRACE + HOOK_OUTPUT_DRAIN_GRACE
 }
 
 struct HookBound {
@@ -77,18 +82,16 @@ struct HookBound {
 
 /// Run a prolog/epilog hook script with rich environment variables.
 ///
-/// Stderr is captured and logged; stdout is discarded.
-/// Returns `Err` on script execution failure or non-zero exit.
+/// Stderr is logged; stdout is discarded. The hook is done when its own
+/// process exits, whatever it left running. Returns `Err` on script execution
+/// failure or non-zero exit.
 pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()> {
     run_hook_with(script_path, ctx, None, |_| {}).await
 }
 
-/// [`run_hook`], but the hook leads a process group of its own and is killed
-/// once `timeout` elapses: SIGTERM to the group, then SIGKILL after
-/// [`HOOK_KILL_GRACE`]. A timeout is an `Err`.
-///
-/// `on_spawn` receives the hook's pid, which is also its process group id,
-/// before this waits on it.
+/// [`run_hook`] in its own process group, SIGTERMed at `timeout` and SIGKILLed
+/// [`HOOK_KILL_GRACE`] later; a timeout is an `Err`. `on_spawn` receives the
+/// pid, which is also the group id.
 pub async fn run_hook_bounded(
     script_path: &str,
     ctx: &HookContext,
@@ -125,7 +128,7 @@ async fn run_hook_with(
     if bound.is_some() {
         cmd.process_group(0);
     }
-    let child = spawn_hook_in_work_dir(cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
+    let mut child = spawn_hook_in_work_dir(cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
             format!(
                 "{} script failed to execute: {}",
@@ -136,77 +139,95 @@ async fn run_hook_with(
     if let Some(pid) = pid {
         on_spawn(pid);
     }
+    let mut stderr_logger = child
+        .stderr
+        .take()
+        .map(|stderr| log_hook_stderr(stderr, ctx.job_id, ctx.script_context.clone()));
 
     let incomplete = || format!("{} script failed to complete", ctx.script_context);
-    let wait = child.wait_with_output();
-    let (output, timed_out) = match bound {
-        None => (Some(wait.await.with_context(incomplete)?), false),
-        Some(bound) => {
-            tokio::pin!(wait);
-            match tokio::time::timeout(bound.timeout, &mut wait).await {
-                Ok(result) => (Some(result.with_context(incomplete)?), false),
-                Err(_) => (
-                    terminate_hook_group(pid, bound.kill_grace, &mut wait).await,
-                    true,
-                ),
+    let status = match bound {
+        None => Some(child.wait().await.with_context(incomplete)?),
+        Some(bound) => match tokio::time::timeout(bound.timeout, child.wait()).await {
+            Ok(status) => Some(status.with_context(incomplete)?),
+            Err(_) => {
+                terminate_hook_group(pid, bound.kill_grace, &mut child).await;
+                None
             }
-        }
+        },
     };
-
-    if let Some(output) = &output {
-        if !output.stderr.is_empty() {
-            let stderr_text = String::from_utf8_lossy(&output.stderr);
-            for line in stderr_text.lines() {
-                warn!(
-                    job_id = ctx.job_id,
-                    hook = %ctx.script_context,
-                    "{}", line
-                );
-            }
-        }
+    if let Some(logger) = stderr_logger.as_mut() {
+        finish_logging_stderr(logger, ctx).await;
     }
 
-    if timed_out {
+    let Some(status) = status else {
         anyhow::bail!(
             "{} script timed out and was killed (script: {})",
             ctx.script_context,
             script_path
         );
-    }
-    if let Some(output) = output {
-        if !output.status.success() {
-            anyhow::bail!(
-                "{} script exited with {} (script: {})",
-                ctx.script_context,
-                output.status,
-                script_path
-            );
-        }
+    };
+    if !status.success() {
+        anyhow::bail!(
+            "{} script exited with {} (script: {})",
+            ctx.script_context,
+            status,
+            script_path
+        );
     }
 
     Ok(())
 }
 
+fn log_hook_stderr(
+    stderr: tokio::process::ChildStderr,
+    job_id: JobId,
+    hook: String,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::AsyncBufReadExt;
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).split(b'\n');
+        loop {
+            match lines.next_segment().await {
+                Ok(Some(line)) => warn!(job_id, hook = %hook, "{}", String::from_utf8_lossy(&line)),
+                Ok(None) => return,
+                Err(error) => {
+                    warn!(job_id, hook = %hook, %error, "cannot read hook stderr");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+async fn finish_logging_stderr(logger: &mut tokio::task::JoinHandle<()>, ctx: &HookContext) {
+    if tokio::time::timeout(HOOK_OUTPUT_DRAIN_GRACE, &mut *logger)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    logger.abort();
+    warn!(
+        job_id = ctx.job_id,
+        hook = %ctx.script_context,
+        "a process the hook left running still holds its stderr; no longer logging it"
+    );
+}
+
 /// SIGTERMs a timed-out hook's process group and escalates to SIGKILL once
-/// `grace` passes. Returns what the leader left behind, or `None` if even
-/// SIGKILL was not observed: a descendant that escaped the group can hold the
-/// stderr pipe open, and the caller must not wait on it.
+/// `grace` passes, then waits at most one more grace for the leader to go.
 async fn terminate_hook_group(
     pid: Option<u32>,
     grace: Duration,
-    wait: &mut (impl Future<Output = std::io::Result<std::process::Output>> + Unpin),
-) -> Option<std::process::Output> {
+    child: &mut tokio::process::Child,
+) {
     signal_hook_group(pid, nix::sys::signal::Signal::SIGTERM);
-    let finished = tokio::time::timeout(grace, &mut *wait).await;
+    let exited = tokio::time::timeout(grace, child.wait()).await.is_ok();
     // Also after a prompt exit: the leader dying on SIGTERM can leave
     // descendants that ignored it.
     signal_hook_group(pid, nix::sys::signal::Signal::SIGKILL);
-    match finished {
-        Ok(result) => result.ok(),
-        Err(_) => tokio::time::timeout(grace, wait)
-            .await
-            .ok()
-            .and_then(Result::ok),
+    if !exited {
+        let _ = tokio::time::timeout(grace, child.wait()).await;
     }
 }
 
@@ -965,6 +986,29 @@ mod tests {
             nix::unistd::Pid::from_raw(escaped as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn bounded_hook_is_done_when_it_exits_even_if_a_child_holds_its_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("escaped.pid");
+        let script = make_script(&format!(
+            "setsid sleep 60 &\necho $! > {}\nexit 0",
+            pidfile.display()
+        ));
+        let result = run_hook_bounded(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .await;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid_recorded_in(&pidfile) as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        result.expect("a hook that exited 0 succeeded, whatever it left running");
     }
 
     #[tokio::test]
