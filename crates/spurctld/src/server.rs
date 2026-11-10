@@ -6966,6 +6966,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(spec),
             },
@@ -7001,6 +7002,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(JobSpec {
                     name: "alice-job".into(),
@@ -7070,6 +7072,7 @@ mod tests {
         <crate::cluster::ClusterManager as crate::raft::StateMachineApply>::apply_operation(
             service.cluster.as_ref(),
             &spur_core::wal::WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(spec),
             },
@@ -7119,6 +7122,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(JobSpec {
                     name: "alice-job".into(),
@@ -7296,6 +7300,7 @@ mod tests {
         per_node.insert("n1".to_string(), res.clone());
         for id in [20, 21] {
             apply(&WalOperation::JobSubmit {
+                at: None,
                 job_id: id,
                 spec: Box::new(JobSpec {
                     name: "cancelled".into(),
@@ -7355,6 +7360,7 @@ mod tests {
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
 
         let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(JobSpec {
                 name: name.into(),
@@ -7466,6 +7472,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(JobSpec {
                 name: "evicted".into(),
@@ -7519,6 +7526,7 @@ mod tests {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
                 &WalOperation::JobSubmit {
+                    at: None,
                     job_id: task_id,
                     spec: Box::new(JobSpec {
                         name: "array-task".into(),
@@ -7604,6 +7612,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 52,
             spec: Box::new(JobSpec {
                 name: "relaunching".into(),
@@ -7704,6 +7713,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 60,
             spec: Box::new(JobSpec {
                 name: "requeueheld".into(),
@@ -7767,6 +7777,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 40,
             spec: Box::new(JobSpec {
                 name: "moved".into(),
@@ -7831,6 +7842,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 50,
                 spec: Box::new(JobSpec {
                     name: "launching".into(),
@@ -7870,6 +7882,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 60,
                 spec: Box::new(JobSpec {
                     name: "starting".into(),
@@ -7923,6 +7936,7 @@ mod tests {
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let cancelled_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
+                at: None,
                 job_id,
                 spec: Box::new(JobSpec {
                     name: "cancelled".into(),
@@ -7992,6 +8006,7 @@ mod tests {
         };
         let timed_out_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
+                at: None,
                 job_id,
                 spec: Box::new(JobSpec {
                     name: "timed-out".into(),
@@ -8055,6 +8070,7 @@ mod tests {
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let stopped_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
+                at: None,
                 job_id,
                 spec: Box::new(JobSpec {
                     name: "victim".into(),
@@ -8144,6 +8160,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 77,
             spec: Box::new(JobSpec {
                 name: "interactive".into(),
@@ -8210,6 +8227,7 @@ mod tests {
         let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
         if cluster.get_job(id).is_none() {
             cluster.apply_operation(&WalOperation::JobSubmit {
+                at: None,
                 job_id: id,
                 spec: Box::new(JobSpec {
                     name: "requeue".into(),
@@ -8392,6 +8410,7 @@ mod tests {
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
         cluster.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 85,
             spec: Box::new(JobSpec {
                 name: "queued".into(),

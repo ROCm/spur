@@ -36,6 +36,8 @@ pub enum WalOperation {
     JobSubmit {
         job_id: JobId,
         spec: Box<JobSpec>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobStateChange {
         job_id: JobId,
@@ -655,7 +657,8 @@ impl WalOperation {
     /// Replays must date from here, not their own clock. `None` pre-upgrade.
     pub fn occurred_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
-            Self::JobStart { at, .. }
+            Self::JobSubmit { at, .. }
+            | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -672,8 +675,7 @@ impl WalOperation {
             Self::JobPreemptSignaled { pending, .. } => Some(pending.signaled_at),
             // Exhaustive on purpose: a new variant that dates something a user
             // reads back must be a compile error here, not a silent `None`.
-            Self::JobSubmit { .. }
-            | Self::JobStepComplete { .. }
+            Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
@@ -705,7 +707,8 @@ impl WalOperation {
     /// An entry that already carries one keeps it.
     pub fn stamp_occurred_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
         let slot = match self {
-            Self::JobStart { at, .. }
+            Self::JobSubmit { at, .. }
+            | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -722,7 +725,6 @@ impl WalOperation {
             | Self::JobTimeLimitExpired { .. }
             | Self::JobPreemptSignaled { .. }
             | Self::JobCancelSignaled { .. }
-            | Self::JobSubmit { .. }
             | Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
@@ -1178,12 +1180,12 @@ mod tests {
     fn job_submit_v0_5_1_payload_still_deserializes() {
         const JOB_SUBMIT_V0_5_1: &str = r#"{"JobSubmit":{"job_id":7,"spec":{"name":"fixture","partition":null,"account":null,"user":"alice","uid":1000,"gid":1000,"num_nodes":1,"num_tasks":1,"tasks_per_node":null,"cpus_per_task":1,"memory_per_node_mb":null,"memory_per_cpu_mb":null,"gres":[],"script":null,"argv":[],"script_args":[],"work_dir":"/home/alice","stdout_path":null,"stderr_path":null,"stdin_path":null,"environment":{},"time_limit":null,"time_min":null,"qos":null,"priority":null,"reservation":null,"dependency":[],"nodelist":null,"exclude":null,"constraint":null,"mpi":null,"distribution":null,"het_group":null,"array_spec":null,"array_job_id":null,"array_task_id":null,"array_max_concurrent":null,"requeue":false,"exclusive":false,"hold":false,"interactive":false,"mail_type":[],"mail_user":null,"comment":null,"wckey":null,"container_image":null,"container_mounts":[],"container_workdir":null,"container_name":null,"container_readonly":false,"container_mount_home":false,"container_env":{},"container_entrypoint":null,"container_remap_root":false,"burst_buffer":null,"begin_time":null,"deadline":null,"spread_job":false,"topology":null,"host_network":false,"privileged":false,"host_ipc":false,"shm_size":null,"extra_resources":{},"open_mode":null}}}"#;
 
-        let op: WalOperation = serde_json::from_str(JOB_SUBMIT_V0_5_1).expect(
-            "v0.5.1 JobSubmit must deserialize; a new JobSpec field needs #[serde(default)]",
-        );
+        let op: WalOperation = serde_json::from_str(JOB_SUBMIT_V0_5_1)
+            .expect("v0.5.1 JobSubmit must deserialize; new persisted fields need defaults");
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, at } => {
                 assert_eq!(job_id, 7);
+                assert_eq!(at, None);
                 assert_eq!(spec.name, "fixture");
                 assert_eq!(spec.work_dir, "/home/alice");
                 assert!(!spec.pty);
@@ -1329,6 +1331,7 @@ mod tests {
         use crate::job::JobSpec;
 
         let op = WalOperation::JobSubmit {
+            at: None,
             job_id: 99,
             spec: Box::new(JobSpec {
                 name: "mpi-job".into(),
@@ -1340,7 +1343,7 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, .. } => {
                 assert_eq!(job_id, 99);
                 assert_eq!(spec.mpi.as_deref(), Some("pmix"));
             }
@@ -1450,6 +1453,25 @@ mod tests {
             Some(at),
             "the instant must survive the log verbatim"
         );
+    }
+
+    #[test]
+    fn submission_stamp_survives_serialization_and_restamping() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07.123456789Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let mut op = WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::default(),
+            at: None,
+        };
+        op.stamp_occurred_at(at);
+        let mut recovered: WalOperation =
+            serde_json::from_slice(&serde_json::to_vec(&op).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(recovered.occurred_at(), Some(at));
+        recovered.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(recovered.occurred_at(), Some(at));
     }
 }
 
