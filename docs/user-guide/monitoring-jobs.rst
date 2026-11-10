@@ -1183,26 +1183,34 @@ default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
 than event-time reports. Pagination uses user/account order, not a frozen
 snapshot; counts can change while pages are read.
 
-Add ``--by-cause`` to show nonzero unused counts by ``reason`` and ``initiator``
-below each user/account summary. These use the same values as the scheduler
+Add ``--by-cause`` to show only nonzero unused counts, with one row per requesting
+user/account, reason, and initiator. These use the same values as the scheduler
 metrics and count victim runs, not nodes. For example:
 
 .. code-block:: text
 
-   User                 Account                      Used       Unused         Open
-   alice                research                        2            3            0
-     Unused: reason=cancelled initiator=user count=2
-     Unused: reason=launch_failed initiator=system count=1
+   $ sreport preemptions --by-cause
+   User                 Account              Reason               Initiator          Unused
+   alice                research             cancelled            user                    2
+   alice                research             launch_failed        system                  1
 
 With ``--parsable --by-cause``, the columns are
-``User|Account|Used|Unused|Open|Reason|Initiator|Count``. Summary rows leave the
-last three columns empty; detail rows repeat the user/account and leave
-``Used``, ``Unused``, and ``Open`` empty. Detail counts sum to the summary's
-``Unused``; do not add them to that total again. Pagination still limits
-user/account pairs and keeps their details together, with at most 16 cause
-buckets per pair. Without ``--by-cause``, the existing five-column output is
-unchanged. The new CLI reports an error when the controller lacks detailed-report
-support instead of silently displaying incomplete details.
+``User|Account|Reason|Initiator|Unused``. For example:
+
+.. code-block:: text
+
+   $ sreport preemptions --parsable --noheader --by-cause --user alice
+   alice|research|cancelled|user|2
+   alice|research|launch_failed|system|1
+
+Cause counts add up to the pair's ``Unused`` total in the default report, which
+continues to show ``User Account Used Unused Open``. Pairs with no unused counts
+have no rows in the cause report. Pagination still limits user/account pairs
+and keeps their causes together, with at most 16 cause buckets plus an optional
+historical remainder per pair. A page can have no cause rows and still print a
+next-page token on standard error; continue until there is no token. The CLI
+reports an error when the controller lacks detailed-report support instead of
+silently displaying incomplete details.
 
 The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
 privacy settings, including coordinator visibility. Scoped reports identify

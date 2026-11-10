@@ -54,7 +54,7 @@ pub enum SreportCommand {
         user: Option<String>,
         #[arg(long)]
         account: Option<String>,
-        /// Show unused counts by reason and initiator below each summary
+        /// Show only unused counts, grouped by reason and initiator
         #[arg(long)]
         by_cause: bool,
         /// User/account pairs per page (1-1000)
@@ -178,18 +178,15 @@ fn print_preemptions(
     parsable: bool,
     noheader: bool,
 ) -> Result<()> {
-    if by_cause && !response.causes_included {
-        anyhow::bail!("controller does not support --by-cause; upgrade the controller");
+    if by_cause {
+        if !response.causes_included {
+            anyhow::bail!("controller does not support --by-cause; upgrade the controller");
+        }
+        return print_preemption_causes(out, response, parsable, noheader);
     }
-    let suffix = if by_cause { "|||" } else { "" };
     if !noheader {
         if parsable {
-            let columns = if by_cause {
-                "|Reason|Initiator|Count"
-            } else {
-                ""
-            };
-            writeln!(out, "User|Account|Used|Unused|Open{columns}")?;
+            writeln!(out, "User|Account|Used|Unused|Open")?;
         } else {
             writeln!(
                 out,
@@ -202,7 +199,7 @@ fn print_preemptions(
         if parsable {
             writeln!(
                 out,
-                "{}|{}|{}|{}|{}{suffix}",
+                "{}|{}|{}|{}|{}",
                 entry.user, entry.account, entry.used, entry.unused, entry.open
             )?;
         } else {
@@ -212,9 +209,28 @@ fn print_preemptions(
                 entry.user, entry.account, entry.used, entry.unused, entry.open
             )?;
         }
-        if !by_cause {
-            continue;
+    }
+    Ok(())
+}
+
+fn print_preemption_causes(
+    out: &mut impl std::io::Write,
+    response: &spur_proto::proto::GetPreemptionUsageResponse,
+    parsable: bool,
+    noheader: bool,
+) -> Result<()> {
+    if !noheader {
+        if parsable {
+            writeln!(out, "User|Account|Reason|Initiator|Unused")?;
+        } else {
+            writeln!(
+                out,
+                "{:<20} {:<20} {:<20} {:<12} {:>12}",
+                "User", "Account", "Reason", "Initiator", "Unused"
+            )?;
         }
+    }
+    for entry in &response.entries {
         let unclassified = spur_proto::proto::UnusedPreemptionCount {
             reason: "unclassified".into(),
             initiator: "unknown".into(),
@@ -231,14 +247,14 @@ fn print_preemptions(
             if parsable {
                 writeln!(
                     out,
-                    "{}|{}||||{}|{}|{}",
+                    "{}|{}|{}|{}|{}",
                     entry.user, entry.account, cause.reason, cause.initiator, cause.count
                 )?;
             } else {
                 writeln!(
                     out,
-                    "  Unused: reason={} initiator={} count={}",
-                    cause.reason, cause.initiator, cause.count
+                    "{:<20} {:<20} {:<20} {:<12} {:>12}",
+                    entry.user, entry.account, cause.reason, cause.initiator, cause.count
                 )?;
             }
         }
@@ -723,41 +739,101 @@ mod tests {
     }
 
     #[test]
-    fn preemption_details_preserve_summary_and_reject_unsupported_servers() {
+    fn preemption_reports_separate_totals_from_nonzero_causes() {
         use spur_proto::proto::{
             GetPreemptionUsageResponse, PreemptionUsageEntry, UnusedPreemptionCount,
         };
         let mut response = GetPreemptionUsageResponse {
-            entries: vec![PreemptionUsageEntry {
-                user: "alice".into(),
-                account: "research".into(),
-                used: 2,
-                unused: 3,
-                open: 1,
-                unused_by_cause: vec![UnusedPreemptionCount {
-                    reason: "cancelled".into(),
-                    initiator: "user".into(),
-                    count: 2,
-                }],
-                unclassified_unused: 1,
-            }],
+            entries: vec![
+                PreemptionUsageEntry {
+                    user: "alice".into(),
+                    account: "research".into(),
+                    used: 2,
+                    unused: 3,
+                    open: 1,
+                    unused_by_cause: vec![
+                        UnusedPreemptionCount {
+                            reason: "cancelled".into(),
+                            initiator: "user".into(),
+                            count: 2,
+                        },
+                        UnusedPreemptionCount {
+                            reason: "launch_failed".into(),
+                            initiator: "system".into(),
+                            count: 0,
+                        },
+                    ],
+                    unclassified_unused: 1,
+                },
+                PreemptionUsageEntry {
+                    user: "bob".into(),
+                    account: "research".into(),
+                    used: 4,
+                    open: 1,
+                    ..Default::default()
+                },
+            ],
             causes_included: true,
             ..Default::default()
         };
-        let mut out = Vec::new();
-        print_preemptions(&mut out, &response, false, true, false).expect("summary");
-        assert_eq!(
-            String::from_utf8(out).expect("utf8"),
-            "User|Account|Used|Unused|Open\nalice|research|2|3|1\n"
-        );
-        let mut out = Vec::new();
-        print_preemptions(&mut out, &response, true, true, false).expect("details");
-        assert_eq!(String::from_utf8(out).expect("utf8"),
-            "User|Account|Used|Unused|Open|Reason|Initiator|Count\nalice|research|2|3|1|||\nalice|research||||cancelled|user|2\nalice|research||||unclassified|unknown|1\n");
+        for (by_cause, header, rows) in [
+            (
+                false,
+                "User|Account|Used|Unused|Open\n",
+                "alice|research|2|3|1\nbob|research|4|0|1\n",
+            ),
+            (
+                true,
+                "User|Account|Reason|Initiator|Unused\n",
+                "alice|research|cancelled|user|2\nalice|research|unclassified|unknown|1\n",
+            ),
+        ] {
+            for noheader in [false, true] {
+                for parsable in [false, true] {
+                    let mut out = Vec::new();
+                    print_preemptions(&mut out, &response, by_cause, parsable, noheader)
+                        .expect("report");
+                    let actual = String::from_utf8(out).expect("utf8");
+                    let expected = format!("{}{rows}", if noheader { "" } else { header });
+                    if parsable {
+                        assert_eq!(actual, expected);
+                    } else {
+                        let normalized = actual
+                            .lines()
+                            .map(|line| line.split_whitespace().collect::<Vec<_>>().join("|"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            + "\n";
+                        assert_eq!(normalized, expected);
+                    }
+                }
+            }
+        }
         response.causes_included = false;
         let mut out = Vec::new();
         assert!(print_preemptions(&mut out, &response, true, true, false).is_err());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn preemption_cause_page_without_unused_has_no_rows() {
+        let response = spur_proto::proto::GetPreemptionUsageResponse {
+            entries: vec![spur_proto::proto::PreemptionUsageEntry {
+                user: "alice".into(),
+                account: "research".into(),
+                used: 2,
+                open: 1,
+                ..Default::default()
+            }],
+            causes_included: true,
+            next_page_token: r#"["alice","research"]"#.into(),
+            ..Default::default()
+        };
+        for parsable in [false, true] {
+            let mut out = Vec::new();
+            print_preemptions(&mut out, &response, true, parsable, true).expect("empty page");
+            assert!(out.is_empty());
+        }
     }
 
     #[test]

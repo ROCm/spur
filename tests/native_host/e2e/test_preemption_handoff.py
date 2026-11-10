@@ -535,20 +535,20 @@ def test_usage_distinguishes_launch_failure_from_later_application_failure(hando
 
 def _rollup_report(c, expected, *filters, causes=None):
     def check():
-        detail_flags = ["--by-cause"] if causes is not None else []
         text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader",
-                      *detail_flags, *filters])
+                      *filters])
         rows = [line.split("|") for line in text.splitlines() if "|" in line]
-        assert all(len(row) == (8 if causes is not None else 5) for row in rows), text
-        summaries = [row for row in rows if row[2]]
-        actual = {(row[0], row[1]): tuple(map(int, row[2:5])) for row in summaries}
-        assert len(actual) == len(summaries) and actual == expected, text
+        assert all(len(row) == 5 for row in rows), text
+        actual = {(row[0], row[1]): tuple(map(int, row[2:5])) for row in rows}
+        assert len(actual) == len(rows) and actual == expected, text
         if causes is not None:
-            details = [row for row in rows if not row[2]]
-            assert all(row[2:5] == ["", "", ""] for row in details), text
-            assert all(row[5:] == ["", "", ""] for row in summaries), text
-            actual_causes = {(row[0], row[1], row[5], row[6]): int(row[7]) for row in details}
+            text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                          "--by-cause", *filters])
+            details = [line.split("|") for line in text.splitlines() if "|" in line]
+            assert all(len(row) == 5 and row[2] and row[3] for row in details), text
+            actual_causes = {tuple(row[:4]): int(row[4]) for row in details}
             assert len(actual_causes) == len(details) and actual_causes == causes, text
+            assert all(n > 0 for n in actual_causes.values()), text
             for pair, (_, unused, _) in actual.items():
                 assert sum(n for key, n in actual_causes.items() if key[:2] == pair) == unused, text
         return True
@@ -642,23 +642,33 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b",
                    causes={(user, "rollup-b", "cancelled", "user"): 1})
     human = c.cli(["spur", "sreport", "preemptions", "--by-cause"])
-    assert ("Unused: reason=launch_failed initiator=system count=1" in human) == (not used), human
-    assert "Unused: reason=cancelled initiator=user count=1" in human, human
+    human_rows = [line.split() for line in human.splitlines() if line.strip()]
+    assert human_rows[0] == ["User", "Account", "Reason", "Initiator", "Unused"], human
+    expected_rows = [[*key, str(count)] for key, count in sorted(causes.items())]
+    assert human_rows[1:] == expected_rows, human
+    noheader = c.cli(["spur", "sreport", "preemptions", "--by-cause", "--noheader"])
+    assert [line.split() for line in noheader.splitlines() if line.strip()] == expected_rows, noheader
+    parsable = c.cli(["spur", "sreport", "preemptions", "--by-cause", "--parsable"])
+    assert parsable.splitlines() == ["User|Account|Reason|Initiator|Unused",
+                                     *["|".join(row) for row in expected_rows]], parsable
     for flags in ([], ["--by-cause"]):
         code, first = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable",
                                        "--noheader", "--limit", "1", *flags])
         assert code == 0, first
-        assert f"{user}|rollup-a|{used}|{sum(first_unused.values())}|0" in first and "rollup-b" not in first, first
+        first_rows = [line for line in first.splitlines() if "|" in line]
         if flags:
-            assert (f"{user}|rollup-a||||launch_failed|system|1" in first) == (not used), first
+            assert first_rows == ([] if used else [f"{user}|rollup-a|launch_failed|system|1"]), first
+        else:
+            assert first_rows == [f"{user}|rollup-a|{used}|{sum(first_unused.values())}|0"], first
         token = re.search(r"Next page token: (.+)", first)
         assert token, first
         code, second = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable", "--noheader",
                                         "--limit", "1", "--page-token", token[1], *flags])
         assert code == 0, second
-        assert f"{user}|rollup-b|0|1|0" in second and "Next page token" not in second, second
+        assert "Next page token" not in second, second
         assert "rollup-a" not in second, second
-        if flags:
-            assert f"{user}|rollup-b||||cancelled|user|1" in second, second
+        second_rows = [line for line in second.splitlines() if "|" in line]
+        expected_second = f"{user}|rollup-b|cancelled|user|1" if flags else f"{user}|rollup-b|0|1|0"
+        assert second_rows == [expected_second], second
     code, output = c.cli_with_exit(["spur", "sreport", "preemptions", "--start", "now-7days"])
     assert code != 0 and "lifetime" in output, output
