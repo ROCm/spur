@@ -62,6 +62,8 @@ fn canonical_preemption(cm: &ClusterManager, observation: u64) -> WalOperation {
 fn requester_reservation(observation: u64, allocation: ResourceAllocations) -> WalOperation {
     WalOperation::JobStart {
         preemption_observation: Some(observation),
+        effective_partition: None,
+        memory_adjustment: None,
         job_id: 10,
         nodes: vec!["n1".into()],
         resources: allocation.clone(),

@@ -31,6 +31,8 @@ fn reserve(cm: &ClusterManager, id: JobId, attempt: u32, nodes: &[(&str, Resourc
     }
     cm.apply_operation(&WalOperation::JobStart {
         preemption_observation: None,
+        effective_partition: None,
+        memory_adjustment: None,
         job_id: id,
         nodes: nodes.iter().map(|(n, _)| n.to_string()).collect(),
         resources: total,

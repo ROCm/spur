@@ -596,6 +596,9 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _gate(c, victim, [0], False)
     _wait_prolog(c, hunter, [0])
     _usage(c, open_count=1)
+    placement = c.scontrol("show", "job", str(hunter))
+    partition = re.search(r"\bPartition=(\S+)", placement)
+    assert partition and f"EffectivePartition={partition[1]}" in placement, placement
     _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)}, causes={})
 
     # Pause preserves the ephemeral published port that the controller is configured to use.

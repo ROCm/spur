@@ -1305,6 +1305,7 @@ mod tests {
             idle_fill: false,
             effective_partition: Some("cpu".into()),
             memory_adjustment: Some(adjustment),
+            preemption_observation: Some(7),
             at: None,
         };
         let back: WalOperation =
@@ -1313,10 +1314,12 @@ mod tests {
             WalOperation::JobStart {
                 effective_partition,
                 memory_adjustment,
+                preemption_observation,
                 ..
             } => {
                 assert_eq!(effective_partition.as_deref(), Some("cpu"));
                 assert_eq!(memory_adjustment, Some(adjustment));
+                assert_eq!(preemption_observation, Some(7));
             }
             _ => panic!("wrong variant"),
         }

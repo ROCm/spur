@@ -50,6 +50,8 @@ fn start_observation(cm: &ClusterManager, observation: u64, run_attempt: u32, no
     assert!(
         cm.apply_operation(&WalOperation::JobStart {
             preemption_observation: Some(observation),
+            effective_partition: None,
+            memory_adjustment: None,
             job_id: 10,
             nodes: vec![node.into()],
             resources: scalar(),
