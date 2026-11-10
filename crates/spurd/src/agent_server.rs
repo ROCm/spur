@@ -1243,6 +1243,9 @@ pub struct TrackedJob {
     /// The job's cgroup, owned here so every launch path into the job can reach
     /// it. `None` when cgroup enforcement is off or no cgroup was created.
     cgroup_path: Option<std::path::PathBuf>,
+    /// Whether a graceful stop already SIGTERMed the job's own process; a
+    /// repeat stop must not SIGTERM it again. Explicit signals do not set it.
+    sigterm_delivered: bool,
 }
 
 impl crate::reporter::HeldRun for TrackedJob {
@@ -1252,6 +1255,20 @@ impl crate::reporter::HeldRun for TrackedJob {
 }
 
 impl TrackedJob {
+    /// SIGTERMs the job's own process unless an earlier stop already did. A
+    /// stop that found no process to signal does not count, so a later one
+    /// still can.
+    fn terminate_once(&mut self) {
+        if self.sigterm_delivered {
+            return;
+        }
+        self.sigterm_delivered = self
+            .job
+            .kill_signal(nix::sys::signal::Signal::SIGTERM)
+            .is_ok()
+            && self.job.has_live_process();
+    }
+
     /// Take the cgroup path, leaving `None`. Whichever teardown path reaches
     /// the job first takes it, so the removal it authorizes happens once.
     fn take_cgroup(&mut self) -> Option<std::path::PathBuf> {
@@ -2179,6 +2196,15 @@ fn tracked_run(
         .filter(|tracked| tracked.run_attempt == run_attempt)
 }
 
+fn tracked_run_mut(
+    jobs: &mut HashMap<u32, TrackedJob>,
+    job_id: u32,
+    run_attempt: u32,
+) -> Option<&mut TrackedJob> {
+    jobs.get_mut(&job_id)
+        .filter(|tracked| tracked.run_attempt == run_attempt)
+}
+
 /// Whether the node already tracks this run of the job or a newer one; an older run is
 /// superseded by the incoming one, not a duplicate of it.
 fn tracks_run_at_or_after(jobs: &HashMap<u32, TrackedJob>, job_id: u32, run_attempt: u32) -> bool {
@@ -2248,6 +2274,7 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         nodelist: descriptor.resources.nodelist.clone(),
         mpi: descriptor.resources.mpi.clone(),
         run_attempt: descriptor.run_attempt,
+        sigterm_delivered: false,
     }
 }
 
@@ -3294,6 +3321,9 @@ struct ActiveStep {
     /// The step's own run_attempt, so a job-wide cancel for one attempt
     /// can't reach an unsupervised step of a different, still-live one.
     run_attempt: u32,
+    /// Whether a graceful stop already SIGTERMed the step; a repeat stop must
+    /// not SIGTERM it again. Explicit signals neither read nor set this.
+    sigterm_delivered: bool,
     /// Spool files the step's stdout/stderr are redirected to, so
     /// `stream_job_output` can tail them live keyed on (job_id, step_id).
     stdout_path: String,
@@ -7358,6 +7388,7 @@ impl SlurmAgent for AgentService {
                         mpi: spec.mpi.clone(),
                         run_attempt,
                         cgroup_path: pty_cgroup_path.clone().or(result.cgroup_path),
+                        sigterm_delivered: false,
                     },
                 );
                 if let Some(tracked) = jobs.get_mut(&job_id) {
@@ -8193,6 +8224,7 @@ impl SlurmAgent for AgentService {
                 // older controller keeps the previous stale-report-disabled behavior.
                 run_attempt: req.run_attempt,
                 cgroup_path,
+                sigterm_delivered: false,
             },
         );
         // Commit under `running`, the order commit_job expects, so the job is
@@ -11152,10 +11184,59 @@ impl AgentService {
         let targets = self
             .unsupervised_step_targets(job_id, run_attempt, true)
             .await;
+        let pids: Vec<u32> = targets.iter().map(|(_key, pid, _epoch)| *pid).collect();
+        self.signal_then_escalate(targets, &pids, signal, escalate_after)
+            .await;
+    }
+
+    /// A graceful stop of the job's unsupervised steps: like
+    /// `cancel_active_steps_for_job` with SIGTERM, except a step that already
+    /// got that SIGTERM from an earlier stop is not signalled again while it
+    /// checkpoints. The SIGKILL escalation still covers every step.
+    async fn terminate_active_steps_for_job(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        kill_wait: std::time::Duration,
+    ) {
+        let targets = self
+            .unsupervised_step_targets(job_id, run_attempt, true)
+            .await;
+        let unsignalled = self.claim_step_sigterms(&targets).await;
+        self.signal_then_escalate(
+            targets,
+            &unsignalled,
+            nix::sys::signal::Signal::SIGTERM as i32,
+            kill_wait,
+        )
+        .await;
+    }
+
+    /// Marks each target step as having had its SIGTERM and returns the pids
+    /// that had not yet. Done in one lock so concurrent stops cannot both claim.
+    async fn claim_step_sigterms(&self, targets: &[((u32, u32), u32, u64)]) -> Vec<u32> {
+        let mut steps = self.active_steps.lock().await;
+        targets
+            .iter()
+            .filter_map(|(key, pid, epoch)| {
+                let step = steps.get_mut(key).filter(|step| step.epoch == *epoch)?;
+                let already_delivered = std::mem::replace(&mut step.sigterm_delivered, true);
+                (!already_delivered).then_some(*pid)
+            })
+            .collect()
+    }
+
+    async fn signal_then_escalate(
+        &self,
+        targets: Vec<((u32, u32), u32, u64)>,
+        pids: &[u32],
+        signal: i32,
+        escalate_after: std::time::Duration,
+    ) {
         if targets.is_empty() {
             return;
         }
-        for (_key, pid, _epoch) in &targets {
+        for pid in pids {
             signal_step_tree(*pid, signal);
         }
         // Escalate to SIGKILL: a container-init step ignores the graceful signal.
@@ -11235,13 +11316,8 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(
-                job_id,
-                0,
-                nix::sys::signal::Signal::SIGTERM as i32,
-                kill_wait,
-            )
-            .await;
+            self.terminate_active_steps_for_job(job_id, 0, kill_wait)
+                .await;
             return;
         };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
@@ -11311,13 +11387,8 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(
-            job_id,
-            run_attempt,
-            nix::sys::signal::Signal::SIGTERM as i32,
-            kill_wait,
-        )
-        .await;
+        self.terminate_active_steps_for_job(job_id, run_attempt, kill_wait)
+            .await;
         if supervised {
             // A stepd already confirmed dead has no teardown coming; fence it
             // now instead of waiting out the release-wait bound below.
@@ -11340,8 +11411,8 @@ impl AgentService {
         // Epoch of the run we're cancelling; the delayed SIGKILL below must not
         // touch a newer run that reused this job_id after a requeue.
         let (cancel_attempt, signaled_at) = {
-            let jobs = self.running.lock().await;
-            let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
+            let mut jobs = self.running.lock().await;
+            let Some(tracked) = tracked_run_mut(&mut jobs, job_id, run_attempt) else {
                 return;
             };
             info!(
@@ -11349,7 +11420,7 @@ impl AgentService {
                 kill_wait_secs = kill_wait.as_secs(),
                 "graceful cancel: SIGTERM, then SIGKILL after the kill wait"
             );
-            let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
+            tracked.terminate_once();
             (tracked.run_attempt, tokio::time::Instant::now())
         };
         wait_for_exit_and_teardown(
@@ -11862,6 +11933,7 @@ impl TrackedJob {
             mpi: String::new(),
             run_attempt: 0,
             cgroup_path,
+            sigterm_delivered: false,
         }
     }
 }
@@ -22439,6 +22511,7 @@ mod tests {
             mpi: String::new(),
             run_attempt: 0,
             cgroup_path: None,
+            sigterm_delivered: false,
         };
         svc.insert_test_job(job_id, tracked).await;
 
@@ -22450,6 +22523,165 @@ mod tests {
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
         );
+    }
+
+    fn once_test_service() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_repeated_graceful_cancel_sends_one_sigterm_to_an_unsupervised_step() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        svc.insert_test_job(
+            930,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.register_test_step(930, 6, child.id()).await;
+
+        svc.graceful_cancel(930, 1, kill_wait_from_request(0)).await;
+        recorder.wait_for("term", 1).await;
+        svc.insert_test_job(
+            930,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        svc.graceful_cancel(930, 1, kill_wait_from_request(0)).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_cancel_with_no_attempt_sends_one_sigterm_to_an_orphaned_step() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.register_test_step(931, 6, child.id()).await;
+
+        svc.graceful_cancel(931, 0, kill_wait_from_request(0)).await;
+        recorder.wait_for("term", 1).await;
+        svc.graceful_cancel(931, 0, kill_wait_from_request(0)).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_step_not_yet_launched_still_gets_its_sigterm_on_a_later_cancel() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        svc.register_test_step(932, 6, None).await;
+        svc.graceful_cancel(932, 0, kill_wait_from_request(0)).await;
+
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&(932, 6))
+            .expect("tracked step")
+            .pid = child.id();
+        svc.graceful_cancel(932, 0, kill_wait_from_request(0)).await;
+        recorder.wait_for("term", 1).await;
+        svc.graceful_cancel(932, 0, kill_wait_from_request(0)).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_signal_after_a_graceful_cancel_still_reaches_an_unsupervised_step() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.register_test_step(933, 6, child.id()).await;
+
+        svc.graceful_cancel(933, 0, kill_wait_from_request(0)).await;
+        recorder.wait_for("term", 1).await;
+        svc.send_explicit_signal(933, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+        recorder.wait_for("term", 2).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_warning_sigterm_to_a_step_does_not_stand_in_for_the_cancel_sigterm() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.register_test_step(934, 6, child.id()).await;
+
+        svc.signal_active_steps_for_job(934, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+        recorder.wait_for("term", 1).await;
+        svc.graceful_cancel(934, 0, kill_wait_from_request(0)).await;
+        recorder.wait_for("term", 2).await;
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_process_yet_still_gets_its_sigterm_on_a_later_stop() {
+        use crate::signal_recorder::SignalRecorder;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.terminate_once();
+        assert!(!tracked.sigterm_delivered);
+
+        let (recorder, child) = SignalRecorder::spawn().await;
+        tracked.job = executor::RunningJob::Managed { child };
+        tracked.terminate_once();
+        recorder.wait_for("term", 1).await;
+        tracked.terminate_once();
+        recorder.settle().await;
+
+        assert_eq!(recorder.sigterms(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_graceful_cancel_sends_one_sigterm_to_an_unsupervised_job() {
+        use crate::signal_recorder::SignalRecorder;
+        let svc = once_test_service();
+        let (recorder, child) = SignalRecorder::spawn().await;
+        svc.insert_test_job(
+            935,
+            TrackedJob {
+                job: executor::RunningJob::Managed { child },
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+
+        // The repeat starts while the first cancel is still waiting out the
+        // SIGTERM-ignoring job, so the wait is spent once.
+        tokio::join!(
+            svc.graceful_cancel(935, 0, kill_wait_from_request(0)),
+            async {
+                recorder.wait_for("term", 1).await;
+                svc.graceful_cancel(935, 0, kill_wait_from_request(0)).await;
+            },
+        );
+        recorder.settle().await;
+        assert_eq!(recorder.sigterms(), 1);
+
+        svc.send_explicit_signal(935, 0, nix::sys::signal::Signal::SIGUSR1 as i32)
+            .await;
+        recorder.wait_for("usr1", 1).await;
     }
 
     #[test]
@@ -23888,6 +24120,7 @@ mod tests {
                 mpi: String::new(),
                 run_attempt,
                 cgroup_path: None,
+                sigterm_delivered: false,
             };
             (t, pid)
         }
@@ -24438,6 +24671,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                sigterm_delivered: false,
             }
         }
         let job_id = 903;
@@ -24526,6 +24760,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt: 1,
+                sigterm_delivered: false,
             },
         )
         .await;

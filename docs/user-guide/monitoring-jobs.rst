@@ -868,9 +868,11 @@ the job is preempted immediately.
 * **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
   process in the job, waits up to the kill wait (5 seconds by default), then
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
-  The deadline SIGTERM is sent once per node: a repeated stop request for a job
-  that is already stopping, such as a second ``scancel``, sends no further
-  SIGTERM. Only the SIGKILL that ends the kill wait follows.
+  A process gets that deadline SIGTERM once on each node, whatever launched it
+  (the batch script, an ``srun`` step, a container step): a repeated stop
+  request for a job that is already stopping, such as a second ``scancel``,
+  sends no further SIGTERM. Only the SIGKILL that ends the kill wait follows.
+  A signal you send yourself with ``scancel --signal`` is always delivered.
   The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``

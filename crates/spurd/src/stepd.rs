@@ -3900,6 +3900,7 @@ mod launch_spec_compat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal_recorder::SignalRecorder;
 
     // A nonexistent pid has no /proc entry, so stepd_liveness reports Stale
     // regardless of the stored ticks value — 0 is fine for that case.
@@ -6759,51 +6760,6 @@ mod tests {
             session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
         session.begin_teardown().await;
         assert!(session.may_exit(std::time::Duration::ZERO));
-    }
-
-    /// Counts what a workload saw: one line in `term` per SIGTERM and one in
-    /// `beat` per loop pass. A pending trap runs before the shell's next
-    /// command, so two beats after a signal was sent prove it has been handled.
-    struct SignalRecorder(tempfile::TempDir);
-
-    impl SignalRecorder {
-        async fn spawn() -> (Self, tokio::process::Child) {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let script = format!(
-                "trap 'echo >> {dir}/term' TERM; \
-                 while :; do echo >> {dir}/beat; sleep 0.02; done",
-                dir = dir.path().display()
-            );
-            let child = tokio::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .process_group(0)
-                .kill_on_drop(true)
-                .spawn()
-                .expect("spawn recorder");
-            let recorder = Self(dir);
-            recorder.wait_for("beat", 1).await;
-            (recorder, child)
-        }
-
-        fn lines(&self, name: &str) -> usize {
-            std::fs::read_to_string(self.0.path().join(name))
-                .map(|contents| contents.lines().count())
-                .unwrap_or(0)
-        }
-
-        async fn wait_for(&self, name: &str, lines: usize) {
-            while self.lines(name) < lines {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        }
-
-        async fn settle(&self) {
-            self.wait_for("beat", self.lines("beat") + 2).await;
-        }
-
-        fn sigterms(&self) -> usize {
-            self.lines("term")
-        }
     }
 
     fn session_over(child: tokio::process::Child) -> Stepd {
