@@ -2364,7 +2364,7 @@ pub(crate) async fn run_interactive_pty(
     let winsize = crate::interactive::get_terminal_size();
 
     let mut created_step: Option<u32> = None;
-    let mut cached_step: Option<(u32, String, String)> = None;
+    let mut cached_step: Option<(u32, String, crate::interactive::StepProof)> = None;
     // The controller resolves the step's own container against the parent job's
     // (inheriting `salloc/sbatch --container-image`) and echoes the effective spec;
     // persisted across retries since a cached step skips the CreateJobStep call.
@@ -2428,7 +2428,10 @@ pub(crate) async fn run_interactive_pty(
                 let pair = (
                     step_resp.step_id,
                     format!("http://{}", step_resp.node_addr),
-                    step_resp.execution_credential,
+                    crate::interactive::StepProof {
+                        execution_credential: step_resp.execution_credential,
+                        join_grant: step_resp.join_grant,
+                    },
                 );
                 cached_step = Some(pair.clone());
                 pair

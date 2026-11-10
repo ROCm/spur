@@ -146,6 +146,14 @@ pub fn sign_dispatch_credential(
     })
 }
 
+/// A step started by someone the owner shared the job with runs as that user.
+#[derive(Debug, Clone, Copy)]
+pub struct StepRunsAs<'a> {
+    pub user: &'a str,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 pub fn sign_step_credential(
     cluster_id: &str,
     job: &spur_core::job::Job,
@@ -153,6 +161,7 @@ pub fn sign_step_credential(
     command: &[String],
     nodes: &[String],
     container_image: &str,
+    runs_as: Option<StepRunsAs<'_>>,
 ) -> Result<String, spur_core::native_cred::CredentialError> {
     if EXEC.get().cloned().flatten().is_none() {
         return Ok(String::new());
@@ -172,9 +181,9 @@ pub fn sign_step_credential(
         job_id: job.job_id,
         step_id,
         run_attempt: job.run_attempt,
-        user: job.spec.user.clone(),
-        uid: job.spec.uid,
-        gid: job.spec.gid,
+        user: runs_as.map_or_else(|| job.spec.user.clone(), |r| r.user.to_string()),
+        uid: runs_as.map_or(job.spec.uid, |r| r.uid),
+        gid: runs_as.map_or(job.spec.gid, |r| r.gid),
         supplementary_gids: Vec::new(),
         account: job.spec.account.clone().unwrap_or_default(),
         partition: job.spec.partition.clone().unwrap_or_default(),

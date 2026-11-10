@@ -827,6 +827,9 @@ pub struct JobSpec {
     /// Where the batch script runs; `None` leaves it to the cluster default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_placement: Option<crate::script_placement::ScriptPlacement>,
+    /// Other users the owner lets run work inside this job.
+    #[serde(default)]
+    pub share: crate::share::JobShare,
 }
 
 impl Default for JobSpec {
@@ -910,6 +913,7 @@ impl Default for JobSpec {
             submit_line: None,
             client_keepalive: false,
             script_placement: None,
+            share: crate::share::JobShare::default(),
         }
     }
 }

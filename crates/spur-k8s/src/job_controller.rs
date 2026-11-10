@@ -1051,6 +1051,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         script_placement: spur_core::script_placement::ScriptPlacement::to_wire(
             spec.script_placement,
         ),
+        share_with: Vec::new(),
     }
 }
 

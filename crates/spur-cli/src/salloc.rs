@@ -131,6 +131,10 @@ pub struct SallocArgs {
     /// Start the shell on this host (overrides `[salloc] use_interactive_step`)
     #[arg(long, overrides_with = "interactive_step")]
     pub no_interactive_step: bool,
+    /// Let other users start sessions in this allocation with `srun --jobid`:
+    /// comma-separated usernames, and/or `@account` for every member of the job's account
+    #[arg(long, value_name = "USERS")]
+    pub share_with: Option<String>,
 
     /// Controller address
     #[arg(
@@ -475,6 +479,7 @@ fn build_salloc_job_spec(
         client_keepalive: true,
         work_dir: submission.work_dir,
         environment: submission.environment,
+        share_with: crate::sbatch::share_with_entries(args.share_with.as_deref())?,
         ..Default::default()
     })
 }
