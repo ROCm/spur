@@ -15,7 +15,7 @@ spec:
       # spurd reaches the cluster through the host's k0s, never a pod token.
       automountServiceAccountToken: false
       nodeSelector:
-        spur.amd.com/compute: "true"
+        spur.amd.com/managed: "true"
       tolerations:
         - key: spur.amd.com/gpu-node
           operator: Exists
@@ -26,7 +26,7 @@ spec:
           image: rocm/spur:0.16.0 # x-release-please-version
           command: [spurd]
           args:
-            - --controller=spurctld.spur.svc.cluster.local:6817
+            - --controller=spurctld-client.spur.svc.cluster.local:6817
             - --listen=[::]:6816
           ports:
             - containerPort: 6816

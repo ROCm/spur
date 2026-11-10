@@ -47,7 +47,7 @@ spec:
             capabilities:
               drop: [ALL]
           args:
-            - --controller-addr=spurctld.spur.svc.cluster.local:6817
+            - --controller-addr=spurctld-client.spur.svc.cluster.local:6817
             - --listen=[::]:6818
             - --health-addr=[::]:8080
             # Authenticate the virtual-agent surface (port 6818), which carries a cluster-wide
