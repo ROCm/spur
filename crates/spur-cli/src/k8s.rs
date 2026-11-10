@@ -253,7 +253,7 @@ async fn cmd_add_nodes(
     selector: Vec<(String, String)>,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_add_nodes(ClusterAddNodesRequest {
             nodes: nodes.unwrap_or_default(),
@@ -280,7 +280,7 @@ async fn cmd_remove_nodes(
     drain_timeout: Option<u32>,
     force: bool,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_remove_nodes(ClusterRemoveNodesRequest {
             nodes,
@@ -556,5 +556,24 @@ mod tests {
             clap::error::ErrorKind::ArgumentConflict,
             "--admin and --user must be mutually exclusive"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env_injection)]
+    async fn add_and_remove_nodes_send_the_callers_credential() {
+        let env = crate::env_defaults::EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "jwt");
+        env.set("SPUR_AUTH_TOKEN", "test-jwt-token");
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+
+        cmd_add_nodes(&controller, Some("node2".into()), None, Vec::new())
+            .await
+            .unwrap();
+        cmd_remove_nodes(&controller, "node2".into(), None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(capture.authorizations(), vec!["Bearer test-jwt-token"; 2]);
     }
 }

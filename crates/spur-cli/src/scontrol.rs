@@ -1308,7 +1308,7 @@ fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String
 }
 
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -3924,5 +3924,20 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env_injection)]
+    async fn requeue_sends_the_callers_credential() {
+        let env = crate::env_defaults::EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "jwt");
+        env.set("SPUR_AUTH_TOKEN", "test-jwt-token");
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+
+        requeue(&controller, 7, false).await.unwrap();
+        requeue(&controller, 7, true).await.unwrap();
+
+        assert_eq!(capture.authorizations(), vec!["Bearer test-jwt-token"; 2]);
     }
 }
