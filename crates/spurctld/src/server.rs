@@ -1563,7 +1563,8 @@ fn reclaim_due(
 }
 
 /// Whether a stop reached `node` for its reported run less than the reclaim grace ago. The
-/// grace follows the kill wait the stop carried, which the job's current state still names.
+/// window is the job's current graceful kill wait (as `is_reclaimable` uses), or the default
+/// kill wait for a job the controller no longer has.
 fn stop_recently_delivered(
     cluster: &ClusterManager,
     node: &str,
