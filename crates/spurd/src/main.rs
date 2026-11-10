@@ -351,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let stepds = stepd::StepdStore::new(&stepd_state_dir);
     let discovered_sessions = stepds.discover_live()?;
+    let recovery_inventory_complete = discovered_sessions.rejected.is_empty();
     // A corrupted descriptor still names its (job_id, run_attempt) in the
     // directory it lives in — fence it the same way as a stale session
     // instead of silently forgetting the job forever.
@@ -713,6 +714,9 @@ async fn main() -> anyhow::Result<()> {
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
+    if recovery_inventory_complete {
+        reporter.set_recovery_inventory(agent_service.recovery_inventory());
+    }
     // stepd_state_dir is shared with spurctld's own state_dir when the operator
     // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
     // exclusively spurd's — use the runtime/ subdir spurd already owns.

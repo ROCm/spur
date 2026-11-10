@@ -322,9 +322,8 @@ pub struct Node {
     /// Captured at emit time so Raft replay is deterministic.
     #[serde(default)]
     pub reason_time: Option<DateTime<Utc>>,
-    /// An administrative scheduling hold. Explicit ReturnToService=2 can clear
-    /// plain DOWN after a valid registration; a retained drain still requires
-    /// an administrative resume.
+    /// Administrative scheduling hold: ReturnToService=2 may clear plain DOWN
+    /// after valid registration; retained drains require administrative resume.
     #[serde(default)]
     pub admin_locked: bool,
     pub partitions: Vec<String>,
@@ -355,6 +354,9 @@ pub struct Node {
     pub free_memory_mb: u64,
 
     pub boot_time: Option<DateTime<Utc>>,
+    /// Genuine agent response time, unlike the replay-seeded liveness deadline.
+    #[serde(default)]
+    pub last_response: Option<DateTime<Utc>>,
     /// Last response before DOWN, retained for the ReturnToService reboot check.
     #[serde(default)]
     pub last_response_before_down: Option<DateTime<Utc>>,
@@ -450,6 +452,7 @@ impl Node {
             cpu_load: 0,
             free_memory_mb: 0,
             boot_time: None,
+            last_response: None,
             last_response_before_down: None,
             down_from_drain: None,
             down_since: None,
@@ -604,6 +607,7 @@ mod tests {
         assert_eq!(back.down_from_drain, None);
         assert_eq!(back.last_response_before_down, None);
         assert_eq!(back.down_since, None);
+        assert_eq!(back.last_response, None);
         assert!(!back.supports(CAP_SIGNAL_JOB));
     }
 

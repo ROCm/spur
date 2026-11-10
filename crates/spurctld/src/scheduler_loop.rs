@@ -6774,6 +6774,7 @@ mod tests {
 
             cm.apply_operation(&WalOperation::NodeRegister {
                 boot_time: None,
+                observed_at: None,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {

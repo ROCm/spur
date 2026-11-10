@@ -1225,6 +1225,10 @@ changes with ``scontrol reconfigure``. Distribute the same configuration to
 all controllers; the setting is read by the current leader and a future leader
 uses its own configuration.
 
+This version also adds a Raft operation for durable cleanup quarantine, used
+even when the policy is unset. During a rolling controller upgrade, upgrade
+followers before the leader as described in :doc:`upgrading`.
+
 .. list-table::
    :header-rows: 1
    :widths: 15 85
@@ -1247,17 +1251,24 @@ uses its own configuration.
        replacement host's newer boot. DRAIN remains held, including a drain that
        became DOWN when the agent disappeared.
 
-For explicit ``1`` and ``2``, recovery requires a fresh accepted registration,
-usable resources and core layout, no controller allocations, and a complete empty
-allocation inventory reported by the agent. The agent reports recovered job
-supervisors too; a failed inventory lookup or surviving work keeps the node DOWN.
+For explicit ``1`` and ``2``, recovery requires a heartbeat carrying the current
+DOWN event, followed by an accepted registration that echoes that event and
+reports an empty inventory sampled afterward. This prevents a delayed report
+from clearing a later DOWN. Recovery also requires usable resources and core
+layout and no controller allocations. The agent checks running jobs, launch
+reservations, recovered supervisors, active setup and teardown, and pending
+cleanup together; an incomplete or failed lookup keeps the node DOWN.
 Heartbeats request another registration while recovery is eligible, allowing the
-existing stale-job reclamation path to finish first. Upgrade ``spurd`` before
+existing stale-job reclamation path to finish first. Initial registration stays
+conservative until the agent finishes connecting its recovery inventory; recovery
+normally follows a later heartbeat. Upgrade ``spurd`` before
 enabling these modes: older agents and the Kubernetes operator do not certify an
 empty registration inventory and therefore remain DOWN until resumed manually.
 Mode ``1`` also requires the boot time reported from Linux ``/proc/stat`` and a
-stored response from before DOWN. A DOWN record predating that response metadata
-needs an administrative resume.
+stored genuine response from before DOWN. Controller replay never supplies that
+response evidence. A DOWN record predating that response metadata needs an
+administrative resume in mode ``1``; a record without a persisted DOWN event
+needs a resume in either explicit recovery mode.
 
 An administrative DOWN restored from an older snapshot may not distinguish a
 plain DOWN from an earlier drain. Such an ambiguous hold remains DOWN in mode

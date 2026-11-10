@@ -78,15 +78,13 @@ pub trait HeldRun {
 /// controller decides from its own authoritative state whether any is stale.
 pub trait HeldJobs: Send + Sync {
     fn held_jobs(&self) -> Vec<(u32, u32)>;
-    fn no_held_jobs(&self) -> Option<bool> {
-        None
-    }
+}
+
+pub trait RecoveryInventory: Send + Sync {
+    fn no_held_jobs(&self) -> Option<bool>;
 }
 
 impl<T: HeldRun + Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn no_held_jobs(&self) -> Option<bool> {
-        self.try_lock().ok().map(|jobs| jobs.is_empty())
-    }
     fn held_jobs(&self) -> Vec<(u32, u32)> {
         match self.try_lock() {
             Ok(jobs) => jobs
@@ -120,6 +118,7 @@ pub struct NodeReporter {
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
+    recovery_inventory: std::sync::OnceLock<Arc<dyn RecoveryInventory>>,
     /// The live per-node allocation, read each heartbeat for the translated GPU
     /// stable_ids each held job occupies so the controller can converge its
     /// used-view. Authoritative post-translation source (an adopted legacy job's
@@ -181,6 +180,7 @@ impl NodeReporter {
                 .ok()
                 .and_then(|stat| boot_time_from_stat(&stat)),
             held_jobs,
+            recovery_inventory: std::sync::OnceLock::new(),
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
             last_failed_endpoint: std::sync::Mutex::new(None),
@@ -509,14 +509,28 @@ impl NodeReporter {
         self.register_with(&self.snapshot_resources()).await
     }
 
-    fn registration_request(&self, resources: &ResourceSet) -> RegisterAgentRequest {
+    pub fn set_recovery_inventory(&self, inventory: Arc<dyn RecoveryInventory>) {
+        let _ = self.recovery_inventory.set(inventory);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registration_request(&self, resources: &ResourceSet) -> RegisterAgentRequest {
+        self.recovery_registration_request(resources, None)
+    }
+
+    pub(crate) fn recovery_registration_request(
+        &self,
+        resources: &ResourceSet,
+        recovery_down_since: Option<prost_types::Timestamp>,
+    ) -> RegisterAgentRequest {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
         RegisterAgentRequest {
             hostname: self.hostname.clone(),
+            recovery_down_since,
             boot_time: self.boot_time,
-            no_held_jobs: self.held_jobs.no_held_jobs(),
+            no_held_jobs: self.recovery_inventory.get().and_then(|i| i.no_held_jobs()),
             resources: Some(resource_to_proto(resources)),
             version: env!("CARGO_PKG_VERSION").into(),
             address: self.node_address.ip.clone(),
@@ -534,8 +548,16 @@ impl NodeReporter {
     /// the reporter baseline, so a failed register leaves the baseline unchanged
     /// and the next tick re-detects the same delta and retries.
     pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
+        self.register_for_recovery(resources, None).await
+    }
+
+    async fn register_for_recovery(
+        &self,
+        resources: &ResourceSet,
+        recovery_down_since: Option<prost_types::Timestamp>,
+    ) -> anyhow::Result<()> {
         let ticket = lock_recover(&self.spec).begin_registration();
-        let req = self.registration_request(resources);
+        let req = self.recovery_registration_request(resources, recovery_down_since);
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
             .await
@@ -659,7 +681,13 @@ impl NodeReporter {
                     // a changed spec policy is redelivered without a restart.
                     if resp.reregister {
                         info!("controller requested re-registration; re-registering");
-                        if let Err(e) = self.register().await {
+                        if let Err(e) = self
+                            .register_for_recovery(
+                                &self.snapshot_resources(),
+                                resp.recovery_down_since,
+                            )
+                            .await
+                        {
                             warn!(error = %e, "controller-requested re-registration failed");
                         }
                     }
@@ -2609,7 +2637,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_reports_boot_and_certifies_only_an_empty_inventory() {
+    fn registration_reports_boot_without_certifying_an_uninitialized_inventory() {
         let mut reporter = test_reporter(rset(8, 1024, vec![]));
         reporter.boot_time = boot_time_from_stat("cpu 1 2 3\nbtime 1700000000\nprocesses 9\n");
         let request = reporter.registration_request(&reporter.snapshot_resources());
@@ -2620,27 +2648,10 @@ mod tests {
                 nanos: 0
             })
         );
-        assert_eq!(request.no_held_jobs, Some(true));
+        assert_eq!(request.no_held_jobs, None);
         for stat in ["", "btime invalid", "btime 0", "btime -1"] {
             assert_eq!(boot_time_from_stat(stat), None);
         }
-    }
-
-    #[test]
-    fn busy_or_nonempty_held_inventory_cannot_certify_recovery() {
-        struct Run;
-        impl HeldRun for Run {
-            fn run_attempt(&self) -> u32 {
-                1
-            }
-        }
-        let jobs = Mutex::new(HashMap::<u32, Run>::new());
-        assert_eq!(jobs.no_held_jobs(), Some(true));
-        let mut guard = jobs.try_lock().unwrap();
-        assert_eq!(jobs.no_held_jobs(), None);
-        guard.insert(7, Run);
-        drop(guard);
-        assert_eq!(jobs.no_held_jobs(), Some(false));
     }
 
     #[test]

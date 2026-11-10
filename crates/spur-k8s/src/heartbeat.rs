@@ -124,6 +124,7 @@ mod tests {
             capabilities: vec![],
             boot_time: None,
             no_held_jobs: None,
+            recovery_down_since: None,
         }
     }
 

@@ -326,6 +326,8 @@ pub enum WalOperation {
         capabilities: Vec<String>,
         #[serde(default)]
         boot_time: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        observed_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     NodeUpdate {
         name: String,
@@ -343,11 +345,19 @@ pub enum WalOperation {
         #[serde(default)]
         boot_time: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
+        observed_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
         return_to_service: Option<u8>,
         #[serde(default)]
         recovery_validated: bool,
         #[serde(default)]
         recovery_down_since: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    NodeQuarantine {
+        name: String,
+        reason: String,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     NodeStateChange {
         name: String,
@@ -661,6 +671,7 @@ impl WalOperation {
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
+            | Self::NodeQuarantine { at, .. }
             | Self::NodeRemove { at, .. } => *at,
             Self::JobSuspend { at, .. }
             | Self::JobResume { at, .. }
@@ -711,6 +722,7 @@ impl WalOperation {
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
+            | Self::NodeQuarantine { at, .. }
             | Self::NodeRemove { at, .. } => at,
             // Exhaustive for the same reason as `occurred_at`: these carry no
             // stamp, and a new one that does must not silently go unstamped.
@@ -1316,6 +1328,7 @@ mod tests {
         let old: WalOperation = serde_json::from_str(r#"{"NodeUpdate":{"name":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"","port":6818,"wg_pubkey":"","version":""}}"#).unwrap();
         let WalOperation::NodeUpdate {
             boot_time,
+            observed_at,
             return_to_service,
             recovery_validated,
             recovery_down_since,
@@ -1325,6 +1338,7 @@ mod tests {
             panic!("node update");
         };
         assert_eq!(boot_time, None);
+        assert_eq!(observed_at, None);
         assert_eq!(return_to_service, None);
         assert!(!recovery_validated);
         assert_eq!(recovery_down_since, None);
@@ -1776,6 +1790,7 @@ mod deregistration_wal_tests {
     fn node_register_capabilities_round_trip() {
         let op = WalOperation::NodeRegister {
             boot_time: None,
+            observed_at: None,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet::default(),

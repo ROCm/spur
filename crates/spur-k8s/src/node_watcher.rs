@@ -127,6 +127,7 @@ pub async fn run(
                     let req = RegisterAgentRequest {
                         boot_time: None,
                         no_held_jobs: None,
+                        recovery_down_since: None,
                         hostname: name.clone(),
                         resources: Some(resources),
                         version: "spur-k8s-operator".into(),

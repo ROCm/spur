@@ -1858,6 +1858,32 @@ fn refuse_allocation(
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
 pub type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
 
+struct AgentRecoveryInventory {
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    stepds: Arc<Mutex<StepdMap>>,
+    lifecycle: crate::job_lifecycle::JobLifecycle,
+    step_launches: crate::job_lifecycle::StepLaunchLifecycle,
+    store: crate::stepd::StepdStore,
+}
+
+impl crate::reporter::RecoveryInventory for AgentRecoveryInventory {
+    fn no_held_jobs(&self) -> Option<bool> {
+        self.lifecycle.certify_idle(|| {
+            self.step_launches.certify_idle(|| {
+                let stepds = self.stepds.try_lock().ok()?;
+                let running = self.running.try_lock().ok()?;
+                let allocation = self.allocation.try_lock().ok()?;
+                if !stepds.is_empty() || !running.is_empty() || allocation.has_jobs() {
+                    return Some(false);
+                }
+                self.store.ensure_cleanup_ready().ok()?;
+                Some(true)
+            })
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct StepdRecoveryCleanup {
     running: RunningJobs,
@@ -4329,6 +4355,17 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    pub fn recovery_inventory(&self) -> Arc<dyn crate::reporter::RecoveryInventory> {
+        Arc::new(AgentRecoveryInventory {
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+            stepds: self.stepds.clone(),
+            lifecycle: self.lifecycle.clone(),
+            step_launches: self.step_launches.clone(),
+            store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+        })
+    }
+
     /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
     /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
     #[cfg(test)]
@@ -11839,6 +11876,103 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/runtime.sock"),
             std::path::PathBuf::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn recovery_registration_certifies_the_complete_agent_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let reporter = test_reporter();
+        let service = AgentService::new(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(root.path().to_path_buf());
+        let certificate = || {
+            reporter
+                .registration_request(&reporter.snapshot_resources())
+                .no_held_jobs
+        };
+        assert_eq!(certificate(), None);
+        reporter.set_recovery_inventory(service.recovery_inventory());
+        assert_eq!(certificate(), Some(true));
+
+        service
+            .allocation
+            .lock()
+            .await
+            .allocate_for_job(7, 1, 1, 0, &[])
+            .unwrap();
+        assert_eq!(certificate(), Some(false), "CPU-only launch reservation");
+        service.allocation.lock().await.release_job(7);
+        let allocation = service.allocation.lock().await;
+        assert_eq!(certificate(), None);
+        drop(allocation);
+
+        let launch = service.lifecycle.acquire(7).await;
+        assert_eq!(
+            certificate(),
+            Some(false),
+            "launch or teardown can outlive tracking"
+        );
+        drop(launch);
+        let step = service.step_launches.acquire((7, 1, 0)).await;
+        assert_eq!(certificate(), Some(false));
+        drop(step);
+
+        let older = session_for(1, 0);
+        let newer = session_for(2, spur_core::step::STEP_BATCH);
+        recover_stepds(&service.running, vec![older.clone(), newer.clone()]).await;
+        service.adopt_stepds(&[older.clone(), newer.clone()]).await;
+        service.running.lock().await.remove(&79);
+        service.stepds.lock().await.remove(&stepd_key(&newer));
+        assert_eq!(
+            certificate(),
+            Some(false),
+            "older supervisor survives the newest running entry"
+        );
+        service.stepds.lock().await.remove(&stepd_key(&older));
+
+        let store = crate::stepd::StepdStore::new(root.path());
+        let cleanup = store.cleanup_store();
+        let record = crate::cgroup_cleanup::PendingCleanup {
+            job_id: 7,
+            run_attempt: 1,
+            step_id: 0,
+            cgroup: root.path().join("job_7"),
+            deadline_unix_ms: 1,
+            quarantine_acknowledged: false,
+        };
+        cleanup.track(&record).unwrap();
+        assert_eq!(certificate(), None, "untracked supervisor cleanup");
+        cleanup.acknowledge_quarantine(&record).unwrap();
+        assert_eq!(
+            certificate(),
+            None,
+            "quarantine acknowledgment does not prove cleanup"
+        );
+        cleanup.finish(&record).unwrap();
+        std::fs::remove_dir(store.root().join("cleanup")).unwrap();
+        std::fs::write(store.root().join("cleanup"), "unreadable directory").unwrap();
+        assert_eq!(certificate(), None);
+        std::fs::remove_file(store.root().join("cleanup")).unwrap();
+        assert_eq!(certificate(), Some(true));
+
+        let challenge = Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 1,
+        });
+        let request =
+            reporter.recovery_registration_request(&reporter.snapshot_resources(), challenge);
+        assert_eq!(request.recovery_down_since, challenge);
+        assert_eq!(request.no_held_jobs, Some(true));
+        assert_eq!(
+            reporter
+                .registration_request(&reporter.snapshot_resources())
+                .recovery_down_since,
+            None
+        );
     }
 
     /// Only an older run is fenced: the launching run's own steps and a newer run's are left alone.

@@ -203,6 +203,10 @@ fn index_cpu_ids(cpu_ids: &[u32]) -> HashMap<u32, usize> {
 }
 
 impl NodeAllocation {
+    pub fn has_jobs(&self) -> bool {
+        !self.owners.is_empty() || !self.launching.is_empty()
+    }
+
     pub fn new(name: String, resources: &ResourceSet) -> Self {
         let num_gpus = resources.gpus.len();
         let cpu_ids = online_cpu_ids(resources);

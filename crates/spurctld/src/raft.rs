@@ -128,6 +128,8 @@ impl JobFinalized {
 /// Response returned after a Raft write is committed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientResponse {
+    #[serde(default)]
+    pub node_quarantined: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs_finalized: Vec<JobFinalized>,
     #[serde(default)]
@@ -1398,6 +1400,12 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn old_client_response_does_not_acknowledge_quarantine() {
+        let response: ClientResponse = serde_json::from_str(r#"{"jobs_finalized":[]}"#).unwrap();
+        assert!(!response.node_quarantined);
+    }
 
     struct NoopApplier;
     impl StateMachineApply for NoopApplier {

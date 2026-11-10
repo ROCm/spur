@@ -2608,6 +2608,16 @@ impl SlurmController for ControllerService {
                     .ok_or_else(|| Status::invalid_argument("invalid boot_time"))
             })
             .transpose()?;
+        let recovery_down_since = req
+            .recovery_down_since
+            .map(|ts| {
+                if ts.nanos < 0 || ts.nanos >= 1_000_000_000 {
+                    return Err(Status::invalid_argument("invalid recovery_down_since"));
+                }
+                chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                    .ok_or_else(|| Status::invalid_argument("invalid recovery_down_since"))
+            })
+            .transpose()?;
         let mut resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
         // Carry the agent's reported CPU topology into the inventory so the
         // controller can compute this node's core layout. Absent
@@ -2645,6 +2655,7 @@ impl SlurmController for ControllerService {
                 caller_privileged,
                 boot_time,
                 req.no_held_jobs,
+                recovery_down_since,
             )
             .map_err(register_node_rpc_status)?;
 
@@ -2696,8 +2707,7 @@ impl SlurmController for ControllerService {
                 ));
             }
             self.verify_node_identity(&req.reporting_node, &req.node_token)?;
-            // Older controllers understand this separate entry too; a completion
-            // must never commit before the node's scheduling hold is durable.
+            // Completion must not release tracking before the scheduling hold is durable.
             self.cluster
                 .quarantine_node(&req.reporting_node, &req.drain_reason)
                 .map_err(|error| {
@@ -2806,9 +2816,16 @@ impl SlurmController for ControllerService {
                 req.core_layout_fingerprint,
                 &req.spec_enforcement_error,
             );
-            let return_registration = self.cluster.return_registration_needed(&req.hostname);
+            let recovery_down_since = self
+                .cluster
+                .return_registration_challenge(&req.hostname)
+                .map(|at| prost_types::Timestamp {
+                    seconds: at.timestamp(),
+                    nanos: at.timestamp_subsec_nanos() as i32,
+                });
             Ok(Response::new(HeartbeatResponse {
-                reregister: reregister || return_registration,
+                reregister: reregister || recovery_down_since.is_some(),
+                recovery_down_since,
             }))
         } else {
             Err(Status::not_found(format!(
@@ -8916,6 +8933,25 @@ mod tests {
                         spur_core::node::NodeState::Down
                     );
                 }
+                svc.register_agent(Request::new(request.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    svc.cluster.get_node("return-node").unwrap().state,
+                    spur_core::node::NodeState::Down
+                );
+                let heartbeat = svc
+                    .heartbeat(Request::new(HeartbeatRequest {
+                        hostname: "return-node".into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let request = RegisterAgentRequest {
+                    recovery_down_since: heartbeat.recovery_down_since,
+                    ..request
+                };
                 svc.register_agent(Request::new(request)).await.unwrap();
                 let expected = if mode == 2 {
                     spur_core::node::NodeState::Idle
@@ -8946,6 +8982,126 @@ mod tests {
                 .await;
             assert_eq!(response.unwrap_err().code(), tonic::Code::InvalidArgument);
             assert!(svc.cluster.get_node("invalid-boot").is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_service_rejects_delayed_certificates_and_retains_cleanup_quarantine() {
+        use spur_core::node::NodeState;
+        use spur_core::wal::WalOperation;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.controller.return_to_service = Some(2);
+        let svc = test_service_with(&dir, config).await;
+        let mut request = RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            resources: Some(spur_proto::proto::ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            }),
+            no_held_jobs: Some(true),
+            ..Default::default()
+        };
+        svc.register_agent(Request::new(request.clone()))
+            .await
+            .unwrap();
+        svc.cluster
+            .update_node_state(
+                "n1",
+                NodeState::Down,
+                Some("operator hold".into()),
+                Some(1000),
+            )
+            .unwrap();
+        let response = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        request.recovery_down_since = response.recovery_down_since;
+        let newer_at =
+            svc.cluster.get_node("n1").unwrap().down_since.unwrap() + chrono::Duration::seconds(1);
+        crate::raft::StateMachineApply::apply_operation(
+            &*svc.cluster,
+            &WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: NodeState::Down,
+                new_state: NodeState::Down,
+                reason: Some("new operator hold".into()),
+                admin_locked: true,
+                reason_uid: Some(1000),
+                reason_time: Some(newer_at),
+                last_response: None,
+                at: Some(newer_at),
+            },
+        );
+        svc.register_agent(Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(svc.cluster.get_node("n1").unwrap().state, NodeState::Down);
+        request.recovery_down_since = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .recovery_down_since;
+        svc.register_agent(Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(svc.cluster.get_node("n1").unwrap().state, NodeState::Idle);
+
+        svc.cluster
+            .update_node_state("n1", NodeState::Down, Some("retired".into()), Some(1000))
+            .unwrap();
+        request.recovery_down_since = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .recovery_down_since;
+        let held = svc.cluster.get_node("n1").unwrap();
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            step_id: None,
+            ..cleanup_failure_report(0, 0)
+        }))
+        .await
+        .unwrap();
+        svc.register_agent(Request::new(request)).await.unwrap();
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.down_from_drain, Some(true));
+        assert_eq!(
+            (node.state_reason, node.reason_uid, node.reason_time),
+            (held.state_reason, held.reason_uid, held.reason_time)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_recovery_challenges_are_rejected_before_registration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        for (seconds, nanos) in [(1, -1), (1, 1_000_000_000), (i64::MAX, 0)] {
+            let error = svc
+                .register_agent(Request::new(RegisterAgentRequest {
+                    hostname: "invalid-challenge".into(),
+                    recovery_down_since: Some(prost_types::Timestamp { seconds, nanos }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(svc.cluster.get_node("invalid-challenge").is_none());
         }
     }
 
@@ -9207,11 +9363,15 @@ mod tests {
             .unwrap();
 
         let operations = logged_operations(dir.path());
-        let drain = operations.iter().position(|(_, op)| matches!(op,
-            WalOperation::NodeStateChange {
-                last_response: None, name, new_state: NodeState::Draining, admin_locked: true, .. }
-                if name == "n1"
-        )).expect("durable quarantine");
+        let drain = operations
+            .iter()
+            .position(|(_, op)| {
+                matches!(op,
+                    WalOperation::NodeQuarantine { name, .. }
+                        if name == "n1"
+                )
+            })
+            .expect("durable quarantine");
         let completion = operations
             .iter()
             .position(|(_, op)| {
@@ -9250,11 +9410,15 @@ mod tests {
         svc.report_job_status(Request::new(report)).await.unwrap();
 
         let operations = logged_operations(dir.path());
-        let drain = operations.iter().position(|(_, op)| matches!(op,
-            WalOperation::NodeStateChange {
-                last_response: None, name, new_state: NodeState::Draining, admin_locked: true, .. }
-                if name == "n1"
-        )).expect("durable quarantine");
+        let drain = operations
+            .iter()
+            .position(|(_, op)| {
+                matches!(op,
+                    WalOperation::NodeQuarantine { name, .. }
+                        if name == "n1"
+                )
+            })
+            .expect("durable quarantine");
         let completion = operations.iter().position(|(_, op)| matches!(op,
             WalOperation::JobStepComplete { job_id: id, .. } | WalOperation::JobComplete { job_id: id, .. }
                 if *id == job_id
