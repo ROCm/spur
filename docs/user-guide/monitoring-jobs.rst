@@ -1146,8 +1146,11 @@ Device-backed victims require matching node-local device IDs and inventory
 generation; merely using CPU on the same GPU node is insufficient. Legacy
 device allocations without node-local identity cannot establish matching use.
 CPU and memory have no allocation-unit identities, so scalar-only attribution consumes
-a deterministic capacity budget in victim-ID order. This is an approximation,
-not proof that preemption was necessary or a measure of lost GPU-hours. One
+a deterministic capacity budget in victim-ID order. Legacy scalar allocations
+without per-node slices divide their totals across the recorded node order,
+assigning any remainder to the first nodes. This preserves the full CPU and
+memory budget but remains an approximation, not proof that preemption was
+necessary or a measure of lost GPU-hours. One
 victim using any matching capacity counts once; this does not measure the
 fraction of its allocation used. Capacity released after launch confirmation
 cannot serve that launch.

@@ -85,13 +85,18 @@ fn allocation_slices(
     let n = nodes.len().max(1) as u32;
     nodes
         .iter()
-        .map(|node| {
+        .enumerate()
+        .map(|(index, node)| {
             let alloc = per_node.get(node).cloned().unwrap_or_else(|| {
                 // Aggregate device IDs cannot identify a node-local slice.
                 total
                     .filter(|a| !a.has_devices())
                     .map(|a| {
-                        ResourceAllocations::with_scalar(a.cpus / n, a.memory_mb / u64::from(n))
+                        let cpus = a.cpus / n + u32::from((index as u32) < a.cpus % n);
+                        let n = u64::from(n);
+                        let memory_mb =
+                            a.memory_mb / n + u64::from((index as u64) < a.memory_mb % n);
+                        ResourceAllocations::with_scalar(cpus, memory_mb)
                     })
                     .unwrap_or_default()
             });

@@ -443,3 +443,134 @@ fn preemption_eviction_discards_cached_confirmations_before_job_id_reuse() {
     assert!(cm.get_job(10).is_none());
     assert!(cm.preemption_confirmations.read().is_empty());
 }
+
+#[test]
+fn aggregate_scalar_preemption_slices_preserve_the_full_budget_in_node_order() {
+    let nodes = vec!["n3".into(), "n1".into(), "n2".into()];
+    let total = ResourceAllocations::with_scalar(10, 11);
+    let slices = allocation_slices(&nodes, Some(&total), &HashMap::new());
+    assert_eq!(slices.values().map(|a| a.cpus).sum::<u32>(), total.cpus);
+    assert_eq!(
+        slices.values().map(|a| a.memory_mb).sum::<u64>(),
+        total.memory_mb
+    );
+    assert_eq!((slices["n3"].cpus, slices["n3"].memory_mb), (4, 4));
+    assert_eq!((slices["n1"].cpus, slices["n1"].memory_mb), (3, 4));
+    assert_eq!((slices["n2"].cpus, slices["n2"].memory_mb), (3, 3));
+    assert!(allocation_slices(&[], Some(&total), &HashMap::new()).is_empty());
+}
+
+#[test]
+fn aggregate_scalar_preemption_remainder_can_supply_the_requesting_launch() {
+    for (cpus, memory_mb) in [(1, 0), (0, 1)] {
+        let (_dir, cm) = cluster();
+        let legacy_start: WalOperation = serde_json::from_value(serde_json::json!({
+            "JobStart": {
+                "job_id": 1,
+                "nodes": ["n1", "n2", "n3"],
+                "resources": {"cpus": cpus, "memory_mb": memory_mb, "devices": {}},
+                "run_attempt": 1
+            }
+        }))
+        .expect("aggregate-only reservation");
+        assert!(replay(&cm, &legacy_start).job_started);
+        assert!(replay(&cm, &WalOperation::job_state_change_activating(1, 1)).state_change_applied);
+        assert!(cm
+            .get_job(1)
+            .expect("legacy victim")
+            .per_node_alloc
+            .is_empty());
+        let (_follower_dir, follower) = restored(&cm);
+        let preemption = canonical_preemption(&cm, 51);
+        for replica in [&cm, &follower] {
+            assert!(replay(replica, &preemption).preempt_applied);
+            assert_eq!(replica.preemption_usage().open, 1);
+            let reservation =
+                requester_reservation(51, ResourceAllocations::with_scalar(cpus, memory_mb));
+            assert!(replay(replica, &reservation).job_started);
+            replay(replica, &WalOperation::job_state_change_activating(10, 1));
+            replay(replica, &release_confirmation(51));
+            assert_usage(replica, 1, 0);
+        }
+        assert_eq!(ledger_snapshot(&cm), ledger_snapshot(&follower));
+    }
+}
+
+#[test]
+fn signaled_preemption_without_completion_unpins_its_terminal_owner_on_node_loss() {
+    for removed in [false, true] {
+        let (_dir, cm) = cluster();
+        register_gpu_node(&cm);
+        start(&cm, 1, 1, &[("n1", scalar())]);
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let pending = PreemptPending {
+            preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
+            preemptor_run_attempt: Some(1),
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(30),
+            preempted_by: 10,
+            preempt_qos: None,
+            mode: PreemptMode::Requeue,
+            run_attempt: 1,
+            requeue_hold_secs: 0,
+        };
+        assert!(
+            replay(
+                &cm,
+                &WalOperation::JobPreemptSignaled { job_id: 1, pending }
+            )
+            .preempt_signal_applied
+        );
+        start(&cm, 10, 1, &[("n2", scalar())]);
+        confirm(&cm, 1, true);
+        let mut complete = WalOperation::job_complete(10, 0, JobState::Completed);
+        complete.stamp_occurred_at(at);
+        replay(&cm, &complete);
+        assert_eq!(cm.preemption_usage(), PreemptionUsage::default());
+        assert!(cm.preemption_usage.read().tracks_request(10));
+        assert_eq!(cm.get_job(1).expect("victim").state, JobState::Running);
+        assert!(cm.get_job(1).expect("victim").node_completions.is_empty());
+        let (_restored_dir, restored) = restored(&cm);
+        let loss = if removed {
+            WalOperation::NodeRemove {
+                name: "n1".into(),
+                reason: None,
+                at: Some(at),
+            }
+        } else {
+            WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: spur_core::node::NodeState::Mixed,
+                new_state: spur_core::node::NodeState::Down,
+                reason: None,
+                admin_locked: false,
+                reason_uid: None,
+                reason_time: None,
+                at: Some(at),
+            }
+        };
+        for replica in [&cm, &restored] {
+            let response = replay(replica, &loss);
+            assert_eq!(response.jobs_finalized.len(), 1);
+            let victim = replica.get_job(1).expect("victim");
+            assert_eq!(victim.state, JobState::NodeFail);
+            assert!(victim.preempt_pending.is_none());
+            assert!(victim.node_completions.is_empty());
+            assert_usage(replica, 0, 1);
+            assert!(!replica.preemption_usage.read().tracks_request(10));
+            replay(replica, &loss);
+            assert_usage(replica, 0, 1);
+            replay(
+                replica,
+                &WalOperation::EvictTerminalJobs {
+                    job_ids: vec![10],
+                    before: Some(at + chrono::Duration::seconds(1)),
+                    at: Some(at),
+                    preemption_release: None,
+                },
+            );
+            assert!(replica.get_job(10).is_none());
+        }
+        assert_eq!(ledger_snapshot(&cm), ledger_snapshot(&restored));
+    }
+}
