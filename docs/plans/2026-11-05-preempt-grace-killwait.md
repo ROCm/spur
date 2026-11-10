@@ -191,7 +191,10 @@ deadline if every controller is down at that moment.
 ### Timers that follow the wait
 
 The heartbeat re-cancel interval (`is_reclaimable`, `cancel_reclaim_grace`) scales with the wait the
-job got. Backfill estimates for running jobs add `timeout_kill_wait_secs`. The requeue hold is
+job got. The leader also keeps an in-memory record of stops it delivered, so heartbeat reclaim does
+not re-send a cancel to a run within `2 × (kill wait + 3 s)` of a delivered stop; it is not
+replicated, so a new leader may re-send once and the node ignores it (a repeated stop sends no
+further SIGTERM). Backfill estimates for running jobs add `timeout_kill_wait_secs`. The requeue hold is
 `max(2 x interval + 3, kill_wait_secs)` (`requeue_hold_secs`). The reclaim cool-down follows
 `kill_wait_secs`. `complete_wait_secs` should exceed the larger wait plus
 `[cgroup] cleanup_timeout_secs` (`SlurmConfig::complete_wait_floor_secs`); the controller logs a

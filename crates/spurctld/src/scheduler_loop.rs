@@ -4529,10 +4529,10 @@ fn record_stop_delivered(
     run_attempt: u32,
     node: &str,
 ) {
-    let sched = &cluster.config().scheduler;
-    let longest_wait = sched
-        .effective_kill_wait_secs()
-        .max(sched.effective_timeout_kill_wait_secs());
+    let longest_wait = cluster
+        .config()
+        .scheduler
+        .longest_effective_kill_wait_secs();
     cluster.recent_stops().record(
         job_id,
         run_attempt,
