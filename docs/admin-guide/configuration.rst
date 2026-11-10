@@ -1062,6 +1062,12 @@ startup, and so is ``mode = "required"`` with neither. Neither is reloadable:
 ``scontrol reconfigure`` keeps the key captured at startup, because adopting a
 new one live would invalidate every outstanding token at once.
 
+Without native credentials, the configured key also signs the short-lived grant
+that lets a node admit a user into a job its owner shared with them
+(:ref:`sharing-a-job`). The built-in fallback key is never used for that: with
+no ``jwt_key`` configured and no native credentials, nobody can join another
+user's job.
+
 Under the default ``mode = "permissive"``, a missing key is allowed: the
 controller still verifies any bearer token that is presented, falling back to a
 built-in signing key. A token signed with that well-known value is accepted as
@@ -1409,6 +1415,8 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``sacct -u other``, ``sacct -j`` for another user's job, and
        ``scontrol show job`` print nothing; ``sstat``, ``scontrol show step``,
        and REST ``/job/{id}`` report it as not found.
+       A job whose owner shares it with a User (``--share-with``) stays
+       visible to that User in ``scontrol show job`` and ``scontrol show step``.
    * - ``"usage"``
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is

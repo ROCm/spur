@@ -814,6 +814,10 @@ pub struct JobSpec {
     /// leave it false and stay exempt.
     #[serde(default)]
     pub client_keepalive: bool,
+
+    /// Other users the owner lets run work inside this job.
+    #[serde(default)]
+    pub share: crate::share::JobShare,
 }
 
 impl Default for JobSpec {
@@ -893,6 +897,7 @@ impl Default for JobSpec {
             pty: false,
             submit_line: None,
             client_keepalive: false,
+            share: crate::share::JobShare::default(),
         }
     }
 }

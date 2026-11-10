@@ -781,6 +781,7 @@ async fn main() -> anyhow::Result<()> {
         None => spur_core::auth::BearerAuth::jwt(auth_mode, jwt_key.as_bytes()),
     };
     agent_service.apply_auth_handshake(&bearer);
+    agent_service.set_join_grant_key(jwt_key.as_bytes());
     match auth_mode {
         spur_core::config::AuthMode::Required if bearer.native.is_none() && jwt_key.is_empty() => {
             anyhow::bail!(

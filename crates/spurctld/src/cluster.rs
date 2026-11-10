@@ -1323,6 +1323,14 @@ impl ClusterManager {
 
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache, &config.accounting)?;
+        if let Some(refusal) = share_refusal(
+            &spec.share,
+            spec.account.as_deref(),
+            &self.association_cache,
+            &config.accounting,
+        ) {
+            return Err(SubmitError::invalid(refusal));
+        }
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
@@ -3045,6 +3053,7 @@ impl ClusterManager {
                 exit_code: None,
                 pty: false,
                 job_shell: false,
+                joined_by: None,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -5015,6 +5024,32 @@ impl ClusterManager {
             }
         }
         info!(job_id, "job updated");
+        Ok(())
+    }
+
+    /// Replace who besides the owner may run work inside a job. Persisted so a
+    /// revocation survives a leader change.
+    pub fn update_job_share(
+        &self,
+        job_id: JobId,
+        share: spur_core::share::JobShare,
+    ) -> anyhow::Result<()> {
+        let account = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .map(|job| job.spec.account.clone())
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+        if let Some(refusal) = share_refusal(
+            &share,
+            account.as_deref(),
+            &self.association_cache,
+            &self.config().accounting,
+        ) {
+            return Err(JobUpdateRefusal::InvalidArgument(refusal).into());
+        }
+        self.propose(WalOperation::JobShareUpdate { job_id, share })?;
+        info!(job_id, "job share list updated");
         Ok(())
     }
 
@@ -9371,6 +9406,11 @@ impl ClusterManager {
                     }
                 }
             },
+            WalOperation::JobShareUpdate { job_id, share } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.spec.share = share.clone();
+                }
+            }
             WalOperation::JobExcludeUpdate { job_id, exclude } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     if job.state == JobState::Pending && !job.holds_a_placement() {
@@ -12236,6 +12276,44 @@ fn validate_user_account(
             valid_accounts.join(", ")
         ))),
     }
+}
+
+/// Why `share` names users who cannot join: a job is shared only within its
+/// account, so a user from another team must first be added to it. Without
+/// accounting there are no accounts, and a cold cache is left to the join-time
+/// check, which fails closed.
+fn share_refusal(
+    share: &spur_core::share::JobShare,
+    account: Option<&str>,
+    assoc_cache: &AssociationCache,
+    accounting: &spur_core::config::AccountingConfig,
+) -> Option<String> {
+    if share.users.is_empty() || !accounting.enabled() {
+        return None;
+    }
+    let Some(account) = account.filter(|a| !a.is_empty()) else {
+        return Some("a job without an account cannot be shared with named users".into());
+    };
+    let outside: Vec<&str> = share
+        .users
+        .iter()
+        .filter(|user| {
+            matches!(
+                assoc_cache.account_membership(user, account),
+                AccountMembership::NotMember(_)
+            )
+        })
+        .map(String::as_str)
+        .collect();
+    if outside.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cannot share the job with {}: not in its account '{account}'. A job is shared only \
+         within its account; an account coordinator can add a user with \
+         sacctmgr add user name=<user> account={account}",
+        outside.join(", ")
+    ))
 }
 
 const QOS_ACCOUNTING_HINT: &str =
@@ -16287,6 +16365,7 @@ state = "UP"
             exit_code: None,
             pty: false,
             job_shell: false,
+            joined_by: None,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -17530,6 +17609,7 @@ state = "UP"
                 exit_code: None,
                 pty: true,
                 job_shell: false,
+                joined_by: None,
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -32462,6 +32542,7 @@ state = "UP"
             exit_code: None,
             pty: false,
             job_shell: false,
+            joined_by: None,
         }
     }
 
@@ -40116,6 +40197,7 @@ state = "UP"
                 exit_code: None,
                 pty,
                 job_shell,
+                joined_by: None,
             }),
         });
     }

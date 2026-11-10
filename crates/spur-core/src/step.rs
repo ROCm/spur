@@ -114,6 +114,10 @@ pub struct JobStep {
     /// id cannot tell it apart from an extra session that got there first.
     #[serde(default)]
     pub job_shell: bool,
+
+    /// The user who started this step when it is not the job's owner.
+    #[serde(default)]
+    pub joined_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +518,7 @@ mod tests {
             exit_code: None,
             pty: false,
             job_shell: false,
+            joined_by: None,
         };
         let encoded = serde_json::to_string(&step).expect("serialize");
         assert!(
@@ -543,6 +548,7 @@ mod tests {
             exit_code: None,
             pty: true,
             job_shell: true,
+            joined_by: None,
         };
         let mut value = serde_json::to_value(&step).expect("serialize");
         let fields = value.as_object_mut().expect("object");
@@ -572,6 +578,7 @@ mod tests {
             exit_code: None,
             pty: false,
             job_shell: false,
+            joined_by: None,
         };
 
         assert!(!step.state.is_terminal());

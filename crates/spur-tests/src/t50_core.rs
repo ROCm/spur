@@ -1009,6 +1009,7 @@ address = "http://peer-a:6817"
                     container: None,
                     non_interactive: false,
                     execution_credential: String::new(),
+                    join_grant: String::new(),
                 },
             )),
         };

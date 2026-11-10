@@ -888,8 +888,13 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             } else {
                 for step in steps {
                     let step_name = spur_core::step::step_display_name(step.step_id);
+                    let joined_by = if step.joined_by.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" JoinedBy={}", step.joined_by)
+                    };
                     println!(
-                        "StepId={}.{} StepName={} State={} NumTasks={}",
+                        "StepId={}.{} StepName={} State={} NumTasks={}{joined_by}",
                         step.job_id, step_name, step.name, step.state, step.num_tasks
                     );
                 }
@@ -1714,6 +1719,11 @@ fn parse_update(params: &[String]) -> Result<UpdateTarget> {
             "comment" => req.comment = Some(value.into()),
             "qos" => req.qos = Some(value.into()),
             "excnodelist" | "excludednodes" => req.exclude = Some(value.into()),
+            "sharewith" => {
+                let share = spur_core::share::JobShare::parse(&[value])
+                    .map_err(|e| anyhow::anyhow!("scontrol update: ShareWith: {e}"))?;
+                req.share_with = Some(share.entries().join(","));
+            }
             "nodename" | "node" => node_name = Some(value.into()),
             "state" => node_state = Some(parse_node_state(value)?),
             "reason" => node_reason = Some(value.into()),
@@ -1755,6 +1765,7 @@ fn job_update_has_changes(req: &spur_proto::proto::UpdateJobRequest) -> bool {
         || req.comment.is_some()
         || req.qos.is_some()
         || req.exclude.is_some()
+        || req.share_with.is_some()
 }
 
 async fn update_nodes(
@@ -2614,6 +2625,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         or_null(&job.req_nodelist),
         or_null(&job.exc_nodelist),
     );
+    if !job.share_with.is_empty() {
+        let _ = writeln!(out, "   ShareWith={}", job.share_with.join(","));
+    }
     let _ = write!(out, "   NodeList={}", or_null(&job.nodelist));
     if !job.sched_nodelist.is_empty() {
         let _ = write!(out, " SchedNodeList={}", job.sched_nodelist);
@@ -4059,6 +4073,19 @@ mod tests {
 
         let req = job_update(&["jobid=101", "excnodelist=node[01-03]"]);
         assert_eq!(req.exclude.as_deref(), Some("node[01-03]"));
+    }
+
+    #[test]
+    fn share_with_is_canonicalized_and_an_empty_value_clears_it() {
+        let req = job_update(&["JobId=101", "ShareWith=bob, @Account,bob"]);
+        assert_eq!(req.share_with.as_deref(), Some("bob,@account"));
+        assert_eq!(
+            job_update(&["JobId=101", "ShareWith="])
+                .share_with
+                .as_deref(),
+            Some("")
+        );
+        assert!(update_error(&["JobId=101", "ShareWith=@everyone"]).contains("@account"));
     }
 
     #[test]

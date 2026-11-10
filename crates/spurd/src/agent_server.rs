@@ -3565,16 +3565,160 @@ fn settled_interactive_stream(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
-/// A job's `STEP_INTERACTIVE` slot is shared by every `srun --pty` invocation,
-/// so a settled outcome recorded there belongs to this request only if the
-/// last launch to claim it was for the same numbered step — otherwise it is a
-/// different invocation and a stale exit must not be replayed onto it.
-/// `None` (nothing recorded, e.g. after a restart) still trusts the outcome.
-fn settled_outcome_belongs_to_this_invocation(
-    last_launched_step_id: Option<u32>,
-    requested_step_id: u32,
-) -> bool {
-    last_launched_step_id.is_none_or(|last| last == requested_step_id)
+async fn reclaim_terminal(
+    job_id: u32,
+    custody_dir: &std::path::Path,
+) -> Option<(u32, std::os::fd::OwnedFd)> {
+    // A step that never launched a terminal has nothing in custody to ask about.
+    if !custody_dir.exists() {
+        return None;
+    }
+    crate::stepd::reclaim_orphaned_pty(custody_dir)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(job_id, %error, "could not look for an orphaned terminal");
+            None
+        })
+}
+
+/// Who a terminal opened inside a job runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionUser {
+    /// The job's owner, or an operator acting on the owner's job.
+    Owner,
+    /// A user the owner shared the job with.
+    Joiner(JoinerAccount),
+}
+
+impl SessionUser {
+    fn is_owner(&self) -> bool {
+        matches!(self, Self::Owner)
+    }
+}
+
+/// A joining user's own account on this node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinerAccount {
+    user: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+/// The keys a node checks a controller's join proof with.
+struct JoinProof<'a> {
+    cred_keys: Option<&'a spur_core::native_jwks::Ed25519VerifyKeySet>,
+    cluster_id: &'a str,
+    grant_key: &'a [u8],
+}
+
+impl JoinProof<'_> {
+    /// The user and uid the controller signed for exactly this step: a native
+    /// step credential where the cluster mints them, else a `jwt_key` join grant.
+    fn granted_user(
+        &self,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+        run_attempt: u32,
+        execution_credential: &str,
+        join_grant: &str,
+        now: u64,
+    ) -> Option<(String, u32)> {
+        if let Some(keys) = self.cred_keys.filter(|_| !execution_credential.is_empty()) {
+            let cred = spur_core::native_exec::verify_execution(
+                execution_credential,
+                keys,
+                self.cluster_id,
+                now,
+            )
+            .ok()?;
+            cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+                .ok()?;
+            return (cred.job_id == job_id
+                && cred.step_id == step_id
+                && cred.run_attempt == run_attempt)
+                .then_some((cred.user, cred.uid));
+        }
+        if join_grant.is_empty() {
+            return None;
+        }
+        let grant = spur_core::share::verify_join_grant(join_grant, self.grant_key).ok()?;
+        (grant.job_id == job_id && grant.step_id == step_id && grant.run_attempt == run_attempt)
+            .then_some((grant.user, grant.uid))
+    }
+}
+
+/// A joiner runs as their own account here, never as root, and never as a uid
+/// other than the one the controller signed for.
+fn joiner_account(user: &str, granted_uid: u32) -> Result<JoinerAccount, Status> {
+    joiner_account_from(
+        user,
+        granted_uid,
+        nix::unistd::User::from_name(user).ok().flatten(),
+    )
+}
+
+fn joiner_account_from(
+    user: &str,
+    granted_uid: u32,
+    entry: Option<nix::unistd::User>,
+) -> Result<JoinerAccount, Status> {
+    let entry = entry.ok_or_else(|| {
+        Status::permission_denied(format!("user {user} has no account on this node"))
+    })?;
+    let uid = entry.uid.as_raw();
+    if uid == 0 {
+        return Err(Status::permission_denied(
+            "a shared job cannot be joined as root",
+        ));
+    }
+    if granted_uid != 0 && granted_uid != uid {
+        return Err(Status::permission_denied(format!(
+            "user {user} is uid {uid} on this node, not the uid {granted_uid} the controller granted"
+        )));
+    }
+    Ok(JoinerAccount {
+        user: entry.name,
+        uid,
+        gid: entry.gid.as_raw(),
+        home: entry.dir.to_string_lossy().into_owned(),
+    })
+}
+
+/// The part of the owner's session a joiner inherits: what the scheduler set
+/// for the job, never the owner's own variables (tokens, keys, paths).
+fn job_context_environ(session_env: Vec<(String, String)>) -> Vec<(String, String)> {
+    const PREFIXES: &[&str] = &["SPUR_", "SLURM_"];
+    const NAMES: &[&str] = &[
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+    ];
+    // `SPUR_AUTH_TOKEN` and the like would let the joiner act as the owner.
+    const SECRET_MARKERS: &[&str] = &["TOKEN", "SECRET", "CRED", "PASS", "KEY"];
+    session_env
+        .into_iter()
+        .filter(|(key, _)| {
+            PREFIXES.iter().any(|p| key.starts_with(p)) || NAMES.contains(&key.as_str())
+        })
+        .filter(|(key, _)| {
+            let upper = key.to_ascii_uppercase();
+            !SECRET_MARKERS.iter().any(|m| upper.contains(m))
+        })
+        .collect()
+}
+
+/// The controller tells a job's terminals apart by `pty_step_id` and expects
+/// them all under the interactive step, as they were before each got its own.
+fn reported_step_id(
+    step_id: Option<spur_core::step::StepId>,
+    pty_step_id: Option<spur_core::step::StepId>,
+) -> Option<spur_core::step::StepId> {
+    match pty_step_id {
+        Some(_) => Some(spur_core::step::STEP_INTERACTIVE),
+        None => step_id,
+    }
 }
 
 /// What a step's own `--container-image` resolves to once weighed against
@@ -3836,6 +3980,7 @@ fn interactive_step_script(
     job_entry: &crate::job_entry::JobEntry,
     uid: u32,
     gid: u32,
+    work_dir: &str,
     argv: &[String],
 ) -> Result<String, Status> {
     let default_shell = ["/bin/bash".to_string()];
@@ -3844,7 +3989,7 @@ fn interactive_step_script(
     } else {
         argv
     };
-    supervised_step_script(job_entry, uid, gid, &job_entry.work_dir, command)
+    supervised_step_script(job_entry, uid, gid, work_dir, command)
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -4292,15 +4437,9 @@ pub struct AgentService {
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     /// Where a supervised step's launching RPC parks for its exit status.
     step_completions: crate::step_completion::StepCompletions,
-    /// Jobs this agent is currently bridging a terminal for. A job absent here
-    /// with a terminal in custody has been orphaned by a restart.
-    live_ptys: Arc<Mutex<std::collections::HashSet<u32>>>,
-    /// The numbered step id (a distinct `CreateJobStep` per `srun --pty`
-    /// invocation) whose launch most recently claimed a job's single
-    /// `STEP_INTERACTIVE` slot — so a settled outcome from a *different*
-    /// invocation is never replayed onto a genuinely new one. Absent after a
-    /// restart, in which case a settled outcome is still trusted.
-    interactive_launch_steps: Arc<Mutex<HashMap<(u32, u32), u32>>>,
+    /// `(job_id, step_id)` of every terminal this agent is currently bridging.
+    /// A step absent here with a terminal in custody has been orphaned by a restart.
+    live_ptys: Arc<Mutex<std::collections::HashSet<(u32, spur_core::step::StepId)>>>,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
     /// Serializes launches that would land on one supervisor session.
@@ -4323,6 +4462,8 @@ pub struct AgentService {
     auth_epoch: u64,
     cluster_id: String,
     cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
+    /// The cluster `jwt_key`, verifying join grants where there are no step credentials.
+    join_grant_key: Vec<u8>,
     launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
     auth_policy: spur_core::config::AuthConfig,
     block_file: Option<std::path::PathBuf>,
@@ -4444,7 +4585,6 @@ impl AgentService {
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             step_completions: crate::step_completion::StepCompletions::new(),
             live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             step_launches: crate::job_lifecycle::StepLaunchLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
@@ -4460,6 +4600,7 @@ impl AgentService {
             auth_epoch: 0,
             cluster_id: String::new(),
             cred_keys: None,
+            join_grant_key: Vec::new(),
             launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
             auth_policy: spur_core::config::AuthConfig::default(),
             block_file: None,
@@ -4496,6 +4637,10 @@ impl AgentService {
             self.cluster_id = native.cluster_id.clone();
             self.cred_keys = native.cred_keys.clone();
         }
+    }
+
+    pub fn set_join_grant_key(&mut self, key: &[u8]) {
+        self.join_grant_key = key.to_vec();
     }
 
     pub fn set_block_file(&mut self, path: Option<std::path::PathBuf>) {
@@ -4929,9 +5074,8 @@ impl AgentService {
         }
     }
 
-    /// Launch the interactive session's own workload through `spurstepd`,
-    /// keyed by the reserved `STEP_INTERACTIVE` id (not a numbered step_id,
-    /// which `sattach`/`srun --pty` reuse). Unlike `run_supervised_step_to_spool`,
+    /// Launch an interactive session's own workload through `spurstepd`, keyed
+    /// by the session's numbered step id. Unlike `run_supervised_step_to_spool`,
     /// this returns once the supervisor has started — not once the workload
     /// exits — so the caller can bridge output while a separate waiter (also
     /// returned) resolves later, from inside that bridge.
@@ -4949,12 +5093,12 @@ impl AgentService {
         ),
         Status,
     > {
-        let step_id = spur_core::step::STEP_INTERACTIVE;
+        let step_id = pty_step_id;
 
         let admission = self.admit_step_launch(job_id, run_attempt, step_id).await;
         if runtime_attempt_already_tracked(&self.stepds, job_id, step_id, run_attempt).await {
             return Err(Status::already_exists(format!(
-                "job {job_id} attempt {run_attempt} already has a terminal supervisor"
+                "step {job_id}.{step_id} attempt {run_attempt} already has a terminal supervisor"
             )));
         }
 
@@ -5058,9 +5202,9 @@ impl AgentService {
         Ok((descriptor, waiter))
     }
 
-    /// Tears down a `STEP_INTERACTIVE` stepd that launched successfully but
-    /// that this call cannot hand off to a client — otherwise it leaks as a
-    /// live supervisor and workload nobody ever attaches to.
+    /// Tears down a terminal stepd that launched successfully but that this
+    /// call cannot hand off to a client — otherwise it leaks as a live
+    /// supervisor and workload nobody ever attaches to.
     async fn abandon_interactive_launch(
         &self,
         job_id: u32,
@@ -5070,7 +5214,7 @@ impl AgentService {
     ) {
         self.active_steps.lock().await.remove(&step_key);
         self.step_completions
-            .deregister(job_id, run_attempt, spur_core::step::STEP_INTERACTIVE)
+            .deregister(job_id, run_attempt, descriptor.step_id)
             .await;
         if let Err(error) = stop_stepd_process(descriptor).await {
             warn!(job_id, %error, "failed to stop an abandoned terminal supervisor");
@@ -5885,7 +6029,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 .await
                 .map_err(ControllerRpcError::Rpc)?;
             let req = ReportJobStatusRequest {
-                step_id,
+                step_id: reported_step_id(step_id, pty_step_id),
                 job_id,
                 state,
                 exit_code,
@@ -7912,7 +8056,7 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        let replaced = jobs.insert(
+        jobs.insert(
             req.job_id,
             TrackedJob {
                 fabric_binding: fabric_binding.clone(),
@@ -7954,12 +8098,6 @@ impl SlurmAgent for AgentService {
             follow_ledger_renames(&self.stepd_state_dir, tracked, &renamed);
         }
         drop(jobs);
-        if let Some(older) = replaced {
-            self.interactive_launch_steps
-                .lock()
-                .await
-                .remove(&(req.job_id, older.run_attempt));
-        }
 
         Ok(Response::new(RegisterJobAllocationResponse {
             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
@@ -9406,8 +9544,7 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
-            .await?;
+        let session = self.authorize_terminal(&init, identity.as_ref()).await?;
 
         if let Some(keys) = &self.cred_keys {
             let launching = !init.execution_credential.is_empty()
@@ -9460,25 +9597,39 @@ impl SlurmAgent for AgentService {
         // while still reading output; an interactive one only closes it on hangup.
         let interactive = !init.non_interactive;
 
-        // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
-        // interactive PTY into a root job must obey allow_root_jobs too. Checked here because
+        let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
+        // A joiner's uid is not mapped into the owner's user namespace, and the
+        // controller refuses joins into a container; this node checks both too.
+        if !session.is_owner()
+            && (entry.has_user_namespace
+                || init.container.as_ref().is_some_and(|c| !c.image.is_empty()))
+        {
+            return Err(Status::failed_precondition(
+                "a job that runs in a container cannot be joined by another user",
+            ));
+        }
+        let (run_uid, run_gid, run_work_dir) = match &session {
+            SessionUser::Owner => (entry.uid, entry.gid, entry.work_dir.clone()),
+            SessionUser::Joiner(account) => (account.uid, account.gid, account.home.clone()),
+        };
+
+        // Same defense-in-depth gate as exec_in_job: an interactive PTY into a
+        // root job must obey allow_root_jobs too. Checked here because
         // interactive_step_script is a static helper with no access to the agent config.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
-            entry.uid,
+            run_uid,
             self.allow_root_jobs,
             self.spurd_is_root,
         ) {
-            warn!(job_id = init.job_id, uid = entry.uid, "{msg}");
+            warn!(job_id = init.job_id, uid = run_uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
 
-        let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
         let container_plan =
             resolve_step_container_plan(init.container.as_ref(), parent_has_namespaces);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
-        let step_id = spur_core::step::STEP_INTERACTIVE;
         let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user, allocation) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&init.job_id).ok_or_else(|| {
@@ -9500,46 +9651,52 @@ impl SlurmAgent for AgentService {
         };
         self.check_step_allocation(&allocation, &nodelist).await?;
         let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
-        let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
-            init.job_id,
-            run_attempt,
-            step_id,
-        );
+        // Each `srun --pty` is its own numbered step, so a job can hold several
+        // terminals on one node at once; a reconnect reuses its step id.
+        let mut step_id = init.step_id;
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let mut custody_dir = store.session_dir(init.job_id, run_attempt, step_id);
 
-        // Resume rather than open a new one: a terminal held for a job this
-        // agent is not already bridging was either just launched (and just
-        // deposited its own master, below) or was orphaned when its agent
-        // went away, and either way the user wants it back.
-        let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
-        if already_bridging {
-            // A live bridge already owns this job's one interactive slot.
-            // Silently fencing it to seat a second attach would kill a
-            // session that might still be in active use.
-            return Err(Status::already_exists(
-                "an interactive session for this job is already active on this node",
-            ));
-        }
-        let reclaimed = match crate::stepd::reclaim_orphaned_pty(&custody_dir).await {
-            Ok(found) => found,
-            Err(error) => {
-                warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
-                None
-            }
-        };
-
-        let last_interactive_launch = self
-            .interactive_launch_steps
+        // Resume rather than open a new one: a terminal held for this step that
+        // this agent is not already bridging was either just launched (and just
+        // deposited its own master, below) or was orphaned when its agent went
+        // away, and either way the user wants it back.
+        if self
+            .live_ptys
             .lock()
             .await
-            .get(&(init.job_id, run_attempt))
-            .copied();
-        let same_invocation =
-            settled_outcome_belongs_to_this_invocation(last_interactive_launch, init.step_id);
+            .contains(&(init.job_id, step_id))
+        {
+            // Silently fencing a live bridge to seat a second attach would kill
+            // a session that might still be in active use.
+            return Err(Status::already_exists(
+                "this interactive session is already attached on this node",
+            ));
+        }
+        let mut reclaimed = reclaim_terminal(init.job_id, &custody_dir).await;
+        if reclaimed.is_none() && session.is_owner() {
+            // A terminal opened before sessions were keyed per step sits in the
+            // job's shared slot; only its owner may take it back.
+            let legacy_step = spur_core::step::STEP_INTERACTIVE;
+            let legacy_bridged = self
+                .live_ptys
+                .lock()
+                .await
+                .contains(&(init.job_id, legacy_step));
+            let legacy_dir = store.session_dir(init.job_id, run_attempt, legacy_step);
+            if !legacy_bridged {
+                if let Some(found) = reclaim_terminal(init.job_id, &legacy_dir).await {
+                    reclaimed = Some(found);
+                    custody_dir = legacy_dir;
+                    step_id = legacy_step;
+                }
+            }
+        }
 
         // Nothing to reclaim can mean "never launched" or "already finished
         // and reaped" — the latter must return the recorded exit, not re-run
         // the command.
-        if reclaimed.is_none() && same_invocation {
+        if reclaimed.is_none() {
             let settled = match self
                 .step_completions
                 .settled(init.job_id, run_attempt, step_id)
@@ -9599,7 +9756,8 @@ impl SlurmAgent for AgentService {
                 }
                 None => {
                     self.ensure_node_cleanup_ready()?;
-                    let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
+                    let script =
+                        interactive_step_script(&entry, run_uid, run_gid, &run_work_dir, &argv)?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
                     let mut host_identity_env: Option<HashMap<String, String>> = None;
@@ -9617,12 +9775,11 @@ impl SlurmAgent for AgentService {
                                     );
                                 }
                             }
-                            if entry.uid > 0 {
-                                if let Some(user) = nix::unistd::User::from_uid(
-                                    nix::unistd::Uid::from_raw(entry.uid),
-                                )
-                                .ok()
-                                .flatten()
+                            if run_uid > 0 {
+                                if let Some(user) =
+                                    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(run_uid))
+                                        .ok()
+                                        .flatten()
                                 {
                                     host_identity_env = Some(HashMap::from([
                                         (
@@ -9642,8 +9799,8 @@ impl SlurmAgent for AgentService {
                                 .resolve_host_device_plan(
                                     init.job_id,
                                     &gpu_devices,
-                                    entry.uid,
-                                    entry.gid,
+                                    run_uid,
+                                    run_gid,
                                 )
                                 .await?;
                             None
@@ -9659,8 +9816,8 @@ impl SlurmAgent for AgentService {
                                     .build_job_injection_plans(
                                         "gpu",
                                         &gpu_devices,
-                                        entry.uid,
-                                        entry.gid,
+                                        run_uid,
+                                        run_gid,
                                     )
                                     .map_err(|e| {
                                         Status::failed_precondition(format!(
@@ -9671,13 +9828,11 @@ impl SlurmAgent for AgentService {
                                 host_device_plan = Some(host_plan);
                                 (env, Some(container_plan))
                             };
-                            let passwd_entry = (entry.uid > 0)
+                            let passwd_entry = (run_uid > 0)
                                 .then(|| {
-                                    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(
-                                        entry.uid,
-                                    ))
-                                    .ok()
-                                    .flatten()
+                                    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(run_uid))
+                                        .ok()
+                                        .flatten()
                                 })
                                 .flatten();
                             let username = passwd_entry
@@ -9699,8 +9854,8 @@ impl SlurmAgent for AgentService {
                                 FreshContainerContext {
                                     gpu_devices: gpu_devices.clone(),
                                     device_plan: container_device_plan,
-                                    uid: entry.uid,
-                                    gid: entry.gid,
+                                    uid: run_uid,
+                                    gid: run_gid,
                                     username,
                                     home_dir,
                                     environment: env.clone(),
@@ -9727,14 +9882,22 @@ impl SlurmAgent for AgentService {
                         joins_parent_namespaces: parent_has_namespaces,
                         allocation_holder: false,
                         script,
-                        work_dir: entry.work_dir.clone(),
+                        work_dir: run_work_dir.clone(),
                         name: format!("{}.{}", init.job_id, step_id),
-                        user,
+                        user: match &session {
+                            SessionUser::Owner => user,
+                            SessionUser::Joiner(account) => account.user.clone(),
+                        },
                         node: self.reporter.hostname.clone(),
                         array_job_id: None,
                         array_task_id: None,
                         environment: interactive_step_environment(
-                            Self::session_environ(&entry),
+                            match &session {
+                                SessionUser::Owner => Self::session_environ(&entry),
+                                SessionUser::Joiner(_) => {
+                                    job_context_environ(Self::session_environ(&entry))
+                                }
+                            },
                             entry.env_vars(init.job_id),
                             host_identity_env,
                             fresh_container_env,
@@ -9747,8 +9910,8 @@ impl SlurmAgent for AgentService {
                         gpu_devices,
                         cpu_ids: Vec::new(),
                         open_mode: None,
-                        uid: entry.uid,
-                        gid: entry.gid,
+                        uid: run_uid,
+                        gid: run_gid,
                         container,
                         prolog_script: None,
                         // This interactive session's teardown runs no TaskEpilog, so keep
@@ -9851,11 +10014,7 @@ impl SlurmAgent for AgentService {
                 }
             };
 
-        self.live_ptys.lock().await.insert(init.job_id);
-        self.interactive_launch_steps
-            .lock()
-            .await
-            .insert((init.job_id, run_attempt), init.step_id);
+        self.live_ptys.lock().await.insert((init.job_id, step_id));
         // Only past this point does `live_ptys` reflect this session, so hold
         // the lock through the insert or a racing attach could still decide
         // "nothing live" and fence what was just started.
@@ -9878,7 +10037,7 @@ impl SlurmAgent for AgentService {
             // Every exit path in `run_pty_bridge` awaits the real exit first,
             // so its return already proves the workload is gone.
             bridge.await;
-            live_ptys.lock().await.remove(&job_id);
+            live_ptys.lock().await.remove(&(job_id, step_id));
             // The terminal is gone; stop holding its descriptor or it leaks for
             // as long as the job runs.
             if let Err(error) =
@@ -9889,14 +10048,7 @@ impl SlurmAgent for AgentService {
             // Best-effort: the stepd's own teardown already retires it once
             // its workload exits; this only catches a supervisor that never
             // got that far (e.g. a fresh launch that failed after this point).
-            if let Err(error) = fence_displaced_stepd(
-                &stepds,
-                job_id,
-                spur_core::step::STEP_INTERACTIVE,
-                run_attempt,
-            )
-            .await
-            {
+            if let Err(error) = fence_displaced_stepd(&stepds, job_id, step_id, run_attempt).await {
                 warn!(job_id, %error, "failed to retire a closed terminal's supervisor");
             }
         });
@@ -10209,10 +10361,6 @@ impl AgentService {
         if !removed {
             return;
         }
-        self.interactive_launch_steps
-            .lock()
-            .await
-            .remove(&(job_id, run_attempt));
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
             let stale: Vec<_> = stepds_for_job(&sessions, job_id)
@@ -11223,6 +11371,64 @@ impl AgentService {
         };
         spur_core::auth::check_job_owner(user, is_internal, &tracked.user, action)
             .map_err(|e| Status::permission_denied(e.to_string()))
+    }
+
+    /// Who a terminal opened in `init.job_id` runs as. The owner (or an operator)
+    /// passes [`check_job_access`](Self::check_job_access) as before; anyone else
+    /// needs a verified identity and the controller's proof that the owner shared
+    /// this step's job with exactly that user.
+    async fn authorize_terminal(
+        &self,
+        init: &InitSession,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<SessionUser, Status> {
+        let denied = match self
+            .check_job_access(init.job_id, identity, &init.user, "attach to")
+            .await
+        {
+            Ok(()) => return Ok(SessionUser::Owner),
+            Err(status) if status.code() == tonic::Code::PermissionDenied => status,
+            Err(status) => return Err(status),
+        };
+        let Some(id) = identity else {
+            return Err(denied);
+        };
+        let Some(run_attempt) = self
+            .running
+            .lock()
+            .await
+            .get(&init.job_id)
+            .map(|tracked| tracked.run_attempt)
+        else {
+            return Err(denied);
+        };
+        let proof = JoinProof {
+            cred_keys: self.cred_keys.as_deref(),
+            cluster_id: &self.cluster_id,
+            grant_key: &self.join_grant_key,
+        };
+        let now = spur_core::native_mint::unix_now().unwrap_or(0);
+        let Some((user, uid)) = proof.granted_user(
+            init.job_id,
+            init.step_id,
+            run_attempt,
+            &init.execution_credential,
+            &init.join_grant,
+            now,
+        ) else {
+            return Err(denied);
+        };
+        if user != id.user {
+            return Err(denied);
+        }
+        let account = joiner_account(&user, uid)?;
+        info!(
+            job_id = init.job_id,
+            step_id = init.step_id,
+            user = %account.user,
+            "admitting a shared-job session"
+        );
+        Ok(SessionUser::Joiner(account))
     }
 
     /// Extract a `JobEntry` from a tracked running job for namespace entry.
@@ -14733,24 +14939,8 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_outcome_is_trusted_only_for_the_invocation_that_launched_it() {
-        assert!(
-            settled_outcome_belongs_to_this_invocation(None, 7),
-            "nothing recorded (e.g. after a restart) must still trust a settled outcome"
-        );
-        assert!(
-            settled_outcome_belongs_to_this_invocation(Some(7), 7),
-            "the same numbered step reconnecting must trust its own settled outcome"
-        );
-        assert!(
-            !settled_outcome_belongs_to_this_invocation(Some(7), 8),
-            "a different numbered step is a new invocation and must not replay the old exit"
-        );
-    }
-
-    #[test]
     fn interactive_step_script_defaults_an_empty_argv_to_a_shell() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &[])
+        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, "/tmp", &[])
             .expect("script")
             .trim()
             .to_string();
@@ -14759,10 +14949,11 @@ mod tests {
 
     #[test]
     fn interactive_step_script_honors_an_explicit_command() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &["zsh".to_string()])
-            .expect("script")
-            .trim()
-            .to_string();
+        let script =
+            interactive_step_script(&plain_job_entry(), 1000, 1000, "/tmp", &["zsh".to_string()])
+                .expect("script")
+                .trim()
+                .to_string();
         assert!(script.ends_with("zsh"), "{script}");
     }
 
@@ -14814,8 +15005,8 @@ mod tests {
         );
     }
 
-    // Every `srun --pty` in a job runs in the one interactive slot, so only the
-    // numbered step tells the controller which session's shell exited.
+    // A session opened before terminals were keyed per step ran in the job's
+    // shared interactive slot; only the numbered step tells which shell exited.
     #[tokio::test]
     async fn an_interactive_sessions_exit_report_names_its_numbered_step() {
         const SLOT: spur_core::step::StepId = spur_core::step::STEP_INTERACTIVE;
@@ -14862,6 +15053,57 @@ mod tests {
         let reports = reports.lock().expect("completion reports").clone();
         assert_eq!(reports.len(), 1, "the session's exit is reported once");
         assert_eq!(reports[0].step_id, Some(SLOT));
+        assert_eq!(reports[0].pty_step_id, Some(3));
+    }
+
+    // Each terminal runs under its own numbered step, but the controller still
+    // expects every terminal's exit under the interactive step.
+    #[tokio::test]
+    async fn a_per_step_terminals_exit_is_reported_under_the_interactive_step() {
+        const SLOT: spur_core::step::StepId = 3;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let (context, _running, sessions, _state_dir, _completions) =
+            completion_listener_fixture_for_step(&controller_addr, SLOT).await;
+        sessions
+            .lock()
+            .await
+            .get_mut(&(42, SLOT))
+            .expect("tracked session")
+            .pty_step_id = Some(3);
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: SLOT,
+            exit_code: 0,
+            signal: 1,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1, "the session's exit is reported once");
+        assert_eq!(reports[0].step_id, Some(spur_core::step::STEP_INTERACTIVE));
         assert_eq!(reports[0].pty_step_id, Some(3));
     }
 
@@ -17732,6 +17974,249 @@ mod tests {
             .await
             .expect_err("an untracked job must report not-found");
         assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    const GRANT_KEY: &[u8] = b"test-jwt-key";
+
+    fn join_grant_for(user: &str, job_id: u32, step_id: u32, run_attempt: u32) -> String {
+        spur_core::share::sign_join_grant(
+            &spur_core::share::JoinGrant {
+                job_id,
+                step_id,
+                run_attempt,
+                user: user.into(),
+                uid: 0,
+                gid: 0,
+            },
+            GRANT_KEY,
+            spur_core::native_mint::unix_now().unwrap_or(0),
+        )
+        .unwrap()
+    }
+
+    fn terminal_init(user: &str, join_grant: String) -> InitSession {
+        InitSession {
+            job_id: 46,
+            step_id: 3,
+            user: user.into(),
+            join_grant,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_terminal_admits_a_joiner_only_with_a_grant_naming_them() {
+        let mut svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.set_join_grant_key(GRANT_KEY);
+        let job = TrackedJob::dummy(std::process::id());
+        let attempt = job.run_attempt;
+        svc.insert_test_job(46, job).await;
+
+        let owner = svc
+            .authorize_terminal(
+                &terminal_init("testuser", String::new()),
+                Some(&user_identity("testuser")),
+            )
+            .await
+            .expect("the owner needs no grant");
+        assert_eq!(owner, SessionUser::Owner);
+
+        let denied = |result: Result<SessionUser, Status>| {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+        };
+        denied(
+            svc.authorize_terminal(
+                &terminal_init("", String::new()),
+                Some(&user_identity("bob")),
+            )
+            .await,
+        );
+        // A grant for another user, another step, or another attempt does not carry over.
+        for grant in [
+            join_grant_for("carol", 46, 3, attempt),
+            join_grant_for("bob", 46, 4, attempt),
+            join_grant_for("bob", 46, 3, attempt + 1),
+            join_grant_for("bob", 47, 3, attempt),
+        ] {
+            denied(
+                svc.authorize_terminal(&terminal_init("", grant), Some(&user_identity("bob")))
+                    .await,
+            );
+        }
+        // An unverified caller never joins on a claimed name, even holding a real grant.
+        denied(
+            svc.authorize_terminal(
+                &terminal_init("bob", join_grant_for("bob", 46, 3, attempt)),
+                None,
+            )
+            .await,
+        );
+        // A correct grant still needs the user to exist on the node.
+        let missing = svc
+            .authorize_terminal(
+                &terminal_init("", join_grant_for("spur-no-such-user", 46, 3, attempt)),
+                Some(&user_identity("spur-no-such-user")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::PermissionDenied);
+        assert!(missing.message().contains("no account on this node"));
+    }
+
+    #[test]
+    fn join_proof_rejects_a_grant_signed_with_another_key() {
+        let proof = JoinProof {
+            cred_keys: None,
+            cluster_id: "",
+            grant_key: b"other-key",
+        };
+        let now = spur_core::native_mint::unix_now().unwrap_or(0);
+        assert_eq!(
+            proof.granted_user(46, 3, 0, "", &join_grant_for("bob", 46, 3, 0), now),
+            None
+        );
+        let proof = JoinProof {
+            grant_key: GRANT_KEY,
+            ..proof
+        };
+        assert_eq!(
+            proof.granted_user(46, 3, 0, "", &join_grant_for("bob", 46, 3, 0), now),
+            Some(("bob".to_string(), 0))
+        );
+        assert_eq!(proof.granted_user(46, 3, 0, "", "", now), None);
+    }
+
+    #[test]
+    fn join_proof_reads_the_joiner_from_a_native_step_credential() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential};
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        let verify =
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification");
+        let credential = |kind, step_id| {
+            spur_core::native_exec::sign_execution(
+                ExecutionCredential {
+                    kind,
+                    cluster_id: "share-test".into(),
+                    key_id: String::new(),
+                    job_id: 46,
+                    step_id,
+                    run_attempt: 1,
+                    user: "bob".into(),
+                    uid: 1001,
+                    gid: 1001,
+                    supplementary_gids: vec![],
+                    account: String::new(),
+                    partition: String::new(),
+                    qos: String::new(),
+                    resources_by_node: vec![spur_core::native_cred::NodeResourceSlice {
+                        node: "n1".into(),
+                        cpus: 1,
+                        memory_mb: 1,
+                        devices: vec![],
+                    }],
+                    command_digest: [0; spur_core::native_cred::DIGEST_LEN],
+                    container_digest: None,
+                    issued_at: 0,
+                    not_before: 0,
+                    expires_at: 0,
+                    credential_id: [0; spur_core::native_cred::CREDENTIAL_ID_LEN],
+                },
+                &signing,
+                now,
+            )
+            .expect("sign")
+        };
+        let proof = JoinProof {
+            cred_keys: Some(&verify),
+            cluster_id: "share-test",
+            grant_key: GRANT_KEY,
+        };
+        assert_eq!(
+            proof.granted_user(46, 3, 1, &credential(CredentialKind::Step, 3), "", now),
+            Some(("bob".to_string(), 1001))
+        );
+        assert_eq!(
+            proof.granted_user(46, 4, 1, &credential(CredentialKind::Step, 3), "", now),
+            None
+        );
+        assert_eq!(
+            proof.granted_user(46, 3, 2, &credential(CredentialKind::Step, 3), "", now),
+            None
+        );
+        assert_eq!(
+            proof.granted_user(46, 3, 1, &credential(CredentialKind::Job, 3), "", now),
+            None
+        );
+    }
+
+    fn passwd_entry(name: &str, uid: u32) -> nix::unistd::User {
+        nix::unistd::User {
+            name: name.into(),
+            passwd: std::ffi::CString::new("x").unwrap(),
+            uid: nix::unistd::Uid::from_raw(uid),
+            gid: nix::unistd::Gid::from_raw(uid),
+            gecos: std::ffi::CString::new("").unwrap(),
+            dir: format!("/home/{name}").into(),
+            shell: "/bin/bash".into(),
+        }
+    }
+
+    #[test]
+    fn a_joiner_runs_as_their_own_non_root_account() {
+        let account = joiner_account_from("bob", 1001, Some(passwd_entry("bob", 1001))).unwrap();
+        assert_eq!((account.uid, account.gid), (1001, 1001));
+        assert_eq!(account.home, "/home/bob");
+        // No uid in the grant (a JWT carries none) defers to the node's account.
+        assert!(joiner_account_from("bob", 0, Some(passwd_entry("bob", 1001))).is_ok());
+        assert!(joiner_account_from("bob", 1002, Some(passwd_entry("bob", 1001))).is_err());
+        assert!(joiner_account_from("toor", 0, Some(passwd_entry("toor", 0))).is_err());
+        assert!(joiner_account_from("bob", 1001, None).is_err());
+    }
+
+    #[test]
+    fn a_joiner_inherits_the_jobs_context_but_not_the_owners_secrets() {
+        let owner_env = vec![
+            ("SPUR_JOB_ID".to_string(), "46".to_string()),
+            ("SLURM_JOB_NODELIST".to_string(), "n1".to_string()),
+            ("ROCR_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ("SPUR_AUTH_TOKEN".to_string(), "owner-token".to_string()),
+            ("HF_TOKEN".to_string(), "secret".to_string()),
+            ("HOME".to_string(), "/home/alice".to_string()),
+        ];
+        let mut inherited = job_context_environ(owner_env);
+        inherited.sort();
+        assert_eq!(
+            inherited,
+            vec![
+                ("ROCR_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+                ("SLURM_JOB_NODELIST".to_string(), "n1".to_string()),
+                ("SPUR_JOB_ID".to_string(), "46".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_terminal_is_reported_under_the_interactive_step() {
+        use spur_core::step::{STEP_BATCH, STEP_INTERACTIVE};
+        assert_eq!(reported_step_id(Some(3), Some(3)), Some(STEP_INTERACTIVE));
+        assert_eq!(
+            reported_step_id(Some(STEP_INTERACTIVE), Some(3)),
+            Some(STEP_INTERACTIVE)
+        );
+        assert_eq!(reported_step_id(Some(3), None), Some(3));
+        assert_eq!(reported_step_id(Some(STEP_BATCH), None), Some(STEP_BATCH));
+        assert_eq!(reported_step_id(None, None), None);
     }
 
     /// An empty-owner job runs as root, so only an internal caller (a verified admin/controller) is
@@ -23564,38 +24049,6 @@ mod tests {
                 .map(|job| job.run_attempt),
             Some(2),
             "a stale-epoch drop must not evict a newer, already-retracked job"
-        );
-    }
-
-    // interactive_launch_steps tracks which step a job's own interactive
-    // launch used, keyed the same as `running`/`stepds` — it must be pruned
-    // alongside them or it grows for the life of the process.
-    #[tokio::test]
-    async fn drop_tracked_job_prunes_interactive_launch_steps() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
-        let job_id = 966;
-        let run_attempt = 1;
-        let mut tracked = TrackedJob::allocation_only(None);
-        tracked.run_attempt = run_attempt;
-        svc.insert_test_job(job_id, tracked).await;
-        svc.interactive_launch_steps
-            .lock()
-            .await
-            .insert((job_id, run_attempt), spur_core::step::STEP_INTERACTIVE);
-
-        svc.drop_tracked_job(job_id, run_attempt).await;
-
-        assert!(
-            !svc.interactive_launch_steps
-                .lock()
-                .await
-                .contains_key(&(job_id, run_attempt)),
-            "a dropped job must not leave its interactive-launch step entry behind"
         );
     }
 

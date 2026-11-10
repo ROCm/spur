@@ -46,6 +46,7 @@ pub mod quota_names;
 pub mod rbac;
 pub mod reservation;
 pub mod resource;
+pub mod share;
 pub mod spur_env;
 pub mod step;
 pub mod task_launch;

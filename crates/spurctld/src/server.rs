@@ -1166,12 +1166,130 @@ impl ControllerService {
         job_read_scope(&self.cluster, identity).permits(owner)
     }
 
+    /// [`caller_may_see_job`](Self::caller_may_see_job), plus the users the
+    /// owner shared the job with: they need its state to join it.
+    fn caller_may_see_shared_job(
+        &self,
+        job: &spur_core::job::Job,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> bool {
+        self.caller_may_see_job(&job.spec.user, identity)
+            || identity.is_some_and(|id| self.shared_with(job, &id.user))
+    }
+
+    /// Whether the owner shared `job` with `user`, by name or through the job's
+    /// account. Either way the user must be in the job's account, so removing
+    /// them from it ends their access; an unloaded association cache admits
+    /// nobody. Without accounting there are no accounts: a named user is
+    /// enough, and `@account` names nobody. Never true for the owner.
+    fn shared_with(&self, job: &spur_core::job::Job, user: &str) -> bool {
+        let share = &job.spec.share;
+        if user.is_empty() || user == job.spec.user {
+            return false;
+        }
+        let named = share.users.iter().any(|u| u == user);
+        if !named && !share.account {
+            return false;
+        }
+        let member = job
+            .spec
+            .account
+            .as_deref()
+            .filter(|account| !account.is_empty())
+            .is_some_and(|account| {
+                matches!(
+                    self.cluster
+                        .association_cache()
+                        .account_membership(user, account),
+                    crate::association_cache::AccountMembership::Member
+                )
+            });
+        member || (named && !self.cluster.config().accounting.enabled())
+    }
+
+    /// Ownership gate for starting a session in `job`. `Ok(None)` is the owner
+    /// (or an operator) as [`check_job_caller`] admits them; `Ok(Some(_))` is a
+    /// verified user the owner shared the job with, who runs as themselves. A
+    /// claimed username alone never joins someone else's job.
+    ///
+    /// [`check_job_caller`]: spur_core::auth::check_job_caller
+    fn authorize_job_session(
+        &self,
+        job: &spur_core::job::Job,
+        user: &str,
+        uid: Option<u32>,
+        identity: Option<&spur_core::auth::Identity>,
+        action: &str,
+    ) -> Result<Option<SessionJoiner>, Status> {
+        let denied = match spur_core::auth::check_job_caller(
+            user,
+            uid,
+            self.caller_is_operator(identity),
+            &job.spec.user,
+            job.spec.uid,
+            identity,
+            action,
+        ) {
+            Ok(()) => return Ok(None),
+            Err(e) => Status::permission_denied(e.to_string()),
+        };
+        let Some(id) = identity.filter(|id| self.shared_with(job, &id.user)) else {
+            return Err(denied);
+        };
+        // A JWT carries no trusted gid; the node resolves the joiner's account
+        // and refuses a uid that does not match it.
+        let uid = if id.trusted_unix {
+            id.uid
+        } else {
+            uid.unwrap_or(id.uid)
+        };
+        Ok(Some(SessionJoiner {
+            user: id.user.clone(),
+            uid,
+            gid: id.gid,
+        }))
+    }
+
+    /// The node's proof for a joiner where no step credential is minted.
+    fn sign_join_grant(
+        &self,
+        job: &spur_core::job::Job,
+        step_id: u32,
+        joiner: &SessionJoiner,
+    ) -> Result<String, Status> {
+        let key = self
+            .cluster
+            .config()
+            .auth
+            .resolved_jwt_key()
+            .ok()
+            .flatten()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "joining another user's job needs [auth] jwt_key or native credentials, \
+                     so the node can verify the controller admitted you",
+                )
+            })?;
+        let grant = spur_core::share::JoinGrant {
+            job_id: job.job_id,
+            step_id,
+            run_attempt: job.run_attempt,
+            user: joiner.user.clone(),
+            uid: joiner.uid,
+            gid: joiner.gid,
+        };
+        let now = spur_core::native_mint::unix_now().unwrap_or(0);
+        spur_core::share::sign_join_grant(&grant, key.as_bytes(), now)
+            .map_err(|e| Status::internal(format!("failed to sign join grant: {e}")))
+    }
+
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        if !self.caller_may_see_job(&job.spec.user, identity) {
+        if !self.caller_may_see_shared_job(job, identity) {
             return None;
         }
         let mut info = job_to_proto(job);
@@ -1686,7 +1804,7 @@ impl SlurmController for ControllerService {
             Some(req.reservation.as_str())
         };
 
-        let jobs = self.cluster.get_jobs(&JobFilter {
+        let filter = JobFilter {
             states: &states,
             user,
             partition,
@@ -1696,7 +1814,26 @@ impl SlurmController for ControllerService {
             reservation,
             job_ids: &req.job_ids,
             nodes: &req.nodes,
-        });
+        };
+        let mut jobs = self.cluster.get_jobs(&filter);
+        // A caller pinned to their own jobs can still look up, by id, a job
+        // whose owner shared it with them.
+        if let Some(id) = __identity.as_ref().filter(|_| {
+            requested_user.is_none()
+                && !req.job_ids.is_empty()
+                && !matches!(scope, spur_core::rbac::ReadScope::All)
+        }) {
+            let shared = self.cluster.get_jobs(&JobFilter {
+                user: None,
+                ..filter.clone()
+            });
+            for job in shared {
+                if self.shared_with(&job, &id.user) && !jobs.iter().any(|j| j.job_id == job.job_id)
+                {
+                    jobs.push(job);
+                }
+            }
+        }
 
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
@@ -1987,6 +2124,7 @@ impl SlurmController for ControllerService {
                     ("priority", req.priority.map(Into::into)),
                     ("comment", req.comment.clone().map(Into::into)),
                     ("exclude", req.exclude.clone().map(Into::into)),
+                    ("share_with", req.share_with.clone().map(Into::into)),
                 ]),
             )
             .asserted_actor(&req.user),
@@ -2009,6 +2147,25 @@ impl SlurmController for ControllerService {
             "modify",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        if let Some(share_with) = req.share_with.take() {
+            let share = spur_core::share::JobShare::parse(&[share_with])
+                .map_err(Status::invalid_argument)?;
+            self.cluster
+                .update_job_share(req.job_id, share)
+                .map_err(update_job_err_to_status)?;
+            let only_share = req.hold.is_none()
+                && req.priority.is_none()
+                && req.time_limit.is_none()
+                && req.partition.is_none()
+                && req.comment.is_none()
+                && req.account.is_none()
+                && req.qos.is_none()
+                && req.exclude.is_none();
+            if only_share {
+                return Ok(Response::new(()));
+            }
+        }
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -3070,7 +3227,7 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        if !self.caller_may_see_job(&job.spec.user, identity.as_ref()) {
+        if !self.caller_may_see_shared_job(&job, identity.as_ref()) {
             return Err(Status::not_found(format!("job {job_id} not found")));
         }
 
@@ -3083,6 +3240,7 @@ impl SlurmController for ControllerService {
                 name: s.name.clone(),
                 state: s.state.display().to_string(),
                 num_tasks: s.num_tasks,
+                joined_by: s.joined_by.clone().unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(GetJobStepsResponse { steps: step_infos }))
@@ -3107,16 +3265,29 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_caller(
+        let joiner = self.authorize_job_session(
+            &job,
             &req.user,
             Some(req.uid),
-            self.caller_is_operator(__identity.as_ref()),
-            &job.spec.user,
-            job.spec.uid,
             __identity.as_ref(),
             "attach to",
-        )
-        .map_err(|e| Status::permission_denied(e.to_string()))?;
+        )?;
+        if joiner.is_some() && !req.pty {
+            return Err(Status::permission_denied(
+                "a shared job only accepts interactive sessions (srun --jobid) from other users",
+            ));
+        }
+        let in_container = job
+            .spec
+            .container_image
+            .as_deref()
+            .is_some_and(|image| !image.is_empty())
+            || req.container.as_ref().is_some_and(|c| !c.image.is_empty());
+        if joiner.is_some() && in_container {
+            return Err(Status::failed_precondition(
+                "a job that runs in a container cannot be joined by another user",
+            ));
+        }
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -3162,13 +3333,19 @@ impl SlurmController for ControllerService {
             end_time: None,
             exit_code: None,
             pty: req.pty,
-            job_shell: req.job_shell && req.pty && job.is_standalone_pty(),
+            job_shell: joiner.is_none() && req.job_shell && req.pty && job.is_standalone_pty(),
+            joined_by: joiner.as_ref().map(|j| j.user.clone()),
         };
 
         self.cluster
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
+        let runs_as = joiner.as_ref().map(|j| crate::native_keys::StepRunsAs {
+            user: &j.user,
+            uid: j.uid,
+            gid: j.gid,
+        });
         let execution_credential = crate::native_keys::sign_step_credential(
             &self.cluster.config().cluster_name,
             &job,
@@ -3180,8 +3357,15 @@ impl SlurmController for ControllerService {
                 .map(|c| c.image.as_str())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| job.spec.container_image.as_deref().unwrap_or("")),
+            runs_as,
         )
         .map_err(|e| Status::internal(format!("failed to sign step credential: {e}")))?;
+        let join_grant = match joiner.as_ref() {
+            Some(joiner) if execution_credential.is_empty() => {
+                self.sign_join_grant(&job, step_id, joiner)?
+            }
+            _ => String::new(),
+        };
 
         // Resolve the effective container so the interactive-PTY client can forward it
         // to the agent: the agent connects directly (bypassing the controller) and cannot
@@ -3193,6 +3377,7 @@ impl SlurmController for ControllerService {
             node_addr,
             container,
             execution_credential,
+            join_grant,
         }))
     }
 
@@ -3215,16 +3400,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_caller(
+        let joiner = self.authorize_job_session(
+            &job,
             &req.user,
             Some(req.uid),
-            self.caller_is_operator(__identity.as_ref()),
-            &job.spec.user,
-            job.spec.uid,
             __identity.as_ref(),
             "complete a step in",
-        )
-        .map_err(|e| Status::permission_denied(e.to_string()))?;
+        )?;
 
         // Owning the job is not licence to address any step id: reserved ids
         // belong to the batch, extern, and interactive steps.
@@ -3237,6 +3419,14 @@ impl SlurmController for ControllerService {
         let step = self.cluster.get_step(job_id, req.step_id).ok_or_else(|| {
             Status::not_found(format!("step {}.{} not found", job_id, req.step_id))
         })?;
+        if let Some(joiner) = joiner {
+            if step.joined_by.as_deref() != Some(joiner.user.as_str()) {
+                return Err(Status::permission_denied(format!(
+                    "user {} may complete only the steps they started in job {job_id}",
+                    joiner.user
+                )));
+            }
+        }
         // Best-effort fast path; the WAL apply enforces this once the job ends.
         if step.state.is_terminal() {
             return Ok(Response::new(()));
@@ -4853,6 +5043,14 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
 /// job's container env (step-wins) so setting one step variable doesn't silently drop
 /// the job's container env. Shared by the buffered (`run_step`) and interactive-PTY
 /// (`create_job_step`) dispatch paths.
+/// A user who is starting a session in a job the owner shared with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionJoiner {
+    user: String,
+    uid: u32,
+    gid: u32,
+}
+
 fn resolve_step_container(
     step: Option<ContainerSpec>,
     job_spec: &spur_core::job::JobSpec,
@@ -5216,6 +5414,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         pty: spec.pty,
         submit_line: sanitize_submit_line(&spec.submit_line),
         client_keepalive: spec.client_keepalive,
+        share: spur_core::share::JobShare::parse(&spec.share_with)
+            .map_err(Status::invalid_argument)?,
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -5398,6 +5598,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preempt_time: job
             .preempt_grace()
             .map(|p| datetime_to_proto(p.signaled_at)),
+        share_with: job.spec.share.entries(),
         time_limit: job.spec.time_limit.map(|d| prost_types::Duration {
             seconds: d.num_seconds(),
             nanos: 0,
@@ -9109,6 +9310,7 @@ mod tests {
                 exit_code: None,
                 pty: true,
                 job_shell: true,
+                joined_by: None,
             })
             .unwrap();
         (job_id, run_attempt)
@@ -11321,6 +11523,396 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    const SHARE_TEST_KEY: &str = "share-test-key";
+
+    /// A running job owned by `alice` in account `research`, on a registered node,
+    /// with jobs private so visibility is what sharing has to grant.
+    async fn shared_job_fixture(
+        dir: &tempfile::TempDir,
+        share: &[&str],
+    ) -> (ControllerService, u32) {
+        shared_job_fixture_with(dir, share, false).await
+    }
+
+    /// `shared_job_fixture`, optionally with accounting on, where accounts are real
+    /// and a job is shared only within its own.
+    async fn shared_job_fixture_with(
+        dir: &tempfile::TempDir,
+        share: &[&str],
+        accounting: bool,
+    ) -> (ControllerService, u32) {
+        let accounting = if accounting {
+            "[accounting]\ndatabase_url = \"postgresql://unused@localhost/spur\"\n"
+        } else {
+            ""
+        };
+        let config = spur_core::config::SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [auth]\nplugin = \"jwt\"\njwt_key = \"{SHARE_TEST_KEY}\"\nprivate_data = [\"jobs\"]\n\
+             {accounting}\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n"
+        ))
+        .unwrap();
+        let svc = test_service_with(dir, config).await;
+        for (user, account) in [
+            ("alice", "research"),
+            ("carol", "research"),
+            ("dave", "other"),
+        ] {
+            svc.cluster
+                .association_cache()
+                .insert_association(user, account);
+        }
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let spec = spur_core::job::JobSpec {
+            name: "shared".into(),
+            user: "alice".into(),
+            uid: 1000,
+            account: Some("research".into()),
+            interactive: true,
+            work_dir: "/tmp".into(),
+            share: spur_core::share::JobShare::parse(share).unwrap(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).expect("submit").job_id;
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 1000);
+        svc.cluster
+            .start_job(
+                job_id,
+                vec!["n1".into()],
+                res.clone(),
+                [("n1".to_string(), res)].into_iter().collect(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (svc, job_id)
+    }
+
+    fn as_user<T>(inner: T, user: &str) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(viewer(user, false));
+        req
+    }
+
+    fn pty_step(job_id: u32) -> CreateJobStepRequest {
+        CreateJobStepRequest {
+            job_id,
+            command: vec!["bash".into()],
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            pty: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listed_user_joins_as_themselves_and_others_do_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+
+        let resp = svc
+            .create_job_step(as_user(pty_step(job_id), "bob"))
+            .await
+            .expect("a listed user may join")
+            .into_inner();
+        let grant =
+            spur_core::share::verify_join_grant(&resp.join_grant, SHARE_TEST_KEY.as_bytes())
+                .expect("the joiner gets a grant the node can verify");
+        assert_eq!(grant.user, "bob");
+        assert_eq!((grant.job_id, grant.step_id), (job_id, resp.step_id));
+        let step = svc.cluster.get_step(job_id, resp.step_id).unwrap();
+        assert_eq!(step.joined_by.as_deref(), Some("bob"));
+        assert!(
+            !step.job_shell,
+            "a joiner's shell never ends the owner's job"
+        );
+
+        let owner = svc
+            .create_job_step(as_user(pty_step(job_id), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(owner.join_grant.is_empty(), "the owner needs no grant");
+        assert_eq!(
+            svc.cluster
+                .get_step(job_id, owner.step_id)
+                .unwrap()
+                .joined_by,
+            None
+        );
+
+        for user in ["carol", "dave"] {
+            let err = svc
+                .create_job_step(as_user(pty_step(job_id), user))
+                .await
+                .expect_err("an unlisted user must not join");
+            assert_eq!(err.code(), Code::PermissionDenied);
+        }
+
+        // A claimed name without a verified identity never joins someone else's job.
+        let mut claimed = pty_step(job_id);
+        claimed.user = "bob".into();
+        let err = svc
+            .create_job_step(Request::new(claimed))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let mut batch = pty_step(job_id);
+        batch.pty = false;
+        let err = svc
+            .create_job_step(as_user(batch, "bob"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sharing_with_the_account_admits_its_members_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["@account"]).await;
+
+        svc.create_job_step(as_user(pty_step(job_id), "carol"))
+            .await
+            .expect("a member of the job's account may join");
+        let err = svc
+            .create_job_step(as_user(pty_step(job_id), "dave"))
+            .await
+            .expect_err("a member of another account must not join");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joiner_sees_the_job_and_completes_only_their_own_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+
+        let seen = svc
+            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
+            .await
+            .expect("a joiner can look up the shared job")
+            .into_inner();
+        assert_eq!(seen.share_with, vec!["bob".to_string()]);
+        let hidden = svc
+            .get_job(get_job_req(job_id, Some(viewer("dave", false))))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code(), Code::NotFound);
+
+        let bobs = svc
+            .create_job_step(as_user(pty_step(job_id), "bob"))
+            .await
+            .unwrap()
+            .into_inner()
+            .step_id;
+        let alices = svc
+            .create_job_step(as_user(pty_step(job_id), "alice"))
+            .await
+            .unwrap()
+            .into_inner()
+            .step_id;
+        let complete = |step_id| CompleteJobStepRequest {
+            job_id,
+            step_id,
+            exit_code: 0,
+            ..Default::default()
+        };
+        let err = svc
+            .complete_job_step(as_user(complete(alices), "bob"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        svc.complete_job_step(as_user(complete(bobs), "bob"))
+            .await
+            .expect("a joiner completes their own session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joiner_finds_the_shared_job_by_id_but_not_in_their_own_listing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+        let list = |user: &str, job_ids: Vec<u32>| {
+            as_user(
+                GetJobsRequest {
+                    job_ids,
+                    ..Default::default()
+                },
+                user,
+            )
+        };
+
+        let by_id = svc
+            .get_jobs(list("bob", vec![job_id]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            by_id.jobs.len(),
+            1,
+            "scontrol show job <id> finds the shared job"
+        );
+        let mine = svc
+            .get_jobs(list("bob", Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            mine.jobs.is_empty(),
+            "squeue still lists only bob's own jobs"
+        );
+        let other = svc
+            .get_jobs(list("dave", vec![job_id]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            other.jobs.is_empty(),
+            "the job stays private to everyone else"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_accounting_a_job_is_shared_only_within_its_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture_with(&dir, &["carol"], true).await;
+        svc.create_job_step(as_user(pty_step(job_id), "carol"))
+            .await
+            .expect("a named member of the job's account may join");
+
+        let share = |value: &str| UpdateJobRequest {
+            job_id,
+            share_with: Some(value.into()),
+            ..Default::default()
+        };
+        for outsider in ["dave", "bob"] {
+            let err = svc
+                .update_job(as_user(share(outsider), "alice"))
+                .await
+                .expect_err("a user outside the job's account cannot be named");
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(
+                err.message().contains("sacctmgr add user"),
+                "{}",
+                err.message()
+            );
+        }
+
+        // Adding the other team's user to the account is what lets them in.
+        svc.cluster
+            .association_cache()
+            .insert_association("dave", "research");
+        svc.update_job(as_user(share("dave"), "alice"))
+            .await
+            .expect("dave is now in the account");
+        svc.create_job_step(as_user(pty_step(job_id), "dave"))
+            .await
+            .expect("and may join");
+
+        // Leaving the account ends access even while still named.
+        svc.cluster.association_cache().reset();
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "research");
+        let err = svc
+            .create_job_step(as_user(pty_step(job_id), "dave"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_accounting_a_submit_naming_another_teams_user_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, _) = shared_job_fixture_with(&dir, &[], true).await;
+        let spec = spur_core::job::JobSpec {
+            name: "cross-team".into(),
+            user: "alice".into(),
+            account: Some("research".into()),
+            work_dir: "/tmp".into(),
+            share: spur_core::share::JobShare::parse(&["dave"]).unwrap(),
+            ..Default::default()
+        };
+        let err = svc.cluster.submit_job(spec).unwrap_err();
+        assert!(err.to_string().contains("not in its account"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_container_job_cannot_be_joined_by_another_user() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+        let mut step = pty_step(job_id);
+        step.container = Some(ContainerSpec {
+            image: "docker://ubuntu".into(),
+            ..Default::default()
+        });
+        let err = svc.create_job_step(as_user(step, "bob")).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_owner_changes_the_share_list_and_a_revocation_takes_effect() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+        let share = |value: &str| UpdateJobRequest {
+            job_id,
+            share_with: Some(value.into()),
+            ..Default::default()
+        };
+
+        let err = svc
+            .update_job(as_user(share("bob,carol"), "bob"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        svc.update_job(as_user(share(""), "alice"))
+            .await
+            .expect("the owner may clear the share list");
+        assert!(svc.cluster.get_job(job_id).unwrap().spec.share.is_empty());
+        let err = svc
+            .create_job_step(as_user(pty_step(job_id), "bob"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = svc
+            .update_job(as_user(share("@everyone"), "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_rejects_when_job_not_running() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -12442,6 +13034,7 @@ mod tests {
                 exit_code: None,
                 pty: false,
                 job_shell: false,
+                joined_by: None,
             })
             .expect("test setup: seed step");
         svc.cluster
@@ -12698,6 +13291,7 @@ mod tests {
                 exit_code: None,
                 pty: false,
                 job_shell: false,
+                joined_by: None,
             })
             .expect("test setup: seed step with stale nodes");
 
@@ -12815,6 +13409,7 @@ mod tests {
                 exit_code: None,
                 pty: false,
                 job_shell: false,
+                joined_by: None,
             })
             .expect("test setup: seed step for run_step");
 

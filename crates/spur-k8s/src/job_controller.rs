@@ -1045,6 +1045,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         // The operator submits non-interactive jobs; it is intentionally exempt
         // from inactivity reaping.
         client_keepalive: false,
+        share_with: Vec::new(),
     }
 }
 
