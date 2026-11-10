@@ -24,10 +24,7 @@ struct UserCounters {
     walltime_actual_secs: u64,
 }
 
-/// Leader-side per-user karma counters.
-///
-/// Reset on every follower→leader transition so that a re-elected leader does
-/// not resume exporting stale values that Prometheus would interpret as new work.
+/// Leader-side per-user karma counters. Reset on every leader transition.
 #[derive(Debug, Default)]
 pub struct KarmaStatsCollector {
     inner: Mutex<Inner>,
@@ -223,5 +220,33 @@ mod tests {
             snap.users[0].1.gpus_requested, 4,
             "never evict: same job_id always deduped"
         );
+    }
+
+    #[test]
+    fn preempt_requeue_accumulates_actual_secs() {
+        let k = KarmaStatsCollector::new();
+        k.record_started(1, "alice", 4, 3600, false);
+        k.record_finalized("alice", JobState::Preempted, 600);
+        k.record_started(1, "alice", 4, 3600, false);
+        k.record_finalized("alice", JobState::Completed, 900);
+        let snap = k.snapshot();
+        let a = &snap.users[0].1;
+        assert_eq!(a.walltime_actual_secs, 1500, "600 + 900 across both runs");
+        assert_eq!(a.completed, 1);
+        assert_eq!(a.walltime_requested_secs, 3600, "request counted once");
+    }
+
+    #[test]
+    fn user_requeue_accumulates_actual_secs() {
+        let k = KarmaStatsCollector::new();
+        k.record_started(1, "alice", 2, 1800, false);
+        k.record_finalized("alice", JobState::Requeued, 300);
+        k.record_started(1, "alice", 2, 1800, false);
+        k.record_finalized("alice", JobState::Completed, 500);
+        let snap = k.snapshot();
+        let a = &snap.users[0].1;
+        assert_eq!(a.walltime_actual_secs, 800, "300 + 500 across both runs");
+        assert_eq!(a.completed, 1);
+        assert_eq!(a.gpus_requested, 2, "request counted once");
     }
 }

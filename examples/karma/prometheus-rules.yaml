@@ -1,11 +1,5 @@
-# Prometheus recording rules for karma sub-scores and composite.
-# Uses native Spur counters from /metrics/jobs-users-accts (requires
-# metrics.high_cardinality = true). Label key is {username}.
-#
-# Every sub-score is aggregated `by (username)` so all dimensions share
-# the same label set. This handles scrape labels (instance, job) on
-# counter terms and the failover case (one series per leader term).
-# NaN from 0/0 is dropped via `> -Inf` before the `or` fallback.
+# Karma sub-scores and composite from /metrics/jobs-users-accts counters.
+# Requires metrics.high_cardinality = true. NaN from 0/0 dropped via > -Inf.
 
 groups:
   - name: karma_subscores

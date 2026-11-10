@@ -1,11 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test for native karma Prometheus counters on /metrics/jobs-users-accts.
-
-Isolation comes from the per-test cluster fixture (fresh leader, empty
-counters). The username is the same across tests within a class.
-"""
+"""E2E test for native karma Prometheus counters on /metrics/jobs-users-accts."""
 
 import re
 import time
@@ -69,6 +65,8 @@ class TestKarmaCounters:
         self.username = self.c.nodes[0].user or "root"
 
     def _submit_and_wait(self, args, timeout=60):
+        if not any(a.startswith("-D") or a.startswith("--chdir") for a in args):
+            args = ["-D", self.c.remote_dir] + args
         job_id = parse_job_id(self.c.sbatch(args))
         assert job_id is not None
         wait_job(self.c, job_id, timeout=timeout)
@@ -76,12 +74,7 @@ class TestKarmaCounters:
         return job_id
 
     def test_exact_counter_values_across_job_sequence(self):
-        """Submit a controlled sequence and assert exact counter values.
-
-        No --gres flag: the non-GPU test shard has no GPUs configured,
-        so gpus_requested stays 0. GPU accounting is exercised on the
-        GPU shard via the Crusoe live-cluster validation.
-        """
+        """Submit ok/fail/cancel/timeout jobs and assert exact counter values."""
         # 1. Completed job: 5min limit, sleeps 3s
         script_ok = self.c.write_file("karma-ok.sh", "#!/bin/bash\nsleep 3\n")
         self._submit_and_wait(["-J", "karma-ok", "-N", "1", "--time=5", script_ok])
@@ -93,7 +86,7 @@ class TestKarmaCounters:
         # 3. Cancelled job: 10min limit
         script_long = self.c.write_file("karma-long.sh", "#!/bin/bash\nsleep 600\n")
         job_id = parse_job_id(
-            self.c.sbatch(["-J", "karma-cancel", "-N", "1", "--time=10", script_long])
+            self.c.sbatch(["-D", self.c.remote_dir, "-J", "karma-cancel", "-N", "1", "--time=10", script_long])
         )
         assert job_id is not None
         for _ in range(30):
@@ -148,37 +141,32 @@ class TestKarmaCounters:
 
 
 class TestKarmaGpuCounters:
-    """GPU-shard test: verify gpus_requested increments with --gres=gpu:N.
-
-    Uses the ``cluster`` fixture with high_cardinality enabled. Skipped
-    on shards without GPU device nodes.
-    """
+    """Verify gpus_requested increments with --gres=gpu:N on GPU nodes."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
         return {"metrics": {"high_cardinality": True}}
 
     @pytest.fixture(autouse=True)
-    def setup(self, cluster):
-        probe = cluster.nodes[0].exec_allow_fail(
-            "ls /dev/dri/renderD* 2>/dev/null | head -1"
-        )
-        if not probe.strip():
-            pytest.skip("no GPU device nodes on this shard")
-        self.c = cluster
+    def setup(self, gpu_cluster):
+        self.c = gpu_cluster
         self.username = self.c.nodes[0].user or "root"
+        self.node_gpus = self.c.node_gpu_count(self.c.node_names[0])
+        if self.node_gpus < 1:
+            pytest.skip("no GPUs configured on node")
 
     def test_gpu_request_counted(self):
-        """A job with --gres=gpu:2 must increment gpus_requested by 2."""
+        """A GPU job must increment gpus_requested by the requested count."""
+        gpus = min(self.node_gpus, 2)
         script = self.c.write_file("karma-gpu.sh", "#!/bin/bash\nsleep 2\n")
         job_id = parse_job_id(
             self.c.sbatch(
-                ["-J", "karma-gpu", "-N", "1", "--gres=gpu:2", "--time=2",
-                 script]
+                ["-D", self.c.remote_dir, "-J", "karma-gpu", "-N", "1",
+                 f"--gres=gpu:{gpus}", "--time=2", script]
             )
         )
         assert job_id is not None
         wait_job(self.c, job_id, timeout=60)
         time.sleep(2)
         counters = _scrape_counters(self.c, self.username)
-        assert counters.get("spur_karma_gpus_requested_total", 0) == 2
+        assert counters.get("spur_karma_gpus_requested_total", 0) == gpus

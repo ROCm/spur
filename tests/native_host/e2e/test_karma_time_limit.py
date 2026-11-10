@@ -1,11 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test for karma score prerequisite: time_limit_secs is recorded in
-the accounting DB and returned by sacct.
-
-Requires Postgres on node 0 (the accounting_cluster fixture).
-"""
+"""E2E: verify time_limit_secs is recorded in accounting DB and sacct."""
 
 import time
 
