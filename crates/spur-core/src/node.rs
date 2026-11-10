@@ -252,6 +252,16 @@ pub fn node_overlay(node: &spur_proto::proto::NodeInfo) -> Option<NodeOverlay> {
     None
 }
 
+/// `CPUTot` for a reported node: CPUs before spec cores are set aside. A
+/// controller that predates the field reports 0, so fall back to the
+/// schedulable count.
+pub fn reported_cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
+    if node.cpu_tot > 0 {
+        return node.cpu_tot;
+    }
+    node.total_resources.as_ref().map_or(0, |r| r.cpus)
+}
+
 /// Where a node originates from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -890,6 +900,22 @@ mod tests {
     #[test]
     fn node_overlay_none_when_plain_idle() {
         assert_eq!(node_overlay(&idle_node_info()), None);
+    }
+
+    #[test]
+    fn reported_cpu_tot_counts_spec_cores_and_falls_back_for_old_controllers() {
+        let mut node = idle_node_info();
+        node.total_resources = Some(spur_proto::proto::ResourceSet {
+            cpus: 6,
+            ..Default::default()
+        });
+        assert_eq!(
+            reported_cpu_tot(&node),
+            6,
+            "no cpu_tot from an older controller"
+        );
+        node.cpu_tot = 8;
+        assert_eq!(reported_cpu_tot(&node), 8);
     }
 
     #[test]

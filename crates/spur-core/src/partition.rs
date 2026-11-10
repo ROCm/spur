@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::node::Node;
+
 /// Partition (queue) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
@@ -168,6 +170,30 @@ pub fn max_priority_tier(spec: Option<&str>, partitions: &[Partition]) -> u32 {
         .unwrap_or(1)
 }
 
+/// A partition's size as Slurm's `TotalNodes`/`TotalCPUs` report it: every
+/// member node whatever its state, with all of its CPUs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionTotals {
+    pub nodes: u32,
+    pub cpus: u32,
+}
+
+/// Totals per partition over each node's resolved `partitions`, the membership
+/// the scheduler places by. Partitions without members have no entry.
+pub fn partition_totals<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+) -> HashMap<String, PartitionTotals> {
+    let mut totals: HashMap<String, PartitionTotals> = HashMap::new();
+    for node in nodes {
+        for name in &node.partitions {
+            let entry = totals.entry(name.clone()).or_default();
+            entry.nodes += 1;
+            entry.cpus = entry.cpus.saturating_add(node.cpu_tot());
+        }
+    }
+    totals
+}
+
 impl Default for Partition {
     fn default() -> Self {
         Self {
@@ -274,5 +300,42 @@ mod tests {
         let parts = vec![partition_with_tier("gpu", 5)];
         assert_eq!(max_priority_tier(None, &parts), 1);
         assert_eq!(max_priority_tier(Some("nope"), &parts), 1);
+    }
+
+    fn member(name: &str, cpus: u32, partitions: &[&str]) -> Node {
+        let resources = crate::resource::ResourceSet {
+            cpus,
+            ..Default::default()
+        };
+        let mut node = Node::new(name.into(), resources);
+        node.partitions = partitions.iter().map(|p| p.to_string()).collect();
+        node
+    }
+
+    #[test]
+    fn partition_totals_counts_a_node_in_every_partition_it_joins() {
+        let nodes = [
+            member("n1", 8, &["batch", "gpu"]),
+            member("n2", 16, &["batch"]),
+        ];
+        let totals = partition_totals(&nodes);
+        assert_eq!(totals["batch"], PartitionTotals { nodes: 2, cpus: 24 });
+        assert_eq!(totals["gpu"], PartitionTotals { nodes: 1, cpus: 8 });
+        assert!(!totals.contains_key("empty"));
+    }
+
+    #[test]
+    fn partition_totals_counts_unavailable_nodes_with_their_spec_cpus() {
+        let mut down = member("n1", 6, &["batch"]);
+        down.state = crate::node::NodeState::Down;
+        down.core_layout = Some(crate::core_layout::CoreLayout {
+            spec_cpus: vec![6, 7],
+            ..Default::default()
+        });
+        let mut drained = member("n2", 4, &["batch"]);
+        drained.state = crate::node::NodeState::Drain;
+
+        let totals = partition_totals([&down, &drained]);
+        assert_eq!(totals["batch"], PartitionTotals { nodes: 2, cpus: 12 });
     }
 }

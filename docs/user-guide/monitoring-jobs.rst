@@ -332,6 +332,11 @@ Default columns (partition view): ``PARTITION AVAIL TIMELIMIT NODES STATE
 NODELIST``; ``-l`` adds CPUS and MEMORY. Node view (``-N``): ``NODELIST NODES
 PARTITION STATE CPUS MEMORY GRES``.
 
+CPUS and MEMORY (``%c`` and ``%m``) are per-node sizes, as in Slurm: CPUS is
+the node's ``CPUTot``, specialized cores included, and MEMORY its
+``RealMemory``. In the partition view, when a row's nodes differ, the smallest
+size is shown with a ``+`` suffix, for example ``64+``.
+
 .. code-block:: bash
 
    sinfo -N -o "%N %.6D %.11T %c %m %G"
@@ -653,6 +658,16 @@ The user names are shown to the same audience as ``EndedBy`` in ``sacct``
    scontrol show job 1024
    spur show node node01
    scontrol show partition gpu
+
+For a partition, ``TotalNodes`` counts every registered node the partition
+holds, whatever its state (a ``DOWN`` or ``DRAIN`` node still counts), and
+``TotalCPUs`` sums those nodes' CPUs with specialized cores included, as in
+Slurm. Membership is the one the scheduler places jobs by, so a node that
+matched no partition and joined the default one counts there. A host named in
+``Nodes=`` that has never registered is not counted: Spur keeps no record of a
+node until its agent registers, while Slurm counts every node defined in
+``slurm.conf``. The REST ``/partitions`` response carries the same values as
+``total_nodes`` and ``total_cpus``.
 
 Expanding node lists — ``scontrol show hostnames`` / ``hostlist``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

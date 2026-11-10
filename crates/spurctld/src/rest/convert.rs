@@ -3,7 +3,7 @@
 
 use spur_core::job::{Job, JobState};
 use spur_core::node::{Node, NodeState};
-use spur_core::partition::Partition;
+use spur_core::partition::{Partition, PartitionTotals};
 
 pub fn job_to_json(job: &Job) -> serde_json::Value {
     serde_json::json!({
@@ -75,13 +75,13 @@ pub fn node_to_json(
     })
 }
 
-pub fn partition_to_json(part: &Partition) -> serde_json::Value {
+pub fn partition_to_json(part: &Partition, totals: PartitionTotals) -> serde_json::Value {
     serde_json::json!({
         "name": part.name,
         "state": part.state.display(),
         "is_default": part.is_default,
-        "total_nodes": 0,
-        "total_cpus": 0,
+        "total_nodes": totals.nodes,
+        "total_cpus": totals.cpus,
         "nodes": part.nodes,
         "max_time": part.max_time_minutes,
         "default_time": part.default_time_minutes,
@@ -142,7 +142,7 @@ mod tests {
             deny_accounts: vec!["student".into()],
             ..Default::default()
         };
-        let json = partition_to_json(&part);
+        let json = partition_to_json(&part, PartitionTotals::default());
         assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
         assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
     }
