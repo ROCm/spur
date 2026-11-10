@@ -24,8 +24,9 @@ Older log entries remain readable, but timestamps absent from those entries cann
 be reconstructed by this change. Such entries retain the recovery-time fallback;
 this does not repair previously reset timestamps. Existing snapshots preserve the
 times they contain. During a rolling upgrade, an older leader still writes
-unstamped submissions, and older replicas still reconstruct submission times from
-their own clocks. Timestamp preservation requires all controllers to be upgraded.
+submissions without timestamps, and older replicas still reconstruct submission
+times from their own clocks. Timestamp preservation requires all controllers to
+be upgraded.
 
 Single-Host: ``spur self-update``
 ---------------------------------
