@@ -13,6 +13,28 @@ and the Ansible playbooks that upgrade a running cluster with or without an outa
    binaries on disk — it does **not** restart the daemons. The drain-aware, jobs-preserving
    cluster path is the Ansible ``rolling_upgrade.yml`` playbook (see below).
 
+Preemption accounting compatibility
+-----------------------------------
+
+The preemption-outcome feature adds a ``preemption_usage`` column to accounting
+job history and PostgreSQL checkpoint, aggregate, and cause tables.
+The accounting service creates these automatically; its database role needs the
+same schema-update permissions as for other migrations. Back up the database
+and controller state before upgrading. Pre-feature history cannot supply these
+new counters, and old preemption log entries without claims are not counted.
+
+Use one controller version when relying on preemption lifetime totals. The log
+and snapshot additions can be read by older controllers, but those controllers
+do not update the ledger or honor its terminal-job retention checks. A mixed
+controller cluster can therefore disagree on preemption totals and retained
+terminal jobs. Complete the controller upgrade before treating these reports as
+consistent; binary-format compatibility alone does not provide that guarantee.
+
+Rollups survive job-history cleanup and fairshare resets. Accounting outages
+retain affected terminal jobs until their latest counts export successfully,
+which can increase controller memory and snapshot size. See
+:doc:`/user-guide/monitoring-jobs` for outcome semantics and reporting limits.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 

@@ -1094,7 +1094,9 @@ Preemption outcomes — ``/metrics/scheduler``
 
 ``sdiag`` reports cluster totals only; user/account detail is available through
 ``sreport preemptions`` when PostgreSQL accounting is configured. ``scontrol show job`` reports a requesting job's
-``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen``. Counts describe
+``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen`` when any
+count is nonzero. REST job responses expose the same counts and cause detail
+in ``preemption_usage``. Counts describe
 **victim runs**, not nodes: preempting the same job on two runs counts twice.
 Suspension and idle-fill reclaim without an owner-directed handoff are excluded.
 A grace warning alone does not increment any count; the first released slice
@@ -1127,7 +1129,7 @@ allocations count as launched once allocation registration and activation succee
 ``reason`` has four values:
 
 * ``started_elsewhere``: the launch succeeded without matching released capacity.
-* ``launch_failed``: the requesting launch was rejected, held, backed off, or not released.
+* ``launch_failed``: a reserved requesting launch was rejected, held, backed off, or not released.
 * ``cancelled``: cancellation ended the request before use.
 * ``ended_other``: another end or a superseding attempt closed the request,
   including an outcome that could not be confirmed after controller failure.
@@ -1150,10 +1152,22 @@ victim using any matching capacity counts once; this does not measure the
 fraction of its allocation used. Capacity released after launch confirmation
 cannot serve that launch.
 
-Each requesting attempt has its own persisted observation ID, including retries
-that fail before resource reservation advances the job's run number. Victim
+Each tracked requesting attempt has a persisted observation ID. A transient
+failure before reservation leaves the pending observation open, so a retry can
+still use that capacity. Cancellation closes it even before reservation. Victim
 allocation evidence travels in the preemption entry; requester evidence comes
 from its reservation entry, so replicas use the same identities.
+
+An observed launch result is retained locally until its Raft confirmation
+succeeds. The scheduler retries failed confirmations. After a controller restart,
+a result that never reached Raft cannot be reconstructed from Running state:
+activation precedes the agents' workload-release acknowledgments. Once the new
+leader's dispatch grace expires, activated observations without that evidence
+close as ``ended_other`` / ``unknown``. This records uncertainty, including for
+workloads that may have run successfully; it does not assert a launch failure.
+Recovery waits twice the configured dispatch timeout; disabling that timeout
+also disables this automatic uncertainty settlement for active requests.
+Ended or superseded requests close without waiting for that grace.
 
 Cluster totals, active observations, and per-job counts are persisted through
 Raft. They start when this feature begins observing events, survive controller
@@ -1172,7 +1186,7 @@ Use the accounting service through the controller's gRPC endpoint:
    sreport preemptions --user alice --parsable
    sreport preemptions --account research --limit 25
    sreport preemptions --account research --by-cause
-   sreport preemptions --account research --limit 25 --page-token '["alice","research"]'
+   sreport preemptions --account research --limit 25 --page-token '<token>'
 
 Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
 requesting user/account pair; a user's rows across accounts add to that user's
@@ -1215,22 +1229,27 @@ silently displaying incomplete details.
 The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
 privacy settings, including coordinator visibility. Scoped reports identify
 that restriction and must not be presented as full account or cluster totals.
-The old scheduler-statistics user fields remain on the wire but are empty.
 
 An asynchronous exporter attempts up to 1000 changed jobs every ten seconds.
+A failing checkpoint is logged and retained while other jobs continue exporting;
+a cursor advances across batches so failing rows cannot starve later jobs.
+Connection failures stop the batch until the next tick.
 PostgreSQL stores durable rollups plus one deduplication checkpoint per job
 incarnation (job ID and leader-stamped submission time; older jobs use a stable
 legacy key). The stamp travels in the existing submission entry. Duplicate or older exports do not
 increment totals; requeued runs accumulate in the same job checkpoint. The
-requesting user/account is fixed at its first export. The rollups and checkpoints
+requesting user/account is fixed at its first export. Later account edits do not
+move that job's lifetime contributions; history can show the new account while
+these counts remain visible to the original account's coordinator. The rollups and checkpoints
 are independent of job-history rows, account deletion, and fairshare resets.
-Retained accounting history is imported on upgrade; already deleted history
-cannot be reconstructed into user/account totals.
+Pre-feature history has no usage observations to import. Totals begin with
+claimed preemptions recorded by this feature; older log entries without claims
+are not counted, regardless of where a replica took its snapshot.
 
 Cause rollups and their deduplication checkpoints also live in PostgreSQL,
 updated in the same transaction as the summary totals. This breakdown adds no
-Raft operations. Older aggregate-only checkpoints retain their totals and show
-any missing cause detail as ``unclassified`` with initiator ``unknown`` until
+Raft operations. A checkpoint missing cause detail retains its totals and reports
+the remainder as ``unclassified`` with initiator ``unknown`` until
 a retained controller job re-exports its cause counts. This is a historical
 data gap, not an event reason. It may remain permanently when the controller
 no longer retains that job. Reports omit zero cause buckets and can show one
@@ -1247,8 +1266,9 @@ counts must also be exported. With accounting disabled, only cluster and
 retained per-job counts are available.
 
 The counters piggyback on existing state-machine operations. A requesting launch
-with unresolved tracked preemptions writes at most one additional guarded
+with unresolved tracked preemptions normally writes at most one additional guarded
 release confirmation, regardless of the number of victims or metric buckets.
+Raft failures can require retries; duplicate confirmations do not count twice.
 Launches without tracked preemptions add no log entry. Open claim storage grows
 with tracked victim allocations; completed claims are removed. Recording a
 partial node completion updates that node's release evidence without copying

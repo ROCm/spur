@@ -669,7 +669,6 @@ impl SlurmAccounting for AccountingService {
                 preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
                     &r.preemption_usage,
                 )),
-
                 fabric_bindings: Default::default(),
                 gpu_bindings: Default::default(),
                 job_id: r.job_id,

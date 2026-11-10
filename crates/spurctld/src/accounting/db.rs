@@ -569,6 +569,20 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     Ok(())
 }
 
+fn decode_preemption_usage(
+    row: &sqlx::postgres::PgRow,
+) -> spur_core::preemption_usage::PreemptionUsage {
+    match row.try_get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
+        "preemption_usage",
+    ) {
+        Ok(usage) => usage.0,
+        Err(error) => {
+            tracing::warn!(job_id = row.get::<i64, _>("job_id"), %error, "invalid preemption history; returning empty job counts");
+            Default::default()
+        }
+    }
+}
+
 fn preemption_usage_json(
     usage: &spur_core::preemption_usage::PreemptionUsage,
 ) -> anyhow::Result<sqlx::types::Json<serde_json::Value>> {
@@ -621,11 +635,7 @@ pub async fn job_accounting_states(
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let total_gpus = r.get::<i32, _>("total_gpus").max(0) as u32;
             let row = AccountingRowState {
-                preemption_usage: r
-                    .get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
-                        "preemption_usage",
-                    )
-                    .0,
+                preemption_usage: decode_preemption_usage(&r),
                 state: r.get("state"),
                 needs_start_backfill: user_name.is_empty() || start_time.is_none(),
                 total_gpus,
@@ -855,11 +865,7 @@ pub async fn get_job_history(
     let records = rows
         .iter()
         .map(|row| JobRecord {
-            preemption_usage: row
-                .get::<sqlx::types::Json<spur_core::preemption_usage::PreemptionUsage>, _>(
-                    "preemption_usage",
-                )
-                .0,
+            preemption_usage: decode_preemption_usage(row),
             job_id: row.get::<i64, _>("job_id") as JobId,
             name: row.get("name"),
             user_name: row.get("user_name"),

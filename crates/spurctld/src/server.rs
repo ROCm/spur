@@ -8552,7 +8552,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preemption_diagnostics_omit_legacy_user_rows_and_reset_preserves_totals() {
+    async fn preemption_diagnostics_report_cluster_totals_and_reset_preserves_totals() {
         use crate::raft::StateMachineApply;
         for category in ["jobs", "usage"] {
             let dir = tempfile::tempdir().expect("temporary state");
@@ -8571,7 +8571,6 @@ mod tests {
                 .await
                 .expect("stats")
                 .into_inner();
-            assert!(stats.preemption_users.is_empty());
             assert_eq!(stats.preemption_usage.expect("totals").used, 2);
             let mut reset = Request::new(());
             reset

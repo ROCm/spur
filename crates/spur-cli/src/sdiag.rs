@@ -297,6 +297,26 @@ mod tests {
     use spur_proto::proto::JobState;
 
     #[test]
+    fn scheduler_statistics_report_cluster_preemption_counts_and_causes() {
+        let stats = SchedStats {
+            preemption_usage: Some(spur_proto::proto::PreemptionUsage {
+                used: 8,
+                unused: 3,
+                open: 1,
+                unused_by_cause: vec![spur_proto::proto::UnusedPreemptionCount {
+                    reason: "launch_failed".into(),
+                    initiator: "system".into(),
+                    count: 3,
+                }],
+            }),
+            ..Default::default()
+        };
+        let lines = scheduler_statistics_lines(&stats).join("\n");
+        assert!(lines.contains("Preemptions (lifetime): used=8 unused=3 open=1"));
+        assert!(lines.contains("Unused: reason=launch_failed initiator=system count=3"));
+    }
+
+    #[test]
     fn job_count_reads_proto_entries() {
         let metrics = JobMetrics {
             total: 2,
@@ -379,8 +399,6 @@ mod tests {
     fn scheduler_statistics_lines_include_cycle_and_lifecycle_fields() {
         let stats = SchedStats {
             preemption_usage: None,
-            preemption_users: Vec::new(),
-            preemption_users_truncated: false,
             plugin: "backfill".into(),
             cycles: 5,
             cycle_total_time_us: 2500,

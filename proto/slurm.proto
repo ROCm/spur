@@ -1035,11 +1035,6 @@ message PreemptionUsage {
   repeated UnusedPreemptionCount unused_by_cause = 4;
 }
 
-message UserPreemptionUsage {
-  string user = 1;
-  PreemptionUsage usage = 2;
-}
-
 message SchedStats {
   string plugin = 1;
   uint64 cycles = 2;
@@ -1057,8 +1052,6 @@ message SchedStats {
   uint64 exit_max_depth = 14;
   uint64 jobs_preempted = 15;
   PreemptionUsage preemption_usage = 16;
-  repeated UserPreemptionUsage preemption_users = 17;
-  bool preemption_users_truncated = 18;
 }
 
 // What one user holds under a scope, beside the caps governing that user. Counts

@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use spur_core::job::{Job, JobId, JobState};
 use spur_core::preemption_usage::{
-    PreemptionClaim, PreemptionInitiator as Initiator, PreemptionUsage, UnusedReason as Reason,
+    PreemptionClaim, PreemptionInitiator as Initiator, PreemptionRelease, PreemptionUsage,
+    UnusedReason as Reason,
 };
 use spur_core::resource::ResourceAllocations;
 use spur_core::wal::WalOperation;
@@ -383,11 +384,13 @@ impl UsageLedger {
         else {
             return;
         };
-        let observation = preemption_observation.unwrap_or(u64::from(*run_attempt));
+        let Some(observation) = preemption_observation else {
+            return;
+        };
         if let Some(request) = self
             .requests
             .get_mut(job_id)
-            .and_then(|r| r.get_mut(&observation))
+            .and_then(|r| r.get_mut(observation))
         {
             if request.outcome.is_none() {
                 request.run_attempt = Some(*run_attempt);
@@ -520,25 +523,84 @@ impl ClusterManager {
         let Some(observation) = observation_id else {
             return Ok(());
         };
+        let release = PreemptionRelease {
+            job_id,
+            run_attempt: attempt,
+            observation_id: Some(observation),
+            released,
+            unconfirmed: false,
+        };
+        self.preemption_confirmations
+            .write()
+            .insert((job_id, observation), release.clone());
+        self.persist_preemption_confirmation(release)
+    }
+
+    fn persist_preemption_confirmation(&self, release: PreemptionRelease) -> anyhow::Result<()> {
+        let Some(observation) = release.observation_id else {
+            return Ok(());
+        };
+        let key = (release.job_id, observation);
         let pending = self
             .preemption_usage
             .read()
             .requests
-            .get(&job_id)
+            .get(&release.job_id)
             .and_then(|a| a.get(&observation))
             .is_some_and(|r| r.outcome.is_none());
-        if !pending {
+        if pending {
+            self.propose(WalOperation::EvictTerminalJobs {
+                job_ids: Vec::new(),
+                before: None,
+                at: None,
+                preemption_release: Some(release),
+            })?;
+        }
+        self.preemption_confirmations.write().remove(&key);
+        Ok(())
+    }
+
+    pub(crate) fn recover_preemption_confirmations(
+        &self,
+        dispatches_quiescent: bool,
+    ) -> anyhow::Result<()> {
+        let saved: Vec<_> = self
+            .preemption_confirmations
+            .read()
+            .values()
+            .take(1000)
+            .cloned()
+            .collect();
+        for release in saved {
+            self.persist_preemption_confirmation(release)?;
+        }
+        if !self.preemption_confirmations.read().is_empty() {
             return Ok(());
         }
-        let mut op = WalOperation::preemption_release(job_id, attempt, released);
-        if let WalOperation::EvictTerminalJobs {
-            preemption_release: Some(release),
-            ..
-        } = &mut op
-        {
-            release.observation_id = Some(observation);
+        let unresolved: Vec<_> = self
+            .preemption_usage
+            .read()
+            .requests
+            .iter()
+            .flat_map(|(&job_id, requests)| {
+                requests.iter().filter_map(move |(&observation, request)| {
+                    (request.activated.is_some()
+                        && request.outcome.is_none()
+                        && (dispatches_quiescent || request.closed))
+                        .then_some(PreemptionRelease {
+                            job_id,
+                            run_attempt: request.run_attempt.unwrap_or(0),
+                            observation_id: Some(observation),
+                            released: false,
+                            unconfirmed: true,
+                        })
+                })
+            })
+            .take(1000)
+            .collect();
+        for release in unresolved {
+            self.persist_preemption_confirmation(release)?;
         }
-        self.propose(op)?;
         Ok(())
     }
 
@@ -550,15 +612,13 @@ impl ClusterManager {
                 job_id,
                 handoff: true,
                 preempted_by: Some(owner),
-                preemptor_run_attempt,
-                preemption_claim,
+                preemption_claim: Some(claim),
                 ..
             }
             | WalOperation::JobPreemptCancel {
                 job_id,
                 preempted_by: Some(owner),
-                preemptor_run_attempt,
-                preemption_claim,
+                preemption_claim: Some(claim),
                 ..
             } => jobs
                 .get(job_id)
@@ -566,39 +626,18 @@ impl ClusterManager {
                 .map(|(v, o)| Registration {
                     victim: v.into(),
                     owner: o.into(),
-                    claim: preemption_claim.clone().unwrap_or_else(|| PreemptionClaim {
-                        observation_id: u64::from(
-                            preemptor_run_attempt
-                                .unwrap_or_else(|| o.run_attempt.saturating_add(1)),
-                        ),
-                        allocations: allocation_slices(
-                            &v.allocated_nodes,
-                            v.allocated_resources.as_ref(),
-                            &HashMap::new(),
-                        ),
-                    }),
+                    claim: claim.clone(),
                 }),
             WalOperation::JobPreemptSignaled { job_id, pending } => {
-                jobs.get(job_id)
-                    .zip(jobs.get(&pending.preempted_by))
-                    .map(|(v, o)| Registration {
-                        victim: v.into(),
-                        owner: o.into(),
-                        claim: pending.preemption_claim.clone().unwrap_or_else(|| {
-                            PreemptionClaim {
-                                observation_id: u64::from(
-                                    pending
-                                        .preemptor_run_attempt
-                                        .unwrap_or_else(|| o.run_attempt.saturating_add(1)),
-                                ),
-                                allocations: allocation_slices(
-                                    &v.allocated_nodes,
-                                    v.allocated_resources.as_ref(),
-                                    &HashMap::new(),
-                                ),
-                            }
-                        }),
-                    })
+                pending.preemption_claim.as_ref().and_then(|claim| {
+                    jobs.get(job_id)
+                        .zip(jobs.get(&pending.preempted_by))
+                        .map(|(v, o)| Registration {
+                            victim: v.into(),
+                            owner: o.into(),
+                            claim: claim.clone(),
+                        })
+                })
             }
             _ => None,
         };
@@ -665,15 +704,19 @@ impl ClusterManager {
             usage.at = op.occurred_at();
             // Requeue can clear or replace the job's cancellation provenance
             // before this observation's delayed launch acknowledgment arrives.
-            let outcome = (!release.released).then(|| {
-                usage
-                    .requests
-                    .get(&release.job_id)
-                    .and_then(|requests| requests.get(&observation))
-                    .and_then(|request| request.closure_cause)
-                    .filter(|(reason, _)| *reason == Reason::Cancelled)
-                    .unwrap_or((Reason::LaunchFailed, Initiator::System))
-            });
+            let outcome = if release.unconfirmed {
+                Some((Reason::EndedOther, Initiator::Unknown))
+            } else {
+                (!release.released).then(|| {
+                    usage
+                        .requests
+                        .get(&release.job_id)
+                        .and_then(|requests| requests.get(&observation))
+                        .and_then(|request| request.closure_cause)
+                        .filter(|(reason, _)| *reason == Reason::Cancelled)
+                        .unwrap_or((Reason::LaunchFailed, Initiator::System))
+                })
+            };
             usage.settle(release.job_id, observation, outcome, &mut jobs);
             return ClientResponse::default();
         }
@@ -732,6 +775,9 @@ impl ClusterManager {
             };
             usage.release(&before, after.as_ref(), completed_node, &mut jobs);
             let Some(after) = after else {
+                self.preemption_confirmations
+                    .write()
+                    .retain(|(job_id, _), _| *job_id != id);
                 usage.high_water.remove(&id);
                 usage.end_owner(
                     id,

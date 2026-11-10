@@ -30,7 +30,7 @@ fn reserve(cm: &ClusterManager, id: JobId, attempt: u32, nodes: &[(&str, Resourc
         total.add(a);
     }
     cm.apply_operation(&WalOperation::JobStart {
-        preemption_observation: None,
+        preemption_observation: cm.preemption_observation(id),
         effective_partition: None,
         memory_adjustment: None,
         job_id: id,
@@ -222,7 +222,7 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
     let pending = PreemptPending {
-        preemption_claim: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         preemptor_run_attempt: Some(1),
         signaled_at: chrono::DateTime::UNIX_EPOCH,
         deadline: chrono::DateTime::UNIX_EPOCH,
@@ -272,7 +272,7 @@ fn capacity_released_after_requester_launch_is_unused() {
     start(&cm, 1, 1, &[("n1", scalar())]);
     assert!(
         cm.apply_operation(&WalOperation::JobPreemptCancel {
-            preemption_claim: None,
+            preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
             job_id: 1,
             preempted_by: Some(10),
             preemptor_run_attempt: Some(1),
@@ -306,7 +306,7 @@ fn reclaimed_capacity_without_a_handoff_is_excluded() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptRequeue {
-        preemption_claim: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),
@@ -427,7 +427,7 @@ fn success_before_late_release_survives_a_snapshot() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptCancel {
-        preemption_claim: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),
@@ -545,7 +545,7 @@ fn cancelled_requester_is_retained_until_its_warned_victims_release_capacity() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     cm.apply_operation(&WalOperation::JobPreemptCancel {
-        preemption_claim: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
         preemptor_run_attempt: Some(1),
@@ -667,22 +667,22 @@ async fn accounting_acknowledgement_gates_eviction_and_is_not_in_snapshots() {
     let mut stale = checkpoint.clone();
     stale.usage.used = 2;
     other.acknowledge_preemption_checkpoint(&stale);
-    assert_eq!(other.pending_preemption_checkpoints(100).len(), 1);
+    assert_eq!(other.pending_preemption_checkpoints(100, None).len(), 1);
     other.acknowledge_preemption_checkpoint(&checkpoint);
-    assert!(other.pending_preemption_checkpoints(100).is_empty());
+    assert!(other.pending_preemption_checkpoints(100, None).is_empty());
     let (_, restarted) = cluster();
     restarted
         .restore_from_snapshot(&other.snapshot_state().expect("snapshot"))
         .expect("restore");
     assert_eq!(
-        restarted.pending_preemption_checkpoints(100).len(),
+        restarted.pending_preemption_checkpoints(100, None).len(),
         1,
         "restart must recheck PostgreSQL"
     );
     other
         .restore_from_snapshot(&other.snapshot_state().expect("snapshot"))
         .expect("restore over existing cache");
-    assert_eq!(other.pending_preemption_checkpoints(100).len(), 1);
+    assert_eq!(other.pending_preemption_checkpoints(100, None).len(), 1);
     other.acknowledge_preemption_checkpoint(&checkpoint);
     other.evict_expired_terminal_jobs();
     assert!(other.get_job(10).is_none());

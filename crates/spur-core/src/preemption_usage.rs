@@ -14,6 +14,7 @@ pub struct PreemptionRelease {
     pub run_attempt: u32,
     pub released: bool,
     pub observation_id: Option<u64>,
+    pub unconfirmed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -284,11 +284,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Held back for twice dispatch_timeout_secs after a leadership change so an old
         // leader's in-flight RPC can land or time out; a backstop to the sweep's agent cancel.
         let leader_since = *leader_since_rx.borrow();
-        if should_sweep_orphaned_placements(
+        let dispatches_quiescent = should_sweep_orphaned_placements(
             dispatch_deadline(&cluster),
             leader_since,
             raft.current_term(),
-        ) {
+        );
+        if let Err(error) = cluster.recover_preemption_confirmations(dispatches_quiescent) {
+            warn!(%error, "could not recover preemption confirmations");
+        }
+        if dispatches_quiescent {
             sweep_orphaned_placements(&cluster).await;
         }
         cluster.purge_expired_reservations();
@@ -586,9 +590,7 @@ async fn process_assignment(
     assignment: spur_sched::traits::Assignment,
     borrowed: bool,
 ) -> bool {
-    let mut attempt = cluster
-        .get_job(assignment.job_id)
-        .map(|job| job.run_attempt.saturating_add(1));
+    let mut attempt = None;
     let job_id = assignment.job_id;
     let observation = cluster.preemption_observation(job_id);
     let released = process_assignment_inner(
@@ -9927,19 +9929,12 @@ mod tests {
                 .preemption_observation(job_id)
                 .expect("first observation");
             let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
-            assert_eq!(
-                cm.preemption_usage().unused_count(
-                    spur_core::preemption_usage::UnusedReason::LaunchFailed,
-                    spur_core::preemption_usage::PreemptionInitiator::System
-                ),
-                1
-            );
-            assert_eq!(cm.preemption_usage().used, 0);
-
             assert!(
                 !started,
                 "a job whose PrologSlurmctld fails must not count as started"
             );
+            let usage = cm.preemption_usage();
+            assert_eq!((usage.used, usage.unused_total(), usage.open), (0, 0, 1));
             // Unlike the interactive case, a batch job is requeued (it has no
             // waiting srun to strand). PrologSlurmctld runs before dispatch, so
             // the job never left Pending and no node was launched.
@@ -9956,17 +9951,12 @@ mod tests {
             );
 
             std::fs::write(&script, "#!/bin/bash\nexit 0\n").expect("successful retry prolog");
-            preempt_for_assignment(&cm, job_id);
-            assert!(
-                cm.preemption_observation(job_id)
-                    .expect("retry observation")
-                    > first_observation
-            );
+            assert_eq!(cm.preemption_observation(job_id), Some(first_observation));
             assert!(process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await);
             cm.node_complete(victim, "n2", 0, 0, victim_attempt)
                 .expect("late victim release");
             let usage = cm.preemption_usage();
-            assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 1, 0));
+            assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 0, 0));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

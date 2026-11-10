@@ -49,42 +49,6 @@ CREATE TABLE IF NOT EXISTS preemption_cause_rollups (
     PRIMARY KEY (user_name, account, reason, initiator)
 );
 
-CREATE TABLE IF NOT EXISTS preemption_migrations (name TEXT PRIMARY KEY);
-
--- Checkpoints deliberately outlive job history; retries must not import it twice.
-WITH migration AS (
-    INSERT INTO preemption_migrations VALUES ('retained_jobs')
-    ON CONFLICT DO NOTHING RETURNING name
-), imported AS (
-    INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, used, unused, open, unused_by_cause)
-    SELECT job_id, 'legacy', user_name, account,
-        COALESCE((preemption_usage->>'used')::numeric, 0),
-        COALESCE((SELECT SUM(count.value::numeric)
-            FROM jsonb_each(COALESCE(preemption_usage->'unused', '{}'::jsonb)) reason,
-                 jsonb_each_text(reason.value) count), 0),
-        COALESCE((preemption_usage->>'open')::numeric, 0),
-        COALESCE(preemption_usage->'unused', '{}'::jsonb)
-    FROM jobs WHERE EXISTS (SELECT 1 FROM migration) AND COALESCE((preemption_usage->>'revision')::numeric, 0) > 0
-    ON CONFLICT DO NOTHING
-    RETURNING user_name, account, used, unused, open, unused_by_cause
-), imported_causes AS (
-    INSERT INTO preemption_cause_rollups (user_name, account, reason, initiator, count)
-    SELECT user_name, account, reason.key, initiator.key, SUM(initiator.value::numeric)
-    FROM imported,
-         jsonb_each(unused_by_cause) reason,
-         jsonb_each_text(reason.value) initiator
-    GROUP BY user_name, account, reason.key, initiator.key
-    ON CONFLICT (user_name, account, reason, initiator) DO UPDATE SET
-        count = preemption_cause_rollups.count + EXCLUDED.count
-    RETURNING user_name
-)
-INSERT INTO preemption_rollups (user_name, account, used, unused, open)
-SELECT user_name, account, SUM(used), SUM(unused), SUM(open)
-FROM imported GROUP BY user_name, account
-ON CONFLICT (user_name, account) DO UPDATE SET
-    used = preemption_rollups.used + EXCLUDED.used,
-    unused = preemption_rollups.unused + EXCLUDED.unused,
-    open = preemption_rollups.open + EXCLUDED.open;
 "#;
 
 #[derive(Clone)]
@@ -200,28 +164,59 @@ pub(super) async fn write(conn: &mut PgConnection, checkpoint: &Checkpoint) -> a
 pub(super) fn spawn_loop(pool: PgPool, cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut cursor = None;
         loop {
             interval.tick().await;
             if !raft.ensure_leader().await {
                 continue;
             }
-            if let Err(error) = sync_once(&pool, &cluster).await {
+            if let Err(error) = sync_once(&pool, &cluster, &mut cursor).await {
                 tracing::warn!(%error, "preemption accounting export failed; retaining unexported jobs");
             }
         }
     });
 }
 
-pub(crate) async fn sync_once(pool: &PgPool, cluster: &ClusterManager) -> anyhow::Result<()> {
-    for checkpoint in cluster.pending_preemption_checkpoints(1000) {
-        tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
+fn connection_failed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .is_some_and(|error| match error {
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed => true,
+            sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+                code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+            }),
+            _ => false,
+        })
+}
+
+pub(crate) async fn sync_once(
+    pool: &PgPool,
+    cluster: &ClusterManager,
+    cursor: &mut Option<JobId>,
+) -> anyhow::Result<()> {
+    let batch = cluster.pending_preemption_checkpoints(1000, *cursor);
+    let last_batch = batch.len() < 1000;
+    for checkpoint in batch {
+        let result = tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
             let mut tx = pool.begin().await?;
             write(&mut tx, &checkpoint).await?;
             tx.commit().await?;
             anyhow::Ok(())
         })
-        .await??;
-        cluster.acknowledge_preemption_checkpoint(&checkpoint);
+        .await?;
+        match result {
+            Ok(()) => cluster.acknowledge_preemption_checkpoint(&checkpoint),
+            Err(error) if connection_failed(&error) => return Err(error),
+            Err(error) => tracing::warn!(job_id = checkpoint.job_id, %error,
+                "preemption checkpoint failed; retaining this job and continuing the batch"),
+        }
+        *cursor = Some(checkpoint.job_id);
+    }
+    if last_batch {
+        *cursor = None;
     }
     Ok(())
 }
@@ -263,6 +258,14 @@ pub(super) async fn report(
     page: Page,
     scope: &ReadScope,
 ) -> anyhow::Result<GetPreemptionUsageResponse> {
+    if matches!(scope, ReadScope::Caller(user) | ReadScope::Coordinated { user, .. } if user.is_empty())
+    {
+        return Ok(GetPreemptionUsageResponse {
+            causes_included: req.by_cause,
+            scoped_to_user: Some(String::new()),
+            ..Default::default()
+        });
+    }
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
         "SELECT user_name, account, used::text, unused::text, open::text, ",
     );
@@ -354,6 +357,12 @@ pub(super) async fn report(
         Some(last) => serde_json::to_string(&(&last.user, &last.account))?,
         None => String::new(),
     };
+    let partial = match scope {
+        ReadScope::Coordinated { user, accounts } => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM preemption_rollups WHERE user_name <> $1 AND NOT (account = ANY($2)))"
+        ).bind(user).bind(accounts).fetch_one(pool).await?,
+        _ => false,
+    };
     Ok(GetPreemptionUsageResponse {
         causes_included: req.by_cause,
         entries,
@@ -362,7 +371,7 @@ pub(super) async fn report(
             ReadScope::Caller(user) => Some(user.clone()),
             _ => None,
         },
-        partial: matches!(scope, ReadScope::Coordinated { .. }),
+        partial,
     })
 }
 
@@ -410,7 +419,8 @@ mod tests {
         super::super::db::migrate(&pool).await?;
         let result = async {
             exercise(&pool).await?;
-            exercise_causes(&pool).await
+            exercise_causes(&pool).await?;
+            exercise_failed_checkpoints(&pool).await
         }
         .await;
         pool.close().await;
@@ -596,38 +606,11 @@ mod tests {
             }
         }
 
-        // Backfill retained history exactly once, then remove history and retry old exports.
-        sqlx::query("INSERT INTO jobs(job_id, user_name, account, submit_time, preemption_usage) VALUES (4,'dan','research',$1,$2)")
-            .bind(DateTime::UNIX_EPOCH).bind(serde_json::json!({"used":2,"unused":{"cancelled":{"user":3}},"open":1,"revision":11})).execute(pool).await?;
-        sqlx::query("DELETE FROM preemption_migrations")
-            .execute(pool)
-            .await?;
-        super::super::db::migrate(pool).await?;
-        super::super::db::migrate(pool).await?;
-        let backfill = query(
-            pool,
-            GetPreemptionUsageRequest {
-                user: "dan".into(),
-                by_cause: true,
-                ..Default::default()
-            },
-            ReadScope::All,
-        )
-        .await?;
-        assert_eq!(
-            (
-                backfill.entries[0].used,
-                backfill.entries[0].unused,
-                backfill.entries[0].open
-            ),
-            (2, 3, 1)
-        );
-        assert_causes(&backfill.entries[0], &[("cancelled", "user", 3)], 0);
         sqlx::query("DELETE FROM jobs").execute(pool).await?;
         save(pool, &open).await?;
         save(pool, &alice).await?;
         let retained = query(pool, Default::default(), ReadScope::All).await?;
-        assert_eq!(retained.entries.len(), 4);
+        assert_eq!(retained.entries.len(), 3);
         assert_eq!(
             (
                 retained.entries[0].used,
@@ -636,6 +619,113 @@ mod tests {
             ),
             (5, 1, 0)
         );
+        Ok(())
+    }
+
+    async fn exercise_failed_checkpoints(pool: &PgPool) -> anyhow::Result<()> {
+        use crate::raft::StateMachineApply;
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups, jobs",
+        )
+        .execute(pool)
+        .await?;
+        let jobs: Vec<_> = (1..=1001)
+            .map(|id| {
+                let mut job = Job::new(
+                    id,
+                    spur_core::job::JobSpec {
+                        user: "alice".into(),
+                        ..Default::default()
+                    },
+                );
+                job.preemption_usage.used = 1;
+                job
+            })
+            .collect();
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        cluster.restore_from_snapshot(&serde_json::to_vec(&serde_json::json!({
+            "jobs": jobs, "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+        }))?)?;
+        sqlx::query("INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, unused_by_cause) SELECT id, 'legacy', 'alice', '', '{\"future_reason\": {\"system\": 1}}'::jsonb FROM generate_series(1, 1000) id").execute(pool).await?;
+        let mut cursor = None;
+        sync_once(pool, &cluster, &mut cursor).await?;
+        assert_eq!(cursor, Some(1000));
+        sync_once(pool, &cluster, &mut cursor).await?;
+        assert_eq!(cursor, None);
+        assert_eq!(
+            cluster.pending_preemption_checkpoints(2000, None).len(),
+            1000
+        );
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!(report.entries[0].used, 1);
+        sqlx::query("UPDATE preemption_checkpoints SET unused_by_cause='{}'")
+            .execute(pool)
+            .await?;
+        sync_once(pool, &cluster, &mut cursor).await?;
+        assert!(cluster
+            .pending_preemption_checkpoints(2000, None)
+            .is_empty());
+        assert_eq!(
+            query(pool, Default::default(), ReadScope::All)
+                .await?
+                .entries[0]
+                .used,
+            1001
+        );
+
+        for value in [
+            serde_json::json!({"unused":{"future_reason":{"system":1}}}),
+            serde_json::json!(42),
+        ] {
+            sqlx::query("INSERT INTO jobs (job_id, user_name, preemption_usage) VALUES (1,'alice',$1) ON CONFLICT (job_id) DO UPDATE SET preemption_usage=EXCLUDED.preemption_usage")
+                .bind(value).execute(pool).await?;
+            let states = super::super::db::job_accounting_states(pool, &[1]).await?;
+            assert_eq!(states[&1].preemption_usage, PreemptionUsage::default());
+            let history = super::super::db::get_job_history(pool, &Default::default()).await?;
+            assert_eq!(history[0].preemption_usage, PreemptionUsage::default());
+        }
+        sqlx::query(
+            "INSERT INTO preemption_rollups (user_name, account, used) VALUES ('', 'unnamed', 7)",
+        )
+        .execute(pool)
+        .await?;
+        for scope in [
+            ReadScope::Caller(String::new()),
+            ReadScope::Coordinated {
+                user: String::new(),
+                accounts: vec!["unnamed".into()],
+            },
+        ] {
+            let hidden = query(
+                pool,
+                GetPreemptionUsageRequest {
+                    by_cause: true,
+                    ..Default::default()
+                },
+                scope,
+            )
+            .await?;
+            assert!(hidden.entries.is_empty());
+            assert!(hidden.next_page_token.is_empty());
+            assert!(hidden.causes_included);
+        }
+        sqlx::query("DELETE FROM preemption_rollups WHERE user_name=''")
+            .execute(pool)
+            .await?;
+        let complete = query(
+            pool,
+            Default::default(),
+            ReadScope::Coordinated {
+                user: "outsider".into(),
+                accounts: vec!["".into()],
+            },
+        )
+        .await?;
+        assert!(!complete.partial);
         Ok(())
     }
 

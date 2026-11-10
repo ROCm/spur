@@ -28,7 +28,12 @@ def rollup_cluster(ssh_nodes, remote_bin_dir):
     yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3, retention=0)
 
 
-def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400):
+@pytest.fixture
+def retry_cluster(ssh_nodes, remote_bin_dir):
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3, controller_prolog=True)
+
+
+def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400, controller_prolog=False):
     if len(ssh_nodes) < count:
         pytest.skip(f"this handoff test requires {count} nodes")
     c = SpurCluster(ssh_nodes[:count], make_remote_dir(), remote_bin_dir)
@@ -60,11 +65,20 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400):
             '[ ! -e "$gate.fail" ]\n',
             all_nodes=True,
         )
+        hooks = {"epilog": epilog, "prolog": prolog}
+        if controller_prolog:
+            hooks["prolog_slurmctld"] = c.write_file(
+                "pre-reservation-prolog.sh",
+                '#!/bin/bash\n'
+                f'gate={shlex.quote(c.remote_dir)}/before-reservation-$SPUR_JOB_ID\n'
+                'touch "$gate.entered"\n'
+                '[ ! -e "$gate.fail" ]\n',
+            )
         # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
         c.start({
             "controller": {"terminal_job_retention_secs": retention},
             "scheduler": {"preempt_type": "qos_priority", "complete_wait_secs": 300},
-            "hooks": {"epilog": epilog, "prolog": prolog},
+            "hooks": hooks,
             "auth": {"allow_root_jobs": True},
         }, kill_stale=False)
         for name, priority, targets, mode in [
@@ -587,6 +601,8 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     for account in ("rollup-a", "rollup-b"):
         c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
         c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    sentinel = _submit(c, "retention-sentinel", "plain", c.node_names[1])
+    wait_job_state(c, sentinel, "R", timeout=60)
     victim = _submit(c, "rollup-victim", "victim-a", c.node_names[0])
     wait_job_state(c, victim, "R", timeout=60)
     _gate(c, victim, [0], True)
@@ -602,7 +618,9 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)}, causes={})
 
     # Pause preserves the ephemeral published port that the controller is configured to use.
-    c.nodes[0].exec(f"docker pause {shlex.quote(c._pg_container)}")
+    c.scancel(str(sentinel))
+    assert wait_job(c, sentinel, timeout=60) == "CA"
+    c.pause_accounting()
     try:
         if not used:
             c.nodes[0].exec(f"touch {shlex.quote(f'{c.remote_dir}/launch-{hunter}.fail')}")
@@ -613,14 +631,15 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
         c.restart_controller()
         code, output = c.cli_with_exit(["spur", "sreport", "preemptions"])
         assert code != 0, output
-        # Zero retention is floored to 120 seconds for accounting repair.
-        time.sleep(130)
+        # A job with no preemption counts must expire while the unexported requester stays.
+        wait_until(lambda: f"JobId={sentinel} " not in c.cli_allow_fail(
+            ["scontrol", "show", "job", str(sentinel)]), timeout_s=180, interval_s=2,
+            desc="ordinary job history eviction during accounting outage")
         assert f"PreemptionsUsed={used} PreemptionsUnused={sum(first_unused.values())}" in c.scontrol(
             "show", "job", str(hunter)
         )
     finally:
-        c.nodes[0].exec(f"docker unpause {shlex.quote(c._pg_container)}")
-    c._wait_pg(c.nodes[0])
+        c.resume_accounting()
     _rollup_report(c, {(user, "rollup-a"): first_totals}, causes=first_causes)
     wait_until(lambda: f"JobId={hunter} " not in c.cli_allow_fail(["scontrol", "show", "job", str(hunter)]),
                timeout_s=90, interval_s=1, desc="exported job leaving controller history")
@@ -675,3 +694,63 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
         assert second_rows == [expected_second], second
     code, output = c.cli_with_exit(["spur", "sreport", "preemptions", "--start", "now-7days"])
     assert code != 0 and "lifetime" in output, output
+
+
+def test_preemption_retry_before_reservation_keeps_the_same_capacity(retry_cluster):
+    c = retry_cluster
+    victim = _submit(c, "retry-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "retry-hunter", "hunter-a", c.node_names[0])
+    _wait_epilog(c, victim, [0])
+    gate = shlex.quote(f"{c.remote_dir}/before-reservation-{hunter}")
+    c.nodes[0].exec(f"touch {gate}.fail")
+    _gate(c, victim, [0], False)
+    wait_until(lambda: "ready" in c.nodes[0].exec_allow_fail(f"test -e {gate}.entered && echo ready"),
+               timeout_s=60, interval_s=1, desc="requester failed before reservation")
+    _assert_pending_for_passes(c, [hunter])
+    _usage(c, open_count=1)
+    c.nodes[0].exec(f"rm {gate}.fail")
+    wait_job_state(c, hunter, "R", timeout=60)
+    _usage(c, used=1)
+    _scenario_report(c, used=1)
+    c.scancel(str(hunter))
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    _usage(c, used=1)
+
+
+@pytest.mark.parametrize("bad_cause", ["unknown", "regressed"])
+def test_preemption_export_skips_a_bad_checkpoint_and_recovers(handoff_cluster, bad_cause):
+    c = handoff_cluster
+    user = c.nodes[0].user
+    for account in ("export-a", "export-b"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    victim = _submit(c, "export-victim-a", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "export-hunter-a", "hunter-a", c.node_names[0], extra=("--account=export-a",))
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _rollup_report(c, {(user, "export-a"): (0, 0, 1)}, causes={})
+    poison = {"future_reason" if bad_cause == "unknown" else "cancelled": {"system": 1}}
+    c.psql(f"UPDATE preemption_checkpoints SET unused_by_cause='{json.dumps(poison)}' "
+           f"WHERE job_id={int(hunter)}")
+    _launch_gate(c, hunter, [0], False)
+    wait_job_state(c, hunter, "R", timeout=60)
+    _usage(c, used=1)
+
+    victim_b = _submit(c, "export-victim-b", "victim-a", c.node_names[1])
+    wait_job_state(c, victim_b, "R", timeout=60)
+    _gate(c, victim_b, [1], True)
+    hunter_b = _submit(c, "export-hunter-b", "hunter-a", c.node_names[1], extra=("--account=export-b",))
+    _wait_epilog(c, victim_b, [1])
+    c.scancel(str(hunter_b))
+    _gate(c, victim_b, [1], False)
+    _usage(c, used=1, unused={("cancelled", "user"): 1})
+    causes = {(user, "export-b", "cancelled", "user"): 1}
+    _rollup_report(c, {(user, "export-a"): (0, 0, 1), (user, "export-b"): (0, 1, 0)}, causes=causes)
+    c.psql(f"UPDATE preemption_checkpoints SET unused_by_cause='{{}}' WHERE job_id={int(hunter)}")
+    _rollup_report(c, {(user, "export-a"): (1, 0, 0), (user, "export-b"): (0, 1, 0)}, causes=causes)

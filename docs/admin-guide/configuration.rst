@@ -1400,7 +1400,8 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``sstat``, ``sacct``/``spur history``, ``scontrol show job``/``step``,
        the jobs that ``scancel -p``, ``-A``, or ``-n`` selects, and REST
        ``/jobs`` and ``/job/{id}``. ``sreport job`` sizes follow the same rule
-       and total the jobs the caller can see. A coordinator also sees jobs in
+       and total the jobs the caller can see. ``sreport preemptions`` is scoped
+       when either ``"jobs"`` or ``"usage"`` is private. A coordinator also sees jobs in
        ``sacct`` and those reports for the accounts they coordinate. ``squeue``
        stays the caller's own jobs. ``squeue -u other``, ``squeue -j``,
        ``sacct -u other``, ``sacct -j`` for another user's job, and
@@ -1416,6 +1417,7 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``% of Tot`` are left blank rather than computed from the User's rows
        alone.
        ``sreport`` utilization leaves those same cells blank.
+       ``sreport preemptions`` shows only the caller's rows and coordinated accounts.
        A coordinator also sees usage for the accounts they coordinate; those
        rows are filled in, and cluster totals stay blank. A coordinator keeps
        their own rows in other accounts too.

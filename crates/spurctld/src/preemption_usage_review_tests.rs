@@ -258,6 +258,7 @@ fn frozen_wal_payloads_default_new_observation_metadata() {
         panic!("release confirmation");
     };
     assert_eq!(release.observation_id, None);
+    assert!(!release.unconfirmed);
 }
 
 #[test]
@@ -273,4 +274,172 @@ fn frozen_ledger_snapshot_defaults_attempt_tracking_and_closure_provenance() {
     assert!(request.reserved.is_none());
     assert!(request.closure_cause.is_none());
     assert_eq!(ledger.victims[&1][&1].owner_attempt, 1);
+}
+
+#[test]
+fn legacy_preemptions_do_not_depend_on_snapshot_position() {
+    for kind in [
+        "JobPreemptRequeue",
+        "JobPreemptCancel",
+        "JobPreemptSignaled",
+    ] {
+        let (_dir, replayed) = cluster();
+        start(&replayed, 1, 1, &[("n1", scalar())]);
+        let (_other_dir, snapshotted) = restored(&replayed);
+        let payload = match kind {
+            "JobPreemptSignaled" => serde_json::json!({kind: {"job_id": 1, "pending": {
+                "signaled_at": "2026-01-01T00:00:00Z", "deadline": "2026-01-01T00:00:00Z",
+                "preempted_by": 10, "mode": "Requeue", "run_attempt": 1, "requeue_hold_secs": 0
+            }}}),
+            _ => serde_json::json!({kind: {"job_id": 1, "begin_time": "2026-01-01T00:00:00Z",
+                "preempted_by": 10, "handoff": true, "run_attempt": 1}}),
+        };
+        let old: WalOperation = serde_json::from_value(payload).expect("legacy entry");
+        snapshotted.apply_job_operation(&old);
+        let (_snapshot_dir, snapshotted) = restored(&snapshotted);
+        replayed.apply_operation(&old);
+        for cm in [&replayed, &snapshotted] {
+            cm.apply_operation(&WalOperation::JobNodeComplete {
+                job_id: 1,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 0,
+                run_attempt: 1,
+                at: None,
+            });
+            start(cm, 10, 1, &[("n1", scalar())]);
+            assert_eq!(cm.preemption_usage(), PreemptionUsage::default());
+            assert!(!cm.preemption_usage.read().tracks_request(10));
+        }
+        assert_eq!(ledger_snapshot(&replayed), ledger_snapshot(&snapshotted));
+    }
+}
+
+#[test]
+fn terminal_request_with_draining_victim_does_not_propose_eviction() {
+    let (_dir, cm) = cluster();
+    start(&cm, 1, 1, &[("n1", scalar())]);
+    cm.apply_operation(&WalOperation::JobPreemptCancel {
+        job_id: 1,
+        preempted_by: Some(10),
+        preemptor_run_attempt: Some(1),
+        preempt_qos: None,
+        run_attempt: Some(1),
+        at: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
+    });
+    cancel(&cm, "User");
+    cm.jobs.write().get_mut(&10).expect("requester").end_time = Some(chrono::DateTime::UNIX_EPOCH);
+    cm.evict_expired_terminal_jobs();
+    assert!(cm.get_job(10).is_some());
+    assert!(cm.preemption_usage.read().tracks_request(10));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preemption_confirmation_timeout_keeps_the_observed_outcome_for_retry() {
+    let dir = tempfile::tempdir().expect("state");
+    let (cm, gate) = crate::cluster::gated::cluster(
+        &dir,
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).expect("config"),
+    )
+    .await;
+    for id in [1, 10] {
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id,
+            spec: Box::default(),
+        });
+    }
+    start(&cm, 1, 1, &[("n1", scalar())]);
+    preempt(&cm, 1, 1, 1);
+    start(&cm, 10, 1, &[("n1", scalar())]);
+    let closed = gate.close();
+    let error = cm
+        .confirm_preemption_observation(10, 1, Some(1), true)
+        .expect_err("blocked confirmation");
+    assert!(crate::cluster::gated::late(&error).is_some());
+    assert_eq!(cm.preemption_confirmations.read().len(), 1);
+    drop(closed);
+    cm.recover_preemption_confirmations(true)
+        .expect("retry confirmed evidence before uncertainty");
+    assert_usage(&cm, 1, 0);
+    assert_eq!(cm.preemption_usage().open, 0);
+    assert!(cm.preemption_confirmations.read().is_empty());
+    cm.recover_preemption_confirmations(true)
+        .expect("idempotent recovery");
+    assert_usage(&cm, 1, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preemption_recovery_after_restart_reports_unknown_without_proof_of_release() {
+    for terminal in [false, true] {
+        let (_dir, cm) = cluster();
+        start(&cm, 1, 1, &[("n1", scalar())]);
+        preempt(&cm, 1, 1, 1);
+        start(&cm, 10, 1, &[("n1", scalar())]);
+        if terminal {
+            cancel(&cm, "User");
+        }
+        let (dir, restored) = restored(&cm);
+        let restored = std::sync::Arc::new(restored);
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), restored.clone())
+            .await
+            .expect("raft");
+        handle
+            .raft
+            .wait(None)
+            .metrics(|m| m.current_leader == Some(1), "leader")
+            .await
+            .expect("elected");
+        restored.set_raft(handle.raft);
+        restored
+            .recover_preemption_confirmations(false)
+            .expect("dispatch grace");
+        assert_eq!(restored.preemption_usage().open, u64::from(!terminal));
+        restored
+            .recover_preemption_confirmations(true)
+            .expect("uncertain settlement");
+        let usage = restored.preemption_usage();
+        assert_eq!((usage.used, usage.open, usage.unused_total()), (0, 0, 1));
+        assert_eq!(
+            usage.unused_count(Reason::EndedOther, Initiator::Unknown),
+            1
+        );
+        assert_eq!(
+            usage.unused_count(Reason::LaunchFailed, Initiator::System),
+            0
+        );
+        assert!(!restored.preemption_usage.read().tracks_request(10));
+        restored
+            .recover_preemption_confirmations(true)
+            .expect("idempotent");
+        assert_eq!(restored.preemption_usage(), usage);
+    }
+}
+
+#[test]
+fn preemption_eviction_discards_cached_confirmations_before_job_id_reuse() {
+    let (_dir, cm) = cluster();
+    start(&cm, 1, 1, &[("n1", scalar())]);
+    preempt(&cm, 1, 1, 1);
+    start(&cm, 10, 1, &[("n1", scalar())]);
+    confirm(&cm, 1, true);
+    cm.preemption_confirmations.write().insert(
+        (10, 1),
+        PreemptionRelease {
+            job_id: 10,
+            run_attempt: 1,
+            observation_id: Some(1),
+            released: true,
+            unconfirmed: false,
+        },
+    );
+    cancel(&cm, "User");
+    cm.apply_operation(&WalOperation::EvictTerminalJobs {
+        job_ids: vec![10],
+        before: None,
+        at: None,
+        preemption_release: None,
+    });
+    assert!(cm.get_job(10).is_none());
+    assert!(cm.preemption_confirmations.read().is_empty());
 }

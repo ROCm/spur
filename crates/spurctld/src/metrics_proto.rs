@@ -55,8 +55,6 @@ pub fn preemption_usage_to_proto(
 pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
     SchedStats {
         preemption_usage: Some(preemption_usage_to_proto(&snap.preemption_usage)),
-        preemption_users: Vec::new(),
-        preemption_users_truncated: false,
         plugin: snap.plugin.clone(),
         cycles: snap.cycles,
         cycle_total_time_us: snap.cycle_total_time_us,

@@ -2688,7 +2688,11 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_exit(job.derived_exit_code, 0),
         job.priority
     );
-    if let Some(usage) = &job.preemption_usage {
+    if let Some(usage) = job
+        .preemption_usage
+        .as_ref()
+        .filter(|u| u.used > 0 || u.unused > 0 || u.open > 0)
+    {
         let _ = writeln!(
             out,
             "   PreemptionsUsed={} PreemptionsUnused={} PreemptionsOpen={}",
@@ -2756,6 +2760,27 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_detail_omits_zero_preemption_counts_and_prints_nonzero_causes() {
+        let mut job = spur_proto::proto::JobInfo::default();
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(Default::default());
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(spur_proto::proto::PreemptionUsage {
+            used: 2,
+            unused: 1,
+            open: 3,
+            unused_by_cause: vec![spur_proto::proto::UnusedPreemptionCount {
+                reason: "cancelled".into(),
+                initiator: "user".into(),
+                count: 1,
+            }],
+        });
+        let out = format_job_detail(&job);
+        assert!(out.contains("PreemptionsUsed=2 PreemptionsUnused=1 PreemptionsOpen=3"));
+        assert!(out.contains("UnusedPreemptionReason=cancelled Initiator=user Count=1"));
+    }
+
     #[test]
     fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
         use spur_proto::proto::*;

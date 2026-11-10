@@ -566,6 +566,7 @@ impl WalOperation {
             at: None,
             preemption_release: Some(crate::preemption_usage::PreemptionRelease {
                 observation_id: None,
+                unconfirmed: false,
                 job_id,
                 run_attempt,
                 released,

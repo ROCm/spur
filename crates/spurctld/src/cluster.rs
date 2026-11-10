@@ -601,6 +601,8 @@ pub struct ClusterManager {
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
     preemption_usage: RwLock<preemption_usage::UsageLedger>,
+    preemption_confirmations:
+        RwLock<BTreeMap<(JobId, u64), spur_core::preemption_usage::PreemptionRelease>>,
     preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
@@ -1025,6 +1027,7 @@ impl ClusterManager {
             config_path,
             jobs: RwLock::new(HashMap::new()),
             preemption_usage: RwLock::new(Default::default()),
+            preemption_confirmations: RwLock::new(BTreeMap::new()),
             preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
@@ -6939,11 +6942,18 @@ impl ClusterManager {
     pub(crate) fn pending_preemption_checkpoints(
         &self,
         limit: usize,
+        after: Option<JobId>,
     ) -> Vec<crate::accounting::preemption::Checkpoint> {
-        self.jobs
-            .read()
+        let jobs = self.jobs.read();
+        let mut pending: Vec<_> = jobs
             .values()
-            .filter(|job| !self.preemption_checkpoint_saved(job))
+            .filter(|job| {
+                after.is_none_or(|id| job.job_id > id) && !self.preemption_checkpoint_saved(job)
+            })
+            .collect();
+        pending.sort_unstable_by_key(|job| job.job_id);
+        pending
+            .into_iter()
             .take(limit)
             .map(crate::accounting::preemption::Checkpoint::from)
             .collect()
@@ -6993,18 +7003,21 @@ impl ClusterManager {
         }
         // is_finalized is load-bearing, not redundant: end_time survives a
         // requeue, so a re-dispatched job's stale end_time alone would reap it.
+        let usage = self.preemption_usage.read();
         let job_ids: Vec<JobId> = jobs
             .iter()
             .filter(|(id, j)| {
                 j.state.is_finalized()
                     && j.end_time.is_some_and(|t| t < before)
                     && j.preemption_usage_updated_at.is_none_or(|t| t < before)
+                    && !usage.tracks_request(**id)
                     && (!accounting_enabled || self.preemption_checkpoint_saved(j))
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
             })
             .map(|(&id, _)| id)
             .collect();
+        drop(usage);
         drop(jobs);
         if job_ids.is_empty() {
             return;
@@ -10180,8 +10193,9 @@ impl StateMachineApply for ClusterManager {
         // `read()` temporaries would otherwise hold `steps` while this waits.
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
+        let preemption_usage = self.preemption_usage.read().clone();
         let snap = ClusterSnapshot {
-            preemption_usage: self.preemption_usage.read().clone(),
+            preemption_usage,
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
@@ -10205,6 +10219,7 @@ impl StateMachineApply for ClusterManager {
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
         let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
+        self.preemption_confirmations.write().clear();
         *self.preemption_usage.write() = snap.preemption_usage;
         self.preemption_accounted.write().clear();
         jobs.clear();

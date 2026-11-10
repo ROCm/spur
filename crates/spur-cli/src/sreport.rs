@@ -118,7 +118,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let response = client
                 .get_preemption_usage(request)
                 .await
-                .context("failed to get preemption report")?
+                .map_err(preemption_report_error)?
                 .into_inner();
             if let Some(user) = &response.scoped_to_user {
                 eprintln!("Visible usage for {user} only");
@@ -170,6 +170,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 }
 
 type AcctClient = SlurmAccountingClient<crate::authclient::AuthChannel>;
+
+fn preemption_report_error(error: tonic::Status) -> anyhow::Error {
+    if error.code() == tonic::Code::Unimplemented {
+        anyhow::anyhow!("controller does not support preemption reports; upgrade the controller")
+    } else {
+        anyhow::Error::new(error).context("failed to get preemption report")
+    }
+}
 
 fn print_preemptions(
     out: &mut impl std::io::Write,
@@ -705,6 +713,20 @@ fn account_visible(visible_accounts: &[String], account: &str, has_usage: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preemption_report_unimplemented_explains_upgrade_for_all_report_modes() {
+        let error = preemption_report_error(tonic::Status::unimplemented("unknown method"));
+        assert!(error.to_string().contains("upgrade the controller"));
+        let error = preemption_report_error(tonic::Status::unavailable("offline"));
+        assert_eq!(
+            error
+                .downcast_ref::<tonic::Status>()
+                .expect("status")
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
 
     #[test]
     fn preemption_report_page_arguments() {
