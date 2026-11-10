@@ -68,10 +68,12 @@ pub enum ScontrolCommand {
     ///
     /// Examples:
     ///   scontrol delete NodeName=n[1-4]
+    ///   scontrol delete node n[1-4]
     ///   scontrol delete PartitionName=gpu
     ///   scontrol delete ReservationName=maint
     Delete {
-        /// Exactly one target: NodeName=<hostlist|ALL>, PartitionName=<name>, or ReservationName=<name>
+        /// One entity and target as key=value or key value.
+        /// Entity: NodeName, PartitionName, or ReservationName (case-insensitive prefix, 3+ characters).
         #[arg(trailing_var_arg = true)]
         params: Vec<String>,
     },
@@ -1623,21 +1625,31 @@ enum DeleteTarget<'a> {
 }
 
 fn parse_delete_target(params: &[String]) -> Result<DeleteTarget<'_>> {
-    let [param] = params else {
-        bail!("scontrol delete: expected exactly one of NodeName=<hostlist|ALL>, PartitionName=<name>, or ReservationName=<name>");
+    let (key, value) = match params {
+        [param] => param
+            .split_once('=')
+            .context("scontrol delete: expected an entity and target as key=value or key value")?,
+        [key, value] => (key.as_str(), value.as_str()),
+        _ => bail!(
+            "scontrol delete: expected exactly one entity and target as key=value or key value"
+        ),
     };
-    let (key, value) = param
-        .split_once('=')
-        .context("scontrol delete: expected key=value")?;
     if value.trim().is_empty() {
         bail!("scontrol delete: {key}= value missing");
     }
-    match key.to_ascii_lowercase().as_str() {
-        "nodename" => Ok(DeleteTarget::Nodes(value)),
-        "partitionname" => Ok(DeleteTarget::Partition(value)),
-        "reservationname" => Ok(DeleteTarget::Reservation(value)),
-        _ => bail!("scontrol delete: unknown key '{key}'; expected NodeName, PartitionName, or ReservationName"),
+    let normalized_key = key.to_ascii_lowercase();
+    if normalized_key.len() >= 3 {
+        if "nodename".starts_with(&normalized_key) {
+            return Ok(DeleteTarget::Nodes(value));
+        }
+        if "partitionname".starts_with(&normalized_key) {
+            return Ok(DeleteTarget::Partition(value));
+        }
+        if "reservationname".starts_with(&normalized_key) {
+            return Ok(DeleteTarget::Reservation(value));
+        }
     }
+    bail!("scontrol delete: unknown key '{key}'; expected NodeName, PartitionName, or ReservationName (prefixes of at least three characters accepted)")
 }
 
 async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
@@ -3760,6 +3772,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scontrol_delete_node_aliases_preserve_targets_and_guards() {
+        for prefix in ["nOd", "nOdE", "nOdEn", "nOdEnA", "nOdEnAm", "nOdEnAmE"] {
+            for key in [
+                prefix.to_string(),
+                prefix.to_lowercase(),
+                prefix.to_uppercase(),
+            ] {
+                for params in [
+                    vec![format!("{key}=Gpu[01-02],Gpu02,Cpu04")],
+                    vec![key.clone(), "Gpu[01-02],Gpu02,Cpu04".into()],
+                ] {
+                    let (addr, capture) = crate::mock_controller::spawn().await;
+                    let mut args = p(&[
+                        "scontrol",
+                        "--controller",
+                        &format!("http://{addr}"),
+                        "delete",
+                    ]);
+                    args.extend(params.clone());
+                    main_with_args(args)
+                        .await
+                        .unwrap_or_else(|err| panic!("{params:?}: {err}"));
+                    assert_eq!(
+                        capture.deregister_node_calls(),
+                        vec![
+                            ("Gpu01".into(), false),
+                            ("Gpu02".into(), false),
+                            ("Cpu04".into(), false)
+                        ],
+                        "{params:?}"
+                    );
+                    assert!(capture.delete_partition_names().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scontrol_delete_aliases_resolve_all() {
+        for params in [
+            p(&["nod=ALL"]),
+            p(&["NODE", "all"]),
+            p(&["NodeName", "All"]),
+        ] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            capture.set_get_node_names(vec!["Gpu01".into(), "Cpu01".into()]);
+            let mut args = p(&[
+                "scontrol",
+                "--controller",
+                &format!("http://{addr}"),
+                "delete",
+            ]);
+            args.extend(params.clone());
+            main_with_args(args)
+                .await
+                .unwrap_or_else(|err| panic!("{params:?}: {err}"));
+            assert_eq!(
+                capture.deregister_node_calls(),
+                vec![("Gpu01".into(), false), ("Cpu01".into(), false)],
+                "{params:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn scontrol_delete_nodes_expands_hostlist_without_forcing() {
         let (addr, capture) = crate::mock_controller::spawn().await;
         main_with_args(p(&[
@@ -3848,28 +3925,38 @@ mod tests {
 
     #[tokio::test]
     async fn scontrol_delete_reports_failures_and_continues() {
-        let (addr, capture) = crate::mock_controller::spawn().await;
-        capture.set_deregister_node_error("n1", tonic::Code::PermissionDenied);
-        capture.set_deregister_node_error("n2", tonic::Code::FailedPrecondition);
-        let err = main_with_args(p(&[
-            "scontrol",
-            "--controller",
-            &format!("http://{addr}"),
-            "delete",
-            "NodeName=n[1-3]",
-        ]))
-        .await
-        .unwrap_err();
+        for params in [
+            p(&["NodeName=n[1-3]"]),
+            p(&["nod=n[1-3]"]),
+            p(&["NODE", "n[1-3]"]),
+        ] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            capture.set_deregister_node_error("n1", tonic::Code::PermissionDenied);
+            capture.set_deregister_node_error("n2", tonic::Code::FailedPrecondition);
+            let mut args = p(&[
+                "scontrol",
+                "--controller",
+                &format!("http://{addr}"),
+                "delete",
+            ]);
+            args.extend(params.clone());
+            let err = main_with_args(args).await.unwrap_err();
 
-        assert_eq!(
-            capture.deregister_node_calls(),
-            vec![
-                ("n1".into(), false),
-                ("n2".into(), false),
-                ("n3".into(), false)
-            ]
-        );
-        assert_eq!(err.to_string(), "failed on 2 of 3 node(s): n1, n2");
+            assert_eq!(
+                capture.deregister_node_calls(),
+                vec![
+                    ("n1".into(), false),
+                    ("n2".into(), false),
+                    ("n3".into(), false)
+                ],
+                "{params:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "failed on 2 of 3 node(s): n1, n2",
+                "{params:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3881,7 +3968,37 @@ mod tests {
             vec!["NodeName="],
             vec!["NodeName=   "],
             vec!["NodeName"],
+            vec!["node"],
+            vec!["partition"],
+            vec!["reservation"],
+            vec!["=n1"],
+            vec!["", "n1"],
+            vec!["node", ""],
+            vec!["node", "   "],
+            vec!["node="],
+            vec!["part", ""],
+            vec!["res", "   "],
+            vec!["No=n1"],
+            vec!["no", "n1"],
+            vec!["Pa=gpu"],
+            vec!["pa", "gpu"],
+            vec!["Re=maint"],
+            vec!["re", "maint"],
+            vec!["Nodes=n1"],
+            vec!["nodes", "n1"],
+            vec!["Partitions=gpu"],
+            vec!["reservations", "maint"],
+            vec!["NodeNameExtra=n1"],
+            vec!["nöd", "n1"],
             vec!["NodeNode=n1"],
+            vec!["node=n1", "n2"],
+            vec!["NodeName=", "n1"],
+            vec!["part=gpu", "cpu"],
+            vec!["res=maint", "other"],
+            vec!["node", "n1", "n2"],
+            vec!["node", "n1", "Force=yes"],
+            vec!["node", "n1", "Reason=test"],
+            vec!["node", "n1", "part", "gpu"],
             vec!["NodeName=n1", "NodeName=n2"],
             vec!["NodeName=n1", "PartitionName=gpu"],
             vec!["PartitionName=gpu", "NodeName=n1"],
@@ -3930,6 +4047,24 @@ mod tests {
                 "{err}"
             );
         }
+
+        for params in [
+            p(&["node=gpu[]"]),
+            p(&["nod", "gpu[1,]"]),
+            p(&["NODE", "gpu[,1]"]),
+            p(&["node", "gpu1,,gpu2"]),
+            p(&["nodename", "gpu[1-]"]),
+            p(&["node", "gpu[3-1]"]),
+            p(&["nod", "gpu[[1]]"]),
+        ] {
+            let mut args = p(&["scontrol", "--controller", &controller, "delete"]);
+            args.extend(params.clone());
+            let err = main_with_args(args).await.unwrap_err();
+            assert!(
+                err.to_string().contains("invalid node name pattern"),
+                "{params:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -3942,6 +4077,90 @@ mod tests {
             parse_delete_target(&p(&["rEsErVaTiOnNaMe=maint"])).unwrap(),
             DeleteTarget::Reservation("maint")
         );
+    }
+
+    #[test]
+    fn scontrol_delete_reservation_aliases_parse_through_cli() {
+        for prefix in [
+            "rEs",
+            "rEsE",
+            "rEsEr",
+            "rEsErV",
+            "rEsErVa",
+            "rEsErVaT",
+            "rEsErVaTi",
+            "rEsErVaTiO",
+            "rEsErVaTiOn",
+            "rEsErVaTiOnN",
+            "rEsErVaTiOnNa",
+            "rEsErVaTiOnNaM",
+            "rEsErVaTiOnNaMe",
+        ] {
+            for key in [
+                prefix.to_string(),
+                prefix.to_lowercase(),
+                prefix.to_uppercase(),
+            ] {
+                for params in [
+                    vec![format!("{key}=Maintenance")],
+                    vec![key.clone(), "Maintenance".into()],
+                ] {
+                    let mut args = p(&["scontrol", "delete"]);
+                    args.extend(params.clone());
+                    let parsed = ScontrolArgs::try_parse_from(args).unwrap();
+                    let ScontrolCommand::Delete {
+                        params: parsed_params,
+                    } = parsed.command
+                    else {
+                        panic!("expected delete command for {params:?}");
+                    };
+                    assert_eq!(
+                        parse_delete_target(&parsed_params).unwrap(),
+                        DeleteTarget::Reservation("Maintenance"),
+                        "{params:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scontrol_delete_partition_aliases_preserve_dispatch() {
+        for prefix in [
+            "pAr",
+            "pArT",
+            "pArTi",
+            "pArTiT",
+            "pArTiTi",
+            "pArTiTiO",
+            "pArTiTiOn",
+            "pArTiTiOnN",
+            "pArTiTiOnNa",
+            "pArTiTiOnNaM",
+            "pArTiTiOnNaMe",
+        ] {
+            for key in [
+                prefix.to_string(),
+                prefix.to_lowercase(),
+                prefix.to_uppercase(),
+            ] {
+                for params in [vec![format!("{key}=Gpu")], vec![key.clone(), "Gpu".into()]] {
+                    let (addr, capture) = crate::mock_controller::spawn().await;
+                    let mut args = p(&[
+                        "scontrol",
+                        "--controller",
+                        &format!("http://{addr}"),
+                        "delete",
+                    ]);
+                    args.extend(params.clone());
+                    main_with_args(args)
+                        .await
+                        .unwrap_or_else(|err| panic!("{params:?}: {err}"));
+                    assert_eq!(capture.delete_partition_names(), vec!["Gpu"], "{params:?}");
+                    assert!(capture.deregister_node_calls().is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]

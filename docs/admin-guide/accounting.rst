@@ -1497,9 +1497,11 @@ even when its agent or container no longer exists:
 .. code-block:: bash
 
    scontrol delete NodeName=gpu001
+   scontrol delete node=gpu001
+   scontrol delete node gpu001
    spur node remove gpu001
 
-Both commands use the same removal operation and refuse nodes with active
+These commands use the same removal operation and refuse nodes with active
 jobs, including placements reserved while a job is launching. The guard is
 checked when removal commits, so a concurrently scheduled job cannot be
 evicted without force. ``NodeName=`` accepts a hostname, a comma-separated
@@ -1512,8 +1514,17 @@ nodes are still attempted, and the command exits unsuccessfully if any
 removal fails. An empty cluster with
 ``ALL`` is also an error.
 
-``scontrol delete`` accepts exactly one of ``NodeName=``, ``PartitionName=``,
-or ``ReservationName=``. For a removal reason or to evict active jobs, use
+``scontrol delete`` accepts one entity and one target as ``key=value`` or
+``key value``. Entity keys are ``NodeName``, ``PartitionName``, and
+``ReservationName``; like Slurm, they ignore case and accept any prefix of at
+least three characters. For example, ``nod``, ``node``, and ``NODENAME`` all
+select nodes, ``par`` and ``partition`` select partitions, and ``res`` and
+``reservation`` select reservations. Target names retain their case. A target
+is required: ``scontrol delete node`` alone is an error. Node targets accept
+the same host lists and ``ALL`` in either syntax. Named Slurm ``NodeSet`` groups
+are not expanded.
+
+For a removal reason or to evict active jobs, use
 ``spur node remove <hostlist> --reason "decommissioned"`` or its ``--force``
 option. Force removal fails running jobs with ``NODE_FAIL`` and releases
 unconfirmed launch reservations. Node removal requires Administrator when
