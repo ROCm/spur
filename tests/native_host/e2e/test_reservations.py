@@ -4,6 +4,7 @@
 """E2E tests for node reservations."""
 
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -709,3 +710,158 @@ class TestScancelReservationFilter:
             for jid in (locals().get("in_res"), locals().get("out_res")):
                 if jid is not None:
                     cluster.cli(["scancel", str(jid)])
+
+
+class TestReservationEndTime:
+    """--end-time as an alternative to --duration (issue #1232)."""
+
+    def test_create_with_end_time_subcommand(self, cluster):
+        """create-reservation --end-time sets the reservation's end time directly."""
+        res_name = f"res-et-sub-{int(time.time())}"
+        node = cluster.node_names[0]
+        end = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            out = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={res_name}",
+                    "--start-time=now",
+                    f"--end-time={end}",
+                    f"--nodes={node}",
+                    "--flags=ignore_jobs",
+                ],
+            )
+            assert "created" in out.lower(), f"create failed: {out}"
+
+            show = cluster.scontrol("show", "reservation", res_name)
+            assert res_name in show
+            assert "ACTIVE" in show or "INACTIVE" in show
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+    def test_create_with_end_time_inline(self, cluster):
+        """scontrol create ReservationName=... EndTime=... works."""
+        res_name = f"res-et-inl-{int(time.time())}"
+        node = cluster.node_names[0]
+        start = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (datetime.now(timezone.utc) + timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            out = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create",
+                    f"ReservationName={res_name}",
+                    f"StartTime={start}",
+                    f"EndTime={end}",
+                    f"Nodes={node}",
+                ],
+            )
+            assert "created" in out.lower(), f"inline create failed: {out}"
+
+            show = cluster.scontrol("show", "reservation", res_name)
+            assert res_name in show
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+    def test_update_with_end_time(self, cluster):
+        """update-reservation --end-time changes the reservation's end time."""
+        res_name = f"res-et-upd-{int(time.time())}"
+        node = cluster.node_names[0]
+        try:
+            cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={res_name}",
+                    "--start-time=now",
+                    "--duration=60",
+                    f"--nodes={node}",
+                    "--flags=ignore_jobs",
+                ],
+            )
+
+            new_end = (datetime.now(timezone.utc) + timedelta(days=7)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            upd = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "update-reservation",
+                    f"--name={res_name}",
+                    f"--end-time={new_end}",
+                ],
+            )
+            assert "updated" in upd.lower(), f"update failed: {upd}"
+
+            show = cluster.scontrol("show", "reservation", res_name)
+            assert new_end[:10] in show, f"end time not reflected: {show}"
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+    def test_create_rejects_both_duration_and_end_time(self, cluster):
+        """--duration and --end-time are mutually exclusive on create."""
+        node = cluster.node_names[0]
+        end = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                "--name=x",
+                "--duration=60",
+                f"--end-time={end}",
+                f"--nodes={node}",
+            ],
+        )
+        assert "cannot be used with" in out.lower() or "mutually exclusive" in out.lower()
+
+    def test_create_rejects_neither_duration_nor_end_time(self, cluster):
+        """Omitting both --duration and --end-time is an error."""
+        node = cluster.node_names[0]
+        out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                "--name=x",
+                f"--nodes={node}",
+            ],
+        )
+        assert "either --duration or --end-time" in out.lower()
+
+    def test_inline_create_rejects_both_duration_and_end_time(self, cluster):
+        """Duration= and EndTime= are mutually exclusive in the inline form."""
+        node = cluster.node_names[0]
+        out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create",
+                "ReservationName=x",
+                "StartTime=now",
+                "Duration=60",
+                "EndTime=2027-01-01T00:00:00Z",
+                f"Nodes={node}",
+            ],
+        )
+        assert "mutually exclusive" in out.lower()
+
+    def test_inline_create_rejects_neither_duration_nor_end_time(self, cluster):
+        """Omitting both Duration= and EndTime= in the inline form is an error."""
+        node = cluster.node_names[0]
+        out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create",
+                "ReservationName=x",
+                "StartTime=now",
+                f"Nodes={node}",
+            ],
+        )
+        assert "either duration= or endtime=" in out.lower()
