@@ -15,6 +15,7 @@ import time
 import pytest
 
 from cluster import (
+    CONTROLLER_PORT,
     HA_HEALTH_TICK_SECS,
     HA_HEARTBEAT_TIMEOUT_SECS,
     log_tail_is_leader,
@@ -26,8 +27,9 @@ from cluster import (
 # The repro needs HA_HEARTBEAT_TIMEOUT_SECS < blip < HA_HEALTH_TICK_SECS: long
 # enough that the regaining leader's heartbeat map is past the timeout (a
 # follower forwards heartbeats and records none of its own), short enough that
-# a once-per-tick is_leader() sampler never observes "not leader".
-BLIP_HOLD_SECS = 42
+# a once-per-tick is_leader() sampler never observes "not leader". The reclaim
+# election adds about 5 s (leader lease plus election timeout) to the blip.
+BLIP_HOLD_SECS = 40
 # Budget for the interim election; the original is resumed as soon as one is
 # seen, so this is a timeout, not an enforced freeze duration.
 INTERIM_ELECTION_TIMEOUT_SECS = 10
@@ -40,6 +42,7 @@ GRACE_SECS = max(HA_HEARTBEAT_TIMEOUT_SECS, HA_HEALTH_TICK_SECS)
 HEALTH_SETTLE_SECS = GRACE_SECS + 2 * HA_HEALTH_TICK_SECS + 10
 # Long enough to outlast MAX_RECLAIM_ATTEMPTS worth of retries plus
 # HEALTH_SETTLE_SECS, so the job can't complete out from under the assertion.
+# It is also the job's time limit: the partition default is shorter than the test.
 SURVIVOR_JOB_SECS = 1800
 
 
@@ -78,6 +81,12 @@ def _attempt_reclaim(cluster, n: int, leader_idx: int) -> tuple[int | None, floa
     reject its vote. Instead it is frozen only long enough for the interim to be
     elected, then resumed as a live, caught-up FOLLOWER -- which records no
     heartbeats of its own, so its map goes stale while it stays eligible to win.
+
+    openraft draws each controller's election timeout once per process, so a
+    plain race against the third controller is decided at start-up, not here.
+    The third controller is down while one more entry commits and restarts only
+    after the interim is frozen: its log is behind, Raft refuses its votes, and
+    the original is the only controller that can win.
     """
     since_lens = {i: len(cluster.spurctld_log(i)) for i in range(n)}
     others = [i for i in range(n) if i != leader_idx]
@@ -95,10 +104,18 @@ def _attempt_reclaim(cluster, n: int, leader_idx: int) -> tuple[int | None, floa
         held = time.time() - blip_start
         time.sleep(max(0.0, BLIP_HOLD_SECS - held))
 
-        # Freeze the incumbent so the (now caught-up) original can win the race.
+        third = next(i for i in others if i != interim)
+        cluster.signal_controller(third, "KILL")
+        cluster.cli(
+            ["sbatch", "-H", "-J", "blip-log-lead", "--wrap", "true"],
+            controller_addr=f"http://{cluster.nodes[interim].host}:{CONTROLLER_PORT}",
+        )
         cluster.signal_controller(interim, "STOP")
+        cluster._start_controller_on(third)
+        # The restart starts a new spurctld log file.
+        since_lens[third] = 0
         winner = _wait_became_leader_since(
-            cluster, [i for i in range(n) if i != interim], since_lens,
+            cluster, [leader_idx, third], since_lens,
             timeout=RACE_SETTLE_TIMEOUT_SECS, want=leader_idx,
         )
         return winner, time.time() - blip_start
@@ -118,7 +135,10 @@ class TestLeadershipBlipHealth:
             "blip-survivor.sh", f"#!/bin/bash\nsleep {SURVIVOR_JOB_SECS}\necho SURVIVED\n"
         )
         sb = cluster.sbatch(
-            ["-J", "blip-survivor", "-N", "1", "-w", target, "-o", out_path, script]
+            [
+                "-J", "blip-survivor", "-N", "1", "-w", target,
+                "-t", str(SURVIVOR_JOB_SECS // 60), "-o", out_path, script,
+            ]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch failed:\n{sb}"
