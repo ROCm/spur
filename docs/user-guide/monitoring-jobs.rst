@@ -872,7 +872,6 @@ the job is preempted immediately.
   (the batch script, an ``srun`` step, a container step): a repeated stop
   request for a job that is already stopping, such as a second ``scancel``,
   sends no further SIGTERM. Only the SIGKILL that ends the kill wait follows.
-  A signal you send yourself with ``scancel --signal`` is always delivered.
   The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``

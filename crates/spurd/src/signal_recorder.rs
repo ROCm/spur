@@ -6,8 +6,9 @@
 //! delivery from two.
 
 /// Counts what a workload saw: one line in `term` per SIGTERM, one in `usr1`
-/// per SIGUSR1 and one in `beat` per loop pass. A pending trap runs before the shell's next command,
-/// so two beats after a signal was sent prove it has been handled.
+/// per SIGUSR1 and one in `beat` per loop pass. A pending trap runs before the
+/// shell's next command, so two beats after a signal was sent prove it has been
+/// handled.
 pub(crate) struct SignalRecorder(tempfile::TempDir);
 
 impl SignalRecorder {
