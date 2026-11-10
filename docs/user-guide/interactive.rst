@@ -244,7 +244,7 @@ session (``JoinedBy=``). Cancelling the job ends every session in it.
 
 Joining needs a verified identity: a JWT token or ``[auth] plugin = "spur"``
 credentials. A username asserted without a credential never opens a session in
-someone else's job. The joining user also needs an account on the node.
+a job owned by another user. The joining user also needs an account on the node.
 
 A job that runs in a container (``--container-image``) cannot be joined by
 other users yet, because their uid is not mapped inside it.

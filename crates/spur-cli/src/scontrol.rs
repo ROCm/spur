@@ -887,16 +887,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!("No steps found for job {}", job_id);
             } else {
                 for step in steps {
-                    let step_name = spur_core::step::step_display_name(step.step_id);
-                    let joined_by = if step.joined_by.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" JoinedBy={}", step.joined_by)
-                    };
-                    println!(
-                        "StepId={}.{} StepName={} State={} NumTasks={}{joined_by}",
-                        step.job_id, step_name, step.name, step.state, step.num_tasks
-                    );
+                    println!("{}", format_step_line(&step));
                 }
             }
         }
@@ -2525,6 +2516,22 @@ fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
     out
 }
 
+fn format_step_line(step: &spur_proto::proto::JobStepInfo) -> String {
+    let joined_by = if step.joined_by.is_empty() {
+        String::new()
+    } else {
+        format!(" JoinedBy={}", step.joined_by)
+    };
+    format!(
+        "StepId={}.{} StepName={} State={} NumTasks={}{joined_by}",
+        step.job_id,
+        spur_core::step::step_display_name(step.step_id),
+        step.name,
+        step.state,
+        step.num_tasks
+    )
+}
+
 fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -2910,6 +2917,47 @@ mod tests {
             "{preempted}"
         );
         assert!(!preempted.contains("PreemptTime"), "{preempted}");
+    }
+
+    #[test]
+    fn show_job_lists_who_it_is_shared_with_only_when_shared() {
+        let plain = format_job_detail(&spur_proto::proto::JobInfo::default());
+        assert!(!plain.contains("ShareWith"), "{plain}");
+
+        let shared = format_job_detail(&spur_proto::proto::JobInfo {
+            share_with: vec!["bob".into(), "@account".into()],
+            ..Default::default()
+        });
+        assert!(
+            shared
+                .lines()
+                .any(|line| line == "   ShareWith=bob,@account"),
+            "{shared}"
+        );
+    }
+
+    #[test]
+    fn show_steps_names_who_joined_a_step_only_when_someone_did() {
+        let step = spur_proto::proto::JobStepInfo {
+            job_id: 7,
+            step_id: 2,
+            name: "bash".into(),
+            state: "RUNNING".into(),
+            num_tasks: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_step_line(&step),
+            "StepId=7.2 StepName=bash State=RUNNING NumTasks=1"
+        );
+        let joined = spur_proto::proto::JobStepInfo {
+            joined_by: "bob".into(),
+            ..step
+        };
+        assert_eq!(
+            format_step_line(&joined),
+            "StepId=7.2 StepName=bash State=RUNNING NumTasks=1 JoinedBy=bob"
+        );
     }
 
     #[test]

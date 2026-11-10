@@ -1250,27 +1250,35 @@ impl ControllerService {
         }))
     }
 
-    /// The node's proof for a joiner where no step credential is minted.
-    fn sign_join_grant(
-        &self,
-        job: &spur_core::job::Job,
-        step_id: u32,
-        joiner: &SessionJoiner,
-    ) -> Result<String, Status> {
-        let key = self
-            .cluster
+    /// The key a joiner's grant is signed with, needed only where no step
+    /// credential is minted. Resolved before the step is created so a cluster
+    /// that cannot vouch for a joiner never records a session for them.
+    fn join_grant_key(&self) -> Result<Option<String>, Status> {
+        if crate::native_keys::mints_step_credentials() {
+            return Ok(None);
+        }
+        self.cluster
             .config()
             .auth
             .resolved_jwt_key()
             .ok()
             .flatten()
             .filter(|key| !key.is_empty())
+            .map(Some)
             .ok_or_else(|| {
                 Status::failed_precondition(
                     "joining another user's job needs [auth] jwt_key or native credentials, \
                      so the node can verify the controller admitted you",
                 )
-            })?;
+            })
+    }
+
+    fn sign_join_grant(
+        job: &spur_core::job::Job,
+        step_id: u32,
+        joiner: &SessionJoiner,
+        key: &str,
+    ) -> Result<String, Status> {
         let grant = spur_core::share::JoinGrant {
             job_id: job.job_id,
             step_id,
@@ -3288,6 +3296,10 @@ impl SlurmController for ControllerService {
                 "a job that runs in a container cannot be joined by another user",
             ));
         }
+        let grant_key = match joiner {
+            Some(_) => self.join_grant_key()?,
+            None => None,
+        };
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -3360,10 +3372,8 @@ impl SlurmController for ControllerService {
             runs_as,
         )
         .map_err(|e| Status::internal(format!("failed to sign step credential: {e}")))?;
-        let join_grant = match joiner.as_ref() {
-            Some(joiner) if execution_credential.is_empty() => {
-                self.sign_join_grant(&job, step_id, joiner)?
-            }
+        let join_grant = match (joiner.as_ref(), grant_key.as_deref()) {
+            (Some(joiner), Some(key)) => Self::sign_join_grant(&job, step_id, joiner, key)?,
             _ => String::new(),
         };
 
@@ -11541,15 +11551,40 @@ mod tests {
         share: &[&str],
         accounting: bool,
     ) -> (ControllerService, u32) {
+        shared_job_fixture_from(dir, Some(SHARE_TEST_KEY), accounting, shared_spec(share)).await
+    }
+
+    fn shared_spec(share: &[&str]) -> spur_core::job::JobSpec {
+        spur_core::job::JobSpec {
+            name: "shared".into(),
+            user: "alice".into(),
+            uid: 1000,
+            account: Some("research".into()),
+            interactive: true,
+            work_dir: "/tmp".into(),
+            share: spur_core::share::JobShare::parse(share).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    async fn shared_job_fixture_from(
+        dir: &tempfile::TempDir,
+        jwt_key: Option<&str>,
+        accounting: bool,
+        spec: spur_core::job::JobSpec,
+    ) -> (ControllerService, u32) {
         let accounting = if accounting {
             "[accounting]\ndatabase_url = \"postgresql://unused@localhost/spur\"\n"
         } else {
             ""
         };
+        let jwt_key = jwt_key
+            .map(|key| format!("jwt_key = \"{key}\"\n"))
+            .unwrap_or_default();
         let config = spur_core::config::SlurmConfig::load_from_str(&format!(
             "cluster_name = \"test\"\n\
              [controller]\nfirst_job_id = 1\n\
-             [auth]\nplugin = \"jwt\"\njwt_key = \"{SHARE_TEST_KEY}\"\nprivate_data = [\"jobs\"]\n\
+             [auth]\nplugin = \"jwt\"\n{jwt_key}private_data = [\"jobs\"]\n\
              {accounting}\
              [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n"
         ))
@@ -11589,16 +11624,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let spec = spur_core::job::JobSpec {
-            name: "shared".into(),
-            user: "alice".into(),
-            uid: 1000,
-            account: Some("research".into()),
-            interactive: true,
-            work_dir: "/tmp".into(),
-            share: spur_core::share::JobShare::parse(share).unwrap(),
-            ..Default::default()
-        };
         let job_id = svc.cluster.submit_job(spec).expect("submit").job_id;
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 1000);
         svc.cluster
@@ -11863,8 +11888,18 @@ mod tests {
             share: spur_core::share::JobShare::parse(&["dave"]).unwrap(),
             ..Default::default()
         };
-        let err = svc.cluster.submit_job(spec).unwrap_err();
+        let err = svc.cluster.submit_job(spec.clone()).unwrap_err();
         assert!(err.to_string().contains("not in its account"), "{err}");
+
+        let err = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                account: None,
+                share: spur_core::share::JobShare::parse(&["carol"]).unwrap(),
+                ..spec
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("without an account"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11878,6 +11913,125 @@ mod tests {
         });
         let err = svc.create_job_step(as_user(step, "bob")).await.unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let spec = spur_core::job::JobSpec {
+            container_image: Some("docker://ubuntu".into()),
+            ..shared_spec(&["bob"])
+        };
+        let (svc, job_id) = shared_job_fixture_from(&dir, Some(SHARE_TEST_KEY), false, spec).await;
+        let err = svc
+            .create_job_step(as_user(pty_step(job_id), "bob"))
+            .await
+            .expect_err("the job's own container is just as unjoinable");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joiner_is_refused_before_a_step_is_recorded_when_no_grant_can_be_signed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture_from(&dir, None, false, shared_spec(&["bob"])).await;
+        let steps_before = svc.cluster.get_steps(job_id).len();
+
+        let err = svc
+            .create_job_step(as_user(pty_step(job_id), "bob"))
+            .await
+            .expect_err("a node could not verify the joiner");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("jwt_key"), "{}", err.message());
+        assert_eq!(
+            svc.cluster.get_steps(job_id).len(),
+            steps_before,
+            "a refused join leaves no step behind"
+        );
+
+        svc.create_job_step(as_user(pty_step(job_id), "alice"))
+            .await
+            .expect("the owner needs no grant");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joiners_grant_carries_the_uid_their_identity_vouches_for() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, job_id) = shared_job_fixture(&dir, &["bob"]).await;
+        let grant_uid = |resp: CreateJobStepResponse| {
+            spur_core::share::verify_join_grant(&resp.join_grant, SHARE_TEST_KEY.as_bytes())
+                .unwrap()
+                .uid
+        };
+
+        let mut step = pty_step(job_id);
+        step.uid = 999;
+        let mut trusted = Request::new(step.clone());
+        trusted.extensions_mut().insert(spur_core::auth::Identity {
+            uid: 4242,
+            trusted_unix: true,
+            ..viewer("bob", false)
+        });
+        let resp = svc.create_job_step(trusted).await.unwrap().into_inner();
+        assert_eq!(
+            grant_uid(resp),
+            4242,
+            "a trusted unix identity overrides the claim"
+        );
+
+        // A JWT carries no trusted uid; the node checks the claim against bob's account.
+        let resp = svc
+            .create_job_step(as_user(step, "bob"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(grant_uid(resp), 999);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lookup_by_id_lists_each_job_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, shared_id) = shared_job_fixture(&dir, &["bob"]).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("bob", "other");
+        let bobs_id = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                user: "bob".into(),
+                account: Some("other".into()),
+                ..shared_spec(&[])
+            })
+            .unwrap()
+            .job_id;
+        let list = |user: &str, job_ids: Vec<u32>| {
+            as_user(
+                GetJobsRequest {
+                    job_ids,
+                    ..Default::default()
+                },
+                user,
+            )
+        };
+
+        let mut ids: Vec<u32> = svc
+            .get_jobs(list("bob", vec![bobs_id, shared_id]))
+            .await
+            .unwrap()
+            .into_inner()
+            .jobs
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![shared_id, bobs_id]);
+
+        let owners = svc
+            .get_jobs(list("alice", vec![shared_id]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            owners.jobs.len(),
+            1,
+            "the owner's own job is not listed twice"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

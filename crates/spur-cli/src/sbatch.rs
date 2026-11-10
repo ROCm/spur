@@ -1179,6 +1179,28 @@ mod tests {
     }
 
     #[test]
+    fn build_sbatch_job_spec_canonicalizes_share_with() {
+        let argv = [
+            "sbatch",
+            "--share-with=bob, @Account,bob",
+            "--wrap",
+            "hostname",
+        ]
+        .map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("spec");
+        assert_eq!(spec.share_with, vec!["bob", "@account"]);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_rejects_an_unknown_share_keyword() {
+        let argv = ["sbatch", "--share-with=@everyone", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let err = build_sbatch_job_spec(args, None, "sbatch").expect_err("must be rejected");
+        assert!(err.to_string().starts_with("--share-with:"), "{err}");
+    }
+
+    #[test]
     fn build_sbatch_job_spec_requeue_enables_requeue() {
         let argv = ["sbatch", "--requeue", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&[], &argv).expect("args");

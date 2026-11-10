@@ -5074,6 +5074,30 @@ impl AgentService {
         }
     }
 
+    /// Serializes launches of one terminal step and refuses a second supervisor
+    /// for the same attempt, retiring any left over from an earlier one.
+    async fn claim_terminal_slot(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> Result<StepLaunchAdmission, Status> {
+        let admission = self.admit_step_launch(job_id, run_attempt, step_id).await;
+        if runtime_attempt_already_tracked(&self.stepds, job_id, step_id, run_attempt).await {
+            return Err(Status::already_exists(format!(
+                "step {job_id}.{step_id} attempt {run_attempt} already has a terminal supervisor"
+            )));
+        }
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "failed to fence a stale terminal supervisor: {error}"
+                ))
+            })?;
+        Ok(admission)
+    }
+
     /// Launch an interactive session's own workload through `spurstepd`, keyed
     /// by the session's numbered step id. Unlike `run_supervised_step_to_spool`,
     /// this returns once the supervisor has started — not once the workload
@@ -5083,7 +5107,7 @@ impl AgentService {
         &self,
         job_id: u32,
         run_attempt: u32,
-        pty_step_id: spur_core::step::StepId,
+        step_id: spur_core::step::StepId,
         cfg: &executor::JobLaunchConfig,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
     ) -> Result<
@@ -5093,22 +5117,9 @@ impl AgentService {
         ),
         Status,
     > {
-        let step_id = pty_step_id;
-
-        let admission = self.admit_step_launch(job_id, run_attempt, step_id).await;
-        if runtime_attempt_already_tracked(&self.stepds, job_id, step_id, run_attempt).await {
-            return Err(Status::already_exists(format!(
-                "step {job_id}.{step_id} attempt {run_attempt} already has a terminal supervisor"
-            )));
-        }
-
-        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
-            .await
-            .map_err(|error| {
-                Status::internal(format!(
-                    "failed to fence a stale terminal supervisor: {error}"
-                ))
-            })?;
+        let admission = self
+            .claim_terminal_slot(job_id, run_attempt, step_id)
+            .await?;
 
         let (fabric_binding, gpu_binding, allocation, job_nodelist) = {
             let jobs = self.running.lock().await;
@@ -5149,7 +5160,7 @@ impl AgentService {
                 cred_id: String::new(),
                 cred_kid: String::new(),
                 cred_digest: String::new(),
-                pty_step_id: Some(pty_step_id),
+                pty_step_id: Some(step_id),
             },
             &admission,
         )
@@ -18066,6 +18077,60 @@ mod tests {
             .unwrap_err();
         assert_eq!(missing.code(), tonic::Code::PermissionDenied);
         assert!(missing.message().contains("no account on this node"));
+    }
+
+    #[tokio::test]
+    async fn authorize_terminal_reports_a_job_it_does_not_run_as_such() {
+        let mut svc = test_agent();
+        svc.set_join_grant_key(GRANT_KEY);
+        let err = svc
+            .authorize_terminal(
+                &terminal_init("", join_grant_for("bob", 46, 3, 0)),
+                Some(&user_identity("bob")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::NotFound,
+            "a grant never turns a missing job into a permission question"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_step_gets_one_supervisor_per_attempt() {
+        let svc = test_agent();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            46,
+            0,
+            3,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        let Err(err) = svc.claim_terminal_slot(46, 0, 3).await else {
+            panic!("a second supervisor for the same attempt must be refused");
+        };
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        let _admitted = svc
+            .claim_terminal_slot(46, 0, 4)
+            .await
+            .expect("another terminal in the same job is its own step");
+    }
+
+    #[tokio::test]
+    async fn reclaiming_from_an_empty_custody_dir_finds_no_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(reclaim_terminal(46, dir.path()).await.is_none());
+        assert!(reclaim_terminal(46, &dir.path().join("never-launched"))
+            .await
+            .is_none());
     }
 
     #[test]

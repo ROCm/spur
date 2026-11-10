@@ -862,25 +862,6 @@ def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> se
     return sessions
 
 
-def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set:
-    node = cluster.nodes[node_index]
-    listing = node.exec_allow_fail(
-        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
-    )
-    prefix = f"{job_id}."
-    sessions = set()
-    for name in listing.split():
-        if not name.startswith(prefix):
-            continue
-        try:
-            step_id = int(name.rsplit(".", 1)[-1])
-        except ValueError:
-            continue
-        if step_id >= _RESERVED_STEP_FLOOR:
-            sessions.add(name)
-    return sessions
-
-
 def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
     """A shell relaunched from scratch after a restart repeats its early
     ticks; a reconnect racing the restart only drops a line or two of a
@@ -983,10 +964,7 @@ class TestSrunContainerStepSupervision:
 
             before: set = set()
             while time.time() < deadline:
-                # An interactive PTY session's own workload runs under the
-                # shared terminal placeholder, a reserved step id, not a
-                # numbered one of its own.
-                before = _reserved_step_sessions_for_job(cluster, job_id)
+                before = _user_step_sessions_for_job(cluster, job_id)
                 if before:
                     break
                 time.sleep(1)
@@ -995,7 +973,7 @@ class TestSrunContainerStepSupervision:
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
-            after = _reserved_step_sessions_for_job(cluster, job_id)
+            after = _user_step_sessions_for_job(cluster, job_id)
             assert before <= after, (
                 "the pty+container step's supervisor must outlive the agent that spawned it: "
                 f"{sorted(before)} before the restart, {sorted(after)} after"
