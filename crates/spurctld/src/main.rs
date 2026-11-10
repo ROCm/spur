@@ -20,6 +20,7 @@ mod node_liveness;
 mod pmix_dispatch;
 mod raft;
 mod raft_server;
+mod recent_stops;
 mod rest;
 mod rpc_middleware;
 mod rpc_stats;
