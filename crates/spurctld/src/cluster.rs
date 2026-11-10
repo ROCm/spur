@@ -4309,6 +4309,15 @@ impl ClusterManager {
             return Ok(());
         }
         let _reconfigure = self.reconfigure_lock.lock();
+        if self.node_inventory.read().is_some() {
+            return Ok(());
+        }
+        self.validate_node_inventory(&self.startup_node_inventory)
+            .map_err(|error| {
+                RegisterNodeError::PermissionDenied(format!(
+                    "cannot initialize admission.node_names: {error}"
+                ))
+            })?;
         let response = self
             .propose(WalOperation::NodeInventoryUpdate {
                 inventory: self.startup_node_inventory.clone(),
@@ -4329,6 +4338,24 @@ impl ClusterManager {
             .as_ref()
             .and_then(|i| i.names.as_ref())
             .is_some_and(|names| !names.contains(name))
+    }
+
+    fn k0s_inventory_error<'a>(
+        &self,
+        nodes: &HashMap<String, Node>,
+        references: impl IntoIterator<Item = &'a String>,
+    ) -> Option<String> {
+        // Legacy logs can reference nodes before registration; only a committed
+        // inventory enables the reciprocal fence against roster deletions.
+        let inventory = self.node_inventory.read();
+        let inventory = inventory.as_ref()?;
+        references
+            .into_iter()
+            .find(|name| {
+                !nodes.contains_key(*name)
+                    || inventory.names.as_ref().is_some_and(|names| !names.contains(*name))
+            })
+            .map(|name| format!("Kubernetes membership references node '{name}' absent from the committed node inventory"))
     }
 
     pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
@@ -5267,13 +5294,16 @@ impl ClusterManager {
         // both observe the same prior phase and double-count the transition.
         let _accounting = self.k0s_phase_accounting.lock();
         let from = self.k0s.read().phase;
-        self.propose(WalOperation::K0sSetPhase {
+        let response = self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
             control_plane_nodes,
             member_nodes,
             reset_requested,
         })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         if from != phase {
             let cluster = self.config().cluster_name.clone();
             self.k8s_metrics
@@ -5296,7 +5326,10 @@ impl ClusterManager {
     /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
     /// narrow it (see the `cluster_add_nodes` handler guard).
     pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        let response = self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         Ok(())
     }
 
@@ -6742,11 +6775,10 @@ impl ClusterManager {
             );
         }
         let inventory = new_config.admission.node_inventory()?;
-        let inventory_changed = self
-            .node_inventory
-            .read()
-            .as_ref()
-            .map_or(inventory.names.is_some(), |current| current != &inventory);
+        let inventory_changed = self.node_inventory.read().as_ref().map_or_else(
+            || inventory.names.is_some() || self.startup_node_inventory.names.is_some(),
+            |current| current != &inventory,
+        );
         if inventory_changed {
             self.validate_node_inventory(&inventory)?;
         }
@@ -6877,7 +6909,19 @@ impl ClusterManager {
         let jobs = self.jobs.read();
         let nodes = self.nodes.read();
         let reservations = self.reservations.read();
-        inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
+        let removed =
+            inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
+        // Heartbeats can change the local used-view; it must not decide whether
+        // a committed roster applies on one replica but is refused on another.
+        for name in removed {
+            let node = &nodes[&name];
+            if node.alloc_resources.cpus > 0
+                || node.alloc_resources.memory_mb > 0
+                || node.alloc_resources.has_devices()
+            {
+                anyhow::bail!("node '{name}' still has allocated resources");
+            }
+        }
         Ok(())
     }
 
@@ -9113,7 +9157,13 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
-                if let Some(name) = node_names.iter().find(|name| !nodes.contains_key(*name)) {
+                // The committed roster enables this fence; earlier log entries
+                // must retain their original placement behavior on replay.
+                if let Some(name) = node_names
+                    .iter()
+                    .find(|name| !nodes.contains_key(*name))
+                    .filter(|_| self.node_inventory.read().is_some())
+                {
                     warn!(job_id = *job_id, node = %name, "refusing a JobStart onto a removed node");
                     return ClientResponse::default();
                 }
@@ -10198,6 +10248,10 @@ impl ClusterManager {
                 }
             }
             WalOperation::K0sMemberNodesAdd { nodes: add } => {
+                if let Some(error) = self.k0s_inventory_error(&nodes, add.iter()) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut k0s = self.k0s.write();
                 k0s.member_nodes = crate::cluster_k8s::merge_member_nodes(&k0s.member_nodes, add);
             }
@@ -10213,6 +10267,16 @@ impl ClusterManager {
                 member_nodes,
                 reset_requested,
             } => {
+                if *phase != spur_core::k0s::K0sPhase::Down {
+                    let references = control_plane_node
+                        .iter()
+                        .chain(control_plane_nodes)
+                        .chain(member_nodes);
+                    if let Some(error) = self.k0s_inventory_error(&nodes, references) {
+                        response.node_inventory_error = Some(error);
+                        return response;
+                    }
+                }
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 k0s.reset_requested = *reset_requested;
@@ -10314,7 +10378,7 @@ fn inventory_removals(
     removed.sort();
     let held: HashSet<_> = jobs
         .values()
-        .filter(|job| !job.state.is_terminal())
+        .filter(|job| !job.state.is_finalized())
         .flat_map(Job::held_nodes)
         .collect();
     let reserved: HashMap<_, _> = reservations
@@ -10333,12 +10397,6 @@ fn inventory_removals(
             );
         }
         let node = &nodes[name];
-        if node.alloc_resources.cpus > 0
-            || node.alloc_resources.memory_mb > 0
-            || node.alloc_resources.has_devices()
-        {
-            anyhow::bail!("node '{name}' still has allocated resources");
-        }
         if let Some(reservation) = reserved.get(name) {
             anyhow::bail!(
                 "node '{name}' belongs to reservation '{reservation}'; remove that reference first"
@@ -13281,6 +13339,111 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_can_clear_uninitialized_startup_roster() {
+        for roster in ["[]", "['n1']"] {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                &format!("cluster_name = 'test'\n[admission]\nnode_names = {roster}\n"),
+            )
+            .await;
+            let startup_config = cm.config().as_ref().clone();
+            assert_eq!(*cm.node_inventory.read(), None);
+            assert!(cm.check_node_inventory("dynamic").is_err());
+            std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+            cm.reconfigure().unwrap();
+            try_register_node(&cm, "dynamic", 4, 8000).unwrap();
+            assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+            let restored = ClusterManager::new(startup_config, dir.path()).unwrap();
+            restored
+                .restore_from_snapshot(&cm.snapshot_state().unwrap())
+                .unwrap();
+            assert!(restored.check_node_inventory("another").is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_inventory_rejects_stale_k0s_membership_before_success_or_metrics() {
+        use spur_core::k0s::K0sPhase;
+        for selection in 0..4 {
+            let dir = TempDir::new().unwrap();
+            let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+            cm.apply_operation(&inventory_registration("n1"));
+            cm.apply_operation(&inventory_registration("n2"));
+            cm.apply_operation(&inventory_update(&["n1", "n2"]));
+            if selection == 3 {
+                cm.apply_operation(&WalOperation::K0sSetPhase {
+                    phase: K0sPhase::Provisioning,
+                    control_plane_node: Some("n1".into()),
+                    control_plane_nodes: vec!["n1".into()],
+                    member_nodes: vec!["n1".into()],
+                    reset_requested: false,
+                });
+            }
+            let before = cm.k0s_state();
+            let metrics = || {
+                let body =
+                    spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
+                let mut lines: Vec<_> = body.lines().map(str::to_owned).collect();
+                lines.sort_unstable();
+                lines
+            };
+            let metrics_before = metrics();
+            let recorder = Arc::new(RecordingApplier {
+                inner: cm.clone(),
+                ops: parking_lot::Mutex::new(Vec::new()),
+                before_apply: |cluster, op| {
+                    if matches!(
+                        op,
+                        WalOperation::K0sSetPhase { .. } | WalOperation::K0sMemberNodesAdd { .. }
+                    ) {
+                        assert!(cluster
+                            .apply_operation(&inventory_update(&["n1"]))
+                            .node_inventory_error
+                            .is_none());
+                    }
+                },
+            });
+            let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder)
+                .await
+                .unwrap();
+            handle
+                .raft
+                .wait(None)
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .unwrap();
+            cm.set_raft(handle.raft);
+            let result = if selection == 3 {
+                cm.add_k0s_member_nodes(vec!["n2".into()])
+            } else {
+                cm.set_k0s_phase(
+                    K0sPhase::Provisioning,
+                    Some(if selection == 0 { "n2" } else { "n1" }.into()),
+                    if selection == 1 {
+                        vec!["n2".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    if selection == 2 {
+                        vec!["n2".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    false,
+                )
+            };
+            assert!(result.unwrap_err().to_string().contains("n2"));
+            assert!(cm.get_node("n2").is_none());
+            assert_eq!(
+                serde_json::to_value(cm.k0s_state()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(metrics(), metrics_before);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconfigure_without_node_inventory_preserves_dynamic_nodes() {
         let dir = TempDir::new().unwrap();
         let (cm, path) = test_cluster_with_conf_file(
@@ -13509,6 +13672,200 @@ pub(crate) mod tests {
             Some(inventory(&[])),
             "late bootstrap cannot overwrite reconfigure"
         );
+        cm.apply_operation(&WalOperation::NodeInventoryUpdate {
+            inventory: NodeInventory::default(),
+            initialize: false,
+        });
+        assert!(cm.check_node_inventory("n1").is_ok());
+        assert!(!cm.apply_operation(&placement).job_started);
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored
+            .restore_from_snapshot(&cm.snapshot_state().unwrap())
+            .unwrap();
+        assert_eq!(
+            *restored.node_inventory.read(),
+            Some(NodeInventory::default())
+        );
+        assert!(!restored.apply_operation(&placement).job_started);
+        assert!(
+            !restored
+                .apply_operation(&inventory_registration("n1"))
+                .node_registration_rejected
+        );
+        assert!(restored.apply_operation(&placement).job_started);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_inventory_initialization_preserves_local_resource_preflight() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.admission.node_names = Some(vec!["n1".into()]);
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.apply_operation(&inventory_registration("old"));
+        cm.nodes
+            .write()
+            .get_mut("old")
+            .unwrap()
+            .alloc_resources
+            .cpus = 1;
+        let error = try_register_node(&cm, "n1", 4, 8000).unwrap_err();
+        assert!(matches!(error, RegisterNodeError::PermissionDenied(_)));
+        assert!(error.to_string().contains("allocated resources"));
+        assert_eq!(*cm.node_inventory.read(), None);
+        assert!(cm.get_node("old").is_some());
+        assert!(cm.get_node("n1").is_none());
+    }
+
+    #[test]
+    fn node_inventory_removes_nodes_with_finalized_legacy_preemption_history() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&inventory_registration("n1"));
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy")),
+        });
+        let slice = ResourceAllocations::with_scalar(1, 0);
+        cm.apply_operation(&WalOperation::job_start(
+            1,
+            vec!["n1".into()],
+            slice.clone(),
+            HashMap::from([("n1".into(), slice)]),
+        ));
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let old: WalOperation = serde_json::from_str(
+            r#"{"JobComplete":{"job_id":1,"exit_code":-1,"state":"PREEMPTED"}}"#,
+        )
+        .unwrap();
+        cm.apply_operation(&old);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Preempted);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_none());
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_job(1).unwrap().allocated_nodes, vec!["n1"]);
+    }
+
+    #[test]
+    fn node_inventory_apply_ignores_replica_local_gpu_accounting() {
+        let leader_dir = TempDir::new().unwrap();
+        let follower_dir = TempDir::new().unwrap();
+        let leader = ClusterManager::new(test_config(), leader_dir.path()).unwrap();
+        let follower = ClusterManager::new(test_config(), follower_dir.path()).unwrap();
+        let stable_ids = [0x63_0000, 0x83_0000];
+        let mut ops: Vec<_> = gpu_id_change_ops(&stable_ids, &[0, 1], &stable_ids)
+            .into_iter()
+            .take(3)
+            .collect();
+        ops.push(WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        ops.push(WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        });
+        for op in &ops {
+            leader.apply_operation(op);
+            follower.apply_operation(op);
+        }
+        assert_eq!(leader.get_job(1).unwrap().state, JobState::Completed);
+        assert!(leader.validate_node_inventory(&inventory(&[])).is_ok());
+        leader.reconcile_node_gpu_allocations("n1", &[(1, stable_ids.to_vec())]);
+        for cluster in [&leader, &follower] {
+            assert!(cluster
+                .apply_operation(&inventory_update(&[]))
+                .node_inventory_error
+                .is_none());
+            assert!(cluster.get_node("n1").is_none());
+            assert_eq!(*cluster.node_inventory.read(), Some(inventory(&[])));
+        }
+    }
+
+    #[test]
+    fn node_inventory_k0s_guards_preserve_legacy_replay_and_teardown() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut phase = WalOperation::K0sSetPhase {
+            phase: K0sPhase::Provisioning,
+            control_plane_node: Some("n1".into()),
+            control_plane_nodes: vec!["n1".into()],
+            member_nodes: vec!["n1".into()],
+            reset_requested: false,
+        };
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        cm.apply_operation(&inventory_update(&["n1"]));
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_some());
+        assert!(cm
+            .apply_operation(&WalOperation::K0sMemberNodesAdd {
+                nodes: vec!["n1".into()]
+            })
+            .node_inventory_error
+            .is_some());
+        cm.apply_operation(&inventory_registration("n1"));
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_some());
+        if let WalOperation::K0sSetPhase { phase, .. } = &mut phase {
+            *phase = K0sPhase::Down;
+        }
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_none());
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert_eq!(cm.k0s_state().phase, K0sPhase::Down);
+        assert!(cm.k0s_state().member_nodes.is_empty());
+    }
+
+    #[test]
+    fn node_inventory_preserves_legacy_missing_node_placement_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        node_test_fixtures::register(&cm, &["n1", "n2"]);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy-placement")),
+        });
+        let removal =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
+                .unwrap();
+        let placement = serde_json::from_str(
+            r#"{"JobStart":{"job_id":1,"nodes":["n1","n2"],"resources":{"cpus":2,"memory_mb":2000,"devices":{}},"per_node_alloc":{"n1":{"cpus":1,"memory_mb":1000,"devices":{}},"n2":{"cpus":1,"memory_mb":1000,"devices":{}}},"run_attempt":1}}"#,
+        ).unwrap();
+        cm.apply_operation(&removal);
+        assert!(cm.apply_operation(&placement).job_started);
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
+        assert_eq!(cm.get_job(1).unwrap().allocated_nodes, vec!["n1", "n2"]);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let completion = serde_json::from_str(
+            r#"{"JobComplete":{"job_id":1,"exit_code":0,"state":"COMPLETED"}}"#,
+        )
+        .unwrap();
+        cm.apply_operation(&completion);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(*cm.node_inventory.read(), None);
     }
 
     #[test]
