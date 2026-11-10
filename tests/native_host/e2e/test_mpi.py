@@ -77,7 +77,7 @@ def assert_mpi_ranks(out: str, expected_ranks: set[int], expected_size: int) -> 
 def assert_one_mpi_world(
     out: str, expected_size: int, expected_hosts: list[str] | None = None
 ) -> None:
-    """Assert exactly one MPI world with distinct ranks, PIDs, and optional host check."""
+    """Assert exactly one MPI world with distinct ranks, processes, and optional host check."""
     rows = parse_mpi_rows(out)
     assert len(rows) == expected_size, (
         f"expected {expected_size} rank lines, got {len(rows)}:\n{out}"
@@ -88,15 +88,35 @@ def assert_one_mpi_world(
     assert all(r.size == expected_size for r in rows), (
         f"not all ranks report size={expected_size}:\n{out}"
     )
-    pids = {r.pid for r in rows}
-    assert len(pids) == expected_size, (
-        f"expected {expected_size} distinct PIDs, got {len(pids)}:\n{out}"
+    # A PID is unique only on its own host, so ranks on two nodes can share one.
+    processes = {(r.host, r.pid) for r in rows}
+    assert len(processes) == expected_size, (
+        f"expected {expected_size} distinct (host, pid) processes, got {len(processes)}:\n{out}"
     )
     if expected_hosts is not None:
         actual_hosts = sorted({r.host for r in rows})
         assert actual_hosts == sorted(expected_hosts), (
             f"expected hosts {sorted(expected_hosts)}, got {actual_hosts}:\n{out}"
         )
+
+
+def test_one_mpi_world_accepts_equal_pids_on_different_hosts():
+    out = "\n".join([
+        "rank=0 size=4 host=node-a pid=100",
+        "rank=1 size=4 host=node-a pid=101",
+        "rank=2 size=4 host=node-b pid=100",
+        "rank=3 size=4 host=node-b pid=101",
+    ])
+    assert_one_mpi_world(out, 4)
+
+
+def test_one_mpi_world_rejects_one_process_reporting_two_ranks():
+    out = "\n".join([
+        "rank=0 size=2 host=node-a pid=100",
+        "rank=1 size=2 host=node-a pid=100",
+    ])
+    with pytest.raises(AssertionError, match="distinct"):
+        assert_one_mpi_world(out, 2)
 
 
 def assert_plm_slurm_selected(log: str) -> None:
@@ -711,7 +731,7 @@ class TestMpirunMultiNode:
         assert len(hosts) == 3, f"expected 3 hosts, got {hosts}:\n{out}"
 
     def test_mpirun_duplicate_driver_guard_m6(self, mpi_multi_node_cluster):
-        """M6: exactly N lines, N distinct PIDs — proves single driver."""
+        """M6: exactly N lines from N distinct processes, which proves a single driver."""
         cluster = mpi_multi_node_cluster
         self._skip_if_no_inter_node_ssh(cluster)
         hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
