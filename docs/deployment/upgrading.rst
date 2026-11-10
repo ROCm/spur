@@ -13,6 +13,20 @@ and the Ansible playbooks that upgrade a running cluster with or without an outa
    binaries on disk — it does **not** restart the daemons. The drain-aware, jobs-preserving
    cluster path is the Ansible ``rolling_upgrade.yml`` playbook (see below).
 
+Job timestamps across controller restarts
+-----------------------------------------
+
+New controllers record submission time in the replicated log, alongside activation
+and completion times. Replaying these entries preserves job timestamps, elapsed
+runtime, and the timestamps used for scheduling age and time-limit calculations.
+
+Older log entries remain readable, but timestamps absent from those entries cannot
+be reconstructed by this change. Such entries retain the recovery-time fallback;
+this does not repair previously reset timestamps. Existing snapshots preserve the
+times they contain. During a rolling upgrade, an older leader still writes
+unstamped submissions, and older replicas still reconstruct submission times from
+their own clocks. Timestamp preservation requires all controllers to be upgraded.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 

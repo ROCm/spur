@@ -2581,6 +2581,7 @@ mod tests {
                 index: 1,
             },
             payload: EntryPayload::Normal(WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(big_spec),
             }),

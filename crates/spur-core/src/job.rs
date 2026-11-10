@@ -1064,6 +1064,10 @@ pub struct Job {
 
 impl Job {
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
+        Self::new_at(job_id, spec, Utc::now())
+    }
+
+    pub fn new_at(job_id: JobId, spec: JobSpec, submit_time: DateTime<Utc>) -> Self {
         let priority = if spec.hold {
             0
         } else {
@@ -1086,7 +1090,7 @@ impl Job {
             pending_reason,
             pending_reason_desc: None,
             priority,
-            submit_time: Utc::now(),
+            submit_time,
             start_time: None,
             end_time: None,
             allocated_nodes: Vec::new(),

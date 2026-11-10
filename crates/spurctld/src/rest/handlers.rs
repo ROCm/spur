@@ -444,6 +444,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(JobSpec {
                     name: "alice-job".into(),
