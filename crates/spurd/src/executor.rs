@@ -490,6 +490,16 @@ impl RunningJob {
         matches!(self, RunningJob::AllocationOnly)
     }
 
+    /// Whether `kill_signal` has a process of its own to aim at, which its `Ok`
+    /// alone does not say: it succeeds as a no-op for an allocation or a reaped job.
+    pub fn has_live_process(&self) -> bool {
+        match self {
+            RunningJob::Managed { child } => child.id().is_some(),
+            RunningJob::Forked { reaped, .. } => !*reaped,
+            RunningJob::AllocationOnly => false,
+        }
+    }
+
     /// Non-blocking check for process exit. Returns (exit_code, signal) if done.
     pub fn try_wait(&mut self) -> anyhow::Result<Option<(i32, i32)>> {
         match self {
