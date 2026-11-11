@@ -67,6 +67,21 @@ jobs:
       - name: Check knowledge base sync
         run: scripts/check-knowledge-sync.sh
 
+  kb-accuracy:
+    name: Knowledge Base Accuracy (LLM)
+    runs-on: [self-hosted, amd-internal]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check KB accuracy against diff
+        env:
+          KB_API_KEY: ${{ secrets.KB_API_KEY }}
+          KB_BASE_REF: origin/${{ github.base_ref }}
+        run: scripts/check-kb-accuracy.sh
+
   fmt:
     runs-on: ubuntu-latest
     steps:

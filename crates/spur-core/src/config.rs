@@ -502,7 +502,7 @@ pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 pub const MAX_GRP_WALL_WINDOW_DAYS: u32 = 3650;
 
 fn default_listen_addr() -> String {
-    "[::]:6817".into()
+    "[::]:9999".into()
 }
 fn default_raft_listen_addr() -> String {
     "[::]:6821".into()
@@ -523,7 +523,7 @@ fn default_max_job_id() -> u32 {
 impl Default for ControllerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "[::]:6817".into(),
+            listen_addr: "[::]:9999".into(),
             rest_addr: "[::]:6820".into(),
             hosts: vec!["localhost".into()],
             state_dir: "/var/spool/spur".into(),
@@ -4021,7 +4021,7 @@ cni_mtu = 1400
     #[test]
     fn test_controller_endpoints_multi_host() {
         let cfg = ControllerConfig {
-            listen_addr: "[::]:6817".into(),
+            listen_addr: "[::]:9999".into(),
             hosts: vec!["ctrl1".into(), "ctrl2".into(), "ctrl3".into()],
             ..Default::default()
         };
@@ -4057,7 +4057,7 @@ cni_mtu = 1400
     #[test]
     fn test_controller_endpoints_ipv6_host_bracketed() {
         let cfg = ControllerConfig {
-            listen_addr: "[::]:6817".into(),
+            listen_addr: "[::]:9999".into(),
             hosts: vec!["::1".into()],
             ..Default::default()
         };
@@ -4067,7 +4067,7 @@ cni_mtu = 1400
     #[test]
     fn test_controller_endpoints_ipv6_already_bracketed() {
         let cfg = ControllerConfig {
-            listen_addr: "[::]:6817".into(),
+            listen_addr: "[::]:9999".into(),
             hosts: vec!["[::1]".into()],
             ..Default::default()
         };
@@ -4499,7 +4499,7 @@ gid = 0
 cluster_name = "test-cluster"
 
 [controller]
-listen_addr = "[::]:6817"
+listen_addr = "[::]:9999"
 rest_addr = "[::]:6820"
 hosts = ["ctrl1", "ctrl2"]
 state_dir = "/var/spool/spur"
@@ -5807,7 +5807,7 @@ max_batch_requeue = 5
 cluster_name = "test"
 
 [controller]
-listen_addr = "[::]:6817"
+listen_addr = "[::]:9999"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
