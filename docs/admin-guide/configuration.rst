@@ -2977,7 +2977,7 @@ another job. The drain reason is one of:
    with this reason when the agent cannot read or update the lost
    supervisor's teardown record; the ``spurd`` log has the error.
 
-The agent recognizes an orphaned epilog's process group by the random
+The agent recognizes the process group of an orphaned epilog by the random
 ``SPUR_HOOK_GROUP_TOKEN`` each epilog run receives in its environment. A
 group none of whose processes still carry it is left running, since the agent
 cannot tell it from an unrelated group that reused the ID.
