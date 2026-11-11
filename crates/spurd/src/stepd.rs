@@ -629,13 +629,21 @@ impl StepdObligationLog {
         })?;
         entry.push(b'\n');
         let mut options = fs::OpenOptions::new();
-        options.create(true).append(true);
+        options.read(true).create(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&self.path)?;
+        // The supervisor and the agent both append. Holding the lock while
+        // judging the tail keeps one from cutting an entry the other is
+        // writing or has just written.
+        let mut file = nix::fcntl::Flock::lock(
+            options.open(&self.path)?,
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .map_err(|(_, errno)| io::Error::from(errno))?;
+        drop_torn_tail(&mut file)?;
         file.write_all(&entry)?;
         file.sync_data()
     }
@@ -672,6 +680,21 @@ impl StepdObligationLog {
             })
             .collect()
     }
+}
+
+/// Cuts a final line a crash left unfinished, which `read` already skips, so
+/// the next entry cannot fuse with it into a complete but malformed record.
+fn drop_torn_tail(file: &mut fs::File) -> io::Result<()> {
+    let mut contents = Vec::new();
+    io::Read::read_to_end(file, &mut contents)?;
+    let complete = contents
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1);
+    if complete < contents.len() {
+        file.set_len(complete as u64)?;
+    }
+    Ok(())
 }
 
 /// `read_line` with no cap on line length; a peer that never sends `\n` grows
@@ -5132,6 +5155,41 @@ mod tests {
     }
 
     #[test]
+    fn a_teardown_torn_mid_append_still_settles_and_replays() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = lost_mid_teardown(&store, 69, None);
+        tear_last_append(
+            &store
+                .session_dir(69, 1, spur_core::step::STEP_BATCH)
+                .join(OBLIGATION_FILE),
+        );
+        let pending = || {
+            store
+                .discover_unacknowledged_completions()
+                .expect("discover unacknowledged completions")
+        };
+        assert_eq!(pending().len(), 1);
+
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+
+        let replayable = pending();
+        assert_eq!(
+            replayable.len(),
+            1,
+            "settling must keep the completion replayable"
+        );
+        assert!(replayable[0].epilog_failed);
+        assert_eq!(
+            batch_epilog_outcome(&store, 69),
+            Some(EpilogOutcome::SupervisorLost)
+        );
+        assert!(!store
+            .settle_interrupted_teardown(&lost)
+            .expect("settle again"));
+    }
+
+    #[test]
     fn a_teardown_lease_counts_before_any_exit_is_recorded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = StepdStore::new(temp.path());
@@ -6076,6 +6134,52 @@ mod tests {
             "{\"obligation\":\"bogus\"}\n{\"obligation\":\"resources_released\"}\n",
         )
         .expect("write corrupt log");
+        assert!(log.read().is_err());
+    }
+
+    /// What a crash midway through appending an epilog outcome leaves behind.
+    const TORN_ENTRY: &str = "{\"obligation\":\"epilog_comp";
+
+    fn tear_last_append(log_path: &Path) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(log_path)
+            .and_then(|mut log| log.write_all(TORN_ENTRY.as_bytes()))
+            .expect("tear the log");
+    }
+
+    #[test]
+    fn appending_after_a_torn_tail_keeps_every_complete_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(OBLIGATION_FILE);
+        let log = StepdObligationLog::new(path.clone());
+        let exit = StepdObligation::ExitObserved {
+            exit_code: 3,
+            signal: 0,
+            synthesized: false,
+        };
+        log.append(&exit).expect("append exit");
+        tear_last_append(&path);
+
+        log.append(&StepdObligation::ResourcesReleased)
+            .expect("append after the torn tail");
+
+        assert_eq!(
+            log.read().expect("read log"),
+            vec![exit, StepdObligation::ResourcesReleased]
+        );
+    }
+
+    #[test]
+    fn appending_leaves_a_malformed_complete_entry_failing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(OBLIGATION_FILE);
+        fs::write(&path, "{\"obligation\":\"bogus\"}\n").expect("write corrupt log");
+        let log = StepdObligationLog::new(path);
+
+        log.append(&StepdObligation::ResourcesReleased)
+            .expect("append");
+
         assert!(log.read().is_err());
     }
 

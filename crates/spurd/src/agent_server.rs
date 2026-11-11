@@ -14160,6 +14160,46 @@ mod tests {
         assert_eq!(reports[0].drain_reason, TEARDOWN_INTERRUPTED_DRAIN_REASON);
     }
 
+    // The supervisor crashed partway through appending its epilog outcome, and
+    // the fence's report never reached the controller: the replay must drain.
+    #[tokio::test]
+    async fn a_torn_ledger_still_drains_through_the_retry_after_a_failed_report() {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let (_descriptor, mut orphan) = session_lost_mid_epilog(&store);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(
+                store
+                    .session_dir(42, 7, spur_core::step::STEP_BATCH)
+                    .join(crate::stepd::OBLIGATION_FILE),
+            )
+            .and_then(|mut ledger| ledger.write_all(b"{\"obligation\":\"epilog_comp"))
+            .expect("tear the ledger");
+
+        fence_against_controller("http://127.0.0.1:1".into(), &store).await;
+
+        assert_eq!(
+            orphan.wait().expect("reap the orphan").signal(),
+            Some(libc::SIGKILL)
+        );
+        assert_eq!(
+            pending_replays(&store),
+            1,
+            "a report the controller never took must stay replayable"
+        );
+        let replayed = replay_runtime_completions(&store, &controller_addr, "test-node", "")
+            .await
+            .expect("replay completions");
+        assert_eq!(replayed.len(), 1);
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].drain_reason, TEARDOWN_INTERRUPTED_DRAIN_REASON);
+    }
+
     // After a restart the replay loop is all that reports a session's exit, so
     // the numbered step has to come back from disk with the rest of it.
     #[tokio::test]
