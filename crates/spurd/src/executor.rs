@@ -1293,6 +1293,11 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
+    // io only gives each job an io.stat for disk accounting; no limits depend on
+    // it, so a kernel without it is not a degrade.
+    if let Err(e) = std::fs::write(&subtree, "+io") {
+        debug!(job_id, error = %e, "io controller not delegated; no per-job disk I/O stats");
+    }
     // Claiming reaps whatever is in the directory, which only the step owning the
     // job's lifetime may do — user steps took the join path above.
     if let Err(e) = claim_cgroup_dir(&cgroup_path) {

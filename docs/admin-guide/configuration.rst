@@ -2450,6 +2450,11 @@ budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem
 the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
 cgroups.
 
+``spurd`` also enables the ``io`` controller for job directories, so each
+``job_<id>_<attempt>`` has an ``io.stat`` with the job's block-device I/O.
+No I/O limits are set; a kernel without the controller only loses those
+statistics.
+
 .. warning::
 
    These settings bound a job only when ``spurd`` runs as root, and with the
