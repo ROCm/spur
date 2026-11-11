@@ -800,7 +800,7 @@ agents). Example on an agent:
 Agent MPI environment (before the first job)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Spur's rank wrapper sources ``${HOME}/spur/mpi/env.sh`` if that file exists
+Each PMIx rank sources ``${HOME}/spur/mpi/env.sh`` if that file exists
 (submitter's home on the agent). Install it on **every** compute node; homes
 are often not shared. Ubuntu ``libpmix2t64`` needs **hash GDS** on both
 ``spurd`` and the ranks — default shmem GDS fails against Spur's PMIx server.
@@ -883,16 +883,18 @@ Architecture
    topology metadata (``PMIX_NODE_MAP``, ``PMIX_PROC_MAP``, job/local size
    keys, ``PMIX_LOCAL_PEERS``, ``PMIX_LOCALLDR``, ``PMIX_TMPDIR``), then serves
    PMIx to application processes.
-3. ``spurd`` runs every rank through a bash wrapper, including a node's only
-   rank, because the wrapper is the one place ``env.sh`` and the aliases below
-   are applied. A batch script that calls ``srun`` itself is a driver, not a
-   rank, and runs unwrapped. With several ranks on a node the wrapper **forks
-   one process per rank**, and each child receives a full
+3. ``spurstepd``'s task launcher starts every rank, including a node's only
+   rank, **forking one process per rank** and waiting on each, so the step
+   exits with the ranks' combined status. A batch script that calls ``srun``
+   itself is a driver, not a rank, and runs unwrapped. Each rank receives a full
    ``PMIx_server_setup_fork`` environment (Slurm ``mpi_p_slurmstepd_task``
    parity) via ``spur_mpi_pmix_setup_fork_env`` in the plugin.
-4. The wrapper sources ``env.sh`` and exports ``PMIX_SERVER_URI4`` /
-   ``PMIX_SERVER_URI3`` aliases. Slurm-compatible ``SLURM_*`` twins remain set
-   (same as Slurm under ``--mpi=pmix``).
+4. Before it execs the program, each rank sources ``env.sh`` and exports
+   ``PMIX_SERVER_URI4`` / ``PMIX_SERVER_URI3`` aliases; its own PMIx
+   environment and GPU slice are applied after ``env.sh``, so ``env.sh``
+   cannot override them. Slurm-compatible ``SLURM_*`` twins remain set (same as
+   Slurm under ``--mpi=pmix``). Ranks of a step that runs inside a container
+   still start through a bash wrapper.
 
 The embedded PMIx server registers ``fence_nb`` once at ``PMIx_server_init``.
 Single-node jobs never call it (OpenPMIx GDS handles modex locally). Multi-node
@@ -1062,7 +1064,7 @@ Operational notes
   across all agents when not passing explicit values.
 - Multi-rank ``--mpi=pmix`` steps use the same per-rank fork + ``setup_fork``
   path as batch jobs. Spur CPU bind (``--cpu-bind``) and per-rank GPU
-  partitioning (``SPUR_JOB_GPUS``) apply through the fork wrapper.
+  partitioning (``SPUR_JOB_GPUS``) apply to each rank.
 - Batch stdout (``spur-<jobid>.out``) is often written on an **allocated agent**,
   not the submission host, when those filesystems are not shared.
 - A job may sit in ``COMPLETING`` after ranks have already printed and
