@@ -67,6 +67,7 @@ jobs:
       - name: Check knowledge base sync
         run: scripts/check-knowledge-sync.sh
 
+
   fmt:
     runs-on: ubuntu-latest
     steps:
