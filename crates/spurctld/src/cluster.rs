@@ -93,7 +93,8 @@ pub(crate) fn warn_if_complete_wait_too_short(config: &spur_core::config::SlurmC
             kill_wait_secs = config.scheduler.effective_kill_wait_secs(),
             timeout_kill_wait_secs = config.scheduler.effective_timeout_kill_wait_secs(),
             cgroup_cleanup_timeout_secs = config.cgroup.cleanup_timeout_secs,
-            "scheduler.complete_wait_secs should exceed complete_wait_floor_secs (the larger kill wait plus cgroup.cleanup_timeout_secs), or a job still being killed or cleaned up is force-finished and its unreported nodes are drained"
+            epilog_timeout_secs = config.hooks.epilog_timeout_secs,
+            "scheduler.complete_wait_secs should exceed complete_wait_floor_secs (the larger kill wait plus cgroup.cleanup_timeout_secs plus hooks.epilog_timeout_secs and its kill sequence), or a job still being killed, cleaned up, or in its epilog is force-finished and its unreported nodes are drained"
         );
     }
 }

@@ -183,8 +183,17 @@ impl SessionFixture {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: nix::sys::signal::Signal::SIGKILL as i32,
+                synthesized: false,
             })
             .expect("record workload exit");
+        // The reap outlived its grace and the supervisor went on to finish teardown.
+        store
+            .obligations(71, 1, step_id)
+            .append(&StepdObligation::EpilogCompleted {
+                failed: false,
+                supervisor_lost: false,
+            })
+            .expect("record finished epilog");
         store
             .cleanup_store()
             .track(&PendingCleanup {
@@ -317,6 +326,7 @@ async fn command_replay_returns_an_acknowledged_exit_during_cleanup() {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 9,
                 signal: 0,
+                synthesized: false,
             })
             .expect("record exit");
         obligations
@@ -871,7 +881,7 @@ fn pending_cleanup_keeps_an_old_finalized_session_recoverable() {
         .store
         .load_descriptor(&session)
         .expect("pending cleanup retains its descriptor");
-    assert_eq!(obligations.read().expect("read obligations").len(), 3);
+    assert_eq!(obligations.read().expect("read obligations").len(), 4);
 
     std::fs::remove_dir_all(&fixture.cgroup).expect("empty cgroup fixture");
     fixture.store.retry_cleanup().expect("finish cleanup");

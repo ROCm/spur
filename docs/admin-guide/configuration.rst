@@ -578,10 +578,12 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        Nodes that have not confirmed completion are drained before their
        resources are released. If that drain cannot be committed, the job
        retains its allocation and the controller retries. A node reports only
-       after the job is killed and its cgroup cleanup finishes, so this should
-       exceed the larger kill wait (``kill_wait_secs`` or
-       ``timeout_kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``; the
-       controller logs a warning when it does not.
+       after the job is killed, its cgroup cleanup finishes, and its node
+       epilog ends, so this should exceed the larger kill wait
+       (``kill_wait_secs`` or ``timeout_kill_wait_secs``) plus
+       ``[cgroup] cleanup_timeout_secs`` plus ``[hooks] epilog_timeout_secs``
+       and its 11 second kill sequence; the controller logs a warning when it
+       does not. See :ref:`the epilog timeout <epilog-timeout>`.
    * - ``kill_wait_secs``
      - integer
      - ``5``
@@ -593,12 +595,13 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        Ends early once the job's processes exit. Valid ``0``-``65533``; values
        below 5 act as 5. ``complete_wait_secs`` should exceed the larger kill
        wait (this or ``timeout_kill_wait_secs``) plus
-       ``[cgroup] cleanup_timeout_secs``, or a healthy node still being killed
-       or cleaned up is drained when the job is force-finished; the controller
-       logs a warning when it does not. Known issue: a requeued job
-       (requeue-mode preemption, ``scontrol requeue``)
-       frees its nodes at once, while the old run is still in its kill wait, so
-       another job can be dispatched onto them during that window. The window
+       ``[cgroup] cleanup_timeout_secs`` and the epilog bound, or a healthy
+       node still being killed, cleaned up, or in its epilog is drained when the
+       job is force-finished; the controller logs a warning when it does not.
+       Known issue: a requeued job (requeue-mode preemption,
+       ``scontrol requeue``) frees its nodes at once, while the old run is
+       still in its kill wait, so another job can be dispatched onto them
+       during that window. The window
        can last up to ``kill_wait_secs``, so keep it low if that matters with
        requeue-mode preemption. A requeued job itself is held out of the queue
        for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
@@ -616,7 +619,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        time-limited batch job moves to COMPLETING straight away and spends this
        wait there before ending ``TIMEOUT``. Valid ``0``-``65533``; values below
        5 act as 5. ``complete_wait_secs`` should exceed the larger kill wait
-       (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In
+       (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs`` and
+       the epilog bound. In
        Slurm, ``KillWait`` also covers time limits; here that part is this
        setting. Does not yet reach ``srun`` steps
        (:ref:`kill wait note <kill-wait-steps-caveat>`). ``scontrol show config``
@@ -2553,7 +2557,8 @@ statistics.
        continues after the deadline; it does not authorize resource reuse.
        Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
        network filesystem unmounts), but keep ``[scheduler] complete_wait_secs``
-       above the larger kill wait plus this value so the agent, not a
+       above the larger kill wait plus this value plus the epilog bound
+       (``[hooks] epilog_timeout_secs`` and 11 seconds) so the agent, not a
        force-finish, drains the node. The controller's warning checks its own
        ``[cgroup] cleanup_timeout_secs``, while each agent uses the value in its
        node's ``spur.conf`` (read at agent start, so ``scontrol reconfigure``
@@ -2913,6 +2918,99 @@ submitting host on each invocation.
    ``reconfigure`` validates ``job_submit`` and ``job_submit_lua`` before swapping
    the config, so a broken submit hook is rejected rather than applied — the
    previous configuration stays in place and the command reports an error.
+
+.. _epilog-timeout:
+
+Epilog timeout
+~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 16 10 10 14 30
+
+   * - Field
+     - Slurm equivalent
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``epilog_timeout_secs``
+     - ``PrologEpilogTimeout``
+     - integer
+     - ``120``
+     - Agent restart (new jobs)
+     - Seconds the compute-node ``epilog`` may run, from 1 to 86400. At the
+       limit its whole process group gets ``SIGTERM``, and whatever remains of
+       the group 5 seconds later gets ``SIGKILL``. A timed-out epilog counts
+       as a failed one. A running job keeps the value captured at launch.
+
+Slurm leaves ``PrologEpilogTimeout`` unset, so its epilog may run forever.
+Spur bounds it because a job's node stays held until its epilog ends. The
+epilog is finished when the script's own process exits. Anything it leaves
+running in the background does not hold the node, and its ``stderr`` is logged
+for one more second.
+
+A cancelled or finished job's node is not released while its teardown is
+still running, with one exception after a ``spurd`` restart: a supervisor the
+restarted agent re-adopts has its job reported complete once the workload
+exits, possibly before its epilog runs. That node can be released mid-epilog,
+and an epilog failure may not drain it.
+
+The node agent normally force-reclaims a job's supervisor 30 seconds after a
+cancel. A supervisor waiting for its cgroup to empty, or running the node
+epilog, holds a lease that defers that reclaim:
+
+- The cleanup lease lasts what remains of ``[cgroup] cleanup_timeout_secs``,
+  plus 30 seconds for rootfs and spool removal.
+- The epilog lease lasts ``epilog_timeout_secs`` plus 11 seconds for the kill
+  sequence and output drain, plus 30 seconds for the SPANK exit hooks and the
+  completion report. A node with SPANK plugins but no epilog script gets the
+  30 seconds alone.
+
+When a supervisor drops a lease the reclaim was waiting on, the agent gives it
+another 30 seconds to report before reclaiming it. However long a supervisor's
+leases claim, the agent stops deferring after a full cleanup timeout plus the
+longest allowed epilog.
+
+The node is drained when its teardown does not confirm it is ready for
+another job. The drain reason is one of:
+
+``epilog script failed``
+   The epilog exited non-zero or hit ``epilog_timeout_secs``. The ``spurd`` log
+   says which.
+
+``job teardown did not complete before its supervisor was lost``
+   The supervisor that runs the node epilog (the batch or allocation step's)
+   recorded the job's exit, then was lost (crashed, or force-reclaimed) before
+   recording the epilog result. This covers every stage of teardown, including
+   ``task_epilog``, the cgroup wait, and the epilog itself. If the epilog was
+   running, its orphaned process group is killed first. The node also drains
+   with this reason when the agent cannot read or update the lost
+   supervisor's teardown record; the ``spurd`` log has the error.
+
+The agent recognizes the process group of an orphaned epilog by the random
+``SPUR_HOOK_GROUP_TOKEN`` each epilog run receives in its environment. A
+group none of whose processes still carry it is left running, since the agent
+cannot tell it from an unrelated group that reused the ID.
+
+``task_epilog`` has no timeout, as in Slurm. If a batch step's
+``task_epilog`` is still running when its supervisor is force-reclaimed after a
+cancel, the node is drained with the second reason.
+
+.. note::
+
+   Keep ``[scheduler] complete_wait_secs`` above the larger kill wait plus
+   ``[cgroup] cleanup_timeout_secs`` plus ``epilog_timeout_secs`` plus 11
+   seconds. The defaults satisfy this: 30 + 60 + 120 + 11 = 221, under 300.
+   Otherwise the controller force-finishes the job and drains the node before
+   a slow but healthy epilog has finished. The controller's warning checks its
+   own ``epilog_timeout_secs``, so set it to the largest any node uses.
+
+.. warning::
+
+   Upgrading from a release without this setting bounds every node epilog at
+   120 seconds. Before upgrading, raise ``epilog_timeout_secs`` on nodes
+   whose epilog can take longer, and ``complete_wait_secs`` with it.
 
 ``[notifications]``
 -------------------
