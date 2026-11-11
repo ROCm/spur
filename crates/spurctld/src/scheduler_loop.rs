@@ -1338,7 +1338,7 @@ fn partition_usage_from_jobs<'a>(
 
 /// Partition a running job is charged to: the one recorded at start, or for
 /// a run started before that was recorded, its highest-tier requested one.
-fn charged_partition<'a>(
+pub(crate) fn charged_partition<'a>(
     job: &spur_core::job::Job,
     partitions: &'a [spur_core::partition::Partition],
 ) -> Option<&'a spur_core::partition::Partition> {
@@ -7916,6 +7916,7 @@ pub(crate) mod tests {
                     allow_accounts: Vec::new(),
                     allow_groups: Vec::new(),
                     deny_accounts: Vec::new(),
+                    qos: None,
                     allow_qos: Vec::new(),
                     deny_qos: Vec::new(),
                     priority_tier: 1,
@@ -10112,7 +10113,7 @@ pub(crate) mod tests {
             };
             cm.update_partition(
                 "p", None, None, None, None, None, None, None, false, None, None, None, None, None,
-                None, None, None, None, None, raise,
+                None, None, None, None, None, raise, None,
             )
             .unwrap();
             assert!(process_assignment(cm.clone(), planned, false).await);
