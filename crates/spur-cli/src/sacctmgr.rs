@@ -1361,17 +1361,7 @@ async fn show(
             // does not belong in the result. Otherwise list the account even
             // when it has no members: that row is where account QOS lives.
             let accounts = if user_filter.is_empty() {
-                let mut accounts_request = tonic::Request::new(ListAccountsRequest { shares: false });
-                accounts_request.set_timeout(SACCTMGR_RPC_TIMEOUT);
-                client
-                    .list_accounts(accounts_request)
-                    .await
-                    .context("ListAccounts RPC failed")?
-                    .into_inner()
-                    .accounts
-                    .into_iter()
-                    .filter(|a| account_filter.is_empty() || a.name == account_filter)
-                    .collect()
+                load_association_accounts(&mut client, &account_filter).await?
             } else {
                 Vec::new()
             };
@@ -1649,6 +1639,34 @@ fn append_coords_column(fields: &mut Vec<format_engine::FormatToken>) {
             header: "Coords".to_string(),
         },
     ));
+}
+
+async fn load_association_accounts(
+    client: &mut SlurmAccountingClient<crate::authclient::AuthChannel>,
+    account_filter: &str,
+) -> Result<Vec<AccountInfo>> {
+    let mut request = tonic::Request::new(ListAccountsRequest { shares: false });
+    request.set_timeout(SACCTMGR_RPC_TIMEOUT);
+    visible_association_accounts(client.list_accounts(request).await, account_filter)
+}
+
+/// Account rows are an addition to the user rows. A caller the controller
+/// denies the account list (`private_data = ["accounts"]`, coordinating
+/// nothing) still gets their user rows, just without the account definitions.
+fn visible_association_accounts(
+    listed: Result<tonic::Response<ListAccountsResponse>, tonic::Status>,
+    account_filter: &str,
+) -> Result<Vec<AccountInfo>> {
+    match listed {
+        Ok(resp) => Ok(resp
+            .into_inner()
+            .accounts
+            .into_iter()
+            .filter(|a| account_filter.is_empty() || a.name == account_filter)
+            .collect()),
+        Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(Vec::new()),
+        Err(status) => Err(status).context("ListAccounts RPC failed"),
+    }
 }
 
 /// `(accounts by user, users by account)`, names joined and sorted. A caller
@@ -2319,6 +2337,55 @@ mod tests {
         let lines = association_lines(&[], &users);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].user, "alice");
+    }
+
+    fn listed_accounts(
+        names: &[&str],
+    ) -> Result<tonic::Response<ListAccountsResponse>, tonic::Status> {
+        Ok(tonic::Response::new(ListAccountsResponse {
+            accounts: names
+                .iter()
+                .map(|name| AccountInfo {
+                    name: (*name).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            partial: false,
+        }))
+    }
+
+    #[test]
+    fn association_accounts_are_dropped_when_the_caller_may_not_list_accounts() {
+        let denied = Err(tonic::Status::permission_denied(
+            "account definitions are visible to their coordinators",
+        ));
+        let accounts = visible_association_accounts(denied, "").expect("denial is not an error");
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn association_accounts_surface_other_failures() {
+        let loading = Err(tonic::Status::unavailable(
+            "association cache is still loading",
+        ));
+        let err = visible_association_accounts(loading, "").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ListAccounts RPC failed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn association_accounts_honor_the_account_filter() {
+        let all = visible_association_accounts(listed_accounts(&["physics", "chemistry"]), "")
+            .expect("listing succeeds");
+        assert_eq!(all.len(), 2);
+
+        let one =
+            visible_association_accounts(listed_accounts(&["physics", "chemistry"]), "physics")
+                .expect("listing succeeds");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "physics");
     }
 
     #[test]

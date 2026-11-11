@@ -350,6 +350,10 @@ accepted as ``association``. The account row has a blank ``User``. Filter by
 ``account=`` and/or ``user=``. A ``user=`` filter omits the account row. Use
 ``format=`` to select columns (for example, ``format=QOS``).
 
+With ``private_data = ["accounts"]``, a User who coordinates no account gets
+the user rows without the account rows, because account definitions are visible
+only to coordinators (see `Show accounts`_).
+
 .. code-block:: bash
 
    sacctmgr show association account=ml
