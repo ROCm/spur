@@ -55,6 +55,18 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
         "Victim runs with released capacity awaiting a requesting launch outcome",
         snap.preemption_usage.open,
     );
+    register_gauge(
+        registry,
+        "spur_scheduler_preemption_exports_pending",
+        "Finished jobs past retention kept until their preemption counts reach accounting",
+        snap.preemption_exports_pending,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_preemption_export_oldest_seconds",
+        "Age of the oldest of those jobs, from its end time",
+        snap.preemption_export_oldest_secs,
+    );
     let unused = Family::<UnusedLabels, Counter>::default();
     for reason in UnusedReason::ALL {
         for initiator in PreemptionInitiator::ALL {
@@ -158,6 +170,8 @@ mod tests {
     fn sample_snapshot() -> SchedStatsSnapshot {
         SchedStatsSnapshot {
             preemption_usage: Default::default(),
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 10,
             cycle_total_time_us: 5000,

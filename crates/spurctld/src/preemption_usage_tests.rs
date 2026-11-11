@@ -71,7 +71,6 @@ fn preempt(
         ),
         job_id: id,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(owner_attempt),
         preempt_qos: None,
         run_attempt: Some(victim_attempt),
         handoff: true,
@@ -88,8 +87,45 @@ mod review;
 #[path = "preemption_usage_attempt_tests.rs"]
 mod attempts;
 
+fn release_op(observation: u64, run_attempt: u32, released: bool) -> WalOperation {
+    WalOperation::EvictTerminalJobs {
+        job_ids: Vec::new(),
+        before: None,
+        at: None,
+        preemption_release: Some(PreemptionRelease {
+            job_id: 10,
+            run_attempt,
+            observation_id: observation,
+            released,
+            unconfirmed: false,
+        }),
+    }
+}
+
 fn confirm(cm: &ClusterManager, attempt: u32, released: bool) {
-    cm.apply_operation(&WalOperation::preemption_release(10, attempt, released));
+    let observation = cm
+        .preemption_usage
+        .read()
+        .requests
+        .get(&10)
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|(_, request)| request.run_attempt == Some(attempt))
+                .map(|(&observation, _)| observation)
+        })
+        .expect("a request reserved for this attempt");
+    cm.apply_operation(&release_op(observation, attempt, released));
+}
+
+fn back_off(cm: &ClusterManager, run_attempt: u32) {
+    cm.apply_operation(&WalOperation::JobDispatchBackoff {
+        job_id: 10,
+        begin_time: chrono::DateTime::UNIX_EPOCH,
+        spare_requeue_budget: true,
+        run_attempt,
+        at_max_requeue: false,
+    });
 }
 
 fn cancel(cm: &ClusterManager, origin: &str) {
@@ -124,7 +160,7 @@ fn subset_of_victims_is_counted_individually_and_duplicate_entries_do_not_count_
         "activation is not workload release"
     );
     confirm(&cm, 1, true);
-    confirm(&cm, 1, true);
+    cm.apply_operation(&release_op(1, 1, true));
     let usage = cm.preemption_usage();
     assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 1, 0));
     assert_eq!(
@@ -162,10 +198,11 @@ fn repeated_victim_runs_and_stale_confirmations_use_run_identity() {
     let (_dir, cm) = cluster();
     start(&cm, 1, 1, &[("n1", scalar())]);
     preempt(&cm, 1, 1, 1);
-    confirm(&cm, 1, false);
+    reserve(&cm, 10, 1, &[("n1", scalar())]);
+    back_off(&cm, 1);
     start(&cm, 1, 2, &[("n1", scalar())]);
     preempt(&cm, 1, 2, 2);
-    confirm(&cm, 1, true);
+    cm.apply_operation(&release_op(1, 1, true));
     assert_eq!(cm.preemption_usage().open, 1);
     start(&cm, 10, 2, &[("n1", scalar())]);
     confirm(&cm, 2, true);
@@ -223,7 +260,6 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
     start(&cm, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
     let pending = PreemptPending {
         preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
-        preemptor_run_attempt: Some(1),
         signaled_at: chrono::DateTime::UNIX_EPOCH,
         deadline: chrono::DateTime::UNIX_EPOCH,
         preempted_by: 10,
@@ -275,7 +311,6 @@ fn capacity_released_after_requester_launch_is_unused() {
             preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
             job_id: 1,
             preempted_by: Some(10),
-            preemptor_run_attempt: Some(1),
             preempt_qos: None,
             run_attempt: Some(1),
             at: None,
@@ -309,7 +344,6 @@ fn reclaimed_capacity_without_a_handoff_is_excluded() {
         preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(1),
         preempt_qos: None,
         run_attempt: Some(1),
         handoff: false,
@@ -393,7 +427,7 @@ fn snapshot_restores_open_claims_and_lifetime_totals_survive_job_eviction() {
 }
 
 #[test]
-fn frozen_old_snapshot_and_grace_default_to_no_usage_and_no_request_epoch() {
+fn frozen_old_snapshot_and_grace_default_to_no_usage_and_no_claim() {
     let (_dir, cm) = cluster();
     cm.restore_from_snapshot(
         br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{}}"#,
@@ -401,7 +435,7 @@ fn frozen_old_snapshot_and_grace_default_to_no_usage_and_no_request_epoch() {
     .expect("pre-feature snapshot");
     assert_eq!(cm.preemption_usage(), PreemptionUsage::default());
     let grace: PreemptPending = serde_json::from_str(r#"{"signaled_at":"2026-01-01T00:00:00Z","deadline":"2026-01-01T00:00:30Z","preempted_by":10,"preempt_qos":null,"mode":"Requeue","run_attempt":1,"requeue_hold_secs":30}"#).expect("pre-feature grace");
-    assert_eq!(grace.preemptor_run_attempt, None);
+    assert_eq!(grace.preemption_claim, None);
     let op: WalOperation = serde_json::from_str(
         r#"{"JobStateChange":{"job_id":10,"old_state":"PENDING","new_state":"RUNNING"}}"#,
     )
@@ -430,7 +464,6 @@ fn success_before_late_release_survives_a_snapshot() {
         preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(1),
         preempt_qos: None,
         run_attempt: Some(1),
         at: None,
@@ -493,23 +526,11 @@ fn unresolved_launch_gets_an_accounting_repair_window_before_eviction() {
 #[test]
 fn frozen_pre_feature_preemption_and_eviction_entries_remain_readable() {
     let requeue: WalOperation = serde_json::from_str(r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2026-01-01T00:00:00Z","preempted_by":10,"handoff":true}}"#).expect("old requeue");
-    assert!(matches!(
-        requeue,
-        WalOperation::JobPreemptRequeue {
-            preemptor_run_attempt: None,
-            ..
-        }
-    ));
+    assert!(matches!(requeue, WalOperation::JobPreemptRequeue { .. }));
     let cancel: WalOperation =
         serde_json::from_str(r#"{"JobPreemptCancel":{"job_id":1,"preempted_by":10}}"#)
             .expect("old cancel");
-    assert!(matches!(
-        cancel,
-        WalOperation::JobPreemptCancel {
-            preemptor_run_attempt: None,
-            ..
-        }
-    ));
+    assert!(matches!(cancel, WalOperation::JobPreemptCancel { .. }));
     let eviction: WalOperation =
         serde_json::from_str(r#"{"EvictTerminalJobs":{"job_ids":[1]}}"#).expect("old eviction");
     assert!(matches!(
@@ -548,7 +569,6 @@ fn cancelled_requester_is_retained_until_its_warned_victims_release_capacity() {
         preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
         job_id: 1,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(1),
         preempt_qos: None,
         run_attempt: Some(1),
         at: None,
@@ -557,7 +577,7 @@ fn cancelled_requester_is_retained_until_its_warned_victims_release_capacity() {
     cm.apply_operation(&WalOperation::EvictTerminalJobs {
         preemption_release: None,
         job_ids: vec![10],
-        before: None,
+        before: Some(chrono::DateTime::<chrono::Utc>::MAX_UTC),
         at: None,
     });
     assert!(cm.get_job(10).is_some());
@@ -609,7 +629,7 @@ fn a_controller_ignoring_the_confirmation_cannot_resume_a_suspended_job() {
         preempt_qos: None,
         by: None,
     });
-    let confirmation = WalOperation::preemption_release(10, 1, true);
+    let confirmation = release_op(1, 1, true);
     cm.apply_job_operation(&confirmation);
     assert_eq!(
         cm.get_job(10).expect("requester").state,
@@ -736,4 +756,43 @@ fn accounting_identity_survives_submission_replay() {
         Checkpoint::from(&second.get_job(22).expect("job")).incarnation,
         "legacy"
     );
+}
+
+#[test]
+fn unexported_jobs_are_reported_and_evicted_only_after_the_export_hold() {
+    let dir = tempfile::tempdir().expect("temporary state");
+    let mut config: spur_core::config::SlurmConfig =
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).expect("config");
+    config.accounting.database_url = "postgres://unused-test".into();
+    config.controller.terminal_job_retention_secs = 0;
+    let cm = ClusterManager::new(config, dir.path()).expect("cluster");
+    let now = chrono::Utc::now();
+    let retention = chrono::Duration::seconds(crate::accounting::RECONCILE_INTERVAL_SECS as i64);
+    let hold = chrono::Duration::seconds(super::super::PREEMPTION_EXPORT_HOLD_SECS);
+    let finished = |id: JobId, end: chrono::DateTime<chrono::Utc>| {
+        let mut job = Job::new(id, JobSpec::default());
+        job.state = JobState::Completed;
+        job.end_time = Some(end);
+        job.preemption_usage.used = 1;
+        job
+    };
+    let held = now - retention - hold + chrono::Duration::minutes(5);
+    let overdue = now - retention - hold - chrono::Duration::minutes(5);
+    let snapshot = serde_json::json!({
+        "jobs": [finished(1, held), finished(2, overdue), finished(3, now)],
+        "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+    });
+    cm.restore_from_snapshot(&serde_json::to_vec(&snapshot).expect("snapshot"))
+        .expect("restore");
+
+    assert_eq!(cm.preemption_export_backlog(now), (1, Some(held)));
+    let scan = cm.scan_terminal_retention(now);
+    assert_eq!((scan.evictable, scan.unexported), (vec![2], 1));
+    cm.acknowledge_preemption_checkpoint(&crate::accounting::preemption::Checkpoint::from(
+        &cm.get_job(1).expect("held job"),
+    ));
+    assert_eq!(cm.preemption_export_backlog(now), (0, None));
+    let mut evictable = cm.scan_terminal_retention(now).evictable;
+    evictable.sort_unstable();
+    assert_eq!(evictable, vec![1, 2]);
 }

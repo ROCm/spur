@@ -95,6 +95,8 @@ impl SchedStatsCollector {
         let accum = self.cycle.lock();
         SchedStatsSnapshot {
             preemption_usage: Default::default(),
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: self.plugin.clone(),
             cycles: accum.cycles,
             cycle_total_time_us: accum.cycle_total_time_us,

@@ -106,6 +106,7 @@ Accounting entities map directly from Slurm:
   a TOML list (``private_data = ["jobs", "usage"]``), not a comma-separated
   string. ``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
   ``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+  ``sreport preemptions`` follows both ``"jobs"`` and ``"usage"``.
   User and account listings follow ``"users"`` and ``"accounts"``. ``sshare``
   is not filtered by ``"accounts"``. A coordinator sees the accounts they
   coordinate, including sub-accounts, and the ``sacct`` history,

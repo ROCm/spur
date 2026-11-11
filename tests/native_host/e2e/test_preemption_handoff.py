@@ -378,10 +378,11 @@ def _usage(c, *, used=0, open_count=0, unused=None, jobs=None):
                 assert match and tuple(map(int, match.groups())) == job_totals, show
             else:
                 assert "PreemptionsUsed=" not in show, show
+            listed = re.search(r"UnusedPreemptionCauses=(\S+)", show)
             causes = {
                 (reason, initiator): int(count)
                 for reason, initiator, count in re.findall(
-                    r"UnusedPreemptionReason=(\w+) Initiator=(\w+) Count=(\d+)", show
+                    r"(\w+)/(\w+):(\d+)", listed.group(1) if listed else ""
                 )
             }
             assert causes == job_unused, show

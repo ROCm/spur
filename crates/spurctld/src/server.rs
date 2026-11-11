@@ -2521,10 +2521,12 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
-        let mut snapshot = self.sched_stats.snapshot();
-        snapshot.preemption_usage = self.cluster.preemption_usage();
-        let response = crate::metrics_proto::sched_stats_to_proto(&snapshot);
-        Ok(Response::new(response))
+        let snapshot = self
+            .cluster
+            .with_preemption_stats(self.sched_stats.snapshot());
+        Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
+            &snapshot,
+        )))
     }
 
     async fn get_assoc_mgr_info(
@@ -8098,7 +8100,6 @@ mod tests {
                 job_id,
                 pending: PreemptPending {
                     preemption_claim: None,
-                    preemptor_run_attempt: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(60),
                     preempted_by: 99,
@@ -8118,7 +8119,6 @@ mod tests {
             });
             apply(&WalOperation::JobPreemptCancel {
                 preemption_claim: None,
-                preemptor_run_attempt: None,
                 job_id,
                 preempted_by: Some(99),
                 preempt_qos: None,
@@ -8561,7 +8561,7 @@ mod tests {
                 .auth
                 .private_data;
             let service = test_service_with(&dir, config).await;
-            service.cluster.restore_from_snapshot(br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{},"preemption_usage":{"cluster":{"used":2},"users":{"alice":{"used":1},"bob":{"used":1}}}}"#).expect("usage fixture");
+            service.cluster.restore_from_snapshot(br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{},"preemption_usage":{"cluster":{"used":2}}}"#).expect("usage fixture");
             let mut request = Request::new(());
             request
                 .extensions_mut()
@@ -10350,7 +10350,6 @@ mod tests {
         let signaled_at = Utc::now();
         let pending = spur_core::job::PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: 99,
@@ -14165,7 +14164,6 @@ mod tests {
         let deadline = signaled_at + Duration::seconds(60);
         job.preempt_pending = Some(PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at,
             deadline,
             preempted_by: 9,

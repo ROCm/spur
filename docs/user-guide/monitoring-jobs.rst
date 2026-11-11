@@ -1006,8 +1006,9 @@ and accounts they take part in, and only their own ``User=`` lines; a ``users=``
 selector is replaced with their own name. ``sshare`` omits other users'
 rows and leaves account totals and shares of the total blank. ``sreport``
 utilization fills in only your own usage and fairshare and leaves the other
-cells blank. ``sprio`` and ``sreport job`` sizes follow
-``"jobs"`` instead. ``Grp*`` totals on the scope line
+cells blank. ``sreport preemptions`` shows only your own rows and the accounts
+you coordinate when either ``"jobs"`` or ``"usage"`` is private. ``sprio`` and
+``sreport job`` sizes follow ``"jobs"`` instead. ``Grp*`` totals on the scope line
 still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
@@ -1092,14 +1093,11 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
 Preemption outcomes — ``/metrics/scheduler``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``sdiag`` reports cluster totals only; user/account detail is available through
-``sreport preemptions`` when PostgreSQL accounting is configured. ``scontrol show job`` reports a requesting job's
-``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen`` when any
-count is nonzero. REST job responses expose the same counts and cause detail
-in ``preemption_usage``. Counts describe
-**victim runs**, not nodes: preempting the same job on two runs counts twice.
-Suspension and idle-fill reclaim without an owner-directed handoff are excluded.
-A grace warning alone does not increment any count; the first released slice
+When a pending job (the requester) preempts running jobs (the victims), Spur
+records whether the launch of the requester used the capacity each victim released.
+Counts describe **victim runs**, not nodes: preempting the same job on two runs
+counts twice. Suspension and idle-fill reclaim without an owner-directed handoff
+are excluded. A grace warning alone does not count; the first released slice
 opens one observation for that victim run.
 
 .. list-table::
@@ -1118,6 +1116,12 @@ opens one observation for that victim run.
    * - ``spur_scheduler_preemptions_open``
      - Gauge
      - Victim runs that released capacity but whose requesting launch outcome is unresolved.
+   * - ``spur_scheduler_preemption_exports_pending``
+     - Gauge
+     - Finished jobs past retention kept in the controller until their counts reach accounting.
+   * - ``spur_scheduler_preemption_export_oldest_seconds``
+     - Gauge
+     - Age of the oldest of those jobs, from its end time.
 
 For example, if a requester preempts A on n1 and B on n2, then launches only
 using B's capacity, used increases by one and unused by one. Partial reports
@@ -1129,7 +1133,8 @@ allocations count as launched once allocation registration and activation succee
 ``reason`` has four values:
 
 * ``started_elsewhere``: the launch succeeded without matching released capacity.
-* ``launch_failed``: a reserved requesting launch was rejected, held, backed off, or not released.
+* ``launch_failed``: a reserved requesting launch was rejected, held, backed off,
+  lost its nodes, or was not released.
 * ``cancelled``: cancellation ended the request before use.
 * ``ended_other``: another end or a superseding attempt closed the request,
   including an outcome that could not be confirmed after controller failure.
@@ -1142,46 +1147,40 @@ by user-supplied input still has a system launch-failure verdict. The
 ``ended_other`` / ``unknown`` bucket is uncertainty, not proof of resource loss.
 No username, job ID, or node name is a Prometheus label.
 
-Device-backed victims require matching node-local device IDs and inventory
-generation; merely using CPU on the same GPU node is insufficient. Legacy
-device allocations without node-local identity cannot establish matching use.
-CPU and memory have no allocation-unit identities, so scalar-only attribution consumes
-a deterministic capacity budget in victim-ID order. Legacy scalar allocations
-without per-node slices divide their totals across the recorded node order,
-assigning any remainder to the first nodes. This preserves the full CPU and
-memory budget but remains an approximation, not proof that preemption was
-necessary or a measure of lost GPU-hours. One
-victim using any matching capacity counts once; this does not measure the
-fraction of its allocation used. Capacity released after launch confirmation
-cannot serve that launch.
+The counts are also available from:
 
-Each tracked requesting attempt has a persisted observation ID. A transient
-failure before reservation leaves the pending observation open, so a retry can
-still use that capacity. Cancellation closes it even before reservation. Victim
-allocation evidence travels in the preemption entry; requester evidence comes
-from its reservation entry, so replicas use the same identities.
+* ``sdiag``: cluster totals, unused counts by cause, and, when finished jobs past
+  retention are waiting for export, how many and the oldest one's age.
+* ``scontrol show job``: ``PreemptionsUsed``, ``PreemptionsUnused``, and
+  ``PreemptionsOpen`` on the requesting job, plus ``UnusedPreemptionCauses`` as
+  comma-separated ``reason/initiator:count`` pairs. Printed only when a count is
+  nonzero.
+* REST job responses: the same counts and causes in ``preemption_usage``.
+* ``sreport preemptions``: lifetime totals per requesting user and account
+  (see below).
 
-An observed launch result is retained locally until its Raft confirmation
-succeeds. The scheduler retries failed confirmations. After a controller restart,
-a result that never reached Raft cannot be reconstructed from Running state:
-activation precedes the agents' workload-release acknowledgments. Once the new
-leader's dispatch grace expires, activated observations without that evidence
-close as ``ended_other`` / ``unknown``. This records uncertainty, including for
-workloads that may have run successfully; it does not assert a launch failure.
-Recovery waits twice the configured dispatch timeout; disabling that timeout
-also disables this automatic uncertainty settlement for active requests.
-Ended or superseded requests close without waiting for that grace.
+A device-backed victim counts as used only when the requester received the same
+node-local devices; using CPU on the same GPU node is not enough. CPU and memory
+have no identity, so they are matched against a capacity budget. Both are
+approximations: they do not prove a preemption was necessary or measure lost
+GPU-hours. One victim using any matching capacity counts once.
 
-Cluster totals, active observations, and per-job counts are persisted through
-Raft. They start when this feature begins observing events, survive controller
-restart, and are unaffected by ``sdiag --reset``. Raft does not retain lifetime
-user/account totals. ``scontrol show job`` retains its per-job counters; job-end
-accounting and reconciliation also copy these into job history.
+If the requesting launch fails before it reserves nodes, the observation stays
+open so a retry can still use the capacity. If the requester gives up a
+reservation before it starts (a backoff, a hold, or a node going down), the
+observation closes as ``launch_failed`` and a later retry does not count as use.
+A launch result that was not recorded before a controller restart closes as
+``ended_other`` / ``unknown`` once the new leader's dispatch grace expires (twice
+the dispatch timeout; never, if that timeout is disabled). This records
+uncertainty, not a launch failure.
+
+Cluster totals and per-job counts survive controller restart and are not
+cleared by ``sdiag --reset``.
 
 Lifetime user/account reporting
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Use the accounting service through the controller's gRPC endpoint:
+``sreport preemptions`` needs PostgreSQL accounting:
 
 .. code-block:: console
 
@@ -1197,8 +1196,9 @@ total. A complete account report requires every page for that account. The CLI
 prints the next-page token on standard error when another page exists. The
 default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
 ``--start`` and ``--end`` are rejected because these are lifetime totals rather
-than event-time reports. Pagination uses user/account order, not a frozen
-snapshot; counts can change while pages are read.
+than event-time reports. Pages are read in user/account order, not from a frozen
+snapshot: counts can change between pages, and a pair added before the current
+position during paging is not shown.
 
 Add ``--by-cause`` to show only nonzero unused counts, with one row per requesting
 user/account, reason, and initiator. These use the same values as the scheduler
@@ -1220,66 +1220,19 @@ With ``--parsable --by-cause``, the columns are
    alice|research|cancelled|user|2
    alice|research|launch_failed|system|1
 
-Cause counts add up to the pair's ``Unused`` total in the default report, which
-continues to show ``User Account Used Unused Open``. Pairs with no unused counts
-have no rows in the cause report. Pagination still limits user/account pairs
-and keeps their causes together, with at most 16 cause buckets plus an optional
-historical remainder per pair. A page can have no cause rows and still print a
-next-page token on standard error; continue until there is no token. The CLI
-reports an error when the controller lacks detailed-report support instead of
-silently displaying incomplete details.
+Cause counts add up to the pair's ``Unused`` total in the default report. Pairs
+with no unused counts have no rows in the cause report. Pagination still counts
+user/account pairs and keeps their causes together, so a page can have no cause
+rows and still print a next-page token; continue until there is no token.
 
-The ``GetPreemptionUsage`` accounting RPC applies both ``jobs`` and ``usage``
-privacy settings, including coordinator visibility. Scoped reports identify
-that restriction and must not be presented as full account or cluster totals.
+The report applies both ``jobs`` and ``usage`` privacy settings, including
+coordinator visibility (see :ref:`private-data`). A scoped report is not a full
+account or cluster total. Cluster totals in ``sdiag`` and the metrics are
+aggregates with no per-user detail and are not scoped.
 
-An asynchronous exporter attempts up to 1000 changed jobs every ten seconds.
-A failing checkpoint is logged and retained while other jobs continue exporting;
-a cursor advances across batches so failing rows cannot starve later jobs.
-Connection failures stop the batch until the next tick.
-PostgreSQL stores durable rollups plus one deduplication checkpoint per job
-incarnation (job ID and leader-stamped submission time; older jobs use a stable
-legacy key). The stamp travels in the existing submission entry. Duplicate or older exports do not
-increment totals; requeued runs accumulate in the same job checkpoint. The
-requesting user/account is fixed at its first export. Later account edits do not
-move that job's lifetime contributions; history can show the new account while
-these counts remain visible to the original account's coordinator. The rollups and checkpoints
-are independent of job-history rows, account deletion, and fairshare resets.
-Pre-feature history has no usage observations to import. Totals begin with
-claimed preemptions recorded by this feature; older log entries without claims
-are not counted, regardless of where a replica took its snapshot.
-
-Cause rollups and their deduplication checkpoints also live in PostgreSQL,
-updated in the same transaction as the summary totals. This breakdown adds no
-Raft operations. A checkpoint missing cause detail retains its totals and reports
-the remainder as ``unclassified`` with initiator ``unknown`` until
-a retained controller job re-exports its cause counts. This is a historical
-data gap, not an event reason. It may remain permanently when the controller
-no longer retains that job. Reports omit zero cause buckets and can show one
-additional row for this unclassified remainder.
-
-The accounting ``Open`` column is the last exported observation count and can
-lag the live cluster gauge. Database outages or an export backlog increase that
-lag. When accounting is configured, a job with counts awaiting export remains in
-controller history until its current counts are committed; scheduling continues
-without waiting for PostgreSQL. Prolonged outages therefore increase retained
-job state. Controllers recheck persisted checkpoints after restart or failover.
-An unresolved terminal observation closes before retention, and its final
-counts must also be exported. With accounting disabled, only cluster and
-retained per-job counts are available.
-
-The counters piggyback on existing state-machine operations. A requesting launch
-with unresolved tracked preemptions normally writes at most one additional guarded
-release confirmation, regardless of the number of victims or metric buckets.
-Raft failures can require retries; duplicate confirmations do not count twice.
-Launches without tracked preemptions add no log entry. Open claim storage grows
-with tracked victim allocations; completed claims are removed. Recording a
-partial node completion updates that node's release evidence without copying
-the victim's entire allocation. Cluster aggregates use fixed cause buckets;
-user/account rollups and historical deduplication storage grow in PostgreSQL.
-Accounting exports, report reads, and export acknowledgements add no Raft writes.
-Controllers from before this feature do not maintain these observations; use a
-uniform controller version when relying on the lifetime totals.
+Accounting reports lag the live counts, and ``Open`` there is the last exported
+value. :ref:`preemption-outcome-export` describes how counts reach PostgreSQL
+and what happens during an accounting outage.
 
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

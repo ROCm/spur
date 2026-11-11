@@ -3297,17 +3297,9 @@ impl ClusterManager {
     /// already in a grace, so the caller must not warn it.
     pub fn signal_preemption(
         &self,
-        mut pending: PreemptPending,
+        pending: PreemptPending,
         job_id: JobId,
     ) -> anyhow::Result<bool> {
-        if pending.preemption_claim.is_none() {
-            if let Some(victim) = self.get_job(job_id) {
-                pending.preemption_claim = Some(self.preemption_claim(
-                    &victim,
-                    self.next_preemption_observation(pending.preempted_by),
-                ));
-            }
-        }
         let resp = self.propose(WalOperation::JobPreemptSignaled { job_id, pending })?;
         Ok(resp.preempt_signal_applied)
     }
@@ -3382,18 +3374,15 @@ impl ClusterManager {
             preempt_qos,
             true,
             None,
-            None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn preempt_job_for_attempt(
+    pub(crate) fn preempt_job_for_observation(
         &self,
         job_id: JobId,
         expected_run_attempt: u32,
         mode: PreemptMode,
         preemptor: JobId,
-        preemptor_run_attempt: u32,
         preempt_qos: Option<String>,
         observation_id: Option<u64>,
     ) -> anyhow::Result<PreemptOutcome> {
@@ -3404,7 +3393,6 @@ impl ClusterManager {
             Some(preemptor),
             preempt_qos,
             true,
-            Some(preemptor_run_attempt),
             observation_id,
         )
     }
@@ -3430,7 +3418,6 @@ impl ClusterManager {
             preempt_qos,
             false,
             None,
-            None,
         )
     }
 
@@ -3443,7 +3430,6 @@ impl ClusterManager {
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
         earmark_freed: bool,
-        preemptor_run_attempt: Option<u32>,
         observation_id: Option<u64>,
     ) -> anyhow::Result<PreemptOutcome> {
         let preemption_claim = {
@@ -3494,7 +3480,6 @@ impl ClusterManager {
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
                     preemption_claim,
-                    preemptor_run_attempt,
                     job_id,
                     preempted_by,
                     preempt_qos,
@@ -3531,7 +3516,6 @@ impl ClusterManager {
                 };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
                     preemption_claim,
-                    preemptor_run_attempt,
                     handoff: earmark_freed && preempted_by.is_some(),
                     job_id,
                     begin_time,
@@ -6932,23 +6916,18 @@ impl ClusterManager {
         }
     }
 
-    fn preemption_checkpoint_saved(&self, job: &Job) -> bool {
-        let revision = crate::accounting::preemption::revision(&job.preemption_usage);
-        revision == 0
-            || self.preemption_accounted.read().get(&job.job_id)
-                == Some(&(job.submit_time, revision))
-    }
-
     pub(crate) fn pending_preemption_checkpoints(
         &self,
         limit: usize,
         after: Option<JobId>,
     ) -> Vec<crate::accounting::preemption::Checkpoint> {
         let jobs = self.jobs.read();
+        let accounted = self.preemption_accounted.read();
         let mut pending: Vec<_> = jobs
             .values()
             .filter(|job| {
-                after.is_none_or(|id| job.job_id > id) && !self.preemption_checkpoint_saved(job)
+                after.is_none_or(|id| job.job_id > id)
+                    && !preemption_checkpoint_saved(&accounted, job)
             })
             .collect();
         pending.sort_unstable_by_key(|job| job.job_id);
@@ -6970,17 +6949,46 @@ impl ClusterManager {
         if job.submit_time == checkpoint.submit_time && job.preemption_usage == checkpoint.usage {
             self.preemption_accounted.write().insert(
                 job.job_id,
-                (
-                    job.submit_time,
-                    crate::accounting::preemption::revision(&job.preemption_usage),
-                ),
+                (job.submit_time, job.preemption_usage.revision()),
             );
         }
+    }
+
+    /// Finished jobs past retention that stay only until their preemption counts
+    /// reach accounting, with the oldest one's end time.
+    pub(crate) fn preemption_export_backlog(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (u64, Option<DateTime<Utc>>) {
+        let held = self.scan_terminal_retention(now).held;
+        (held.len() as u64, held.into_iter().min())
     }
 
     /// Evict finished jobs whose end_time is older than the retention window,
     /// bounding controller memory. No-op when nothing has aged out.
     pub fn evict_expired_terminal_jobs(&self) {
+        let scan = self.scan_terminal_retention(Utc::now());
+        if scan.evictable.is_empty() {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            job_ids: scan.evictable,
+            before: Some(scan.before),
+            at: None,
+        }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+            return;
+        }
+        if scan.unexported > 0 {
+            warn!(
+                jobs = scan.unexported,
+                "evicted finished jobs whose preemption counts never reached accounting"
+            );
+        }
+    }
+
+    fn scan_terminal_retention(&self, now: DateTime<Utc>) -> RetentionScan {
         // Floor above the reconcile interval so a job survives at least one
         // accounting reconcile pass before it can be evicted (retention 0 included).
         let retention = self
@@ -6988,8 +6996,10 @@ impl ClusterManager {
             .controller
             .terminal_job_retention_secs
             .max(crate::accounting::RECONCILE_INTERVAL_SECS);
-        let before = Utc::now() - chrono::Duration::seconds(retention as i64);
-        let accounting_enabled = self.accounting_enabled();
+        let before = now - chrono::Duration::seconds(retention as i64);
+        let export_deadline = self
+            .accounting_enabled()
+            .then(|| before - chrono::Duration::seconds(PREEMPTION_EXPORT_HOLD_SECS));
         let jobs = self.jobs.read();
         // Spare a target still referenced by a live job's dependency: dropping it
         // makes resolve_target_state return None, which cancels/early-releases dependents.
@@ -7004,32 +7014,33 @@ impl ClusterManager {
         // is_finalized is load-bearing, not redundant: end_time survives a
         // requeue, so a re-dispatched job's stale end_time alone would reap it.
         let usage = self.preemption_usage.read();
-        let job_ids: Vec<JobId> = jobs
-            .iter()
-            .filter(|(id, j)| {
-                j.state.is_finalized()
-                    && j.end_time.is_some_and(|t| t < before)
-                    && j.preemption_usage_updated_at.is_none_or(|t| t < before)
-                    && !usage.tracks_request(**id)
-                    && (!accounting_enabled || self.preemption_checkpoint_saved(j))
-                    && !referenced.contains(id)
-                    && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        drop(usage);
-        drop(jobs);
-        if job_ids.is_empty() {
-            return;
+        let accounted = self.preemption_accounted.read();
+        let mut scan = RetentionScan {
+            before,
+            ..Default::default()
+        };
+        for (&id, j) in jobs.iter() {
+            let expired = j.state.is_finalized()
+                && j.end_time.is_some_and(|t| t < before)
+                && j.preemption_usage_updated_at.is_none_or(|t| t < before)
+                && !usage.tracks_request(id)
+                && !referenced.contains(&id)
+                && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p));
+            if !expired {
+                continue;
+            }
+            match (export_deadline, j.end_time) {
+                (Some(_), _) if preemption_checkpoint_saved(&accounted, j) => {}
+                (Some(deadline), Some(end)) if end < deadline => scan.unexported += 1,
+                (Some(_), Some(end)) => {
+                    scan.held.push(end);
+                    continue;
+                }
+                _ => {}
+            }
+            scan.evictable.push(id);
         }
-        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs {
-            preemption_release: None,
-            job_ids,
-            before: Some(before),
-            at: None,
-        }) {
-            warn!(error = %e, "failed to evict expired terminal jobs");
-        }
+        scan
     }
 
     /// Cancel running jobs whose reservation window has ended (after optional grace).
@@ -9981,9 +9992,9 @@ impl ClusterManager {
                     .filter(|id| {
                         jobs.get(id).is_some_and(|j| {
                             j.state.is_finalized()
-                                && !usage.tracks_request(**id)
                                 && before.is_none_or(|cutoff| {
-                                    j.end_time.is_some_and(|end| end < cutoff)
+                                    !usage.tracks_request(**id)
+                                        && j.end_time.is_some_and(|end| end < cutoff)
                                         && j.preemption_usage_updated_at
                                             .is_none_or(|updated| updated < cutoff)
                                 })
@@ -12411,6 +12422,25 @@ pub(crate) mod gated {
     pub(crate) fn late(err: &anyhow::Error) -> Option<&OutcomeUnknown> {
         err.downcast_ref::<OutcomeUnknown>()
     }
+}
+
+/// How long past retention a finished job waits for its preemption counts to reach accounting.
+const PREEMPTION_EXPORT_HOLD_SECS: i64 = 24 * 3600;
+
+#[derive(Default)]
+struct RetentionScan {
+    before: DateTime<Utc>,
+    evictable: Vec<JobId>,
+    unexported: usize,
+    held: Vec<DateTime<Utc>>,
+}
+
+fn preemption_checkpoint_saved(
+    accounted: &HashMap<JobId, (DateTime<Utc>, u128)>,
+    job: &Job,
+) -> bool {
+    let revision = job.preemption_usage.revision();
+    revision == 0 || accounted.get(&job.job_id) == Some(&(job.submit_time, revision))
 }
 
 #[cfg(test)]
@@ -17868,7 +17898,6 @@ state = "UP"
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -19024,7 +19053,6 @@ state = "UP"
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -19251,7 +19279,6 @@ state = "UP"
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -21192,7 +21219,6 @@ state = "UP"
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -21234,7 +21260,6 @@ state = "UP"
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -21289,7 +21314,6 @@ state = "UP"
     fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: None,
@@ -21301,7 +21325,6 @@ state = "UP"
     fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -21946,7 +21969,6 @@ state = "UP"
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -21973,7 +21995,6 @@ state = "UP"
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -24121,7 +24142,6 @@ state = "UP"
         let signaled_at = Utc::now();
         let pending = PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: hunter_id,
@@ -24467,7 +24487,6 @@ state = "UP"
         let owner = submit_and_wait(cm, basic_spec("owner"));
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -24526,7 +24545,6 @@ state = "UP"
         let owner = run_job_on(&cm, "owner", "n2");
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -33283,7 +33301,6 @@ state = "UP"
             .with_timezone(&Utc);
         PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
             preempted_by: 99,
@@ -33466,16 +33483,11 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
         let id = run_job_on(&cm, "victim", "n1");
         let attempt = cm.get_job(id).unwrap().run_attempt;
-        let pending = preempt_pending_for(attempt, 90);
+        let mut pending = preempt_pending_for(attempt, 90);
+        pending.preemption_claim = Some(cm.preemption_claim(&cm.get_job(id).unwrap(), 1));
 
         assert!(cm.signal_preemption(pending.clone(), id).unwrap());
-        let victim = cm.get_job(id).unwrap();
-        let mut saved = victim.preempt_pending.clone().unwrap();
-        assert_eq!(
-            saved.preemption_claim.take(),
-            Some(cm.preemption_claim(&victim, 1))
-        );
-        assert_eq!(saved, pending);
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(pending));
 
         let again = preempt_pending_for(attempt, 600);
         assert!(!cm.signal_preemption(again, id).unwrap());
@@ -33988,7 +34000,6 @@ state = "UP"
 
         cm.apply_operation(&WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: None,
@@ -34010,7 +34021,6 @@ state = "UP"
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: false,
             job_id: id,
             begin_time: Utc::now(),
@@ -34452,7 +34462,6 @@ state = "UP"
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: Some("high".into()),
@@ -34534,7 +34543,6 @@ state = "UP"
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: true,
             job_id: id,
             begin_time,

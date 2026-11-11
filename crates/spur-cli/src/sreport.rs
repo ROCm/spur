@@ -187,9 +187,6 @@ fn print_preemptions(
     noheader: bool,
 ) -> Result<()> {
     if by_cause {
-        if !response.causes_included {
-            anyhow::bail!("controller does not support --by-cause; upgrade the controller");
-        }
         return print_preemption_causes(out, response, parsable, noheader);
     }
     if !noheader {
@@ -239,16 +236,7 @@ fn print_preemption_causes(
         }
     }
     for entry in &response.entries {
-        let unclassified = spur_proto::proto::UnusedPreemptionCount {
-            reason: "unclassified".into(),
-            initiator: "unknown".into(),
-            count: entry.unclassified_unused,
-        };
-        for cause in entry
-            .unused_by_cause
-            .iter()
-            .chain(std::iter::once(&unclassified))
-        {
+        for cause in &entry.unused_by_cause {
             if cause.count == 0 {
                 continue;
             }
@@ -765,13 +753,13 @@ mod tests {
         use spur_proto::proto::{
             GetPreemptionUsageResponse, PreemptionUsageEntry, UnusedPreemptionCount,
         };
-        let mut response = GetPreemptionUsageResponse {
+        let response = GetPreemptionUsageResponse {
             entries: vec![
                 PreemptionUsageEntry {
                     user: "alice".into(),
                     account: "research".into(),
                     used: 2,
-                    unused: 3,
+                    unused: 2,
                     open: 1,
                     unused_by_cause: vec![
                         UnusedPreemptionCount {
@@ -785,7 +773,6 @@ mod tests {
                             count: 0,
                         },
                     ],
-                    unclassified_unused: 1,
                 },
                 PreemptionUsageEntry {
                     user: "bob".into(),
@@ -795,19 +782,18 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            causes_included: true,
             ..Default::default()
         };
         for (by_cause, header, rows) in [
             (
                 false,
                 "User|Account|Used|Unused|Open\n",
-                "alice|research|2|3|1\nbob|research|4|0|1\n",
+                "alice|research|2|2|1\nbob|research|4|0|1\n",
             ),
             (
                 true,
                 "User|Account|Reason|Initiator|Unused\n",
-                "alice|research|cancelled|user|2\nalice|research|unclassified|unknown|1\n",
+                "alice|research|cancelled|user|2\n",
             ),
         ] {
             for noheader in [false, true] {
@@ -831,10 +817,6 @@ mod tests {
                 }
             }
         }
-        response.causes_included = false;
-        let mut out = Vec::new();
-        assert!(print_preemptions(&mut out, &response, true, true, false).is_err());
-        assert!(out.is_empty());
     }
 
     #[test]
@@ -847,7 +829,6 @@ mod tests {
                 open: 1,
                 ..Default::default()
             }],
-            causes_included: true,
             next_page_token: r#"["alice","research"]"#.into(),
             ..Default::default()
         };

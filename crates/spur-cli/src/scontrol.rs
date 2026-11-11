@@ -2693,18 +2693,20 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         .as_ref()
         .filter(|u| u.used > 0 || u.unused > 0 || u.open > 0)
     {
-        let _ = writeln!(
+        let _ = write!(
             out,
             "   PreemptionsUsed={} PreemptionsUnused={} PreemptionsOpen={}",
             usage.used, usage.unused, usage.open
         );
-        for cause in &usage.unused_by_cause {
-            let _ = writeln!(
-                out,
-                "   UnusedPreemptionReason={} Initiator={} Count={}",
-                cause.reason, cause.initiator, cause.count
-            );
+        let causes: Vec<String> = usage
+            .unused_by_cause
+            .iter()
+            .map(|c| format!("{}/{}:{}", c.reason, c.initiator, c.count))
+            .collect();
+        if !causes.is_empty() {
+            let _ = write!(out, " UnusedPreemptionCauses={}", causes.join(","));
         }
+        let _ = writeln!(out);
     }
     if let Some(line) = preemption_line(job) {
         let _ = writeln!(out, "{line}");
@@ -2768,17 +2770,25 @@ mod tests {
         assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
         job.preemption_usage = Some(spur_proto::proto::PreemptionUsage {
             used: 2,
-            unused: 1,
+            unused: 3,
             open: 3,
-            unused_by_cause: vec![spur_proto::proto::UnusedPreemptionCount {
-                reason: "cancelled".into(),
-                initiator: "user".into(),
-                count: 1,
-            }],
+            unused_by_cause: vec![
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "cancelled".into(),
+                    initiator: "user".into(),
+                    count: 1,
+                },
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "launch_failed".into(),
+                    initiator: "system".into(),
+                    count: 2,
+                },
+            ],
         });
-        let out = format_job_detail(&job);
-        assert!(out.contains("PreemptionsUsed=2 PreemptionsUnused=1 PreemptionsOpen=3"));
-        assert!(out.contains("UnusedPreemptionReason=cancelled Initiator=user Count=1"));
+        assert!(format_job_detail(&job).contains(
+            "   PreemptionsUsed=2 PreemptionsUnused=3 PreemptionsOpen=3 \
+             UnusedPreemptionCauses=cancelled/user:1,launch_failed/system:2\n"
+        ));
     }
 
     #[test]

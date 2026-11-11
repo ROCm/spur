@@ -7,6 +7,12 @@ spur_scheduler_preemptions_used_total 0
 # HELP spur_scheduler_preemptions_open Victim runs with released capacity awaiting a requesting launch outcome.
 # TYPE spur_scheduler_preemptions_open gauge
 spur_scheduler_preemptions_open 0
+# HELP spur_scheduler_preemption_exports_pending Finished jobs past retention kept until their preemption counts reach accounting.
+# TYPE spur_scheduler_preemption_exports_pending gauge
+spur_scheduler_preemption_exports_pending 0
+# HELP spur_scheduler_preemption_export_oldest_seconds Age of the oldest of those jobs, from its end time.
+# TYPE spur_scheduler_preemption_export_oldest_seconds gauge
+spur_scheduler_preemption_export_oldest_seconds 0
 # HELP spur_scheduler_preemptions_unused Victim runs closed without confirmed use by the requesting launch; durable lifetime total.
 # TYPE spur_scheduler_preemptions_unused counter
 spur_scheduler_preemptions_unused_total{reason="cancelled",initiator="admin"} 0

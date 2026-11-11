@@ -587,12 +587,7 @@ fn preemption_usage_json(
     usage: &spur_core::preemption_usage::PreemptionUsage,
 ) -> anyhow::Result<sqlx::types::Json<serde_json::Value>> {
     let mut value = serde_json::to_value(usage)?;
-    let revision = usage
-        .used
-        .saturating_add(usage.unused_total())
-        .saturating_mul(2)
-        .saturating_add(usage.open);
-    value["revision"] = revision.into();
+    value["revision"] = usage.revision().to_string().into();
     Ok(sqlx::types::Json(value))
 }
 

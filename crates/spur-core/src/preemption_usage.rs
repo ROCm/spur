@@ -13,7 +13,7 @@ pub struct PreemptionRelease {
     pub job_id: crate::job::JobId,
     pub run_attempt: u32,
     pub released: bool,
-    pub observation_id: Option<u64>,
+    pub observation_id: u64,
     pub unconfirmed: bool,
 }
 
@@ -91,6 +91,15 @@ pub struct PreemptionUsage {
 }
 
 impl PreemptionUsage {
+    /// Grows on every open and settlement, so a stale export can never overwrite a newer one.
+    pub fn revision(&self) -> u128 {
+        Self::revision_of(self.used, self.unused_total(), self.open)
+    }
+
+    pub fn revision_of(used: u64, unused: u64, open: u64) -> u128 {
+        2 * (u128::from(used) + u128::from(unused)) + u128::from(open)
+    }
+
     pub fn unused_total(&self) -> u64 {
         self.unused
             .values()

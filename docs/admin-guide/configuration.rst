@@ -285,7 +285,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``3600``
      - Live
      - How long a completed job stays in controller memory before eviction.
-       Accounting rows in PostgreSQL are unaffected.
+       Accounting rows in PostgreSQL are unaffected. With accounting enabled, a
+       job whose preemption counts are not yet exported can stay up to 24 hours
+       longer (see :ref:`preemption-outcome-export`).
    * - ``dispatch_reject_cooldown_secs``
      - integer
      - ``30``
@@ -1417,10 +1419,12 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``% of Tot`` are left blank rather than computed from the User's rows
        alone.
        ``sreport`` utilization leaves those same cells blank.
-       ``sreport preemptions`` shows only the caller's rows and coordinated accounts.
        A coordinator also sees usage for the accounts they coordinate; those
        rows are filled in, and cluster totals stay blank. A coordinator keeps
        their own rows in other accounts too.
+       ``sreport preemptions`` shows only the caller's rows and coordinated
+       accounts. Preemption totals in ``sdiag`` and ``/metrics/scheduler`` are
+       cluster-wide aggregates and are not scoped.
        ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
        ``"users"`` also drops other users from ``sshare``.
    * - ``"users"``

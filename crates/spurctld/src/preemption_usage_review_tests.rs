@@ -50,7 +50,6 @@ fn canonical_preemption(cm: &ClusterManager, observation: u64) -> WalOperation {
         preemption_claim: Some(cm.preemption_claim(&victim, observation)),
         job_id: victim.job_id,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(1),
         preempt_qos: None,
         run_attempt: Some(victim.run_attempt),
         handoff: true,
@@ -76,15 +75,7 @@ fn requester_reservation(observation: u64, allocation: ResourceAllocations) -> W
 }
 
 fn release_confirmation(observation: u64) -> WalOperation {
-    let mut operation = WalOperation::preemption_release(10, 1, true);
-    let WalOperation::EvictTerminalJobs {
-        preemption_release: Some(release),
-        ..
-    } = &mut operation
-    else {
-        panic!("release confirmation operation");
-    };
-    release.observation_id = Some(observation);
+    let mut operation = release_op(observation, 1, true);
     operation.stamp_occurred_at(chrono::DateTime::UNIX_EPOCH);
     operation
 }
@@ -228,7 +219,7 @@ fn requester_activation_uses_reserved_wal_allocation_after_gpu_reconciliation() 
 #[test]
 fn frozen_wal_payloads_default_new_observation_metadata() {
     let preemption: WalOperation = serde_json::from_str(
-        r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2026-01-01T00:00:00Z","preempted_by":10,"handoff":true,"preemptor_run_attempt":1}}"#,
+        r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2026-01-01T00:00:00Z","preempted_by":10,"handoff":true}}"#,
     ).expect("old preemption WAL");
     assert!(matches!(
         preemption,
@@ -247,24 +238,12 @@ fn frozen_wal_payloads_default_new_observation_metadata() {
             ..
         }
     ));
-    let confirmation: WalOperation = serde_json::from_str(
-        r#"{"EvictTerminalJobs":{"job_ids":[],"preemption_release":{"job_id":10,"run_attempt":1,"released":true}}}"#,
-    ).expect("old confirmation WAL");
-    let WalOperation::EvictTerminalJobs {
-        preemption_release: Some(release),
-        ..
-    } = confirmation
-    else {
-        panic!("release confirmation");
-    };
-    assert_eq!(release.observation_id, None);
-    assert!(!release.unconfirmed);
 }
 
 #[test]
 fn frozen_ledger_snapshot_defaults_attempt_tracking_and_closure_provenance() {
     let ledger: UsageLedger = serde_json::from_str(
-        r#"{"requests":{"10":{"1":{"user":"owner","victims":[[1,1]],"activated":null,"outcome":null}}},"victims":{"1":{"1":{"run_attempt":1,"owner":10,"owner_attempt":1,"allocations":{},"freed":[],"opened":false,"settled":false}}}}"#,
+        r#"{"requests":{"10":{"1":{"victims":[[1,1]],"activated":null,"outcome":null}}},"victims":{"1":{"1":{"run_attempt":1,"owner":10,"owner_attempt":1,"allocations":{},"freed":[],"opened":false,"settled":false}}}}"#,
     ).expect("old ledger snapshot");
     assert!(ledger.high_water.is_empty());
     assert!(ledger.current.is_empty());
@@ -322,7 +301,6 @@ fn terminal_request_with_draining_victim_does_not_propose_eviction() {
     cm.apply_operation(&WalOperation::JobPreemptCancel {
         job_id: 1,
         preempted_by: Some(10),
-        preemptor_run_attempt: Some(1),
         preempt_qos: None,
         run_attempt: Some(1),
         at: None,
@@ -330,9 +308,18 @@ fn terminal_request_with_draining_victim_does_not_propose_eviction() {
     });
     cancel(&cm, "User");
     cm.jobs.write().get_mut(&10).expect("requester").end_time = Some(chrono::DateTime::UNIX_EPOCH);
-    cm.evict_expired_terminal_jobs();
-    assert!(cm.get_job(10).is_some());
-    assert!(cm.preemption_usage.read().tracks_request(10));
+    let now = chrono::Utc::now();
+    assert!(cm.scan_terminal_retention(now).evictable.is_empty());
+    cm.apply_operation(&WalOperation::JobNodeComplete {
+        job_id: 1,
+        node_name: "n1".into(),
+        exit_code: 0,
+        signal: 0,
+        run_attempt: 1,
+        at: Some(chrono::DateTime::UNIX_EPOCH),
+    });
+    assert!(!cm.preemption_usage.read().tracks_request(10));
+    assert!(cm.scan_terminal_retention(now).evictable.contains(&10));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -428,7 +415,7 @@ fn preemption_eviction_discards_cached_confirmations_before_job_id_reuse() {
         PreemptionRelease {
             job_id: 10,
             run_attempt: 1,
-            observation_id: Some(1),
+            observation_id: 1,
             released: true,
             unconfirmed: false,
         },
@@ -505,7 +492,6 @@ fn signaled_preemption_without_completion_unpins_its_terminal_owner_on_node_loss
         let at = chrono::DateTime::UNIX_EPOCH;
         let pending = PreemptPending {
             preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
-            preemptor_run_attempt: Some(1),
             signaled_at: at,
             deadline: at + chrono::Duration::seconds(30),
             preempted_by: 10,
@@ -573,4 +559,193 @@ fn signaled_preemption_without_completion_unpins_its_terminal_owner_on_node_loss
         }
         assert_eq!(ledger_snapshot(&cm), ledger_snapshot(&restored));
     }
+}
+
+fn hold_requester(cm: &ClusterManager) {
+    cm.apply_operation(&WalOperation::JobPriorityChange {
+        job_id: 10,
+        old_priority: 1,
+        new_priority: 0,
+        pending_reason: Some(spur_core::job::PendingReason::Held),
+        pending_reason_desc: None,
+        reset_requeue_count: false,
+        clear_reservation: false,
+        run_attempt: None,
+    });
+}
+
+fn take_node_down(cm: &ClusterManager) {
+    cm.apply_operation(&WalOperation::NodeStateChange {
+        name: "n1".into(),
+        old_state: spur_core::node::NodeState::Mixed,
+        new_state: spur_core::node::NodeState::Down,
+        reason: None,
+        admin_locked: false,
+        reason_uid: None,
+        reason_time: None,
+        at: None,
+    });
+}
+
+fn remove_node(cm: &ClusterManager) {
+    cm.apply_operation(&WalOperation::NodeRemove {
+        name: "n1".into(),
+        reason: None,
+        at: None,
+    });
+}
+
+#[test]
+fn a_reservation_given_up_before_activation_settles_and_its_retry_is_not_credited() {
+    let discards: [fn(&ClusterManager); 4] = [hold_requester, take_node_down, remove_node, |cm| {
+        back_off(cm, 1)
+    }];
+    for discard in discards {
+        let (_dir, cm) = cluster();
+        start(&cm, 1, 1, &[("n1", scalar())]);
+        preempt(&cm, 1, 1, 1);
+        reserve(&cm, 10, 1, &[("n1", scalar())]);
+        assert_eq!(cm.preemption_usage().open, 1);
+
+        discard(&cm);
+        assert!(!cm.get_job(10).expect("requester").holds_a_placement());
+        let usage = cm.preemption_usage();
+        assert_eq!((usage.used, usage.unused_total(), usage.open), (0, 1, 0));
+        assert_eq!(
+            usage.unused_count(Reason::LaunchFailed, Initiator::System),
+            1
+        );
+        assert_eq!(cm.preemption_observation(10), None);
+
+        let (_restored_dir, restored) = restored(&cm);
+        for replica in [&cm, &restored] {
+            start(replica, 10, 2, &[("n1", scalar())]);
+            replica.apply_operation(&release_op(1, 2, true));
+            assert_eq!(replica.preemption_usage(), usage);
+        }
+        assert_eq!(ledger_snapshot(&cm), ledger_snapshot(&restored));
+    }
+}
+
+#[test]
+fn a_confirmation_for_a_superseded_attempt_is_ignored() {
+    let (_dir, cm) = cluster();
+    start(&cm, 1, 1, &[("n1", scalar())]);
+    let observation = cm.next_preemption_observation(10);
+    preempt(&cm, 1, 1, u32::try_from(observation).expect("small id"));
+    reserve(&cm, 10, 2, &[("n1", scalar())]);
+    cm.apply_operation(&release_op(observation, 1, false));
+    assert_eq!(cm.preemption_usage().open, 1);
+    assert!(
+        cm.apply_operation(&WalOperation::job_state_change_activating(10, 2))
+            .state_change_applied
+    );
+    cm.apply_operation(&release_op(observation, 2, true));
+    assert_usage(&cm, 1, 0);
+}
+
+#[test]
+fn an_eviction_from_an_older_leader_keeps_its_old_meaning_on_upgraded_replicas() {
+    let (_dir, cm) = cluster();
+    start(&cm, 1, 1, &[("n1", scalar())]);
+    cm.apply_operation(&WalOperation::JobPreemptCancel {
+        job_id: 1,
+        preempted_by: Some(10),
+        preempt_qos: None,
+        run_attempt: Some(1),
+        at: None,
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
+    });
+    cancel(&cm, "User");
+    assert!(cm.preemption_usage.read().tracks_request(10));
+    let (_restored_dir, restored) = restored(&cm);
+    let legacy = WalOperation::EvictTerminalJobs {
+        job_ids: vec![10],
+        before: None,
+        at: None,
+        preemption_release: None,
+    };
+    for replica in [&cm, &restored] {
+        replay(replica, &legacy);
+        assert!(replica.get_job(10).is_none());
+        replay(
+            replica,
+            &WalOperation::JobNodeComplete {
+                job_id: 1,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 0,
+                run_attempt: 1,
+                at: None,
+            },
+        );
+        assert!(!replica.preemption_usage.read().tracks_request(10));
+    }
+    assert_eq!(ledger_snapshot(&cm), ledger_snapshot(&restored));
+}
+
+#[test]
+fn claimed_preemption_flow_matches_across_replicas_and_a_midway_snapshot() {
+    let at = chrono::DateTime::UNIX_EPOCH;
+    let (_dir, leader) = cluster();
+    let (_follower_dir, follower) = cluster();
+    let mut log = Vec::new();
+    for replica in [&leader, &follower] {
+        start(replica, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
+    }
+    let pending = PreemptPending {
+        preemption_claim: Some(leader.preemption_claim(&leader.get_job(1).expect("victim"), 1)),
+        signaled_at: at,
+        deadline: at + chrono::Duration::seconds(30),
+        preempted_by: 10,
+        preempt_qos: None,
+        mode: PreemptMode::Cancel,
+        run_attempt: 1,
+        requeue_hold_secs: 0,
+    };
+    log.push(WalOperation::JobPreemptSignaled { job_id: 1, pending });
+    log.push(WalOperation::JobNodeComplete {
+        job_id: 1,
+        node_name: "n1".into(),
+        exit_code: 0,
+        signal: 0,
+        run_attempt: 1,
+        at: Some(at),
+    });
+    let midway = log.len();
+    log.push(WalOperation::JobPreemptCancel {
+        job_id: 1,
+        preempted_by: Some(10),
+        preempt_qos: None,
+        run_attempt: Some(1),
+        at: Some(at),
+        preemption_claim: None,
+    });
+    log.push(requester_reservation(1, scalar()));
+    log.push(WalOperation::job_state_change_activating(10, 1));
+    log.push(release_confirmation(1));
+    for (index, op) in log.iter().enumerate() {
+        replay(&leader, op);
+        if index < midway {
+            replay(&follower, op);
+        }
+    }
+    let (_restored_dir, restored) = restored(&follower);
+    for op in &log[midway..] {
+        replay(&follower, op);
+        replay(&restored, op);
+    }
+    for replica in [&follower, &restored] {
+        assert_eq!(ledger_snapshot(replica), ledger_snapshot(&leader));
+        let (job, expected) = (
+            replica.get_job(10).expect("requester"),
+            leader.get_job(10).expect("requester"),
+        );
+        assert_eq!(job.preemption_usage, expected.preemption_usage);
+        assert_eq!(
+            job.preemption_usage_updated_at,
+            expected.preemption_usage_updated_at
+        );
+    }
+    assert_eq!(leader.preemption_usage().used, 1);
 }

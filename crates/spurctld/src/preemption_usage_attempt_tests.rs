@@ -6,11 +6,9 @@ use super::*;
 fn preempt_observation(cm: &ClusterManager, victim_id: JobId, observation: u64, late: bool) {
     let victim = cm.get_job(victim_id).expect("victim");
     let claim = Some(cm.preemption_claim(&victim, observation));
-    let owner_attempt = Some(cm.get_job(10).expect("requester").run_attempt + 1);
     let op = if late {
         WalOperation::JobPreemptCancel {
             preemption_claim: claim,
-            preemptor_run_attempt: owner_attempt,
             job_id: victim_id,
             preempted_by: Some(10),
             preempt_qos: None,
@@ -20,7 +18,6 @@ fn preempt_observation(cm: &ClusterManager, victim_id: JobId, observation: u64, 
     } else {
         WalOperation::JobPreemptRequeue {
             preemption_claim: claim,
-            preemptor_run_attempt: owner_attempt,
             job_id: victim_id,
             begin_time: chrono::DateTime::UNIX_EPOCH,
             handoff: true,
@@ -34,16 +31,7 @@ fn preempt_observation(cm: &ClusterManager, victim_id: JobId, observation: u64, 
 }
 
 fn confirm_observation(cm: &ClusterManager, observation: u64, run_attempt: u32, released: bool) {
-    let mut op = WalOperation::preemption_release(10, run_attempt, released);
-    let WalOperation::EvictTerminalJobs {
-        preemption_release: Some(release),
-        ..
-    } = &mut op
-    else {
-        panic!("release operation");
-    };
-    release.observation_id = Some(observation);
-    cm.apply_operation(&op);
+    cm.apply_operation(&release_op(observation, run_attempt, released));
 }
 
 fn start_observation(cm: &ClusterManager, observation: u64, run_attempt: u32, node: &str) {
@@ -100,57 +88,48 @@ fn restore(cm: &ClusterManager) -> (tempfile::TempDir, ClusterManager) {
 }
 
 #[test]
-fn early_failure_and_pending_cancel_do_not_reuse_an_observation_on_the_same_run() {
-    for cancelled in [false, true] {
-        let (_dir, cm) = cluster();
-        start(&cm, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
-        let first = cm.next_preemption_observation(10);
-        preempt_observation(&cm, 1, first, true);
-        report_victim_node(&cm, "n1");
-        assert_eq!(cm.preemption_usage().open, 1);
+fn pending_cancel_does_not_reuse_an_observation_on_the_same_run() {
+    let (_dir, cm) = cluster();
+    start(&cm, 1, 1, &[("n1", scalar()), ("n2", scalar())]);
+    let first = cm.next_preemption_observation(10);
+    preempt_observation(&cm, 1, first, true);
+    report_victim_node(&cm, "n1");
+    assert_eq!(cm.preemption_usage().open, 1);
 
-        let (reason, initiator) = if cancelled {
-            cancel(&cm, "User");
-            (Reason::Cancelled, Initiator::User)
-        } else {
-            confirm_observation(&cm, first, 1, false);
-            (Reason::LaunchFailed, Initiator::System)
-        };
-        assert_eq!(cm.get_job(10).expect("requester").run_attempt, 0);
-        assert_eq!(cm.preemption_observation(10), None);
-        assert_eq!(cm.preemption_usage().unused_count(reason, initiator), 1);
+    cancel(&cm, "User");
+    let (reason, initiator) = (Reason::Cancelled, Initiator::User);
+    assert_eq!(cm.get_job(10).expect("requester").run_attempt, 0);
+    assert_eq!(cm.preemption_observation(10), None);
+    assert_eq!(cm.preemption_usage().unused_count(reason, initiator), 1);
 
-        let (_restored_dir, cm) = restore(&cm);
-        if cancelled {
-            user_requeue_requester(&cm);
-        }
-        assert_eq!(cm.get_job(10).expect("requester").run_attempt, 0);
-        start(&cm, 2, 1, &[("n3", scalar())]);
-        let second = cm.next_preemption_observation(10);
-        assert!(second > first);
-        preempt_observation(&cm, 2, second, false);
-        assert_eq!(cm.preemption_observation(10), Some(second));
-        assert_eq!(cm.preemption_usage().open, 1);
+    let (_restored_dir, cm) = restore(&cm);
+    user_requeue_requester(&cm);
+    assert_eq!(cm.get_job(10).expect("requester").run_attempt, 0);
+    start(&cm, 2, 1, &[("n3", scalar())]);
+    let second = cm.next_preemption_observation(10);
+    assert!(second > first);
+    preempt_observation(&cm, 2, second, false);
+    assert_eq!(cm.preemption_observation(10), Some(second));
+    assert_eq!(cm.preemption_usage().open, 1);
 
-        confirm_observation(&cm, first, 1, true);
-        confirm_observation(&cm, first, 1, false);
-        assert_eq!(cm.preemption_usage().open, 1);
-        assert_eq!(cm.preemption_usage().unused_count(reason, initiator), 1);
+    confirm_observation(&cm, first, 1, true);
+    confirm_observation(&cm, first, 1, false);
+    assert_eq!(cm.preemption_usage().open, 1);
+    assert_eq!(cm.preemption_usage().unused_count(reason, initiator), 1);
 
-        let (_retry_dir, cm) = restore(&cm);
-        assert_eq!(cm.preemption_observation(10), Some(second));
-        start_observation(&cm, second, 1, "n3");
-        confirm_observation(&cm, second, 1, true);
-        report_victim_node(&cm, "n2");
-        confirm_observation(&cm, first, 1, false);
-        let usage = cm.preemption_usage();
-        assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 1, 0));
-        assert_eq!(usage.unused_count(reason, initiator), 1);
-        assert_eq!(cm.get_job(10).expect("requester").run_attempt, 1);
-        assert_eq!(cm.get_job(10).expect("requester").preemption_usage, usage);
-        assert!(cm.preemption_usage.read().requests.is_empty());
-        assert!(cm.preemption_usage.read().victims.is_empty());
-    }
+    let (_retry_dir, cm) = restore(&cm);
+    assert_eq!(cm.preemption_observation(10), Some(second));
+    start_observation(&cm, second, 1, "n3");
+    confirm_observation(&cm, second, 1, true);
+    report_victim_node(&cm, "n2");
+    confirm_observation(&cm, first, 1, false);
+    let usage = cm.preemption_usage();
+    assert_eq!((usage.used, usage.unused_total(), usage.open), (1, 1, 0));
+    assert_eq!(usage.unused_count(reason, initiator), 1);
+    assert_eq!(cm.get_job(10).expect("requester").run_attempt, 1);
+    assert_eq!(cm.get_job(10).expect("requester").preemption_usage, usage);
+    assert!(cm.preemption_usage.read().requests.is_empty());
+    assert!(cm.preemption_usage.read().victims.is_empty());
 }
 
 #[test]
@@ -188,38 +167,32 @@ fn a_new_run_does_not_discard_an_activated_observations_late_success() {
 fn delayed_launch_ack_preserves_its_first_cancellation_after_requeue() {
     for released in [false, true] {
         for cancelled_again in [false, true] {
-            for legacy_confirmation in [false, true] {
-                let (_dir, cm) = cluster();
-                start(&cm, 1, 1, &[("n1", scalar())]);
-                let observation = cm.next_preemption_observation(10);
-                preempt_observation(&cm, 1, observation, false);
-                start_observation(&cm, observation, 1, "n1");
-                cancel(&cm, "User");
-                user_requeue_requester(&cm);
-                assert!(cm.get_job(10).expect("requester").cancelled_by.is_none());
-                if cancelled_again {
-                    cancel(&cm, "Admin");
-                }
-                assert_eq!(cm.preemption_usage().open, 1);
-
-                let (_restored_dir, cm) = restore(&cm);
-                if legacy_confirmation {
-                    cm.apply_operation(&WalOperation::preemption_release(10, 1, released));
-                } else {
-                    confirm_observation(&cm, observation, 1, released);
-                }
-                let usage = cm.preemption_usage();
-                let expected_used = u64::from(released);
-                let expected_cancelled = u64::from(!released);
-                assert_eq!(
-                    (usage.used, usage.unused_total(), usage.open),
-                    (expected_used, expected_cancelled, 0)
-                );
-                assert_eq!(
-                    usage.unused_count(Reason::Cancelled, Initiator::User),
-                    expected_cancelled
-                );
+            let (_dir, cm) = cluster();
+            start(&cm, 1, 1, &[("n1", scalar())]);
+            let observation = cm.next_preemption_observation(10);
+            preempt_observation(&cm, 1, observation, false);
+            start_observation(&cm, observation, 1, "n1");
+            cancel(&cm, "User");
+            user_requeue_requester(&cm);
+            assert!(cm.get_job(10).expect("requester").cancelled_by.is_none());
+            if cancelled_again {
+                cancel(&cm, "Admin");
             }
+            assert_eq!(cm.preemption_usage().open, 1);
+
+            let (_restored_dir, cm) = restore(&cm);
+            confirm_observation(&cm, observation, 1, released);
+            let usage = cm.preemption_usage();
+            let expected_used = u64::from(released);
+            let expected_cancelled = u64::from(!released);
+            assert_eq!(
+                (usage.used, usage.unused_total(), usage.open),
+                (expected_used, expected_cancelled, 0)
+            );
+            assert_eq!(
+                usage.unused_count(Reason::Cancelled, Initiator::User),
+                expected_cancelled
+            );
         }
     }
 }

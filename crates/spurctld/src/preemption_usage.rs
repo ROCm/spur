@@ -148,6 +148,7 @@ struct ObservedJob {
     job_id: JobId,
     state: JobState,
     run_attempt: u32,
+    holds_placement: bool,
     cancelled_by: Option<spur_core::end_reason::CancelProvenance>,
 }
 
@@ -157,6 +158,7 @@ impl From<&Job> for ObservedJob {
             job_id: job.job_id,
             state: job.state,
             run_attempt: job.run_attempt,
+            holds_placement: job.holds_a_placement(),
             cancelled_by: job.cancelled_by.clone(),
         }
     }
@@ -171,6 +173,17 @@ struct Registration {
 impl UsageLedger {
     pub(super) fn tracks_request(&self, id: JobId) -> bool {
         self.requests.contains_key(&id)
+    }
+
+    fn open_observation(&self, job_id: JobId) -> Option<u64> {
+        self.current.get(&job_id).copied().or_else(|| {
+            self.requests
+                .get(&job_id)?
+                .iter()
+                .rev()
+                .find(|(_, request)| !request.closed && request.outcome.is_none())
+                .map(|(&id, _)| id)
+        })
     }
 
     fn take_victim(&mut self, id: JobId, run_attempt: u32) -> Option<Victim> {
@@ -472,24 +485,12 @@ struct Observation {
 
 impl ClusterManager {
     pub(crate) fn preemption_observation(&self, job_id: JobId) -> Option<u64> {
-        let usage = self.preemption_usage.read();
-        usage.current.get(&job_id).copied().or_else(|| {
-            usage
-                .requests
-                .get(&job_id)?
-                .iter()
-                .rev()
-                .find(|(_, request)| !request.closed && request.outcome.is_none())
-                .map(|(&id, _)| id)
-        })
+        self.preemption_usage.read().open_observation(job_id)
     }
 
     pub(crate) fn next_preemption_observation(&self, job_id: JobId) -> u64 {
-        if let Some(current) = self.preemption_observation(job_id) {
-            return current;
-        }
         let usage = self.preemption_usage.read();
-        usage.current.get(&job_id).copied().unwrap_or_else(|| {
+        usage.open_observation(job_id).unwrap_or_else(|| {
             usage
                 .high_water
                 .get(&job_id)
@@ -518,6 +519,20 @@ impl ClusterManager {
         self.preemption_usage.read().cluster.clone()
     }
 
+    pub(crate) fn with_preemption_stats(
+        &self,
+        mut snapshot: spur_metrics::scheduler::SchedStatsSnapshot,
+    ) -> spur_metrics::scheduler::SchedStatsSnapshot {
+        let now = chrono::Utc::now();
+        let (pending, oldest) = self.preemption_export_backlog(now);
+        snapshot.preemption_usage = self.preemption_usage();
+        snapshot.preemption_exports_pending = pending;
+        snapshot.preemption_export_oldest_secs = oldest
+            .map(|end| (now - end).num_seconds().max(0) as u64)
+            .unwrap_or(0);
+        snapshot
+    }
+
     pub(crate) fn confirm_preemption_observation(
         &self,
         job_id: JobId,
@@ -531,7 +546,7 @@ impl ClusterManager {
         let release = PreemptionRelease {
             job_id,
             run_attempt: attempt,
-            observation_id: Some(observation),
+            observation_id: observation,
             released,
             unconfirmed: false,
         };
@@ -542,9 +557,7 @@ impl ClusterManager {
     }
 
     fn persist_preemption_confirmation(&self, release: PreemptionRelease) -> anyhow::Result<()> {
-        let Some(observation) = release.observation_id else {
-            return Ok(());
-        };
+        let observation = release.observation_id;
         let key = (release.job_id, observation);
         let pending = self
             .preemption_usage
@@ -595,7 +608,7 @@ impl ClusterManager {
                         .then_some(PreemptionRelease {
                             job_id,
                             run_attempt: request.run_attempt.unwrap_or(0),
-                            observation_id: Some(observation),
+                            observation_id: observation,
                             released: false,
                             unconfirmed: true,
                         })
@@ -701,23 +714,27 @@ impl ClusterManager {
             if !job_ids.is_empty() {
                 return self.apply_job_operation(op);
             }
-            let observation = release
-                .observation_id
-                .unwrap_or(u64::from(release.run_attempt));
+            let observation = release.observation_id;
             let mut jobs = self.jobs.write();
             let mut usage = self.preemption_usage.write();
             usage.at = op.occurred_at();
+            let Some(request) = usage
+                .requests
+                .get(&release.job_id)
+                .and_then(|requests| requests.get(&observation))
+                .filter(|request| request.run_attempt == Some(release.run_attempt))
+            else {
+                // A confirmation for an attempt the observation has since moved past is stale.
+                return ClientResponse::default();
+            };
             // Requeue can clear or replace the job's cancellation provenance
             // before this observation's delayed launch acknowledgment arrives.
             let outcome = if release.unconfirmed {
                 Some((Reason::EndedOther, Initiator::Unknown))
             } else {
                 (!release.released).then(|| {
-                    usage
-                        .requests
-                        .get(&release.job_id)
-                        .and_then(|requests| requests.get(&observation))
-                        .and_then(|request| request.closure_cause)
+                    request
+                        .closure_cause
                         .filter(|(reason, _)| *reason == Reason::Cancelled)
                         .unwrap_or((Reason::LaunchFailed, Initiator::System))
                 })
@@ -726,20 +743,21 @@ impl ClusterManager {
             return ClientResponse::default();
         }
         if let WalOperation::EvictTerminalJobs {
-            job_ids, before, ..
+            job_ids,
+            before: Some(cutoff),
+            ..
         } = op
         {
+            // An older leader's entry (no cutoff) keeps its old meaning on every replica.
             let mut jobs = self.jobs.write();
             let mut usage = self.preemption_usage.write();
             usage.at = op.occurred_at();
             for id in job_ids {
                 if jobs.get(id).is_some_and(|j| {
                     j.state.is_finalized()
-                        && before.is_none_or(|cutoff| {
-                            j.end_time.is_some_and(|end| end < cutoff)
-                                && j.preemption_usage_updated_at
-                                    .is_none_or(|updated| updated < cutoff)
-                        })
+                        && j.end_time.is_some_and(|end| end < *cutoff)
+                        && j.preemption_usage_updated_at
+                            .is_none_or(|updated| updated < *cutoff)
                 }) {
                     usage.end_owner(
                         *id,
@@ -836,24 +854,13 @@ impl ClusterManager {
                     &mut jobs,
                 );
             }
-            match op {
-                WalOperation::JobDispatchBackoff { run_attempt, .. }
-                    if before.state == JobState::Pending
-                        && after.state == JobState::Pending
-                        && (*run_attempt == 0 || *run_attempt >= before.run_attempt) =>
-                {
-                    usage.fail_run(id, *run_attempt, &mut jobs)
-                }
-                WalOperation::JobPriorityChange {
-                    run_attempt: Some(attempt),
-                    ..
-                } if before.state == JobState::Pending
-                    && after.state == JobState::Pending
-                    && (*attempt == 0 || *attempt >= before.run_attempt) =>
-                {
-                    usage.fail_run(id, *attempt, &mut jobs)
-                }
-                _ => {}
+            // Backoff, hold, node loss: a placement given up before activation never launched.
+            if before.state == JobState::Pending
+                && after.state == JobState::Pending
+                && before.holds_placement
+                && !after.holds_placement
+            {
+                usage.fail_run(id, before.run_attempt, &mut jobs);
             }
         }
         response

@@ -99,8 +99,9 @@ async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    let mut snapshot = state.sched_stats.snapshot();
-    snapshot.preemption_usage = state.cluster.preemption_usage();
+    let snapshot = state
+        .cluster
+        .with_preemption_stats(state.sched_stats.snapshot());
     metrics_response(encode_scheduler_metrics(&snapshot))
 }
 

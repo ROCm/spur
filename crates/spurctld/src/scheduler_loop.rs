@@ -1770,7 +1770,6 @@ async fn try_preempt_with_handoffs(
             let outcome = if grace_secs > 0 {
                 let grace = PreemptionGrace {
                     preemptor: pending.job_id,
-                    preemptor_run_attempt: Some(pending.run_attempt.saturating_add(1)),
                     observation_id: Some(observation_id),
                     preempt_qos: preempt_qos.clone(),
                     mode: *mode,
@@ -1784,7 +1783,6 @@ async fn try_preempt_with_handoffs(
                     candidate,
                     *mode,
                     pending.job_id,
-                    Some(pending.run_attempt.saturating_add(1)),
                     preempt_qos.clone(),
                     Some(observation_id),
                 )
@@ -1924,25 +1922,16 @@ async fn preempt_victim_now(
     victim: &spur_core::job::Job,
     mode: spur_core::partition::PreemptMode,
     preemptor: spur_core::job::JobId,
-    preemptor_run_attempt: Option<u32>,
     preempt_qos: Option<String>,
     observation_id: Option<u64>,
 ) -> anyhow::Result<()> {
     use crate::cluster::PreemptOutcome;
 
-    let attempt = preemptor_run_attempt
-        .or_else(|| {
-            cluster
-                .get_job(preemptor)
-                .map(|j| j.run_attempt.saturating_add(1))
-        })
-        .unwrap_or(0);
-    match cluster.preempt_job_for_attempt(
+    match cluster.preempt_job_for_observation(
         victim.job_id,
         victim.run_attempt,
         mode,
         preemptor,
-        attempt,
         preempt_qos,
         observation_id,
     ) {
@@ -1983,7 +1972,6 @@ async fn preempt_victim_now(
 struct PreemptionGrace {
     observation_id: Option<u64>,
     preemptor: spur_core::job::JobId,
-    preemptor_run_attempt: Option<u32>,
     preempt_qos: Option<String>,
     mode: spur_core::partition::PreemptMode,
     secs: u32,
@@ -2008,7 +1996,6 @@ async fn start_preemption_grace(
                     .unwrap_or_else(|| cluster.next_preemption_observation(grace.preemptor)),
             ),
         ),
-        preemptor_run_attempt: grace.preemptor_run_attempt,
         signaled_at: grace.now,
         deadline,
         preempted_by: grace.preemptor,
@@ -2078,7 +2065,6 @@ async fn finalize_running_grace(cluster: &Arc<ClusterManager>, job: &spur_core::
         job,
         pending.mode,
         pending.preempted_by,
-        pending.preemptor_run_attempt,
         pending.preempt_qos.clone(),
         pending
             .preemption_claim
@@ -4949,7 +4935,6 @@ mod tests {
     fn in_grace(mut job: Job, deadline: DateTime<Utc>) -> Job {
         job.preempt_pending = Some(spur_core::job::PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at: deadline - chrono::Duration::seconds(60),
             deadline,
             preempted_by: 99,
@@ -7250,12 +7235,11 @@ mod tests {
                     [("n1".into(), allocation)].into_iter().collect(),
                 )
                 .expect("victim start");
-            cm.preempt_job_for_attempt(
+            cm.preempt_job_for_observation(
                 victim,
                 attempt,
                 spur_core::partition::PreemptMode::Requeue,
                 owner,
-                1,
                 None,
                 None,
             )
@@ -7793,7 +7777,6 @@ mod tests {
             let signaled_at = Utc::now();
             let pending = PreemptPending {
                 preemption_claim: None,
-                preemptor_run_attempt: None,
                 signaled_at,
                 deadline: signaled_at + chrono::Duration::seconds(90),
                 preempted_by: 99,
@@ -7804,7 +7787,7 @@ mod tests {
             };
             assert!(cm.signal_preemption(pending, victim.job_id).unwrap());
 
-            let err = preempt_victim_now(&cm, &victim, PreemptMode::Suspend, 7, None, None, None)
+            let err = preempt_victim_now(&cm, &victim, PreemptMode::Suspend, 7, None, None)
                 .await
                 .expect_err("a victim in its grace is not suspended");
 
@@ -9912,12 +9895,11 @@ mod tests {
                     allocation.per_node_alloc,
                 )
                 .expect("victim start");
-            cm.preempt_job_for_attempt(
+            cm.preempt_job_for_observation(
                 victim,
                 victim_attempt,
                 spur_core::partition::PreemptMode::Cancel,
                 job_id,
-                1,
                 None,
                 None,
             )
@@ -10246,7 +10228,6 @@ mod tests {
             ) -> PreemptPending {
                 PreemptPending {
                     preemption_claim: None,
-                    preemptor_run_attempt: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(600),
                     preempted_by: preemptor.job_id,
@@ -10824,7 +10805,6 @@ mod tests {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
                 let grace = PreemptionGrace {
                     observation_id: None,
-                    preemptor_run_attempt: None,
                     preemptor: f.hunter.job_id,
                     preempt_qos: None,
                     mode: PreemptMode::Cancel,

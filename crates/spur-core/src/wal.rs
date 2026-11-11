@@ -218,9 +218,6 @@ pub enum WalOperation {
     JobPreemptRequeue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
-        /// Fix the requesting epoch before the scheduler awaits victim signals.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preemptor_run_attempt: Option<u32>,
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
         /// Job that triggered this preemption. Absent in WAL entries written by
@@ -250,9 +247,6 @@ pub enum WalOperation {
     JobPreemptCancel {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
-        /// Fix the requesting epoch before the scheduler awaits victim signals.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preemptor_run_attempt: Option<u32>,
         job_id: JobId,
         /// Job that triggered this preemption. Absent in WAL entries written by
         /// older controllers; defaults to `None` on replay.
@@ -475,13 +469,12 @@ pub enum WalOperation {
         name: String,
     },
 
-    /// Evict the named terminal jobs to bound controller memory. The leader
-    /// resolves the aged-out set so every replica evicts identically.
+    /// Evict the named terminal jobs to bound controller memory, or, with an empty
+    /// `job_ids`, confirm a preemption launch: older controllers apply that as a no-op.
     EvictTerminalJobs {
-        /// Empty maintenance entries preserve observations while older controllers apply a no-op.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preemption_release: Option<crate::preemption_usage::PreemptionRelease>,
-        /// Leave late usage updates long enough for accounting reconciliation.
+        /// Apply-side cutoff: jobs that ended or changed preemption counts after it stay.
         #[serde(default)]
         before: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
@@ -556,21 +549,6 @@ impl WalOperation {
             cancel: Some(cancel),
             controller_initiated: false,
             at: None,
-        }
-    }
-
-    pub fn preemption_release(job_id: JobId, run_attempt: u32, released: bool) -> Self {
-        Self::EvictTerminalJobs {
-            job_ids: Vec::new(),
-            before: None,
-            at: None,
-            preemption_release: Some(crate::preemption_usage::PreemptionRelease {
-                observation_id: None,
-                unconfirmed: false,
-                job_id,
-                run_attempt,
-                released,
-            }),
         }
     }
 
@@ -698,6 +676,7 @@ impl WalOperation {
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
             | Self::JobPreemptRequeue { at, .. }
+            | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
@@ -715,7 +694,6 @@ impl WalOperation {
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
             | Self::JobDispatchBackoff { .. }
-            | Self::JobPreemptCancel { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
@@ -748,6 +726,7 @@ impl WalOperation {
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
             | Self::JobPreemptRequeue { at, .. }
+            | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
@@ -765,7 +744,6 @@ impl WalOperation {
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
             | Self::JobDispatchBackoff { .. }
-            | Self::JobPreemptCancel { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
@@ -1907,13 +1885,13 @@ mod suspend_wal_tests {
         let stamped = chrono::Utc::now();
         let op = WalOperation::JobPreemptCancel {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             job_id: 7,
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
             at: Some(stamped),
             run_attempt: Some(4),
         };
+        assert_eq!(op.occurred_at(), Some(stamped));
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
@@ -1924,14 +1902,12 @@ mod suspend_wal_tests {
                 preempt_qos,
                 at,
                 run_attempt,
-                preemptor_run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
                 assert_eq!(at, Some(stamped));
                 assert_eq!(run_attempt, Some(4));
-                assert_eq!(preemptor_run_attempt, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1947,14 +1923,12 @@ mod suspend_wal_tests {
                 preempt_qos,
                 at,
                 run_attempt,
-                preemptor_run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
                 assert_eq!(at, None, "legacy entry falls back to apply time");
                 assert_eq!(run_attempt, None, "legacy entry checks no run");
-                assert_eq!(preemptor_run_attempt, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1965,7 +1939,6 @@ mod suspend_wal_tests {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             handoff: true,
             job_id: 42,
             begin_time,
@@ -2187,7 +2160,6 @@ mod suspend_wal_tests {
         );
         let pending = crate::job::PreemptPending {
             preemption_claim: None,
-            preemptor_run_attempt: None,
             signaled_at: at,
             deadline,
             preempted_by: 21,

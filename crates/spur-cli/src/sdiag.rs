@@ -252,6 +252,12 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
             ));
         }
     }
+    if stats.preemption_exports_pending > 0 {
+        lines.push(format!(
+            "  Preemption exports pending: {} (oldest {}s)",
+            stats.preemption_exports_pending, stats.preemption_export_oldest_secs
+        ));
+    }
     lines
 }
 
@@ -314,6 +320,14 @@ mod tests {
         let lines = scheduler_statistics_lines(&stats).join("\n");
         assert!(lines.contains("Preemptions (lifetime): used=8 unused=3 open=1"));
         assert!(lines.contains("Unused: reason=launch_failed initiator=system count=3"));
+        assert!(!lines.contains("exports pending"));
+        let stats = SchedStats {
+            preemption_exports_pending: 4,
+            preemption_export_oldest_secs: 90,
+            ..stats
+        };
+        let lines = scheduler_statistics_lines(&stats).join("\n");
+        assert!(lines.contains("Preemption exports pending: 4 (oldest 90s)"));
     }
 
     #[test]
@@ -399,6 +413,8 @@ mod tests {
     fn scheduler_statistics_lines_include_cycle_and_lifecycle_fields() {
         let stats = SchedStats {
             preemption_usage: None,
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 5,
             cycle_total_time_us: 2500,

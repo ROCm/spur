@@ -1052,6 +1052,8 @@ message SchedStats {
   uint64 exit_max_depth = 14;
   uint64 jobs_preempted = 15;
   PreemptionUsage preemption_usage = 16;
+  uint64 preemption_exports_pending = 17;
+  uint64 preemption_export_oldest_secs = 18;
 }
 
 // What one user holds under a scope, beside the caps governing that user. Counts
@@ -2428,7 +2430,7 @@ message PreemptionUsageEntry {
   uint64 unused = 4;
   uint64 open = 5;
   repeated UnusedPreemptionCount unused_by_cause = 6;
-  uint64 unclassified_unused = 7;
+  reserved 7;
 }
 
 message GetPreemptionUsageResponse {
@@ -2436,5 +2438,5 @@ message GetPreemptionUsageResponse {
   string next_page_token = 2;
   optional string scoped_to_user = 3;
   bool partial = 4;
-  bool causes_included = 5;
+  reserved 5;
 }

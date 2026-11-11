@@ -55,6 +55,8 @@ pub fn preemption_usage_to_proto(
 pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
     SchedStats {
         preemption_usage: Some(preemption_usage_to_proto(&snap.preemption_usage)),
+        preemption_exports_pending: snap.preemption_exports_pending,
+        preemption_export_oldest_secs: snap.preemption_export_oldest_secs,
         plugin: snap.plugin.clone(),
         cycles: snap.cycles,
         cycle_total_time_us: snap.cycle_total_time_us,
@@ -331,6 +333,8 @@ mod tests {
     fn sched_proto_matches_http_gauges() {
         let snap = SchedStatsSnapshot {
             preemption_usage: Default::default(),
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 10,
             cycle_total_time_us: 5000,

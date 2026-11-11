@@ -6,6 +6,8 @@
 pub struct SchedStatsSnapshot {
     pub plugin: String,
     pub preemption_usage: spur_core::preemption_usage::PreemptionUsage,
+    pub preemption_exports_pending: u64,
+    pub preemption_export_oldest_secs: u64,
     pub cycles: u64,
     pub cycle_total_time_us: u64,
     pub cycle_last_time_us: u64,

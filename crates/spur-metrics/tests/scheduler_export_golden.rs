@@ -60,6 +60,8 @@ fn normalize_exposition(body: &str) -> String {
 fn sample_snapshot() -> SchedStatsSnapshot {
     SchedStatsSnapshot {
         preemption_usage: Default::default(),
+        preemption_exports_pending: 0,
+        preemption_export_oldest_secs: 0,
         plugin: "backfill".into(),
         cycles: 10,
         cycle_total_time_us: 5000,

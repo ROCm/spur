@@ -75,7 +75,7 @@ pub fn spawn_txn_purge_loop(
     });
 }
 
-/// Include cancelled requesters with preemption usage even when they never
+/// Include finished requesters with preemption usage even when they never
 /// started, so their final counters reach history before controller eviction.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
