@@ -353,6 +353,12 @@ IDs. A node whose GPUs renumber (driver reload, hot-add) preserves running
 allocations as long as the stable IDs survive. If a held stable ID vanishes,
 `update_capacity` rejects the update to prevent silent resource leaks.
 
+**Dispatch failure detail** -- the job reason includes the failure categories,
+agent reasons, and the nodes that did not confirm the launch (including missing
+agent addresses). Names are sorted and deduplicated, limited to eight with a count
+of any remainder. Nodes that confirmed are excluded. This uses the existing
+replicated launch-failure detail rather than adding a job field.
+
 **Reconcile TTL** -- a launching reservation (reserved but not committed) is
 spared by reconcile for `launching_ttl` seconds. Past that, it is reclaimed as
 an abandoned launch. A commit arriving after reclaim returns false, telling the

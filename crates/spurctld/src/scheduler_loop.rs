@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2737,6 +2737,22 @@ impl<E: Into<anyhow::Error>> From<E> for DispatchError {
 }
 
 const MAX_REPORTED_AGENT_REASONS: usize = 3;
+const MAX_REPORTED_FAILED_NODES: usize = 8;
+
+fn failed_nodes_detail(nodes: &BTreeSet<String>) -> String {
+    let shown = nodes
+        .iter()
+        .take(MAX_REPORTED_FAILED_NODES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    let remaining = nodes.len().saturating_sub(MAX_REPORTED_FAILED_NODES);
+    if remaining == 0 {
+        format!("failed nodes: {shown}")
+    } else {
+        format!("failed nodes: {shown} (+{remaining} more)")
+    }
+}
 
 /// Ceiling on one agent RPC in a fan-out that is drained to completion. `0` disables it, matching
 /// the sibling `dispatch_reject_cooldown_secs` knob.
@@ -3315,6 +3331,7 @@ async fn confirm_dispatch_on_nodes(
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let mut agent_reasons = std::collections::BTreeSet::new();
+    let mut unconfirmed_nodes = BTreeSet::new();
     let total = dispatch_nodes.len() as u32;
 
     // Batch stdout/stderr live on the primary node (task_offset == 0). Capture
@@ -3349,6 +3366,7 @@ async fn confirm_dispatch_on_nodes(
                     );
                     failures += 1;
                     *failure_categories.entry("no agent address").or_insert(0) += 1;
+                    unconfirmed_nodes.insert(node_name.clone());
                     continue;
                 }
             },
@@ -3360,6 +3378,7 @@ async fn confirm_dispatch_on_nodes(
                 );
                 failures += 1;
                 *failure_categories.entry("no agent address").or_insert(0) += 1;
+                unconfirmed_nodes.insert(node_name.clone());
                 continue;
             }
         };
@@ -3408,9 +3427,10 @@ async fn confirm_dispatch_on_nodes(
                 "incomplete agent set for multi-node PMIx — aborting dispatch"
             );
             let detail = format!(
-                "incomplete PMIx agent set: {} of {} nodes reachable",
+                "incomplete PMIx agent set: {} of {} nodes reachable; {}",
                 node_agents.len(),
-                dispatch_nodes.len()
+                dispatch_nodes.len(),
+                failed_nodes_detail(&unconfirmed_nodes),
             );
             return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
         }
@@ -3499,6 +3519,7 @@ async fn confirm_dispatch_on_nodes(
         ));
     }
 
+    unconfirmed_nodes.extend(node_agents.iter().map(|(name, _)| name.clone()));
     let mut set = tokio::task::JoinSet::new();
     for (node_idx, (node_name, agent_addr)) in node_agents.iter().enumerate() {
         let spec = spec.clone();
@@ -3557,7 +3578,8 @@ async fn confirm_dispatch_on_nodes(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((_node_name, is_primary, Ok(outcome))) => {
+            Ok((node_name, is_primary, Ok(outcome))) => {
+                unconfirmed_nodes.remove(&node_name);
                 successes += 1;
                 if is_primary {
                     primary_outcome = Some(outcome);
@@ -3632,6 +3654,7 @@ async fn confirm_dispatch_on_nodes(
             .join("; ");
         category_summary.push_str(&format!("; agent reported: {shown}"));
     }
+    category_summary.push_str(&format!("; {}", failed_nodes_detail(&unconfirmed_nodes)));
     let confirmation_detail = if needs_pmix_prepare {
         format!(
             "PMIx dispatch confirmation failed ({successes}/{total} confirmed): {category_summary}"
@@ -8412,6 +8435,11 @@ mod tests {
                 "a node skipped before dispatch even starts must still get a category, \
                  not an empty summary"
             );
+            assert!(cm
+                .get_job(job_id)
+                .unwrap()
+                .state_reason()
+                .contains("failed nodes: n1"));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -8485,6 +8513,72 @@ mod tests {
                     && reason.contains("1 resources unavailable on agent"),
                 "both failure categories from the two nodes must show up, not just one: {reason}"
             );
+            assert!(reason.ends_with("failed nodes: n1,n2"), "{reason}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dispatch_failure_names_only_the_nodes_that_did_not_confirm() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (healthy, _) = spawn_mock_agent().await;
+            let rejected = spawn_mock_agent_rejecting_resources().await;
+            register_node_at(&cm, "healthy-node", healthy);
+            register_node_at(&cm, "z-rejected", rejected);
+            register_node_without_comm_addr(&cm, "a-unaddressed");
+
+            let id = submit_and_wait(&cm, batch_spec("mixed-dispatch-nodes", 3));
+            let outcome = confirm_dispatch_pending_job(
+                &cm,
+                id,
+                &["z-rejected", "healthy-node", "a-unaddressed"],
+            )
+            .await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let reason = cm.get_job(id).unwrap().state_reason();
+            assert!(reason.contains("1/3 confirmed"), "{reason}");
+            assert!(reason.contains("1 no agent address"), "{reason}");
+            assert!(
+                reason.contains("1 resources unavailable on agent"),
+                "{reason}"
+            );
+            assert!(
+                reason.ends_with("failed nodes: a-unaddressed,z-rejected)"),
+                "{reason}"
+            );
+            assert!(!reason.contains("healthy-node"), "{reason}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn pmix_dispatch_names_nodes_with_missing_agent_addresses() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            for name in ["node-b", "node-a"] {
+                register_node_without_comm_addr(&cm, name);
+            }
+            let mut spec = batch_spec("pmix-missing-addresses", 2);
+            spec.mpi = Some("pmix".into());
+            let id = submit_and_wait(&cm, spec);
+            let outcome = confirm_dispatch_pending_job(&cm, id, &["node-b", "node-a"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let reason = cm.get_job(id).unwrap().state_reason();
+            assert!(reason.contains("incomplete PMIx agent set"), "{reason}");
+            assert!(reason.contains("failed nodes: node-a,node-b"), "{reason}");
+        }
+
+        #[test]
+        fn failed_node_details_are_sorted_deduplicated_and_bounded() {
+            let mut nodes = BTreeSet::new();
+            assert!(nodes.insert("n1".into()));
+            assert!(!nodes.insert("n1".into()));
+            assert_eq!(failed_nodes_detail(&nodes), "failed nodes: n1");
+            nodes = (0..MAX_REPORTED_FAILED_NODES + 2)
+                .rev()
+                .map(|i| format!("n{i:02}"))
+                .collect();
+            assert_eq!(
+                failed_nodes_detail(&nodes),
+                "failed nodes: n00,n01,n02,n03,n04,n05,n06,n07 (+2 more)"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -8537,11 +8631,11 @@ mod tests {
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure; failed nodes: n1"
             );
             assert_eq!(
                 job.state_reason(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure; failed nodes: n1"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
@@ -10043,7 +10137,7 @@ mod tests {
                 job.state_reason(),
                 "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
                  1 resources unavailable on agent; \
-                 agent reported: node has unfinished job cgroup cleanup)"
+                 agent reported: node has unfinished job cgroup cleanup; failed nodes: n1)"
             );
         }
 
@@ -10069,7 +10163,7 @@ mod tests {
                 job.state_reason(),
                 "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
                  1 resources unavailable on agent; \
-                 agent reported: controller-allocated GPUs unavailable on this node)",
+                 agent reported: controller-allocated GPUs unavailable on this node; failed nodes: n1)",
                 "operators need the specific failure category, not a generic count"
             );
         }
@@ -10102,7 +10196,7 @@ mod tests {
                 job.state_reason(),
                 format!(
                     "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
-                     1 agent rejected launch; agent reported: {agent_message})"
+                     1 agent rejected launch; agent reported: {agent_message}; failed nodes: n1)"
                 ),
                 "a refused launch must not read as an unreachable agent"
             );
