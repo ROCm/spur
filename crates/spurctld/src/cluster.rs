@@ -3842,7 +3842,7 @@ impl ClusterManager {
                 .map(|j| j.allocated_nodes.join(","))
                 .unwrap_or_default(),
             script_context: "epilog_slurmctld".into(),
-            gpu_devices: Vec::new(),
+            gpu_indices: Vec::new(),
             cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
             memory_mb: job
                 .as_ref()

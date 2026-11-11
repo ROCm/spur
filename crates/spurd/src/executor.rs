@@ -572,7 +572,7 @@ pub async fn launch_job(
             partition: cfg.partition.clone(),
             nodelist: cfg.nodelist.clone(),
             script_context: "prolog_slurmd".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
+            gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
             cpus: cfg.cpus,
             memory_mb: cfg.memory_mb,
         };
@@ -776,7 +776,7 @@ async fn spawn_job_process(
             partition: cfg.partition.clone(),
             nodelist: cfg.nodelist.clone(),
             script_context: "prolog_task".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
+            gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
             cpus,
             memory_mb,
         };
@@ -813,7 +813,7 @@ async fn spawn_job_process(
                 partition: cfg.partition.clone(),
                 nodelist: cfg.nodelist.clone(),
                 script_context: "epilog_task".into(),
-                gpu_devices: cfg.gpu_devices.clone(),
+                gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
                 cpus,
                 memory_mb,
             };
@@ -1138,6 +1138,10 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
 /// the filter allows exactly what it is handed.
 fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> &[String] {
     plan.map(|p| p.device_paths.as_slice()).unwrap_or(&[])
+}
+
+pub(crate) fn hook_gpu_indices(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> Vec<u32> {
+    plan.map(|p| p.gpu_ids.clone()).unwrap_or_default()
 }
 
 /// Set up a cgroups v2 hierarchy for a job.

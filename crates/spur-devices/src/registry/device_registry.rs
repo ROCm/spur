@@ -562,6 +562,10 @@ mod tests {
     /// `device_id` (0..). Resolution must key on stable_id, and the resolved
     /// entry must still carry its positional device_id for visibility emission.
     fn make_amd_cache_with_render_minors() -> CdiCache {
+        make_amd_cache_with_stable_ids([128, 129])
+    }
+
+    fn make_amd_cache_with_stable_ids(stable_ids: [u64; 2]) -> CdiCache {
         let mut spec = CdiSpec {
             cdi_version: "0.6.0".into(),
             kind: "amd.com/gpu".into(),
@@ -569,15 +573,18 @@ mod tests {
             devices: Vec::new(),
             container_edits: None,
         };
-        for (name, render_path, minor) in [
+        for ((name, render_path, minor), stable_id) in [
             ("0", "/dev/dri/renderD128", "128"),
             ("1", "/dev/dri/renderD129", "129"),
-        ] {
+        ]
+        .into_iter()
+        .zip(stable_ids)
+        {
             spec.devices.push(CdiDevice {
                 name: name.into(),
                 annotations: [
                     (annotations::RENDER_MINOR.into(), minor.into()),
-                    (annotations::STABLE_ID.into(), minor.into()),
+                    (annotations::STABLE_ID.into(), stable_id.to_string()),
                 ]
                 .into(),
                 container_edits: Some(ContainerEdits {
@@ -626,6 +633,25 @@ mod tests {
         let (host_plan, _) = build_injection_plans(&resolved, 1000, 1000);
         assert_eq!(host_plan.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0");
         assert_eq!(host_plan.env.get("SPUR_JOB_GPUS").unwrap(), "0");
+    }
+
+    #[test]
+    fn host_plan_gpu_ids_are_positional_for_pci_encoded_stable_ids() {
+        // Unpartitioned GPUs on buses 0x11 and 0x83: both stable ids are 0 mod 128.
+        let cache = make_amd_cache_with_stable_ids([0x11_0000, 0x83_0000]);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+
+        let (host_plan, _) = reg
+            .build_job_injection_plans("gpu", &[0x83_0000], 1000, 1000)
+            .unwrap();
+        assert_eq!(host_plan.gpu_ids, vec![1]);
+        assert_eq!(host_plan.env.get("SPUR_JOB_GPUS").unwrap(), "1");
+
+        let (host_plan, _) = reg
+            .build_job_injection_plans("gpu", &[0x11_0000, 0x83_0000], 1000, 1000)
+            .unwrap();
+        assert_eq!(host_plan.gpu_ids, vec![0, 1]);
     }
 
     /// Annotation-less CDI devices arrive with stable_id 0. Without a backfill

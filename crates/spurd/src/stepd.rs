@@ -2250,6 +2250,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let stderr_path = launch_spec.stderr_path.clone();
     let hooks = launch_spec.hooks.clone();
     let spank = load_runtime_spank(&launch_spec.plugstack_path);
+    let gpu_indices = crate::executor::hook_gpu_indices(launch_spec.host_device_plan.as_ref());
     let hook_context = spur_core::hooks::HookContext {
         job_id,
         work_dir: launch_spec.work_dir.clone(),
@@ -2258,7 +2259,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         partition: launch_spec.partition.clone(),
         nodelist: launch_spec.nodelist.clone(),
         script_context: "epilog_slurmd".into(),
-        gpu_devices: launch_spec.gpu_devices.clone(),
+        gpu_indices: gpu_indices.clone(),
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
@@ -2273,7 +2274,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         partition: launch_spec.partition.clone(),
         nodelist: launch_spec.nodelist.clone(),
         script_context: "epilog_task".into(),
-        gpu_devices: launch_spec.gpu_devices.clone(),
+        gpu_indices,
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
@@ -4242,6 +4243,7 @@ mod tests {
             env: HashMap::from([("ROCR_VISIBLE_DEVICES".into(), "3,7".into())]),
             visible_devices: vec!["/dev/dri/renderD128".into()],
             device_paths: vec!["/dev/dri/renderD128".into()],
+            gpu_ids: vec![3, 7],
         });
         let restored: StepdLaunchSpec =
             serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
@@ -4255,6 +4257,19 @@ mod tests {
                 .and_then(|plan| plan.env.get("ROCR_VISIBLE_DEVICES")),
             Some(&"3,7".to_string())
         );
+        assert_eq!(
+            crate::executor::hook_gpu_indices(config.host_device_plan.as_ref()),
+            vec![3, 7]
+        );
+    }
+
+    #[test]
+    fn a_gpu_plan_persisted_before_gpu_ids_existed_still_decodes() {
+        let plan: spur_devices::inject::HostInjectionPlan = serde_json::from_value(
+            serde_json::json!({"env": {}, "visible_devices": [], "device_paths": []}),
+        )
+        .expect("decode older host plan");
+        assert!(plan.gpu_ids.is_empty());
     }
 
     // Drives the whole agent -> launch.json -> supervisor boundary: the array
