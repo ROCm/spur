@@ -640,7 +640,7 @@ or in ``spur.conf``:
    qos = "usercap"
 
 A user over the cap waits with the usual QOS reason (``QOSMaxNodePerUserLimit``,
-``QOSMaxGpuPerUserLimit``, …); other users and other partitions are unaffected.
+``QOSMaxGRESPerUser``, …); other users and other partitions are unaffected.
 ``scontrol show partition`` prints the partition QOS as ``QoS=``.
 
 How it behaves:
@@ -650,13 +650,17 @@ How it behaves:
   Submit-count limits (``MaxSubmitJobsPU``, ``MaxSubmitJobsPA``, ``GrpSubmit``)
   and ``GrpWall`` on a partition QOS are not enforced.
 - A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
-  partitions whose QOS still admits it, and waits only when none does.
+  partitions whose QOS still admits it, and waits only when none does. Until it is
+  placed, it counts against every candidate partition's QOS for the rest of that
+  scheduling pass, so a later job in the same pass may wait one pass longer.
 - Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
   idle capacity past it: the cap bounds what a user holds, borrowed or not.
 - A partition QOS that names no defined QOS holds the partition's jobs with
   ``InvalidQOS`` rather than silently lifting the cap. While the QOS cache is
   still loading, the partition's jobs wait with ``AccountingUnavailable``.
 - The same QOS may be both a partition QOS and a job QOS; both checks then apply.
+- A partition QOS needs accounting. With accounting disabled no QOS is defined, so
+  the partition QOS has no effect.
 
 .. _deny-on-limit:
 
