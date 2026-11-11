@@ -27,7 +27,8 @@ Upgrade every controller before relying on preemption totals. Older controllers
 can read the new log and snapshot entries but do not update the counts or hold
 finished jobs for export. While an older controller leads, it can evict a
 finished job whose latest counts were never exported; those counts are lost
-from the ``sreport preemptions`` totals for good.
+from the ``sreport preemptions`` totals for good, and any of its observations
+still open there are closed as ``ended_other`` / ``unknown``.
 
 **Rollback.** An older controller drops the preemption counts from its next
 snapshot: live totals, open observations, and per-job counts reset, and finished

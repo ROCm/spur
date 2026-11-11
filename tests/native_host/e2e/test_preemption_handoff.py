@@ -699,6 +699,57 @@ def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cl
     assert code != 0 and "lifetime" in output, output
 
 
+def test_preemption_rollups_close_orphans_after_retained_checkpoint_page(handoff_cluster):
+    c = handoff_cluster
+    user = c.nodes[0].user
+    for account in ("orphan-live", "orphan-lost"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    script = c.write_file("orphan-retained.sh", "#!/bin/bash\ntrue\n", all_nodes=True)
+    assert parse_job_id(c.sbatch([
+        "--hold", "--array=1-100", "--account=orphan-live", "-q", "plain",
+        "-J", "orphan-retained", script,
+    ])) is not None
+    c.stop_controller()
+    # Preserve the exact submission stamp, including nanoseconds, in injected checkpoints.
+    retained = json.loads(c.nodes[0].exec(
+        "python3 - <<'PY'\n"
+        "import json\nfrom pathlib import Path\n"
+        "rows = []\n"
+        f"for path in Path({str(c.state_dir)!r}, 'raft', 'log').glob('*.json'):\n"
+        "    payload = json.loads(path.read_text())['payload']\n"
+        "    op = payload.get('Normal', {}) if isinstance(payload, dict) else {}\n"
+        "    job = op.get('JobSubmit')\n"
+        "    if job and job['spec']['name'] == 'orphan-retained':\n"
+        "        rows.append({'job_id': job['job_id'],\n"
+        "                     'incarnation': job['spec']['submitted_at'].replace('Z', '+00:00')})\n"
+        "print(json.dumps(rows))\nPY"
+    ))
+    assert len(retained) == 100, retained
+    orphan_id = max(row["job_id"] for row in retained) + 1
+    rows_sql = json.dumps(retained).replace("'", "''")
+    user_sql = user.replace("'", "''")
+    # Seed exported observations to exercise paging without running 100 preemptions.
+    c.psql(f"""
+        BEGIN;
+        INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, open)
+        SELECT job_id, incarnation, '{user_sql}', 'orphan-live', 1
+        FROM jsonb_to_recordset('{rows_sql}') AS r(job_id bigint, incarnation text);
+        INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, open)
+        VALUES ({orphan_id}, 'legacy', '{user_sql}', 'orphan-lost', 1);
+        INSERT INTO preemption_rollups (user_name, account, open)
+        VALUES ('{user_sql}', 'orphan-live', 100), ('{user_sql}', 'orphan-lost', 1);
+        COMMIT;
+    """)
+    assert c.psql("SELECT sum(open) FROM preemption_checkpoints").strip() == "101"
+    expected = {(user, "orphan-live"): (0, 0, 100), (user, "orphan-lost"): (0, 1, 0)}
+    causes = {(user, "orphan-lost", "ended_other", "unknown"): 1}
+    c.start_controller(kill_stale=False)
+    _rollup_report(c, expected, causes=causes)
+    c.restart_controller()
+    _rollup_report(c, expected, causes=causes)
+
+
 def test_preemption_retry_before_reservation_keeps_the_same_capacity(retry_cluster):
     c = retry_cluster
     victim = _submit(c, "retry-victim", "victim-a", c.node_names[0])

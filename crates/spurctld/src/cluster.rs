@@ -6938,6 +6938,13 @@ impl ClusterManager {
             .collect()
     }
 
+    pub(crate) fn holds_preemption_checkpoint(&self, job_id: JobId, incarnation: &str) -> bool {
+        self.jobs
+            .read()
+            .get(&job_id)
+            .is_some_and(|job| crate::accounting::preemption::incarnation(job) == incarnation)
+    }
+
     pub(crate) fn acknowledge_preemption_checkpoint(
         &self,
         checkpoint: &crate::accounting::preemption::Checkpoint,

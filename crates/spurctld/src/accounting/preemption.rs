@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS preemption_rollups (
 );
 CREATE INDEX IF NOT EXISTS idx_preemption_rollups_account
     ON preemption_rollups(account, user_name);
+CREATE INDEX IF NOT EXISTS idx_preemption_checkpoints_open
+    ON preemption_checkpoints(job_id, incarnation) WHERE open > 0;
 CREATE TABLE IF NOT EXISTS preemption_cause_rollups (
     user_name TEXT NOT NULL,
     account TEXT NOT NULL,
@@ -61,16 +63,19 @@ pub(crate) struct Checkpoint {
     pub usage: PreemptionUsage,
 }
 
+pub(crate) fn incarnation(job: &Job) -> String {
+    job.spec
+        .submitted_at
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_else(|| "legacy".into())
+}
+
 impl From<&Job> for Checkpoint {
     fn from(job: &Job) -> Self {
         Self {
             job_id: job.job_id,
             submit_time: job.submit_time,
-            incarnation: job
-                .spec
-                .submitted_at
-                .map(|at| at.to_rfc3339())
-                .unwrap_or_else(|| "legacy".into()),
+            incarnation: incarnation(job),
             user: job.spec.user.clone(),
             account: job.spec.account.clone().unwrap_or_default(),
             usage: job.preemption_usage.clone(),
@@ -158,16 +163,23 @@ pub(super) async fn write(conn: &mut PgConnection, checkpoint: &Checkpoint) -> a
     Ok(())
 }
 
+#[derive(Default)]
+pub(crate) struct ExportCursor {
+    jobs: Option<JobId>,
+    orphans: Option<(i64, String)>,
+}
+
 pub(super) fn spawn_loop(pool: PgPool, cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
-        let mut cursor = None;
+        let mut cursor = ExportCursor::default();
         loop {
             interval.tick().await;
             if !raft.ensure_leader().await {
                 continue;
             }
-            if let Err(error) = sync_once(&pool, &cluster, &mut cursor).await {
+            if let Err(error) = sync_once(&pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await
+            {
                 tracing::warn!(%error, "preemption accounting export failed; retaining unexported jobs");
             }
         }
@@ -189,33 +201,137 @@ fn connection_failed(error: &anyhow::Error) -> bool {
         })
 }
 
+/// Server-side bounds below the client timeout, so a stuck statement is cancelled
+/// by PostgreSQL and its connection returns to the pool instead of waiting.
+#[derive(Clone, Copy)]
+pub(crate) struct ExportLimits {
+    pub lock: Duration,
+    pub statement: Duration,
+}
+
+impl ExportLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        lock: Duration::from_secs(5),
+        statement: Duration::from_secs(8),
+    };
+}
+
+fn stalled(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(|error| error.as_database_error()?.code())
+        .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014"))
+}
+
+async fn save(pool: &PgPool, limits: ExportLimits, checkpoint: &Checkpoint) -> anyhow::Result<()> {
+    tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+        )
+        .bind(format!("{}ms", limits.lock.as_millis()))
+        .bind(format!("{}ms", limits.statement.as_millis()))
+        .execute(&mut *tx)
+        .await?;
+        write(&mut tx, checkpoint).await?;
+        tx.commit().await?;
+        anyhow::Ok(())
+    })
+    .await?
+}
+
 pub(crate) async fn sync_once(
     pool: &PgPool,
     cluster: &ClusterManager,
-    cursor: &mut Option<JobId>,
+    cursor: &mut ExportCursor,
+    limits: ExportLimits,
 ) -> anyhow::Result<()> {
-    let batch = cluster.pending_preemption_checkpoints(1000, *cursor);
+    let batch = cluster.pending_preemption_checkpoints(1000, cursor.jobs);
     let last_batch = batch.len() < 1000;
     for checkpoint in batch {
-        let result = tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
-            let mut tx = pool.begin().await?;
-            write(&mut tx, &checkpoint).await?;
-            tx.commit().await?;
-            anyhow::Ok(())
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => cluster.acknowledge_preemption_checkpoint(&checkpoint),
-            Ok(Err(error)) if connection_failed(&error) => return Err(error),
-            Ok(Err(error)) => tracing::warn!(job_id = checkpoint.job_id, %error,
-                "preemption checkpoint failed; retaining this job and continuing the batch"),
+        match save(pool, limits, &checkpoint).await {
+            Ok(()) => cluster.acknowledge_preemption_checkpoint(&checkpoint),
+            Err(error) if connection_failed(&error) => return Err(error),
             // Step past a row stuck behind a lock, but stop: the database may be stalled.
-            Err(elapsed) => {
-                *cursor = Some(checkpoint.job_id);
-                return Err(elapsed.into());
+            Err(error) if stalled(&error) || error.is::<tokio::time::error::Elapsed>() => {
+                cursor.jobs = Some(checkpoint.job_id);
+                return Err(error);
+            }
+            Err(error) => tracing::warn!(job_id = checkpoint.job_id, %error,
+                "preemption checkpoint failed; retaining this job and continuing the batch"),
+        }
+        cursor.jobs = Some(checkpoint.job_id);
+    }
+    if last_batch {
+        cursor.jobs = None;
+    }
+    close_orphaned_checkpoints(pool, cluster, &mut cursor.orphans, limits).await
+}
+
+/// A checkpoint still open for a job the controller no longer holds lost its final
+/// export; settle the remainder as `ended_other`/`unknown` so `Open` cannot stay stale.
+async fn close_orphaned_checkpoints(
+    pool: &PgPool,
+    cluster: &ClusterManager,
+    cursor: &mut Option<(i64, String)>,
+    limits: ExportLimits,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT job_id, incarnation, used::text, unused::text, open::text, unused_by_cause \
+         FROM preemption_checkpoints WHERE open > 0 AND (job_id, incarnation) > ($1, $2) \
+         ORDER BY job_id, incarnation LIMIT 100",
+    )
+    .bind(cursor.as_ref().map_or(i64::MIN, |(id, _)| *id))
+    .bind(
+        cursor
+            .as_ref()
+            .map_or("", |(_, incarnation)| incarnation.as_str()),
+    )
+    .fetch_all(pool)
+    .await?;
+    let last_batch = rows.len() < 100;
+    for row in rows {
+        let raw_job_id: i64 = row.try_get("job_id")?;
+        let incarnation: String = row.try_get("incarnation")?;
+        // Retained or malformed rows must not hide later orphans.
+        *cursor = Some((raw_job_id, incarnation.clone()));
+        let Ok(job_id) = JobId::try_from(raw_job_id) else {
+            continue;
+        };
+        if cluster.holds_preemption_checkpoint(job_id, &incarnation) {
+            continue;
+        }
+        let mut usage = PreemptionUsage {
+            used: row.try_get::<String, _>("used")?.parse()?,
+            unused: row
+                .try_get::<sqlx::types::Json<CauseCounts>, _>("unused_by_cause")?
+                .0,
+            open: row.try_get::<String, _>("open")?.parse()?,
+        };
+        while usage.open > 0 {
+            usage.settle(Some((
+                UnusedReason::EndedOther,
+                PreemptionInitiator::Unknown,
+            )));
+        }
+        let checkpoint = Checkpoint {
+            job_id,
+            submit_time: DateTime::UNIX_EPOCH,
+            incarnation,
+            user: String::new(),
+            account: String::new(),
+            usage,
+        };
+        match save(pool, limits, &checkpoint).await {
+            Ok(()) => tracing::warn!(
+                job_id,
+                "closed open preemption counts the controller can no longer export"
+            ),
+            Err(error) if connection_failed(&error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(job_id, %error, "could not close orphaned preemption counts")
             }
         }
-        *cursor = Some(checkpoint.job_id);
     }
     if last_batch {
         *cursor = None;
@@ -396,7 +512,9 @@ mod tests {
             exercise(&pool).await?;
             exercise_causes(&pool).await?;
             exercise_failed_checkpoints(&pool).await?;
-            exercise_timed_out_checkpoint(&pool).await
+            exercise_timed_out_checkpoint(&pool).await?;
+            exercise_orphaned_checkpoints(&pool).await?;
+            exercise_orphaned_checkpoint_pagination(&pool).await
         }
         .await;
         pool.close().await;
@@ -626,11 +744,11 @@ mod tests {
             "jobs": jobs, "nodes": [], "reservations": [], "steps": [], "license_pool": {}
         }))?)?;
         sqlx::query("INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, unused_by_cause) SELECT id, 'legacy', 'alice', '', '{\"future_reason\": {\"system\": 1}}'::jsonb FROM generate_series(1, 1000) id").execute(pool).await?;
-        let mut cursor = None;
-        sync_once(pool, &cluster, &mut cursor).await?;
-        assert_eq!(cursor, Some(1000));
-        sync_once(pool, &cluster, &mut cursor).await?;
-        assert_eq!(cursor, None);
+        let mut cursor = ExportCursor::default();
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        assert_eq!(cursor.jobs, Some(1000));
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        assert_eq!(cursor.jobs, None);
         assert_eq!(
             cluster.pending_preemption_checkpoints(2000, None).len(),
             1000
@@ -640,7 +758,7 @@ mod tests {
         sqlx::query("UPDATE preemption_checkpoints SET unused_by_cause='{}'")
             .execute(pool)
             .await?;
-        sync_once(pool, &cluster, &mut cursor).await?;
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
         assert!(cluster
             .pending_preemption_checkpoints(2000, None)
             .is_empty());
@@ -732,13 +850,20 @@ mod tests {
         sqlx::query("SELECT 1 FROM preemption_checkpoints WHERE job_id = 1 FOR UPDATE")
             .execute(&mut *blocker)
             .await?;
-        let mut cursor = None;
-        tokio::time::pause();
-        let stalled = sync_once(pool, &cluster, &mut cursor).await;
-        tokio::time::resume();
-        assert!(stalled.is_err());
-        assert_eq!(cursor, Some(1));
-        sync_once(pool, &cluster, &mut cursor).await?;
+        let limits = ExportLimits {
+            lock: Duration::from_millis(50),
+            statement: Duration::from_secs(5),
+        };
+        let mut cursor = ExportCursor::default();
+        // More stalls than the pool has connections: none of them may keep one.
+        for _ in 0..6 {
+            assert!(sync_once(pool, &cluster, &mut cursor, limits)
+                .await
+                .is_err());
+            assert_eq!(cursor.jobs, Some(1));
+            sync_once(pool, &cluster, &mut cursor, limits).await?;
+            assert_eq!(cursor.jobs, None);
+        }
         let pending: Vec<_> = cluster
             .pending_preemption_checkpoints(10, None)
             .into_iter()
@@ -746,6 +871,149 @@ mod tests {
             .collect();
         assert_eq!(pending, vec![1]);
         blocker.rollback().await?;
+        sync_once(pool, &cluster, &mut cursor, limits).await?;
+        assert!(cluster.pending_preemption_checkpoints(10, None).is_empty());
+        Ok(())
+    }
+
+    async fn exercise_orphaned_checkpoints(pool: &PgPool) -> anyhow::Result<()> {
+        use crate::raft::StateMachineApply;
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        let mut live = Job::new(1, Default::default());
+        live.preemption_usage.open_one();
+        cluster.restore_from_snapshot(&serde_json::to_vec(&serde_json::json!({
+            "jobs": [live], "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+        }))?)?;
+        for (job_id, user) in [(1, "alice"), (2, "bob")] {
+            let mut checkpoint = Checkpoint {
+                job_id,
+                submit_time: DateTime::UNIX_EPOCH,
+                incarnation: "legacy".into(),
+                user: user.into(),
+                account: "research".into(),
+                usage: PreemptionUsage::default(),
+            };
+            checkpoint.usage.open_one();
+            checkpoint.usage.open_one();
+            checkpoint
+                .usage
+                .settle(Some((UnusedReason::Cancelled, PreemptionInitiator::User)));
+            save(pool, &checkpoint).await?;
+        }
+        let mut cursor = ExportCursor::default();
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        let report = query(
+            pool,
+            GetPreemptionUsageRequest {
+                by_cause: true,
+                ..Default::default()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        let rows: Vec<_> = report
+            .entries
+            .iter()
+            .map(|e| (e.user.as_str(), e.unused, e.open))
+            .collect();
+        assert_eq!(rows, [("alice", 1, 1), ("bob", 2, 0)]);
+        assert_causes(
+            &report.entries[1],
+            &[("cancelled", "user", 1), ("ended_other", "unknown", 1)],
+        );
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        assert_eq!(
+            query(pool, Default::default(), ReadScope::All)
+                .await?
+                .entries[1]
+                .unused,
+            2
+        );
+        Ok(())
+    }
+
+    async fn exercise_orphaned_checkpoint_pagination(pool: &PgPool) -> anyhow::Result<()> {
+        use crate::raft::StateMachineApply;
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        let jobs: Vec<_> = (1..=100)
+            .map(|job_id| {
+                let mut job = Job::new(
+                    job_id,
+                    spur_core::job::JobSpec {
+                        user: "alice".into(),
+                        account: Some("research".into()),
+                        submitted_at: Some(DateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    },
+                );
+                job.preemption_usage.open_one();
+                job
+            })
+            .collect();
+        for job in &jobs {
+            save(pool, &Checkpoint::from(job)).await?;
+        }
+        cluster.restore_from_snapshot(&serde_json::to_vec(&serde_json::json!({
+            "jobs": jobs, "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+        }))?)?;
+        let mut orphan = Checkpoint {
+            job_id: 100,
+            submit_time: DateTime::UNIX_EPOCH,
+            incarnation: "legacy".into(),
+            user: "bob".into(),
+            account: "research".into(),
+            usage: PreemptionUsage::default(),
+        };
+        orphan.usage.open_one();
+        save(pool, &orphan).await?;
+        orphan.job_id = 101;
+        save(pool, &orphan).await?;
+        let mut cursor = ExportCursor::default();
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!(report.entries[0].open, 100);
+        assert_eq!(report.entries[1].open, 2);
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!(report.entries[0].open, 100);
+        assert_eq!((report.entries[1].unused, report.entries[1].open), (2, 0));
+
+        // A row behind the cursor must be found after wrapping around.
+        orphan.job_id = 0;
+        save(pool, &orphan).await?;
+        for _ in 0..3 {
+            sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        }
+        let report = query(
+            pool,
+            GetPreemptionUsageRequest {
+                by_cause: true,
+                ..Default::default()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (0, 100));
+        assert_eq!((report.entries[1].unused, report.entries[1].open), (3, 0));
+        assert_causes(&report.entries[1], &[("ended_other", "unknown", 3)]);
         Ok(())
     }
 

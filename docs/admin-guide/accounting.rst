@@ -1773,8 +1773,9 @@ reused job ID starts a new key. The requesting user and account are fixed at
 the first export: a later account change on the job does not move counts
 already recorded, and those stay visible to the original account's coordinator.
 
-A job whose export fails is logged and skipped; later jobs keep exporting. A job
-whose export times out ends that pass, and the next pass starts after it. A
+A job whose export fails is logged and skipped; later jobs keep exporting. Each
+export waits at most 5 seconds for a row lock and 8 seconds for a statement; a
+job whose export times out ends that pass, and the next pass starts after it. A
 database connection failure ends the pass until the next tick.
 
 While accounting is enabled, a finished job with counts stays in the controller
@@ -1795,8 +1796,16 @@ scheduler metrics show the jobs held past retention this way:
 
 If a job's counts are still not exported 24 hours after
 ``terminal_job_retention_secs`` would have evicted it, the job is evicted anyway,
-with a warning in the controller log; those counts never reach the rollups. A rising pending count or an oldest age near that limit
-means exports are failing.
+with a warning in the controller log; those counts never reach the rollups. A
+rising pending count or an oldest age near that limit means exports are failing.
+
+The controller checks up to 100 open checkpoints per pass, continuing from the
+previous page and starting over after reaching the end. Retained jobs do not
+prevent later checkpoints from being checked. When the controller no longer
+holds a job, its remaining open observations are closed as ``ended_other`` /
+``unknown``, with a warning in the controller log. This covers a job evicted by
+the limit above and one evicted by an older controller. The scan position is
+kept in memory; it adds no Raft writes.
 
 Job history also stores each job's counts in ``preemption_usage``, written when
 the job ends and by the accounting reconcile pass. ``sacct`` does not show them;
