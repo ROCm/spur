@@ -1109,21 +1109,22 @@ impl ControllerService {
         identity.is_none() || self.caller_is_admin(identity)
     }
 
+    /// Reads the Raft core state, not the metrics: openraft answers a membership
+    /// write before it publishes the new metrics, so the metrics can still show
+    /// the membership from before the last change.
+    async fn current_membership(&self) -> Result<openraft::Membership<u64, BasicNode>, Status> {
+        self.raft
+            .raft
+            .with_raft_state(|st| st.membership_state.effective().membership().clone())
+            .await
+            .map_err(|e| Status::unavailable(format!("read raft membership: {e}")))
+    }
+
     /// Refuse a promote unless every other voter answers `ClusterProbe`. A voter
     /// on a build without it cannot reach a node that only the replicated
     /// membership names, so it would fall out of the cluster as soon as it became
     /// leader. A voter that does not answer at all may be dead, and a promote
     /// would then widen a quorum that already counts a member which is gone.
-    fn current_membership(&self) -> openraft::Membership<u64, BasicNode> {
-        self.raft
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .clone()
-    }
-
     async fn refuse_promote_unless_every_voter_answers(
         &self,
         membership: &openraft::Membership<u64, BasicNode>,
@@ -4566,7 +4567,7 @@ impl SlurmController for ControllerService {
                 "address is required: the leader can only reach a new node through it",
             ));
         }
-        let membership = self.current_membership();
+        let membership = self.current_membership().await?;
         if let Some(node) = membership.get_node(&node_id) {
             return Err(Status::already_exists(format!(
                 "node {node_id} is already a member at {}; remove it first to change its address",
@@ -4605,11 +4606,11 @@ impl SlurmController for ControllerService {
             .await?;
 
         let node_id = validate_raft_node_id(req.node_id)?;
-        let metrics = self.raft.raft.metrics().borrow().clone();
-        let membership = metrics.membership_config.membership().clone();
+        let membership = self.current_membership().await?;
         promote_membership_ruling(&membership, node_id)?;
         self.refuse_promote_unless_every_voter_answers(&membership)
             .await?;
+        let metrics = self.raft.raft.metrics().borrow().clone();
         // The handler runs on the leader, so the replication map is populated.
         promote_lag_ruling(
             metrics.last_log_index.unwrap_or(0),
@@ -4649,7 +4650,7 @@ impl SlurmController for ControllerService {
             .await?;
 
         let node_id = validate_raft_node_id(req.node_id)?;
-        let change = remove_membership_change(&self.current_membership(), node_id)?;
+        let change = remove_membership_change(&self.current_membership().await?, node_id)?;
         let role = match change {
             openraft::ChangeMembers::RemoveVoters(_) => "voter",
             _ => "learner",
