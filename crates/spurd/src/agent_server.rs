@@ -1234,6 +1234,7 @@ pub struct TrackedJob {
     user: String,
     partition: String,
     gpu_devices: Vec<u64>,
+    gpu_indices: Vec<u32>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -1270,7 +1271,7 @@ struct CompletedJob {
     uid: u32,
     gid: u32,
     partition: String,
-    gpu_devices: Vec<u64>,
+    gpu_indices: Vec<u32>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -1347,7 +1348,7 @@ async fn run_completion_hooks_and_report(
                 partition: c.partition.clone(),
                 nodelist: c.nodelist.clone(),
                 script_context: "epilog_slurmd".into(),
-                gpu_devices: c.gpu_devices.clone(),
+                gpu_indices: c.gpu_indices.clone(),
                 cpus: c.cpus,
                 memory_mb: c.memory_mb,
             };
@@ -1467,7 +1468,7 @@ async fn wait_for_exit_and_teardown(
                         uid: tracked.uid,
                         gid: tracked.gid,
                         partition: tracked.partition,
-                        gpu_devices: tracked.gpu_devices,
+                        gpu_indices: tracked.gpu_indices,
                         cpus: tracked.cpus,
                         memory_mb: tracked.memory_mb,
                         nodelist: tracked.nodelist,
@@ -2113,6 +2114,7 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         user: own(&descriptor.owner),
         partition: descriptor.resources.partition.clone(),
         gpu_devices: descriptor.resources.gpu_devices.clone(),
+        gpu_indices: Vec::new(),
         cpus: descriptor.resources.cpus,
         memory_mb: descriptor.resources.memory_mb,
         nodelist: descriptor.resources.nodelist.clone(),
@@ -5171,7 +5173,7 @@ impl AgentService {
                                 uid: tracked.uid,
                                 gid: tracked.gid,
                                 partition: tracked.partition.clone(),
-                                gpu_devices: tracked.gpu_devices.clone(),
+                                gpu_indices: tracked.gpu_indices.clone(),
                                 cpus: tracked.cpus,
                                 memory_mb: tracked.memory_mb,
                                 nodelist: tracked.nodelist.clone(),
@@ -6777,7 +6779,7 @@ impl SlurmAgent for AgentService {
                 partition: spec.partition.clone(),
                 nodelist: spec.nodelist.clone(),
                 script_context: "prolog_slurmd".into(),
-                gpu_devices: allocated_device_ids.clone(),
+                gpu_indices: host_device_plan.gpu_ids.clone(),
                 cpus,
                 memory_mb,
             };
@@ -7099,6 +7101,9 @@ impl SlurmAgent for AgentService {
                         gid: launch_cfg.gid,
                         user: launch_cfg.user,
                         partition: launch_cfg.partition,
+                        gpu_indices: executor::hook_gpu_indices(
+                            launch_cfg.host_device_plan.as_ref(),
+                        ),
                         gpu_devices: launch_cfg.gpu_devices,
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
@@ -7637,6 +7642,7 @@ impl SlurmAgent for AgentService {
             .as_ref()
             .map(|p| p.device_paths.clone())
             .unwrap_or_default();
+        let gpu_indices = executor::hook_gpu_indices(host_device_plan.as_ref());
 
         // Before reserving, for the same reason as the batch launch.
         if supervise_allocation {
@@ -7766,7 +7772,7 @@ impl SlurmAgent for AgentService {
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 script_context: "prolog_slurmd".into(),
-                gpu_devices: controller_gpu_ids.clone(),
+                gpu_indices: gpu_indices.clone(),
                 cpus,
                 memory_mb,
             };
@@ -7931,6 +7937,7 @@ impl SlurmAgent for AgentService {
                 user: req.user,
                 partition: req.partition,
                 gpu_devices: controller_gpu_ids.clone(),
+                gpu_indices,
                 cpus,
                 memory_mb,
                 nodelist: req.nodelist,
@@ -8299,6 +8306,7 @@ impl SlurmAgent for AgentService {
             host_plan.env.clear();
             (env, Some(host_plan), Some(container_plan))
         };
+        let gpu_indices = executor::hook_gpu_indices(host_device_plan.as_ref());
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
         let mut senv = SpurEnv::new();
@@ -8686,7 +8694,7 @@ impl SlurmAgent for AgentService {
                     partition: partition.clone(),
                     nodelist: job_nodelist.clone(),
                     script_context: "prolog_task".into(),
-                    gpu_devices: gpu_devices.clone(),
+                    gpu_indices: gpu_indices.clone(),
                     cpus,
                     memory_mb,
                 };
@@ -9024,7 +9032,7 @@ impl SlurmAgent for AgentService {
                     partition,
                     nodelist: job_nodelist,
                     script_context: "epilog_task".into(),
-                    gpu_devices,
+                    gpu_indices,
                     cpus,
                     memory_mb,
                 };
@@ -11568,6 +11576,7 @@ impl TrackedJob {
             user: "testuser".into(),
             partition: String::new(),
             gpu_devices: Vec::new(),
+            gpu_indices: Vec::new(),
             fabric_binding: None,
             gpu_binding: None,
             cpus: 1,
@@ -15952,6 +15961,131 @@ mod tests {
         path
     }
 
+    /// Writes `$SPUR_JOB_GPUS` to `target`, then exits with `code`.
+    fn recording_hook_script(target: &std::path::Path, code: i32) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "#!/bin/bash\necho \"$SPUR_JOB_GPUS\" > {}\nexit {code}",
+            target.display()
+        )
+        .unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// `(device_id, stable_id)` of two unpartitioned GPUs on PCI buses 0x11 and
+    /// 0x83: real stable ids, both 0 mod 128.
+    const PCI_GPUS: [(u32, u64); 2] = [(0, 0x11_0000), (1, 0x83_0000)];
+
+    fn pci_gpu_registry() -> DeviceRegistry {
+        use spur_devices::cdi::{annotations, cache::CdiCache, spec::CdiSpec};
+        let devices: Vec<_> = PCI_GPUS
+            .iter()
+            .map(|&(index, stable_id)| {
+                serde_json::json!({
+                    "name": index.to_string(),
+                    "annotations": { annotations::STABLE_ID: stable_id.to_string() },
+                    "containerEdits": {
+                        "deviceNodes": [{ "path": format!("/dev/dri/renderD{}", 128 + index) }]
+                    },
+                })
+            })
+            .collect();
+        let spec: CdiSpec = serde_json::from_value(serde_json::json!({
+            "cdiVersion": "0.6.0",
+            "kind": "amd.com/gpu",
+            "devices": devices,
+        }))
+        .unwrap();
+        let mut cdi = CdiCache::new();
+        cdi.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cdi, &spur_devices::GresCache::from_entries(&[]));
+        reg
+    }
+
+    fn second_pci_gpu_allocation() -> ResourceAllocations {
+        ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
+            cpus: 1,
+            memory_mb: 0,
+            devices: HashMap::from([(
+                "gpu".to_string(),
+                DeviceAllocations {
+                    devices: vec![AllocatedDevice {
+                        device_id: PCI_GPUS[1].1,
+                        count: 1,
+                    }],
+                },
+            )]),
+            generation: 0,
+        }
+    }
+
+    fn pci_gpu_service(prolog: &std::path::Path) -> AgentService {
+        AgentService::new(
+            Arc::new(test_reporter_with_stable_ids(&PCI_GPUS)),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(pci_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_prolog_sees_the_positional_gpu_index_not_the_stable_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = dir.path().join("gpus");
+        // Exits non-zero so the launch stops right after the prolog.
+        let prolog = recording_hook_script(&recorded, 1);
+        let svc = pci_gpu_service(&prolog);
+
+        svc.launch_job(Request::new(LaunchJobRequest {
+            job_id: 41,
+            spec: Some(JobSpec {
+                name: "gpu-index".into(),
+                script: "#!/bin/bash\ntrue\n".into(),
+                num_tasks: 1,
+                num_nodes: 1,
+                cpus_per_task: 1,
+                work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            allocated: Some(second_pci_gpu_allocation()),
+            ..Default::default()
+        }))
+        .await
+        .expect("launch");
+
+        assert_eq!(std::fs::read_to_string(&recorded).unwrap().trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn srun_allocation_prolog_sees_the_positional_gpu_index_not_the_stable_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = dir.path().join("gpus");
+        let prolog = recording_hook_script(&recorded, 0);
+        let svc = pci_gpu_service(&prolog);
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 42,
+            cpus: 1,
+            allocated: Some(second_pci_gpu_allocation()),
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        assert_eq!(std::fs::read_to_string(&recorded).unwrap().trim(), "1");
+    }
+
     fn touch_hook_script(target: &std::path::Path) -> tempfile::TempPath {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -19121,17 +19255,23 @@ mod tests {
     }
 
     fn unwrapped_test_reporter(device_ids: &[u32]) -> NodeReporter {
+        let gpus: Vec<(u32, u64)> = device_ids.iter().map(|&id| (id, id as u64)).collect();
+        test_reporter_with_stable_ids(&gpus)
+    }
+
+    /// `(device_id, stable_id)` per GPU.
+    fn test_reporter_with_stable_ids(gpus: &[(u32, u64)]) -> NodeReporter {
         use spur_core::resource::{GpuLinkType, GpuResource};
-        let gpus = device_ids
+        let gpus = gpus
             .iter()
-            .map(|&device_id| GpuResource {
+            .map(|&(device_id, stable_id)| GpuResource {
                 device_id,
                 gpu_type: "mi300x".into(),
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
                 topology: None,
-                stable_id: device_id as u64,
+                stable_id,
             })
             .collect();
         NodeReporter::new(
@@ -21731,6 +21871,7 @@ mod tests {
             user: "testuser".into(),
             partition: String::new(),
             gpu_devices: Vec::new(),
+            gpu_indices: Vec::new(),
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
@@ -22992,6 +23133,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 gpu_devices: Vec::new(),
+                gpu_indices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 nodelist: String::new(),
@@ -23543,6 +23685,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 gpu_devices: Vec::new(),
+                gpu_indices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 nodelist: String::new(),
@@ -23631,6 +23774,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 gpu_devices: Vec::new(),
+                gpu_indices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 nodelist: String::new(),
@@ -23920,7 +24064,7 @@ mod tests {
             uid: 0,
             gid: 0,
             partition: String::new(),
-            gpu_devices: Vec::new(),
+            gpu_indices: Vec::new(),
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),

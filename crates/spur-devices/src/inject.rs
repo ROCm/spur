@@ -90,6 +90,9 @@ pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,
     pub device_paths: Vec<String>,
+    /// Node-local positional GPU ids, the numbering the job's `SPUR_JOB_GPUS` uses.
+    #[serde(default)]
+    pub gpu_ids: Vec<u32>,
 }
 
 /// Merge container edits and inject actions from resolved registry entries.
@@ -282,7 +285,10 @@ pub struct HostInjector;
 
 impl HostInjector {
     pub fn plan(edits: &MergedEdits, device_ids: &[u32]) -> HostInjectionPlan {
-        let mut plan = HostInjectionPlan::default();
+        let mut plan = HostInjectionPlan {
+            gpu_ids: device_ids.to_vec(),
+            ..Default::default()
+        };
 
         for env_str in edits.all_env() {
             if let Some((key, value)) = env_str.split_once('=') {

@@ -670,7 +670,7 @@ async fn process_assignment_inner(
             partition: job.spec.partition.clone().unwrap_or_default(),
             nodelist: assignment.nodes.join(","),
             script_context: "prolog_slurmctld".into(),
-            gpu_devices: Vec::new(),
+            gpu_indices: Vec::new(),
             cpus: spec.cpus_per_task,
             memory_mb: crate::cluster::hook_memory_mb(&spec, &per_node_allocs),
         };

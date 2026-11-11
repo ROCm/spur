@@ -2120,7 +2120,7 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
         partition: String::new(),
         nodelist: String::new(),
         script_context: script_context.into(),
-        gpu_devices: Vec::new(),
+        gpu_indices: Vec::new(),
         cpus: 1,
         memory_mb: 0,
     }

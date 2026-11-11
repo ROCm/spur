@@ -271,7 +271,7 @@ mod tests {
             partition: "batch".into(),
             nodelist: "node01".into(),
             script_context: "prolog_task".into(),
-            gpu_devices: vec![],
+            gpu_indices: vec![],
             cpus: 1,
             memory_mb: 128,
         }

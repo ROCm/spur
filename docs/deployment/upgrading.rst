@@ -421,6 +421,16 @@ Behavior Changes Between Releases
 Some releases change how an existing ``spur.conf`` behaves without that file being
 edited. Review these before rolling binaries out.
 
+Hook GPU list (``SPUR_JOB_GPUS``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Releases 0.13.0 through 0.16.0 passed internal GPU ids to the node prolog and
+epilog. On an unpartitioned GPU the documented exporter scripts then wrote
+every GPU of a job to one file. This release passes the same positional indices the job itself sees, and
+the epilog removes the files the prolog wrote. A node that ran those releases
+can still have leftover numeric files; delete them once while it runs no GPU
+job. See :doc:`/admin-guide/dme-integration`.
+
 .. _cgroup-upgrade-notes:
 
 Job resource enforcement (``[cgroup]``)

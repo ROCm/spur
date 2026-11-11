@@ -144,6 +144,21 @@ of writing it:
        rm -f "${EXPORT_DIR}/$((gpu % 128))"
    done
 
+``SPUR_JOB_GPUS`` uses the same numbering as the job's own
+``ROCR_VISIBLE_DEVICES``, and the prolog and epilog of a job see the same list.
+
+Upgrading from Spur 0.13.0 through 0.16.0
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Those releases passed internal GPU ids in the hook's ``SPUR_JOB_GPUS``, so
+on unpartitioned GPUs these scripts wrote every GPU's labels to file ``0``
+and never removed files written for other GPUs by earlier releases. After upgrading a node, clear the
+leftover files once while it runs no GPU jobs:
+
+.. code-block:: bash
+
+   sudo find /var/run/exporter -maxdepth 1 -type f -name '[0-9]*' -delete
+
 Running the exporter container
 --------------------------------
 
