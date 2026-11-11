@@ -63,6 +63,14 @@ impl HookContext {
 /// Grace between SIGTERM and SIGKILL when a bounded hook outlives its limit.
 pub const HOOK_KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// Carries a token unique to one bounded hook run, which its whole process
+/// group inherits. Once the leader has exited, the group id alone can be
+/// reused by an unrelated group; the token cannot.
+pub const HOOK_GROUP_TOKEN_ENV: &str = "SPUR_HOOK_GROUP_TOKEN";
+
+/// How often a terminated hook's group is checked for survivors.
+const HOOK_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// How long a hook's stderr is still logged after the hook exits. A child it
 /// left running can hold the pipe open indefinitely, and must not hold the
 /// caller with it.
@@ -78,6 +86,19 @@ pub fn bounded_hook_ceiling(timeout: Duration) -> Duration {
 struct HookBound {
     timeout: Duration,
     kill_grace: Duration,
+    group_token: String,
+}
+
+impl HookBound {
+    fn new(timeout: Duration, kill_grace: Duration) -> Self {
+        use rand::RngExt;
+        let token: u128 = rand::rng().random();
+        Self {
+            timeout,
+            kill_grace,
+            group_token: format!("{token:032x}"),
+        }
+    }
 }
 
 /// Run a prolog/epilog hook script with rich environment variables.
@@ -86,22 +107,19 @@ struct HookBound {
 /// process exits, whatever it left running. Returns `Err` on script execution
 /// failure or non-zero exit.
 pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()> {
-    run_hook_with(script_path, ctx, None, |_| {}).await
+    run_hook_with(script_path, ctx, None, |_, _| {}).await
 }
 
 /// [`run_hook`] in its own process group, SIGTERMed at `timeout` and SIGKILLed
 /// [`HOOK_KILL_GRACE`] later; a timeout is an `Err`. `on_spawn` receives the
-/// pid, which is also the group id.
+/// pid, which is also the group id, and the group's [`HOOK_GROUP_TOKEN_ENV`].
 pub async fn run_hook_bounded(
     script_path: &str,
     ctx: &HookContext,
     timeout: Duration,
-    on_spawn: impl FnOnce(u32),
+    on_spawn: impl FnOnce(u32, &str),
 ) -> anyhow::Result<()> {
-    let bound = HookBound {
-        timeout,
-        kill_grace: HOOK_KILL_GRACE,
-    };
+    let bound = HookBound::new(timeout, HOOK_KILL_GRACE);
     run_hook_with(script_path, ctx, Some(bound), on_spawn).await
 }
 
@@ -109,7 +127,7 @@ async fn run_hook_with(
     script_path: &str,
     ctx: &HookContext,
     bound: Option<HookBound>,
-    on_spawn: impl FnOnce(u32),
+    on_spawn: impl FnOnce(u32, &str),
 ) -> anyhow::Result<()> {
     info!(
         job_id = ctx.job_id,
@@ -125,8 +143,9 @@ async fn run_hook_with(
         cmd.env(k, v);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    if bound.is_some() {
-        cmd.process_group(0);
+    if let Some(bound) = bound.as_ref() {
+        cmd.process_group(0)
+            .env(HOOK_GROUP_TOKEN_ENV, &bound.group_token);
     }
     let mut child = spawn_hook_in_work_dir(cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
@@ -136,8 +155,8 @@ async fn run_hook_with(
             )
         })?;
     let pid = child.id();
-    if let Some(pid) = pid {
-        on_spawn(pid);
+    if let (Some(pid), Some(bound)) = (pid, bound.as_ref()) {
+        on_spawn(pid, &bound.group_token);
     }
     let mut stderr_logger = child
         .stderr
@@ -214,33 +233,67 @@ async fn finish_logging_stderr(logger: &mut tokio::task::JoinHandle<()>, ctx: &H
     );
 }
 
-/// SIGTERMs a timed-out hook's process group and escalates to SIGKILL once
-/// `grace` passes, then waits at most one more grace for the leader to go.
+/// SIGTERMs a timed-out hook's process group and SIGKILLs whatever is left of
+/// it once `grace` passes, then waits at most one more grace for the leader.
 async fn terminate_hook_group(
     pid: Option<u32>,
     grace: Duration,
     child: &mut tokio::process::Child,
 ) {
     signal_hook_group(pid, nix::sys::signal::Signal::SIGTERM);
-    let exited = tokio::time::timeout(grace, child.wait()).await.is_ok();
-    // Also after a prompt exit: the leader dying on SIGTERM can leave
-    // descendants that ignored it.
+    let deadline = tokio::time::Instant::now() + grace;
+    let leader_exited = tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .is_ok();
+    // A descendant cleaning up on SIGTERM keeps the grace its leader did not need.
+    if leader_exited && hook_group_exits_by(pid, deadline).await {
+        return;
+    }
     signal_hook_group(pid, nix::sys::signal::Signal::SIGKILL);
-    if !exited {
+    if !leader_exited {
         let _ = tokio::time::timeout(grace, child.wait()).await;
     }
 }
 
+/// Whether the group of a reaped leader empties by `deadline`.
+async fn hook_group_exits_by(pid: Option<u32>, deadline: tokio::time::Instant) -> bool {
+    loop {
+        if !hook_group_has_members(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + HOOK_GROUP_POLL_INTERVAL).min(deadline),
+        )
+        .await;
+    }
+}
+
+fn hook_group_has_members(pid: Option<u32>) -> bool {
+    let Some(pgid) = hook_group_id(pid) else {
+        return false;
+    };
+    !matches!(
+        nix::sys::signal::killpg(pgid, None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
 fn signal_hook_group(pid: Option<u32>, signal: nix::sys::signal::Signal) {
-    // Pid 0 and 1 would address our own group and init; a hook is neither.
-    let Some(pid) = pid
-        .filter(|pid| *pid > 1)
-        .and_then(|pid| i32::try_from(pid).ok())
-    else {
+    let Some(pgid) = hook_group_id(pid) else {
         return;
     };
     // ESRCH: the group is already gone.
-    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal);
+    let _ = nix::sys::signal::killpg(pgid, signal);
+}
+
+fn hook_group_id(pid: Option<u32>) -> Option<nix::unistd::Pid> {
+    // Pid 0 and 1 would address our own group and init; a hook is neither.
+    pid.filter(|pid| *pid > 1)
+        .and_then(|pid| i32::try_from(pid).ok())
+        .map(nix::unistd::Pid::from_raw)
 }
 
 /// Context for the job-submission hook. Feeds env twins and the audit line;
@@ -886,7 +939,7 @@ mod tests {
             script.to_str().unwrap(),
             &test_ctx(),
             Duration::from_secs(60),
-            |pid| {
+            |pid, _| {
                 let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)));
                 reported.set(Some((pid, pgid)));
             },
@@ -905,7 +958,7 @@ mod tests {
             script.to_str().unwrap(),
             &test_ctx(),
             Duration::from_secs(60),
-            |_| {},
+            |_, _| {},
         )
         .await
         .unwrap_err()
@@ -927,7 +980,7 @@ mod tests {
             script.to_str().unwrap(),
             &test_ctx(),
             Duration::from_secs(1),
-            |_| {},
+            |_, _| {},
         )
         .await
         .unwrap_err()
@@ -945,14 +998,16 @@ mod tests {
             "trap '' TERM\nsleep 300 &\necho $! > {}\nwait",
             pidfile.display()
         ));
-        let bound = HookBound {
-            timeout: Duration::from_secs(1),
-            kill_grace: Duration::from_millis(100),
-        };
-        let err = run_hook_with(script.to_str().unwrap(), &test_ctx(), Some(bound), |_| {})
-            .await
-            .unwrap_err()
-            .to_string();
+        let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
+        let err = run_hook_with(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Some(bound),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("timed out"), "unexpected error: {err}");
         assert!(!process_is_running(pid_recorded_in(&pidfile)));
     }
@@ -967,14 +1022,16 @@ mod tests {
             "setsid sleep 60 &\necho $! > {}\nwait",
             pidfile.display()
         ));
-        let bound = HookBound {
-            timeout: Duration::from_secs(1),
-            kill_grace: Duration::from_millis(100),
-        };
-        let err = run_hook_with(script.to_str().unwrap(), &test_ctx(), Some(bound), |_| {})
-            .await
-            .unwrap_err()
-            .to_string();
+        let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
+        let err = run_hook_with(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Some(bound),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("timed out"), "unexpected error: {err}");
 
         let escaped = pid_recorded_in(&pidfile);
@@ -1001,7 +1058,7 @@ mod tests {
             script.to_str().unwrap(),
             &test_ctx(),
             Duration::from_secs(60),
-            |_| {},
+            |_, _| {},
         )
         .await;
         let _ = nix::sys::signal::kill(
@@ -1009,6 +1066,55 @@ mod tests {
             nix::sys::signal::Signal::SIGKILL,
         );
         result.expect("a hook that exited 0 succeeded, whatever it left running");
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn bounded_hook_exports_the_group_token_it_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("token");
+        let script = make_script(&format!(
+            "echo \"${HOOK_GROUP_TOKEN_ENV}\" > {}",
+            seen.display()
+        ));
+        let reported = std::cell::RefCell::new(String::new());
+        run_hook_bounded(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Duration::from_secs(60),
+            |_, token| *reported.borrow_mut() = token.to_owned(),
+        )
+        .await
+        .unwrap();
+        let reported = reported.into_inner();
+        assert!(!reported.is_empty());
+        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), reported);
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn bounded_hook_timeout_lets_a_descendant_finish_cleanup_after_its_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cleaned_up = dir.path().join("cleaned-up");
+        // The leader dies on SIGTERM at once; the subshell's cleanup takes a second.
+        let script = make_script(&format!(
+            "(trap 'sleep 1; touch {}; exit 0' TERM; while :; do sleep 0.1; done) &\nexec sleep 300",
+            cleaned_up.display()
+        ));
+        let err = run_hook_bounded(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Duration::from_secs(1),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(
+            cleaned_up.exists(),
+            "a descendant still inside its SIGTERM grace must not be SIGKILLed"
+        );
     }
 
     #[tokio::test]

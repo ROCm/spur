@@ -28,22 +28,12 @@ pub(crate) enum TeardownPhase {
     Epilog,
 }
 
-/// A hook's leader, identified by start time as well as pid so a recycled pid
-/// is never mistaken for it. The hook leads its own process group, so the pid
-/// is also the group id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A bounded hook's process group: its id, which is the leader's pid, and the
+/// [`spur_core::hooks::HOOK_GROUP_TOKEN_ENV`] its members inherit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HookProcess {
     pub pid: u32,
-    pub start_ticks: u64,
-}
-
-impl HookProcess {
-    pub(crate) fn of(pid: u32) -> io::Result<Self> {
-        Ok(Self {
-            pid,
-            start_ticks: crate::stepd::process_start_ticks(pid)?,
-        })
-    }
+    pub group_token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,12 +140,17 @@ pub(crate) fn clear(session_dir: &Path) -> io::Result<()> {
 pub(crate) fn kill_orphaned_hook(hook: &HookProcess) -> bool {
     // Pid 0 and 1 would address the caller's own group and init. The pid
     // comes from the lease file, not from a process this function spawned.
-    if hook.pid <= 1 || !names_the_hooks_group(hook) {
-        return false;
-    }
-    let Ok(pgid) = i32::try_from(hook.pid) else {
+    let Some(pgid) = i32::try_from(hook.pid).ok().filter(|pgid| *pgid > 1) else {
         return false;
     };
+    match is_the_hooks_group(hook) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(pid = hook.pid, %error, "cannot tell whether an orphaned epilog is still running");
+            return false;
+        }
+    }
     match nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pgid),
         nix::sys::signal::Signal::SIGKILL,
@@ -169,14 +164,46 @@ pub(crate) fn kill_orphaned_hook(hook: &HookProcess) -> bool {
     }
 }
 
-/// Whether the hook's pid still identifies its process group. Linux does not
-/// hand out a pid while a group of that id has members, so once the leader is
-/// gone the id can only name the hook's leftover children, or nothing.
-fn names_the_hooks_group(hook: &HookProcess) -> bool {
-    match crate::stepd::process_start_ticks(hook.pid) {
-        Ok(start_ticks) => start_ticks == hook.start_ticks,
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
+/// Whether a live member of group `hook.pid` carries the hook's token. A group
+/// whose members all dropped it is spared: leaving it running beats killing
+/// an unrelated group that reused the id.
+pub(crate) fn is_the_hooks_group(hook: &HookProcess) -> io::Result<bool> {
+    if hook.group_token.is_empty() {
+        return Ok(false);
     }
+    let marker = format!(
+        "{}={}",
+        spur_core::hooks::HOOK_GROUP_TOKEN_ENV,
+        hook.group_token
+    );
+    for entry in fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        if process_group(pid) == Some(hook.pid) && environment_contains(pid, &marker) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn process_group(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    // After the command: state, ppid, then the process group id.
+    fields.split_ascii_whitespace().nth(2)?.parse().ok()
+}
+
+fn environment_contains(pid: u32, entry: &str) -> bool {
+    fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| {
+        environ
+            .split(|byte| *byte == 0)
+            .any(|variable| variable == entry.as_bytes())
+    })
 }
 
 #[cfg(test)]
@@ -264,7 +291,7 @@ mod tests {
             .unwrap()
             .with_hook(HookProcess {
                 pid: 4242,
-                start_ticks: 7,
+                group_token: "token".into(),
             });
         grant(dir.path(), &epilog).unwrap();
         assert_eq!(read(dir.path()).unwrap(), Some(epilog));
@@ -290,31 +317,41 @@ mod tests {
         assert_eq!(read(dir.path()).unwrap(), Some(lease_expiring_at(5)));
     }
 
-    fn spawn_group_leader(script: &str) -> Child {
-        Command::new("sh")
+    /// A group led by `sh -c script`, whose members carry `group_token`.
+    fn spawn_group(script: &str, group_token: &str) -> (Child, HookProcess) {
+        let leader = Command::new("sh")
             .args(["-c", script])
+            .env(spur_core::hooks::HOOK_GROUP_TOKEN_ENV, group_token)
             .process_group(0)
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap()
+            .unwrap();
+        let hook = HookProcess {
+            pid: leader.id(),
+            group_token: group_token.into(),
+        };
+        (leader, hook)
     }
 
     fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
         std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
     }
 
+    fn is_running(pid: u32) -> bool {
+        crate::stepd::process_start_ticks(pid)
+            .is_ok_and(|ticks| crate::stepd::process_is_live(pid, ticks))
+    }
+
     #[test]
     fn killing_an_orphaned_hook_ends_its_whole_group() {
-        let mut leader = spawn_group_leader("exec sleep 300");
-        let hook = HookProcess::of(leader.id()).unwrap();
+        let (mut leader, hook) = spawn_group("exec sleep 300", "orphaned-hook");
         assert!(kill_orphaned_hook(&hook));
         assert!(killed_by_sigkill(leader.wait().unwrap()));
     }
 
     #[test]
     fn a_hook_whose_leader_exited_still_has_its_children_killed() {
-        let mut leader = spawn_group_leader("sleep 300 &");
-        let hook = HookProcess::of(leader.id()).unwrap();
+        let (mut leader, hook) = spawn_group("sleep 300 &", "leaderless-hook");
         let mut held_by_child = leader.stdout.take().unwrap();
         leader.wait().unwrap();
 
@@ -325,12 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn a_recycled_pid_is_not_mistaken_for_the_hook() {
-        let mut stranger = spawn_group_leader("exec sleep 300");
-        let hook = HookProcess {
-            start_ticks: HookProcess::of(stranger.id()).unwrap().start_ticks + 1,
-            ..HookProcess::of(stranger.id()).unwrap()
-        };
+    fn a_group_without_the_hooks_token_is_spared() {
+        let (mut stranger, mut hook) = spawn_group("exec sleep 300", "a-strangers-token");
+        hook.group_token = "the-hooks-token".into();
         assert!(!kill_orphaned_hook(&hook));
         assert!(stranger.try_wait().unwrap().is_none());
         stranger.kill().unwrap();
@@ -338,9 +372,35 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_lease_spares_a_group_that_reused_its_id_after_the_leader_was_reaped() {
+        let (mut replacement, mut hook) =
+            spawn_group("sleep 300 > /dev/null & echo $!", "a-strangers-token");
+        let mut output = String::new();
+        replacement
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        replacement.wait().unwrap();
+        let survivor: u32 = output.trim().parse().unwrap();
+        hook.group_token = "the-hooks-token".into();
+
+        assert!(!kill_orphaned_hook(&hook));
+        assert!(
+            is_running(survivor),
+            "the reused group must be left running"
+        );
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn a_hook_whose_whole_group_is_gone_is_not_signalled() {
-        let mut leader = spawn_group_leader("exec sleep 300");
-        let hook = HookProcess::of(leader.id()).unwrap();
+        let (mut leader, hook) = spawn_group("exec sleep 300", "finished-hook");
         leader.kill().unwrap();
         leader.wait().unwrap();
         assert!(!kill_orphaned_hook(&hook));

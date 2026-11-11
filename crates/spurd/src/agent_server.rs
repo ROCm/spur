@@ -1355,7 +1355,7 @@ async fn run_completion_hooks_and_report(
                 epilog_script,
                 &ctx,
                 hooks.epilog_timeout(),
-                |_| {},
+                |_, _| {},
             )
             .await
             {
@@ -1750,12 +1750,9 @@ fn spawn_wedged_stepd_force_reclaim(
 /// How often a deferred reclaim re-reads the supervisor's lease and liveness.
 const LEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Defers the force-reclaim while the supervisor's teardown lease is unexpired
-/// (an unreadable one for a window), then for a window after it drops it to
-/// report. Never defers past [`crate::teardown_lease::longest_hold`].
-///
-/// Returns whether to proceed. `false` means the supervisor finished or died
-/// meanwhile, or the attempt was superseded, so there is nothing left to kill.
+/// Defers the force-reclaim while the supervisor holds a teardown lease, and
+/// briefly after it drops one, never past [`crate::teardown_lease::longest_hold`].
+/// `false`: the supervisor finished, died, or was superseded meanwhile.
 async fn await_lease_expiry(
     context: &CompletionListenerContext,
     descriptor: &crate::stepd::StepdDescriptor,
@@ -2660,27 +2657,27 @@ fn drain_for(reason: &str) -> DrainRequest {
 }
 
 /// The drain a lost supervisor's completion carries, every time it is
-/// reported. The node epilog is what readies a node for its next job, so one
-/// that never confirmed keeps the node out of service until an operator looks.
+/// reported. A ledger that cannot be settled drains too: nothing then shows
+/// the node epilog, which readies the node for its next job, ever finished.
 fn settle_lost_teardown(
     store: &crate::stepd::StepdStore,
     descriptor: &crate::stepd::StepdDescriptor,
 ) -> Option<DrainRequest> {
     let (job_id, run_attempt) = (descriptor.job_id, descriptor.run_attempt);
-    if let Err(error) = store.settle_interrupted_teardown(descriptor) {
-        warn!(job_id, run_attempt, %error,
-            "failed to settle a teardown the lost stepd left unfinished");
-    }
     let outcome = store
-        .epilog_outcome(job_id, run_attempt, descriptor.step_id)
-        .unwrap_or_else(|error| {
-            warn!(job_id, run_attempt, %error, "cannot read the epilog outcome a lost stepd recorded");
-            None
-        });
-    match outcome? {
-        crate::stepd::EpilogOutcome::Succeeded => None,
-        crate::stepd::EpilogOutcome::ScriptFailed => Some(drain_for(EPILOG_FAILED_DRAIN_REASON)),
-        crate::stepd::EpilogOutcome::SupervisorLost => {
+        .settle_interrupted_teardown(descriptor)
+        .and_then(|_| store.epilog_outcome(job_id, run_attempt, descriptor.step_id));
+    match outcome {
+        Ok(None | Some(crate::stepd::EpilogOutcome::Succeeded)) => None,
+        Ok(Some(crate::stepd::EpilogOutcome::ScriptFailed)) => {
+            Some(drain_for(EPILOG_FAILED_DRAIN_REASON))
+        }
+        Ok(Some(crate::stepd::EpilogOutcome::SupervisorLost)) => {
+            Some(drain_for(TEARDOWN_INTERRUPTED_DRAIN_REASON))
+        }
+        Err(error) => {
+            warn!(job_id, run_attempt, %error,
+                "cannot settle the teardown a lost stepd left; draining its node");
             Some(drain_for(TEARDOWN_INTERRUPTED_DRAIN_REASON))
         }
     }
@@ -13946,8 +13943,8 @@ mod tests {
         );
     }
 
-    // Lost before it recorded an exit, the supervisor never began teardown,
-    // so there is nothing the node is still owed.
+    // The node epilog runs only after a real exit is recorded, so a supervisor
+    // lost before one never left it unfinished.
     #[tokio::test]
     async fn fencing_a_stepd_lost_before_it_recorded_an_exit_does_not_drain() {
         let (controller_addr, reports, _drains) = spawn_mock_controller();
@@ -13961,8 +13958,8 @@ mod tests {
         assert!(reports[0].drain_reason.is_empty());
     }
 
-    // TaskEpilog and the cgroup reap run before any lease is granted; a
-    // supervisor lost there still never ran the node epilog.
+    // A supervisor lost outside a leased phase, such as in TaskEpilog, leaves
+    // no lease; its recorded exit alone shows the epilog never confirmed.
     #[tokio::test]
     async fn fencing_a_stepd_lost_after_its_exit_drains_without_a_lease() {
         let (controller_addr, reports, _drains) = spawn_mock_controller();
@@ -13987,16 +13984,53 @@ mod tests {
         assert_eq!(reports[0].drain_reason, TEARDOWN_INTERRUPTED_DRAIN_REASON);
     }
 
+    // Root ignores file modes, so a corrupt ledger stands in for one that
+    // cannot be written: either way the settlement cannot be recorded.
+    #[tokio::test]
+    async fn fencing_a_stepd_whose_teardown_cannot_be_settled_still_drains() {
+        use std::io::Write;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session = store
+            .prepare_session_dir(42, 7, spur_core::step::STEP_BATCH)
+            .expect("session directory");
+        store
+            .obligations(42, 7, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+                synthesized: false,
+            })
+            .expect("record the exit");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(session.join(crate::stepd::OBLIGATION_FILE))
+            .and_then(|mut ledger| ledger.write_all(b"not an obligation\n"))
+            .expect("corrupt the ledger");
+
+        fence_against_controller(controller_addr, &store).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].drain_reason, TEARDOWN_INTERRUPTED_DRAIN_REASON);
+    }
+
     /// A dead supervisor's session whose node epilog was still running: the
     /// returned child is that epilog, left behind in its own process group.
     /// The epilog readies the node for its next job, so the node must drain.
     fn session_lost_mid_epilog(
         store: &crate::stepd::StepdStore,
     ) -> (crate::stepd::StepdDescriptor, std::process::Child) {
+        const GROUP_TOKEN: &str = "orphaned-epilog";
         let descriptor = fenced_session(store);
         let mut orphan = std::process::Command::new("sleep");
         std::os::unix::process::CommandExt::process_group(&mut orphan, 0);
-        let orphan = orphan.arg("300").spawn().expect("spawn orphaned epilog");
+        let orphan = orphan
+            .arg("300")
+            .env(spur_core::hooks::HOOK_GROUP_TOKEN_ENV, GROUP_TOKEN)
+            .spawn()
+            .expect("spawn orphaned epilog");
         store
             .obligations(42, 7, spur_core::step::STEP_BATCH)
             .append(&crate::stepd::StepdObligation::ExitObserved {
@@ -14010,7 +14044,10 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .expect("lease")
-        .with_hook(crate::teardown_lease::HookProcess::of(orphan.id()).expect("identify epilog"));
+        .with_hook(crate::teardown_lease::HookProcess {
+            pid: orphan.id(),
+            group_token: GROUP_TOKEN.into(),
+        });
         crate::teardown_lease::grant(
             &store.session_dir(
                 descriptor.job_id,

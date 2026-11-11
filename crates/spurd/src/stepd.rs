@@ -484,7 +484,7 @@ pub async fn reclaim_pty_master(
     })
 }
 
-const OBLIGATION_FILE: &str = "obligations.jsonl";
+pub(crate) const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
 /// Oldest session format this build still adopts. Raise it only when a change
@@ -587,8 +587,8 @@ pub enum StepdObligation {
     ExitObserved {
         exit_code: i32,
         signal: i32,
-        /// Recorded by the agent for a supervisor it lost before the
-        /// supervisor recorded an exit, so that supervisor never began teardown.
+        /// Recorded by the agent for a supervisor lost before it recorded an
+        /// exit of its own.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         synthesized: bool,
     },
@@ -2499,8 +2499,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             signal |= spur_core::job::OOM_SIGNAL_FLAG;
         }
     }
-    // Record the exit before teardown: cleanup, the epilog, and SPANK are
-    // unbounded operator code, and a crash in them must not read as "never ran".
+    // Record the exit before teardown: a supervisor lost from here on drains
+    // its node unless the epilog outcome was recorded too.
     obligations.append(&StepdObligation::ExitObserved {
         exit_code,
         signal,
@@ -2517,17 +2517,26 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     let epilog_failed = match epilog {
         Some(epilog) => {
-            match spur_core::hooks::run_hook_bounded(epilog, &hook_context, epilog_timeout, |pid| {
-                // Restart the deadline at spawn. The timeout clock starts now,
-                // and the lease granted above has already spent the time it
-                // took to exec.
-                grant_teardown_lease(
-                    &session_dir,
-                    TeardownPhase::Epilog,
-                    epilog_window,
-                    Some(pid),
-                )
-            })
+            match spur_core::hooks::run_hook_bounded(
+                epilog,
+                &hook_context,
+                epilog_timeout,
+                |pid, group_token| {
+                    // Restart the deadline at spawn. The timeout clock starts now,
+                    // and the lease granted above has already spent the time it
+                    // took to exec.
+                    let hook = teardown_lease::HookProcess {
+                        pid,
+                        group_token: group_token.to_owned(),
+                    };
+                    grant_teardown_lease(
+                        &session_dir,
+                        TeardownPhase::Epilog,
+                        epilog_window,
+                        Some(hook),
+                    )
+                },
+            )
             .await
             {
                 Err(error) => {
@@ -2594,7 +2603,7 @@ fn grant_teardown_lease(
     session_dir: &Path,
     phase: TeardownPhase,
     window: std::time::Duration,
-    hook_pid: Option<u32>,
+    hook: Option<teardown_lease::HookProcess>,
 ) {
     let mut lease = match TeardownLease::new(phase, window) {
         Ok(lease) => lease,
@@ -2603,16 +2612,8 @@ fn grant_teardown_lease(
             return;
         }
     };
-    if let Some(pid) = hook_pid {
-        match teardown_lease::HookProcess::of(pid) {
-            Ok(hook) => lease = lease.with_hook(hook),
-            Err(error) => tracing::warn!(
-                session = %session_dir.display(),
-                pid,
-                %error,
-                "cannot identify the epilog process; the lease will not name it"
-            ),
-        }
+    if let Some(hook) = hook {
+        lease = lease.with_hook(hook);
     }
     if let Err(error) = teardown_lease::grant(session_dir, &lease) {
         tracing::warn!(session = %session_dir.display(), %error, "cannot grant a teardown lease");
@@ -3311,10 +3312,8 @@ impl StepdStore {
         Ok(outcome.is_some_and(|outcome| outcome != EpilogOutcome::Succeeded))
     }
 
-    /// The lease a supervisor still holds on its teardown. None once the
-    /// ledger records the epilog outcome, even if the lease file outlived it.
-    /// A lease with no exit recorded still counts: a supervisor whose run
-    /// failed tears its cgroup down without recording one.
+    /// The supervisor's lease until the ledger records an epilog outcome. It
+    /// counts with no exit recorded: a failed run tears down without one.
     pub(crate) fn unfinished_teardown_lease(
         &self,
         job_id: u32,
@@ -3331,9 +3330,9 @@ impl StepdStore {
         teardown_lease::read(&self.session_dir(job_id, run_attempt, step_id))
     }
 
-    /// For a supervisor lost between recording the exit and the epilog outcome,
-    /// kills any epilog it left running and records the loss so every report,
-    /// replays included, drains. `Ok(false)`: nothing to settle, or not provably gone.
+    /// Kills the epilog a supervisor lost mid-teardown left running and records
+    /// the loss, so every report drains. `Ok(false)`: nothing to settle, or
+    /// the supervisor is not provably lost.
     pub fn settle_interrupted_teardown(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
         let (job_id, run_attempt, step_id) = (
             descriptor.job_id,
@@ -5025,10 +5024,16 @@ mod tests {
         assert_eq!(pending[0].job_id, 11);
     }
 
+    const ORPHANED_EPILOG_TOKEN: &str = "orphaned-epilog";
+
     fn spawn_orphaned_epilog() -> std::process::Child {
         use std::os::unix::process::CommandExt;
         std::process::Command::new("sleep")
             .arg("300")
+            .env(
+                spur_core::hooks::HOOK_GROUP_TOKEN_ENV,
+                ORPHANED_EPILOG_TOKEN,
+            )
             .process_group(0)
             .spawn()
             .expect("spawn the epilog stand-in")
@@ -5065,9 +5070,10 @@ mod tests {
         let lease = TeardownLease::new(phase, std::time::Duration::from_secs(300))
             .expect("lease for the test");
         match hook {
-            Some(hook) => lease.with_hook(
-                teardown_lease::HookProcess::of(hook.id()).expect("identify the epilog"),
-            ),
+            Some(hook) => lease.with_hook(teardown_lease::HookProcess {
+                pid: hook.id(),
+                group_token: ORPHANED_EPILOG_TOKEN.into(),
+            }),
             None => lease,
         }
     }
@@ -6403,8 +6409,11 @@ mod tests {
         }
         let lease = leased.expect("the supervisor leases its node while the epilog runs");
         assert_eq!(lease.phase, TeardownPhase::Epilog);
-        let hook = lease.hook.expect("the lease names the epilog's leader");
-        assert!(process_is_live(hook.pid, hook.start_ticks));
+        let hook = lease
+            .hook
+            .clone()
+            .expect("the lease names the epilog's leader");
+        assert!(teardown_lease::is_the_hooks_group(&hook).expect("scan for the epilog"));
         assert_eq!(
             nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(hook.pid as i32)))
                 .expect("group of the epilog")
@@ -6430,7 +6439,7 @@ mod tests {
             None,
             "a finished teardown must not keep the node leased"
         );
-        assert!(!process_is_live(hook.pid, hook.start_ticks));
+        assert!(!teardown_lease::is_the_hooks_group(&hook).expect("scan for the epilog"));
     }
 
     struct ExitedTerminal {
