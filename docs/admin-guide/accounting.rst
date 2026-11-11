@@ -352,7 +352,9 @@ accepted as ``association``. The account row has a blank ``User``. Filter by
 
 With ``private_data = ["accounts"]``, a User who coordinates no account gets
 the user rows without the account rows, because account definitions are visible
-only to coordinators (see `Show accounts`_).
+only to coordinators (see `Show accounts`_). If the controller cannot list
+accounts yet (for example, while it is still loading after a restart), the user
+rows still print, and a warning on stderr says the account rows were omitted.
 
 .. code-block:: bash
 

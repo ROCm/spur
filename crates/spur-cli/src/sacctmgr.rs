@@ -1053,16 +1053,20 @@ fn build_modify_user_request(
 /// Modify shares `add`'s upsert RPCs, but sends only the restated fields
 /// (proto3 presence) so the server preserves every unstated column.
 async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let p = parse_params(params);
+    let entity = entity.to_lowercase();
+    let p = if entity == "account" {
+        parse_modify_account_params(params)?
+    } else {
+        parse_params(params)
+    };
 
     // rawusage= is a separate RPC, not part of the normal upsert.
     if let Some(raw) = p.get("rawusage") {
-        return modify_raw_usage(entity, &p, raw, addr).await;
+        return modify_raw_usage(&entity, &p, raw, addr).await;
     }
 
-    match entity.to_lowercase().as_str() {
+    match entity.as_str() {
         "account" => {
-            let p = parse_modify_account_params(params)?;
             let req = build_modify_account_request(&p)?;
             let name = req.name.clone();
             let mut client = connect(addr).await?;
@@ -1074,7 +1078,6 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
-            let p = parse_params(params);
             let req = build_modify_qos_request(&p)?;
             let name = req.name.clone();
             let mut client = connect(addr).await?;
@@ -1086,7 +1089,6 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let p = parse_params(params);
             let req = build_modify_user_request(&p)?;
             let name = req.user.clone();
             let mut client = connect(addr).await?;
@@ -1161,7 +1163,8 @@ async fn modify_raw_usage(
 }
 
 /// Accept Slurm's positional account selector in `modify account <name> set ...`
-/// without changing the generic key/value grammar used by other entities.
+/// without changing the generic key/value grammar used by other entities. A
+/// leading account key is the space-separated `key value` form, not a name.
 fn parse_modify_account_params(
     params: &[String],
 ) -> Result<std::collections::HashMap<String, String>> {
@@ -1169,6 +1172,7 @@ fn parse_modify_account_params(
         !param.contains('=')
             && !param.eq_ignore_ascii_case("where")
             && !param.eq_ignore_ascii_case("set")
+            && !ACCOUNT_KEYS.contains(&param.to_lowercase().as_str())
     }) else {
         return Ok(parse_params(params));
     };
@@ -1653,6 +1657,8 @@ async fn load_association_accounts(
 /// Account rows are an addition to the user rows. A caller the controller
 /// denies the account list (`private_data = ["accounts"]`, coordinating
 /// nothing) still gets their user rows, just without the account definitions.
+/// `Unavailable` covers both the controller's cache-loading fence and a lost
+/// transport, which the CLI cannot tell apart, so the omission is reported.
 fn visible_association_accounts(
     listed: Result<tonic::Response<ListAccountsResponse>, tonic::Status>,
     account_filter: &str,
@@ -1665,6 +1671,10 @@ fn visible_association_accounts(
             .filter(|a| account_filter.is_empty() || a.name == account_filter)
             .collect()),
         Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(Vec::new()),
+        Err(status) if status.code() == tonic::Code::Unavailable => {
+            eprintln!("sacctmgr: account rows omitted: {}", status.message());
+            Ok(Vec::new())
+        }
         Err(status) => Err(status).context("ListAccounts RPC failed"),
     }
 }
@@ -2364,11 +2374,18 @@ mod tests {
     }
 
     #[test]
-    fn association_accounts_surface_other_failures() {
+    fn association_accounts_are_dropped_while_the_controller_is_unavailable() {
         let loading = Err(tonic::Status::unavailable(
             "association cache is still loading",
         ));
-        let err = visible_association_accounts(loading, "").unwrap_err();
+        let accounts = visible_association_accounts(loading, "").expect("user rows still print");
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn association_accounts_surface_other_failures() {
+        let failed = Err(tonic::Status::internal("database error"));
+        let err = visible_association_accounts(failed, "").unwrap_err();
         assert!(
             format!("{err:#}").contains("ListAccounts RPC failed"),
             "unexpected error: {err:#}"
@@ -2411,6 +2428,29 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("specified both"));
+    }
+
+    #[test]
+    fn modify_account_keeps_the_space_separated_key_value_form() {
+        let p = parse_modify_account_params(&[
+            "fairshare".into(),
+            "80".into(),
+            "where".into(),
+            "name=ml".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.get("name").map(String::as_str), Some("ml"));
+        assert_eq!(p.get("fairshare").map(String::as_str), Some("80"));
+
+        let p = parse_modify_account_params(&[
+            "name".into(),
+            "ml".into(),
+            "set".into(),
+            "qos=normal".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.get("name").map(String::as_str), Some("ml"));
+        assert_eq!(p.get("qos").map(String::as_str), Some("normal"));
     }
 
     #[test]
@@ -4220,6 +4260,24 @@ mod tests {
         assert!(
             err.to_string().contains("not supported for 'user'"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_account_rawusage_accepts_a_positional_name() {
+        // Port 1 is closed: a resolved name fails while connecting, a missing
+        // one fails earlier with "name= required".
+        let err = modify(
+            "account",
+            &["physics".into(), "set".into(), "rawusage=0".into()],
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("port 1 is closed");
+
+        assert!(
+            err.to_string().contains("failed to connect"),
+            "positional name must reach rawusage, got: {err}"
         );
     }
 
