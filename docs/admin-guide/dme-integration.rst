@@ -147,7 +147,7 @@ of writing it:
 ``SPUR_JOB_GPUS`` uses the same numbering as the job's own
 ``ROCR_VISIBLE_DEVICES``, and the prolog and epilog of a job see the same list.
 
-Upgrading from Spur 0.13.0 through 0.16.x
+Upgrading from Spur 0.13.0 through 0.16.0
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Those releases passed internal GPU ids in the hook's ``SPUR_JOB_GPUS``, so
