@@ -29,3 +29,4 @@ pub mod spec;
 pub mod step_completion;
 pub mod stepd;
 pub(crate) mod task_hook;
+pub mod task_launcher;

@@ -3712,8 +3712,11 @@ name = "spur-stepd"
 version = "0.16.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "serde_json",
  "spur-core",
  "spurd",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
