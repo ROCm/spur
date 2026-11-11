@@ -2929,9 +2929,9 @@ Epilog timeout
      - ``120``
      - Agent restart (new jobs)
      - Seconds the compute-node ``epilog`` may run, from 1 to 86400. At the
-       limit its whole process group gets ``SIGTERM``, then ``SIGKILL`` 5
-       seconds later. A timed-out epilog counts as a failed one. A running job
-       keeps the value captured at launch.
+       limit its whole process group gets ``SIGTERM``, and whatever remains of
+       the group 5 seconds later gets ``SIGKILL``. A timed-out epilog counts
+       as a failed one. A running job keeps the value captured at launch.
 
 Slurm leaves ``PrologEpilogTimeout`` unset, so its epilog may run forever.
 Spur bounds it because a job's node stays held until its epilog ends. The
@@ -2940,9 +2940,14 @@ running in the background does not hold the node, and its ``stderr`` is logged
 for one more second.
 
 A cancelled or finished job's node is not released while its teardown is
-still running. The node agent normally force-reclaims a job's supervisor 30
-seconds after a cancel. A supervisor waiting for its cgroup to empty, or
-running the node epilog, holds a lease that defers that reclaim:
+still running, with one exception after a ``spurd`` restart: a supervisor the
+restarted agent re-adopts has its job reported complete once the workload
+exits, possibly before its epilog runs. That node can be released mid-epilog,
+and an epilog failure may not drain it.
+
+The node agent normally force-reclaims a job's supervisor 30 seconds after a
+cancel. A supervisor waiting for its cgroup to empty, or running the node
+epilog, holds a lease that defers that reclaim:
 
 - The cleanup lease lasts what remains of ``[cgroup] cleanup_timeout_secs``,
   plus 30 seconds for rootfs and spool removal.
@@ -2968,7 +2973,14 @@ another job. The drain reason is one of:
    recorded the job's exit, then was lost (crashed, or force-reclaimed) before
    recording the epilog result. This covers every stage of teardown, including
    ``task_epilog``, the cgroup wait, and the epilog itself. If the epilog was
-   running, its orphaned process group is killed first.
+   running, its orphaned process group is killed first. The node also drains
+   with this reason when the agent cannot read or update the lost
+   supervisor's teardown record; the ``spurd`` log has the error.
+
+The agent recognizes an orphaned epilog's process group by the random
+``SPUR_HOOK_GROUP_TOKEN`` each epilog run receives in its environment. A
+group none of whose processes still carry it is left running, since the agent
+cannot tell it from an unrelated group that reused the ID.
 
 ``task_epilog`` has no timeout, as in Slurm. If a batch step's
 ``task_epilog`` is still running when its supervisor is force-reclaimed after a

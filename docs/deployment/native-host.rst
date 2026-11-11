@@ -584,9 +584,11 @@ to new jobs after the agent restarts.
 The node ``epilog`` is part of that teardown. While a job's supervisor is
 waiting for its cgroup to empty or running the epilog, it holds a lease that
 stops the agent from force-killing it, so a cancelled job's node is not handed
-back mid-epilog. The epilog is bounded by ``[hooks] epilog_timeout_secs``
-(default 120 seconds): its process group is terminated at the limit and the
-node is drained.
+back mid-epilog. The exception is a supervisor re-adopted after a ``spurd``
+restart: its job can be reported complete before its epilog runs, so its node
+can be released mid-epilog. The epilog is bounded by
+``[hooks] epilog_timeout_secs`` (default 120 seconds): its process group is
+terminated at the limit and the node is drained.
 A supervisor lost after the job exits but before its epilog finishes has any
 orphaned epilog killed and its node drained. See
 :ref:`the epilog timeout <epilog-timeout>` for the drain reasons and how this
