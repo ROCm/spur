@@ -197,19 +197,26 @@ class TestSupervisorLostMidEpilog:
         )
         assert job_id is not None
         _wait_marker(cluster, f"epilog-start-{job_id}")
+        # Await the epilog's child first: once the supervisor dies, the agent
+        # may kill it at once, leaving no window to observe the orphan.
+        wait_until(
+            lambda: _surviving(cluster, marker),
+            timeout_s=30,
+            interval_s=1,
+            desc="the epilog's child",
+        )
 
         supervisors = cluster.nodes[0].exec_allow_fail("pgrep -x spurstepd || true").split()
         assert supervisors, "a job in its epilog must still have a supervisor"
-        cluster.nodes[0].exec(f"sudo kill -9 {' '.join(supervisors)}")
-        assert _surviving(cluster, marker), (
-            "killing the supervisor must leave the epilog orphaned, or this test "
-            "proves nothing"
-        )
+        cluster.nodes[0].exec(f"{cluster._sudo_prefix()}kill -9 {' '.join(supervisors)}")
 
         wait_node_state(cluster, node, ("drain",), timeout=90)
         assert TEARDOWN_INTERRUPTED in _node_reason(cluster, node)
-        assert not _surviving(cluster, marker), (
-            "the agent must kill the epilog its lost supervisor left running"
+        wait_until(
+            lambda: not _surviving(cluster, marker),
+            timeout_s=30,
+            interval_s=1,
+            desc="the agent to kill the epilog its lost supervisor left running",
         )
         state = wait_job(cluster, job_id, timeout=60)
         assert state in ("CD", "GONE", "F"), f"the job must still resolve, got {state}"
