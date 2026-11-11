@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,7 +179,11 @@ pub(super) fn spawn_loop(pool: PgPool, cluster: Arc<ClusterManager>, raft: Arc<R
             if !raft.ensure_leader().await {
                 continue;
             }
-            if let Err(error) = sync_once(&pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await
+            if let Err(error) =
+                sync_once(&pool, &cluster, &mut cursor, ExportLimits::DEFAULT, || {
+                    raft.ensure_leader()
+                })
+                .await
             {
                 tracing::warn!(%error, "preemption accounting export failed; retaining unexported jobs");
             }
@@ -223,16 +228,24 @@ fn stalled(error: &anyhow::Error) -> bool {
         .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014"))
 }
 
+async fn begin_export(
+    pool: &PgPool,
+    limits: ExportLimits,
+) -> anyhow::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(format!("{}ms", limits.lock.as_millis()))
+    .bind(format!("{}ms", limits.statement.as_millis()))
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
+}
+
 async fn save(pool: &PgPool, limits: ExportLimits, checkpoint: &Checkpoint) -> anyhow::Result<()> {
     tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
-        let mut tx = pool.begin().await?;
-        sqlx::query(
-            "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
-        )
-        .bind(format!("{}ms", limits.lock.as_millis()))
-        .bind(format!("{}ms", limits.statement.as_millis()))
-        .execute(&mut *tx)
-        .await?;
+        let mut tx = begin_export(pool, limits).await?;
         write(&mut tx, checkpoint).await?;
         tx.commit().await?;
         anyhow::Ok(())
@@ -240,12 +253,17 @@ async fn save(pool: &PgPool, limits: ExportLimits, checkpoint: &Checkpoint) -> a
     .await?
 }
 
-pub(crate) async fn sync_once(
+async fn sync_once<F, Fut>(
     pool: &PgPool,
     cluster: &ClusterManager,
     cursor: &mut ExportCursor,
     limits: ExportLimits,
-) -> anyhow::Result<()> {
+    ensure_leader: F,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
     let batch = cluster.pending_preemption_checkpoints(1000, cursor.jobs);
     let last_batch = batch.len() < 1000;
     for checkpoint in batch {
@@ -265,30 +283,46 @@ pub(crate) async fn sync_once(
     if last_batch {
         cursor.jobs = None;
     }
-    close_orphaned_checkpoints(pool, cluster, &mut cursor.orphans, limits).await
+    close_orphaned_checkpoints(pool, cluster, &mut cursor.orphans, limits, ensure_leader).await
 }
 
 /// A checkpoint still open for a job the controller no longer holds lost its final
 /// export; settle the remainder as `ended_other`/`unknown` so `Open` cannot stay stale.
-async fn close_orphaned_checkpoints(
+async fn close_orphaned_checkpoints<F, Fut>(
     pool: &PgPool,
     cluster: &ClusterManager,
     cursor: &mut Option<(i64, String)>,
     limits: ExportLimits,
-) -> anyhow::Result<()> {
-    let rows = sqlx::query(
-        "SELECT job_id, incarnation, used::text, unused::text, open::text, unused_by_cause \
-         FROM preemption_checkpoints WHERE open > 0 AND (job_id, incarnation) > ($1, $2) \
-         ORDER BY job_id, incarnation LIMIT 100",
-    )
-    .bind(cursor.as_ref().map_or(i64::MIN, |(id, _)| *id))
-    .bind(
-        cursor
-            .as_ref()
-            .map_or("", |(_, incarnation)| incarnation.as_str()),
-    )
-    .fetch_all(pool)
-    .await?;
+    ensure_leader: F,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let (after_id, after_incarnation) =
+        cursor.as_ref().map_or((i64::MIN, ""), |(id, incarnation)| {
+            (*id, incarnation.as_str())
+        });
+    let rows = tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, async {
+        let mut tx = begin_export(pool, limits).await?;
+        let rows = sqlx::query(
+            "SELECT job_id, incarnation, used::text, unused::text, open::text, unused_by_cause \
+             FROM preemption_checkpoints WHERE open > 0 AND (job_id, incarnation) > ($1, $2) \
+             ORDER BY job_id, incarnation LIMIT 100",
+        )
+        .bind(after_id)
+        .bind(after_incarnation)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        anyhow::Ok(rows)
+    })
+    .await??;
+    // Fence after the read: checkpoint submissions precede this Raft apply barrier.
+    // An absent incarnation in the caught-up state cannot subsequently become live.
+    if !rows.is_empty() && !ensure_leader().await {
+        return Ok(());
+    }
     let last_batch = rows.len() < 100;
     for row in rows {
         let raw_job_id: i64 = row.try_get("job_id")?;
@@ -327,7 +361,13 @@ async fn close_orphaned_checkpoints(
                 job_id,
                 "closed open preemption counts the controller can no longer export"
             ),
-            Err(error) if connection_failed(&error) => return Err(error),
+            Err(error)
+                if connection_failed(&error)
+                    || stalled(&error)
+                    || error.is::<tokio::time::error::Elapsed>() =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 tracing::warn!(job_id, %error, "could not close orphaned preemption counts")
             }
@@ -514,7 +554,10 @@ mod tests {
             exercise_failed_checkpoints(&pool).await?;
             exercise_timed_out_checkpoint(&pool).await?;
             exercise_orphaned_checkpoints(&pool).await?;
-            exercise_orphaned_checkpoint_pagination(&pool).await
+            exercise_orphaned_checkpoint_pagination(&pool).await?;
+            exercise_orphan_scan_timeouts(&pool).await?;
+            exercise_orphan_write_stall(&pool).await?;
+            exercise_orphan_leadership_fence(&pool).await
         }
         .await;
         pool.close().await;
@@ -529,6 +572,15 @@ mod tests {
         write(&mut tx, checkpoint).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn sync_once(
+        pool: &PgPool,
+        cluster: &ClusterManager,
+        cursor: &mut ExportCursor,
+        limits: ExportLimits,
+    ) -> anyhow::Result<()> {
+        super::sync_once(pool, cluster, cursor, limits, || async { true }).await
     }
 
     async fn query(
@@ -1014,6 +1066,201 @@ mod tests {
         assert_eq!((report.entries[0].unused, report.entries[0].open), (0, 100));
         assert_eq!((report.entries[1].unused, report.entries[1].open), (3, 0));
         assert_causes(&report.entries[1], &[("ended_other", "unknown", 3)]);
+        Ok(())
+    }
+
+    async fn exercise_orphan_scan_timeouts(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        let mut blocker = pool.begin().await?;
+        sqlx::query("LOCK TABLE preemption_checkpoints IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await?;
+        let mut cursor = ExportCursor {
+            orphans: Some((5, "legacy".into())),
+            ..Default::default()
+        };
+        for (lock_ms, statement_ms, code) in [(50, 5000, "55P03"), (5000, 50, "57014")] {
+            let limits = ExportLimits {
+                lock: Duration::from_millis(lock_ms),
+                statement: Duration::from_millis(statement_ms),
+            };
+            // More failures than pool slots must still reach the server-side timeout.
+            for _ in 0..6 {
+                let error = sync_once(pool, &cluster, &mut cursor, limits)
+                    .await
+                    .expect_err("the scan must time out on the table lock");
+                let sql = error.downcast_ref::<sqlx::Error>().unwrap();
+                assert_eq!(
+                    sql.as_database_error().unwrap().code().as_deref(),
+                    Some(code)
+                );
+                assert_eq!(cursor.orphans, Some((5, "legacy".into())));
+            }
+        }
+        blocker.rollback().await?;
+
+        let mut connections = Vec::new();
+        for _ in 0..4 {
+            connections.push(pool.acquire().await?);
+        }
+        tokio::time::pause();
+        let result = sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await;
+        tokio::time::resume();
+        assert!(result.unwrap_err().is::<tokio::time::error::Elapsed>());
+        assert_eq!(cursor.orphans, Some((5, "legacy".into())));
+        drop(connections);
+        sync_once(pool, &cluster, &mut cursor, ExportLimits::DEFAULT).await?;
+        assert_eq!(cursor.orphans, None);
+        Ok(())
+    }
+
+    async fn exercise_orphan_write_stall(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        for job_id in [1, 2] {
+            let mut job = Job::new(job_id, Default::default());
+            job.preemption_usage.open_one();
+            save(pool, &Checkpoint::from(&job)).await?;
+        }
+        let mut blocker = pool.begin().await?;
+        sqlx::query("SELECT 1 FROM preemption_checkpoints WHERE job_id = 1 FOR UPDATE")
+            .execute(&mut *blocker)
+            .await?;
+        let limits = ExportLimits {
+            lock: Duration::from_millis(50),
+            statement: Duration::from_secs(5),
+        };
+        let mut cursor = ExportCursor::default();
+        let error = sync_once(pool, &cluster, &mut cursor, limits)
+            .await
+            .unwrap_err();
+        assert!(stalled(&error));
+        assert_eq!(cursor.orphans, Some((1, "legacy".into())));
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (0, 2));
+
+        sync_once(pool, &cluster, &mut cursor, limits).await?;
+        assert_eq!(cursor.orphans, None);
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (1, 1));
+        blocker.rollback().await?;
+        for _ in 0..2 {
+            sync_once(pool, &cluster, &mut cursor, limits).await?;
+        }
+        let report = query(
+            pool,
+            GetPreemptionUsageRequest {
+                by_cause: true,
+                ..Default::default()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (2, 0));
+        assert_causes(&report.entries[0], &[("ended_other", "unknown", 2)]);
+        Ok(())
+    }
+
+    async fn exercise_orphan_leadership_fence(pool: &PgPool) -> anyhow::Result<()> {
+        use crate::raft::StateMachineApply;
+        sqlx::query(
+            "TRUNCATE preemption_checkpoints, preemption_rollups, preemption_cause_rollups",
+        )
+        .execute(pool)
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let cluster = ClusterManager::new(
+            serde_json::from_str(r#"{"cluster_name":"test"}"#)?,
+            dir.path(),
+        )?;
+        let jobs: Vec<_> = (1..=3)
+            .map(|id| {
+                let mut job = Job::new(id, Default::default());
+                job.preemption_usage.open_one();
+                job
+            })
+            .collect();
+        for job in &jobs[..2] {
+            save(pool, &Checkpoint::from(job)).await?;
+        }
+        let mut cursor = ExportCursor::default();
+        let calls = std::cell::Cell::new(0);
+        super::sync_once(
+            pool,
+            &cluster,
+            &mut cursor,
+            ExportLimits::DEFAULT,
+            || async {
+                calls.set(calls.get() + 1);
+                false
+            },
+        )
+        .await?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cursor.orphans, None);
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (0, 2));
+
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "jobs": [&jobs[0]], "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+        }))?;
+        super::sync_once(
+            pool,
+            &cluster,
+            &mut cursor,
+            ExportLimits::DEFAULT,
+            || async {
+                cluster.restore_from_snapshot(&snapshot).unwrap();
+                // A checkpoint published after the barrier must wait for the next scan.
+                save(pool, &Checkpoint::from(&jobs[2])).await.unwrap();
+                true
+            },
+        )
+        .await?;
+        let report = query(pool, Default::default(), ReadScope::All).await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (1, 2));
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "jobs": [&jobs[0], &jobs[2]], "nodes": [], "reservations": [], "steps": [], "license_pool": {}
+        }))?;
+        super::sync_once(
+            pool,
+            &cluster,
+            &mut cursor,
+            ExportLimits::DEFAULT,
+            || async {
+                cluster.restore_from_snapshot(&snapshot).unwrap();
+                true
+            },
+        )
+        .await?;
+        let report = query(
+            pool,
+            GetPreemptionUsageRequest {
+                by_cause: true,
+                ..Default::default()
+            },
+            ReadScope::All,
+        )
+        .await?;
+        assert_eq!((report.entries[0].unused, report.entries[0].open), (1, 2));
+        assert_causes(&report.entries[0], &[("ended_other", "unknown", 1)]);
         Ok(())
     }
 
