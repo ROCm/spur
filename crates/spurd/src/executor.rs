@@ -193,6 +193,9 @@ pub struct JobLaunchConfig {
     /// Isolating it would make it PID 1 of a namespace, where the kernel drops
     /// unhandled signals and nothing can then tear it down.
     pub allocation_holder: bool,
+    /// When set, the workload is the native task launcher starting these tasks,
+    /// and `script` is not run.
+    pub task_launch: Option<crate::task_launcher::TaskPlan>,
 }
 
 pub struct LaunchResult {
@@ -851,6 +854,28 @@ async fn spawn_job_process(
         // If root, wrap the job in fresh namespaces. A `--mpi=pmix` multi-rank
         // wrapper stays in the host's: its PMIx server runs outside them.
         let use_namespaces = would_use_namespaces(cfg, nix::unistd::geteuid().is_root());
+        let enable_seccomp = std::env::var("SPUR_SECCOMP")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let enable_landlock = std::env::var("SPUR_LANDLOCK")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let launcher_argv = cfg
+            .task_launch
+            .as_ref()
+            .map(|plan| {
+                crate::task_launcher::launcher_argv(
+                    &crate::stepd::resolve_stepd_executable(),
+                    &crate::task_launcher::LauncherInvocation {
+                        plan: plan.clone(),
+                        uid,
+                        gid,
+                        seccomp: enable_seccomp,
+                        landlock_work_dir: enable_landlock.then(|| work_dir.to_string()),
+                    },
+                )
+            })
+            .transpose()?;
         let (launch_cmd, launch_args) = if use_namespaces {
             let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));
             let visible_devices = cfg
@@ -858,7 +883,14 @@ async fn spawn_job_process(
                 .as_ref()
                 .map(|p| p.visible_devices.as_slice())
                 .unwrap_or(&[]);
-            let wrapper = build_namespace_wrapper(uid, gid, visible_devices, &script_path);
+            let wrapper = match &launcher_argv {
+                Some(argv) => {
+                    let launcher = shlex::try_join(argv.iter().map(String::as_str))
+                        .map_err(|e| anyhow::anyhow!("cannot quote the task launcher: {e}"))?;
+                    build_launcher_namespace_wrapper(visible_devices, &launcher)
+                }
+                None => build_namespace_wrapper(uid, gid, visible_devices, &script_path),
+            };
             write_job_scratch(&wrapper_path, &wrapper, uid, gid)
                 .map_err(|e| classify_spool_error(&spool_dir, Path::new(SPOOL_ROOT), e))?;
             debug!(job_id, "namespace isolation wrapper created");
@@ -872,12 +904,18 @@ async fn spawn_job_process(
                     wrapper_path.to_string_lossy().to_string(),
                 ],
             )
+        } else if let Some(mut argv) = launcher_argv {
+            let program = argv.remove(0);
+            (program, argv)
         } else {
             (
                 "/bin/bash".to_string(),
                 vec![script_path.to_string_lossy().to_string()],
             )
         };
+        // The launcher drops privilege and applies seccomp and Landlock in each
+        // task itself, after the per-task setup that still needs root.
+        let launches_tasks = cfg.task_launch.is_some();
 
         // Launch the process
         let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
@@ -966,7 +1004,7 @@ async fn spawn_job_process(
         //
         // Both namespace shapes drop privilege themselves via setpriv, after the
         // unshare or nsenter that needs CAP_SYS_ADMIN; dropping here fails those.
-        if !use_namespaces && !cfg.joins_parent_namespaces {
+        if !use_namespaces && !cfg.joins_parent_namespaces && !launches_tasks {
             if let Some(pd) = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid) {
                 unsafe {
                     cmd.pre_exec(move || {
@@ -983,10 +1021,7 @@ async fn spawn_job_process(
         }
 
         // Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
-        let enable_seccomp = std::env::var("SPUR_SECCOMP")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-        if enable_seccomp {
+        if enable_seccomp && !launches_tasks {
             unsafe {
                 cmd.pre_exec(|| {
                     if let Err(e) = crate::seccomp::apply_seccomp_filter() {
@@ -999,10 +1034,7 @@ async fn spawn_job_process(
 
         // Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
         let work_dir_for_landlock = work_dir.to_string();
-        let enable_landlock = std::env::var("SPUR_LANDLOCK")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-        if enable_landlock {
+        if enable_landlock && !launches_tasks {
             unsafe {
                 cmd.pre_exec(move || {
                     if let Err(e) = crate::landlock::apply_landlock_rules(&work_dir_for_landlock) {
@@ -2548,6 +2580,26 @@ fn build_namespace_wrapper(
     visible_device_paths: &[String],
     script_path: &Path,
 ) -> String {
+    let final_exec = if uid > 0 {
+        format!(
+            "exec setpriv --reuid={uid} --regid={gid} --init-groups -- /bin/bash {script}\n",
+            uid = uid,
+            gid = gid,
+            script = script_path.display(),
+        )
+    } else {
+        format!("exec /bin/bash {}\n", script_path.display())
+    };
+    namespace_wrapper(visible_device_paths, &final_exec)
+}
+
+/// The namespace wrapper for a task launcher launch: the mounts, then the
+/// launcher itself, still as root, since each task drops privilege on its own.
+fn build_launcher_namespace_wrapper(visible_device_paths: &[String], launcher: &str) -> String {
+    namespace_wrapper(visible_device_paths, &format!("exec {launcher}\n"))
+}
+
+fn namespace_wrapper(visible_device_paths: &[String], final_exec: &str) -> String {
     let dri_nodes: Vec<&str> = visible_device_paths
         .iter()
         .filter(|p| p.starts_with("/dev/dri/"))
@@ -2570,17 +2622,6 @@ fn build_namespace_wrapper(
             .map(|b| format!("    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n"))
             .collect::<String>();
         format!("  if {MOUNT_DRI}; then\n{restore}  fi\n")
-    };
-
-    let final_exec = if uid > 0 {
-        format!(
-            "exec setpriv --reuid={uid} --regid={gid} --init-groups -- /bin/bash {script}\n",
-            uid = uid,
-            gid = gid,
-            script = script_path.display(),
-        )
-    } else {
-        format!("exec /bin/bash {}\n", script_path.display())
     };
 
     format!(
@@ -3747,6 +3788,7 @@ mod tests {
         JobLaunchConfig {
             joins_parent_namespaces: false,
             allocation_holder: false,
+            task_launch: None,
             step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,
@@ -3884,6 +3926,22 @@ mod tests {
         let script = "#!/bin/bash\necho run\n";
         let wrapped = wrap_with_burst_buffer(script, "capacity=64");
         assert_eq!(wrapped, script);
+    }
+
+    #[test]
+    fn the_namespace_wrapper_hands_the_task_launcher_root() {
+        let wrapper =
+            build_launcher_namespace_wrapper(&[], "'/opt/spur/spurstepd' launch-tasks '{}'");
+
+        assert!(wrapper.contains("mount -t proc proc /proc"), "{wrapper}");
+        assert!(
+            wrapper.ends_with("exec '/opt/spur/spurstepd' launch-tasks '{}'\n"),
+            "{wrapper}"
+        );
+        assert!(
+            !wrapper.contains("setpriv"),
+            "each task drops privilege itself: {wrapper}"
+        );
     }
 
     /// When uid > 0, the wrapper must drop privilege via setpriv

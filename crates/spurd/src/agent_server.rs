@@ -68,18 +68,6 @@ struct StepdLaunchOptions {
     pty_step_id: Option<spur_core::step::StepId>,
 }
 
-/// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
-/// fallback resolves via `execv` (CWD-relative only, no $PATH search).
-fn resolve_stepd_executable() -> std::path::PathBuf {
-    let co_located = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("spurstepd")));
-    match co_located {
-        Some(path) if path.exists() => path,
-        _ => std::path::PathBuf::from("spurstepd"),
-    }
-}
-
 /// Double-fork+setsid detach (Slurm's `slurmstepd` spawn pattern): the
 /// grandchild reports its real pid over a pipe before exec, since
 /// `Command::spawn`'s return is just the immediately-exiting intermediate
@@ -311,7 +299,7 @@ async fn launch_stepd(
     // Published before the spawn so the window between claiming the directory
     // and the supervisor publishing itself never reads as an unowned session.
     claim_session_provisionally(&store, &mut descriptor, &launch_path, state_dir)?;
-    let executable = resolve_stepd_executable();
+    let executable = crate::stepd::resolve_stepd_executable();
     info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
     let spawn_args = vec![
         state_dir.to_path_buf(),
@@ -3780,6 +3768,94 @@ fn supervised_step_pmix(
     })
 }
 
+/// What decides how a step's tasks start on this node.
+#[derive(Clone, Copy)]
+struct StepLaunchShape {
+    supervised: bool,
+    joins_parent_namespaces: bool,
+    fresh_container: bool,
+    mpi: bool,
+    mpirun: bool,
+    num_tasks: u32,
+    label: bool,
+}
+
+/// Whether the native task launcher starts this step's tasks. Steps that enter
+/// a container or run MPI still use the generated shell wrappers.
+fn step_uses_task_launcher(shape: StepLaunchShape) -> bool {
+    shape.supervised
+        && !shape.joins_parent_namespaces
+        && !shape.fresh_container
+        && !shape.mpi
+        && !shape.mpirun
+        && (shape.num_tasks > 1 || shape.label)
+}
+
+#[cfg(test)]
+mod task_launcher_routing_tests {
+    use super::*;
+
+    const HOST_STEP: StepLaunchShape = StepLaunchShape {
+        supervised: true,
+        joins_parent_namespaces: false,
+        fresh_container: false,
+        mpi: false,
+        mpirun: false,
+        num_tasks: 4,
+        label: false,
+    };
+
+    #[test]
+    fn a_host_step_with_several_tasks_uses_the_launcher() {
+        assert!(step_uses_task_launcher(HOST_STEP));
+    }
+
+    #[test]
+    fn a_labeled_lone_task_uses_the_launcher() {
+        assert!(step_uses_task_launcher(StepLaunchShape {
+            num_tasks: 1,
+            label: true,
+            ..HOST_STEP
+        }));
+    }
+
+    #[test]
+    fn a_lone_unlabeled_task_still_runs_directly() {
+        assert!(!step_uses_task_launcher(StepLaunchShape {
+            num_tasks: 1,
+            ..HOST_STEP
+        }));
+    }
+
+    #[test]
+    fn containers_mpi_and_unsupervised_steps_keep_the_shell_wrapper() {
+        for shape in [
+            StepLaunchShape {
+                supervised: false,
+                ..HOST_STEP
+            },
+            StepLaunchShape {
+                joins_parent_namespaces: true,
+                ..HOST_STEP
+            },
+            StepLaunchShape {
+                fresh_container: true,
+                ..HOST_STEP
+            },
+            StepLaunchShape {
+                mpi: true,
+                ..HOST_STEP
+            },
+            StepLaunchShape {
+                mpirun: true,
+                ..HOST_STEP
+            },
+        ] {
+            assert!(!step_uses_task_launcher(shape));
+        }
+    }
+}
+
 /// The user-script and wrapper file names for one step. Concurrent steps of a
 /// job share a scratch directory, so the step id has to be part of the name.
 fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
@@ -6880,6 +6956,7 @@ impl SlurmAgent for AgentService {
             pmix_multi_task,
             joins_parent_namespaces: false,
             allocation_holder,
+            task_launch: None,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
@@ -7796,6 +7873,7 @@ impl SlurmAgent for AgentService {
                 step_id: spur_core::step::STEP_EXTERN,
                 joins_parent_namespaces: false,
                 allocation_holder: false,
+                task_launch: None,
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),
@@ -8410,6 +8488,21 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
+        let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
+        let use_task_launcher = step_uses_task_launcher(StepLaunchShape {
+            supervised: supervise_step,
+            joins_parent_namespaces,
+            fresh_container: matches!(
+                resolve_step_container_plan(req.container.as_ref(), joins_parent_namespaces),
+                StepContainerPlan::Fresh(_)
+            ),
+            mpi: step_mpi,
+            mpirun: step_mpirun,
+            num_tasks,
+            label: req.label,
+        });
+        let mut task_plan = None;
+
         // A lone PMIx rank needs the wrapper too: it carries `env.sh` and the
         // `PMIX_SERVER_URI` aliases, which no other part of the launch applies.
         let (program, program_args, step_script_cleanup) = if num_tasks > 1
@@ -8435,7 +8528,16 @@ impl SlurmAgent for AgentService {
             guard.paths.push(user_script_path.clone());
 
             let wrapper_path = step_dir.join(wrapper_name);
-            let wrapper = if step_mpirun {
+            let wrapper = if use_task_launcher {
+                task_plan = Some(crate::task_launcher::TaskPlan {
+                    tasks_on_node: num_tasks,
+                    task_offset: req.task_offset,
+                    user_script: user_script_path.to_string_lossy().into_owned(),
+                    label: req.label,
+                    cpu_bind: spur_core::task_launch::parse_cpu_bind(&req.environment),
+                });
+                None
+            } else if step_mpirun {
                 let total_tasks = step_num_tasks.max(num_tasks);
                 let user_cmd = shlex::try_join(req.command.iter().map(String::as_str))
                     .map_err(|e| Status::invalid_argument(format!("cannot quote command: {e}")))?;
@@ -8495,8 +8597,15 @@ impl SlurmAgent for AgentService {
             } else {
                 SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0);
             }
-            let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
-            ("bash".to_string(), vec![wrapper_path_string], Some(guard))
+            // With the launcher there is no wrapper; the supervisor ignores
+            // this program, which only names what each task runs.
+            let launched = if use_task_launcher {
+                &user_script_path
+            } else {
+                &wrapper_path
+            };
+            let launched = launched.to_string_lossy().into_owned();
+            ("bash".to_string(), vec![launched], Some(guard))
         } else {
             SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
@@ -8575,7 +8684,6 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         let mut supervised_rootfs_mode = None;
         let mut supervised_step_cfg = if supervise_step {
             let command: Vec<String> = std::iter::once(program.clone())
@@ -8636,6 +8744,7 @@ impl SlurmAgent for AgentService {
                 script: step_script,
                 joins_parent_namespaces,
                 allocation_holder: false,
+                task_launch: task_plan.clone(),
                 work_dir: work_dir.clone(),
                 name: format!("{job_id}.{step_id}"),
                 user: job_owner,
@@ -9726,6 +9835,7 @@ impl SlurmAgent for AgentService {
                         step_id,
                         joins_parent_namespaces: parent_has_namespaces,
                         allocation_holder: false,
+                        task_launch: None,
                         script,
                         work_dir: entry.work_dir.clone(),
                         name: format!("{}.{}", init.job_id, step_id),
@@ -16549,6 +16659,7 @@ mod tests {
             step_id: spur_core::step::STEP_BATCH,
             joins_parent_namespaces: false,
             allocation_holder: false,
+            task_launch: None,
             script: String::new(),
             work_dir: "/tmp".into(),
             name: String::new(),
