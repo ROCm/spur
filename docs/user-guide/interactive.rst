@@ -133,6 +133,17 @@ environment exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``,
 partition/account/QOS variables, and their ``SLURM_*`` twins). When you exit the
 shell, the allocation is released. Ctrl-C cancels it.
 
+By default that shell runs on the host where you typed ``salloc``, not on the
+allocated node, as in Slurm. Commands at its prompt run on the submit host
+unless you launch them with ``srun``. To get a shell on the node instead, see
+:ref:`salloc-interactive-step`.
+
+The allocation records the directory and environment ``salloc`` was run from:
+``SPUR_SUBMIT_DIR`` / ``SLURM_SUBMIT_DIR`` is that directory, and steps started
+in the job's environment (such as ``srun --pty``) see your variables, as with
+Slurm's default ``--export=ALL``. ``$SPUR_AUTH_TOKEN`` and
+``$SPUR_REGISTRY_PASSWORD`` are left out of the recorded environment.
+
 When JWT authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN``
 (or ``~/.spur/token``) into the allocation shell so step commands can
 authenticate to the controller. With ``[auth] plugin = "spur"``, the shell does
@@ -165,6 +176,46 @@ Examples:
 
    salloc -N1 --gres=gpu:2 -t 2:00:00
    spur alloc --partition gpu --exclusive
+
+.. _salloc-interactive-step:
+
+Shell on the Allocated Node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With ``--interactive-step``, or when the site sets ``[salloc]
+use_interactive_step = true`` (see :ref:`salloc-config`), ``salloc`` starts your
+``$SHELL`` as an interactive step on the allocation's first node rather than
+locally. This is Slurm's ``LaunchParameters=use_interactive_step``.
+``--no-interactive-step`` keeps the shell local when the site default is on.
+
+.. code-block:: bash
+
+   salloc -N2 --interactive-step
+   hostname                  # the first allocated node
+   srun -N2 hostname         # a step across the whole allocation
+
+The shell runs inside the job's cgroup, with your submission directory,
+environment, and the allocation's ``SPUR_*`` / ``SLURM_*`` variables. It does
+not hold any of the allocation's resources, so ``srun`` steps started from it
+can use all of them. Exiting the shell releases the allocation, and ``salloc``
+exits with the shell's exit code. If the job ends first (time limit,
+``scancel``), the node ends the shell and ``salloc`` exits.
+
+Limitations:
+
+- A node runs one interactive terminal per job at a time. While the ``salloc``
+  shell is open on the first node, another ``srun --pty`` (nested, or
+  ``srun --jobid <id> --overlap --pty`` from another terminal) on that node is
+  refused. Use ``-w`` to open it on another allocated node.
+- Under JWT authentication the shell on the node does not inherit
+  ``$SPUR_AUTH_TOKEN``, so ``srun`` from it reads ``~/.spur/token``, which must
+  be readable on the node. ``[auth] plugin = "spur"`` needs no token.
+- Nodes managed through Kubernetes do not support interactive terminals, so
+  ``salloc`` reports the error and releases the allocation.
+- The shell is the allocation's lifetime. If ``salloc`` cannot keep or regain
+  its session (for example the first node's ``spurd`` is down for longer than
+  ``salloc``'s reconnect attempts), it releases the allocation. With the shell
+  on the submit host, losing an ``srun --pty`` costs only that terminal.
 
 Attach to a Running Job — ``sattach``
 -------------------------------------

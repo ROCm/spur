@@ -56,6 +56,15 @@ const CREDENTIAL_VARS: &[&str] = &[
     spur_net::oci::REGISTRY_PASSWORD_ENV,
 ];
 
+/// `env` minus [`CREDENTIAL_VARS`], for a job record that should not carry a
+/// bearer the caller never named.
+pub(crate) fn without_credentials(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    for var in CREDENTIAL_VARS {
+        env.remove(*var);
+    }
+    env
+}
+
 /// Copy the `SLURM_*`/`SPUR_*` variables Slurm always propagates, minus
 /// credentials (see [`CREDENTIAL_VARS`]).
 fn scheduler_vars(source: &HashMap<String, String>) -> HashMap<String, String> {
@@ -113,6 +122,15 @@ mod tests {
             let named = resolve_export_env(&format!("NONE,{cred}"), source);
             assert_eq!(named[*cred], "secret", "{cred} not forwarded when named");
         }
+    }
+
+    #[test]
+    fn without_credentials_keeps_everything_but_the_credentials() {
+        let mut source = source_env();
+        for cred in CREDENTIAL_VARS {
+            source.insert((*cred).into(), "secret".into());
+        }
+        assert_eq!(without_credentials(source), source_env());
     }
 
     #[test]

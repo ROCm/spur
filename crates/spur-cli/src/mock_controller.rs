@@ -39,6 +39,8 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
+    create_step_node: Arc<Mutex<String>>,
+    create_step_command: Arc<Mutex<Vec<String>>>,
     create_step_job_shell: Arc<AtomicBool>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
@@ -107,6 +109,15 @@ impl StepCapture {
 
     pub(crate) fn create_step_nodelist(&self) -> String {
         self.create_step_nodelist.lock().unwrap().clone()
+    }
+
+    /// Legacy single-node target of the most recent `CreateJobStep`.
+    pub(crate) fn create_step_node(&self) -> String {
+        self.create_step_node.lock().unwrap().clone()
+    }
+
+    pub(crate) fn create_step_command(&self) -> Vec<String> {
+        self.create_step_command.lock().unwrap().clone()
     }
 
     pub(crate) fn create_step_job_shell(&self) -> bool {
@@ -245,6 +256,8 @@ mock_controller_impl! {
                 .create_step_num_nodes
                 .store(request.num_nodes, Ordering::SeqCst);
             *self.capture.create_step_nodelist.lock().unwrap() = request.nodelist;
+            *self.capture.create_step_node.lock().unwrap() = request.node;
+            *self.capture.create_step_command.lock().unwrap() = request.command;
             self.capture
                 .create_step_job_shell
                 .store(request.job_shell, Ordering::SeqCst);

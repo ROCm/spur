@@ -12558,6 +12558,7 @@ mod tests {
             mpi: Default::default(),
             health: Default::default(),
             spurd: Default::default(),
+            salloc: Default::default(),
         }
     }
 

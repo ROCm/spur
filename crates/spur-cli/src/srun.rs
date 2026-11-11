@@ -1732,14 +1732,14 @@ fn reconnect_setup_timeout() -> std::time::Duration {
 
 /// What a PTY session is to its job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PtySession {
+pub(crate) enum PtySession {
     /// A standalone `srun --pty`'s own shell: its exit ends the job.
     JobShell,
     /// An extra session in a job that runs on without it.
     Extra,
 }
 
-async fn run_interactive_pty(
+pub(crate) async fn run_interactive_pty(
     ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     command: Vec<String>,

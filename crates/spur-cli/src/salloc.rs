@@ -5,7 +5,8 @@ use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, Parser};
 use spur_core::spur_env::SpurEnv;
-use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobInfo, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
 
 /// Allocate resources for an interactive job.
@@ -98,6 +99,15 @@ pub struct SallocArgs {
     #[arg(long)]
     pub exclusive: bool,
 
+    /// Start the shell as an interactive step on the first allocated node
+    /// (overrides `[salloc] use_interactive_step`)
+    #[arg(long, overrides_with = "no_interactive_step")]
+    pub interactive_step: bool,
+
+    /// Start the shell on this host (overrides `[salloc] use_interactive_step`)
+    #[arg(long, overrides_with = "interactive_step")]
+    pub no_interactive_step: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -119,7 +129,19 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let controller = args.controller.clone();
-    let job_spec = build_salloc_job_spec(&args, nodelist, &submit_line)?;
+    let interactive_step = use_interactive_step(
+        &args,
+        crate::spur_config::load_spur_config()
+            .salloc
+            .use_interactive_step,
+    );
+    let submission = Submission {
+        work_dir: std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        environment: crate::export_env::without_credentials(std::env::vars().collect()),
+    };
+    let job_spec = build_salloc_job_spec(&args, nodelist, &submit_line, submission)?;
     let submit_user = job_spec.user.clone();
 
     let channel = crate::authclient::connect(&controller)
@@ -141,7 +163,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let job_id = response.job_id;
     eprintln!("salloc: Pending job allocation {}...", job_id);
 
-    crate::interactive::install_ctrl_c_cancel(
+    let ctrl_c_cancel = crate::interactive::install_ctrl_c_cancel(
         client.clone(),
         job_id,
         submit_user.clone(),
@@ -212,23 +234,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         anyhow::bail!("salloc: job {} has no owner after allocation", job_id);
     }
 
-    let mut env = SpurEnv::new();
-    env.set_with_slurm_twin("SPUR_JOB_ID", job_id);
-    env.set_with_slurm_twin("SPUR_JOBID", job_id);
-    env.set_with_slurm_twin("SPUR_JOB_USER", &owner);
-    env.set_with_slurm_twin("SPUR_JOB_NAME", &job_info.name);
-    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &job_info.partition);
-    env.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &job_info.account);
-    env.set_with_slurm_twin("SPUR_JOB_QOS", &job_info.qos);
-    env.set_with_slurm_twin("SPUR_NODELIST", nodelist);
-    env.set_with_slurm_twin("SPUR_JOB_NODELIST", nodelist);
-    env.set_with_slurm_twin("SPUR_NNODES", job_info.num_nodes);
-    env.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_info.num_nodes);
-    env.set_with_slurm_twin("SPUR_NTASKS", job_info.num_tasks);
-    env.set_with_slurm_twin("SPUR_NPROCS", job_info.num_tasks);
-    env.set_with_slurm_twin("SPUR_CPUS_PER_TASK", job_info.cpus_per_task);
-    env.set_with_slurm_twin("SPUR_SUBMIT_DIR", &job_info.work_dir);
-
     // Keep the allocation attended while the shell is open: absence of these
     // pings past the controller's InactiveLimit is what lets it reap an
     // abandoned allocation. The guard stops the pings on drop.
@@ -241,18 +246,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     );
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let mut cmd = tokio::process::Command::new(&shell);
-    for (k, v) in env.into_map() {
-        cmd.env(k, v);
-    }
-    crate::interactive::inherit_auth_token(&mut cmd);
-    let status = cmd
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .await
-        .context("failed to spawn shell")?;
+    let exit_code = if interactive_step {
+        // The session's raw-mode terminal forwards Ctrl-C to the remote shell;
+        // it must not also cancel the allocation from here.
+        ctrl_c_cancel.abort();
+        run_shell_on_node(&mut client, job_id, &owner, &shell).await
+    } else {
+        run_local_shell(&shell, allocation_shell_env(job_id, &job_info)).await?
+    };
 
     drop(_keepalive);
 
@@ -266,13 +267,100 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .await;
 
-    std::process::exit(status.code().unwrap_or(0));
+    std::process::exit(exit_code);
+}
+
+/// A `--interactive-step`/`--no-interactive-step` flag beats the site's
+/// `[salloc] use_interactive_step`.
+fn use_interactive_step(args: &SallocArgs, configured: bool) -> bool {
+    if args.interactive_step {
+        return true;
+    }
+    if args.no_interactive_step {
+        return false;
+    }
+    configured
+}
+
+/// Run the shell as an interactive step on the allocation's first node, the
+/// controller's pick for an untargeted step. A session that never runs exits
+/// 1, so the caller still releases the allocation.
+async fn run_shell_on_node(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    owner: &str,
+    shell: &str,
+) -> i32 {
+    let session = crate::srun::run_interactive_pty(
+        client,
+        job_id,
+        vec![shell.to_string()],
+        String::new(),
+        owner,
+        None,
+        crate::srun::PtySession::Extra,
+    )
+    .await;
+    match session {
+        Ok(exit_code) => exit_code,
+        Err(e) => {
+            eprintln!("salloc: error: interactive step failed: {e:#}");
+            1
+        }
+    }
+}
+
+async fn run_local_shell(shell: &str, env: SpurEnv) -> Result<i32> {
+    let mut cmd = tokio::process::Command::new(shell);
+    for (k, v) in env.into_map() {
+        cmd.env(k, v);
+    }
+    crate::interactive::inherit_auth_token(&mut cmd);
+    let status = cmd
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .context("failed to spawn shell")?;
+    Ok(status.code().unwrap_or(0))
+}
+
+/// Allocation variables for a shell on the submit host. A shell on a node
+/// gets these from its agent instead.
+fn allocation_shell_env(job_id: u32, job: &JobInfo) -> SpurEnv {
+    let mut env = SpurEnv::new();
+    env.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+    env.set_with_slurm_twin("SPUR_JOBID", job_id);
+    env.set_with_slurm_twin("SPUR_JOB_USER", &job.user);
+    env.set_with_slurm_twin("SPUR_JOB_NAME", &job.name);
+    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &job.partition);
+    env.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &job.account);
+    env.set_with_slurm_twin("SPUR_JOB_QOS", &job.qos);
+    env.set_with_slurm_twin("SPUR_NODELIST", &job.nodelist);
+    env.set_with_slurm_twin("SPUR_JOB_NODELIST", &job.nodelist);
+    env.set_with_slurm_twin("SPUR_NNODES", job.num_nodes);
+    env.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job.num_nodes);
+    env.set_with_slurm_twin("SPUR_NTASKS", job.num_tasks);
+    env.set_with_slurm_twin("SPUR_NPROCS", job.num_tasks);
+    env.set_with_slurm_twin("SPUR_CPUS_PER_TASK", job.cpus_per_task);
+    env.set_with_slurm_twin("SPUR_SUBMIT_DIR", &job.work_dir);
+    env
+}
+
+/// Where and in what environment the allocation was requested. Its processes
+/// on the nodes, an interactive-step shell included, start from these, as
+/// under Slurm's default `--export=ALL`.
+struct Submission {
+    work_dir: String,
+    environment: HashMap<String, String>,
 }
 
 fn build_salloc_job_spec(
     args: &SallocArgs,
     nodelist: Option<String>,
     submit_line: &str,
+    submission: Submission,
 ) -> Result<JobSpec> {
     let gres = args.gres.clone();
     let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
@@ -327,7 +415,8 @@ fn build_salloc_job_spec(
         reservation: args.reservation.clone().unwrap_or_default(),
         interactive: true,
         client_keepalive: true,
-        environment: HashMap::new(),
+        work_dir: submission.work_dir,
+        environment: submission.environment,
         ..Default::default()
     })
 }
@@ -423,17 +512,107 @@ mod tests {
     use super::*;
     use clap::FromArgMatches;
 
+    fn spec_from(args: &SallocArgs, submit_line: &str) -> Result<JobSpec> {
+        let submission = Submission {
+            work_dir: String::new(),
+            environment: HashMap::new(),
+        };
+        build_salloc_job_spec(args, None, submit_line, submission)
+    }
+
+    #[test]
+    fn build_salloc_job_spec_carries_the_submission_dir_and_environment() {
+        let args = SallocArgs::parse_from(["salloc"]);
+        let submission = Submission {
+            work_dir: "/home/alice/project".into(),
+            environment: [("PATH".to_string(), "/opt/tools/bin".to_string())].into(),
+        };
+        let spec = build_salloc_job_spec(&args, None, "salloc", submission).expect("build spec");
+        assert_eq!(spec.work_dir, "/home/alice/project");
+        assert_eq!(spec.environment["PATH"], "/opt/tools/bin");
+    }
+
+    #[test]
+    fn interactive_step_flags_override_the_configured_default() {
+        let cases = [
+            (vec!["salloc"], false, false),
+            (vec!["salloc"], true, true),
+            (vec!["salloc", "--interactive-step"], false, true),
+            (vec!["salloc", "--no-interactive-step"], true, false),
+            (
+                vec!["salloc", "--no-interactive-step", "--interactive-step"],
+                false,
+                true,
+            ),
+            (
+                vec!["salloc", "--interactive-step", "--no-interactive-step"],
+                true,
+                false,
+            ),
+        ];
+        for (cli, configured, expected) in cases {
+            let args = SallocArgs::try_parse_from(&cli).expect("parse failed");
+            assert_eq!(
+                use_interactive_step(&args, configured),
+                expected,
+                "{cli:?} with configured={configured}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn the_interactive_step_runs_the_shell_on_the_first_node_and_returns_its_exit() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![crate::mock_agent::ScriptedSession::Exit(5)]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_shell_on_node(&mut client, 9, "alice", "/bin/zsh").await;
+
+        assert_eq!(exit_code, 5);
+        assert_eq!(ctrl_capture.create_step_command(), vec!["/bin/zsh"]);
+        assert!(
+            ctrl_capture.create_step_node().is_empty(),
+            "an untargeted step lands on the allocation's first node"
+        );
+        assert!(
+            !ctrl_capture.create_step_job_shell(),
+            "salloc, not the step, owns the allocation's lifetime"
+        );
+        assert_eq!(
+            ctrl_capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 5)]
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn an_interactive_step_that_cannot_start_exits_nonzero() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_create_step_error(tonic::Code::PermissionDenied);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        assert_eq!(
+            run_shell_on_node(&mut client, 9, "alice", "/bin/bash").await,
+            1
+        );
+    }
+
     #[test]
     fn build_salloc_job_spec_records_the_submit_line() {
         let args = SallocArgs::parse_from(["salloc", "-N", "2"]);
-        let spec = build_salloc_job_spec(&args, None, "salloc -N 2").expect("build spec");
+        let spec = spec_from(&args, "salloc -N 2").expect("build spec");
         assert_eq!(spec.submit_line, "salloc -N 2");
     }
 
     #[test]
     fn build_salloc_job_spec_opts_into_inactivity_reaping() {
         let args = SallocArgs::parse_from(["salloc"]);
-        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        let spec = spec_from(&args, "salloc").expect("build spec");
         assert!(spec.client_keepalive);
     }
 
@@ -466,7 +645,7 @@ mod tests {
     #[test]
     fn build_job_spec_sets_qos() {
         let args = SallocArgs::try_parse_from(["salloc", "--qos", "high"]).expect("parse");
-        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
+        let spec = spec_from(&args, "salloc --test").expect("build spec");
         assert_eq!(spec.qos, "high");
         assert!(spec.interactive);
     }
@@ -474,7 +653,7 @@ mod tests {
     #[test]
     fn build_job_spec_qos_defaults_empty() {
         let args = SallocArgs::try_parse_from(["salloc"]).expect("parse");
-        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
+        let spec = spec_from(&args, "salloc --test").expect("build spec");
         assert!(spec.qos.is_empty());
     }
 
@@ -560,7 +739,7 @@ mod tests {
         let env = EnvGuard::new();
         env.set("SALLOC_QOS", "burst");
         let args = resolve_from(&["salloc"]);
-        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
+        let spec = spec_from(&args, "salloc --test").expect("build spec");
         assert_eq!(spec.qos, "burst");
     }
 
