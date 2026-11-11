@@ -5850,6 +5850,12 @@ impl ClusterManager {
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
             let partitions = self.partitions.read().clone();
+            let partition_qos = PartitionQosView::build(
+                &partitions,
+                &self.qos_cache,
+                self.config().accounting.enabled(),
+                &jobs,
+            );
             // An unplaceable job must not reserve grp-node quota it never uses.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 if let Some(reason) = structural_unplaceable_reason(job, &nodes, &reservations) {
@@ -5911,6 +5917,7 @@ impl ClusterManager {
                         let verdict = quota_gate(
                             &mut probe,
                             qos,
+                            &partition_qos,
                             &self.association_cache,
                             &jobs,
                             &reuse,
@@ -5929,6 +5936,7 @@ impl ClusterManager {
                     claim.narrow(job);
                     if !unclaimed.contains(&job.job_id) {
                         reserved.reserve(job, &claim.tres, claim.qos_charge, claim.account_charge);
+                        reserved.reserve_partition_qos(job, &claim.tres, &partition_qos);
                         claimed_any = true;
                     }
                     return GateOutcome::Keep;
@@ -5969,6 +5977,7 @@ impl ClusterManager {
                     // is deliberately 0 — that is the one aggregate a borrowed job
                     // is outside of (D1).
                     reserved.reserve(&lent, &job_tres(probe), 0, job.spec.num_nodes as u64);
+                    reserved.reserve_partition_qos(&lent, &job_tres(probe), &partition_qos);
                     *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
                         job.spec.num_nodes as u64;
                     idle_fill_candidates.push(lent);
@@ -6417,6 +6426,7 @@ impl ClusterManager {
         preempt_exempt_time: Option<Option<u32>>,
         grace_time: Option<Option<u32>>,
         limits: PartitionLimitsUpdate,
+        qos: Option<Option<String>>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -6478,6 +6488,7 @@ impl ClusterManager {
             preempt_exempt_time,
             grace_time,
             resource_limits,
+            qos,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         self.warn_partition_cap_overcommits_in(name);
@@ -6670,6 +6681,7 @@ impl ClusterManager {
                 resource_limits: Some(PartitionLimitsUpdate::replacing(
                     &PartitionResourceLimits::of(part),
                 )),
+                qos: Some(part.qos.clone()),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -7746,6 +7758,13 @@ impl ClusterManager {
         !self.config().accounting.enabled() || self.qos_cache.is_loaded()
     }
 
+    fn runs_under_a_partition_qos(&self, job: &Job) -> bool {
+        let partitions = self.partitions.read();
+        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), &partitions)
+            .iter()
+            .any(|p| p.qos.as_deref().is_some_and(|q| !q.is_empty()))
+    }
+
     /// Whether association limits can be read right now; the association-cache
     /// counterpart of [`qos_limits_readable`](Self::qos_limits_readable).
     pub(crate) fn association_limits_readable(&self) -> bool {
@@ -7770,6 +7789,10 @@ impl ClusterManager {
             if self.qos_cache.get(name).is_none() {
                 return Some(PendingReason::InvalidQOS);
             }
+        }
+
+        if !self.qos_limits_readable() && self.runs_under_a_partition_qos(job) {
+            return Some(PendingReason::AccountingUnavailable);
         }
 
         let has_account = job.spec.account.as_deref().is_some_and(|a| !a.is_empty());
@@ -9757,6 +9780,7 @@ impl ClusterManager {
                 preempt_exempt_time,
                 grace_time,
                 resource_limits,
+                qos,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -9820,6 +9844,9 @@ impl ClusterManager {
                         }
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
+                        }
+                        if let Some(q) = qos {
+                            part.qos.clone_from(q);
                         }
                         if let Some(limits) = resource_limits.as_ref().and_then(|u| u.merged(part))
                         {
@@ -11083,6 +11110,7 @@ enum QuotaVerdict {
         qos_charge: u64,
     },
     AccountBlocked(spur_core::job::PendingReason),
+    PartitionQosBlocked(spur_core::job::PendingReason),
     QosBlocked {
         account: AccountAdmitted,
         blocked: QosBlocked,
@@ -11093,7 +11121,9 @@ impl QuotaVerdict {
     fn block_reason(&self) -> Option<spur_core::job::PendingReason> {
         match self {
             Self::Admitted { .. } => None,
-            Self::AccountBlocked(reason) => Some(reason.clone()),
+            Self::AccountBlocked(reason) | Self::PartitionQosBlocked(reason) => {
+                Some(reason.clone())
+            }
             Self::QosBlocked { blocked, .. } => Some(blocked.reason.clone()),
         }
     }
@@ -11109,10 +11139,180 @@ impl QuotaVerdict {
     }
 }
 
-/// Run the association gate, then the QOS gate, on `job` as it stands.
+/// Running usage of one partition QOS.
+#[derive(Default)]
+struct PartitionQosUsage {
+    grp: TresRecord,
+    user_tres: HashMap<String, TresRecord>,
+    user_jobs: HashMap<String, u32>,
+}
+
+/// A pass's view of partition QOSes. Usage is counted over every job charged to a
+/// partition carrying the QOS, whatever its account or job QOS, so one user's
+/// footprint adds up across accounts. Idle-fill borrowed jobs count too: the cap
+/// bounds what a user holds, borrowed or not.
+#[derive(Default)]
+struct PartitionQosView {
+    /// Partition name to its QOS name and record; `None` when no such QOS is defined.
+    by_partition: HashMap<String, (String, Option<Qos>)>,
+    usage: HashMap<String, PartitionQosUsage>,
+    /// An undefined partition QOS holds the partition's jobs rather than lifting the cap.
+    unknown_blocks: bool,
+}
+
+impl PartitionQosView {
+    fn build(
+        partitions: &[Partition],
+        qos_cache: &QosCache,
+        unknown_blocks: bool,
+        jobs: &HashMap<JobId, Job>,
+    ) -> Self {
+        let by_partition: HashMap<String, (String, Option<Qos>)> = partitions
+            .iter()
+            .filter_map(|p| {
+                let name = p.qos.as_deref().filter(|q| !q.is_empty())?;
+                Some((p.name.clone(), (name.to_string(), qos_cache.get(name))))
+            })
+            .collect();
+        if by_partition.is_empty() {
+            return Self::default();
+        }
+
+        let mut grp: HashMap<&str, RunningTresAccumulator<'_>> = HashMap::new();
+        let mut per_user: HashMap<(&str, &str), RunningTresAccumulator<'_>> = HashMap::new();
+        let mut user_jobs: HashMap<(&str, &str), u32> = HashMap::new();
+        for job in jobs.values().filter(|j| j.occupies_resources()) {
+            let Some(partition) = crate::scheduler_loop::charged_partition(job, partitions) else {
+                continue;
+            };
+            let Some((qos, _)) = by_partition.get(&partition.name) else {
+                continue;
+            };
+            let key = (qos.as_str(), job.spec.user.as_str());
+            grp.entry(qos.as_str()).or_default().add(job);
+            per_user.entry(key).or_default().add(job);
+            *user_jobs.entry(key).or_insert(0) += 1;
+        }
+
+        let mut usage: HashMap<String, PartitionQosUsage> = HashMap::new();
+        for (qos, acc) in grp {
+            usage.entry(qos.to_string()).or_default().grp = acc.finish();
+        }
+        for ((qos, user), acc) in per_user {
+            usage
+                .entry(qos.to_string())
+                .or_default()
+                .user_tres
+                .insert(user.to_string(), acc.finish());
+        }
+        for ((qos, user), count) in user_jobs {
+            usage
+                .entry(qos.to_string())
+                .or_default()
+                .user_jobs
+                .insert(user.to_string(), count);
+        }
+        Self {
+            by_partition,
+            usage,
+            unknown_blocks,
+        }
+    }
+
+    /// Narrows `job` to the requested partitions whose QOS admits it; `Err` with the
+    /// first refusal when none does.
+    fn admit(
+        &self,
+        job: &mut Job,
+        reserved: &PassReservations,
+    ) -> Result<(), spur_core::job::PendingReason> {
+        if self.by_partition.is_empty() {
+            return Ok(());
+        }
+        let requested: Vec<String> = requested_partition_names(job.spec.partition.as_deref())
+            .map(str::to_string)
+            .collect();
+        let mut admitted = Vec::new();
+        let mut refusal = None;
+        for name in &requested {
+            match self.refusal(job, name, reserved) {
+                None => admitted.push(name.clone()),
+                Some(reason) => {
+                    refusal.get_or_insert(reason);
+                }
+            }
+        }
+        let Some(reason) = refusal else {
+            return Ok(());
+        };
+        if admitted.is_empty() {
+            return Err(reason);
+        }
+        job.spec.partition = Some(admitted.join(","));
+        Ok(())
+    }
+
+    fn refusal(
+        &self,
+        job: &Job,
+        partition: &str,
+        reserved: &PassReservations,
+    ) -> Option<spur_core::job::PendingReason> {
+        let (name, qos) = self.by_partition.get(partition)?;
+        let Some(qos) = qos else {
+            return self
+                .unknown_blocks
+                .then_some(spur_core::job::PendingReason::InvalidQOS);
+        };
+        let user = &job.spec.user;
+        let usage = self.usage.get(name);
+        let key = (user.clone(), name.clone());
+        let mut user_tres = usage
+            .and_then(|u| u.user_tres.get(user))
+            .cloned()
+            .unwrap_or_default();
+        let mut grp = usage.map(|u| u.grp.clone()).unwrap_or_default();
+        let mut user_jobs = usage
+            .and_then(|u| u.user_jobs.get(user))
+            .copied()
+            .unwrap_or(0);
+        if let Some(t) = reserved.partition_qos_user_tres.get(&key) {
+            user_tres.add(t);
+        }
+        if let Some(t) = reserved.partition_qos_grp.get(name) {
+            grp.add(t);
+        }
+        user_jobs += reserved
+            .partition_qos_user_count
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        // Submit counts are not tracked per partition, so MaxSubmitJobsPU is not applied here.
+        let mut enforced = qos.clone();
+        enforced.limits.max_submit_jobs_per_user = None;
+        match spur_core::qos::check_qos_limits(job, &enforced, user_jobs, 0, &user_tres, &grp, None)
+        {
+            QosCheckResult::Allowed => None,
+            QosCheckResult::Blocked(reason) => Some(reason),
+        }
+    }
+
+    /// The distinct partition QOSes `job` is charged against if it runs.
+    fn qos_names(&self, job: &Job) -> BTreeSet<String> {
+        requested_partition_names(job.spec.partition.as_deref())
+            .filter_map(|p| self.by_partition.get(p).map(|(name, _)| name.clone()))
+            .collect()
+    }
+}
+
+/// Run the association gate, the partition QOS gate, then the job QOS gate, on
+/// `job` as it stands. The partition QOS goes before the job QOS so a job lent idle
+/// capacity has already cleared it.
+#[allow(clippy::too_many_arguments)]
 fn quota_gate(
     job: &mut Job,
     qos: &Qos,
+    partition_qos: &PartitionQosView,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
     reuse: &ReuseView<'_>,
@@ -11123,6 +11323,9 @@ fn quota_gate(
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
+    if let Err(reason) = partition_qos.admit(job, reserved) {
+        return QuotaVerdict::PartitionQosBlocked(reason);
+    }
     match qos_block_with(job, qos, jobs, reuse, reserved, consumed_wall_minutes) {
         Ok(qos_charge) => QuotaVerdict::Admitted {
             account,
@@ -11712,9 +11915,29 @@ struct PassReservations {
     account_grp: HashMap<String, TresRecord>,
     account_user_count: HashMap<(String, String), u32>,
     account_claimed_nodes: HashMap<String, HashSet<String>>,
+    partition_qos_grp: HashMap<String, TresRecord>,
+    partition_qos_user_tres: HashMap<(String, String), TresRecord>,
+    partition_qos_user_count: HashMap<(String, String), u32>,
 }
 
 impl PassReservations {
+    /// Charge `job` against every partition QOS it could run under; a multi-partition
+    /// job is charged to each, since placement has not picked one yet.
+    fn reserve_partition_qos(&mut self, job: &Job, tres: &TresRecord, view: &PartitionQosView) {
+        for qos in view.qos_names(job) {
+            self.partition_qos_grp
+                .entry(qos.clone())
+                .or_default()
+                .add(tres);
+            let key = (job.spec.user.clone(), qos);
+            self.partition_qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(tres);
+            *self.partition_qos_user_count.entry(key).or_insert(0) += 1;
+        }
+    }
+
     /// Record that `job` (kept this pass) now occupies its footprint against the
     /// QOS and account aggregates, so lower-priority jobs later in the pass see
     /// the reduced headroom. `qos_node_charge`/`account_node_charge` are the
@@ -12462,6 +12685,7 @@ mod tests {
     use tempfile::TempDir;
 
     mod partition_limits;
+    mod partition_qos;
 
     #[test]
     fn submission_size_accepts_normal_script() {
@@ -12522,6 +12746,7 @@ mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -15139,6 +15364,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -15421,6 +15647,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -38614,6 +38841,7 @@ state = "UP"
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -38641,6 +38869,7 @@ state = "UP"
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -38709,6 +38938,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -40706,6 +40936,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -40831,6 +41062,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -40878,6 +41110,7 @@ state = "UP"
             is_default: Some(true),
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -40947,6 +41180,7 @@ state = "UP"
                 None,
                 grace_time,
                 PartitionLimitsUpdate::default(),
+                None,
             )
         };
         update(None).unwrap();

@@ -97,6 +97,7 @@ pub fn partition_to_json(part: &Partition) -> serde_json::Value {
         "priority_tier": part.priority_tier,
         "allow_accounts": part.allow_accounts,
         "deny_accounts": part.deny_accounts,
+        "qos": part.qos,
         "max_cpus_per_node": part.max_tres_per_node.get(spur_core::partition::TRES_CPU),
         "max_tres_per_node": part.max_tres_per_node,
         "max_mem_per_node": part.max_mem_per_node,
@@ -178,6 +179,16 @@ mod tests {
         let json = partition_to_json(&part);
         assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
         assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
+    }
+
+    #[test]
+    fn partition_to_json_reports_the_partition_qos() {
+        let capped = Partition {
+            qos: Some("usercap".into()),
+            ..Default::default()
+        };
+        assert_eq!(partition_to_json(&capped)["qos"], "usercap");
+        assert!(partition_to_json(&Partition::default())["qos"].is_null());
     }
 
     #[test]

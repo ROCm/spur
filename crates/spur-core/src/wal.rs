@@ -424,6 +424,12 @@ pub enum WalOperation {
         /// Merged into the partition's limits when the entry applies.
         #[serde(default)]
         resource_limits: Option<PartitionLimitsUpdate>,
+        #[serde(
+            default,
+            deserialize_with = "clear_or_set",
+            skip_serializing_if = "Option::is_none"
+        )]
+        qos: Option<Option<String>>,
     },
     PartitionDelete {
         name: String,
@@ -1666,6 +1672,7 @@ mod deregistration_wal_tests {
             preempt_exempt_time: None,
             grace_time,
             resource_limits: None,
+            qos: None,
         }
     }
 
