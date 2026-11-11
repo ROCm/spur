@@ -306,6 +306,13 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub peers: Vec<String>,
 
+    /// Client API address ("host:port") of each controller in `peers`, in the
+    /// same order. Followers forward writes to the leader here. Empty means each
+    /// peer's host from `peers` plus this controller's own `listen_addr` port, so
+    /// set it only when controllers serve clients on different ports or hosts.
+    #[serde(default)]
+    pub peer_client_addrs: Vec<String>,
+
     /// This node's Raft ID. Normally unset; single-node mode always uses 1.
     /// Otherwise resolved as: explicit value, else position in `peers` (by
     /// hostname), else hostname ordinal (IP-only peers). Must be in
@@ -491,6 +498,7 @@ impl Default for ControllerConfig {
             max_job_id: 999_999_999,
             first_job_id: 1,
             peers: Vec::new(),
+            peer_client_addrs: Vec::new(),
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
@@ -554,6 +562,68 @@ impl ControllerConfig {
                 }
             })
             .collect()
+    }
+
+    fn validate_peer_client_addrs(&self) -> Result<(), ConfigError> {
+        if self.peer_client_addrs.is_empty() {
+            return Ok(());
+        }
+        let invalid = |value: String| ConfigError::InvalidValue {
+            field: "controller.peer_client_addrs".into(),
+            value,
+        };
+        // Entries are matched to Raft node ids by position, so a short or long
+        // list would silently point some leader at the wrong controller.
+        if self.peer_client_addrs.len() != self.peers.len() {
+            return Err(invalid(format!(
+                "length {} does not match peers length {} (list one address per peer, in peers order)",
+                self.peer_client_addrs.len(),
+                self.peers.len()
+            )));
+        }
+        for entry in &self.peer_client_addrs {
+            check_client_addr(entry).map_err(|reason| invalid(format!("{entry:?}: {reason}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// Checks one `peer_client_addrs` entry is a dialable plaintext gRPC address,
+/// so a typo fails at load time rather than on the first forwarded write.
+fn check_client_addr(entry: &str) -> Result<(), &'static str> {
+    if entry.starts_with("https://") {
+        return Err("TLS is not supported for controller forwarding; use host:port");
+    }
+    let authority = entry.strip_prefix("http://").unwrap_or(entry);
+    if authority.contains('/') || authority.chars().any(char::is_whitespace) {
+        return Err("must be host:port, optionally prefixed with http://");
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (ip, port) = rest
+                .split_once("]:")
+                .ok_or("missing port after the bracketed IPv6 address")?;
+            ip.parse::<std::net::Ipv6Addr>()
+                .map_err(|_| "invalid IPv6 address")?;
+            (ip, port)
+        }
+        None => {
+            let (host, port) = authority.rsplit_once(':').ok_or("missing port")?;
+            if host.contains(':') {
+                return Err("IPv6 addresses must be bracketed, e.g. [fd00::1]:6817");
+            }
+            (host, port)
+        }
+    };
+    if host.is_empty() {
+        return Err("missing host");
+    }
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("port must be a number between 1 and 65535");
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p > 0 => Ok(()),
+        _ => Err("port must be a number between 1 and 65535"),
     }
 }
 
@@ -2531,6 +2601,7 @@ impl SlurmConfig {
                 ),
             });
         }
+        self.controller.validate_peer_client_addrs()?;
         for pc in &self.partitions {
             crate::partition::parse_preempt_mode(&pc.preempt_mode).map_err(|value| {
                 ConfigError::InvalidValue {
@@ -3954,6 +4025,79 @@ cni_mtu = 1400
             ..Default::default()
         };
         assert_eq!(cfg.endpoints(), vec!["http://ctrl1:7000"]);
+    }
+
+    fn peers_config(peers: &[&str], client_addrs: &[&str]) -> Result<SlurmConfig, ConfigError> {
+        let quote = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| format!("{item:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"t\"\n[controller]\npeers = [{}]\npeer_client_addrs = [{}]\n",
+            quote(peers),
+            quote(client_addrs)
+        ))
+    }
+
+    const THREE_PEERS: [&str; 3] = ["ctrl1:6821", "ctrl2:6821", "ctrl3:6821"];
+
+    #[test]
+    fn peer_client_addrs_defaults_to_empty() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[controller]\npeers = [\"ctrl1:6821\", \"ctrl2:6821\"]\n",
+        )
+        .unwrap();
+        assert!(config.controller.peer_client_addrs.is_empty());
+    }
+
+    #[test]
+    fn peer_client_addrs_accepts_one_valid_entry_per_peer() {
+        let config = peers_config(
+            &THREE_PEERS,
+            &["ctrl1:7817", "http://ctrl2:7818", "[fd00::3]:7819"],
+        )
+        .unwrap();
+        assert_eq!(
+            config.controller.peer_client_addrs,
+            vec!["ctrl1:7817", "http://ctrl2:7818", "[fd00::3]:7819"]
+        );
+    }
+
+    #[test]
+    fn peer_client_addrs_must_match_the_peer_count() {
+        let err = peers_config(&THREE_PEERS, &["ctrl1:7817", "ctrl2:7817"]).unwrap_err();
+        assert!(
+            err.to_string().contains("controller.peer_client_addrs"),
+            "{err}"
+        );
+        assert!(peers_config(&[], &["ctrl1:7817"]).is_err());
+    }
+
+    #[test]
+    fn peer_client_addrs_rejects_undialable_entries() {
+        for bad in [
+            "ctrl1",
+            "ctrl1:",
+            "ctrl1:0",
+            "ctrl1:65536",
+            "ctrl1:+80",
+            ":7817",
+            "fd00::1:7817",
+            "[fd00::1]",
+            "[not-ipv6]:7817",
+            "https://ctrl1:7817",
+            "http://ctrl1:7817/path",
+            "ctrl 1:7817",
+        ] {
+            let err = peers_config(&["ctrl1:6821"], &[bad]).unwrap_err();
+            assert!(
+                err.to_string().contains("controller.peer_client_addrs"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

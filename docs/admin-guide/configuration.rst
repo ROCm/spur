@@ -185,6 +185,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``"[::]:6817"``
      - Restart
      - gRPC listen address serving ``SlurmController`` and ``SlurmAccounting``.
+       ``--listen`` overrides it. In HA, followers forward writes to the leader
+       on this same port (at the leader's ``peers`` host), so every controller
+       must use the same port unless ``peer_client_addrs`` is set.
    * - ``rest_addr``
      - string
      - ``"[::]:6820"``
@@ -228,6 +231,19 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Raft HA peers as ``"host:port"``. Empty means single-node. The list must be
        identically ordered on every controller — node IDs derive from position.
        Example: ``["node1:6821", "node2:6821", "node3:6821"]``.
+   * - ``peer_client_addrs``
+     - [string]
+     - ``[]``
+     - Restart
+     - Client API address (``"host:port"``, optionally ``http://``) of each
+       controller in ``peers``, in the same order. Followers forward writes to
+       the leader at this address. Empty means each ``peers`` host plus this
+       controller's own ``listen_addr`` port. Set it only when controllers serve
+       clients on different ports or hostnames than Raft uses. When set it must
+       have one entry per peer; IPv6 hosts must be bracketed (``[fd00::1]:6817``)
+       and TLS (``https://``) is not supported. An invalid list stops
+       ``spurctld`` at startup and is rejected by ``scontrol reconfigure``.
+       Example: ``["node1:7817", "node2:7818", "node3:7817"]``.
    * - ``node_id``
      - integer
      - none
