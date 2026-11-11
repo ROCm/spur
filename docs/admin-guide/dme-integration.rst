@@ -151,8 +151,8 @@ Upgrading from Spur 0.13.0 through 0.16.0
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Those releases passed internal GPU ids in the hook's ``SPUR_JOB_GPUS``, so
-these scripts wrote every GPU's labels to file ``0`` and never removed files
-written for other GPUs by earlier releases. After upgrading a node, clear the
+on unpartitioned GPUs these scripts wrote every GPU's labels to file ``0``
+and never removed files written for other GPUs by earlier releases. After upgrading a node, clear the
 leftover files once while it runs no GPU jobs:
 
 .. code-block:: bash
