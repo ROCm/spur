@@ -48,6 +48,22 @@ pub struct SreportArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SreportCommand {
+    /// Lifetime preemption outcomes by requesting user and account
+    Preemptions {
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        /// Show only unused counts, grouped by reason and initiator
+        #[arg(long)]
+        by_cause: bool,
+        /// User/account pairs per page (1-1000)
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+        /// Continue from a previous report's next-page token
+        #[arg(long)]
+        page_token: Option<String>,
+    },
     /// Cluster utilization reports
     Cluster {
         /// Report type: AccountUtilizationByUser, UserUtilizationByAccount
@@ -67,6 +83,11 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SreportArgs>(&args);
 
+    if matches!(args.command, SreportCommand::Preemptions { .. })
+        && (args.start.is_some() || args.end.is_some())
+    {
+        anyhow::bail!("preemption reports are lifetime totals; --start/--end are not supported");
+    }
     let since = args
         .start
         .as_deref()
@@ -79,6 +100,44 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut client = spur_proto::accounting_client(channel);
 
     match &args.command {
+        SreportCommand::Preemptions {
+            user,
+            account,
+            limit,
+            page_token,
+            by_cause,
+        } => {
+            let mut request = tonic::Request::new(spur_proto::proto::GetPreemptionUsageRequest {
+                user: user.clone().unwrap_or_default(),
+                account: account.clone().unwrap_or_default(),
+                limit: *limit,
+                page_token: page_token.clone().unwrap_or_default(),
+                by_cause: *by_cause,
+            });
+            request.set_timeout(std::time::Duration::from_secs(15));
+            let response = client
+                .get_preemption_usage(request)
+                .await
+                .map_err(preemption_report_error)?
+                .into_inner();
+            if let Some(user) = &response.scoped_to_user {
+                eprintln!("Visible usage for {user} only");
+            }
+            if response.partial {
+                eprintln!("Visible usage only; account totals may be incomplete");
+            }
+            print_preemptions(
+                &mut std::io::stdout().lock(),
+                &response,
+                *by_cause,
+                args.parsable,
+                args.noheader,
+            )?;
+            if !response.next_page_token.is_empty() {
+                eprintln!("Next page token: {}", response.next_page_token);
+            }
+            Ok(())
+        }
         SreportCommand::Cluster { report_type } => match report_type.to_lowercase().as_str() {
             "accountutilizationbyuser" | "accountutilization" => {
                 report_account_utilization_by_user(&mut client, since, &args).await
@@ -111,6 +170,93 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 }
 
 type AcctClient = SlurmAccountingClient<crate::authclient::AuthChannel>;
+
+fn preemption_report_error(error: tonic::Status) -> anyhow::Error {
+    if error.code() == tonic::Code::Unimplemented {
+        anyhow::anyhow!("controller does not support preemption reports; upgrade the controller")
+    } else {
+        anyhow::Error::new(error).context("failed to get preemption report")
+    }
+}
+
+fn print_preemptions(
+    out: &mut impl std::io::Write,
+    response: &spur_proto::proto::GetPreemptionUsageResponse,
+    by_cause: bool,
+    parsable: bool,
+    noheader: bool,
+) -> Result<()> {
+    if by_cause {
+        return print_preemption_causes(out, response, parsable, noheader);
+    }
+    if !noheader {
+        if parsable {
+            writeln!(out, "User|Account|Used|Unused|Open")?;
+        } else {
+            writeln!(
+                out,
+                "{:<20} {:<20} {:>12} {:>12} {:>12}",
+                "User", "Account", "Used", "Unused", "Open"
+            )?;
+        }
+    }
+    for entry in &response.entries {
+        if parsable {
+            writeln!(
+                out,
+                "{}|{}|{}|{}|{}",
+                entry.user, entry.account, entry.used, entry.unused, entry.open
+            )?;
+        } else {
+            writeln!(
+                out,
+                "{:<20} {:<20} {:>12} {:>12} {:>12}",
+                entry.user, entry.account, entry.used, entry.unused, entry.open
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_preemption_causes(
+    out: &mut impl std::io::Write,
+    response: &spur_proto::proto::GetPreemptionUsageResponse,
+    parsable: bool,
+    noheader: bool,
+) -> Result<()> {
+    if !noheader {
+        if parsable {
+            writeln!(out, "User|Account|Reason|Initiator|Unused")?;
+        } else {
+            writeln!(
+                out,
+                "{:<20} {:<20} {:<20} {:<12} {:>12}",
+                "User", "Account", "Reason", "Initiator", "Unused"
+            )?;
+        }
+    }
+    for entry in &response.entries {
+        for cause in &entry.unused_by_cause {
+            if cause.count == 0 {
+                continue;
+            }
+            if parsable {
+                writeln!(
+                    out,
+                    "{}|{}|{}|{}|{}",
+                    entry.user, entry.account, cause.reason, cause.initiator, cause.count
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "{:<20} {:<20} {:<20} {:<12} {:>12}",
+                    entry.user, entry.account, cause.reason, cause.initiator, cause.count
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Account definitions. A non-coordinator is denied when `accounts` is private;
 /// the caller then builds rows from the usage it is allowed to see.
@@ -555,6 +701,143 @@ fn account_visible(visible_accounts: &[String], account: &str, has_usage: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preemption_report_unimplemented_explains_upgrade_for_all_report_modes() {
+        let error = preemption_report_error(tonic::Status::unimplemented("unknown method"));
+        assert!(error.to_string().contains("upgrade the controller"));
+        let error = preemption_report_error(tonic::Status::unavailable("offline"));
+        assert_eq!(
+            error
+                .downcast_ref::<tonic::Status>()
+                .expect("status")
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[test]
+    fn preemption_report_page_arguments() {
+        let args = SreportArgs::try_parse_from([
+            "sreport",
+            "preemptions",
+            "--user",
+            "alice",
+            "--account",
+            "research",
+            "--limit",
+            "25",
+            "--parsable",
+            "--by-cause",
+        ])
+        .expect("arguments");
+        assert!(matches!(
+            args.command,
+            SreportCommand::Preemptions {
+                limit: 25,
+                user: Some(_),
+                account: Some(_),
+                by_cause: true,
+                ..
+            }
+        ));
+        for limit in ["0", "1001"] {
+            assert!(
+                SreportArgs::try_parse_from(["sreport", "preemptions", "--limit", limit]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn preemption_reports_separate_totals_from_nonzero_causes() {
+        use spur_proto::proto::{
+            GetPreemptionUsageResponse, PreemptionUsageEntry, UnusedPreemptionCount,
+        };
+        let response = GetPreemptionUsageResponse {
+            entries: vec![
+                PreemptionUsageEntry {
+                    user: "alice".into(),
+                    account: "research".into(),
+                    used: 2,
+                    unused: 2,
+                    open: 1,
+                    unused_by_cause: vec![
+                        UnusedPreemptionCount {
+                            reason: "cancelled".into(),
+                            initiator: "user".into(),
+                            count: 2,
+                        },
+                        UnusedPreemptionCount {
+                            reason: "launch_failed".into(),
+                            initiator: "system".into(),
+                            count: 0,
+                        },
+                    ],
+                },
+                PreemptionUsageEntry {
+                    user: "bob".into(),
+                    account: "research".into(),
+                    used: 4,
+                    open: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        for (by_cause, header, rows) in [
+            (
+                false,
+                "User|Account|Used|Unused|Open\n",
+                "alice|research|2|2|1\nbob|research|4|0|1\n",
+            ),
+            (
+                true,
+                "User|Account|Reason|Initiator|Unused\n",
+                "alice|research|cancelled|user|2\n",
+            ),
+        ] {
+            for noheader in [false, true] {
+                for parsable in [false, true] {
+                    let mut out = Vec::new();
+                    print_preemptions(&mut out, &response, by_cause, parsable, noheader)
+                        .expect("report");
+                    let actual = String::from_utf8(out).expect("utf8");
+                    let expected = format!("{}{rows}", if noheader { "" } else { header });
+                    if parsable {
+                        assert_eq!(actual, expected);
+                    } else {
+                        let normalized = actual
+                            .lines()
+                            .map(|line| line.split_whitespace().collect::<Vec<_>>().join("|"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            + "\n";
+                        assert_eq!(normalized, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preemption_cause_page_without_unused_has_no_rows() {
+        let response = spur_proto::proto::GetPreemptionUsageResponse {
+            entries: vec![spur_proto::proto::PreemptionUsageEntry {
+                user: "alice".into(),
+                account: "research".into(),
+                used: 2,
+                open: 1,
+                ..Default::default()
+            }],
+            next_page_token: r#"["alice","research"]"#.into(),
+            ..Default::default()
+        };
+        for parsable in [false, true] {
+            let mut out = Vec::new();
+            print_preemptions(&mut out, &response, true, parsable, true).expect("empty page");
+            assert!(out.is_empty());
+        }
+    }
 
     #[test]
     fn partial_utilization_fills_visible_accounts_and_blanks_the_rest() {

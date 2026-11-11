@@ -1756,6 +1756,73 @@ number of days:
 Leaving it unset (the default) or ``0`` keeps records forever, matching Slurm's
 default purge-off behavior; a positive value enables the purge.
 
+.. _preemption-outcome-export:
+
+Preemption outcome export
+-------------------------
+
+:doc:`/user-guide/monitoring-jobs` describes the preemption outcome counts.
+With accounting enabled, the controller leader also exports each requesting
+job's counts to PostgreSQL, where ``sreport preemptions`` reads lifetime totals
+per requesting user and account.
+
+Every ten seconds the leader exports up to 1000 jobs whose counts changed. A
+job's counts and its rollups commit in one transaction, keyed by job ID
+and submission time, so a repeated or older export does not count twice and a
+reused job ID starts a new key. The requesting user and account are fixed at
+the first export: a later account change on the job does not move counts
+already recorded, and those stay visible to the original account's coordinator.
+
+A job whose export fails is logged and skipped; later jobs keep exporting. Each
+export has a 10-second attempt deadline, including connection acquisition, with
+a 5-second lock wait and an 8-second statement timeout. A job whose export times
+out ends that pass, and the next pass starts after it. A database connection
+failure ends the pass until the next tick.
+
+While accounting is enabled, a finished job with counts stays in the controller
+past ``terminal_job_retention_secs`` until its latest counts are exported, so an
+accounting outage grows controller memory and snapshots. ``sdiag`` and two
+scheduler metrics show the jobs held past retention this way:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 50 50
+
+   * - Metric
+     - Meaning
+   * - ``spur_scheduler_preemption_exports_pending``
+     - Finished jobs past retention kept until their counts reach accounting.
+   * - ``spur_scheduler_preemption_export_oldest_seconds``
+     - Age of the oldest of those jobs, from its end time.
+
+If a job's counts are still not exported 24 hours after
+``terminal_job_retention_secs`` would have evicted it, the job is evicted anyway,
+with a warning in the controller log; those counts never reach the rollups. A
+rising pending count or an oldest age near that limit means exports are failing.
+
+The controller checks up to 100 open checkpoints per pass, continuing from the
+previous page and starting over after reaching the end. Retained jobs do not
+prevent later checkpoints from being checked. The scan uses the same database
+and client timeouts as exports; cleanup stops on the first stalled write and
+resumes on the next pass. After reading each nonempty page, the controller
+confirms leadership with a quorum and waits for Raft apply to catch up before
+checking job history. When the controller no longer holds a job, its remaining
+open observations are closed as ``ended_other`` /
+``unknown``, with a warning in the controller log. This covers a job evicted by
+the limit above and one evicted by an older controller. The scan position is
+kept in memory; it adds no Raft writes.
+
+Job history also stores each job's counts in ``preemption_usage``, written when
+the job ends and by the accounting reconcile pass. ``sacct`` does not show them;
+the ``GetJobHistory`` API returns them. Rollups survive job-history deletion,
+account deletion, and fairshare resets. The per-job checkpoint table has one row
+per requesting job and is not pruned.
+
+Exports, report reads, and export acknowledgements add no Raft writes. A
+requesting launch with tracked preemptions adds at most one log entry to confirm
+the outcome, independent of the number of victims; a failed write is retried
+without counting twice.
+
 Declarative management with Ansible
 -----------------------------------
 

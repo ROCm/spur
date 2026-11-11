@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "preemption_usage.rs"]
+mod preemption_usage;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -597,6 +600,10 @@ pub struct ClusterManager {
     /// None when running without a config file (e.g. in tests).
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
+    preemption_usage: RwLock<preemption_usage::UsageLedger>,
+    preemption_confirmations:
+        RwLock<BTreeMap<(JobId, u64), spur_core::preemption_usage::PreemptionRelease>>,
+    preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -1019,6 +1026,9 @@ impl ClusterManager {
             scheduler_interval_secs,
             config_path,
             jobs: RwLock::new(HashMap::new()),
+            preemption_usage: RwLock::new(Default::default()),
+            preemption_confirmations: RwLock::new(BTreeMap::new()),
+            preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -1426,6 +1436,7 @@ impl ClusterManager {
             expand_job_specs(spec, job_id).map_err(|e| SubmitError::invalid(e.to_string()))?;
 
         for mut task_spec in specs {
+            task_spec.submitted_at = None;
             let task_id = if task_spec.array_job_id.is_some() {
                 self.next_job_id.fetch_add(1, Ordering::SeqCst)
             } else {
@@ -2815,7 +2826,7 @@ impl ClusterManager {
         job_id: JobId,
         node_names: Vec<String>,
         resources: ResourceAllocations,
-        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
         idle_fill: bool,
     ) -> anyhow::Result<u32> {
@@ -2832,16 +2843,40 @@ impl ClusterManager {
         )
     }
 
-    /// Charge a placement in Raft before dispatching, so a leader change mid-dispatch finds
-    /// it charged; the charged partition rides the same entry. Returns the run epoch.
+    #[cfg(test)]
     pub fn reserve_attributed_placement(
         &self,
         job_id: JobId,
         node_names: Vec<String>,
         resources: ResourceAllocations,
-        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
         attribution: RunAttribution,
+    ) -> anyhow::Result<u32> {
+        let observation = self.preemption_observation(job_id);
+        self.reserve_placement_for_observation(
+            job_id,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            attribution,
+            observation,
+        )
+    }
+
+    /// Charge a placement in Raft before dispatching, so a leader change mid-dispatch finds
+    /// it charged; partition and preemption attribution ride the same entry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_placement_for_observation(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        attribution: RunAttribution,
+        preemption_observation: Option<u64>,
     ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
@@ -2880,6 +2915,7 @@ impl ClusterManager {
         // the job is still Pending; the transition to Running follows once the
         // dispatch is confirmed (see `activate_job`).
         let resp = self.propose(WalOperation::JobStart {
+            preemption_observation,
             job_id,
             nodes: node_names,
             resources,
@@ -3337,6 +3373,27 @@ impl ClusterManager {
             preempted_by,
             preempt_qos,
             true,
+            None,
+        )
+    }
+
+    pub(crate) fn preempt_job_for_observation(
+        &self,
+        job_id: JobId,
+        expected_run_attempt: u32,
+        mode: PreemptMode,
+        preemptor: JobId,
+        preempt_qos: Option<String>,
+        observation_id: Option<u64>,
+    ) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_inner(
+            job_id,
+            expected_run_attempt,
+            mode,
+            Some(preemptor),
+            preempt_qos,
+            true,
+            observation_id,
         )
     }
 
@@ -3360,9 +3417,11 @@ impl ClusterManager {
             reclaimed_by,
             preempt_qos,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn preempt_job_inner(
         &self,
         job_id: JobId,
@@ -3371,8 +3430,9 @@ impl ClusterManager {
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
         earmark_freed: bool,
+        observation_id: Option<u64>,
     ) -> anyhow::Result<PreemptOutcome> {
-        {
+        let preemption_claim = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -3388,7 +3448,12 @@ impl ClusterManager {
                     expected_run_attempt
                 );
             }
-        }
+            preempted_by.filter(|_| earmark_freed).map(|owner| {
+                let observation =
+                    observation_id.unwrap_or_else(|| self.next_preemption_observation(owner));
+                self.preemption_claim(job, observation)
+            })
+        };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
@@ -3414,6 +3479,7 @@ impl ClusterManager {
             }
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
+                    preemption_claim,
                     job_id,
                     preempted_by,
                     preempt_qos,
@@ -3449,6 +3515,7 @@ impl ClusterManager {
                         .map_or(hold, |user_begin| user_begin.max(hold))
                 };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    preemption_claim,
                     handoff: earmark_freed && preempted_by.is_some(),
                     job_id,
                     begin_time,
@@ -3830,6 +3897,11 @@ impl ClusterManager {
                 })
                 .unwrap_or((0, 0, None, None, None, None));
             notifier.notify_job_end(JobEndRecord {
+                preemption_usage: self
+                    .jobs
+                    .read()
+                    .get(&job_id)
+                    .map(|j| j.preemption_usage.clone()),
                 job_id,
                 state: state.display().to_owned(),
                 exit_code: finalized.exit_code,
@@ -6844,9 +6916,86 @@ impl ClusterManager {
         }
     }
 
+    pub(crate) fn pending_preemption_checkpoints(
+        &self,
+        limit: usize,
+        after: Option<JobId>,
+    ) -> Vec<crate::accounting::preemption::Checkpoint> {
+        let jobs = self.jobs.read();
+        let accounted = self.preemption_accounted.read();
+        let mut pending: Vec<_> = jobs
+            .values()
+            .filter(|job| {
+                after.is_none_or(|id| job.job_id > id)
+                    && !preemption_checkpoint_saved(&accounted, job)
+            })
+            .collect();
+        pending.sort_unstable_by_key(|job| job.job_id);
+        pending
+            .into_iter()
+            .take(limit)
+            .map(crate::accounting::preemption::Checkpoint::from)
+            .collect()
+    }
+
+    pub(crate) fn holds_preemption_checkpoint(&self, job_id: JobId, incarnation: &str) -> bool {
+        self.jobs
+            .read()
+            .get(&job_id)
+            .is_some_and(|job| crate::accounting::preemption::incarnation(job) == incarnation)
+    }
+
+    pub(crate) fn acknowledge_preemption_checkpoint(
+        &self,
+        checkpoint: &crate::accounting::preemption::Checkpoint,
+    ) {
+        let jobs = self.jobs.read();
+        let Some(job) = jobs.get(&checkpoint.job_id) else {
+            return;
+        };
+        if job.submit_time == checkpoint.submit_time && job.preemption_usage == checkpoint.usage {
+            self.preemption_accounted.write().insert(
+                job.job_id,
+                (job.submit_time, job.preemption_usage.revision()),
+            );
+        }
+    }
+
+    /// Finished jobs past retention that stay only until their preemption counts
+    /// reach accounting, with the oldest one's end time.
+    pub(crate) fn preemption_export_backlog(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (u64, Option<DateTime<Utc>>) {
+        let held = self.scan_terminal_retention(now).held;
+        (held.len() as u64, held.into_iter().min())
+    }
+
     /// Evict finished jobs whose end_time is older than the retention window,
     /// bounding controller memory. No-op when nothing has aged out.
     pub fn evict_expired_terminal_jobs(&self) {
+        let scan = self.scan_terminal_retention(Utc::now());
+        if scan.evictable.is_empty() {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            job_ids: scan.evictable,
+            before: Some(scan.before),
+            at: None,
+        }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+            return;
+        }
+        if scan.unexported > 0 {
+            warn!(
+                jobs = scan.unexported,
+                "evicted finished jobs whose preemption counts never reached accounting"
+            );
+        }
+    }
+
+    fn scan_terminal_retention(&self, now: DateTime<Utc>) -> RetentionScan {
         // Floor above the reconcile interval so a job survives at least one
         // accounting reconcile pass before it can be evicted (retention 0 included).
         let retention = self
@@ -6854,7 +7003,10 @@ impl ClusterManager {
             .controller
             .terminal_job_retention_secs
             .max(crate::accounting::RECONCILE_INTERVAL_SECS);
-        let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        let before = now - chrono::Duration::seconds(retention as i64);
+        let export_deadline = self
+            .accounting_enabled()
+            .then(|| before - chrono::Duration::seconds(PREEMPTION_EXPORT_HOLD_SECS));
         let jobs = self.jobs.read();
         // Spare a target still referenced by a live job's dependency: dropping it
         // makes resolve_target_state return None, which cancels/early-releases dependents.
@@ -6868,23 +7020,34 @@ impl ClusterManager {
         }
         // is_finalized is load-bearing, not redundant: end_time survives a
         // requeue, so a re-dispatched job's stale end_time alone would reap it.
-        let job_ids: Vec<JobId> = jobs
-            .iter()
-            .filter(|(id, j)| {
-                j.state.is_finalized()
-                    && j.end_time.is_some_and(|t| t < before)
-                    && !referenced.contains(id)
-                    && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        drop(jobs);
-        if job_ids.is_empty() {
-            return;
+        let usage = self.preemption_usage.read();
+        let accounted = self.preemption_accounted.read();
+        let mut scan = RetentionScan {
+            before,
+            ..Default::default()
+        };
+        for (&id, j) in jobs.iter() {
+            let expired = j.state.is_finalized()
+                && j.end_time.is_some_and(|t| t < before)
+                && j.preemption_usage_updated_at.is_none_or(|t| t < before)
+                && !usage.tracks_request(id)
+                && !referenced.contains(&id)
+                && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p));
+            if !expired {
+                continue;
+            }
+            match (export_deadline, j.end_time) {
+                (Some(_), _) if preemption_checkpoint_saved(&accounted, j) => {}
+                (Some(deadline), Some(end)) if end < deadline => scan.unexported += 1,
+                (Some(_), Some(end)) => {
+                    scan.held.push(end);
+                    continue;
+                }
+                _ => {}
+            }
+            scan.evictable.push(id);
         }
-        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
-            warn!(error = %e, "failed to evict expired terminal jobs");
-        }
+        scan
     }
 
     /// Cancel running jobs whose reservation window has ended (after optional grace).
@@ -8287,7 +8450,7 @@ impl ClusterManager {
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+    fn apply_job_operation(&self, op: &WalOperation) -> ClientResponse {
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
@@ -8610,6 +8773,7 @@ impl ClusterManager {
                 preempt_qos,
                 at,
                 run_attempt,
+                ..
             } => {
                 let at = at.unwrap_or(timestamp);
                 let freed_nodes;
@@ -8758,6 +8922,7 @@ impl ClusterManager {
                 }
             }
             WalOperation::JobStart {
+                preemption_observation: _,
                 job_id,
                 nodes: node_names,
                 resources,
@@ -8868,8 +9033,8 @@ impl ClusterManager {
 
                     let grace = job
                         .preempt_grace()
-                        .filter(|_| job.state == JobState::Running)
-                        .cloned();
+                        .filter(|_| job.state == JobState::Running);
+                    let in_grace = grace.is_some();
                     let already_reported = job.node_completions.contains_key(node_name);
                     freed_for_preemptor = if already_reported {
                         None
@@ -8905,7 +9070,13 @@ impl ClusterManager {
                         }
                     }
 
-                    Self::advance_after_node_report(job, grace.as_ref(), timestamp)
+                    // A claim carries every node's allocation; only the final report needs a copy.
+                    if in_grace && !job.all_nodes_completed() {
+                        None
+                    } else {
+                        let grace = job.preempt_grace().filter(|_| in_grace).cloned();
+                        Self::advance_after_node_report(job, grace.as_ref(), timestamp)
+                    }
                 };
 
                 if let Some(preemptor) = freed_for_preemptor {
@@ -9817,16 +9988,33 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::EvictTerminalJobs { job_ids } => {
+            WalOperation::EvictTerminalJobs {
+                job_ids, before, ..
+            } => {
                 // Re-check finalized: spare an id requeued between propose and
                 // apply. Deterministic — every replica applies in the same order.
+                let usage = self.preemption_usage.read();
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
-                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
+                    .filter(|id| {
+                        jobs.get(id).is_some_and(|j| {
+                            j.state.is_finalized()
+                                && before.is_none_or(|cutoff| {
+                                    !usage.tracks_request(**id)
+                                        && j.end_time.is_some_and(|end| end < cutoff)
+                                        && j.preemption_usage_updated_at
+                                            .is_none_or(|updated| updated < cutoff)
+                                })
+                        })
+                    })
                     .copied()
                     .collect();
+                drop(usage);
                 if !evicted.is_empty() {
                     jobs.retain(|id, _| !evicted.contains(id));
+                    self.preemption_accounted
+                        .write()
+                        .retain(|id, _| !evicted.contains(id));
                     self.steps
                         .write()
                         .retain(|_, s| !evicted.contains(&s.job_id));
@@ -9855,6 +10043,8 @@ const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Must include all durable cluster state so a follower can fully restore from it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ClusterSnapshot {
+    #[serde(default)]
+    preemption_usage: preemption_usage::UsageLedger,
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
@@ -10021,7 +10211,9 @@ impl StateMachineApply for ClusterManager {
         // `read()` temporaries would otherwise hold `steps` while this waits.
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
+        let preemption_usage = self.preemption_usage.read().clone();
         let snap = ClusterSnapshot {
+            preemption_usage,
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
@@ -10045,6 +10237,9 @@ impl StateMachineApply for ClusterManager {
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
         let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
+        self.preemption_confirmations.write().clear();
+        *self.preemption_usage.write() = snap.preemption_usage;
+        self.preemption_accounted.write().clear();
         jobs.clear();
         for job in snap.jobs {
             next_id = next_id.max(job.job_id + 1);
@@ -12236,6 +12431,25 @@ pub(crate) mod gated {
     }
 }
 
+/// How long past retention a finished job waits for its preemption counts to reach accounting.
+const PREEMPTION_EXPORT_HOLD_SECS: i64 = 24 * 3600;
+
+#[derive(Default)]
+struct RetentionScan {
+    before: DateTime<Utc>,
+    evictable: Vec<JobId>,
+    unexported: usize,
+    held: Vec<DateTime<Utc>>,
+}
+
+fn preemption_checkpoint_saved(
+    accounted: &HashMap<JobId, (DateTime<Utc>, u128)>,
+    job: &Job,
+) -> bool {
+    let revision = job.preemption_usage.revision();
+    revision == 0 || accounted.get(&job.job_id) == Some(&(job.submit_time, revision))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -13983,6 +14197,7 @@ state = "UP"
         let id = submit_and_wait(&cm, basic_spec("a"));
         let res = scalar_alloc(4, 8000);
         let start = |run_attempt| WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec!["n1".into()],
             resources: res.clone(),
@@ -15341,6 +15556,7 @@ state = "UP"
 
         let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: resources.clone(),
@@ -15544,6 +15760,7 @@ state = "UP"
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0, 1]);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: stale_slice.clone(),
@@ -15667,6 +15884,7 @@ state = "UP"
                 idle_fill: false,
                 effective_partition: None,
                 memory_adjustment: None,
+                preemption_observation: None,
                 at: None,
             },
             WalOperation::NodeUpdate {
@@ -15950,6 +16168,7 @@ state = "UP"
         });
         let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0]);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: stale_slice.clone(),
@@ -15984,6 +16203,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
@@ -16074,6 +16294,9 @@ state = "UP"
         // Apply removes only ids still finalized; live ids 2 and 3 are no-ops
         // even when named (a job requeued between propose and apply).
         cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
             job_ids: vec![1, 2, 3, 4],
         });
         assert!(
@@ -16119,7 +16342,12 @@ state = "UP"
         cm_b.jobs.write().get_mut(&1).unwrap().end_time =
             Some(chrono::Utc::now() + chrono::Duration::hours(2));
 
-        let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
+        let entry = WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![1],
+        };
         cm_a.apply_operation(&entry);
         cm_b.apply_operation(&entry);
         assert!(cm_a.get_job(1).is_none(), "finalized id is evicted");
@@ -16281,7 +16509,12 @@ state = "UP"
         });
         cm.apply_operation(&WalOperation::job_complete(id2, 0, JobState::Cancelled));
         let next_before = cm.next_job_id.load(Ordering::Relaxed);
-        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![id2],
+        });
         assert!(cm.get_job(id2).is_none(), "high-id job evicted");
 
         // Snapshot AFTER eviction: id2's JobSubmit is compacted away, so the map
@@ -17028,6 +17261,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -17075,6 +17309,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -17123,6 +17358,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -17198,6 +17434,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -17265,6 +17502,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -17337,6 +17575,7 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
 
         let start = || WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -17451,6 +17690,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
@@ -17509,6 +17749,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -17548,6 +17789,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -17601,6 +17843,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -17648,6 +17891,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -17660,6 +17904,7 @@ state = "UP"
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -17709,6 +17954,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -17745,6 +17991,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -18180,6 +18427,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -18219,6 +18467,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -18261,6 +18510,7 @@ state = "UP"
         ));
         // Re-dispatched run: current epoch is 2.
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -18304,6 +18554,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -18386,6 +18637,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -18807,6 +19059,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-kind", "worker1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -19032,6 +19285,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -20955,6 +21209,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -20970,6 +21225,7 @@ state = "UP"
 
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -21010,6 +21266,7 @@ state = "UP"
 
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -21041,6 +21298,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -21062,6 +21320,7 @@ state = "UP"
 
     fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: None,
@@ -21072,6 +21331,7 @@ state = "UP"
 
     fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -21617,6 +21877,7 @@ state = "UP"
 
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -21696,6 +21957,7 @@ state = "UP"
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -21713,6 +21975,7 @@ state = "UP"
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -21738,6 +22001,7 @@ state = "UP"
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -23884,6 +24148,7 @@ state = "UP"
         let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
         let signaled_at = Utc::now();
         let pending = PreemptPending {
+            preemption_claim: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: hunter_id,
@@ -24228,6 +24493,7 @@ state = "UP"
         let victim = run_job_on(cm, "victim", "n1");
         let owner = submit_and_wait(cm, basic_spec("owner"));
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -24249,6 +24515,7 @@ state = "UP"
         }
         let owner = requeue_into_earmark(&cm);
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: owner,
             nodes: vec!["n2".into()],
             resources: scalar_alloc(2, 4000),
@@ -24284,6 +24551,7 @@ state = "UP"
         let victim = run_job_on(&cm, "victim", "n1");
         let owner = run_job_on(&cm, "owner", "n2");
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -32292,7 +32560,12 @@ state = "UP"
         });
         assert_eq!(cm.allocate_step_id(1), 0);
 
-        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![1] });
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![1],
+        });
 
         assert_eq!(
             cm.allocate_step_id(1),
@@ -33034,6 +33307,7 @@ state = "UP"
             .expect("fixture instant")
             .with_timezone(&Utc);
         PreemptPending {
+            preemption_claim: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
             preempted_by: 99,
@@ -33134,7 +33408,10 @@ state = "UP"
                 spec: Box::new(basic_spec("preemptor")),
             });
         }
-        let mut pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        let victim = cm.get_job(id).expect("grace victim");
+        let mut pending = preempt_pending_for(victim.run_attempt, 90);
+        pending.preemption_claim =
+            Some(cm.preemption_claim(&victim, cm.next_preemption_observation(99)));
         pending.mode = mode;
         let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
             job_id: id,
@@ -33213,7 +33490,8 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
         let id = run_job_on(&cm, "victim", "n1");
         let attempt = cm.get_job(id).unwrap().run_attempt;
-        let pending = preempt_pending_for(attempt, 90);
+        let mut pending = preempt_pending_for(attempt, 90);
+        pending.preemption_claim = Some(cm.preemption_claim(&cm.get_job(id).unwrap(), 1));
 
         assert!(cm.signal_preemption(pending.clone(), id).unwrap());
         assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(pending));
@@ -33728,6 +34006,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: None,
@@ -33748,6 +34027,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: false,
             job_id: id,
             begin_time: Utc::now(),
@@ -34092,13 +34372,18 @@ state = "UP"
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
             let id = run_two_node_job_in_grace(&cm, mode);
+            let pending = cm.get_job(id).unwrap().preempt_pending.unwrap();
+            assert_eq!(
+                pending.preemption_claim.as_ref().unwrap().allocations.len(),
+                2
+            );
 
             let resp = report_node(&cm, id, "n1", grace_exit_at());
 
             assert!(resp.jobs_finalized.is_empty(), "{mode:?}");
             let job = cm.get_job(id).unwrap();
             assert_eq!(job.state, JobState::Running, "{mode:?}");
-            assert!(job.preempt_pending.is_some(), "{mode:?}");
+            assert_eq!(job.preempt_pending, Some(pending), "{mode:?}");
             assert_eq!(job.end_time, None, "{mode:?}");
             assert_eq!(job.cancel_signaled_at, None, "{mode:?}");
             assert_eq!(job.preempted_by, None, "not preempted until the deadline");
@@ -34107,6 +34392,21 @@ state = "UP"
             assert_eq!(cpus_in_use(&cm, "n2"), 1, "the other node is still held");
             assert_eq!(earmark_owner(&cm, "n1"), Some(99), "{mode:?}");
             assert_eq!(earmark_owner(&cm, "n2"), None, "{mode:?}");
+
+            let last = report_node(&cm, id, "n2", grace_exit_at());
+            assert_eq!(last.jobs_finalized.len(), 1, "{mode:?}");
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(
+                job.state,
+                if mode == PreemptMode::Cancel {
+                    JobState::Cancelled
+                } else {
+                    JobState::Pending
+                },
+                "{mode:?}"
+            );
+            assert!(job.preempt_pending.is_none(), "{mode:?}");
+            assert_eq!(cm.preemption_usage().open, 1, "one victim run");
         }
     }
 
@@ -34115,12 +34415,19 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        let pending = cm.get_job(id).unwrap().preempt_pending;
         report_node(&cm, id, "n1", grace_exit_at());
         take_over_node(&cm, "n1");
 
         report_node(&cm, id, "n1", grace_exit_at());
 
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, pending);
+        assert_eq!(
+            cm.preemption_usage().open,
+            1,
+            "replay does not reopen the claim"
+        );
         assert_eq!(cpus_in_use(&cm, "n1"), 1, "only the job that took n1 over");
     }
 
@@ -34161,6 +34468,7 @@ state = "UP"
         take_over_node(&cm, "n1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: Some("high".into()),
@@ -34241,6 +34549,7 @@ state = "UP"
         let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
             handoff: true,
             job_id: id,
             begin_time,
@@ -38873,6 +39182,7 @@ state = "UP"
         stale.labels = HashMap::new();
 
         let snap = ClusterSnapshot {
+            preemption_usage: Default::default(),
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),
@@ -38961,6 +39271,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
@@ -38981,6 +39292,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
@@ -39766,6 +40078,7 @@ state = "UP"
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
             resources: scalar_alloc(nodes.len() as u32, 1000 * nodes.len() as u64),

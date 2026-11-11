@@ -3,13 +3,14 @@
 
 """Exercise resource handoffs through real eviction, epilog, and placement."""
 
+import json
 import re
 import shlex
 import time
 
 import pytest
 
-from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state
+from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state, wait_until
 
 
 @pytest.fixture
@@ -22,7 +23,17 @@ def wide_handoff_cluster(ssh_nodes, remote_bin_dir):
     yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 4)
 
 
-def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
+@pytest.fixture
+def rollup_cluster(ssh_nodes, remote_bin_dir):
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3, retention=0)
+
+
+@pytest.fixture
+def retry_cluster(ssh_nodes, remote_bin_dir):
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3, controller_prolog=True)
+
+
+def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400, controller_prolog=False):
     if len(ssh_nodes) < count:
         pytest.skip(f"this handoff test requires {count} nodes")
     c = SpurCluster(ssh_nodes[:count], make_remote_dir(), remote_bin_dir)
@@ -45,10 +56,29 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
             'done\n',
             all_nodes=True,
         )
+        prolog = c.write_file(
+            "handoff-prolog.sh",
+            '#!/bin/bash\n'
+            f'gate={shlex.quote(c.remote_dir)}/launch-$SPUR_JOB_ID\n'
+            'touch "$gate.entered"\n'
+            'while [ -e "$gate" ]; do sleep 0.02; done\n'
+            '[ ! -e "$gate.fail" ]\n',
+            all_nodes=True,
+        )
+        hooks = {"epilog": epilog, "prolog": prolog}
+        if controller_prolog:
+            hooks["prolog_slurmctld"] = c.write_file(
+                "pre-reservation-prolog.sh",
+                '#!/bin/bash\n'
+                f'gate={shlex.quote(c.remote_dir)}/before-reservation-$SPUR_JOB_ID\n'
+                'touch "$gate.entered"\n'
+                '[ ! -e "$gate.fail" ]\n',
+            )
         # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
         c.start({
+            "controller": {"terminal_job_retention_secs": retention},
             "scheduler": {"preempt_type": "qos_priority", "complete_wait_secs": 300},
-            "hooks": {"epilog": epilog},
+            "hooks": hooks,
             "auth": {"allow_root_jobs": True},
         }, kill_stale=False)
         for name, priority, targets, mode in [
@@ -70,7 +100,9 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
         yield c
     finally:
         for node in c.nodes:
-            node.exec_allow_fail(f"rm -f {shlex.quote(c.remote_dir)}/hold-*")
+            node.exec_allow_fail(
+                f"rm -f {shlex.quote(c.remote_dir)}/hold-* {shlex.quote(c.remote_dir)}/launch-*"
+            )
         c.teardown()
 
 
@@ -297,3 +329,482 @@ def test_preemptor_does_not_evict_for_a_node_assigned_in_the_same_pass(handoff_c
     wait_job(c, short, timeout=60)
     wait_job_state(c, hunter, "R", timeout=60)
     assert _preempted_by(c, low) == hunter
+
+
+def _usage(c, *, used=0, open_count=0, unused=None, jobs=None):
+    unused = unused or {}
+    totals = (used, sum(unused.values()), open_count)
+    expected_series = {
+        (reason, initiator): unused.get((reason, initiator), 0)
+        for reason in ("started_elsewhere", "launch_failed", "cancelled", "ended_other")
+        for initiator in ("user", "admin", "system", "unknown")
+    }
+
+    def check():
+        body = c.nodes[0].exec("curl -fsS http://127.0.0.1:6822/metrics/scheduler")
+        prefix = "spur_scheduler_preemptions_"
+        for family, kind in (("used", "counter"), ("unused", "counter"), ("open", "gauge")):
+            assert f"# TYPE {prefix}{family} {kind}\n" in body, body
+        for name, value in (("used_total", used), ("open", open_count)):
+            assert re.search(rf"^{prefix}{name} {value}$", body, re.M), body
+        series = {}
+        for line in body.splitlines():
+            if line.startswith(f"{prefix}unused_total"):
+                match = re.fullmatch(rf'{prefix}unused_total\{{([^}}]+)\}} (\d+)', line)
+                assert match, line
+                labels = dict(re.findall(r'(\w+)="([^"]*)"', match[1]))
+                assert set(labels) == {"reason", "initiator"}, labels
+                key = (labels["reason"], labels["initiator"])
+                assert key not in series, line
+                series[key] = int(match[2])
+        assert series == expected_series, series
+
+        diag = c.sdiag()
+        match = re.search(r"Preemptions \(lifetime\): used=(\d+) unused=(\d+) open=(\d+)", diag)
+        assert match and tuple(map(int, match.groups())) == totals, diag
+        causes = {
+            (reason, initiator): int(count)
+            for reason, initiator, count in re.findall(
+                r"Unused: reason=(\w+) initiator=(\w+) count=(\d+)", diag
+            )
+        }
+        assert causes == unused, diag
+        assert not re.search(r"User .*: used=", diag), diag
+        for job, (job_used, job_open, job_unused) in (jobs or {}).items():
+            show = c.scontrol("show", "job", str(job))
+            match = re.search(r"PreemptionsUsed=(\d+) PreemptionsUnused=(\d+) PreemptionsOpen=(\d+)", show)
+            job_totals = (job_used, sum(job_unused.values()), job_open)
+            if any(job_totals):
+                assert match and tuple(map(int, match.groups())) == job_totals, show
+            else:
+                assert "PreemptionsUsed=" not in show, show
+            listed = re.search(r"UnusedPreemptionCauses=(\S+)", show)
+            causes = {
+                (reason, initiator): int(count)
+                for reason, initiator, count in re.findall(
+                    r"(\w+)/(\w+):(\d+)", listed.group(1) if listed else ""
+                )
+            }
+            assert causes == job_unused, show
+        return True
+
+    wait_until(check, timeout_s=60, interval_s=0.2,
+               desc=f"preemption usage {totals}, causes={unused}, jobs={jobs}",
+               tolerate=(AssertionError,))
+
+
+def _launch_gate(c, job, indices, hold):
+    path = shlex.quote(f"{c.remote_dir}/launch-{job}")
+    for index in indices:
+        c.nodes[index].exec(f"{'touch' if hold else 'rm -f'} {path}")
+
+
+def _wait_prolog(c, job, indices):
+    path = shlex.quote(f"{c.remote_dir}/launch-{job}.entered")
+    wait_until(
+        lambda: all(c.nodes[i].exec_allow_fail(f"test -e {path} && echo ready").strip() == "ready"
+                    for i in indices),
+        timeout_s=60, interval_s=0.2, desc=f"job {job} waiting inside node prolog",
+    )
+
+
+def _accounted_usage(c, job, *, used=0, unused=None):
+    expected = {"used": used, "open": 0, "unused": unused or {}}
+
+    def check():
+        raw = c.psql(f"SELECT preemption_usage FROM jobs WHERE job_id = {int(job)}")
+        assert raw.strip(), f"job {job} has no accounting row"
+        stored = json.loads(raw)
+        assert {key: stored.get(key) for key in expected} == expected, raw
+        return True
+
+    # Late settlements repair existing rows on the two-minute reconciliation pass.
+    wait_until(check, timeout_s=150, interval_s=1,
+               desc=f"accounting usage for job {job}: {expected}", tolerate=(AssertionError,))
+
+
+def test_usage_counts_multinode_victim_once_after_launch_confirmation(handoff_cluster):
+    c = handoff_cluster
+    nodes = ",".join(c.node_names[:2])
+    _usage(c)
+    victim = _submit(c, "usage-victim", "victim-a", nodes, 2)
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0, 1], True)
+    hunter = _submit(c, "usage-hunter", "hunter-a", nodes, 2)
+    _wait_epilog(c, victim, [0, 1])
+    _launch_gate(c, hunter, [0, 1], True)
+    _usage(c, jobs={hunter: (0, 0, {}), victim: (0, 0, {})})
+
+    _gate(c, victim, [0], False)
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _state(c, hunter, "PENDING")
+    c.restart_controller()
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+
+    _gate(c, victim, [1], False)
+    _wait_prolog(c, hunter, [0, 1])
+    _state(c, hunter, "PENDING")
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _launch_gate(c, hunter, [0, 1], False)
+    _usage(c, used=1, jobs={hunter: (1, 0, {}), victim: (0, 0, {})})
+
+    c.cli(["scancel", str(hunter)])
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+    _accounted_usage(c, hunter, used=1)
+    c.cli(["spur", "sdiag", "--reset"])
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+    c.restart_controller()
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+
+
+def test_usage_cancelled_request_counts_each_victim_including_late_release(handoff_cluster):
+    c = handoff_cluster
+    victims = [_submit(c, f"usage-victim-{i}", "victim-a", c.node_names[i]) for i in (0, 1)]
+    for i, victim in enumerate(victims):
+        wait_job_state(c, victim, "R", timeout=60)
+        _gate(c, victim, [i], True)
+    hunter = _submit(c, "usage-hunter", "hunter-a", ",".join(c.node_names[:2]), 2)
+    for i, victim in enumerate(victims):
+        _wait_epilog(c, victim, [i])
+        assert f"PreemptedBy={hunter}" in _state(c, victim, "COMPLETING")
+    _usage(c, jobs={hunter: (0, 0, {})})
+    _gate(c, victims[0], [0], False)
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    c.cli(["scancel", str(hunter)])
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    cause = {("cancelled", "user"): 1}
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _accounted_usage(c, hunter, unused={"cancelled": {"user": 1}})
+    c.restart_controller()
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _gate(c, victims[1], [1], False)
+    cause = {("cancelled", "user"): 2}
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _accounted_usage(c, hunter, unused={"cancelled": {"user": 2}})
+    _scenario_report(c, unused={("cancelled", "user"): 2})
+
+
+def test_usage_started_elsewhere_and_cancelled_have_distinct_causes(handoff_cluster):
+    c = handoff_cluster
+    a, b, flexible, pinned = _competing_preemptors(c)
+    _usage(c, open_count=1, jobs={pinned: (0, 1, {}), flexible: (0, 0, {})})
+    c.cli(["scancel", str(pinned)])
+    wait_job_state(c, flexible, "R", timeout=60)
+    assert f"NodeList={c.node_names[1]}" in _state(c, flexible, "RUNNING")
+    cancelled = {("cancelled", "user"): 1}
+    _usage(c, unused=cancelled, jobs={pinned: (0, 0, cancelled), flexible: (0, 0, {})})
+    _gate(c, a, [0], False)
+    _gate(c, b, [2], False)
+    elsewhere = {("started_elsewhere", "system"): 1}
+    _usage(c, unused={**cancelled, **elsewhere},
+           jobs={pinned: (0, 0, cancelled), flexible: (0, 0, elsewhere)})
+    c.cli(["scancel", str(flexible)])
+    assert wait_job(c, flexible, timeout=60) == "CA"
+    _usage(c, unused={**cancelled, **elsewhere})
+    _accounted_usage(c, flexible, unused={"started_elsewhere": {"system": 1}})
+    _scenario_report(c, unused={**cancelled, **elsewhere})
+
+
+@pytest.mark.parametrize("failure", ["launch", "application"])
+def test_usage_distinguishes_launch_failure_from_later_application_failure(handoff_cluster, failure):
+    c = handoff_cluster
+    victim = _submit(c, "usage-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    finish = f"{c.remote_dir}/finish-application"
+    script = c.write_file(
+        "usage-failure.sh",
+        f"#!/bin/bash\nwhile [ ! -e {shlex.quote(finish)} ]; do sleep 0.02; done\nexit 7\n",
+        all_nodes=True,
+    )
+    hunter = parse_job_id(c.sbatch([
+        "--exclusive", "-N1", "-t", "10:00", "-q", "hunter-a",
+        f"--nodelist={c.node_names[0]}", script,
+    ]))
+    assert hunter is not None
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    if failure == "launch":
+        c.nodes[0].exec(f"touch {shlex.quote(f'{c.remote_dir}/launch-{hunter}.fail')}")
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _state(c, hunter, "PENDING")
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _launch_gate(c, hunter, [0], False)
+    if failure == "launch":
+        cause = {("launch_failed", "system"): 1}
+        _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+        c.cli(["scancel", str(hunter)])
+        wait_job(c, hunter, timeout=60)
+        _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+        _accounted_usage(c, hunter, unused={"launch_failed": {"system": 1}})
+        _scenario_report(c, unused=cause)
+    else:
+        _usage(c, used=1, jobs={hunter: (1, 0, {})})
+        c.nodes[0].exec(f"touch {shlex.quote(finish)}")
+        assert wait_job(c, hunter, timeout=60) == "F"
+        assert "ExitCode=7:0" in _state(c, hunter, "FAILED")
+        _usage(c, used=1, jobs={hunter: (1, 0, {})})
+        _accounted_usage(c, hunter, used=1)
+        _scenario_report(c, used=1)
+
+
+def _rollup_report(c, expected, *filters, causes=None):
+    def check():
+        text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                      *filters])
+        rows = [line.split("|") for line in text.splitlines() if "|" in line]
+        assert all(len(row) == 5 for row in rows), text
+        actual = {(row[0], row[1]): tuple(map(int, row[2:5])) for row in rows}
+        assert len(actual) == len(rows) and actual == expected, text
+        if causes is not None:
+            text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                          "--by-cause", *filters])
+            details = [line.split("|") for line in text.splitlines() if "|" in line]
+            assert all(len(row) == 5 and row[2] and row[3] for row in details), text
+            actual_causes = {tuple(row[:4]): int(row[4]) for row in details}
+            assert len(actual_causes) == len(details) and actual_causes == causes, text
+            assert all(n > 0 for n in actual_causes.values()), text
+            for pair, (_, unused, _) in actual.items():
+                assert sum(n for key, n in actual_causes.items() if key[:2] == pair) == unused, text
+        return True
+
+    wait_until(check, timeout_s=90, interval_s=1, desc="accounting preemption rollup",
+               tolerate=(AssertionError, RuntimeError))
+
+
+def _scenario_report(c, used=0, unused=None):
+    unused = unused or {}
+    user = c.nodes[0].user
+    # Resolve the default association from the actual report, including an empty account.
+    wait_until(lambda: "|" in c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader"]),
+               timeout_s=90, interval_s=1, desc="first accounting rollup")
+    text = c.cli(["spur", "sreport", "preemptions", "--parsable", "--noheader"])
+    pairs = [tuple(row.split("|")[:2]) for row in text.splitlines() if "|" in row]
+    assert len(pairs) == 1 and pairs[0][0] == user, text
+    pair = pairs[0]
+    expected = {pair: (used, sum(unused.values()), 0)}
+    causes = {(*pair, reason, initiator): count for (reason, initiator), count in unused.items()}
+    _rollup_report(c, expected)
+    _rollup_report(c, expected, causes=causes)
+    c.restart_controller()
+    _rollup_report(c, expected, causes=causes)
+
+
+@pytest.mark.parametrize("outcome", ["used", "launch_failed"])
+def test_preemption_rollups_survive_outage_restart_and_history_cleanup(rollup_cluster, outcome):
+    c = rollup_cluster
+    user = c.nodes[0].user
+    used = int(outcome == "used")
+    first_unused = {} if used else {("launch_failed", "system"): 1}
+    first_totals = (used, sum(first_unused.values()), 0)
+    first_causes = {(user, "rollup-a", reason, initiator): n
+                    for (reason, initiator), n in first_unused.items()}
+    for account in ("rollup-a", "rollup-b"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    sentinel = _submit(c, "retention-sentinel", "plain", c.node_names[1])
+    wait_job_state(c, sentinel, "R", timeout=60)
+    victim = _submit(c, "rollup-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "rollup-hunter", "hunter-a", c.node_names[0], extra=("--account=rollup-a",))
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _usage(c, open_count=1)
+    placement = c.scontrol("show", "job", str(hunter))
+    partition = re.search(r"\bPartition=(\S+)", placement)
+    assert partition and f"EffectivePartition={partition[1]}" in placement, placement
+    _rollup_report(c, {(user, "rollup-a"): (0, 0, 1)}, causes={})
+
+    # Pause preserves the ephemeral published port that the controller is configured to use.
+    c.scancel(str(sentinel))
+    assert wait_job(c, sentinel, timeout=60) == "CA"
+    c.pause_accounting()
+    try:
+        if not used:
+            c.nodes[0].exec(f"touch {shlex.quote(f'{c.remote_dir}/launch-{hunter}.fail')}")
+        _launch_gate(c, hunter, [0], False)
+        _usage(c, used=used, unused=first_unused)
+        c.scancel(str(hunter))
+        assert wait_job(c, hunter, timeout=60) == "CA"
+        c.restart_controller()
+        code, output = c.cli_with_exit(["spur", "sreport", "preemptions"])
+        assert code != 0, output
+        # A job with no preemption counts must expire while the unexported requester stays.
+        wait_until(lambda: f"JobId={sentinel} " not in c.cli_allow_fail(
+            ["scontrol", "show", "job", str(sentinel)]), timeout_s=180, interval_s=2,
+            desc="ordinary job history eviction during accounting outage")
+        assert f"PreemptionsUsed={used} PreemptionsUnused={sum(first_unused.values())}" in c.scontrol(
+            "show", "job", str(hunter)
+        )
+    finally:
+        c.resume_accounting()
+    _rollup_report(c, {(user, "rollup-a"): first_totals}, causes=first_causes)
+    wait_until(lambda: f"JobId={hunter} " not in c.cli_allow_fail(["scontrol", "show", "job", str(hunter)]),
+               timeout_s=90, interval_s=1, desc="exported job leaving controller history")
+    c.psql(f"DELETE FROM jobs WHERE job_id={int(hunter)}")
+    c.restart_controller()
+    _rollup_report(c, {(user, "rollup-a"): first_totals}, causes=first_causes)
+
+    victim = _submit(c, "rollup-victim-b", "victim-a", c.node_names[1])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [1], True)
+    hunter = _submit(c, "rollup-hunter-b", "hunter-a", c.node_names[1], extra=("--account=rollup-b",))
+    _wait_epilog(c, victim, [1])
+    c.scancel(str(hunter))
+    _gate(c, victim, [1], False)
+    _usage(c, used=used, unused={**first_unused, ("cancelled", "user"): 1})
+    expected = {(user, "rollup-a"): first_totals, (user, "rollup-b"): (0, 1, 0)}
+    _rollup_report(c, expected, "--user", user)
+    _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b")
+    causes = {**first_causes,
+              (user, "rollup-b", "cancelled", "user"): 1}
+    _rollup_report(c, expected, "--user", user, causes=causes)
+    _rollup_report(c, {(user, "rollup-b"): (0, 1, 0)}, "--account", "rollup-b",
+                   causes={(user, "rollup-b", "cancelled", "user"): 1})
+    human = c.cli(["spur", "sreport", "preemptions", "--by-cause"])
+    human_rows = [line.split() for line in human.splitlines() if line.strip()]
+    assert human_rows[0] == ["User", "Account", "Reason", "Initiator", "Unused"], human
+    expected_rows = [[*key, str(count)] for key, count in sorted(causes.items())]
+    assert human_rows[1:] == expected_rows, human
+    noheader = c.cli(["spur", "sreport", "preemptions", "--by-cause", "--noheader"])
+    assert [line.split() for line in noheader.splitlines() if line.strip()] == expected_rows, noheader
+    parsable = c.cli(["spur", "sreport", "preemptions", "--by-cause", "--parsable"])
+    assert parsable.splitlines() == ["User|Account|Reason|Initiator|Unused",
+                                     *["|".join(row) for row in expected_rows]], parsable
+    for flags in ([], ["--by-cause"]):
+        code, first = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable",
+                                       "--noheader", "--limit", "1", *flags])
+        assert code == 0, first
+        first_rows = [line for line in first.splitlines() if "|" in line]
+        if flags:
+            assert first_rows == ([] if used else [f"{user}|rollup-a|launch_failed|system|1"]), first
+        else:
+            assert first_rows == [f"{user}|rollup-a|{used}|{sum(first_unused.values())}|0"], first
+        token = re.search(r"Next page token: (.+)", first)
+        assert token, first
+        code, second = c.cli_with_exit(["spur", "sreport", "preemptions", "--parsable", "--noheader",
+                                        "--limit", "1", "--page-token", token[1], *flags])
+        assert code == 0, second
+        assert "Next page token" not in second, second
+        assert "rollup-a" not in second, second
+        second_rows = [line for line in second.splitlines() if "|" in line]
+        expected_second = f"{user}|rollup-b|cancelled|user|1" if flags else f"{user}|rollup-b|0|1|0"
+        assert second_rows == [expected_second], second
+    code, output = c.cli_with_exit(["spur", "sreport", "preemptions", "--start", "now-7days"])
+    assert code != 0 and "lifetime" in output, output
+
+
+def test_preemption_rollups_close_orphans_after_retained_checkpoint_page(handoff_cluster):
+    c = handoff_cluster
+    user = c.nodes[0].user
+    for account in ("orphan-live", "orphan-lost"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    script = c.write_file("orphan-retained.sh", "#!/bin/bash\ntrue\n", all_nodes=True)
+    assert parse_job_id(c.sbatch([
+        "--hold", "--array=1-100", "--account=orphan-live", "-q", "plain",
+        "-J", "orphan-retained", script,
+    ])) is not None
+    c.stop_controller()
+    # Preserve the exact submission stamp, including nanoseconds, in injected checkpoints.
+    retained = json.loads(c.nodes[0].exec(
+        "python3 - <<'PY'\n"
+        "import json\nfrom pathlib import Path\n"
+        "rows = []\n"
+        f"for path in Path({str(c.state_dir)!r}, 'raft', 'log').glob('*.json'):\n"
+        "    payload = json.loads(path.read_text())['payload']\n"
+        "    op = payload.get('Normal', {}) if isinstance(payload, dict) else {}\n"
+        "    job = op.get('JobSubmit')\n"
+        "    if job and job['spec']['name'] == 'orphan-retained':\n"
+        "        rows.append({'job_id': job['job_id'],\n"
+        "                     'incarnation': job['spec']['submitted_at'].replace('Z', '+00:00')})\n"
+        "print(json.dumps(rows))\nPY"
+    ))
+    assert len(retained) == 100, retained
+    orphan_id = max(row["job_id"] for row in retained) + 1
+    rows_sql = json.dumps(retained).replace("'", "''")
+    user_sql = user.replace("'", "''")
+    # Seed exported observations to exercise paging without running 100 preemptions.
+    c.psql(f"""
+        BEGIN;
+        INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, open)
+        SELECT job_id, incarnation, '{user_sql}', 'orphan-live', 1
+        FROM jsonb_to_recordset('{rows_sql}') AS r(job_id bigint, incarnation text);
+        INSERT INTO preemption_checkpoints (job_id, incarnation, user_name, account, open)
+        VALUES ({orphan_id}, 'legacy', '{user_sql}', 'orphan-lost', 1);
+        INSERT INTO preemption_rollups (user_name, account, open)
+        VALUES ('{user_sql}', 'orphan-live', 100), ('{user_sql}', 'orphan-lost', 1);
+        COMMIT;
+    """)
+    assert c.psql("SELECT sum(open) FROM preemption_checkpoints").strip() == "101"
+    expected = {(user, "orphan-live"): (0, 0, 100), (user, "orphan-lost"): (0, 1, 0)}
+    causes = {(user, "orphan-lost", "ended_other", "unknown"): 1}
+    c.start_controller(kill_stale=False)
+    _rollup_report(c, expected, causes=causes)
+    c.restart_controller()
+    _rollup_report(c, expected, causes=causes)
+
+
+def test_preemption_retry_before_reservation_keeps_the_same_capacity(retry_cluster):
+    c = retry_cluster
+    victim = _submit(c, "retry-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "retry-hunter", "hunter-a", c.node_names[0])
+    _wait_epilog(c, victim, [0])
+    gate = shlex.quote(f"{c.remote_dir}/before-reservation-{hunter}")
+    c.nodes[0].exec(f"touch {gate}.fail")
+    _gate(c, victim, [0], False)
+    wait_until(lambda: "ready" in c.nodes[0].exec_allow_fail(f"test -e {gate}.entered && echo ready"),
+               timeout_s=60, interval_s=1, desc="requester failed before reservation")
+    _assert_pending_for_passes(c, [hunter])
+    _usage(c, open_count=1)
+    c.nodes[0].exec(f"rm {gate}.fail")
+    wait_job_state(c, hunter, "R", timeout=60)
+    _usage(c, used=1)
+    _scenario_report(c, used=1)
+    c.scancel(str(hunter))
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    _usage(c, used=1)
+
+
+@pytest.mark.parametrize("bad_cause", ["unknown", "regressed"])
+def test_preemption_export_skips_a_bad_checkpoint_and_recovers(handoff_cluster, bad_cause):
+    c = handoff_cluster
+    user = c.nodes[0].user
+    for account in ("export-a", "export-b"):
+        c.cli(["spur", "sacctmgr", "add", "account", f"name={account}"])
+        c.cli(["spur", "sacctmgr", "add", "user", f"name={user}", f"account={account}"])
+    victim = _submit(c, "export-victim-a", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    hunter = _submit(c, "export-hunter-a", "hunter-a", c.node_names[0], extra=("--account=export-a",))
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _rollup_report(c, {(user, "export-a"): (0, 0, 1)}, causes={})
+    poison = {"future_reason" if bad_cause == "unknown" else "cancelled": {"system": 1}}
+    c.psql(f"UPDATE preemption_checkpoints SET unused_by_cause='{json.dumps(poison)}' "
+           f"WHERE job_id={int(hunter)}")
+    _launch_gate(c, hunter, [0], False)
+    wait_job_state(c, hunter, "R", timeout=60)
+    _usage(c, used=1)
+
+    victim_b = _submit(c, "export-victim-b", "victim-a", c.node_names[1])
+    wait_job_state(c, victim_b, "R", timeout=60)
+    _gate(c, victim_b, [1], True)
+    hunter_b = _submit(c, "export-hunter-b", "hunter-a", c.node_names[1], extra=("--account=export-b",))
+    _wait_epilog(c, victim_b, [1])
+    c.scancel(str(hunter_b))
+    _gate(c, victim_b, [1], False)
+    _usage(c, used=1, unused={("cancelled", "user"): 1})
+    causes = {(user, "export-b", "cancelled", "user"): 1}
+    _rollup_report(c, {(user, "export-a"): (0, 0, 1), (user, "export-b"): (0, 1, 0)}, causes=causes)
+    c.psql(f"UPDATE preemption_checkpoints SET unused_by_cause='{{}}' WHERE job_id={int(hunter)}")
+    _rollup_report(c, {(user, "export-a"): (1, 0, 0), (user, "export-b"): (0, 1, 0)}, causes=causes)

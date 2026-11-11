@@ -56,6 +56,7 @@ Pyxis
 oversubscription
 preempt
 preemption
+preemptions
 preemptable
 preemptor
 prolog
@@ -416,3 +417,4 @@ frontend
 handoff
 handoffs
 preemptors
+rollups

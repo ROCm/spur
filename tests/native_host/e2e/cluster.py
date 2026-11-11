@@ -1728,6 +1728,16 @@ tar -C "$R" -czf '{local_tar}' .
             time.sleep(2)
         raise RuntimeError("Postgres did not become ready in time")
 
+    def pause_accounting(self):
+        """Stop database progress without changing its published port."""
+        if not self.accounting_enabled:
+            raise RuntimeError("pause_accounting() requires accounting")
+        self.nodes[0].exec(f"docker pause {shlex.quote(self._pg_container)}")
+
+    def resume_accounting(self):
+        self.nodes[0].exec(f"docker unpause {shlex.quote(self._pg_container)}")
+        self._wait_pg(self.nodes[0])
+
     def psql(self, sql: str) -> str:
         """Run *sql* against the accounting database and return stdout.
 

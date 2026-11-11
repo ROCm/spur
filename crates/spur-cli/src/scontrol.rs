@@ -2688,6 +2688,26 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_exit(job.derived_exit_code, 0),
         job.priority
     );
+    if let Some(usage) = job
+        .preemption_usage
+        .as_ref()
+        .filter(|u| u.used > 0 || u.unused > 0 || u.open > 0)
+    {
+        let _ = write!(
+            out,
+            "   PreemptionsUsed={} PreemptionsUnused={} PreemptionsOpen={}",
+            usage.used, usage.unused, usage.open
+        );
+        let causes: Vec<String> = usage
+            .unused_by_cause
+            .iter()
+            .map(|c| format!("{}/{}:{}", c.reason, c.initiator, c.count))
+            .collect();
+        if !causes.is_empty() {
+            let _ = write!(out, " UnusedPreemptionCauses={}", causes.join(","));
+        }
+        let _ = writeln!(out);
+    }
     if let Some(line) = preemption_line(job) {
         let _ = writeln!(out, "{line}");
     }
@@ -2742,6 +2762,35 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_detail_omits_zero_preemption_counts_and_prints_nonzero_causes() {
+        let mut job = spur_proto::proto::JobInfo::default();
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(Default::default());
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(spur_proto::proto::PreemptionUsage {
+            used: 2,
+            unused: 3,
+            open: 3,
+            unused_by_cause: vec![
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "cancelled".into(),
+                    initiator: "user".into(),
+                    count: 1,
+                },
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "launch_failed".into(),
+                    initiator: "system".into(),
+                    count: 2,
+                },
+            ],
+        });
+        assert!(format_job_detail(&job).contains(
+            "   PreemptionsUsed=2 PreemptionsUnused=3 PreemptionsOpen=3 \
+             UnusedPreemptionCauses=cancelled/user:1,launch_failed/system:2\n"
+        ));
+    }
+
     #[test]
     fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
         use spur_proto::proto::*;

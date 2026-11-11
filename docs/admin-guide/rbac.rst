@@ -81,7 +81,10 @@ accounts. Operators and Administrators are exempt. A caller with no verified
 identity is not restricted
 either, so ``private_data`` is enforceable only under ``plugin = "spur"`` with
 ``mode = "required"``. See :ref:`private-data` for the full list of affected
-commands.
+commands. ``sreport preemptions`` applies both ``jobs`` and ``usage`` privacy:
+either setting limits a User to their own rows and the accounts they coordinate.
+These lifetime reports retain the requesting association from the first export,
+even if the job's account is subsequently changed.
 
 ``CancelJob`` with no verified identity and an empty ``user`` is treated as the
 in-cluster daemon (the Kubernetes operator) and can cancel any job. A named

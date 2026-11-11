@@ -13,6 +13,37 @@ and the Ansible playbooks that upgrade a running cluster with or without an outa
    binaries on disk — it does **not** restart the daemons. The drain-aware, jobs-preserving
    cluster path is the Ansible ``rolling_upgrade.yml`` playbook (see below).
 
+Preemption accounting compatibility
+-----------------------------------
+
+The preemption-outcome feature adds a ``preemption_usage`` column to accounting
+job history and PostgreSQL checkpoint, aggregate, and cause tables.
+The accounting service creates these automatically; its database role needs the
+same schema-update permissions as for other migrations. Back up the database
+and controller state before upgrading. Counting starts with the upgrade:
+earlier preemptions are not counted.
+
+Upgrade every controller before relying on preemption totals. Older controllers
+can read the new log and snapshot entries but do not update the counts or hold
+finished jobs for export. While an older controller leads, it can evict a
+finished job whose latest counts were never exported; those counts are lost
+from the ``sreport preemptions`` totals for good, and any of its observations
+still open there are closed as ``ended_other`` / ``unknown``.
+
+**Rollback.** An older controller drops the preemption counts from its next
+snapshot: live totals, open observations, and per-job counts reset, and finished
+jobs held for export can be evicted before their counts reach PostgreSQL. The
+PostgreSQL tables and rollups already written stay in place and are ignored by
+the older controller; upgrading again resumes counting from zero in Raft while
+keeping the existing rollups. A job that lives across the rollback and the
+re-upgrade restarts its counts from zero, and its new counts reach the rollups
+only once they exceed what was already exported for it.
+
+Rollups survive job-history cleanup and fairshare resets. Accounting outages
+keep affected finished jobs in the controller, up to 24 hours past
+``terminal_job_retention_secs``, which can increase controller memory and
+snapshot size. See :ref:`preemption-outcome-export`.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 

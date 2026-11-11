@@ -1006,8 +1006,9 @@ and accounts they take part in, and only their own ``User=`` lines; a ``users=``
 selector is replaced with their own name. ``sshare`` omits other users'
 rows and leaves account totals and shares of the total blank. ``sreport``
 utilization fills in only your own usage and fairshare and leaves the other
-cells blank. ``sprio`` and ``sreport job`` sizes follow
-``"jobs"`` instead. ``Grp*`` totals on the scope line
+cells blank. ``sreport preemptions`` shows only your own rows and the accounts
+you coordinate when either ``"jobs"`` or ``"usage"`` is private. ``sprio`` and
+``sreport job`` sizes follow ``"jobs"`` instead. ``Grp*`` totals on the scope line
 still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
@@ -1053,8 +1054,8 @@ Endpoints
      - Planned
      - Route exists but currently returns an empty body.
    * - ``/metrics/scheduler``
-     - Planned
-     - Route exists but currently returns an empty body.
+     - Live
+     - Scheduler cycle statistics and preemption outcomes.
    * - ``/metrics/k8s``
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
@@ -1088,6 +1089,150 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - Memory (bytes) allocated to running/completing jobs.
    * - ``spur_jobs_gpus_alloc``
      - GPUs allocated to running/completing jobs.
+
+Preemption outcomes — ``/metrics/scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a pending job (the requester) preempts running jobs (the victims), Spur
+records whether the launch of the requester used the capacity each victim released.
+Counts describe **victim runs**, not nodes: preempting the same job on two runs
+counts twice. Suspension and idle-fill reclaim without an owner-directed handoff
+are excluded. A grace warning alone does not count; the first released slice
+opens one observation for that victim run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 48 12 40
+
+   * - Metric
+     - Type
+     - Meaning
+   * - ``spur_scheduler_preemptions_used_total``
+     - Counter
+     - Victim runs with matching released capacity in a confirmed requesting launch.
+   * - ``spur_scheduler_preemptions_unused_total{reason,initiator}``
+     - Counter
+     - Victim runs closed without confirmed use by the requesting launch.
+   * - ``spur_scheduler_preemptions_open``
+     - Gauge
+     - Victim runs that released capacity but whose requesting launch outcome is unresolved.
+   * - ``spur_scheduler_preemption_exports_pending``
+     - Gauge
+     - Finished jobs past retention kept in the controller until their counts reach accounting.
+   * - ``spur_scheduler_preemption_export_oldest_seconds``
+     - Gauge
+     - Age of the oldest of those jobs, from its end time.
+
+For example, if a requester preempts A on n1 and B on n2, then launches only
+using B's capacity, used increases by one and unused by one. Partial reports
+and replay do not count a victim run again. A successful launch followed by a
+later application failure remains used. A failed release is a launch failure,
+even if the controller already recorded the job as Running. Native interactive
+allocations count as launched once allocation registration and activation succeed.
+
+``reason`` has four values:
+
+* ``started_elsewhere``: the launch succeeded without matching released capacity.
+* ``launch_failed``: a reserved requesting launch was rejected, held, backed off,
+  lost its nodes, or was not released.
+* ``cancelled``: cancellation ended the request before use.
+* ``ended_other``: another end or a superseding attempt closed the request,
+  including an outcome that could not be confirmed after controller failure.
+
+``initiator`` is ``user``, ``admin``, ``system``, or ``unknown``. Cancellation
+uses the authenticated cancellation provenance. Scheduler placement and launch
+failures use ``system``. Missing provenance stays ``unknown``. The label records
+the observed operation, not an inferred root cause: a launch rejection caused
+by user-supplied input still has a system launch-failure verdict. The
+``ended_other`` / ``unknown`` bucket is uncertainty, not proof of resource loss.
+No username, job ID, or node name is a Prometheus label.
+
+The counts are also available from:
+
+* ``sdiag``: cluster totals, unused counts by cause, and, when finished jobs past
+  retention are waiting for export, how many and the oldest one's age.
+* ``scontrol show job``: ``PreemptionsUsed``, ``PreemptionsUnused``, and
+  ``PreemptionsOpen`` on the requesting job, plus ``UnusedPreemptionCauses`` as
+  comma-separated ``reason/initiator:count`` pairs. Printed only when a count is
+  nonzero.
+* REST job responses: the same counts and causes in ``preemption_usage``.
+* ``sreport preemptions``: lifetime totals per requesting user and account
+  (see below).
+
+A device-backed victim counts as used only when the requester received the same
+node-local devices; using CPU on the same GPU node is not enough. CPU and memory
+have no identity, so they are matched against a capacity budget. Both are
+approximations: they do not prove a preemption was necessary or measure lost
+GPU-hours. One victim using any matching capacity counts once.
+
+If the requesting launch fails before it reserves nodes, the observation stays
+open so a retry can still use the capacity. If the requester gives up a
+reservation before it starts (a backoff, a hold, or a node going down), the
+observation closes as ``launch_failed`` and a later retry does not count as use.
+A launch result that was not recorded before a controller restart closes as
+``ended_other`` / ``unknown`` once the new leader's dispatch grace expires (twice
+the dispatch timeout; never, if that timeout is disabled). This records
+uncertainty, not a launch failure.
+
+Cluster totals and per-job counts survive controller restart and are not
+cleared by ``sdiag --reset``.
+
+Lifetime user/account reporting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``sreport preemptions`` needs PostgreSQL accounting:
+
+.. code-block:: console
+
+   sreport preemptions
+   sreport preemptions --user alice --parsable
+   sreport preemptions --account research --limit 25
+   sreport preemptions --account research --by-cause
+   sreport preemptions --account research --limit 25 --page-token '<token>'
+
+Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
+requesting user/account pair; a user's rows across accounts add to that user's
+total. A complete account report requires every page for that account. The CLI
+prints the next-page token on standard error when another page exists. The
+default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
+``--start`` and ``--end`` are rejected because these are lifetime totals rather
+than event-time reports. Pages are read in user/account order, not from a frozen
+snapshot: counts can change between pages, and a pair added before the current
+position during paging is not shown.
+
+Add ``--by-cause`` to show only nonzero unused counts, with one row per requesting
+user/account, reason, and initiator. These use the same values as the scheduler
+metrics and count victim runs, not nodes. For example:
+
+.. code-block:: text
+
+   $ sreport preemptions --by-cause
+   User                 Account              Reason               Initiator          Unused
+   alice                research             cancelled            user                    2
+   alice                research             launch_failed        system                  1
+
+With ``--parsable --by-cause``, the columns are
+``User|Account|Reason|Initiator|Unused``. For example:
+
+.. code-block:: text
+
+   $ sreport preemptions --parsable --noheader --by-cause --user alice
+   alice|research|cancelled|user|2
+   alice|research|launch_failed|system|1
+
+Cause counts add up to the pair's ``Unused`` total in the default report. Pairs
+with no unused counts have no rows in the cause report. Pagination still counts
+user/account pairs and keeps their causes together, so a page can have no cause
+rows and still print a next-page token; continue until there is no token.
+
+The report applies both ``jobs`` and ``usage`` privacy settings, including
+coordinator visibility (see :ref:`private-data`). A scoped report is not a full
+account or cluster total. Cluster totals in ``sdiag`` and the metrics are
+aggregates with no per-user detail and are not scoped.
+
+Accounting reports lag the live counts, and ``Open`` there is the last exported
+value. :ref:`preemption-outcome-export` describes how counts reach PostgreSQL
+and what happens during an accounting outage.
 
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

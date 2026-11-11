@@ -221,7 +221,7 @@ fn print_node_statistics(metrics: &NodeMetrics) {
 }
 
 fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         String::new(),
         "Scheduler Statistics:".to_string(),
         format!("  Plugin              : {}", stats.plugin),
@@ -239,7 +239,26 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
         format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
         format!("  Exit end of queue   : {}", stats.exit_end),
         format!("  Exit max depth      : {}", stats.exit_max_depth),
-    ]
+    ];
+    if let Some(usage) = &stats.preemption_usage {
+        lines.push(format!(
+            "  Preemptions (lifetime): used={} unused={} open={}",
+            usage.used, usage.unused, usage.open
+        ));
+        for cause in &usage.unused_by_cause {
+            lines.push(format!(
+                "    Unused: reason={} initiator={} count={}",
+                cause.reason, cause.initiator, cause.count
+            ));
+        }
+    }
+    if stats.preemption_exports_pending > 0 {
+        lines.push(format!(
+            "  Preemption exports pending: {} (oldest {}s)",
+            stats.preemption_exports_pending, stats.preemption_export_oldest_secs
+        ));
+    }
+    lines
 }
 
 fn print_scheduler_statistics(stats: &SchedStats) {
@@ -282,6 +301,34 @@ fn print_rpc_statistics(stats: &RpcStats) {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState;
+
+    #[test]
+    fn scheduler_statistics_report_cluster_preemption_counts_and_causes() {
+        let stats = SchedStats {
+            preemption_usage: Some(spur_proto::proto::PreemptionUsage {
+                used: 8,
+                unused: 3,
+                open: 1,
+                unused_by_cause: vec![spur_proto::proto::UnusedPreemptionCount {
+                    reason: "launch_failed".into(),
+                    initiator: "system".into(),
+                    count: 3,
+                }],
+            }),
+            ..Default::default()
+        };
+        let lines = scheduler_statistics_lines(&stats).join("\n");
+        assert!(lines.contains("Preemptions (lifetime): used=8 unused=3 open=1"));
+        assert!(lines.contains("Unused: reason=launch_failed initiator=system count=3"));
+        assert!(!lines.contains("exports pending"));
+        let stats = SchedStats {
+            preemption_exports_pending: 4,
+            preemption_export_oldest_secs: 90,
+            ..stats
+        };
+        let lines = scheduler_statistics_lines(&stats).join("\n");
+        assert!(lines.contains("Preemption exports pending: 4 (oldest 90s)"));
+    }
 
     #[test]
     fn job_count_reads_proto_entries() {
@@ -365,6 +412,9 @@ mod tests {
     #[test]
     fn scheduler_statistics_lines_include_cycle_and_lifecycle_fields() {
         let stats = SchedStats {
+            preemption_usage: None,
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 5,
             cycle_total_time_us: 2500,

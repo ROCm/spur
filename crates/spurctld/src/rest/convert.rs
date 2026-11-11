@@ -8,6 +8,14 @@ use spur_core::partition::Partition;
 pub fn job_to_json(job: &Job) -> serde_json::Value {
     serde_json::json!({
         "job_id": job.job_id,
+        "preemption_usage": {
+            "used": job.preemption_usage.used,
+            "unused": job.preemption_usage.unused_total(),
+            "open": job.preemption_usage.open,
+            "unused_by_cause": crate::metrics_proto::preemption_usage_to_proto(&job.preemption_usage).unused_by_cause.iter().map(|cause| serde_json::json!({
+                "reason": cause.reason, "initiator": cause.initiator, "count": cause.count,
+            })).collect::<Vec<_>>(),
+        },
         "idle_fill": job.idle_fill,
         "name": job.spec.name,
         "user_name": job.spec.user,
@@ -127,6 +135,23 @@ pub fn parse_states_query(s: &str) -> Result<Vec<JobState>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_to_json_reports_preemption_counts_and_causes() {
+        let mut job = Job::new(7, Default::default());
+        job.preemption_usage.open_one();
+        job.preemption_usage.settle(Some((
+            spur_core::preemption_usage::UnusedReason::Cancelled,
+            spur_core::preemption_usage::PreemptionInitiator::User,
+        )));
+        assert_eq!(
+            job_to_json(&job)["preemption_usage"],
+            serde_json::json!({
+                "used": 0, "unused": 1, "open": 0,
+                "unused_by_cause": [{"reason": "cancelled", "initiator": "user", "count": 1}],
+            })
+        );
+    }
 
     #[test]
     fn node_to_json_projects_a_core_layout_block_like_scontrol() {

@@ -583,6 +583,7 @@ impl SlurmAccounting for AccountingService {
         db::record_job_end(
             &mut tx,
             &db::JobEndRecord {
+                preemption_usage: None,
                 job_id: req.job_id,
                 state: state_str.to_string(),
                 exit_code: req.exit_code,
@@ -665,6 +666,9 @@ impl SlurmAccounting for AccountingService {
         let jobs = records
             .iter()
             .map(|r| JobInfo {
+                preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
+                    &r.preemption_usage,
+                )),
                 fabric_bindings: Default::default(),
                 gpu_bindings: Default::default(),
                 job_id: r.job_id,
@@ -756,6 +760,27 @@ impl SlurmAccounting for AccountingService {
             .collect();
 
         Ok(Response::new(GetJobHistoryResponse { jobs }))
+    }
+
+    async fn get_preemption_usage(
+        &self,
+        request: Request<GetPreemptionUsageRequest>,
+    ) -> Result<Response<GetPreemptionUsageResponse>, Status> {
+        let page = super::preemption::Page::parse(request.get_ref())?;
+        let scope = self.caller_read_scope_with(
+            &request,
+            |auth| auth.jobs_private() || auth.usage_private(),
+            true,
+        );
+        let pool = self.pool()?;
+        let response = tokio::time::timeout(
+            super::notifier::ATTEMPT_TIMEOUT,
+            super::preemption::report(&pool, request.get_ref(), page, &scope),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("preemption report timed out"))?
+        .map_err(internal)?;
+        Ok(Response::new(response))
     }
 
     async fn get_usage(
@@ -1857,6 +1882,7 @@ mod tests {
         assert_rpc_unavailable!(record_job_end, RecordJobEndRequest);
         assert_rpc_unavailable!(get_job_history, GetJobHistoryRequest);
         assert_rpc_unavailable!(get_usage, GetUsageRequest);
+        assert_rpc_unavailable!(get_preemption_usage, GetPreemptionUsageRequest);
         assert_rpc_unavailable!(create_account, CreateAccountRequest);
         assert_rpc_unavailable!(delete_account, DeleteAccountRequest);
         assert_rpc_unavailable!(list_accounts, ListAccountsRequest);
@@ -2143,6 +2169,34 @@ mod tests {
             usage_visible_accounts(&spur_core::rbac::ReadScope::Caller("alice".into()), true)
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn preemption_report_rejects_bad_page_before_database_access() {
+        let service = AccountingService::unavailable("test without database");
+        for request in [
+            GetPreemptionUsageRequest {
+                limit: 1001,
+                ..Default::default()
+            },
+            GetPreemptionUsageRequest {
+                page_token: "bogus".into(),
+                ..Default::default()
+            },
+            GetPreemptionUsageRequest {
+                user: "x".repeat(1025),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                service
+                    .get_preemption_usage(Request::new(request))
+                    .await
+                    .expect_err("invalid request")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 
     #[test]

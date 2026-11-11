@@ -2521,8 +2521,11 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
+        let snapshot = self
+            .cluster
+            .with_preemption_stats(self.sched_stats.snapshot());
         Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
-            &self.sched_stats.snapshot(),
+            &snapshot,
         )))
     }
 
@@ -5001,6 +5004,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
 
     let job_spec = spur_core::job::JobSpec {
+        submitted_at: None,
         name: spec.name,
         partition: if spec.partition.is_empty() {
             None
@@ -5353,6 +5357,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
     JobInfo {
+        preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
+            &job.preemption_usage,
+        )),
         gpu_bindings: job
             .per_node_alloc
             .iter()
@@ -7482,7 +7489,12 @@ mod tests {
             JobState::Pending,
             JobState::Cancelled,
         ));
-        apply(&WalOperation::EvictTerminalJobs { job_ids: vec![20] });
+        apply(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![20],
+        });
 
         assert_eq!(job_state(&cluster, 20), None, "eviction drops the record");
         let issued = cluster.peek_next_job_id();
@@ -7619,6 +7631,7 @@ mod tests {
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
         apply(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: 52,
             nodes: vec!["n1".into()],
             resources: res,
@@ -7685,6 +7698,7 @@ mod tests {
             let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
             let per_node_alloc = std::collections::HashMap::from([("n1".to_string(), res.clone())]);
             apply(&WalOperation::JobStart {
+                preemption_observation: None,
                 job_id: 60,
                 nodes: vec!["n1".into()],
                 resources: res,
@@ -8085,6 +8099,7 @@ mod tests {
             apply(&WalOperation::JobPreemptSignaled {
                 job_id,
                 pending: PreemptPending {
+                    preemption_claim: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(60),
                     preempted_by: 99,
@@ -8103,6 +8118,7 @@ mod tests {
                 at: Some(signaled_at),
             });
             apply(&WalOperation::JobPreemptCancel {
+                preemption_claim: None,
                 job_id,
                 preempted_by: Some(99),
                 preempt_qos: None,
@@ -8224,6 +8240,7 @@ mod tests {
             });
         }
         cluster.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
             job_id: id,
             nodes: nodes.iter().map(|n| n.to_string()).collect(),
             resources: res,
@@ -8531,6 +8548,36 @@ mod tests {
             incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemption_diagnostics_report_cluster_totals_and_reset_preserves_totals() {
+        use crate::raft::StateMachineApply;
+        for category in ["jobs", "usage"] {
+            let dir = tempfile::tempdir().expect("temporary state");
+            let mut config = step_test_config();
+            config.auth.private_data = test_support::test_slurm_config_private(&[category])
+                .auth
+                .private_data;
+            let service = test_service_with(&dir, config).await;
+            service.cluster.restore_from_snapshot(br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{},"preemption_usage":{"cluster":{"used":2}}}"#).expect("usage fixture");
+            let mut request = Request::new(());
+            request
+                .extensions_mut()
+                .insert(test_support::viewer("alice", false));
+            let stats = service
+                .get_sched_stats(request)
+                .await
+                .expect("stats")
+                .into_inner();
+            assert_eq!(stats.preemption_usage.expect("totals").used, 2);
+            let mut reset = Request::new(());
+            reset
+                .extensions_mut()
+                .insert(test_support::viewer("admin", true));
+            service.reset_diag_stats(reset).await.expect("reset");
+            assert_eq!(service.cluster.preemption_usage().used, 2);
         }
     }
 
@@ -10302,6 +10349,7 @@ mod tests {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
         let signaled_at = Utc::now();
         let pending = spur_core::job::PreemptPending {
+            preemption_claim: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: 99,
@@ -14115,6 +14163,7 @@ mod tests {
         let signaled_at = Utc::now();
         let deadline = signaled_at + Duration::seconds(60);
         job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
             signaled_at,
             deadline,
             preempted_by: 9,
