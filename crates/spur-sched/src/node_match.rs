@@ -17,15 +17,10 @@ use spur_core::reservation::Reservation;
 /// Job placement constraints, parsed once and reused across all candidate nodes.
 pub struct NodePlacement<'a> {
     job: &'a Job,
-    /// Expanded, deduplicated `--nodelist`, whose cardinality determines
-    /// whether the request is a candidate pool or an additive requirement.
-    /// Falls back to `job.preferred_nodes` (a QOS/account grp-node admission
-    /// credit) when the job didn't request one explicitly and this instance
-    /// was built via [`new`](NodePlacement::new), so placement honors the
-    /// same reuse assumption admission made. Instances built via
-    /// [`new_ignoring_preferred_nodes`](NodePlacement::new_ignoring_preferred_nodes)
-    /// never see that fallback.
+    /// Without an explicit node list, placement follows admission's reuse credits
+    /// so the allocation honors the group-node charge.
     nodelist: Option<HashSet<String>>,
+    restrict_to_preferred: bool,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
     /// Requested `--constraint` features (all must be present on a node).
@@ -40,18 +35,8 @@ impl<'a> NodePlacement<'a> {
         Self::build(job, true)
     }
 
-    /// Like [`new`](Self::new), but never falls back to `job.preferred_nodes`.
-    ///
-    /// Admission's own reuse-credit computation (the QOS and account
-    /// grp-node gates in spurctld) calls this while it is still in the
-    /// middle of *computing* `job.preferred_nodes` for the same job: the
-    /// account gate runs first and may already have written its own credited
-    /// nodes into the field before the QOS gate runs. If that gate's own
-    /// `NodePlacement` fell back to the field, the account's credit would
-    /// leak in as a spurious nodelist restriction on the QOS's independent
-    /// reuse computation. Use `new` (which intentionally honors
-    /// `preferred_nodes`) for actual scheduling/placement, once both gates
-    /// have finished computing their credits for the job.
+    /// Ignore reuse credits while account and QOS gates compute their independent credits.
+    /// Actual placement uses [`new`](Self::new) to enforce the finished result.
     pub fn new_ignoring_preferred_nodes(job: &'a Job) -> Self {
         Self::build(job, false)
     }
@@ -92,15 +77,21 @@ impl<'a> NodePlacement<'a> {
         Self {
             job,
             nodelist,
+            restrict_to_preferred: use_preferred_nodes
+                && job.preferred_nodes.len() >= (job.spec.num_nodes as usize).max(1),
             exclude,
             required_features,
             partitions,
         }
     }
 
-    /// True if the job's `--nodelist`/`--exclude` permit this node by name.
+    /// True if the job's node lists and complete reuse credit permit this node by name.
     /// Name-only check: no partition, feature, capacity, or state involved.
     pub fn allows_name(&self, name: &str) -> bool {
+        // A full reuse credit must hold even when the user supplied a wider node pool.
+        if self.restrict_to_preferred && !self.job.preferred_nodes.contains(name) {
+            return false;
+        }
         if let Some(ref allowed) = self.nodelist {
             if !self.nodelist_is_additive() && !allowed.contains(name) {
                 return false;
@@ -454,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_nodelist_takes_priority_over_preferred_nodes() {
+    fn explicit_nodelist_and_full_reuse_credit_both_restrict_placement() {
         let mut job = job_with(JobSpec {
             nodelist: Some("node001".into()),
             num_nodes: 1,
@@ -462,11 +453,45 @@ mod tests {
         });
         job.preferred_nodes = HashSet::from(["node002".to_string()]);
         let p = NodePlacement::new(&job);
-        assert!(p.allows_name("node001"), "user's own nodelist must win");
-        assert!(
-            !p.allows_name("node002"),
-            "preferred_nodes must not override an explicit nodelist"
-        );
+        assert!(!p.allows_name("node001"));
+        assert!(!p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
+    }
+
+    #[test]
+    fn full_reuse_credit_restricts_an_explicit_candidate_pool() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-003]".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string(), "node002".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(!p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
+        assert!(!p.allows_name("node004"));
+
+        let admission = NodePlacement::new_ignoring_preferred_nodes(&job);
+        assert!(admission.allows_name("node003"));
+        assert!(!admission.allows_name("node004"));
+    }
+
+    #[test]
+    fn partial_reuse_credit_keeps_an_explicit_candidate_pool() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-003]".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(!p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(p.allows_name("node002"));
+        assert!(p.allows_name("node003"));
+        assert!(!p.allows_name("node004"));
     }
 
     #[test]
