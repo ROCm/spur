@@ -51,6 +51,7 @@ pub(crate) struct StepCapture {
     update_node_names: Arc<Mutex<Vec<String>>>,
     drain_node_names: Arc<Mutex<Vec<String>>>,
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
+    deregister_node_reasons: Arc<Mutex<Vec<String>>>,
     deregister_node_errors: Arc<Mutex<HashMap<String, tonic::Code>>>,
     delete_partition_names: Arc<Mutex<Vec<String>>>,
     /// Node names that `update_node` should reject with `NotFound`.
@@ -162,6 +163,10 @@ impl StepCapture {
 
     pub(crate) fn deregister_node_calls(&self) -> Vec<(String, bool)> {
         self.deregister_node_calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn deregister_node_reasons(&self) -> Vec<String> {
+        self.deregister_node_reasons.lock().unwrap().clone()
     }
 
     pub(crate) fn set_deregister_node_error(&self, name: &str, code: tonic::Code) {
@@ -434,6 +439,7 @@ mock_controller_impl! {
                 .lock()
                 .unwrap()
                 .push((request.name.clone(), request.force));
+            self.capture.deregister_node_reasons.lock().unwrap().push(request.reason);
             if let Some(code) = self.capture.deregister_node_errors.lock().unwrap().get(&request.name) {
                 return Err(tonic::Status::new(*code, "mock deregister_node failure"));
             }

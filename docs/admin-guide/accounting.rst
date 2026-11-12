@@ -1491,7 +1491,7 @@ An allocated node reports ``DRAINING`` until its last CPU or device allocation
 is released, then reports ``DRAINED`` in ``scontrol show node`` while keeping
 the administrative reason. An empty node enters ``DRAINED`` immediately.
 
-To remove a departed node's record, use either command below. Removal works
+To remove a departed node's record, use any of these forms. Removal works
 even when its agent or container no longer exists:
 
 .. code-block:: bash
@@ -1501,18 +1501,16 @@ even when its agent or container no longer exists:
    scontrol delete node gpu001
    spur node remove gpu001
 
-These commands use the same removal operation and refuse nodes with active
-jobs, including placements reserved while a job is launching. The guard is
-checked when removal commits, so a concurrently scheduled job cannot be
-evicted without force. ``NodeName=`` accepts a hostname, a comma-separated
-list, a hostlist such as ``gpu[001-004]``, or ``ALL`` for every registered
-node. A malformed hostlist with an empty component, such as ``gpu[]`` or
-``gpu[1,]``, is rejected
-before connecting. Overlapping targets are removed once, in the order of
+These commands use the existing native node-removal RPC and its checks for
+allocated running, completing, or suspended jobs. Drain a node and wait for
+its jobs to finish before removing it. ``NodeName=`` accepts a hostname,
+a comma-separated list, a hostlist such as ``gpu[001-004]``, or ``ALL`` for
+every registered node. A malformed hostlist with an empty component, such as
+``gpu[]`` or ``gpu[1,]``, is rejected before connecting.
+Overlapping targets are removed once, in the order of
 their first appearance. A failed removal is reported per node; remaining
 nodes are still attempted, and the command exits unsuccessfully if any
-removal fails. An empty cluster with
-``ALL`` is also an error.
+removal fails. An empty cluster with ``ALL`` is also an error.
 
 ``scontrol delete`` accepts one entity and one target as ``key=value`` or
 ``key value``. Entity keys are ``NodeName``, ``PartitionName``, and
@@ -1526,21 +1524,14 @@ are not expanded.
 
 For a removal reason or to evict active jobs, use
 ``spur node remove <hostlist> --reason "decommissioned"`` or its ``--force``
-option. Force removal fails running jobs with ``NODE_FAIL`` and releases
-unconfirmed launch reservations. Node removal requires Administrator when
-the caller has a verified identity; see
-:ref:`privileged-operations`.
+option. Node removal requires Administrator when the caller has a verified
+identity; see :ref:`privileged-operations`.
 
 Removal does not stop the agent or change ``spur.conf``. An agent that
 registers again can recreate the node record. Slurm restricts this command
 to dynamic nodes without running jobs or reservation membership; Spur uses
 its native registered-node removal rules and does not currently guard
 reservation membership.
-
-Node removal and new placements use distinct guarded log operations while
-historical entries retain their original replay behavior. Upgrade controllers
-with the leader last; see :ref:`node-removal-upgrade-notes` for mixed-version
-replication requirements.
 
 .. note::
 

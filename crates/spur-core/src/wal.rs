@@ -97,28 +97,6 @@ pub enum WalOperation {
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
-    /// A distinct tag prevents older controllers from silently ignoring the node guard.
-    JobStartChecked {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preemption_observation: Option<u64>,
-        job_id: JobId,
-        nodes: Vec<String>,
-        resources: ResourceAllocations,
-        #[serde(default)]
-        per_node_alloc: HashMap<String, ResourceAllocations>,
-        #[serde(default)]
-        srun_step_dispatch: bool,
-        #[serde(default)]
-        run_attempt: u32,
-        #[serde(default)]
-        idle_fill: bool,
-        #[serde(default)]
-        effective_partition: Option<String>,
-        #[serde(default)]
-        memory_adjustment: Option<MemoryAdjustment>,
-        #[serde(default)]
-        at: Option<chrono::DateTime<chrono::Utc>>,
-    },
     JobComplete {
         job_id: JobId,
         exit_code: i32,
@@ -406,16 +384,6 @@ pub enum WalOperation {
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
 
-    /// Legacy NodeRemove entries always evict; this tag requires an explicit force decision.
-    NodeRemoveChecked {
-        name: String,
-        reason: Option<String>,
-        #[serde(default)]
-        force: bool,
-        #[serde(default)]
-        at: Option<chrono::DateTime<chrono::Utc>>,
-    },
-
     // Admission token operations
     TokenCreate {
         token: AdmissionToken,
@@ -682,7 +650,7 @@ impl WalOperation {
         resources: ResourceAllocations,
         per_node_alloc: HashMap<String, ResourceAllocations>,
     ) -> Self {
-        Self::JobStartChecked {
+        Self::JobStart {
             preemption_observation: None,
             job_id,
             nodes,
@@ -704,7 +672,6 @@ impl WalOperation {
             Self::JobSubmit { spec, .. } => spec.submitted_at,
             Self::EvictTerminalJobs { at, .. }
             | Self::JobStart { at, .. }
-            | Self::JobStartChecked { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -713,8 +680,7 @@ impl WalOperation {
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
-            | Self::NodeRemove { at, .. }
-            | Self::NodeRemoveChecked { at, .. } => *at,
+            | Self::NodeRemove { at, .. } => *at,
             Self::JobSuspend { at, .. }
             | Self::JobResume { at, .. }
             | Self::JobTimeLimitSignaled { at, .. }
@@ -756,7 +722,6 @@ impl WalOperation {
             Self::JobSubmit { spec, .. } => &mut spec.submitted_at,
             Self::EvictTerminalJobs { at, .. }
             | Self::JobStart { at, .. }
-            | Self::JobStartChecked { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -765,8 +730,7 @@ impl WalOperation {
             | Self::JobUserRequeue { at, .. }
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
-            | Self::NodeRemove { at, .. }
-            | Self::NodeRemoveChecked { at, .. } => at,
+            | Self::NodeRemove { at, .. } => at,
             // Exhaustive for the same reason as `occurred_at`: these carry no
             // stamp, and a new one that does must not silently go unstamped.
             Self::JobSuspend { .. }
@@ -1529,64 +1493,6 @@ mod deregistration_wal_tests {
                 assert_eq!(reason.as_deref(), Some("decommission"));
             }
             _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn node_remove_frozen_payload_preserves_legacy_variant() {
-        let op: WalOperation =
-            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
-                .unwrap();
-        assert!(matches!(op, WalOperation::NodeRemove { .. }));
-    }
-
-    #[test]
-    fn checked_job_start_frozen_payload_defaults_placement_metadata() {
-        let op: WalOperation = serde_json::from_str(
-            r#"{"JobStartChecked":{"job_id":1,"nodes":["n1"],"resources":{"cpus":1,"memory_mb":1000,"devices":{}},"run_attempt":1}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            op,
-            WalOperation::JobStartChecked {
-                preemption_observation: None,
-                effective_partition: None,
-                memory_adjustment: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn checked_node_operations_keep_distinct_wire_tags_and_timestamps() {
-        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        for (tag, mut op) in [
-            (
-                "JobStartChecked",
-                WalOperation::job_start(
-                    1,
-                    vec!["n1".into()],
-                    ResourceAllocations::with_scalar(1, 1000),
-                    HashMap::new(),
-                ),
-            ),
-            (
-                "NodeRemoveChecked",
-                WalOperation::NodeRemoveChecked {
-                    name: "n1".into(),
-                    reason: None,
-                    force: false,
-                    at: None,
-                },
-            ),
-        ] {
-            op.stamp_occurred_at(at);
-            let json = serde_json::to_value(&op).unwrap();
-            assert!(json.get(tag).is_some(), "{json}");
-            let restored: WalOperation = serde_json::from_value(json).unwrap();
-            assert_eq!(restored.occurred_at(), Some(at));
         }
     }
 

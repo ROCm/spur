@@ -3772,7 +3772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scontrol_delete_node_aliases_preserve_targets_and_guards() {
+    async fn scontrol_delete_node_aliases_preserve_targets_without_force_or_reason() {
         for prefix in ["nOd", "nOdE", "nOdEn", "nOdEnA", "nOdEnAm", "nOdEnAmE"] {
             for key in [
                 prefix.to_string(),
@@ -3804,6 +3804,7 @@ mod tests {
                         "{params:?}"
                     );
                     assert!(capture.delete_partition_names().is_empty());
+                    assert_eq!(capture.deregister_node_reasons(), vec!["", "", ""]);
                 }
             }
         }

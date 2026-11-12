@@ -390,7 +390,7 @@ impl UsageLedger {
     }
 
     fn reserve(&mut self, op: &WalOperation) {
-        let (WalOperation::JobStart {
+        let WalOperation::JobStart {
             job_id,
             run_attempt,
             nodes,
@@ -398,16 +398,7 @@ impl UsageLedger {
             per_node_alloc,
             preemption_observation,
             ..
-        }
-        | WalOperation::JobStartChecked {
-            job_id,
-            run_attempt,
-            nodes,
-            resources,
-            per_node_alloc,
-            preemption_observation,
-            ..
-        }) = op
+        } = op
         else {
             return;
         };
@@ -671,7 +662,6 @@ impl ClusterManager {
         let ids: Vec<JobId> = match op {
             WalOperation::JobStateChange { job_id, .. }
             | WalOperation::JobStart { job_id, .. }
-            | WalOperation::JobStartChecked { job_id, .. }
             | WalOperation::JobComplete { job_id, .. }
             | WalOperation::JobNodeComplete { job_id, .. }
             | WalOperation::JobCancelSignaled { job_id, .. }
@@ -684,17 +674,17 @@ impl ClusterManager {
             | WalOperation::JobUserRequeue { job_id, .. }
             | WalOperation::JobEvict { job_id, .. } => vec![*job_id],
             WalOperation::EvictTerminalJobs { job_ids, .. } => job_ids.clone(),
-            WalOperation::NodeStateChange { name, .. }
-            | WalOperation::NodeRemove { name, .. }
-            | WalOperation::NodeRemoveChecked { name, .. } => usage
-                .victims
-                .keys()
-                .chain(usage.requests.keys())
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter(|id| jobs.get(id).is_some_and(|j| j.is_held_on(name)))
-                .collect(),
+            WalOperation::NodeStateChange { name, .. } | WalOperation::NodeRemove { name, .. } => {
+                usage
+                    .victims
+                    .keys()
+                    .chain(usage.requests.keys())
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|id| jobs.get(id).is_some_and(|j| j.is_held_on(name)))
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let before = ids

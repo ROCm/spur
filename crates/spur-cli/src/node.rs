@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_all_forces_every_registered_node() {
+    async fn remove_all_preserves_force_and_reason_for_every_registered_node() {
         let (addr, capture) = crate::mock_controller::spawn().await;
         capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
 
@@ -407,6 +407,8 @@ mod tests {
             "remove".into(),
             "ALL".into(),
             "--force".into(),
+            "--reason".into(),
+            "decommissioned".into(),
         ])
         .await
         .unwrap();
@@ -414,6 +416,10 @@ mod tests {
         assert_eq!(
             capture.deregister_node_calls(),
             vec![("n1".to_string(), true), ("n2".to_string(), true)]
+        );
+        assert_eq!(
+            capture.deregister_node_reasons(),
+            vec!["decommissioned", "decommissioned"]
         );
     }
 

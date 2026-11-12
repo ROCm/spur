@@ -318,24 +318,6 @@ Two further consequences of not draining:
    to fail over to. See :ref:`srun-controller-restart` for output retention and
    replay limits.
 
-.. _node-removal-upgrade-notes:
-
-Guarded node removal and placement
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-New node removals and job placements use the ``NodeRemoveChecked`` and
-``JobStartChecked`` log variants. Historical ``NodeRemove`` and ``JobStart``
-entries keep their original behavior when replayed, including placements
-that reference a node already removed by an earlier entry.
-
-Upgrade controllers with the leader last, as described below. Older
-controllers reject an append batch containing a guarded variant before
-applying any of its entries. If an upgraded controller becomes leader early,
-older followers pause replication, and writes require a quorum of upgraded
-controllers. Complete the controller upgrade to restore replication; an older
-binary cannot restart from a log containing these new variants. Agent and CLI
-protocols are unchanged.
-
 .. _upgrading-leader-last:
 
 Controller order: the leader goes last
@@ -365,10 +347,9 @@ one does, the playbook warns and falls back to inventory order. Pass
    Leader-last shrinks the mixed-version window but cannot remove it. If leadership moves
    onto an already-upgraded controller mid-run and something then writes a new WAL variant —
    ``scancel`` and preemption are the usual triggers — a not-yet-upgraded follower stalls.
-   Writes continue only with a quorum of upgraded controllers; otherwise they pause
-   until enough controllers have been upgraded. Each stalled follower catches up once
-   upgraded. The stalled follower logs nothing itself; the rejection is only visible
-   on the leader.
+   Quorum survives, and the stalled follower catches up as soon as it is upgraded, so this
+   is degraded-but-self-healing rather than an outage. The stalled follower logs nothing
+   itself; the rejection is only visible on the leader.
 
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
