@@ -21,17 +21,20 @@ pub struct SinfoArgs {
     #[arg(short = 'p', long)]
     pub partition: Option<String>,
 
-    /// Show only nodes in these states (comma-separated). Accepts the base
-    /// states, the display-only labels resv, maint, and plnd, and no_respond
-    /// for nodes the controller is not hearing from. `all` disables the filter.
+    /// Show only nodes in any of these states (comma-separated). Accepts the
+    /// base states, the display-only labels resv, maint, and plnd, and
+    /// no_respond (or noresp) for nodes the controller is not hearing from.
+    /// `all` disables the filter.
     #[arg(short = 't', long)]
     pub states: Option<String>,
 
-    /// Show only non-responding nodes.
+    /// Show only non-responding nodes. Combines with -t and -r, all of which
+    /// must match.
     #[arg(short = 'd', long)]
     pub dead: bool,
 
-    /// Show only responding nodes.
+    /// Show only responding nodes. Combines with -t and -d, all of which must
+    /// match.
     #[arg(short = 'r', long)]
     pub responding: bool,
 
@@ -103,7 +106,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Built before connecting so an invalid `-t` fails without a round-trip.
     let mut filter = StateFilter::parse(args.states.as_deref())?;
-    filter.apply_respond_flags(args.dead, args.responding)?;
+    filter.apply_respond_flags(args.dead, args.responding);
     let nodes_req = build_get_nodes_request(&args, &filter);
 
     let channel = crate::authclient::connect(&args.controller)
@@ -188,33 +191,20 @@ impl OverlayFilter {
     }
 }
 
-/// Whether to keep responding nodes, non-responding nodes, or both. Set by the
-/// `no_respond` state token and by `--dead` / `--responding`.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum RespondFilter {
-    #[default]
-    Any,
-    NotResponding,
-    Responding,
-}
-
-/// Parsed `-t` / `--states` filter. `base` holds real node states pushed to the
-/// controller; `overlays` hold display-only labels filtered client-side.
+/// Parsed `-t` / `--states` filter, whose tokens OR as in Slurm: `base` holds
+/// real node states, `overlays` display-only labels, and `no_respond` the
+/// not-responding flag. `dead` and `responding` (`--dead` / `--responding`)
+/// AND with the list and with each other.
+#[derive(Default)]
 struct StateFilter {
     base: Vec<spur_proto::proto::NodeState>,
     overlays: Vec<OverlayFilter>,
-    respond: RespondFilter,
+    no_respond: bool,
+    dead: bool,
+    responding: bool,
 }
 
 impl StateFilter {
-    fn empty() -> Self {
-        Self {
-            base: Vec::new(),
-            overlays: Vec::new(),
-            respond: RespondFilter::Any,
-        }
-    }
-
     /// Parse the comma-separated `-t` argument. Whole-string `all` (or a missing
     /// argument) means no filter. Unknown tokens are rejected (Slurm exits with
     /// an error rather than showing all nodes).
@@ -222,12 +212,12 @@ impl StateFilter {
         use spur_core::node::NodeState;
 
         let Some(s) = arg else {
-            return Ok(Self::empty());
+            return Ok(Self::default());
         };
 
         let trimmed = s.trim();
         if trimmed.eq_ignore_ascii_case("all") {
-            return Ok(Self::empty());
+            return Ok(Self::default());
         }
 
         let tokens: Vec<&str> = trimmed
@@ -242,10 +232,10 @@ impl StateFilter {
 
         let mut base = Vec::new();
         let mut overlays = Vec::new();
-        let mut respond = RespondFilter::Any;
+        let mut no_respond = false;
         for token in tokens {
             if token.eq_ignore_ascii_case("no_respond") || token.eq_ignore_ascii_case("noresp") {
-                respond = RespondFilter::NotResponding;
+                no_respond = true;
             } else if let Some(core) = NodeState::from_short_or_name(token) {
                 base.push(core.to_proto());
             } else if let Some(overlay) = OverlayFilter::parse(token) {
@@ -257,31 +247,26 @@ impl StateFilter {
         Ok(Self {
             base,
             overlays,
-            respond,
+            no_respond,
+            ..Self::default()
         })
     }
 
-    /// Fold the `--dead` / `--responding` flags into the filter. They are
-    /// mutually exclusive, and `--responding` contradicts `-t no_respond`.
-    fn apply_respond_flags(&mut self, dead: bool, responding: bool) -> Result<()> {
-        if dead && responding {
-            anyhow::bail!("--dead and --responding are mutually exclusive");
-        }
-        if dead {
-            self.respond = RespondFilter::NotResponding;
-        } else if responding {
-            if self.respond == RespondFilter::NotResponding {
-                anyhow::bail!("--responding conflicts with -t no_respond");
-            }
-            self.respond = RespondFilter::Responding;
-        }
-        Ok(())
+    /// Fold the `--dead` / `--responding` flags into the filter. Given both,
+    /// nothing matches, as in Slurm.
+    fn apply_respond_flags(&mut self, dead: bool, responding: bool) {
+        self.dead = dead;
+        self.responding = responding;
     }
 
     /// States sent to the controller. Overlays only apply to idle nodes, so
     /// their presence pulls idle into the query; that overlay-implied idle is
-    /// deduplicated against existing base states.
+    /// deduplicated against existing base states. A not-responding node can be
+    /// in any state, so `no_respond` asks for all of them.
     fn request_states(&self) -> Vec<i32> {
+        if self.no_respond {
+            return Vec::new();
+        }
         let mut states: Vec<i32> = self.base.iter().map(|s| *s as i32).collect();
         if !self.overlays.is_empty() {
             let idle = spur_proto::proto::NodeState::NodeIdle as i32;
@@ -298,13 +283,16 @@ impl StateFilter {
         self.state_keeps(node) && self.respond_keeps(node)
     }
 
-    /// The base/overlay state filter. With no overlays the controller already
-    /// applied the base filter, so everything it returned is kept.
+    /// The `-t` list. With only base states the controller already applied it,
+    /// so everything it returned is kept.
     fn state_keeps(&self, node: &NodeInfo) -> bool {
-        if self.overlays.is_empty() {
+        if self.overlays.is_empty() && !self.no_respond {
             return true;
         }
         if self.base.iter().any(|s| *s as i32 == node.state) {
+            return true;
+        }
+        if self.no_respond && node.not_responding {
             return true;
         }
         let overlay = spur_core::node::node_overlay(node);
@@ -312,11 +300,7 @@ impl StateFilter {
     }
 
     fn respond_keeps(&self, node: &NodeInfo) -> bool {
-        match self.respond {
-            RespondFilter::Any => true,
-            RespondFilter::NotResponding => node.not_responding,
-            RespondFilter::Responding => !node.not_responding,
-        }
+        (!self.dead || node.not_responding) && (!self.responding || !node.not_responding)
     }
 }
 
@@ -729,12 +713,12 @@ mod tests {
         down.not_responding = true;
 
         let mut dead = StateFilter::parse(None).unwrap();
-        dead.apply_respond_flags(true, false).unwrap();
+        dead.apply_respond_flags(true, false);
         assert!(dead.keeps(&down));
         assert!(!dead.keeps(&up));
 
         let mut responding = StateFilter::parse(None).unwrap();
-        responding.apply_respond_flags(false, true).unwrap();
+        responding.apply_respond_flags(false, true);
         assert!(responding.keeps(&up));
         assert!(!responding.keeps(&down));
     }
@@ -755,15 +739,80 @@ mod tests {
     }
 
     #[test]
-    fn dead_and_responding_are_mutually_exclusive() {
-        let mut filter = StateFilter::parse(None).unwrap();
-        assert!(filter.apply_respond_flags(true, true).is_err());
+    fn no_respond_ors_with_the_other_states_and_queries_all_states() {
+        let mut silent_mixed = make_node("silent", NodeState::NodeMixed, "batch");
+        silent_mixed.not_responding = true;
+        let mut silent_idle = make_node("silent-idle", NodeState::NodeIdle, "batch");
+        silent_idle.not_responding = true;
+        let idle = make_node("idle", NodeState::NodeIdle, "batch");
+        let mixed = make_node("mixed", NodeState::NodeMixed, "batch");
+
+        for spec in ["idle,no_respond", "noresp,idle"] {
+            let filter = StateFilter::parse(Some(spec)).unwrap();
+            assert!(filter.keeps(&idle), "{spec}: an idle node is kept");
+            assert!(filter.keeps(&silent_idle), "{spec}");
+            assert!(filter.keeps(&silent_mixed), "{spec}: no_respond ORs");
+            assert!(!filter.keeps(&mixed), "{spec}: neither idle nor silent");
+            let args = parse_sinfo_args(&["sinfo", "-t", spec]);
+            assert!(
+                build_get_nodes_request(&args, &filter).states.is_empty(),
+                "{spec}: a non-idle silent node must reach the client"
+            );
+        }
     }
 
     #[test]
-    fn responding_conflicts_with_t_no_respond() {
+    fn no_respond_ors_with_overlay_labels() {
+        let filter = StateFilter::parse(Some("plnd,no_respond")).unwrap();
+        let mut silent = make_node("silent", NodeState::NodeAllocated, "batch");
+        silent.not_responding = true;
+        assert!(filter.keeps(&overlay_node("p", true, false, false)));
+        assert!(filter.keeps(&silent));
+        assert!(!filter.keeps(&overlay_node("i", false, false, false)));
+    }
+
+    #[test]
+    fn dead_and_responding_and_with_the_state_list() {
+        let mut silent = make_node("silent", NodeState::NodeIdle, "batch");
+        silent.not_responding = true;
+        let idle = make_node("idle", NodeState::NodeIdle, "batch");
+
+        let mut dead_idle = StateFilter::parse(Some("idle")).unwrap();
+        dead_idle.apply_respond_flags(true, false);
+        assert!(dead_idle.keeps(&silent));
+        assert!(!dead_idle.keeps(&idle));
+
+        let mut responding_or = StateFilter::parse(Some("idle,no_respond")).unwrap();
+        responding_or.apply_respond_flags(false, true);
+        assert!(responding_or.keeps(&idle));
+        assert!(!responding_or.keeps(&silent));
+    }
+
+    #[test]
+    fn dead_with_responding_is_accepted_and_matches_nothing() {
+        let mut silent = make_node("silent", NodeState::NodeIdle, "batch");
+        silent.not_responding = true;
+        let idle = make_node("idle", NodeState::NodeIdle, "batch");
+
+        let mut filter = StateFilter::parse(None).unwrap();
+        filter.apply_respond_flags(true, true);
+        assert!(!filter.keeps(&silent));
+        assert!(!filter.keeps(&idle));
+
+        let args = parse_sinfo_args(&["sinfo", "-d", "-r"]);
+        assert!(args.dead && args.responding);
+    }
+
+    #[test]
+    fn responding_with_t_no_respond_matches_nothing() {
+        let mut silent = make_node("silent", NodeState::NodeIdle, "batch");
+        silent.not_responding = true;
+        let idle = make_node("idle", NodeState::NodeIdle, "batch");
+
         let mut filter = StateFilter::parse(Some("no_respond")).unwrap();
-        assert!(filter.apply_respond_flags(false, true).is_err());
+        filter.apply_respond_flags(false, true);
+        assert!(!filter.keeps(&silent));
+        assert!(!filter.keeps(&idle));
     }
 
     #[test]

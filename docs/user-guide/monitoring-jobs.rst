@@ -309,16 +309,19 @@ Flags:
      - Filter by partition.
    * - ``--states``
      - ``-t``
-     - Filter by node state (comma-separated). Accepts the base states, the
-       display-only labels ``resv`` (or ``reserved``), ``maint``, and ``plnd``
-       (or ``planned``), and ``no_respond`` (or ``noresp``) for nodes the
-       controller is not hearing from. ``all`` disables the filter.
+     - Filter by node state (comma-separated; a node in any listed state
+       matches). Accepts the base states, the display-only labels ``resv`` (or
+       ``reserved``), ``maint``, and ``plnd`` (or ``planned``), and
+       ``no_respond`` (or ``noresp``) for nodes the controller is not hearing
+       from. ``all`` disables the filter.
    * - ``--dead``
      - ``-d``
-     - Only nodes the controller is not hearing from.
+     - Only nodes the controller is not hearing from. Combines with ``-t`` and
+       ``-r``; a node must match all of them.
    * - ``--responding``
      - ``-r``
-     - Only nodes the controller is hearing from.
+     - Only nodes the controller is hearing from. Combines with ``-t`` and
+       ``-d``; a node must match all of them.
    * - ``--nodes``
      - ``-n``
      - Filter by node.
@@ -389,7 +392,11 @@ A trailing ``*`` on the state (``idle*``, ``mix*``, ``down*``) marks a node the
 controller is not currently hearing from: its heartbeats have gone stale, so it
 is given no new work until they resume, while its running jobs are untouched.
 Filter on it with ``-t no_respond``, ``--dead`` (``-d``, only non-responding
-nodes), or ``--responding`` (``-r``, only responding nodes).
+nodes), or ``--responding`` (``-r``, only responding nodes). Like the other
+``-t`` states, ``no_respond`` widens the list: ``sinfo -t idle,no_respond``
+shows idle nodes plus every non-responding node, whatever its state. ``-d`` and
+``-r`` narrow it instead: ``sinfo -t idle -d`` shows only idle nodes that are
+not responding, and ``-d -r`` together match nothing.
 ``scontrol show node`` shows the same condition as a ``+NOT_RESPONDING`` suffix
 on ``State=``, the REST node object carries a ``not_responding`` boolean, and
 ``spur health`` stars the node and counts it as unhealthy.
