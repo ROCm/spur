@@ -391,7 +391,9 @@ host. So when a node's heartbeats stop reaching the leader for
 ``controller.heartbeat_timeout_secs`` (default 90), it is flagged not-responding (shown as
 a ``*`` suffix in ``sinfo`` and ``+NOT_RESPONDING`` in ``scontrol show node``), which stops
 new work landing on it while its running jobs continue, and the leader asks the node's
-agent directly before marking it down:
+agent directly before marking it down. The probe is a gRPC ``Ping``, which is exempt from
+authentication, so it carries no controller credential and works in every auth mode. The
+agent must answer with the node's own name to count as alive:
 
 - **The agent answers.** The node and its jobs are kept and it is not marked ``DOWN``,
   though it stays not-responding and takes no new work until its heartbeats resume. The

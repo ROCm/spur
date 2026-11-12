@@ -66,8 +66,8 @@ pub(crate) trait Prober: Clone + Send + Sync + 'static {
     fn probe(&self, target: ProbeTarget) -> impl Future<Output = ProbeOutcome> + Send;
 }
 
-/// Asks the node's own agent, over the same path the leader uses to launch
-/// and cancel its jobs.
+/// Asks the node's own agent, at the address the leader uses to launch and
+/// cancel its jobs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AgentProbe;
 
@@ -87,22 +87,13 @@ async fn probe_agent_within(target: ProbeTarget, timeout: Duration) -> ProbeOutc
     let Some(endpoint) = target.endpoint else {
         return ProbeOutcome::Unreachable("node has no address to probe".into());
     };
-    let ping = async {
-        let mut agent = crate::agent_client::connect(endpoint)
-            .await
-            .map_err(|e| format!("connect failed: {e:?}"))?;
-        agent
-            .ping(())
-            .await
-            .map(|response| response.into_inner().hostname)
-            .map_err(|status| format!("ping failed: {}", status.message()))
-    };
+    let ping = crate::agent_client::ping_hostname(endpoint);
     match tokio::time::timeout(timeout, ping).await {
         Ok(Ok(hostname)) if hostname == target.node => ProbeOutcome::Alive,
         Ok(Ok(hostname)) => ProbeOutcome::Unreachable(format!(
             "the agent at the node's address answered as {hostname}"
         )),
-        Ok(Err(reason)) => ProbeOutcome::Unreachable(reason),
+        Ok(Err(e)) => ProbeOutcome::Unreachable(e.to_string()),
         Err(_) => ProbeOutcome::Unreachable(format!("no answer within {timeout:?}")),
     }
 }
