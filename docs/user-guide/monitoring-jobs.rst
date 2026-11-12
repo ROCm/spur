@@ -1254,6 +1254,8 @@ Accounting reports lag the live counts, and ``Open`` there is the last exported
 value. :ref:`preemption-outcome-export` describes how counts reach PostgreSQL
 and what happens during an accounting outage.
 
+.. _node-metrics:
+
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1272,6 +1274,14 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
      - Total number of nodes.
    * - ``spur_nodes_<state>``
      - Number of nodes in each state.
+   * - ``spur_nodes_not_responding``
+     - Number of nodes the leader is not hearing heartbeats from (the ``*`` in
+       ``sinfo``), in any state, so it overlaps the per-state counts. See
+       :ref:`node-liveness`.
+   * - ``spur_nodes_liveness_breaker_tripped``
+     - ``1`` while the leader's last health pass marked no node ``DOWN``
+       because too many nodes went silent at once, otherwise ``0``. See
+       :ref:`node-liveness`.
    * - ``spur_nodes_cpus`` / ``spur_nodes_cpus_alloc``
      - Total and allocated CPUs across all nodes.
    * - ``spur_nodes_memory_bytes`` / ``spur_nodes_memory_alloc_bytes``

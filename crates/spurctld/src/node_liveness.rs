@@ -34,6 +34,9 @@ const FAILED_PROBES_TO_MARK_DOWN: u32 = 2;
 /// Tolerance on the gap between a node's two failed probes, so a pass that lands
 /// a hair under one tick still counts.
 const STRIKE_SPACING_SLACK: Duration = Duration::from_millis(500);
+/// How often the leader repeats its warning about a silent node whose agent
+/// still answers.
+const SILENT_NODE_WARN_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 pub(crate) enum ProbeOutcome {
@@ -134,8 +137,9 @@ impl Suspects {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// The agent answered; `first` is true on the first pass of this silence.
-    Keep { first: bool },
+    /// The agent answered; `warn` is true on the first pass of this silence and
+    /// then once per [`SILENT_NODE_WARN_INTERVAL`].
+    Keep { warn: bool },
     /// The probe failed; the node gets one more pass.
     Wait,
     /// The probe failed on consecutive passes.
@@ -166,11 +170,12 @@ impl FailureRun {
 /// node that answers, heartbeats, or stops being stale starts over. A second
 /// failure marks the node Down only when that probe ran at least `min_gap`
 /// after the first failed one, so a probe queued late in one pass and run early
-/// in the next cannot count one outage twice.
+/// in the next cannot count one outage twice. Answering nodes map to when the
+/// leader last warned about them.
 #[derive(Debug, Default)]
 pub(crate) struct StrikeTracker {
     failures: HashMap<String, FailureRun>,
-    answering: HashSet<String>,
+    answering: HashMap<String, Instant>,
     min_gap: Duration,
 }
 
@@ -193,7 +198,7 @@ impl StrikeTracker {
             ProbeOutcome::Alive => {
                 self.failures.remove(node);
                 Verdict::Keep {
-                    first: self.answering.insert(node.to_string()),
+                    warn: self.warn_due(node, now),
                 }
             }
             ProbeOutcome::Unreachable(_) => {
@@ -222,10 +227,23 @@ impl StrikeTracker {
         }
     }
 
+    /// Whether an answering node is due a warning, starting its interval if so.
+    fn warn_due(&mut self, node: &str, now: Instant) -> bool {
+        let Some(last) = self.answering.get_mut(node) else {
+            self.answering.insert(node.to_string(), now);
+            return true;
+        };
+        if now.saturating_duration_since(*last) < SILENT_NODE_WARN_INTERVAL {
+            return false;
+        }
+        *last = now;
+        true
+    }
+
     /// Forgets every node that is no longer stale.
     pub(crate) fn retain(&mut self, stale: &HashSet<String>) {
         self.failures.retain(|node, _| stale.contains(node));
-        self.answering.retain(|node| stale.contains(node));
+        self.answering.retain(|node, _| stale.contains(node));
     }
 
     pub(crate) fn clear(&mut self) {
@@ -257,13 +275,14 @@ impl NodeLiveness {
 
     /// Called every health tick with the term this controller leads, or `None`.
     /// Leader-local state belongs to the term that built it, so a new term or a
-    /// lost leadership discards strikes and not-responding flags.
+    /// lost leadership discards strikes, not-responding flags, and the breaker.
     pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
         if self.term == leading_term {
             return;
         }
         self.strikes.clear();
         cluster.clear_not_responding();
+        cluster.set_liveness_breaker_tripped(false);
         self.term = leading_term;
     }
 
@@ -307,13 +326,16 @@ impl NodeLiveness {
         let stale_names: HashSet<String> = stale.names.iter().cloned().collect();
         self.strikes.retain(&stale_names);
         if stale_names.is_empty() {
+            cluster.set_liveness_breaker_tripped(false);
             return HashSet::new();
         }
         let (operator_managed, targets) = split_by_source(cluster, &stale.names);
         let results = probe_all(targets, prober).await;
 
         let suspects = Suspects::count(&results, &operator_managed, &stale);
-        if breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction) {
+        let tripped = breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction);
+        cluster.set_liveness_breaker_tripped(tripped);
+        if tripped {
             error!(
                 failed_probes = suspects.failed_probes,
                 operator_managed = suspects.operator_managed,
@@ -359,11 +381,12 @@ impl NodeLiveness {
             .strikes
             .record(&node, target.last_heartbeat, &outcome, at)
         {
-            Verdict::Keep { first: true } => warn!(
+            Verdict::Keep { warn: true } => warn!(
                 node = %node,
-                "heartbeats from this node stopped reaching the leader, but its agent answers; not marking it Down"
+                silent_for = %silent_for(target.last_heartbeat, Utc::now()),
+                "heartbeats from this node are not reaching the leader, but its agent still answers; not marking it Down, so check its jobs"
             ),
-            Verdict::Keep { first: false } => {
+            Verdict::Keep { warn: false } => {
                 debug!(node = %node, "silent node's agent still answers")
             }
             Verdict::Wait => warn!(
@@ -381,6 +404,13 @@ impl NodeLiveness {
             }
         }
         None
+    }
+}
+
+fn silent_for(last_heartbeat: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    match last_heartbeat {
+        Some(hb) => format!("{}s", (now - hb).num_seconds().max(0)),
+        None => "no heartbeat on record".into(),
     }
 }
 
@@ -513,7 +543,7 @@ mod tests {
         );
         assert_eq!(
             strikes.record("n1", None, &ProbeOutcome::Alive, now),
-            Verdict::Keep { first: true }
+            Verdict::Keep { warn: true }
         );
         assert_eq!(
             strikes.record("n1", None, &unreachable(), now),
@@ -527,16 +557,77 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             strikes.record("n1", None, &ProbeOutcome::Alive, now),
-            Verdict::Keep { first: true }
+            Verdict::Keep { warn: true }
         );
         assert_eq!(
             strikes.record("n1", None, &ProbeOutcome::Alive, now),
-            Verdict::Keep { first: false }
+            Verdict::Keep { warn: false }
         );
         strikes.retain(&HashSet::new());
         assert_eq!(
             strikes.record("n1", None, &ProbeOutcome::Alive, now),
-            Verdict::Keep { first: true }
+            Verdict::Keep { warn: true }
+        );
+    }
+
+    #[test]
+    fn an_answering_silent_node_is_warned_about_again_only_after_the_interval() {
+        let mut strikes = StrikeTracker::default();
+        let t0 = Instant::now();
+        let keep =
+            |strikes: &mut StrikeTracker, at| strikes.record("n1", None, &ProbeOutcome::Alive, at);
+
+        assert_eq!(keep(&mut strikes, t0), Verdict::Keep { warn: true });
+        assert_eq!(
+            keep(&mut strikes, t0 + Duration::from_secs(30)),
+            Verdict::Keep { warn: false }
+        );
+        assert_eq!(
+            keep(
+                &mut strikes,
+                t0 + SILENT_NODE_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            Verdict::Keep { warn: false }
+        );
+        assert_eq!(
+            keep(&mut strikes, t0 + SILENT_NODE_WARN_INTERVAL),
+            Verdict::Keep { warn: true }
+        );
+        assert_eq!(
+            keep(
+                &mut strikes,
+                t0 + SILENT_NODE_WARN_INTERVAL + Duration::from_secs(30)
+            ),
+            Verdict::Keep { warn: false },
+            "the interval restarts at the last warning"
+        );
+    }
+
+    #[test]
+    fn a_node_that_stops_answering_or_being_stale_is_warned_about_afresh() {
+        let mut strikes = StrikeTracker::default();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let alive = ProbeOutcome::Alive;
+
+        assert_eq!(
+            strikes.record("n1", None, &alive, at(0)),
+            Verdict::Keep { warn: true }
+        );
+        strikes.record("n1", None, &unreachable(), at(1));
+        assert_eq!(
+            strikes.record("n1", None, &alive, at(2)),
+            Verdict::Keep { warn: true }
+        );
+        strikes.retain(&HashSet::new());
+        assert_eq!(
+            strikes.record("n1", None, &alive, at(3)),
+            Verdict::Keep { warn: true }
+        );
+        strikes.clear();
+        assert_eq!(
+            strikes.record("n1", None, &alive, at(4)),
+            Verdict::Keep { warn: true }
         );
     }
 
@@ -558,7 +649,7 @@ mod tests {
         );
         assert_eq!(
             strikes.record("up", None, &ProbeOutcome::Alive, now),
-            Verdict::Keep { first: false }
+            Verdict::Keep { warn: false }
         );
     }
 
@@ -962,7 +1053,7 @@ mod tests {
             liveness
                 .strikes
                 .record("a", None, &ProbeOutcome::Alive, Instant::now()),
-            Verdict::Keep { first: false },
+            Verdict::Keep { warn: false },
             "a node that kept answering through a trip is not new"
         );
     }
@@ -1120,6 +1211,65 @@ mod tests {
             9,
             "a tripped breaker still probes every silent node, each pass"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_breaker_gauge_is_set_on_a_trip_and_cleared_by_a_pass_that_does_not_trip() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2", "n3", "n4"]).await;
+        silence(&cm, &["n1", "n2", "n3"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        assert!(!cm.node_metrics().liveness_breaker_tripped);
+
+        pass(&mut liveness, &cm, &prober).await;
+        let tripped = cm.node_metrics();
+        assert!(tripped.liveness_breaker_tripped);
+        assert_eq!(tripped.not_responding, 3);
+
+        silent_for(&cm, &["n1", "n2", "n3"], 0);
+        pass(&mut liveness, &cm, &prober).await;
+        let cleared = cm.node_metrics();
+        assert!(!cleared.liveness_breaker_tripped);
+        assert_eq!(cleared.not_responding, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_breaker_gauge_counts_only_the_last_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2", "n3", "n4"]).await;
+        silence(&cm, &["n1", "n2", "n3"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        pass(&mut liveness, &cm, &prober).await;
+        assert!(cm.node_metrics().liveness_breaker_tripped);
+
+        // Two of the three answer again: one suspect of four does not trip.
+        prober.answering.lock().extend(["n1".into(), "n2".into()]);
+        pass(&mut liveness, &cm, &prober).await;
+        let metrics = cm.node_metrics();
+        assert!(!metrics.liveness_breaker_tripped);
+        assert_eq!(metrics.not_responding, 3, "answering nodes stay flagged");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_term_clears_the_breaker_gauge() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2", "n3", "n4"]).await;
+        silence(&cm, &["n1", "n2", "n3"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        pass(&mut liveness, &cm, &prober).await;
+        assert!(cm.node_metrics().liveness_breaker_tripped);
+
+        liveness.observe_term(&cm, None);
+
+        let metrics = cm.node_metrics();
+        assert!(!metrics.liveness_breaker_tripped);
+        assert_eq!(metrics.not_responding, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

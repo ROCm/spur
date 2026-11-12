@@ -396,9 +396,15 @@ authentication, so it carries no controller credential and works in every auth m
 agent must answer with the node's own name to count as alive:
 
 - **The agent answers.** The node and its jobs are kept and it is not marked ``DOWN``,
-  though it stays not-responding and takes no new work until its heartbeats resume. The
-  leader logs a warning that the node's heartbeats stop reaching it but its agent answers.
-  Look for ``heartbeat failed`` in the agent's log to find the broken path.
+  though it stays not-responding and takes no new work until its heartbeats resume. This
+  lasts as long as the agent keeps answering, with no automatic drain, and an agent whose
+  heartbeats cannot reach the leader often cannot report job completions either, so its
+  finished jobs can stay running. The leader logs a warning naming the node and how long
+  it has been silent (``silent_for``), saying its heartbeats are not reaching the leader
+  but its agent still answers. The warning repeats about every 10 minutes while the
+  condition lasts, and ``spur_nodes_not_responding`` counts such nodes (see
+  :ref:`node-metrics`). Look for ``heartbeat failed`` in the agent's log to find the
+  broken path, and drain the node if it cannot be fixed soon.
 - **The agent does not answer on two consecutive health passes**
   (``controller.health_tick_secs``, default 30; the second failed probe counts only if it ran
   at least one pass after the first, and only if no heartbeat arrived between the two). The
@@ -411,8 +417,9 @@ agent must answer with the node's own name to count as alive:
   heartbeat (silent for more than 45 seconds). A node whose agent answered is never a
   suspect. When the suspects exceed ``controller.max_stale_node_fraction`` (default half)
   of the watched nodes, rounded down but never below one, the leader assumes the fault is
-  on its side, marks none of them ``DOWN``, and logs ``suspecting the control plane`` at
-  error level. Watched nodes are those not ``DOWN``, drained, or suspended, so draining
+  on its side, marks none of them ``DOWN``, logs ``suspecting the control plane`` at
+  error level, and sets the ``spur_nodes_liveness_breaker_tripped`` gauge to ``1`` until a
+  pass that does not trip. Watched nodes are those not ``DOWN``, drained, or suspended, so draining
   part of the cluster lowers the number of suspects it takes. Silent nodes are still
   probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
   the two-probe rule above. To mark nodes down sooner, use

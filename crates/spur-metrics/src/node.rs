@@ -46,6 +46,11 @@ pub struct NodeMetricsSnapshot {
     pub alloc_gpus: u64,
     /// Per-node breakdown, sorted by name for stable encoding.
     pub per_node: Vec<PerNodeMetrics>,
+    /// Nodes the leader is not hearing heartbeats from, in any state.
+    pub not_responding: u64,
+    /// Whether the leader's last health pass withheld every Down because too
+    /// many nodes went silent at once. Set by the controller, not [`Self::collect`].
+    pub liveness_breaker_tripped: bool,
 }
 
 /// Map [`NodeState`] to a stable index in [`NodeMetricsSnapshot::by_state`]
@@ -84,6 +89,7 @@ impl NodeMetricsSnapshot {
         for node in nodes {
             snap.total += 1;
             snap.by_state[node_state_index(node.state)] += 1;
+            snap.not_responding += u64::from(node.not_responding);
 
             let total_cpus = u64::from(node.total_resources.cpus);
             let alloc_cpus = u64::from(node.alloc_resources.cpus);
@@ -240,6 +246,32 @@ mod tests {
         assert_eq!(snap.per_node[2].name, "c");
         assert_eq!(snap.per_node[0].cpu_load, 10);
         assert_eq!(snap.per_node[0].free_memory_bytes, memory_mb_to_bytes(4096));
+    }
+
+    #[test]
+    fn counts_not_responding_nodes_across_states() {
+        let mut idle = node_named(
+            "idle",
+            NodeState::Idle,
+            resources(4, 8192, 0),
+            ResourceAllocations::default(),
+            0,
+            0,
+        );
+        idle.not_responding = true;
+        let mut down = idle.clone();
+        down.name = "down".into();
+        down.state = NodeState::Down;
+        let mut heard = idle.clone();
+        heard.name = "heard".into();
+        heard.not_responding = false;
+
+        let snap = NodeMetricsSnapshot::collect([&idle, &down, &heard]);
+        assert_eq!(snap.not_responding, 2);
+        assert!(
+            !snap.liveness_breaker_tripped,
+            "the breaker is not a property of the node map"
+        );
     }
 
     #[test]

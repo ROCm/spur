@@ -502,7 +502,8 @@ scraper at all controllers and let it follow the leader.
 **Node metrics** (`/metrics/nodes`): `spur_nodes`, `spur_nodes_<state>`,
 `spur_nodes_cpus`/`spur_nodes_cpus_alloc`,
 `spur_nodes_memory_bytes`/`spur_nodes_memory_alloc_bytes`,
-`spur_nodes_gpus`/`spur_nodes_gpus_alloc`.  Per-node: `spur_node_cpus`,
+`spur_nodes_gpus`/`spur_nodes_gpus_alloc`, `spur_nodes_not_responding`,
+`spur_nodes_liveness_breaker_tripped`.  Per-node: `spur_node_cpus`,
 `spur_node_gpus`, `spur_node_cpu_load`, `spur_node_free_memory_bytes`.
 
 **k0s metrics** (`/metrics/k8s`): `spur_k8s_cluster_up`,

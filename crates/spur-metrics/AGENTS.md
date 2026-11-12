@@ -77,7 +77,7 @@ State-based metrics use a fixed suffix per enum variant (e.g. `spur_jobs_pending
 
 ### Nodes (`/metrics/nodes`)
 
-Aggregate gauges: `spur_nodes`, `spur_nodes_{state}` (idle, alloc, mixed, down, drain, draining, error, unknown, suspended), `spur_nodes_cpus`, `spur_nodes_cpus_alloc`, `spur_nodes_memory_bytes`, `spur_nodes_memory_alloc_bytes`, `spur_nodes_gpus`, `spur_nodes_gpus_alloc`.
+Aggregate gauges: `spur_nodes`, `spur_nodes_{state}` (idle, alloc, mixed, down, drain, draining, error, unknown, suspended), `spur_nodes_cpus`, `spur_nodes_cpus_alloc`, `spur_nodes_memory_bytes`, `spur_nodes_memory_alloc_bytes`, `spur_nodes_gpus`, `spur_nodes_gpus_alloc`, `spur_nodes_not_responding`, `spur_nodes_liveness_breaker_tripped` (set by spurctld, not `collect`).
 
 Per-node families (label `node`): `spur_node_cpus`, `spur_node_cpus_alloc`, `spur_node_memory_bytes`, `spur_node_memory_alloc_bytes`, `spur_node_gpus`, `spur_node_gpus_alloc`, `spur_node_cpu_load`, `spur_node_free_memory_bytes`.
 

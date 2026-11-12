@@ -6,7 +6,7 @@ mod preemption_usage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -646,6 +646,9 @@ pub struct ClusterManager {
     /// Nodes `k8s remove-nodes` is taking out right now, counted so overlapping calls for one
     /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
     k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
+    /// Whether the leader's last health pass withheld every Down because too many
+    /// nodes went silent at once. Leader-local, like the not-responding flags.
+    liveness_breaker_tripped: AtomicBool,
     raft: RwLock<Option<SpurRaft>>,
     /// This controller's durable start counter; orders layout deliveries when a
     /// restarted leader keeps its Raft term.
@@ -1047,6 +1050,7 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
+            liveness_breaker_tripped: AtomicBool::new(false),
             raft: RwLock::new(None),
             boot_epoch: AtomicU64::new(0),
             layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
@@ -1827,7 +1831,10 @@ impl ClusterManager {
     /// this scans it on each call.
     pub fn node_metrics(&self) -> NodeMetricsSnapshot {
         let nodes = self.nodes.read();
-        NodeMetricsSnapshot::collect(nodes.values())
+        NodeMetricsSnapshot {
+            liveness_breaker_tripped: self.liveness_breaker_tripped.load(Ordering::Relaxed),
+            ..NodeMetricsSnapshot::collect(nodes.values())
+        }
     }
 
     /// Aggregated per-partition metrics from the current job, node, and partition maps.
@@ -5334,6 +5341,11 @@ impl ClusterManager {
         for node in self.nodes.write().values_mut() {
             node.not_responding = false;
         }
+    }
+
+    pub(crate) fn set_liveness_breaker_tripped(&self, tripped: bool) {
+        self.liveness_breaker_tripped
+            .store(tripped, Ordering::Relaxed);
     }
 
     /// The stale nodes a health pass would mark Down, read before anything is
