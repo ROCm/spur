@@ -331,6 +331,9 @@ impl NodeLiveness {
         cluster.set_liveness_breaker_tripped(false);
         cluster.set_silent_answering_nodes(0);
         cluster.reset_recovery_holds();
+        if leading_term.is_some() {
+            cluster.hold_down_nodes_until_reported();
+        }
         self.term = leading_term;
     }
 
@@ -1714,6 +1717,33 @@ mod tests {
             NodeState::Idle,
             "the strike from the lost term must not count"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_node_recovers_only_after_reporting_to_a_new_leader() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        // A replicated snapshot taken mid-hold carries a fresh stamp for a Down node.
+        set_node_state(&cm, "n1", NodeState::Down);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        liveness.observe_term(&cm, Some(1));
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        assert_eq!(state(&cm, "n1"), NodeState::Down);
+
+        cm.record_node_report("n1", None);
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        wait_for("recovered after a clean report", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

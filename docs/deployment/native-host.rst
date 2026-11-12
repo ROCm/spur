@@ -458,7 +458,9 @@ no longer assigns to it, such as a job that ended or the old run of a job that w
 requeued, for example because it was unreachable at the time, the controller cancels that
 work again and keeps the node ``DOWN`` until it reports clean, so no new job lands beside
 it. A heartbeat that cannot enumerate the node's jobs (a momentarily contended agent lock,
-or a just-restarted agent still adopting its jobs) does not count as clean.
+or a just-restarted agent still adopting its jobs) does not count as clean. After a
+leadership change, a ``DOWN`` node stays down until its first heartbeat to the new leader
+reports a clean job list.
 
 The hold gives the node time to finish killing and cleaning up: it lasts the longer of
 ``controller.heartbeat_timeout_secs`` and the node's kill and cleanup budget plus one
