@@ -78,6 +78,33 @@ async fn a_user_at_the_partition_cap_is_held_whichever_account_submits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partitions_sharing_a_partition_qos_add_up_one_users_usage() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 2).await;
+    cm.create_partition(Partition {
+        name: "gpu2".into(),
+        nodes: "ALL".into(),
+        qos: Some("usercap".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let in_gpu2 = |account: &str, qos: &str| JobSpec {
+        partition: Some("gpu2".into()),
+        ..gpu_job("alice", account, qos)
+    };
+    run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
+    run_on(&cm, in_gpu2("acct-b", "qb"), "n2");
+
+    let third = submit_and_wait(&cm, in_gpu2("acct-a", "qa"));
+
+    assert!(schedulable(&cm, third).is_none());
+    assert_eq!(
+        cm.get_job(third).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_job_qos_alone_would_have_let_the_third_job_run() {
     let dir = TempDir::new().unwrap();
     let cm = capped_cluster(&dir, 2).await;

@@ -659,6 +659,9 @@ How it behaves:
   ``InvalidQOS`` rather than silently lifting the cap. While the QOS cache is
   still loading, the partition's jobs wait with ``AccountingUnavailable``.
 - The same QOS may be both a partition QOS and a job QOS; both checks then apply.
+- Several partitions may name the same partition QOS, and a user's usage in all of
+  them adds up against it. Naming one QOS on every partition caps a user across the
+  whole cluster.
 - A partition QOS needs accounting. With accounting disabled no QOS is defined, so
   the partition QOS has no effect.
 

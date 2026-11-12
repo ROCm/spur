@@ -23,7 +23,7 @@ _CACHE_REFRESH = 15
 _GUARD_SECS = 15
 
 
-def _config(*, idle_fill: bool = False) -> dict:
+def _config(*, idle_fill: bool = False, second_capped: bool = False) -> dict:
     base = {
         "state": "UP",
         "nodes": "ALL",
@@ -31,11 +31,14 @@ def _config(*, idle_fill: bool = False) -> dict:
         "default_time": "30:00",
         "preempt_mode": "off",
     }
+    partitions = [
+        {**base, "name": "capped", "default": True, "qos": "usercap"},
+        {**base, "name": "open"},
+    ]
+    if second_capped:
+        partitions.append({**base, "name": "capped2", "qos": "usercap"})
     return {
-        "partitions": [
-            {**base, "name": "capped", "default": True, "qos": "usercap"},
-            {**base, "name": "open"},
-        ],
+        "partitions": partitions,
         "scheduler": {
             "idle_fill_enabled": idle_fill,
             "idle_fill_exempt_secs": 5,
@@ -174,6 +177,35 @@ class TestPartitionQosCapsAUserAcrossAccounts:
             fifth = _submit(c, "a3", "acct-a")
             ids.append(fifth)
             _stays_pending(c, fifth, "QOSMaxNodePerUserLimit")
+        finally:
+            _cancel(c, ids)
+
+
+class TestPartitionsSharingAQosAddUp:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config(second_capped=True)
+
+    def test_one_users_jobs_in_two_partitions_share_one_cap(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "maxtresperuser=node=2"])
+        time.sleep(_CACHE_REFRESH)
+        ids = []
+        try:
+            first = _submit(c, "a1", "acct-a")
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+
+            second = _submit(c, "b1", "acct-b", "-p", "capped2")
+            ids.append(second)
+            wait_job_state(c, second, "R", timeout=60)
+
+            third = _submit(c, "a2", "acct-a", "-p", "capped2")
+            ids.append(third)
+            _stays_pending(c, third, "QOSMaxNodePerUserLimit")
+            assert _idle_nodes(c) > 0, "a free node must exist, so only the cap holds the job"
         finally:
             _cancel(c, ids)
 
