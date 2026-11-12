@@ -460,12 +460,17 @@ work again and keeps the node ``DOWN`` until it reports clean, so no new job lan
 it. A heartbeat that cannot enumerate the node's jobs (a momentarily contended agent lock,
 or a just-restarted agent still adopting its jobs) does not count as clean.
 
-The hold lasts at most ``controller.heartbeat_timeout_secs``. If that work still has not
-cleared by then, usually a process that will not die, the node is drained rather than
-returned (it shows as ``DRAINED``), with reason ``Kill task failed (JobId=...)``, or with
-``Agent job list unavailable`` when it cannot report its jobs at all. The node takes no new
-work until an operator clears it with ``scontrol update nodename=<node> state=resume`` once
-it is sound; reclaim cancels keep running in the meantime.
+The hold gives the node time to finish killing and cleaning up: it lasts the longer of
+``controller.heartbeat_timeout_secs`` and the node's kill and cleanup budget plus one
+30-second heartbeat interval for the clean report to arrive. That budget is the larger of
+``scheduler.kill_wait_secs`` and ``scheduler.timeout_kill_wait_secs``, plus
+``cgroup.cleanup_timeout_secs``, plus the ``hooks.epilog_timeout_secs`` bound, so the hold
+lasts about four minutes at defaults. If that work still has not cleared by then, usually a
+process that will not die, the node is drained rather than returned (it shows as
+``DRAINED``), with reason ``Kill task failed (JobId=...)``, or with ``Agent job list
+unavailable`` when it cannot report its jobs at all. The node takes no new work until an
+operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
+reclaim cancels keep running in the meantime.
 
 Joining Worker Nodes
 --------------------
