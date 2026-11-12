@@ -690,7 +690,7 @@ pub struct ClusterManager {
     /// clean. Leader-local soft state, like `Node::last_heartbeat`.
     stale_reporting_nodes: RwLock<HashMap<String, NodeReport>>,
     /// When the health pass began withholding each node's recovery. Only the
-    /// health pass writes it, so a leadership change can reset it without
+    /// health pass starts a hold, so a leadership change can reset it without
     /// racing heartbeats.
     recovery_holds: RwLock<HashMap<String, std::time::Instant>>,
     /// Nodes skipped for new dispatch until the given instant after a
@@ -4444,10 +4444,24 @@ impl ClusterManager {
         self.stale_reporting_nodes.read().contains_key(node)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_recovery_held(&self, node: &str) -> bool {
+        self.recovery_holds.read().contains_key(node)
+    }
+
     /// Clear recovery holds on leadership (re)gain: their start times were set
     /// by another leadership's health passes.
     pub(crate) fn reset_recovery_holds(&self) {
         self.recovery_holds.write().clear();
+    }
+
+    fn end_recovery_hold(&self, node: &str) {
+        self.recovery_holds.write().remove(node);
+    }
+
+    fn forget_node_report(&self, node: &str) {
+        self.stale_reporting_nodes.write().remove(node);
+        self.end_recovery_hold(node);
     }
 
     /// Prune the keepalive map to the given live interactive allocations and
@@ -5146,6 +5160,8 @@ impl ClusterManager {
             reason_time,
             at: None,
         })?;
+        // The operator's call supersedes the hold; a later one starts its own clock.
+        self.end_recovery_hold(name);
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
@@ -5654,6 +5670,7 @@ impl ClusterManager {
             reason,
             at: None,
         })?;
+        self.forget_node_report(name);
         self.k8s_metrics
             .remove_node(&self.config().cluster_name, name);
         self.run_all_finalized_side_effects(&resp);
@@ -12271,7 +12288,9 @@ pub(crate) fn withhold_recoveries(
     cap: std::time::Duration,
     now: std::time::Instant,
 ) {
-    holds.retain(|node, _| reporting_stale.contains_key(node));
+    // A hold spans only consecutive passes that withhold a recovery; one that
+    // lapsed (silent, resumed, removed) starts afresh, not from its old start.
+    let previous = std::mem::take(holds);
     for action in std::mem::take(actions) {
         let HealthAction::Recover { name, old_state } = action else {
             actions.push(action);
@@ -12281,7 +12300,9 @@ pub(crate) fn withhold_recoveries(
             actions.push(HealthAction::Recover { name, old_state });
             continue;
         };
-        let held_for = now.saturating_duration_since(*holds.entry(name.clone()).or_insert(now));
+        let since = previous.get(&name).copied().unwrap_or(now);
+        holds.insert(name.clone(), since);
+        let held_for = now.saturating_duration_since(since);
         // Passes land on a fixed tick, so the one due exactly at the cap can run a
         // hair early; the slack keeps the decision from slipping a whole pass.
         if held_for + HOLD_RELEASE_SLACK < cap {
@@ -36190,6 +36211,33 @@ state = "UP"
         assert_eq!(actions, vec![drain("stuck", "Agent job list unavailable")]);
     }
 
+    #[test]
+    fn a_held_node_that_went_silent_past_the_cap_starts_a_fresh_hold_on_return() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(90);
+        let reporting = reporting(&["back"]);
+        let mut holds = HashMap::new();
+        let mut pass = |mut actions: Vec<super::HealthAction>, at| {
+            super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, at);
+            actions
+        };
+
+        assert!(pass(vec![recover("back")], started).is_empty());
+        // Silent: past the heartbeat timeout it gets no Recover action at all.
+        assert!(pass(
+            Vec::new(),
+            started + cap + std::time::Duration::from_secs(1)
+        )
+        .is_empty());
+        let returned = started + cap + std::time::Duration::from_secs(30);
+
+        assert!(
+            pass(vec![recover("back")], returned).is_empty(),
+            "a node back from silence still reporting ended jobs is held, not drained"
+        );
+        assert_eq!(holds.get("back"), Some(&returned));
+    }
+
     fn default_config() -> spur_core::config::SlurmConfig {
         spur_core::config::SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap()
     }
@@ -36371,6 +36419,47 @@ state = "UP"
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
+    }
+
+    async fn held_down_node(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        cm.record_node_report("n1", Some(super::NodeReport::StaleJobs(vec![1])));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert!(cm.is_recovery_held("n1"));
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_resume_ends_a_recovery_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = held_down_node(&dir).await;
+
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+
+        assert!(!cm.is_recovery_held("n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_node_forgets_its_report_and_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = held_down_node(&dir).await;
+
+        cm.remove_node("n1", false, None).unwrap();
+
+        assert!(!cm.is_recovery_held("n1"));
+        assert!(!cm.reports_stale_jobs("n1"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
