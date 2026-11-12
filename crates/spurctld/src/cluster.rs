@@ -3720,12 +3720,15 @@ impl ClusterManager {
     /// Whether the health system must leave `node` untouched: only a node that
     /// is up and schedulable (idle/allocated/mixed) is probed. A down node, or
     /// one already drained (by an operator or a failed check), is off-limits —
-    /// a failed check's drain is sticky until an operator resumes the node.
+    /// a failed check's drain is sticky until an operator resumes the node. So
+    /// is a not-responding one: its check could not be placed, and a pending one
+    /// would only age into a force-drain of a node the leader cannot hear.
     fn node_off_limits_for_health(&self, node: &Node) -> bool {
-        !matches!(
-            node.state,
-            NodeState::Idle | NodeState::Allocated | NodeState::Mixed
-        )
+        node.not_responding
+            || !matches!(
+                node.state,
+                NodeState::Idle | NodeState::Allocated | NodeState::Mixed
+            )
     }
 
     /// Submit one check as an exclusive whole-node job pinned to `node`. It runs
@@ -14149,6 +14152,39 @@ state = "UP"
         assert!(
             cm.get_jobs(&JobFilter::default()).is_empty(),
             "must not probe a drained node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_leaves_a_not_responding_node_alone() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/bin/true", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+        cm.check_node_health(90, MarkDownPolicy::Only(HashSet::new()));
+        let n1 = cm.get_node("n1").unwrap();
+        assert!(n1.not_responding);
+        assert_eq!(n1.state, NodeState::Idle, "kept up, only flagged");
+
+        assert!(cm.node_off_limits_for_health(&n1));
+        cm.run_node_health_pass();
+        wait_for("health job submitted", || {
+            !cm.get_jobs(&JobFilter::default()).is_empty()
+        });
+        let targets: Vec<Option<String>> = cm
+            .get_jobs(&JobFilter::default())
+            .iter()
+            .map(|j| j.spec.nodelist.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Some("n2".to_string())],
+            "a node the leader cannot hear must not be sent a check"
         );
     }
 

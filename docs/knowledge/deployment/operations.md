@@ -575,7 +575,8 @@ timeout_secs = 60
 ```
 
 The controller submits each check as a real job.  Non-zero exit drains the
-node.  Resume to re-validate.
+node.  Resume to re-validate.  Only idle, allocated, and mixed nodes are
+checked: down, drained, and not-responding (`*` in `sinfo`) nodes are skipped.
 
 ### Add/remove agents
 
