@@ -4488,6 +4488,8 @@ pub struct AgentService {
     lifecycle: crate::job_lifecycle::JobLifecycle,
     /// Serializes launches that would land on one supervisor session.
     step_launches: crate::job_lifecycle::StepLaunchLifecycle,
+    /// GPUs launching steps have taken before their supervisor's descriptor holds them.
+    pending_step_gpus: crate::step_resources::PendingStepGpus,
     stepds: Arc<Mutex<StepdMap>>,
     stepd_state_dir: std::path::PathBuf,
     /// Candidate roots `RunCommand`'s job spool is created under, in order.
@@ -4630,6 +4632,7 @@ impl AgentService {
             interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             step_launches: crate::job_lifecycle::StepLaunchLifecycle::default(),
+            pending_step_gpus: crate::step_resources::PendingStepGpus::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             force_legacy_launch: true,
@@ -4957,6 +4960,70 @@ impl AgentService {
         self.step_launches
             .acquire((job_id, run_attempt, step_id))
             .await
+    }
+
+    /// Take `count` of the job's GPUs on this node for a step, skipping any that
+    /// a live supervisor of the same job attempt or another launching step holds.
+    async fn reserve_step_gpus(
+        &self,
+        key: crate::step_resources::StepGpuKey,
+        job_gpus: &[u64],
+        count: usize,
+    ) -> Result<crate::step_resources::StepGpuReservation, Status> {
+        let (job_id, run_attempt, step_id) = key;
+        let stepds = self.stepds.lock().await;
+        let held = stepds
+            .values()
+            .filter(|d| d.job_id == job_id && d.run_attempt == run_attempt && d.step_id != step_id)
+            .filter_map(|d| d.resources.step_limits.gpus.as_ref())
+            .flatten()
+            .copied();
+        self.pending_step_gpus
+            .reserve(key, job_gpus, held, count)
+            .map_err(|exhausted| Status::resource_exhausted(exhausted.to_string()))
+    }
+
+    /// Resolve a step's own share of this node and take its GPUs. A step that
+    /// asked for nothing gets empty limits and keeps sharing the job's resources.
+    async fn claim_step_share(
+        &self,
+        request: Option<&spur_proto::proto::StepResources>,
+        key: crate::step_resources::StepGpuKey,
+        placement: crate::step_resources::StepPlacement,
+        job: &crate::step_resources::JobShare<'_>,
+    ) -> Result<
+        (
+            crate::step_resources::StepLimits,
+            Option<crate::step_resources::StepGpuReservation>,
+        ),
+        Status,
+    > {
+        let Some(request) = request else {
+            return Ok(Default::default());
+        };
+        let resolved = crate::step_resources::resolve(request, placement, job)
+            .map_err(Status::invalid_argument)?;
+        if resolved.is_empty() {
+            return Ok(Default::default());
+        }
+        if let Some(reason) =
+            crate::step_resources::unenforceable(&resolved, &self.cgroup, self.spurd_is_root)
+        {
+            return Err(Status::failed_precondition(format!(
+                "node {} cannot give the step limits of its own: {reason}",
+                self.reporter.hostname
+            )));
+        }
+        let reservation = match resolved.gpus {
+            Some(count) => Some(self.reserve_step_gpus(key, job.gpus, count).await?),
+            None => None,
+        };
+        let limits = crate::step_resources::StepLimits {
+            cpus: resolved.cpus,
+            memory_mb: resolved.memory_mb,
+            gpus: reservation.as_ref().map(|r| r.gpus().to_vec()),
+        };
+        Ok((limits, reservation))
     }
 
     /// Run a numbered step under its own supervisor. The job already holds its
@@ -7014,6 +7081,7 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 &cpu_ids,
                 &host_device_plan.device_paths,
+                &crate::step_resources::StepLimits::default(),
             );
             match allocation_cgroup(setup, self.cgroup.required) {
                 AllocationCgroup::Record(path) => path,
@@ -7063,6 +7131,7 @@ impl SlurmAgent for AgentService {
             pmix_multi_task,
             joins_parent_namespaces: false,
             allocation_holder,
+            step_limits: Default::default(),
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
@@ -7909,6 +7978,7 @@ impl SlurmAgent for AgentService {
             memory_mb,
             &alloc_result.cpu_ids,
             &device_paths,
+            &crate::step_resources::StepLimits::default(),
         );
         let cgroup_path = match allocation_cgroup(setup, self.cgroup.required) {
             AllocationCgroup::Record(path) => path,
@@ -7979,6 +8049,7 @@ impl SlurmAgent for AgentService {
                 step_id: spur_core::step::STEP_EXTERN,
                 joins_parent_namespaces: false,
                 allocation_holder: false,
+                step_limits: Default::default(),
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),
@@ -8465,14 +8536,36 @@ impl SlurmAgent for AgentService {
             .count()
             .max(1) as u32;
 
-        let (mut gpu_env, host_device_plan, container_device_plan) = if gpu_devices.is_empty() {
+        // Held until this RPC returns. Once the step's supervisor is tracked, its
+        // descriptor holds the GPUs too, so a dropped RPC cannot free them early.
+        let (step_limits, _step_gpu_reservation) = self
+            .claim_step_share(
+                req.resources.as_ref(),
+                (job_id, job_attempt, step_id),
+                crate::step_resources::StepPlacement {
+                    tasks_on_node: num_tasks,
+                    step_nodes: num_nodes,
+                },
+                &crate::step_resources::JobShare {
+                    cpus,
+                    memory_mb,
+                    gpus: &gpu_devices,
+                },
+            )
+            .await?;
+        let launch_gpus = step_limits
+            .gpus
+            .clone()
+            .unwrap_or_else(|| gpu_devices.clone());
+
+        let (mut gpu_env, host_device_plan, container_device_plan) = if launch_gpus.is_empty() {
             (HashMap::new(), None, None)
         } else {
             let (mut host_plan, container_plan) = self
                 .device_registry
                 .lock()
                 .await
-                .build_job_injection_plans("gpu", &gpu_devices, req.uid, req.gid)
+                .build_job_injection_plans("gpu", &launch_gpus, req.uid, req.gid)
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
                 })?;
@@ -8482,7 +8575,7 @@ impl SlurmAgent for AgentService {
             host_plan.env.clear();
             (env, Some(host_plan), Some(container_plan))
         };
-        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
+        maybe_deny_gpu_env(&mut gpu_env, &launch_gpus);
 
         let mut senv = SpurEnv::new();
         senv.extend(&req.environment);
@@ -8494,7 +8587,7 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
         senv.extend(&gpu_env);
         let mut bind_env = HashMap::new();
-        spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &gpu_devices);
+        spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &launch_gpus);
         senv.extend(&bind_env);
         if let Some(cpu_bind) = spur_core::task_launch::unsupported_cpu_bind(&req.environment) {
             warn!(
@@ -8549,6 +8642,11 @@ impl SlurmAgent for AgentService {
         let supervise_step = true;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
+        if !supervise_step && !step_limits.is_empty() {
+            return Err(Status::failed_precondition(
+                "a step's own limits need a supervised step",
+            ));
+        }
         if !supervise_step {
             drop(lifecycle.take());
         }
@@ -8693,6 +8791,9 @@ impl SlurmAgent for AgentService {
         let _step_script_guard = step_script_cleanup;
 
         let mut env = senv.into_map();
+        if step_limits.gpus.is_some() {
+            spur_core::task_launch::localize_gpu_selectors(&mut env);
+        }
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
         }
@@ -8795,7 +8896,7 @@ impl SlurmAgent for AgentService {
                         self.allow_root_jobs,
                         &c,
                         FreshContainerContext {
-                            gpu_devices: gpu_devices.clone(),
+                            gpu_devices: launch_gpus.clone(),
                             device_plan: container_device_plan.clone(),
                             uid: req.uid,
                             gid: req.gid,
@@ -8850,6 +8951,7 @@ impl SlurmAgent for AgentService {
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
                 pmix_multi_task: step_mpi && num_tasks > 1,
+                step_limits,
             })
         } else {
             None
@@ -9909,6 +10011,7 @@ impl SlurmAgent for AgentService {
                         step_id,
                         joins_parent_namespaces: parent_has_namespaces,
                         allocation_holder: false,
+                        step_limits: Default::default(),
                         script,
                         work_dir: entry.work_dir.clone(),
                         name: format!("{}.{}", init.job_id, step_id),
@@ -16994,6 +17097,7 @@ mod tests {
             step_id: spur_core::step::STEP_BATCH,
             joins_parent_namespaces: false,
             allocation_holder: false,
+            step_limits: Default::default(),
             script: String::new(),
             work_dir: "/tmp".into(),
             name: String::new(),
@@ -17171,6 +17275,7 @@ mod tests {
             partition: "gpu".into(),
             nodelist: "node-a,node-b".into(),
             mpi: "pmix".into(),
+            step_limits: Default::default(),
         };
 
         recover_stepds(&running, vec![descriptor]).await;
@@ -21710,6 +21815,154 @@ mod tests {
             "AMD registry should not set CUDA_VISIBLE_DEVICES, got: {}",
             resp.stdout
         );
+    }
+
+    fn gpu_holding_step(
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+        gpus: Vec<u64>,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources.step_limits.gpus = Some(gpus);
+        descriptor
+    }
+
+    fn gpu_share(gpus: &[u64]) -> crate::step_resources::JobShare<'_> {
+        crate::step_resources::JobShare {
+            cpus: 8,
+            memory_mb: 4096,
+            gpus,
+        }
+    }
+
+    const ONE_TASK_ONE_NODE: crate::step_resources::StepPlacement =
+        crate::step_resources::StepPlacement {
+            tasks_on_node: 1,
+            step_nodes: 1,
+        };
+
+    #[tokio::test]
+    async fn a_step_takes_gpus_no_live_step_of_its_job_attempt_holds() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let mut stepds = svc.stepds.lock().await;
+        stepds.insert((7, 1), gpu_holding_step(7, 0, 1, vec![10, 11]));
+        stepds.insert((7, 9), gpu_holding_step(7, 3, 9, vec![12]));
+        stepds.insert((8, 1), gpu_holding_step(8, 0, 1, vec![12, 13]));
+        drop(stepds);
+        let request = StepResources {
+            gpus_per_node: Some(2),
+            memory_mb: Some(1024),
+            ..Default::default()
+        };
+
+        let (limits, reservation) = svc
+            .claim_step_share(
+                Some(&request),
+                (7, 0, 2),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[10, 11, 12, 13]),
+            )
+            .await
+            .expect("two GPUs are free for job 7 attempt 0");
+        assert_eq!(limits.gpus, Some(vec![12, 13]));
+        assert_eq!(limits.memory_mb, Some(1024));
+        assert_eq!(limits.cpus, None, "an unrequested resource stays shared");
+
+        let one_more = StepResources {
+            gpus: Some(1),
+            ..Default::default()
+        };
+        let err = svc
+            .claim_step_share(
+                Some(&one_more),
+                (7, 0, 3),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[10, 11, 12, 13]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+
+        drop(reservation);
+        let (limits, _) = svc
+            .claim_step_share(
+                Some(&one_more),
+                (7, 0, 3),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[10, 11, 12, 13]),
+            )
+            .await
+            .expect("a finished launch hands its GPUs back");
+        assert_eq!(limits.gpus, Some(vec![12]));
+    }
+
+    #[tokio::test]
+    async fn a_step_without_a_request_of_its_own_shares_the_job() {
+        let svc = test_agent_service(test_reporter()).with_root_override(false);
+        for request in [None, Some(StepResources::default())] {
+            let (limits, reservation) = svc
+                .claim_step_share(
+                    request.as_ref(),
+                    (7, 0, 1),
+                    ONE_TASK_ONE_NODE,
+                    &gpu_share(&[10]),
+                )
+                .await
+                .expect("nothing to enforce, so nothing to refuse");
+            assert!(limits.is_empty());
+            assert!(reservation.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_cannot_enforce_a_steps_limits_refuses_the_step() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(false);
+        svc.cgroup = CgroupConfig::default();
+        let request = StepResources {
+            cpus_per_task: Some(1),
+            ..Default::default()
+        };
+        let err = svc
+            .claim_step_share(
+                Some(&request),
+                (7, 0, 1),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("not running as root"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_a_step_asking_for_more_than_its_job_holds() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let err = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                step_id: 1,
+                resources: Some(StepResources {
+                    gpus_per_node: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("holds 0"), "{err}");
     }
 
     #[tokio::test]

@@ -323,6 +323,38 @@ fn hip_relative_indices(visible: &str) -> String {
         .join(",")
 }
 
+/// Renumber GPU selectors to their position in `SPUR_JOB_GPUS`.
+///
+/// For a launch fenced to its own GPUs by a device filter: the runtimes there can
+/// open no other GPU, so they enumerate its GPUs from 0 and a node-wide id would
+/// name a device they cannot see. An id outside `SPUR_JOB_GPUS` is left as is.
+pub fn localize_gpu_selectors(env: &mut HashMap<String, String>) {
+    let Some(ids) = env.get("SPUR_JOB_GPUS").cloned() else {
+        return;
+    };
+    let rank: HashMap<&str, String> = ids
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .enumerate()
+        .map(|(i, id)| (id, i.to_string()))
+        .collect();
+    for var in [
+        "SPUR_JOB_GPUS",
+        "ROCR_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+        "ZE_AFFINITY_MASK",
+    ] {
+        if let Some(value) = env.get_mut(var) {
+            *value = value
+                .split(',')
+                .map(|id| rank.get(id).map_or(id, String::as_str))
+                .collect::<Vec<_>>()
+                .join(",");
+        }
+    }
+}
+
 /// Hide all GPUs from the common vendor runtimes for a zero-GPU job.
 ///
 /// Unset/empty isn't reliably "no devices", so each selector gets a deny token:
@@ -1236,6 +1268,56 @@ mod tests {
         );
         // Spur's own allocated-GPU list: empty is "none", not a device index.
         assert_eq!(env.get("SPUR_JOB_GPUS").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn localize_gpu_selectors_numbers_a_fenced_launchs_gpus_from_zero() {
+        let mut env: HashMap<String, String> = [
+            ("SPUR_JOB_GPUS", "5,2"),
+            ("ROCR_VISIBLE_DEVICES", "5,2"),
+            ("CUDA_VISIBLE_DEVICES", "2"),
+            ("GPU_DEVICE_ORDINAL", "5,2"),
+            ("HIP_VISIBLE_DEVICES", "0,1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        localize_gpu_selectors(&mut env);
+        assert_eq!(env["SPUR_JOB_GPUS"], "0,1");
+        assert_eq!(env["ROCR_VISIBLE_DEVICES"], "0,1");
+        assert_eq!(
+            env["CUDA_VISIBLE_DEVICES"], "1",
+            "a selector naming a subset keeps pointing at the same GPU"
+        );
+        assert_eq!(env["GPU_DEVICE_ORDINAL"], "0,1");
+        assert_eq!(env["HIP_VISIBLE_DEVICES"], "0,1", "HIP is already relative");
+        assert!(
+            !env.contains_key("ZE_AFFINITY_MASK"),
+            "absent selectors stay absent"
+        );
+    }
+
+    #[test]
+    fn localize_gpu_selectors_keeps_deny_tokens_and_foreign_ids() {
+        let mut env = HashMap::new();
+        gpu_deny_visibility(&mut env);
+        let denied = env.clone();
+        localize_gpu_selectors(&mut env);
+        assert_eq!(
+            env, denied,
+            "an empty grant leaves every deny token in place"
+        );
+
+        let mut env: HashMap<String, String> =
+            [("SPUR_JOB_GPUS", "3"), ("ROCR_VISIBLE_DEVICES", "7")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        localize_gpu_selectors(&mut env);
+        assert_eq!(
+            env["ROCR_VISIBLE_DEVICES"], "7",
+            "an id outside the grant is not invented"
+        );
     }
 
     #[test]

@@ -175,6 +175,10 @@ pub struct StepdJobResources {
     pub nodelist: String,
     #[serde(default)]
     pub mpi: String,
+    /// What a numbered step narrows the job's share to. Its GPUs stay off-limits
+    /// to other steps for as long as a descriptor carrying them is live.
+    #[serde(default)]
+    pub step_limits: crate::step_resources::StepLimits,
 }
 
 impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
@@ -235,6 +239,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
                 mpi: config.mpi.clone(),
+                step_limits: config.step_limits.clone(),
             },
             pmix: None,
             cred_id: String::new(),
@@ -283,6 +288,7 @@ impl StepdLaunchSpec {
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
+            step_limits: self.resources.step_limits,
         }
     }
 }
@@ -4481,6 +4487,43 @@ mod tests {
                 .and_then(|plan| plan.env.get("ROCR_VISIBLE_DEVICES")),
             Some(&"3,7".to_string())
         );
+    }
+
+    /// The supervisor applies a step's own limits and its descriptor keeps the
+    /// step's GPUs from other steps, so both must cross launch.json intact while
+    /// the job's own share stays what the job holds.
+    #[test]
+    fn a_steps_own_limits_survive_the_launch_spec_beside_its_jobs_share() {
+        let mut config = launch_spec().into_launch_config();
+        config.gpu_devices = vec![3, 5, 7];
+        config.step_limits = crate::step_resources::StepLimits {
+            cpus: Some(2),
+            memory_mb: Some(512),
+            gpus: Some(vec![5]),
+        };
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        assert_eq!(spec.resources.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(spec.resources.step_limits, config.step_limits);
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+        let restored = restored.into_launch_config();
+        assert_eq!(restored.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(restored.step_limits, config.step_limits);
+    }
+
+    #[test]
+    fn job_resources_from_an_older_build_carry_no_step_limits() {
+        let mut resources =
+            serde_json::to_value(StepdJobResources::default()).expect("encode resources");
+        resources
+            .as_object_mut()
+            .expect("resources encode as an object")
+            .remove("step_limits");
+        let restored: StepdJobResources =
+            serde_json::from_value(resources).expect("decode older resources");
+        assert!(restored.step_limits.is_empty());
     }
 
     // Drives the whole agent -> launch.json -> supervisor boundary: the array

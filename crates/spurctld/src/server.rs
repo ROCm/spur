@@ -3992,6 +3992,7 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             let container = step_container.clone();
+            let resources = req.resources;
             let step_nodelist = step_nodelist.clone();
             let step_user = job.spec.user.clone();
             let execution_credential = req.execution_credential.clone();
@@ -4021,6 +4022,7 @@ impl SlurmController for ControllerService {
                         container,
                         nodelist: step_nodelist.clone(),
                         execution_credential: execution_credential.clone(),
+                        resources,
                     })
                     .await;
 

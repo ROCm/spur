@@ -27,6 +27,7 @@ pub mod reporter;
 pub mod seccomp;
 pub mod spec;
 pub mod step_completion;
+pub mod step_resources;
 pub mod stepd;
 pub(crate) mod task_hook;
 pub(crate) mod teardown_lease;
