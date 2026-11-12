@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::tests::Recorder;
 use super::*;
 use crate::partition_cap::{PartitionNodeUsage, RunningCharge};
 use spur_core::job::JobSpec;
@@ -137,6 +138,15 @@ impl Fixture {
     }
 
     fn schedule(&self, sched: &mut BackfillScheduler, jobs: &[Job]) -> Vec<Assignment> {
+        self.schedule_admitting(sched, jobs, &mut AdmitAll)
+    }
+
+    fn schedule_admitting(
+        &self,
+        sched: &mut BackfillScheduler,
+        jobs: &[Job],
+        admission: &mut dyn StartAdmission,
+    ) -> Vec<Assignment> {
         let cluster = ClusterState {
             nodes: &self.nodes,
             partitions: &self.partitions,
@@ -147,7 +157,7 @@ impl Fixture {
             preemption_handoffs: &Default::default(),
             partition_node_usage: &self.usage,
         };
-        sched.schedule_with(jobs, &cluster, now(), &mut AdmitAll)
+        sched.schedule_with(jobs, &cluster, now(), admission)
     }
 }
 
@@ -209,6 +219,44 @@ fn cpu_cap_binds_exactly_at_the_limit_on_an_idle_node() {
         (o.resource.as_str(), o.used, o.requested, o.limit),
         ("cpu", 0, 9, 8)
     );
+}
+
+#[test]
+fn a_refused_start_leaves_its_partition_cap_to_the_next_job() {
+    let fx = Fixture::new(
+        vec![node("n1", 64, 256_000, &["cpu"])],
+        vec![partition("cpu", &[("cpu", 8)])],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let mut admission = Recorder::refusing(1);
+    let a = fx.schedule_admitting(
+        &mut sched,
+        &[job(1, "cpu", 8, 1), job(2, "cpu", 8, 1)],
+        &mut admission,
+    );
+    assert_eq!(started(&a), [2]);
+    assert_eq!(outcome(&sched, 1), Some(UnplacedKind::RefusedAtStart));
+}
+
+#[test]
+fn a_refused_het_job_leaves_its_partition_cap_to_the_next_job() {
+    let fx = Fixture::new(
+        vec![node("n1", 64, 256_000, &["cpu"])],
+        vec![partition("cpu", &[("cpu", 8)])],
+    );
+    let mut first = job(1, "cpu", 4, 1);
+    first.het_group = Some(0);
+    let mut second = job(2, "cpu", 4, 1);
+    second.het_group = Some(1);
+    second.het_job_id = Some(1);
+    let mut sched = BackfillScheduler::new(100);
+    let mut admission = Recorder::refusing(2);
+    let a = fx.schedule_admitting(
+        &mut sched,
+        &[first, second, job(3, "cpu", 8, 1)],
+        &mut admission,
+    );
+    assert_eq!(started(&a), [3]);
 }
 
 #[test]

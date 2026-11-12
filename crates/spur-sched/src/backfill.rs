@@ -198,6 +198,22 @@ impl<'a> HandoffGate<'a> {
             }
         }
     }
+
+    /// A refused `owner` starts nowhere this pass, so its hold on all its nodes ends,
+    /// including any it was already planned on.
+    fn owner_refused(&mut self, owner: JobId, now: chrono::DateTime<Utc>) {
+        if !self.owner_ids.contains(&owner) {
+            return;
+        }
+        for (node, owners) in self.owners {
+            if owners.contains(&owner) {
+                if !self.released.contains(&(node.as_str(), owner)) {
+                    self.released.push((node, owner));
+                }
+                self.held_until.entry(node).or_default().insert(owner, now);
+            }
+        }
+    }
 }
 
 impl BackfillScheduler {
@@ -882,13 +898,14 @@ impl BackfillScheduler {
     }
 
     /// Asks `admission` to start a heterogeneous job's start-now `components`, each
-    /// with its end, as one. If refused, none of them starts and the slots reserved
-    /// for them are released.
+    /// with its end, as one. If refused, none of them starts, and the slots reserved
+    /// for them and their handoffs are released.
     fn admit_het_components(
         &mut self,
         components: &[(Job, chrono::DateTime<Utc>)],
         now: chrono::DateTime<Utc>,
         admission: &mut dyn StartAdmission,
+        handoffs: &mut HandoffGate,
         assignments: &mut Vec<Assignment>,
         unplaced: &mut HashMap<JobId, Unplaced>,
     ) {
@@ -919,6 +936,7 @@ impl BackfillScheduler {
             return;
         }
         for start in &starts {
+            handoffs.owner_refused(start.job.job_id, now);
             unplaced.insert(
                 start.job.job_id,
                 Unplaced {
@@ -1040,6 +1058,7 @@ impl BackfillScheduler {
                     &entry.remove(),
                     now,
                     admission,
+                    &mut handoffs,
                     &mut assignments,
                     &mut unplaced,
                 );
@@ -1106,6 +1125,7 @@ impl BackfillScheduler {
                                 end: now + duration,
                             }])
                         {
+                            handoffs.owner_refused(job.job_id, now);
                             note(UnplacedKind::RefusedAtStart, assignment.nodes.len(), None);
                             continue;
                         }
@@ -1208,6 +1228,7 @@ impl BackfillScheduler {
                         "scheduling job"
                     );
                 } else {
+                    handoffs.owner_refused(job.job_id, now);
                     note(UnplacedKind::RefusedAtStart, plan.nodes.len(), None);
                     continue;
                 }
@@ -1243,7 +1264,14 @@ impl BackfillScheduler {
             }
         }
         for components in het_starts.into_values() {
-            self.admit_het_components(&components, now, admission, &mut assignments, &mut unplaced);
+            self.admit_het_components(
+                &components,
+                now,
+                admission,
+                &mut handoffs,
+                &mut assignments,
+                &mut unplaced,
+            );
         }
 
         if initialize {
@@ -4679,6 +4707,53 @@ mod tests {
             );
             assert!(!holds_a_slot(&sched, component));
         }
+    }
+
+    #[test]
+    fn a_refused_handoff_owner_leaves_its_node_to_the_next_job() {
+        let nodes = make_nodes(1);
+        let handoffs = owned(&[("node001", 1)]);
+        let busy_until = HashMap::new();
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(1);
+
+        let assignments = sched.schedule_with(
+            &[
+                job_for(1, 1, Duration::hours(1)),
+                job_for(2, 1, Duration::hours(1)),
+            ],
+            &handoff_state(&nodes, &busy_until, &handoffs),
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(started(&assignments), [(2, vec!["node001"])]);
+        assert_eq!(sched.last_outcome[&1].kind, UnplacedKind::RefusedAtStart);
+        assert_eq!(sched.released_handoffs(), [("node001".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_refused_het_job_releases_the_handoff_its_component_was_placed_on() {
+        let nodes = make_nodes(2);
+        let handoffs = owned(&[("node001", 1)]);
+        let busy_until = HashMap::new();
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(2);
+
+        let assignments = sched.schedule_with(
+            &[
+                het_component(job_for(1, 1, Duration::hours(1)), 0, 1),
+                het_component(job_for(2, 1, Duration::hours(1)), 1, 1),
+                job_for(3, 2, Duration::hours(1)),
+            ],
+            &handoff_state(&nodes, &busy_until, &handoffs),
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![1, 2], vec![3]]);
+        assert_eq!(started(&assignments), [(3, vec!["node001", "node002"])]);
+        assert_eq!(sched.released_handoffs(), [("node001".to_string(), 1)]);
     }
 
     #[test]
