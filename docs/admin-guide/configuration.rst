@@ -202,7 +202,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``"/var/spool/spur"``
      - Restart
      - Ignored by ``spurctld``, which always uses its ``--state-dir`` flag
-       (itself defaulting to ``/var/spool/spur``). Read by ``spurd`` as the
+       (itself defaulting to ``/var/spool/spur``). A root ``spurd`` keeps job spool
+       folders in ``/var/spool/spur``, so it must stay root-owned; see
+       :ref:`spool-root-ownership`. Read by ``spurd`` as the
        fallback root for the supervisor session spool that lets running jobs
        survive an agent restart, used when neither the agent's ``--state-dir``
        flag nor ``SPUR_STEPD_STATE_DIR`` is set. Changing it relocates that

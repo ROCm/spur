@@ -533,6 +533,35 @@ An agent without them logs ``device filter not installed`` and runs the job with
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
+Job spool folders (``/var/spool/spur/job<id>``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``spurd`` keeps each job's generated scripts and step output in a per-job spool
+folder. When ``spurd`` runs as root, that folder is now owned by root with the job's
+group and mode ``0750``, as Slurm's batch directory is, instead of belonging to the
+job's user. ``spurd`` creates every file in it through an open directory handle and
+replaces an existing file rather than rewriting it in place.
+
+**Effect on jobs:**
+
+* A job can still read its own scripts in the folder, but can no longer create,
+  rename or remove entries there. A script that wrote files next to itself
+  (``$(dirname "$0")``) must write to its work dir or ``$TMPDIR`` instead.
+* ``srun`` steps that ``spurd`` wraps in generated scripts (several tasks per node,
+  ``--label``, ``--mpi=pmix``) keep those scripts in the spool folder, not in a
+  ``.spur_step_<id>`` folder in the work dir. Such steps now also run when root cannot
+  write the work dir, for example on an NFS export with ``root_squash``.
+* A root ``spurd`` no longer falls back to ``$TMPDIR/spur`` when it cannot create the
+  spool folder. The failure drains the node, like any other fault in the spool tree.
+
+A folder created by an older ``spurd`` for a job still running across the upgrade is
+taken over by root the next time the new agent writes to it, so no drain is needed.
+
+**Spool root ownership.** With a root ``spurd``, ``/var/spool/spur`` should be owned by
+root and not writable by group or others; ``spurd`` logs a warning at startup when it is
+not. If ``spurctld`` runs as an unprivileged user on the same node and shares that
+directory, move its state out first; see :ref:`spool-root-ownership`.
+
 Reserved step IDs aligned to Slurm
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
