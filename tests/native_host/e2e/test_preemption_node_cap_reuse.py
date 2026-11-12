@@ -41,18 +41,20 @@ def _assert_fully_busy(cluster, node):
 
 
 def _assert_blocked_for_scheduler_passes(cluster, job_id, reason, holders):
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if _reason(cluster, job_id) == reason:
-            break
-        time.sleep(1)
-    assert _reason(cluster, job_id) == reason, cluster.scontrol("show", "job", str(job_id))
+    if reason is not None:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if _reason(cluster, job_id) == reason:
+                break
+            time.sleep(1)
+        assert _reason(cluster, job_id) == reason, cluster.scontrol("show", "job", str(job_id))
     # Several one-second scheduling passes must observe the same restriction.
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         queue = cluster.squeue_all()
         assert job_state(queue, job_id) == "PD", queue
-        assert _reason(cluster, job_id) == reason, cluster.scontrol("show", "job", str(job_id))
+        if reason is not None:
+            assert _reason(cluster, job_id) == reason, cluster.scontrol("show", "job", str(job_id))
         for holder in holders:
             assert job_state(queue, holder) == "R", queue
         time.sleep(1)

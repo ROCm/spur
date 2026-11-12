@@ -6116,6 +6116,7 @@ impl ClusterManager {
                 // The stored flag describes the previous run; requeue leaves it set.
                 let mut job = job.clone();
                 job.idle_fill = false;
+                job.node_reuse.clear();
                 Some(PendingJobCandidate {
                     tag_reason: job.pending_reason != PendingReason::DeadLine,
                     job,
@@ -6358,22 +6359,43 @@ impl ClusterManager {
                     .qos
                     .as_deref()
                     .and_then(|name| consumed_minutes(&grp_wall_usage, name));
-                let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(job, &partitions)
-                    .into_iter()
-                    .map(|mut probe| {
-                        let verdict = quota_gate(
-                            &mut probe,
-                            qos,
-                            &partition_qos,
-                            &self.association_cache,
-                            &ledger,
-                            &reuse,
-                            &reserved,
-                            consumed_wall,
-                        );
-                        (probe, verdict)
-                    })
-                    .collect();
+                let account_limits = self.association_cache.limits(
+                    &job.spec.user,
+                    job.spec.account.as_deref().unwrap_or_default(),
+                );
+                let per_partition = [
+                    qos.limits.grp_tres.as_ref(),
+                    account_limits.grp_tres.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .chain(
+                    partition_qos
+                        .candidate_names(job)
+                        .into_iter()
+                        .filter_map(|name| {
+                            let (_, qos) = partition_qos.by_partition.get(&name)?;
+                            qos.as_ref()?.limits.grp_tres.as_ref()
+                        }),
+                )
+                .any(|limits| limits.get(TresType::Node) > 0);
+                let outcomes: Vec<(Job, QuotaVerdict)> =
+                    quota_probes(job, &partitions, per_partition)
+                        .into_iter()
+                        .map(|mut probe| {
+                            let verdict = quota_gate(
+                                &mut probe,
+                                qos,
+                                &partition_qos,
+                                &self.association_cache,
+                                &ledger,
+                                &reuse,
+                                &reserved,
+                                consumed_wall,
+                            );
+                            (probe, verdict)
+                        })
+                        .collect();
                 let refusal = outcomes
                     .iter()
                     .find_map(|(_, verdict)| verdict.block_reason());
@@ -6423,6 +6445,7 @@ impl ClusterManager {
                     let mut lent = job.clone();
                     lent.spec.partition = probe.spec.partition.clone();
                     lent.preferred_nodes.clear();
+                    lent.node_reuse.clear();
                     // D8: charge the account in full and the QOS in every
                     // dimension but Node, so later jobs in this pass see the
                     // cpu/mem/gpu this candidate would consume. The Node dimension
@@ -11685,6 +11708,7 @@ fn qos_block_with(
         grp_node_charge,
     ) {
         QosCheckResult::Allowed => {
+            record_node_reuse(job, &reusable_nodes);
             job.preferred_nodes.extend(reusable_nodes);
             Ok(grp_node_charge)
         }
@@ -11777,6 +11801,7 @@ fn account_block_with(
         grp_node_charge,
     ) {
         AccountCheckResult::Allowed => {
+            record_node_reuse(job, &reusable_nodes);
             job.preferred_nodes.extend(reusable_nodes);
             Ok(AccountAdmitted {
                 charge: grp_node_charge,
@@ -11806,7 +11831,7 @@ fn account_block_with(
 /// The job reshaped per request it could run with, in order, each limited to the requested
 /// partitions admitting it with that request. A job that names no partition is limited to
 /// the defaults it would be placed in; one that no requested partition admits keeps its list.
-fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
+fn quota_probes(job: &Job, partitions: &[Partition], per_partition: bool) -> Vec<Job> {
     let requested =
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
     let unnamed = requested_partition_names(job.spec.partition.as_deref())
@@ -11824,13 +11849,24 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
     };
     candidate_requests(&job.spec, candidates)
         .into_iter()
-        .map(|request| {
-            let mut probe = job.clone();
-            probe.spec = request.spec;
-            if narrows || (unnamed && !request.partitions.is_empty()) {
-                probe.spec.partition = Some(request.partitions.join(","));
-            }
-            probe
+        .flat_map(|request| {
+            let scopes = if per_partition && !request.partitions.is_empty() {
+                request
+                    .partitions
+                    .into_iter()
+                    .map(|partition| vec![partition])
+                    .collect()
+            } else {
+                vec![request.partitions]
+            };
+            scopes.into_iter().map(move |partitions| {
+                let mut probe = job.clone();
+                probe.spec = request.spec.clone();
+                if (narrows || per_partition || unnamed) && !partitions.is_empty() {
+                    probe.spec.partition = Some(partitions.join(","));
+                }
+                probe
+            })
         })
         .collect()
 }
@@ -12031,6 +12067,12 @@ impl PartitionQosView {
                     let entry = admission.charges.entry(charge.qos).or_insert(0);
                     *entry = (*entry).max(charge.charge);
                     admission.admits_without_credit &= charge.admits_without_credit;
+                    if !charge.reusable.is_empty() {
+                        job.node_reuse
+                            .entry(name.clone())
+                            .or_default()
+                            .push(charge.reusable.clone());
+                    }
                     reusable.extend(charge.reusable);
                 }
                 Err(reason) => {
@@ -12100,8 +12142,13 @@ impl PartitionQosView {
             .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
             .cloned()
             .collect();
-        let (charge, reusable) =
-            grp_node_credit(job, enforced.limits.grp_tres.as_ref(), &occupied, reuse);
+        let (charge, reusable) = grp_node_credit(
+            job,
+            enforced.limits.grp_tres.as_ref(),
+            grp.get(TresType::Node),
+            &occupied,
+            reuse,
+        );
         let check = |charge| {
             check_qos_limits_with_grp_node_charge(
                 job, &enforced, user_jobs, 0, &user_tres, &grp, None, charge,
@@ -12177,6 +12224,7 @@ struct QuotaClaim {
     partition_qos_charges: HashMap<String, u64>,
     partitions: Vec<String>,
     preferred_nodes: HashSet<String>,
+    node_reuse: HashMap<String, Vec<HashSet<String>>>,
 }
 
 impl QuotaClaim {
@@ -12223,6 +12271,12 @@ impl QuotaClaim {
             .extend(requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string));
         self.preferred_nodes
             .extend(probe.preferred_nodes.iter().cloned());
+        for (partition, credits) in &probe.node_reuse {
+            self.node_reuse
+                .entry(partition.clone())
+                .or_default()
+                .extend(credits.iter().cloned());
+        }
     }
 
     /// Restrict the job to the partitions whose request was admitted, and pass
@@ -12232,6 +12286,7 @@ impl QuotaClaim {
             job.spec.partition = Some(self.partitions.join(","));
         }
         job.preferred_nodes.clone_from(&self.preferred_nodes);
+        job.node_reuse.clone_from(&self.node_reuse);
     }
 }
 
@@ -12607,6 +12662,18 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
         .collect()
 }
 
+fn record_node_reuse(job: &mut Job, reusable: &HashSet<String>) {
+    if reusable.is_empty() {
+        return;
+    }
+    for partition in requested_partition_names(job.spec.partition.as_deref()) {
+        job.node_reuse
+            .entry(partition.to_string())
+            .or_default()
+            .push(reusable.clone());
+    }
+}
+
 /// Eviction needs admission before release, so reuse can consider total capacity.
 /// Actual placement still proves release feasibility and reservation access.
 fn new_distinct_nodes_needed(
@@ -12646,10 +12713,23 @@ fn new_distinct_nodes_needed(
         .cloned()
         .collect();
     let reusable_count = reusable.len() as u32;
-    let charge = job
+    let mut charge = job
         .spec
         .num_nodes
         .saturating_sub(reusable_count.min(job.spec.num_nodes)) as u64;
+    if placement.nodelist_is_additive() {
+        let mandatory_new = job
+            .spec
+            .nodelist
+            .as_deref()
+            .map(spur_sched::node_match::expand_hostlist_or_split)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !reusable.contains(name))
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        charge = charge.max(mandatory_new);
+    }
     (charge, reusable)
 }
 
@@ -13731,6 +13811,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     mod node_inventory;
+    mod node_reuse;
     mod partition_limits;
     mod partition_qos;
 

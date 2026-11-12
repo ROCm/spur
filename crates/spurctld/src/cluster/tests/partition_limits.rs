@@ -370,7 +370,7 @@ fn quota_probes_are_each_admitting_partitions_adjusted_request() {
             ..spec_in("b,down,a,plain", 2)
         },
     );
-    let probes: Vec<(String, u32)> = quota_probes(&job, &partitions)
+    let probes: Vec<(String, u32)> = quota_probes(&job, &partitions, false)
         .into_iter()
         .map(|p| (p.spec.partition.unwrap_or_default(), p.spec.cpus_per_task))
         .collect();

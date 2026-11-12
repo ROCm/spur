@@ -412,7 +412,7 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
         },
     );
 
-    let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions)
+    let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions, false)
         .into_iter()
         .map(|mut probe| {
             assert!(view
