@@ -1418,6 +1418,26 @@ precedence over tier order. ``MaxTRESPerJob``'s and
 a job's actual requested node count, since they bound a single job's or
 user's own footprint rather than group-wide capacity reuse.
 
+With QOS preemption enabled and a nonempty preemption allow-list, or with
+idle-fill reclaim enabled, admission can also credit an occupied node whose
+total resources and partition cap could hold the job after resources are
+released. This credit is considered only when the live-capacity node charge
+would exceed the cap, preserving idle alternatives when quota has room.
+For example, account A already occupies five hosts under
+``GrpTRES=node=5``. A new job needing resources held by eligible burst work
+on N5 adds zero distinct hosts, so the node quota permits it to reach
+preemption evaluation. A job restricted to a sixth host still exceeds the
+cap. CPU, memory, GPU, and other quota limits continue to apply.
+
+Admission credit does not authorize an eviction. Placement and victim
+selection still check available resources, reservations, partition caps,
+and preemption eligibility. Partial-node victim selection remains a
+limitation: when an ineligible sibling remains on N5, Spur cannot yet
+evict only the burst work beside it. The job waits for resources rather
+than reporting a group node quota violation. Exclusive jobs receive no
+occupied-node reuse credit. A complete reuse credit also constrains an
+explicit candidate ``--nodelist`` to the credited hosts.
+
 Scripted output
 ---------------
 

@@ -89,6 +89,16 @@ job. `NodePlacement::new()` falls back to this field when no explicit
 `--nodelist` was provided, so scheduling honors the admission credit.
 `new_ignoring_preferred_nodes()` suppresses this fallback for admission's own
 internal reuse computation to prevent cross-gate leakage.
+When the credit covers the complete node request, placement also requires
+membership in the credited set even with an explicit `--nodelist` pool.
+Configured preemption/reclaim can credit a busy node's total capacity and
+empty partition cap; actual victim selection still proves release feasibility.
+Admission credits remain independent for account and QOS. Partial reuse supplies
+an additive node list when no explicit list exists; explicit candidate pools
+can leave partial credits unenforced. Same-pass claimed-node sets prevent
+duplicate credits, while reuse across passes remains best effort.
+Exclusive jobs receive no occupied-node credit,
+and reservation access is enforced by actual placement and victim selection.
 
 ---
 
