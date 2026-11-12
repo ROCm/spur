@@ -402,16 +402,21 @@ agent directly before marking it down:
   at least one pass after the first). The node is marked ``DOWN`` with reason
   ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were submitted
   with ``--requeue``.
-- **Many nodes go silent at once.** When more than ``controller.max_stale_node_fraction``
-  (default half) of the watched nodes go silent in the same pass, the leader assumes the
-  fault is on its side, marks none of them ``DOWN``, and logs ``suspecting the control
-  plane`` at error level. Watched nodes are those not already ``DOWN`` or drained, so
-  draining part of the cluster lowers the number of silent nodes it takes. If the nodes
-  really are gone, mark them down by hand with
+- **Many nodes go silent at once.** Each pass probes every silent node first, then counts
+  the suspects: nodes that failed their probe, operator-managed nodes past the timeout
+  (they cannot be probed), and nodes not yet past the timeout that have missed a
+  heartbeat (silent for more than 45 seconds). A node whose agent answered is never a
+  suspect. When the suspects exceed ``controller.max_stale_node_fraction`` (default half)
+  of the watched nodes, rounded down but never below one, the leader assumes the fault is
+  on its side, marks none of them ``DOWN``, and logs ``suspecting the control plane`` at
+  error level. Watched nodes are those not ``DOWN``, drained, or suspended, so draining
+  part of the cluster lowers the number of suspects it takes. Silent nodes are still
+  probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
+  the two-probe rule above. To mark nodes down sooner, use
   ``scontrol update nodename=<node> state=down``.
 
-Nodes managed by the Kubernetes operator are not checked this way; they are marked ``DOWN``
-on the heartbeat timeout alone.
+Nodes managed by the Kubernetes operator are not probed; they are marked ``DOWN`` on the
+heartbeat timeout alone, though they count toward the limit above.
 
 The not-responding flag is the current leader's view: each leader builds it from the
 heartbeats it receives, and a controller that loses leadership drops its flags. After a

@@ -366,9 +366,10 @@ pub struct ControllerConfig {
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
 
-    /// Largest fraction of watched nodes that may go silent in one health pass
-    /// before the leader suspects its own connectivity and marks none of them
-    /// Down. Configured in TOML as `[controller] max_stale_node_fraction`
+    /// Largest fraction of watched nodes that may fail their liveness probe or
+    /// miss a heartbeat in one health pass before the leader suspects its own
+    /// connectivity and marks none of them Down. Nodes whose agent answers do
+    /// not count. Configured in TOML as `[controller] max_stale_node_fraction`
     /// (default: 0.5; 1.0 disables the check).
     #[serde(default = "default_max_stale_node_fraction")]
     pub max_stale_node_fraction: f64,

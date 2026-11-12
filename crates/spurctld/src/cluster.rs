@@ -5341,17 +5341,7 @@ impl ClusterManager {
     pub(crate) fn stale_nodes(&self, timeout_secs: u64) -> StaleNodes {
         let nodes = self.nodes.read();
         let refs: Vec<&Node> = nodes.values().collect();
-        let names = evaluate_node_health(&refs, Utc::now(), timeout_secs)
-            .into_iter()
-            .filter_map(|action| match action {
-                HealthAction::MarkDown { name, .. } => Some(name),
-                HealthAction::Recover { .. } => None,
-            })
-            .collect();
-        StaleNodes {
-            names,
-            monitored: monitored_node_count(&refs),
-        }
+        stale_nodes_at(&refs, Utc::now(), timeout_secs)
     }
 
     fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
@@ -11954,11 +11944,17 @@ pub enum MarkDownPolicy {
     Only(HashSet<String>),
 }
 
-/// The nodes one health pass would mark Down, and how many nodes it watches.
+/// The nodes one health pass would mark Down, and what the silent-node limit
+/// judges them against.
 #[derive(Debug)]
 pub(crate) struct StaleNodes {
     pub(crate) names: Vec<String>,
-    pub(crate) monitored: usize,
+    /// Stale nodes that are Suspended, which the limit leaves out of its counts.
+    pub(crate) suspended: HashSet<String>,
+    /// Nodes a heartbeat timeout could move to Down, Suspended ones excluded.
+    pub(crate) watched: usize,
+    /// Watched nodes not yet stale that have already missed a heartbeat.
+    pub(crate) recently_silent: usize,
 }
 
 /// Withholds DOWN marking for `grace` after leadership is won: a non-leader
@@ -12051,19 +12047,55 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     recovered.state
 }
 
-/// Nodes a heartbeat timeout could still move to Down: a heartbeat is on
-/// record and the node is not already Down or held in Drain.
-pub(crate) fn monitored_node_count(nodes: &[&Node]) -> usize {
-    nodes
-        .iter()
-        .filter(|node| {
-            node.last_heartbeat.is_some()
-                && node
-                    .state
-                    .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
-                    .is_some()
+/// A heartbeat can run late by its RPC bound and a retry, so only silence past
+/// one interval plus this counts as a missed beat.
+const MISSED_HEARTBEAT_SLACK_SECS: u64 = 15;
+
+/// Whether the silent-node limit watches this node: a heartbeat timeout could
+/// still move it to Down (a heartbeat is on record and it is not already Down
+/// or held in Drain), and it is not Suspended.
+fn is_watched(node: &Node) -> bool {
+    node.last_heartbeat.is_some()
+        && node.state != NodeState::Suspended
+        && node
+            .state
+            .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
+            .is_some()
+}
+
+fn missed_a_heartbeat(node: &Node, now: DateTime<Utc>) -> bool {
+    let limit = chrono::Duration::seconds(
+        (spur_core::config::HEARTBEAT_INTERVAL_SECS + MISSED_HEARTBEAT_SLACK_SECS) as i64,
+    );
+    node.last_heartbeat.is_some_and(|hb| now - hb > limit)
+}
+
+pub(crate) fn stale_nodes_at(nodes: &[&Node], now: DateTime<Utc>, timeout_secs: u64) -> StaleNodes {
+    let names: Vec<String> = evaluate_node_health(nodes, now, timeout_secs)
+        .into_iter()
+        .filter_map(|action| match action {
+            HealthAction::MarkDown { name, .. } => Some(name),
+            HealthAction::Recover { .. } => None,
         })
-        .count()
+        .collect();
+    let stale: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let is_stale = |node: &Node| stale.contains(node.name.as_str());
+    let suspended = nodes
+        .iter()
+        .filter(|node| node.state == NodeState::Suspended && is_stale(node))
+        .map(|node| node.name.clone())
+        .collect();
+    let watched: Vec<&Node> = nodes.iter().copied().filter(|n| is_watched(n)).collect();
+    let recently_silent = watched
+        .iter()
+        .filter(|node| !is_stale(node) && missed_a_heartbeat(node, now))
+        .count();
+    StaleNodes {
+        names,
+        suspended,
+        watched: watched.len(),
+        recently_silent,
+    }
 }
 
 pub(crate) fn evaluate_node_health(
@@ -13761,6 +13793,12 @@ state = "UP"
     pub(crate) fn set_last_heartbeat(cm: &ClusterManager, name: &str, at: Option<DateTime<Utc>>) {
         if let Some(node) = cm.nodes.write().get_mut(name) {
             node.last_heartbeat = at;
+        }
+    }
+
+    pub(crate) fn set_node_state(cm: &ClusterManager, name: &str, state: NodeState) {
+        if let Some(node) = cm.nodes.write().get_mut(name) {
+            node.state = state;
         }
     }
 
@@ -35885,9 +35923,46 @@ state = "UP"
         let stale = cm.stale_nodes(90);
         assert_eq!(stale.names, vec!["stale".to_string()]);
         assert_eq!(
-            stale.monitored, 2,
+            stale.watched, 2,
             "fresh and stale are watched; a drained or down node is not"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_nodes_counts_recent_silence_and_leaves_out_suspended_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let names = [
+            "fresh",
+            "late",
+            "silent",
+            "stale",
+            "suspended-silent",
+            "suspended-stale",
+        ];
+        for name in names {
+            register_node(&cm, name, 4, 8000);
+        }
+        let ago = |secs| Some(Utc::now() - chrono::Duration::seconds(secs));
+        // Within one interval plus slack, a beat is late, not missed.
+        set_last_heartbeat(&cm, "late", ago(40));
+        set_last_heartbeat(&cm, "silent", ago(60));
+        set_last_heartbeat(&cm, "stale", ago(200));
+        set_last_heartbeat(&cm, "suspended-silent", ago(60));
+        set_last_heartbeat(&cm, "suspended-stale", ago(200));
+        set_node_state(&cm, "suspended-silent", NodeState::Suspended);
+        set_node_state(&cm, "suspended-stale", NodeState::Suspended);
+
+        let stale = cm.stale_nodes(90);
+        let mut stale_names = stale.names.clone();
+        stale_names.sort();
+        assert_eq!(stale_names, vec!["stale", "suspended-stale"]);
+        assert_eq!(
+            stale.suspended,
+            HashSet::from(["suspended-stale".to_string()])
+        );
+        assert_eq!(stale.watched, 4);
+        assert_eq!(stale.recently_silent, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

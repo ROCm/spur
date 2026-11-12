@@ -7,7 +7,8 @@
 //! follower, so silence cannot tell a dead node from a broken path or a
 //! struggling leader. The leader asks a silent node's agent directly, marks it
 //! Down only after it fails to answer on two consecutive passes, and marks no
-//! one Down when so many nodes go silent at once that the fault is likely its own.
+//! one Down when so many nodes fail to answer or miss heartbeats at once that
+//! the fault is likely its own.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -40,6 +41,10 @@ pub(crate) enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
+    fn is_alive(&self) -> bool {
+        matches!(self, Self::Alive)
+    }
+
     fn reason(&self) -> &str {
         match self {
             Self::Alive => "",
@@ -100,11 +105,38 @@ async fn probe_agent_within(target: ProbeTarget, timeout: Duration) -> ProbeOutc
     }
 }
 
-/// Whether so many watched nodes went stale in one pass that the leader should
+/// Whether so many watched nodes are suspect in one pass that the leader should
 /// suspect its own connectivity. Never trips on a single node.
-pub(crate) fn breaker_tripped(stale: usize, monitored: usize, max_fraction: f64) -> bool {
-    let allowed = (monitored as f64 * max_fraction).floor() as usize;
-    stale > allowed.max(1)
+pub(crate) fn breaker_tripped(suspects: usize, watched: usize, max_fraction: f64) -> bool {
+    let allowed = (watched as f64 * max_fraction).floor() as usize;
+    suspects > allowed.max(1)
+}
+
+/// The nodes one pass counts against the silent-node limit. A node whose agent
+/// answered is never one, and neither is a Suspended node.
+#[derive(Debug)]
+struct Suspects {
+    failed_probes: usize,
+    operator_managed: usize,
+    recently_silent: usize,
+}
+
+impl Suspects {
+    fn count(results: &[ProbeResult], operator_managed: &[String], stale: &StaleNodes) -> Self {
+        let counted = |node: &String| !stale.suspended.contains(node);
+        Self {
+            failed_probes: results
+                .iter()
+                .filter(|r| !r.outcome.is_alive() && counted(&r.target.node))
+                .count(),
+            operator_managed: operator_managed.iter().filter(|n| counted(n)).count(),
+            recently_silent: stale.recently_silent,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.failed_probes + self.operator_managed + self.recently_silent
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +216,10 @@ impl StrikeTracker {
         self.failures.clear();
         self.answering.clear();
     }
+
+    pub(crate) fn clear_failures(&mut self) {
+        self.failures.clear();
+    }
 }
 
 /// The health loop's liveness state. Leader-local: see [`Self::observe_term`].
@@ -242,84 +278,113 @@ impl NodeLiveness {
         cluster.check_node_health(timeout_secs, mark_down)
     }
 
+    /// Probes every stale node that has an agent to ask, then judges the
+    /// silent-node limit by the nodes that did not answer. During a mass silence
+    /// every stale node is probed each pass, so a pass can overrun its tick: that
+    /// delays recoveries but marks nobody Down wrongly.
     async fn confirm<P: Prober>(
         &mut self,
         cluster: &ClusterManager,
         stale: StaleNodes,
         prober: &P,
     ) -> HashSet<String> {
-        let stale_names: HashSet<String> = stale.names.into_iter().collect();
+        let stale_names: HashSet<String> = stale.names.iter().cloned().collect();
         self.strikes.retain(&stale_names);
         if stale_names.is_empty() {
             return HashSet::new();
         }
-        if breaker_tripped(stale_names.len(), stale.monitored, self.max_stale_fraction) {
+        let (operator_managed, targets) = split_by_source(cluster, &stale.names);
+        let results = probe_all(targets, prober).await;
+
+        let suspects = Suspects::count(&results, &operator_managed, &stale);
+        if breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction) {
             error!(
-                stale = stale_names.len(),
-                monitored = stale.monitored,
+                failed_probes = suspects.failed_probes,
+                operator_managed = suspects.operator_managed,
+                recently_silent = suspects.recently_silent,
+                watched = stale.watched,
                 "too many nodes went silent in one health pass; suspecting the control plane and marking none of them Down"
             );
-            self.strikes.clear();
+            self.record_answers(results);
+            self.strikes.clear_failures();
             return HashSet::new();
         }
 
-        let mut confirmed = HashSet::new();
-        let mut targets = Vec::new();
-        for name in stale_names {
-            let Some(node) = cluster.get_node(&name) else {
-                continue;
-            };
-            if node.source != NodeSource::NativeHost {
-                // The operator answers for its nodes, so there is no agent of
-                // their own to ask: they keep the plain timeout rule.
-                confirmed.insert(name);
-                continue;
-            }
-            targets.push(ProbeTarget {
-                endpoint: crate::scheduler_loop::node_comm_http_url(&node),
-                node: name,
-            });
-        }
-
-        confirmed.extend(self.judge_probes(probe_all(targets, prober).await));
+        let mut confirmed: HashSet<String> = operator_managed.into_iter().collect();
+        confirmed.extend(self.judge_probes(results));
         confirmed
     }
 
     /// Records each probe's outcome and returns the nodes now confirmed gone.
     fn judge_probes(&mut self, results: Vec<ProbeResult>) -> HashSet<String> {
-        let mut confirmed = HashSet::new();
-        for ProbeResult {
+        results
+            .into_iter()
+            .filter_map(|result| self.judge(result))
+            .collect()
+    }
+
+    /// Records only the nodes that answered, so a node that keeps answering
+    /// through a tripped pass is not reported as newly silent afterwards.
+    fn record_answers(&mut self, results: Vec<ProbeResult>) {
+        for result in results.into_iter().filter(|r| r.outcome.is_alive()) {
+            self.judge(result);
+        }
+    }
+
+    /// Records one probe's outcome; returns the node if it is now confirmed gone.
+    fn judge(&mut self, result: ProbeResult) -> Option<String> {
+        let ProbeResult {
             target,
             outcome,
             at,
-        } in results
-        {
-            let node = target.node;
-            match self.strikes.record(&node, &outcome, at) {
-                Verdict::Keep { first: true } => warn!(
-                    node = %node,
-                    "heartbeats from this node stopped reaching the leader, but its agent answers; not marking it Down"
-                ),
-                Verdict::Keep { first: false } => {
-                    debug!(node = %node, "silent node's agent still answers")
-                }
-                Verdict::Wait => warn!(
+        } = result;
+        let node = target.node;
+        match self.strikes.record(&node, &outcome, at) {
+            Verdict::Keep { first: true } => warn!(
+                node = %node,
+                "heartbeats from this node stopped reaching the leader, but its agent answers; not marking it Down"
+            ),
+            Verdict::Keep { first: false } => {
+                debug!(node = %node, "silent node's agent still answers")
+            }
+            Verdict::Wait => warn!(
+                node = %node,
+                reason = %outcome.reason(),
+                "silent node did not answer a liveness probe; waiting one more sweep before marking it Down"
+            ),
+            Verdict::MarkDown => {
+                warn!(
                     node = %node,
                     reason = %outcome.reason(),
-                    "silent node did not answer a liveness probe; waiting one more sweep before marking it Down"
-                ),
-                Verdict::MarkDown => {
-                    warn!(
-                        node = %node,
-                        reason = %outcome.reason(),
-                        "silent node failed liveness probes on consecutive sweeps"
-                    );
-                    confirmed.insert(node);
-                }
+                    "silent node failed liveness probes on consecutive sweeps"
+                );
+                return Some(node);
             }
         }
-        confirmed
+        None
     }
+}
+
+/// Splits stale nodes into operator-managed ones and probe targets for the
+/// rest. The operator answers for its nodes, so there is no agent of their own
+/// to ask: they keep the plain timeout rule.
+fn split_by_source(cluster: &ClusterManager, names: &[String]) -> (Vec<String>, Vec<ProbeTarget>) {
+    let mut operator_managed = Vec::new();
+    let mut targets = Vec::new();
+    for name in names {
+        let Some(node) = cluster.get_node(name) else {
+            continue;
+        };
+        if node.source != NodeSource::NativeHost {
+            operator_managed.push(name.clone());
+            continue;
+        }
+        targets.push(ProbeTarget {
+            endpoint: crate::scheduler_loop::node_comm_http_url(&node),
+            node: name.clone(),
+        });
+    }
+    (operator_managed, targets)
 }
 
 /// One probe's outcome and when it ran.
@@ -374,7 +439,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::cluster::tests::{register_node, set_last_heartbeat, test_cluster, wait_for};
+    use crate::cluster::tests::{
+        register_node, set_last_heartbeat, set_node_state, test_cluster, wait_for,
+    };
     use crate::cluster::{ClusterManager, MarkDownPolicy};
     use crate::scheduler_loop::tests::dispatch_trigger_tests::spawn_mock_agent_answering_ping;
 
@@ -438,6 +505,22 @@ mod tests {
         assert_eq!(
             strikes.record("n1", &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
+        );
+    }
+
+    #[test]
+    fn clearing_failures_keeps_the_answering_nodes() {
+        let mut strikes = StrikeTracker::default();
+        let now = Instant::now();
+        strikes.record("up", &ProbeOutcome::Alive, now);
+        assert_eq!(strikes.record("down", &unreachable(), now), Verdict::Wait);
+
+        strikes.clear_failures();
+
+        assert_eq!(strikes.record("down", &unreachable(), now), Verdict::Wait);
+        assert_eq!(
+            strikes.record("up", &ProbeOutcome::Alive, now),
+            Verdict::Keep { first: false }
         );
     }
 
@@ -605,14 +688,214 @@ mod tests {
         }
     }
 
-    fn silence(cm: &ClusterManager, nodes: &[&str]) {
+    fn silent_for(cm: &ClusterManager, nodes: &[&str], secs: i64) {
         for name in nodes {
-            set_last_heartbeat(cm, name, Some(Utc::now() - chrono::Duration::seconds(200)));
+            set_last_heartbeat(cm, name, Some(Utc::now() - chrono::Duration::seconds(secs)));
         }
+    }
+
+    fn silence(cm: &ClusterManager, nodes: &[&str]) {
+        silent_for(cm, nodes, 200);
     }
 
     fn state(cm: &ClusterManager, name: &str) -> NodeState {
         cm.get_node(name).unwrap().state
+    }
+
+    async fn cluster_of(dir: &TempDir, nodes: &[&str]) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        for name in nodes {
+            register_node(&cm, name, 4, 8000);
+        }
+        cm
+    }
+
+    fn register_operator_node(cm: &ClusterManager, name: &str) {
+        cm.register_node(
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            spur_core::node::K8S_OPERATOR_VERSION.into(),
+            NodeSource::Kubernetes {
+                namespace: "default".into(),
+            },
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("operator node registered", || cm.get_node(name).is_some());
+    }
+
+    async fn pass(
+        liveness: &mut NodeLiveness,
+        cm: &ClusterManager,
+        prober: &ScriptedProber,
+    ) -> Vec<JobFinalized> {
+        liveness
+            .sweep(cm, 90, MarkDownPolicy::Allowed, prober, || true)
+            .await
+    }
+
+    fn assert_all_up(cm: &ClusterManager, nodes: &[&str]) {
+        for name in nodes {
+            assert_ne!(state(cm, name), NodeState::Down, "{name} was marked Down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answering_silent_node_does_not_shield_a_dead_one() {
+        let dir = TempDir::new().unwrap();
+        // n1's heartbeats are lost but its agent answers, n2 is dead, n3 is fine.
+        let cm = cluster_of(&dir, &["n1", "n2", "n3"]).await;
+        silence(&cm, &["n1", "n2"]);
+        let prober = ScriptedProber::answering(&["n1"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        for _ in 0..2 {
+            pass(&mut liveness, &cm, &prober).await;
+        }
+
+        assert_eq!(state(&cm, "n2"), NodeState::Down);
+        assert_all_up(&cm, &["n1", "n3"]);
+    }
+
+    async fn assert_a_dead_node_goes_down_after_a_trip_clears(change_term: bool) {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2", "n3", "n4"]).await;
+        silence(&cm, &["n1", "n2", "n3"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+
+        pass(&mut liveness, &cm, &prober).await;
+        assert_all_up(&cm, &["n1", "n2", "n3"]);
+
+        if change_term {
+            liveness.observe_term(&cm, Some(2));
+        }
+        // n1 and n2 answer again but still cannot heartbeat; only n3 is dead.
+        prober.answering.lock().extend(["n1".into(), "n2".into()]);
+        for _ in 0..2 {
+            pass(&mut liveness, &cm, &prober).await;
+        }
+
+        assert_eq!(state(&cm, "n3"), NodeState::Down);
+        assert_all_up(&cm, &["n1", "n2", "n4"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_node_goes_down_once_the_failures_behind_a_trip_clear() {
+        assert_a_dead_node_goes_down_after_a_trip_clears(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_node_goes_down_after_a_trip_and_a_new_term() {
+        assert_a_dead_node_goes_down_after_a_trip_clears(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodes_that_missed_a_heartbeat_count_before_they_go_stale() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["s1", "s2", "r1", "r2", "h1"]).await;
+        // A correlated fault with staggered last heartbeats: s1 and s2 are past
+        // the timeout, r1 and r2 will be in a moment.
+        silent_for(&cm, &["s1", "s2"], 100);
+        silent_for(&cm, &["r1", "r2"], 60);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        for _ in 0..2 {
+            assert!(pass(&mut liveness, &cm, &prober).await.is_empty());
+        }
+
+        assert_all_up(&cm, &["s1", "s2", "r1", "r2", "h1"]);
+        let mut probed = prober.probed();
+        probed.sort();
+        assert_eq!(probed, vec!["s1", "s1", "s2", "s2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_suspended_nodes_do_not_count_toward_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["h1", "h2", "d1", "s1", "s2"]).await;
+        silence(&cm, &["d1", "s1"]);
+        silent_for(&cm, &["s2"], 60);
+        set_node_state(&cm, "s1", NodeState::Suspended);
+        set_node_state(&cm, "s2", NodeState::Suspended);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        // Counting s1 and s2 would make three suspects of five, over the limit.
+        for _ in 0..2 {
+            pass(&mut liveness, &cm, &prober).await;
+        }
+
+        assert_eq!(state(&cm, "d1"), NodeState::Down);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_nodes_do_not_raise_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["h1", "d1", "d2", "s1", "s2"]).await;
+        silence(&cm, &["d1", "d2"]);
+        set_node_state(&cm, "s1", NodeState::Suspended);
+        set_node_state(&cm, "s2", NodeState::Suspended);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        // Two of three watched nodes fail; counting s1 and s2 would allow two.
+        for _ in 0..2 {
+            pass(&mut liveness, &cm, &prober).await;
+        }
+
+        assert_all_up(&cm, &["d1", "d2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trip_forgets_failed_probes_but_not_answering_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["a", "d1", "d2", "d3", "h1"]).await;
+        silence(&cm, &["a", "d1"]);
+        let prober = ScriptedProber::answering(&["a"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        pass(&mut liveness, &cm, &prober).await;
+
+        silence(&cm, &["d2", "d3"]);
+        pass(&mut liveness, &cm, &prober).await;
+
+        assert_all_up(&cm, &["d1", "d2", "d3"]);
+        assert!(liveness.strikes.failures.is_empty());
+        assert_eq!(
+            liveness
+                .strikes
+                .record("a", &ProbeOutcome::Alive, Instant::now()),
+            Verdict::Keep { first: false },
+            "a node that kept answering through a trip is not new"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_operator_managed_node_counts_toward_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["r1", "h1"]).await;
+        register_operator_node(&cm, "k1");
+        silence(&cm, &["k1"]);
+        silent_for(&cm, &["r1"], 60);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        pass(&mut liveness, &cm, &prober).await;
+
+        assert_all_up(&cm, &["k1"]);
+        assert!(prober.probed().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -710,9 +993,10 @@ mod tests {
                 "{name} should be flagged not-responding"
             );
         }
-        assert!(
-            prober.probed().is_empty(),
-            "a tripped breaker probes nobody"
+        assert_eq!(
+            prober.probed().len(),
+            9,
+            "a tripped breaker still probes every silent node, each pass"
         );
     }
 
@@ -745,27 +1029,7 @@ mod tests {
     async fn an_operator_managed_node_is_marked_down_without_a_probe() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        cm.register_node(
-            "k1".into(),
-            "k1".into(),
-            ResourceSet {
-                cpus: 4,
-                memory_mb: 8000,
-                ..Default::default()
-            },
-            "127.0.0.1".into(),
-            6818,
-            String::new(),
-            spur_core::node::K8S_OPERATOR_VERSION.into(),
-            NodeSource::Kubernetes {
-                namespace: "default".into(),
-            },
-            HashMap::new(),
-            Vec::new(),
-            true,
-        )
-        .unwrap();
-        wait_for("operator node registered", || cm.get_node("k1").is_some());
+        register_operator_node(&cm, "k1");
         silence(&cm, &["k1"]);
         let prober = ScriptedProber::default();
         let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);

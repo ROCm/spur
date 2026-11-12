@@ -210,6 +210,31 @@ def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = C
         controller.exec_allow_fail(f"sudo iptables -D INPUT {rule_args}")
 
 
+@contextlib.contextmanager
+def isolate_controller(cluster: "SpurCluster", node_index: int):
+    """Cut one controller off from every node both ways, keeping Raft up.
+
+    Drops inbound traffic to its client port from every node and its outbound
+    calls to every agent, so it stays leader but can neither hear a heartbeat
+    nor reach an agent to probe. Always removes the rules on exit.
+    """
+    controller = cluster.nodes[node_index]
+    hosts = ",".join(node.host for node in cluster.nodes)
+    rules = [
+        f"INPUT -p tcp --dport {CONTROLLER_PORT} -s {hosts} -j DROP",
+        f"OUTPUT -p tcp --dport {AGENT_PORT} -d {hosts} -j DROP",
+    ]
+    added = []
+    try:
+        for rule in rules:
+            controller.exec(f"sudo iptables -I {rule}")
+            added.append(rule)
+        yield
+    finally:
+        for rule in added:
+            controller.exec_allow_fail(f"sudo iptables -D {rule}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 

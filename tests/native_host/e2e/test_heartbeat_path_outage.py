@@ -6,7 +6,8 @@
 Heartbeats live only in the Raft leader's memory and often reach it through a
 follower, so the leader must not read their absence as a dead node. These tests
 break the heartbeat path in the two shapes seen in production and check that no
-job ends, then check that a node whose agent is really gone still goes DOWN.
+job ends, cut the leader off from every node to check it blames itself, then
+check that a node whose agent is really gone still goes DOWN.
 """
 
 import time
@@ -16,6 +17,7 @@ from cluster import (
     HA_HEARTBEAT_TIMEOUT_SECS,
     block_controller_port,
     block_heartbeats_from,
+    isolate_controller,
     job_state,
     parse_job_id,
     wait_job_state,
@@ -73,6 +75,28 @@ def _leader_view(cluster, leader: int) -> tuple[dict[str, str], str]:
     return nodes, jobs
 
 
+def _start_job_on_every_node(cluster, label: str) -> dict[str, int]:
+    return {
+        name: _start_long_job(cluster, name, f"{label}-{i}")
+        for i, name in enumerate(cluster.node_names)
+    }
+
+
+def _assert_nobody_went_down(
+    cluster, leader: int, jobs_by_node: dict[str, int], log_start: int
+) -> str:
+    """Checks every node stayed up with its job running; returns the leader's
+    log since `log_start`."""
+    assert cluster._current_raft_leader() == leader, "leadership moved mid-test"
+    nodes, jobs = _leader_view(cluster, leader)
+    for name, job_id in jobs_by_node.items():
+        assert nodes.get(name) != "down", f"{name} was marked down:\n{nodes}"
+        assert job_state(jobs, job_id) == "R", f"job {job_id} on {name} ended:\n{jobs}"
+    log = cluster.spurctld_log(leader)[log_start:]
+    assert "node marked DOWN (heartbeat timeout)" not in log
+    return log
+
+
 class TestHeartbeatPathOutage:
     def test_a_node_whose_heartbeats_cannot_reach_any_controller_keeps_its_job(
         self, ha_cluster
@@ -116,23 +140,29 @@ class TestHeartbeatPathOutage:
         cluster = ha_cluster
         leader = _settled_leader(cluster)
         _wait_out_grace(cluster)
-        jobs_by_node = {
-            name: _start_long_job(cluster, name, f"hb-blackout-{i}")
-            for i, name in enumerate(cluster.node_names)
-        }
+        jobs_by_node = _start_job_on_every_node(cluster, "hb-blackout")
         log_start = len(cluster.spurctld_log(leader))
 
+        # Only heartbeats are lost: every agent still answers its probe.
         with block_controller_port(cluster, leader):
             time.sleep(OUTAGE_SECS)
 
-        assert cluster._current_raft_leader() == leader, "leadership moved mid-test"
-        nodes, jobs = _leader_view(cluster, leader)
-        for name, job_id in jobs_by_node.items():
-            assert nodes.get(name) != "down", f"{name} was marked down:\n{nodes}"
-            assert job_state(jobs, job_id) == "R", f"job {job_id} on {name} ended:\n{jobs}"
-        log = cluster.spurctld_log(leader)[log_start:]
+        log = _assert_nobody_went_down(cluster, leader, jobs_by_node, log_start)
+        assert "agent answers" in log, "the leader never confirmed the silent nodes"
+
+    def test_the_breaker_trips_when_the_leader_can_reach_no_node(self, ha_cluster):
+        cluster = ha_cluster
+        leader = _settled_leader(cluster)
+        _wait_out_grace(cluster)
+        jobs_by_node = _start_job_on_every_node(cluster, "hb-isolated")
+        log_start = len(cluster.spurctld_log(leader))
+
+        # Heartbeats and probes are both lost: every node looks dead to the leader.
+        with isolate_controller(cluster, leader):
+            time.sleep(OUTAGE_SECS)
+
+        log = _assert_nobody_went_down(cluster, leader, jobs_by_node, log_start)
         assert "suspecting the control plane" in log
-        assert "node marked DOWN (heartbeat timeout)" not in log
 
     def test_a_node_whose_agent_is_gone_is_still_marked_down(self, ha_cluster):
         cluster = ha_cluster
