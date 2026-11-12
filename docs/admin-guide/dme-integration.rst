@@ -41,7 +41,8 @@ GPU:
      - which GPUs get those labels
 
 A Spur ``prolog`` hook writes one file per GPU when a job starts; the
-matching ``epilog`` hook deletes them when the job ends. Deleting a file
+matching ``epilog`` hook deletes them when the job ends, or when its launch
+fails after the ``prolog`` ran. Deleting a file
 clears the labels only of the GPU the file is named after, so each file must
 list only its own render ID in ``CUDA_VISIBLE_DEVICES``. A file that lists
 other GPUs leaves their labels behind after the job ends, or takes them from

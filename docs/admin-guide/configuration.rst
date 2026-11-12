@@ -355,8 +355,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Live
      - Ceiling on a single launch, allocation-register, or multi-node PMIx
        prepare RPC to an agent. The agent runs the node prolog and any
-       container image unpack before it answers, so this must exceed your
-       slowest prolog. Range 0-86400;
+       container image unpack before it answers, and the node epilog too when
+       the launch then fails, so this must exceed your slowest prolog plus
+       ``[hooks] epilog_timeout_secs`` and 11 seconds. Range 0-86400;
        ``0`` disables it. A node that has died or become unreachable is
        detected sooner by channel keepalive, when keepalive is enabled; an
        agent that is still running but whose launch never completes is
@@ -3222,7 +3223,7 @@ submitting host on each invocation.
      - Agent restart
    * - ``epilog``
      - ``Epilog``
-     - compute node, at job termination
+     - compute node, at job termination — and right after a launch that fails once the ``prolog`` has run, before the failure is reported
      - Agent restart
    * - ``prolog_slurmctld``
      - ``PrologSlurmctld``
