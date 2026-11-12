@@ -312,6 +312,25 @@ Enable and start it:
    systemctl daemon-reload
    systemctl enable --now spurctld
 
+.. _spool-root-ownership:
+
+.. note::
+
+   On a node that also runs a root ``spurd``, ``/var/spool/spur`` holds every job's
+   spool folder, so keep it owned by root and not writable by group or others: the
+   account that can write it can swap a job's folder and so act as root on that node.
+   ``spurd`` logs a warning at startup when it is not. To run ``spurctld`` as an
+   unprivileged user on such a node, give it its own state directory instead of
+   handing it ``/var/spool/spur``:
+
+   .. code-block:: bash
+
+      sudo install -d -o spur -g spur -m 700 /var/lib/spur
+      spurctld -f /etc/spur/spur.conf --state-dir /var/lib/spur
+
+   An existing controller keeps its Raft log in ``<state-dir>/raft``; stop it and move
+   that directory to the new location before restarting with the new ``--state-dir``.
+
 .. _spurctld-fatal-raft-error:
 
 .. important::

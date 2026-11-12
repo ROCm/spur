@@ -115,6 +115,30 @@ fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
     }
 }
 
+/// The job spool root is only as safe as the account that owns it: that account
+/// can swap a job's folder between spurd writing a file and root running it.
+fn log_spool_root_ownership() {
+    use std::os::unix::fs::MetadataExt;
+
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let root = spurd::executor::job_spool_root();
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return;
+    };
+    if spurd::executor::spool_root_is_trusted(metadata.uid(), metadata.mode()) {
+        return;
+    }
+    warn!(
+        path = %root.display(),
+        owner_uid = metadata.uid(),
+        mode = format!("{:o}", metadata.mode() & 0o7777),
+        "the job spool root is not root-owned or is writable by others, so that account can \
+         act as root on this node; make it root-owned 0755 and give spurctld its own --state-dir"
+    );
+}
+
 /// Whether a best-effort config load failed only because no file exists at the default
 /// path, which is the expected shape for an agent configured entirely by flags.
 ///
@@ -669,6 +693,7 @@ async fn main() -> anyhow::Result<()> {
     };
     log_memlock_status(limits.memlock);
     log_cgroup_status(&cgroup_config);
+    log_spool_root_ownership();
     let cluster_config = config
         .as_ref()
         .map(|c| c.cluster.clone())

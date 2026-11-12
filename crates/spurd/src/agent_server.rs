@@ -4048,8 +4048,13 @@ async fn awaited_step_response(
 }
 
 async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> String {
+    use tokio::io::AsyncReadExt;
     for path in crate::executor::step_output_path_candidates(job_id, step_id, stderr) {
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        let Ok(mut file) = crate::scratch::open_spool_file(&path).await else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).await.is_ok() {
             return String::from_utf8_lossy(&bytes).into_owned();
         }
     }
@@ -5954,37 +5959,32 @@ mod child_containment_tests {
     }
 }
 
-fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
-    }
-    let _ = std::fs::remove_dir(dir);
-}
-
+/// A step's generated scripts in the job's spool folder, unlinked on drop. The
+/// folder itself is shared with the job's other steps and outlives them.
 struct StepScriptCleanup {
-    dir: std::path::PathBuf,
-    paths: Vec<std::path::PathBuf>,
+    dir: crate::scratch::ScratchDir,
+    names: Vec<String>,
 }
 
 impl StepScriptCleanup {
+    /// Copy the scripts to the same paths inside a container's rootfs, which a
+    /// fresh container needs because pivot_root hides the host's copies.
     fn stage_in_rootfs(&self, rootfs: &std::path::Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-        for source in &self.paths {
-            let relative = source
-                .strip_prefix("/")
-                .map_err(|_| anyhow::anyhow!("step script path must be absolute"))?;
-            if relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                anyhow::bail!("step script path contains unsupported components");
-            }
-            let destination = rootfs.join(relative);
-            let parent = destination
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("step script has no parent directory"))?;
-            std::fs::create_dir_all(parent)?;
-            let content = std::fs::read_to_string(source)?;
-            crate::executor::write_job_scratch(&destination, &content, uid, gid)?;
+        let relative = self
+            .dir
+            .path()
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("step script path must be absolute"))?;
+        let staged = crate::scratch::open_dir_beneath(rootfs, relative, 0o755).map_err(|e| {
+            anyhow::anyhow!(
+                "stage step scripts under {}: {e}",
+                rootfs.join(relative).display()
+            )
+        })?;
+        let owner = crate::executor::job_scratch_owner(uid, gid);
+        for name in &self.names {
+            let content = crate::scratch::read_scratch(&self.dir, name)?;
+            crate::scratch::write_scratch(&staged, name, &content, owner, 0o700)?;
         }
         Ok(())
     }
@@ -5992,9 +5992,9 @@ impl StepScriptCleanup {
 
 impl Drop for StepScriptCleanup {
     fn drop(&mut self) {
-        let path_refs: Vec<&std::path::Path> =
-            self.paths.iter().map(std::path::PathBuf::as_path).collect();
-        cleanup_step_scripts(&self.dir, &path_refs);
+        for name in &self.names {
+            let _ = crate::scratch::unlink_scratch(&self.dir, name);
+        }
     }
 }
 
@@ -8698,24 +8698,33 @@ impl SlurmAgent for AgentService {
             || step_mpi
             || step_mpirun
         {
-            let step_dir =
-                crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
-                    .map_err(|e| {
-                        Status::internal(format!("failed to create step script dir: {e}"))
-                    })?;
+            // In the job's spool folder rather than its work dir: the job picks
+            // the work dir, so a folder there is one root must never create or chown.
+            let dir = match crate::executor::create_job_spool_dir_under(
+                &self.job_spool_roots,
+                job_id,
+                req.uid,
+                req.gid,
+            ) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.drain_on_node_fault(&error, job_id);
+                    return Err(Status::internal(format!("step script dir: {error}")));
+                }
+            };
+            let owner = crate::executor::job_scratch_owner(req.uid, req.gid);
             let mut guard = StepScriptCleanup {
-                dir: step_dir.clone(),
-                paths: Vec::new(),
+                dir,
+                names: Vec::new(),
             };
 
             let (user_script_name, wrapper_name) = step_scratch_names(node_id, step_id);
-            let user_script_path = step_dir.join(user_script_name);
             let user_script = build_one_shot_command_script(&req.command)?;
-            crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
-            guard.paths.push(user_script_path.clone());
+            let user_script_path =
+                self.write_step_script(&guard.dir, &user_script_name, &user_script, owner, job_id)?;
+            guard.names.push(user_script_name);
 
-            let wrapper_path = step_dir.join(wrapper_name);
+            let wrapper_path = guard.dir.join(&wrapper_name);
             let wrapper = if step_mpirun {
                 let total_tasks = step_num_tasks.max(num_tasks);
                 let user_cmd = shlex::try_join(req.command.iter().map(String::as_str))
@@ -8766,10 +8775,9 @@ impl SlurmAgent for AgentService {
                 ))
             };
             if let Some(wrapper) = wrapper {
-                crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
-                    .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+                self.write_step_script(&guard.dir, &wrapper_name, &wrapper, owner, job_id)?;
             }
-            guard.paths.push(wrapper_path.clone());
+            guard.names.push(wrapper_name);
 
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
@@ -9496,15 +9504,16 @@ impl SlurmAgent for AgentService {
                     return;
                 }
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                let mut file = match tokio::fs::File::open(&file_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("open step output file: {e}"))))
-                            .await;
-                        return;
-                    }
-                };
+                let mut file =
+                    match crate::scratch::open_spool_file(std::path::Path::new(&file_path)).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("open step output file: {e}"))))
+                                .await;
+                            return;
+                        }
+                    };
                 // Tail incrementally: seek to the last offset and read only the
                 // newly appended bytes each poll, instead of re-reading the whole
                 // file (which is O(n^2) for high-volume steps).
@@ -10457,6 +10466,22 @@ impl AgentService {
                 request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
             });
         }
+    }
+
+    fn write_step_script(
+        &self,
+        dir: &crate::scratch::ScratchDir,
+        name: &str,
+        content: &str,
+        owner: crate::scratch::ScratchOwner,
+        job_id: u32,
+    ) -> Result<std::path::PathBuf, Status> {
+        executor::write_spool_scratch(dir, name, content, owner, "write step script").map_err(
+            |error| {
+                self.drain_on_node_fault(&error, job_id);
+                Status::internal(format!("failed to write step script: {error}"))
+            },
+        )
     }
 
     /// Drops the tracked entry for `job_id` only if it's still `run_attempt` —
@@ -18611,15 +18636,13 @@ mod tests {
         );
 
         let spool = root.path().join("spool/job42");
-        let scripts = root.path().join(".spur_step_42");
         std::fs::create_dir_all(&spool).unwrap();
-        std::fs::create_dir(&scripts).unwrap();
         let (user_script, wrapper) = step_scratch_names(0, step_id);
         let files = [
             spool.join("step3.out"),
             spool.join("step3.err"),
-            scripts.join(user_script),
-            scripts.join(wrapper),
+            spool.join(user_script),
+            spool.join(wrapper),
         ];
         for path in &files {
             std::fs::write(path, b"original step data").unwrap();
@@ -18858,32 +18881,110 @@ mod tests {
 
     #[test]
     fn step_scripts_are_staged_at_their_container_paths() {
-        let work = tempfile::TempDir::new().unwrap();
+        let spool = tempfile::TempDir::new().unwrap();
         let rootfs = tempfile::TempDir::new().unwrap();
-        let dir = work.path().join(".spur_step_1");
-        std::fs::create_dir(&dir).unwrap();
-        let command = dir.join("cmd_0.sh");
-        let wrapper = dir.join("wrapper_0.sh");
-        std::fs::write(&command, "#!/bin/bash\necho staged\n").unwrap();
-        std::fs::write(
-            &wrapper,
-            format!("#!/bin/bash\nbash {}\n", command.display()),
-        )
-        .unwrap();
-        let scripts = StepScriptCleanup {
+        let dir = crate::scratch::ScratchDir::open(spool.path()).unwrap();
+        let command = "#!/bin/bash\necho staged\n".to_string();
+        let wrapper = format!("#!/bin/bash\nbash {}\n", dir.join("cmd_0.sh").display());
+        let scripts = [("cmd_0.sh", &command), ("wrapper_0.sh", &wrapper)];
+        for (name, content) in scripts {
+            crate::scratch::write_scratch(
+                &dir,
+                name,
+                content.as_bytes(),
+                crate::scratch::ScratchOwner::Daemon,
+                0o700,
+            )
+            .unwrap();
+        }
+        let cleanup = StepScriptCleanup {
             dir,
-            paths: vec![command.clone(), wrapper.clone()],
+            names: scripts.iter().map(|(name, _)| name.to_string()).collect(),
         };
 
-        scripts.stage_in_rootfs(rootfs.path(), 0, 0).unwrap();
+        cleanup.stage_in_rootfs(rootfs.path(), 0, 0).unwrap();
 
-        for source in [&command, &wrapper] {
-            let destination = rootfs.path().join(source.strip_prefix("/").unwrap());
+        let staged = rootfs.path().join(spool.path().strip_prefix("/").unwrap());
+        for (name, content) in scripts {
             assert_eq!(
-                std::fs::read_to_string(destination).unwrap(),
-                std::fs::read_to_string(source).unwrap()
+                &std::fs::read_to_string(staged.join(name)).unwrap(),
+                content
             );
         }
+    }
+
+    // A container image is user-supplied, and an absolute link inside it would
+    // resolve against the host when root walks the unpacked tree.
+    #[test]
+    fn step_script_staging_refuses_a_symlink_inside_the_image() {
+        let spool = tempfile::TempDir::new().unwrap();
+        let rootfs = tempfile::TempDir::new().unwrap();
+        let host = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            spool.path().join("cmd_0_1.sh"),
+            "#!/bin/bash\necho staged\n",
+        )
+        .unwrap();
+        let first = spool
+            .path()
+            .strip_prefix("/")
+            .unwrap()
+            .components()
+            .next()
+            .unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join(first)).unwrap();
+        let scripts = StepScriptCleanup {
+            dir: crate::scratch::ScratchDir::open(spool.path()).unwrap(),
+            names: vec!["cmd_0_1.sh".into()],
+        };
+
+        assert!(
+            scripts.stage_in_rootfs(rootfs.path(), 0, 0).is_err(),
+            "a link in the image must not lead staging out of the rootfs"
+        );
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+    }
+
+    // The job picks its own work dir, so a step folder planted there must never
+    // be created, chmod'ed or chowned by root.
+    #[tokio::test]
+    async fn a_labeled_step_never_touches_a_step_folder_planted_in_its_work_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let (svc, job_id) = run_command_test_setup().await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let canary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(canary.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(
+            canary.path(),
+            work_dir.path().join(format!(".spur_step_{job_id}")),
+        )
+        .unwrap();
+
+        let resp = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["echo".into(), "labeled".into()],
+                uid: 0,
+                gid: 0,
+                job_id,
+                label: true,
+                work_dir: work_dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.exit_code, 0, "{}", resp.stderr);
+        let mode = std::fs::metadata(canary.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the planted folder's target must be left alone"
+        );
+        assert_eq!(std::fs::read_dir(canary.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
