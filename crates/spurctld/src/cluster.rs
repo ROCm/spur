@@ -5527,6 +5527,15 @@ impl ClusterManager {
                     old_state,
                     reason,
                 } => {
+                    // The NodeStateChange apply does not check old_state, so an
+                    // operator who acted since the pass would be overwritten.
+                    let unchanged = self
+                        .get_node(&name)
+                        .is_some_and(|n| !n.admin_locked && n.state == old_state);
+                    if !unchanged {
+                        info!(node = %name, "skipping hold-cap drain: node changed since the health pass");
+                        continue;
+                    }
                     warn!(node = %name, reason = %reason, "node drained: jobs the controller ended were not released within the hold cap");
                     // Admin-locked so it will not auto-recover; an operator clears
                     // it with `scontrol update state=resume` once the node is sound.
@@ -36434,6 +36443,32 @@ state = "UP"
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cap_drain_skips_a_node_an_operator_changed_since_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+        let drain = || super::HealthAction::Drain {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+            reason: "Kill task failed (JobId=7)".into(),
+        };
+
+        cm.update_node_state("n1", NodeState::Down, Some("bad dimm".into()), Some(1000))
+            .unwrap();
+        cm.apply_health_actions(vec![drain()]);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.state_reason.as_deref(), Some("bad dimm"));
+        assert_eq!(node.reason_uid, Some(1000));
+
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+        cm.apply_health_actions(vec![drain()]);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Idle);
+        assert!(!node.admin_locked);
     }
 
     async fn held_down_node(dir: &TempDir) -> Arc<ClusterManager> {
