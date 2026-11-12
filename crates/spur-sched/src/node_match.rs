@@ -20,7 +20,7 @@ pub struct NodePlacement<'a> {
     /// Without an explicit node list, placement follows admission's reuse credits
     /// so the allocation honors the group-node charge.
     nodelist: Option<HashSet<String>>,
-    restrict_to_preferred: bool,
+    use_reuse: bool,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
     /// Requested `--constraint` features (all must be present on a node).
@@ -32,16 +32,21 @@ pub struct NodePlacement<'a> {
 impl<'a> NodePlacement<'a> {
     /// Parse a job's placement constraints once.
     pub fn new(job: &'a Job) -> Self {
-        Self::build(job, true)
+        Self::build(job, true, None)
+    }
+
+    /// Match the credits for the partition whose request placement is evaluating.
+    pub fn new_in_partition(job: &'a Job, partition: &'a str) -> Self {
+        Self::build(job, true, Some(partition))
     }
 
     /// Ignore reuse credits while account and QOS gates compute their independent credits.
     /// Actual placement uses [`new`](Self::new) to enforce the finished result.
     pub fn new_ignoring_preferred_nodes(job: &'a Job) -> Self {
-        Self::build(job, false)
+        Self::build(job, false, None)
     }
 
-    fn build(job: &'a Job, use_preferred_nodes: bool) -> Self {
+    fn build(job: &'a Job, use_reuse: bool, partition: Option<&'a str>) -> Self {
         let nodelist = job
             .spec
             .nodelist
@@ -49,8 +54,15 @@ impl<'a> NodePlacement<'a> {
             .filter(|s| !s.is_empty())
             .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
             .or_else(|| {
-                (use_preferred_nodes && !job.preferred_nodes.is_empty())
-                    .then(|| job.preferred_nodes.clone())
+                if !use_reuse {
+                    return None;
+                }
+                if job.node_reuse.is_empty() {
+                    return (!job.preferred_nodes.is_empty()).then(|| job.preferred_nodes.clone());
+                }
+                let credits = job.node_reuse.get(partition?)?;
+                let listed: HashSet<String> = credits.iter().flatten().cloned().collect();
+                (!listed.is_empty()).then_some(listed)
             });
 
         let exclude = job
@@ -67,18 +79,23 @@ impl<'a> NodePlacement<'a> {
                 // Invalid requests must not become unconstrained candidates.
                 .unwrap_or_else(|_| vec![job.spec.constraint.as_deref().unwrap_or_default()]);
 
-        let partitions = job
-            .spec
-            .partition
-            .as_deref()
-            .map(|p| p.split(',').map(str::trim).collect())
-            .unwrap_or_default();
+        let partitions = if let Some(partition) = partition {
+            vec![partition]
+        } else {
+            let requested: Vec<&str> =
+                spur_core::partition::requested_partition_names(job.spec.partition.as_deref())
+                    .collect();
+            if requested.is_empty() && use_reuse && !job.node_reuse.is_empty() {
+                job.node_reuse.keys().map(String::as_str).collect()
+            } else {
+                requested
+            }
+        };
 
         Self {
             job,
             nodelist,
-            restrict_to_preferred: use_preferred_nodes
-                && job.preferred_nodes.len() >= (job.spec.num_nodes as usize).max(1),
+            use_reuse,
             exclude,
             required_features,
             partitions,
@@ -88,16 +105,43 @@ impl<'a> NodePlacement<'a> {
     /// True if the job's node lists and complete reuse credit permit this node by name.
     /// Name-only check: no partition, feature, capacity, or state involved.
     pub fn allows_name(&self, name: &str) -> bool {
-        // A full reuse credit must hold even when the user supplied a wider node pool.
-        if self.restrict_to_preferred && !self.job.preferred_nodes.contains(name) {
-            return false;
-        }
         if let Some(ref allowed) = self.nodelist {
             if !self.nodelist_is_additive() && !allowed.contains(name) {
                 return false;
             }
         }
         !self.exclude.contains(name)
+            && (self.partitions.is_empty()
+                || self
+                    .partitions
+                    .iter()
+                    .any(|partition| self.reuse_allows(name, partition)))
+            && (!self.job.node_reuse.is_empty()
+                || self.credit_allows(name, &self.job.preferred_nodes))
+    }
+
+    fn reuse_allows(&self, name: &str, partition: &str) -> bool {
+        !self.use_reuse
+            || self.job.node_reuse.get(partition).is_none_or(|credits| {
+                credits
+                    .iter()
+                    .all(|credit| self.credit_allows(name, credit))
+            })
+    }
+
+    fn credit_allows(&self, name: &str, credit: &HashSet<String>) -> bool {
+        if !self.use_reuse || credit.is_empty() {
+            return true;
+        }
+        let mandatory = self
+            .nodelist
+            .as_ref()
+            .filter(|_| self.nodelist_is_additive());
+        let covered =
+            credit.len() + mandatory.map_or(0, |listed| listed.difference(credit).count());
+        covered < (self.job.spec.num_nodes as usize).max(1)
+            || credit.contains(name)
+            || mandatory.is_some_and(|listed| listed.contains(name))
     }
 
     pub fn nodelist_is_additive(&self) -> bool {
@@ -113,15 +157,19 @@ impl<'a> NodePlacement<'a> {
             .is_some_and(|nodelist| nodelist.contains(name))
     }
 
+    pub fn listed_count(&self) -> usize {
+        self.nodelist.as_ref().map_or(0, HashSet::len)
+    }
+
     /// True if the node is in one of the job's requested partitions (or the job
     /// requested no partition).
     pub fn in_partition(&self, node: &Node) -> bool {
         if self.partitions.is_empty() {
             return true;
         }
-        self.partitions
-            .iter()
-            .any(|rp| node.partitions.iter().any(|np| np == rp))
+        self.partitions.iter().any(|rp| {
+            node.partitions.iter().any(|np| np == rp) && self.reuse_allows(&node.name, rp)
+        })
     }
 
     /// True if the node carries every requested `--constraint` feature.
@@ -492,6 +540,165 @@ mod tests {
         assert!(p.allows_name("node002"));
         assert!(p.allows_name("node003"));
         assert!(!p.allows_name("node004"));
+    }
+
+    #[test]
+    fn additive_nodelist_stays_mandatory_when_credits_cover_the_fillers() {
+        for credit in [
+            HashSet::from(["node002".to_string()]),
+            HashSet::from(["node002".to_string(), "node003".to_string()]),
+        ] {
+            let mut job = job_with(JobSpec {
+                nodelist: Some("node001".into()),
+                num_nodes: 2,
+                ..base_spec()
+            });
+            job.preferred_nodes = credit.clone();
+            let p = NodePlacement::new(&job);
+            assert!(p.nodelist_is_additive());
+            assert!(p.is_listed("node001"));
+            assert!(p.allows_name("node001"));
+            assert!(p.allows_name("node002"));
+            assert_eq!(p.allows_name("node003"), credit.contains("node003"));
+            assert!(!p.allows_name("node004"));
+
+            job.node_reuse.insert("default".into(), vec![credit]);
+            let scoped = NodePlacement::new_in_partition(&job, "default");
+            assert!(scoped.nodelist_is_additive());
+            assert!(scoped.is_listed("node001"));
+            assert!(scoped.allows_name("node001"));
+            assert!(scoped.allows_name("node002"));
+            assert!(!scoped.allows_name("node004"));
+        }
+    }
+
+    #[test]
+    fn partial_credits_in_alternative_partitions_never_become_full() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-004]".into()),
+            partition: Some("a,b".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".into(), "node003".into()]);
+        job.node_reuse
+            .insert("a".into(), vec![HashSet::from(["node001".into()])]);
+        job.node_reuse
+            .insert("b".into(), vec![HashSet::from(["node003".into()])]);
+        let generic = NodePlacement::new(&job);
+        let now = Utc::now();
+        for (partition, names) in [("a", ["node001", "node002"]), ("b", ["node003", "node004"])] {
+            let scoped = NodePlacement::new_in_partition(&job, partition);
+            for name in names {
+                let mut candidate = node(name);
+                candidate.partitions = vec![partition.into()];
+                assert!(generic.matches_for_reservation(&candidate, &[], now));
+                assert!(scoped.matches_for_reservation(&candidate, &[], now));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_partial_quota_credits_never_become_full() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-003]".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".into(), "node002".into()]);
+        job.node_reuse.insert(
+            "default".into(),
+            vec![
+                HashSet::from(["node001".into()]),
+                HashSet::from(["node002".into()]),
+            ],
+        );
+        for p in [
+            NodePlacement::new(&job),
+            NodePlacement::new_in_partition(&job, "default"),
+        ] {
+            assert!(p.allows_name("node001"));
+            assert!(p.allows_name("node002"));
+            assert!(p.allows_name("node003"));
+        }
+    }
+
+    #[test]
+    fn full_credits_must_hold_for_each_quota_scope() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-004]".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.node_reuse.insert(
+            "default".into(),
+            vec![
+                HashSet::from(["node001".into(), "node002".into()]),
+                HashSet::from(["node002".into(), "node003".into()]),
+            ],
+        );
+        let p = NodePlacement::new_in_partition(&job, "default");
+        assert!(!p.allows_name("node001"));
+        assert!(p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
+        assert!(!p.allows_name("node004"));
+    }
+
+    #[test]
+    fn reuse_requires_membership_in_the_partition_that_credited_the_node() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node[001-003]".into()),
+            partition: Some("a,b".into()),
+            ..base_spec()
+        });
+        job.node_reuse
+            .insert("a".into(), vec![HashSet::from(["node001".into()])]);
+        job.node_reuse
+            .insert("b".into(), vec![HashSet::from(["node002".into()])]);
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+        let mut candidate = node("node001");
+        candidate.partitions = vec!["b".into()];
+        assert!(p.allows_name("node001"));
+        assert!(!p.matches_for_reservation(&candidate, &[], now));
+        candidate.partitions = vec!["a".into()];
+        assert!(p.matches_for_reservation(&candidate, &[], now));
+
+        job.spec.partition = Some("a".into());
+        assert!(!NodePlacement::new(&job).allows_name("node002"));
+    }
+
+    #[test]
+    fn scoped_partial_credit_supplies_only_its_own_additive_fallback() {
+        let mut job = job_with(JobSpec {
+            partition: Some("a,b".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".into(), "node002".into()]);
+        job.node_reuse
+            .insert("a".into(), vec![HashSet::from(["node001".into()])]);
+        job.node_reuse
+            .insert("b".into(), vec![HashSet::from(["node002".into()])]);
+        let scoped = NodePlacement::new_in_partition(&job, "a");
+        assert!(scoped.nodelist_is_additive());
+        assert!(scoped.is_listed("node001"));
+        assert!(!scoped.is_listed("node002"));
+        assert!(scoped.allows_name("node003"));
+        let generic = NodePlacement::new(&job);
+        assert!(!generic.nodelist_is_additive());
+        assert!(generic.allows_name("node003"));
+    }
+
+    #[test]
+    fn admission_ignores_scoped_credits() {
+        let mut job = job_with(base_spec());
+        job.preferred_nodes.insert("node001".into());
+        job.node_reuse
+            .insert("default".into(), vec![HashSet::from(["node001".into()])]);
+        let p = NodePlacement::new_ignoring_preferred_nodes(&job);
+        assert!(p.allows_name("node002"));
+        assert!(!p.is_listed("node001"));
     }
 
     #[test]

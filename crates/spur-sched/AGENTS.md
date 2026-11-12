@@ -147,8 +147,11 @@ remainder from the general pool. When the nodelist covers or exceeds the
 request, it is **restrictive**: only named nodes are candidates. The
 `preferred_nodes` field (set by QOS/account group-node admission) provides
 a fallback nodelist when the user did not specify `--nodelist`.
-When it covers the complete node request, it also constrains an explicit
-candidate pool to credited nodes.
+`node_reuse` retains separate credit sets per partition and quota scope.
+`new_in_partition()` enforces those sets during placement without treating
+their union as complete reuse. Complete credit constrains explicit candidate
+pools; additive mandatory hosts remain allowed, and credited hosts constrain
+filler slots when they cover the rest of the request.
 
 `new_ignoring_preferred_nodes()` exists for admission's own reuse-credit
 computation, preventing the account gate's credit from leaking into the QOS

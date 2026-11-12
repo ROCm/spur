@@ -1435,8 +1435,16 @@ and preemption eligibility. Partial-node victim selection remains a
 limitation: when an ineligible sibling remains on N5, Spur cannot yet
 evict only the burst work beside it. The job waits for resources rather
 than reporting a group node quota violation. Exclusive jobs receive no
-occupied-node reuse credit. A complete reuse credit also constrains an
-explicit candidate ``--nodelist`` to the credited hosts.
+occupied-node reuse credit. Credits remain separate for each candidate
+partition and each account or QOS scope. Partial credits from alternative
+partitions do not combine into a complete placement restriction.
+
+An additive ``--nodelist`` still requires its named hosts. For example,
+``-N2 --nodelist=N3`` needs one new host when the group already occupies
+N1 and N2: ``GrpTRES=node=3`` permits N3 plus a reusable host, while
+``GrpTRES=node=2`` blocks it. When the credited hosts cover all remaining
+slots, placement constrains those slots to the credited hosts while
+preserving the mandatory list.
 
 Scripted output
 ---------------

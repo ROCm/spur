@@ -414,11 +414,15 @@ impl BackfillScheduler {
         cluster: &ClusterState,
         handoffs: &HandoffGate,
         now: chrono::DateTime<Utc>,
+        partition: Option<&str>,
     ) -> Vec<usize> {
         let nodes = cluster.nodes;
         let reservations = cluster.reservations;
         let required = job_resource_request(job);
-        let placement = NodePlacement::new(job);
+        let placement = partition.map_or_else(
+            || NodePlacement::new(job),
+            |partition| NodePlacement::new_in_partition(job, partition),
+        );
 
         let suitable = |node: &Node| {
             if !placement.matches_for_reservation(node, reservations, now) {
@@ -968,7 +972,8 @@ impl BackfillScheduler {
                         else {
                             return false;
                         };
-                        let suitable = self.find_suitable_nodes(&member, cluster, &handoffs, now);
+                        let suitable =
+                            self.find_suitable_nodes(&member, cluster, &handoffs, now, None);
                         suitable.len() >= member.spec.num_nodes as usize
                     });
                     if !all_have_nodes {
@@ -1036,6 +1041,7 @@ impl BackfillScheduler {
             let candidates = candidate_partitions(job, cluster.partitions);
             let capped = candidates.iter().any(|p| is_capped(p));
             let per_partition = capped
+                || !job.node_reuse.is_empty()
                 || candidates
                     .iter()
                     .any(|p| p.has_memory_policy() || p.max_mem_per_node.is_some());
@@ -1269,7 +1275,7 @@ impl BackfillScheduler {
         let job = &*job_in_partition(job, partition);
         let required = job_resource_request(job);
         let overshoots: Vec<PartitionTresOvershoot> = self
-            .find_suitable_nodes(job, cluster, handoffs, now)
+            .find_suitable_nodes(job, cluster, handoffs, now, Some(&partition.name))
             .into_iter()
             .filter(|ni| in_partition(&cluster.nodes[*ni], partition))
             .filter_map(|ni| {
@@ -1327,10 +1333,40 @@ impl BackfillScheduler {
         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
         let needed_nodes = (job.spec.num_nodes as usize).max(1);
 
-        let mut suitable = self.find_suitable_nodes(job, cluster, handoffs, now);
+        let partition = scope.map(|scope| scope.partition.name.as_str());
+        let placement = partition.map_or_else(
+            || NodePlacement::new(job),
+            |partition| NodePlacement::new_in_partition(job, partition),
+        );
+        let listed_nodes = if job
+            .spec
+            .nodelist
+            .as_deref()
+            .is_some_and(|list| !list.is_empty())
+        {
+            placement.listed_count()
+        } else {
+            cluster
+                .nodes
+                .iter()
+                .filter(|node| placement.is_listed(&node.name))
+                .count()
+        };
+        let missing_listed_node = |suitable: &[usize]| {
+            placement.nodelist_is_additive()
+                && suitable
+                    .iter()
+                    .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
+                    .count()
+                    < listed_nodes
+        };
+        let mut suitable = self.find_suitable_nodes(job, cluster, handoffs, now, partition);
         let capped_scope = scope.filter(|s| s.enforce_cap && is_capped(s.partition));
         if let Some(scope) = scope {
             suitable.retain(|ni| in_partition(&cluster.nodes[*ni], scope.partition));
+        }
+        if missing_listed_node(&suitable) {
+            return Err((UnplacedKind::RequestedNodesUnavailable, suitable.len()));
         }
         if suitable.is_empty() {
             return Err((UnplacedKind::NoSuitableNodes, 0));
@@ -1353,6 +1389,9 @@ impl BackfillScheduler {
                 }
                 ever_fits
             });
+            if missing_listed_node(&suitable) {
+                return Err((UnplacedKind::RequestedNodesUnavailable, suitable.len()));
+            }
             if suitable.len() < needed_nodes {
                 return Err((UnplacedKind::PartitionCapNeverFits, considered));
             }
@@ -1364,12 +1403,6 @@ impl BackfillScheduler {
                 charge: cap_charges.get(&ni)?,
             })
         };
-
-        let placement = NodePlacement::new(job);
-        let listed_suitable = suitable
-            .iter()
-            .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
-            .count();
 
         let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
         let gpu_type = demand.gpu_type().map(str::to_string);
@@ -1435,16 +1468,6 @@ impl BackfillScheduler {
                 })
                 .collect()
         };
-
-        if placement.nodelist_is_additive()
-            && node_starts
-                .iter()
-                .filter(|(ni, _)| placement.is_listed(&cluster.nodes[*ni].name))
-                .count()
-                < listed_suitable
-        {
-            return Err((UnplacedKind::RequestedNodesUnavailable, suitable.len()));
-        }
 
         let allocated_cpus_at_start: HashMap<usize, u32> = node_starts
             .iter()
@@ -3608,6 +3631,113 @@ mod tests {
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
         assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn scoped_node_reuse_preserves_every_mandatory_host() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (overlap, missing) in [(false, false), (true, false), (true, true)] {
+            let mut sched = BackfillScheduler::new(100);
+            let mut nodes = make_nodes(6);
+            for node in &mut nodes[3..] {
+                node.partitions = vec!["other".into()];
+            }
+            if overlap {
+                nodes[3].partitions.push("default".into());
+            }
+            let partitions = vec![
+                Partition {
+                    name: "default".into(),
+                    ..Default::default()
+                },
+                Partition {
+                    name: "other".into(),
+                    priority_tier: 100,
+                    ..Default::default()
+                },
+            ];
+            let listed = if missing {
+                "node001,node007"
+            } else {
+                "node001,node004"
+            };
+            let mut job = make_job_with_nodelist(1, 3, Some(listed), None);
+            job.spec.partition = Some("default,other".into());
+            job.preferred_nodes = HashSet::from(["node001".into(), "node004".into()]);
+            job.node_reuse
+                .insert("default".into(), vec![HashSet::from(["node001".into()])]);
+            job.node_reuse
+                .insert("other".into(), vec![HashSet::from(["node004".into()])]);
+            let cluster = ClusterState {
+                fabric: None,
+                preemption_handoffs: &HashMap::new(),
+                busy_until: &HashMap::new(),
+                partition_node_usage: &Default::default(),
+                nodes: &nodes,
+                partitions: &partitions,
+                reservations: &[],
+                topology: None,
+            };
+            let assignments = sched.schedule_jobs(&[job], &cluster, now, true);
+            if !overlap || missing {
+                assert!(assignments.is_empty());
+                assert!(sched.planned_job_starts().is_empty());
+                assert_eq!(
+                    sched.last_outcome[&1].kind,
+                    UnplacedKind::RequestedNodesUnavailable
+                );
+                continue;
+            }
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].partition.as_deref(), Some("default"));
+            assert_eq!(assignments[0].nodes.len(), 3);
+            assert!(assignments[0].nodes.iter().any(|node| node == "node001"));
+            assert!(assignments[0].nodes.iter().any(|node| node == "node004"));
+        }
+    }
+
+    #[test]
+    fn additive_nodelist_reports_a_mandatory_host_filtered_by_its_partition_policy() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for cap in [false, true] {
+            let mut sched = BackfillScheduler::new(100);
+            let mut nodes = make_nodes(4);
+            let mut partition = Partition {
+                name: "default".into(),
+                ..Default::default()
+            };
+            let mut job = make_job_with_nodelist(1, 3, Some("node001"), None);
+            if cap {
+                job.spec.exclusive = true;
+                partition.max_tres_per_node.insert("cpu".into(), 32);
+                for node in &mut nodes[1..] {
+                    node.total_resources.cpus = 16;
+                }
+            } else {
+                partition.def_mem_per_node = Some(128);
+                nodes[0].total_resources.memory_mb = 64;
+            }
+            let cluster = ClusterState {
+                fabric: None,
+                preemption_handoffs: &HashMap::new(),
+                busy_until: &HashMap::new(),
+                partition_node_usage: &Default::default(),
+                nodes: &nodes,
+                partitions: std::slice::from_ref(&partition),
+                reservations: &[],
+                topology: None,
+            };
+            assert!(sched.schedule_jobs(&[job], &cluster, now, true).is_empty());
+            assert!(sched.planned_job_starts().is_empty());
+            assert_eq!(
+                sched.last_outcome[&1].kind,
+                UnplacedKind::RequestedNodesUnavailable
+            );
+        }
     }
 
     #[test]

@@ -85,16 +85,21 @@ unavailable (down, draining) blocks the entire job. A listed node inside
 another active reservation is silently dropped from the candidate set.
 
 **Preferred nodes** -- QOS/account admission can write `preferred_nodes` on a
-job. `NodePlacement::new()` falls back to this field when no explicit
-`--nodelist` was provided, so scheduling honors the admission credit.
+job. For jobs without scoped credits, `NodePlacement::new()` falls back to
+this field when no explicit `--nodelist` was provided.
 `new_ignoring_preferred_nodes()` suppresses this fallback for admission's own
 internal reuse computation to prevent cross-gate leakage.
-When the credit covers the complete node request, placement also requires
-membership in the credited set even with an explicit `--nodelist` pool.
+Transient `Job.node_reuse` keeps each partition's account and QOS credit
+sets separate. `NodePlacement::new_in_partition()` enforces each set for
+the selected partition; the generic matcher checks the node's actual
+partition membership. Backfill evaluates these alternatives separately.
+Complete credits constrain explicit candidate pools.
+Additive mandatory hosts remain allowed and count toward the new-host charge;
+credited hosts constrain the filler slots when they cover the remainder.
 Configured preemption/reclaim can credit a busy node's total capacity and
 empty partition cap; actual victim selection still proves release feasibility.
-Admission credits remain independent for account and QOS. Partial reuse supplies
-an additive node list when no explicit list exists; explicit candidate pools
+Partial reuse supplies an additive node list within the selected partition
+when no explicit list exists; explicit candidate pools
 can leave partial credits unenforced. Same-pass claimed-node sets prevent
 duplicate credits, while reuse across passes remains best effort.
 Exclusive jobs receive no occupied-node credit,
