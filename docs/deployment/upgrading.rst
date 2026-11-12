@@ -47,15 +47,20 @@ snapshot size. See :ref:`preemption-outcome-export`.
 Account QOS allow-list compatibility
 ------------------------------------
 
-Account QOS allow-lists (``sacctmgr add/modify account ... qos=``) add an
-``allowed_qos`` column to the ``accounts`` table, created automatically at
-startup. Upgrade every controller before setting one. An older controller
-ignores the field: ``sacctmgr`` reports the account as added or modified, but no
-list is stored.
+Account QOS allow-lists (``sacctmgr add/modify account ... qos=``) add
+``allowed_qos`` and ``default_qos`` columns to the ``accounts`` table, created
+automatically at startup. A stored list may be a replacement (``normal,burst``)
+or an add/remove edit (``+expedite,-standby``). Upgrade every controller before
+setting one. An older controller ignores the field: ``sacctmgr`` reports the
+account as added or modified, but no list is stored. On a user, it rejects a
+``qos+=`` or ``qos-=`` value as an unknown QOS name.
 
-**Rollback.** An older controller leaves the column in place but does not read
-it. Users who have no ``qos=`` of their own stop inheriting the account's list
-and may again use any QOS. Lists set directly on users are unaffected.
+**Rollback.** An older controller leaves the columns in place but does not read
+them. Users who have no ``qos=`` of their own stop inheriting the account's
+list, including anything that account inherited from its parent, and may again
+use any QOS. Exact lists set directly on users are unaffected. A user whose
+stored value is an add/remove edit (``+name``) is read as a literal QOS name,
+so that user can use no QOS until the edit is replaced with ``qos=``.
 
 Single-Host: ``spur self-update``
 ---------------------------------

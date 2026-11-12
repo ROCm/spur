@@ -9,7 +9,7 @@ use spur_core::accounting::{limit_to_wire, TresRecord};
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
-use super::{db, txn};
+use super::{db, qos_level, txn};
 use crate::audit::Annotation;
 
 fn internal(e: impl std::fmt::Display) -> Status {
@@ -143,21 +143,48 @@ fn normalize_admin_level(raw: &str) -> Result<&str, Status> {
     })
 }
 
-/// Normalize a comma-separated QOS allow-list: trim, drop empty tokens (a
-/// trailing comma is harmless), and reject any name that is not a QOS.
-async fn normalize_qos_list(pool: &PgPool, list: &str) -> Result<String, Status> {
-    let names: Vec<&str> = list
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let missing = db::missing_qos(pool, &names)
+/// Names this write mentions. An unknown name is a typo, including one
+/// being removed.
+async fn qos_names_exist(pool: &PgPool, names: &[&str]) -> Result<(), Status> {
+    let missing = db::missing_qos(pool, names)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
     if let Some(name) = missing.first() {
         return Err(Status::not_found(format!("QOS '{name}' does not exist")));
     }
-    Ok(names.join(","))
+    Ok(())
+}
+
+/// Validate a QOS edit and its default before anything is written, and parse
+/// the edit. References are checked against the live DB, not `QosCache`, so a
+/// QOS created just now is accepted. Each check runs only for a field the
+/// request restated. A default is compared with the list only when both are
+/// an exact `qos=` list in the same request; submit enforces the rest.
+async fn validated_qos_edit(
+    pool: &PgPool,
+    allowed_qos: Option<&str>,
+    default_qos: Option<&str>,
+) -> Result<Option<qos_level::QosWrite>, Status> {
+    let default_qos = default_qos.filter(|name| !name.is_empty());
+    if let Some(name) = default_qos {
+        let exists = db::qos_exists(pool, name).await.map_err(internal)?;
+        if !exists {
+            return Err(Status::not_found(format!("QOS '{name}' does not exist")));
+        }
+    }
+    let Some(write) = qos_level::parse_write(allowed_qos).map_err(Status::invalid_argument)? else {
+        return Ok(None);
+    };
+    qos_names_exist(pool, &write.names()).await?;
+    if let (Some(name), qos_level::QosWrite::Exact(names)) = (default_qos, &write) {
+        if !names.iter().any(|listed| listed == name) {
+            return Err(Status::invalid_argument(format!(
+                "default QOS '{name}' must be included in qos={}",
+                names.join(",")
+            )));
+        }
+    }
+    Ok(Some(write))
 }
 
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
@@ -912,10 +939,19 @@ impl SlurmAccounting for AccountingService {
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
         }
-        let allowed_qos_normalized = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
+        let write =
+            validated_qos_edit(pool, req.allowed_qos.as_deref(), req.default_qos.as_deref())
+                .await?;
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let current = match &write {
+            Some(write) if write.needs_current() => db::account_allowed_qos(&mut tx, &req.name)
+                .await
+                .map_err(internal)?,
+            _ => None,
         };
+        let stored_qos = write
+            .as_ref()
+            .map(|write| qos_level::apply_write(current.as_deref(), write));
         let update = db::AccountUpdate {
             description: req.description.as_deref(),
             organization: req.organization.as_deref(),
@@ -923,9 +959,9 @@ impl SlurmAccounting for AccountingService {
             fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
-            allowed_qos: nullable_str(&allowed_qos_normalized),
+            allowed_qos: stored_qos.as_ref().map(|value| value.as_deref()),
+            default_qos: nullable_str(&req.default_qos),
         };
-        let mut tx = pool.begin().await.map_err(internal)?;
         let result = db::upsert_account(&mut tx, &req.name, update)
             .await
             .map_err(internal)?;
@@ -936,7 +972,8 @@ impl SlurmAccounting for AccountingService {
             ("fairshare_weight", req.fairshare_weight.map(Into::into)),
             ("max_running_jobs", req.max_running_jobs.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
-            ("allowed_qos", allowed_qos_normalized.map(Into::into)),
+            ("allowed_qos", req.allowed_qos.map(Into::into)),
+            ("default_qos", req.default_qos.map(Into::into)),
         ]);
         write_txn_in_band(
             &mut tx,
@@ -1027,6 +1064,7 @@ impl SlurmAccounting for AccountingService {
         let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let effects = db::account_effects(&records);
         let partial = allowed
             .as_ref()
             .is_some_and(|names| records.iter().any(|r| !names.iter().any(|n| n == &r.name)));
@@ -1034,15 +1072,23 @@ impl SlurmAccounting for AccountingService {
         let accounts = records
             .into_iter()
             .filter(|r| account_allowed(allowed.as_deref(), &r.name))
-            .map(|r| AccountInfo {
-                name: r.name,
-                description: r.description,
-                organization: r.organization,
-                parent_account: r.parent.unwrap_or_default(),
-                fairshare_weight: r.fairshare_weight as f64,
-                max_running_jobs: limit_to_wire(r.max_running_jobs),
-                grp_tres: r.grp_tres.unwrap_or_default(),
-                allowed_qos: r.allowed_qos.unwrap_or_default(),
+            .map(|r| {
+                let effect = effects.get(&r.name);
+                AccountInfo {
+                    name: r.name,
+                    description: r.description,
+                    organization: r.organization,
+                    parent_account: r.parent.unwrap_or_default(),
+                    fairshare_weight: r.fairshare_weight as f64,
+                    max_running_jobs: limit_to_wire(r.max_running_jobs),
+                    grp_tres: r.grp_tres.unwrap_or_default(),
+                    allowed_qos: effect
+                        .map(|effect| effect.qos.display())
+                        .unwrap_or_default(),
+                    default_qos: effect
+                        .and_then(|effect| effect.default_qos.clone())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
 
@@ -1060,50 +1106,32 @@ impl SlurmAccounting for AccountingService {
             .as_deref()
             .map(normalize_admin_level)
             .transpose()?;
-        // QOS references are validated against the live DB, not QosCache: a QOS
-        // created just now may not have reached the cache's next refresh yet,
-        // the same lag job submission already accepts for QosCache reads. Each
-        // check runs only for a field the request actually restated.
-        if let Some(dq) = req.default_qos.as_deref() {
-            if !dq.is_empty() {
-                let exists = db::qos_exists(pool, dq)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                if !exists {
-                    return Err(Status::not_found(format!("QOS '{dq}' does not exist")));
-                }
-            }
-        }
-        // Normalize + validate an explicitly restated allow-list. `None` leaves
-        // the stored allow-list untouched; an explicit empty clears it.
-        let allowed_qos_normalized: Option<String> = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
-        };
-        // Cross-check the default is in the allow-list only when both are
-        // restated here; a preserved (unset) side can't be validated without a
-        // read and is left to the stored value.
-        if let (Some(dq), Some(list)) = (
-            req.default_qos.as_deref(),
-            allowed_qos_normalized.as_deref(),
-        ) {
-            if !dq.is_empty() && !list.is_empty() && !list.split(',').any(|q| q == dq) {
-                return Err(Status::invalid_argument(format!(
-                    "default QOS '{dq}' must be included in qos={list}"
-                )));
-            }
-        }
+        let write =
+            validated_qos_edit(pool, req.allowed_qos.as_deref(), req.default_qos.as_deref())
+                .await?;
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
         }
         if let Some(t) = &req.grp_tres {
             validate_tres("grptres", t)?;
         }
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let current = match &write {
+            Some(write) if write.needs_current() => {
+                db::user_allowed_qos(&mut tx, &req.user, &req.account)
+                    .await
+                    .map_err(internal)?
+            }
+            _ => None,
+        };
+        let stored_qos = write
+            .as_ref()
+            .map(|write| qos_level::apply_write(current.as_deref(), write));
         let update = db::UserUpdate {
             admin_level,
             is_default: req.is_default,
             default_qos: nullable_str(&req.default_qos),
-            allowed_qos: nullable_str(&allowed_qos_normalized),
+            allowed_qos: stored_qos.as_ref().map(|value| value.as_deref()),
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             max_submit_jobs: nullable_limit(req.max_submit_jobs, "max_submit_jobs")?,
             grp_submit_jobs: nullable_limit(req.grp_submit_jobs, "grp_submit_jobs")?,
@@ -1111,7 +1139,6 @@ impl SlurmAccounting for AccountingService {
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        let mut tx = pool.begin().await.map_err(internal)?;
         let outcome = db::add_user(&mut tx, &req.user, &req.account, update)
             .await
             .map_err(internal)?;
@@ -1125,7 +1152,7 @@ impl SlurmAccounting for AccountingService {
                     ("admin_level", admin_level.map(Into::into)),
                     ("is_default", req.is_default.map(Into::into)),
                     ("default_qos", req.default_qos.map(Into::into)),
-                    ("allowed_qos", allowed_qos_normalized.map(Into::into)),
+                    ("allowed_qos", req.allowed_qos.map(Into::into)),
                     ("max_running_jobs", req.max_running_jobs.map(Into::into)),
                     ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
                 ]),
@@ -1479,6 +1506,12 @@ impl SlurmAccounting for AccountingService {
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
+        if qos_level::is_edit_marker(&req.name) {
+            return Err(Status::invalid_argument(format!(
+                "QOS name '{}' must not start with '+' or '-'",
+                req.name
+            )));
+        }
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
         }

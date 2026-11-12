@@ -214,6 +214,7 @@ mod tests {
             max_running_jobs: None,
             grp_tres: None,
             allowed_qos: None,
+            default_qos: None,
         }
     }
 
@@ -635,6 +636,7 @@ mod tests {
             max_running_jobs: None,
             grp_tres: None,
             allowed_qos: None,
+            default_qos: None,
         }];
         let mut user_weights = HashMap::new();
         user_weights.insert(("alice".into(), "research".into()), 1);
@@ -688,6 +690,7 @@ mod tests {
             max_running_jobs: None,
             grp_tres: None,
             allowed_qos: None,
+            default_qos: None,
         }];
         let mut user_weights = HashMap::new();
         user_weights.insert(("alice".into(), "research".into()), 1);

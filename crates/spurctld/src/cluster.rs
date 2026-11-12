@@ -12258,14 +12258,6 @@ fn apply_default_qos(
     // concurrent cache refresh can't validate one against the other's
     // stale snapshot.
     let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
-    // A stale pinned default (removed from qos_cache since it was set) is
-    // treated as unset for authorization, matching how the fallback chain
-    // below already ignores it rather than letting it block every explicit
-    // `--qos` a user could otherwise submit.
-    let default_qos_for_auth = default_qos
-        .as_deref()
-        .filter(|d| qos_cache.get(d).is_some())
-        .map(str::to_owned);
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
@@ -12278,7 +12270,7 @@ fn apply_default_qos(
                 "QOS '{name}' does not exist{hint}"
             )));
         }
-        if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
+        if !qos_permitted(allowed_qos.as_ref(), name) {
             return Err(SubmitError::invalid(format!(
                 "QOS '{name}' is not permitted for user '{}' under account '{}'",
                 spec.user,
@@ -12290,6 +12282,16 @@ fn apply_default_qos(
 
     if let Some(default_qos) = default_qos {
         if qos_cache.get(&default_qos).is_some() {
+            // Slurm refuses the job when the automatic QOS is not on the
+            // allow-list, rather than running it anyway or skipping to the
+            // cluster fallback.
+            if !qos_permitted(allowed_qos.as_ref(), &default_qos) {
+                return Err(SubmitError::invalid(format!(
+                    "default QOS '{default_qos}' is not permitted for user '{}' under account '{}'",
+                    spec.user,
+                    account.as_deref().unwrap_or_default()
+                )));
+            }
             spec.qos = Some(default_qos);
             return Ok(());
         }
@@ -12318,7 +12320,7 @@ fn apply_default_qos(
                 "configured default QOS '{fallback}' does not exist{hint}"
             )));
         }
-        if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
+        if qos_permitted(allowed_qos.as_ref(), fallback) {
             spec.qos = Some(fallback.to_string());
             return Ok(());
         }
@@ -35240,6 +35242,8 @@ state = "UP"
             ..Default::default()
         });
         cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["highprio"]);
+        cm.association_cache()
             .insert_default_qos("testuser", "research", "highprio");
         let mut spec = basic_spec("q");
         spec.account = Some("research".into());
@@ -35275,7 +35279,7 @@ state = "UP"
             "rejected update must leave the existing QOS untouched"
         );
 
-        // The association's own default QOS is still accepted explicitly.
+        // A QOS on the allow-list is still accepted explicitly.
         cm.update_job(
             id,
             None,
@@ -35308,6 +35312,8 @@ state = "UP"
             name: "other-teams-qos".into(),
             ..Default::default()
         });
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["highprio"]);
         cm.association_cache()
             .insert_default_qos("testuser", "research", "highprio");
         let id = submit_and_wait(&cm, basic_spec("q"));
@@ -37785,9 +37791,9 @@ state = "UP"
     }
 
     #[test]
-    fn apply_default_qos_explicit_unauthorized_qos_is_rejected() {
-        // An explicit QOS that exists but isn't the association's own default
-        // must be rejected, not silently accepted.
+    fn apply_default_qos_explicit_is_not_limited_to_the_default() {
+        // The default is what a job gets when it names no QOS. Naming another
+        // one is allowed when no allow-list applies.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "research", "highprio");
         let qos = qos_cache_with(&["highprio", "other-teams-qos"]);
@@ -37795,13 +37801,8 @@ state = "UP"
         spec.account = Some("research".into());
         spec.qos = Some("other-teams-qos".into());
 
-        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
-        assert_eq!(
-            err,
-            SubmitError::invalid(
-                "QOS 'other-teams-qos' is not permitted for user 'testuser' under account 'research'"
-            )
-        );
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("other-teams-qos"));
     }
 
     #[test]
@@ -37848,12 +37849,11 @@ state = "UP"
 
     #[test]
     fn apply_default_qos_explicit_rejects_other_accounts_qos() {
-        // A user in two accounts, each pinned to its own QOS, must not be
-        // able to borrow one account's QOS while submitting under the
-        // other.
+        // A user in two accounts, each with its own allow-list, must not be
+        // able to use one account's QOS while submitting under the other.
         let assoc = AssociationCache::new();
-        assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
-        assoc.insert_default_qos("testuser", "primus", "primus-qos");
+        assoc.insert_allowed_qos("testuser", "hyperloom", &["hyperloom-qos"]);
+        assoc.insert_allowed_qos("testuser", "primus", &["primus-qos"]);
         let qos = qos_cache_with(&["hyperloom-qos", "primus-qos"]);
         let mut spec = basic_spec("j");
         spec.account = Some("hyperloom".into());
@@ -37914,6 +37914,30 @@ state = "UP"
 
         super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn apply_default_qos_rejects_a_default_outside_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["burst"]);
+        assoc.insert_default_qos("testuser", "research", "normal");
+        let qos = qos_cache_with(&["burst", "normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("default QOS 'normal' is not permitted"),
+            "{err}"
+        );
+
+        spec.qos = Some("normal".into());
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert!(
+            err.to_string().contains("QOS 'normal' is not permitted"),
+            "{err}"
+        );
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────
