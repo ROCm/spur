@@ -552,9 +552,8 @@ message NodeInfo {
   // is blank because `[auth] private_data = ["reservations"]` hides its name.
   bool in_reservation = 63;
 
-  // The leader's heartbeats from this node have gone stale, so it is given no
-  // new work until they resume (Slurm's NOT_RESPONDING, the `*` suffix). Its
-  // base `state` and running jobs are unaffected. Leader-local, never persisted.
+  // Slurm's NOT_RESPONDING (`*`): the leader's heartbeats from this node are
+  // stale, so it takes no new work. Reflects the leader's view only.
   bool not_responding = 64;
 }
 

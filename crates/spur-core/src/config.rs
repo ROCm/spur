@@ -366,11 +366,9 @@ pub struct ControllerConfig {
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
 
-    /// Largest fraction of watched nodes that may fail their liveness probe or
-    /// miss a heartbeat in one health pass before the leader suspects its own
-    /// connectivity and marks none of them Down. Nodes whose agent answers do
-    /// not count. Configured in TOML as `[controller] max_stale_node_fraction`
-    /// (default: 0.5; 1.0 disables the check).
+    /// Largest fraction of watched nodes that may fail a liveness probe or miss
+    /// a heartbeat in one health pass before the leader suspects its own
+    /// connectivity and marks none Down (default: 0.5; 1.0 disables the check).
     #[serde(default = "default_max_stale_node_fraction")]
     pub max_stale_node_fraction: f64,
 
@@ -569,14 +567,16 @@ impl ControllerConfig {
     }
 
     /// A warning when a shutdown drain can outlast agent heartbeats: the draining controller
-    /// answers none, yet keeps checking node health, so it marks nodes DOWN and fails their jobs.
+    /// answers none, yet keeps checking node health, so it flags nodes not responding and can
+    /// mark operator-managed nodes, which it cannot probe, DOWN.
     pub fn shutdown_grace_warning(&self) -> Option<String> {
         let timeout = self.effective_heartbeat_timeout_secs();
         if self.shutdown_grace_secs == 0 {
             return Some(format!(
                 "[controller] shutdown_grace_secs = 0 lets a shutdown drain outlast \
                  heartbeat_timeout_secs ({timeout}s); the draining controller answers no \
-                 heartbeats, so it would mark nodes DOWN and fail their jobs"
+                 heartbeats, so it would flag nodes not responding and could mark \
+                 operator-managed nodes DOWN"
             ));
         }
         // A node's last heartbeat can be one interval old at the signal, and the flush follows.
@@ -587,7 +587,7 @@ impl ControllerConfig {
         Some(format!(
             "[controller] shutdown_grace_secs ({}s) is within {margin}s of heartbeat_timeout_secs \
              ({timeout}s); the draining controller answers no heartbeats, so a full drain would \
-             mark nodes DOWN and fail their jobs",
+             flag nodes not responding and could mark operator-managed nodes DOWN",
             self.shutdown_grace_secs
         ))
     }
@@ -2543,8 +2543,8 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
-        // Zero makes every heartbeat instantly stale, so the first health pass
-        // past the grace window marks every registered node Down.
+        // Zero makes every heartbeat instantly stale, so every node would be
+        // flagged not responding and take no new work.
         if self.controller.heartbeat_timeout_secs == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "controller.heartbeat_timeout_secs".into(),

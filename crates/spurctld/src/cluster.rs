@@ -5286,10 +5286,8 @@ impl ClusterManager {
         )
     }
 
-    /// Marks stale nodes Down as `mark_down` allows, and recovers nodes whose
-    /// heartbeat resumed. Staleness is judged here, when the pass applies, so a
-    /// node confirmed gone that has heartbeated since is kept. Returns finalized
-    /// jobs for cancel RPCs.
+    /// Staleness is re-judged here, when the pass applies, so a node confirmed
+    /// gone that has heartbeated since is kept. Returns finalized jobs for cancel RPCs.
     pub fn check_node_health(
         &self,
         timeout_secs: u64,
@@ -5326,10 +5324,8 @@ impl ClusterManager {
         self.apply_health_actions(actions)
     }
 
-    /// Flags a node NOT_RESPONDING when its heartbeat is stale or there is none
-    /// on record (a Down node the leader has not heard since), and clears the
-    /// flag on one heard from within the timeout. A flagged node keeps its
-    /// running jobs but takes no new work until heartbeats resume (Slurm's `*`).
+    /// A node with no heartbeat on record counts as not responding, so a Down
+    /// node keeps its `*` on a leader that has not heard it since.
     fn refresh_not_responding(&self, timeout_secs: u64, now: DateTime<Utc>) {
         let threshold = chrono::Duration::seconds(timeout_secs as i64);
         let mut nodes = self.nodes.write();
@@ -7413,10 +7409,8 @@ impl ClusterManager {
                 continue;
             }
 
-            // Eligible nodes exist but none can take work. is_up_for_work keeps a
-            // busy `Allocated` cluster out of NodeDown while also treating a
-            // not-responding node as unavailable; a nodelist pin to such nodes is
-            // ReqNodeNotAvail (Slurm parity).
+            // is_up_for_work keeps a busy `Allocated` cluster out of NodeDown; a
+            // nodelist pin to unavailable nodes is ReqNodeNotAvail (Slurm parity).
             if eligible.iter().all(|n| !n.is_up_for_work()) {
                 job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {

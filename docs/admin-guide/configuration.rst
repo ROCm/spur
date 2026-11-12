@@ -261,7 +261,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Restart
      - Seconds between node-health passes. After winning a Raft election the
        controller withholds DOWN marking for ``max(heartbeat_timeout_secs,
-       health_tick_secs)`` so heartbeats can refresh. Must be ``>= 1``.
+       health_tick_secs)`` so heartbeats can refresh. No node is flagged
+       not-responding in that window, so a silent node can still take new work.
+       Must be ``>= 1``.
    * - ``max_stale_node_fraction``
      - float
      - ``0.5``
@@ -270,10 +272,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        pass: nodes that fail their liveness probe, operator-managed nodes past
        the heartbeat timeout, and nodes that have missed a heartbeat. Nodes
        whose agent answers do not count. Watched nodes exclude ``DOWN``,
-       drained, and suspended ones. Above the limit (rounded down, never
-       below one node),
-       the leader assumes the fault is on its side, marks none of them Down,
-       and logs an error. Must be greater than ``0`` and at most ``1``; ``1``
+       drained (``drain``), and suspended ones; draining (``drng``) and
+       operator-managed nodes are watched. Above the limit (rounded down, never
+       below one node, so a single silent node never trips it), the leader
+       assumes the fault is on its side, marks none of them Down, operator-managed
+       ones included, and logs an error. Must be greater than ``0`` and at most ``1``; ``1``
        turns the check off. See :ref:`node-liveness`.
    * - ``max_batch_requeue``
      - integer
@@ -372,8 +375,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        ``heartbeat_timeout_secs``: the draining controller answers no
        heartbeats but still checks node health, so a grace within 35 seconds of
        that timeout (one heartbeat interval plus the flush) lets a full drain
-       mark nodes DOWN and fail their jobs, and so can ``0``, whose drain has no
-       bound. ``spurctld`` warns at startup in either case. Also keep the grace,
+       flag nodes not-responding and mark operator-managed nodes, which it
+       cannot probe, ``DOWN``. So can ``0``, whose drain has no bound.
+       ``spurctld`` warns at startup in either case. Also keep the grace,
        plus up to 5 seconds for the accounting flush that follows, below your
        service manager's stop timeout (systemd ``TimeoutStopSec``, Kubernetes
        ``terminationGracePeriodSeconds``): a ``SIGKILL`` from that timeout skips

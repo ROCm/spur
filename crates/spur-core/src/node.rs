@@ -360,10 +360,8 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
-    /// Leader-local: the leader's heartbeats from this node have gone stale, so
-    /// it is given no new work until they resume (Slurm's NOT_RESPONDING, the
-    /// `*` suffix). Its running jobs are untouched. Never persisted; a new leader
-    /// starts it false and recomputes it from heartbeats.
+    /// Slurm's NOT_RESPONDING (`*`). Leader-local and never persisted: only the
+    /// leader sees heartbeats, so each leader rebuilds it from its own.
     #[serde(skip)]
     pub not_responding: bool,
 
@@ -497,10 +495,8 @@ impl Node {
         !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
     }
 
-    /// Whether this node can accept new work. A node whose heartbeats have gone
-    /// stale (`not_responding`) takes none until they resume, though its running
-    /// jobs continue; one whose core settings cannot yield a valid layout takes
-    /// none until the settings are fixed, as it could not enforce its spec cores.
+    /// Whether this node can accept new work. One whose core settings cannot
+    /// yield a valid layout is excluded, as it could not enforce its spec cores.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available() && !self.not_responding && self.layout_block_reason().is_none()
     }

@@ -352,7 +352,8 @@ Enable and start it:
    and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
    what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
    well below ``heartbeat_timeout_secs``, since the draining controller answers no
-   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   heartbeats and would flag every node not-responding (see :ref:`node-liveness`), and
+   avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
    grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
    unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
    flush.
@@ -419,21 +420,24 @@ agent must answer with the node's own name to count as alive:
   of the watched nodes, rounded down but never below one, the leader assumes the fault is
   on its side, marks none of them ``DOWN``, logs ``suspecting the control plane`` at
   error level, and sets the ``spur_nodes_liveness_breaker_tripped`` gauge to ``1`` until a
-  pass that does not trip. Watched nodes are those not ``DOWN``, drained, or suspended, so draining
-  part of the cluster lowers the number of suspects it takes. Silent nodes are still
+  pass that does not trip. Watched nodes are those not ``DOWN``, drained (``drain``), or
+  suspended; draining (``drng``) and operator-managed nodes are watched. Draining part of the
+  cluster to ``drain`` lowers the number of suspects it takes. Silent nodes are still
   probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
   the two-probe rule above. To mark nodes down sooner, use
   ``scontrol update nodename=<node> state=down``.
 
 Nodes managed by the Kubernetes operator are not probed; they are marked ``DOWN`` on the
-heartbeat timeout alone, though they count toward the limit above.
+heartbeat timeout alone. They count toward the limit above, and while it is tripped they
+are held up like every other node.
 
 The not-responding flag is the current leader's view: each leader builds it from the
 heartbeats it receives, and a controller that loses leadership drops its flags. After a
 leadership change the flag stays blank for a grace window of
 ``controller.heartbeat_timeout_secs`` (at least one health pass), while the new leader
-waits to hear from the agents; nodes are not marked ``DOWN`` in that window either. Once
-it ends, a ``DOWN`` node the leader has not heard from shows as ``down*``.
+waits to hear from the agents, so a silent node can still take new work in that window;
+nodes are not marked ``DOWN`` in it either. Once it ends, a ``DOWN`` node the leader has
+not heard from shows as ``down*``.
 
 Joining Worker Nodes
 --------------------

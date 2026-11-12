@@ -191,10 +191,8 @@ impl OverlayFilter {
     }
 }
 
-/// Parsed `-t` / `--states` filter, whose tokens OR as in Slurm: `base` holds
-/// real node states, `overlays` display-only labels, and `no_respond` the
-/// not-responding flag. `dead` and `responding` (`--dead` / `--responding`)
-/// AND with the list and with each other.
+/// Parsed `-t` / `--states` filter. As in Slurm, the `-t` tokens OR together,
+/// while `--dead` / `--responding` AND with them and with each other.
 #[derive(Default)]
 struct StateFilter {
     base: Vec<spur_proto::proto::NodeState>,

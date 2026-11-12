@@ -177,9 +177,8 @@ class TestDownNodeFailsJobs:
     # that makes a live node's heartbeat look stale to most health ticks and
     # it never recovers. Keep well above 30s so only a truly dead agent trips it.
     HB_TIMEOUT = 60
-    # Pinned so the DOWN budget below is exact: once a node is stale the leader
-    # confirms it with a direct probe and only marks it DOWN after two failed
-    # probes a health pass apart, so DOWN lands about two ticks after the timeout.
+    # Pinned so the DOWN budget below is exact: DOWN needs two failed probes a
+    # health pass apart.
     HEALTH_TICK = 30
 
     @pytest.fixture

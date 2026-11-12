@@ -796,21 +796,54 @@ after the flush is lost.
 
 The default suits most sites. Keep it well below ``heartbeat_timeout_secs``: the controller
 answers no heartbeats while it drains, so a grace within about 35 seconds of that timeout
-lets a full drain mark nodes DOWN and fail their jobs. ``0`` restores the unbounded wait,
+lets a full drain flag nodes not-responding and mark operator-managed nodes, which it cannot
+probe, ``DOWN``. ``0`` restores the unbounded wait,
 which can run past that timeout too, and which a repeated ``SIGTERM`` or ``SIGINT`` does not
 end; only ``SIGKILL`` does. ``spurctld`` warns at startup in either case. Keep the grace,
 plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step that
 finishes during the drain does not end it, so raising the value mostly lengthens the
 restart. A new value takes effect at the next start.
 
+.. _node-liveness-upgrade-notes:
+
+Confirmed node ``DOWN`` and the not-responding flag
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The leader no longer marks a node ``DOWN`` as soon as its heartbeats pass
+``controller.heartbeat_timeout_secs``. It flags the node not-responding (``*`` in ``sinfo``),
+which keeps new work off it, and asks the node's agent directly. See :ref:`node-liveness`.
+
+- **A dead node goes** ``DOWN`` **one pass later.** Its agent must fail to answer on two
+  health passes at least ``controller.health_tick_secs`` apart, so ``NODE_FAIL`` and the
+  requeue of a ``--requeue`` job come about one pass later than before. Nodes managed by the
+  Kubernetes operator are not probed and keep the timeout rule.
+- **A node whose heartbeats cannot reach a controller is no longer marked** ``DOWN``. If its
+  agent answers, it stays up and flagged, keeping its running jobs, until its heartbeats
+  resume. Such an agent often cannot report job completions either, so its finished jobs can
+  stay running. The leader warns about the node every 10 minutes and
+  ``spur_nodes_not_responding`` counts it.
+- **A mass silence marks no node** ``DOWN``. When the nodes that fail their probe or miss a
+  heartbeat in one pass exceed ``controller.max_stale_node_fraction`` (default ``0.5``) of
+  the watched nodes, rounded down but never below one node (so a single silent node never
+  trips it), the leader assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
+  needs ``scontrol update nodename=<nodes> state=down``. Alert on
+  ``spur_nodes_liveness_breaker_tripped``, or set the fraction to ``1`` to turn the check off.
+- **Older clients do not show the flag.** It is a new field in the node reply, so an
+  ``sinfo`` or ``scontrol`` from an earlier release shows no ``*`` or ``+NOT_RESPONDING`` and
+  lacks ``-d``, ``-r``, and ``-t no_respond``.
+
+No configuration change is needed. The flag lives only in the leader's memory, so no Raft
+entry is added and rolling back is safe; an older controller ignores
+``max_stale_node_fraction``.
+
 .. _requeued-run-upgrade-notes:
 
 Stopping a requeued job's run on a recovered node
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
-with ``--requeue`` goes back to the queue, but the job's nodes are not told to
-stop when they go Down. From this release, the controller stops that run when a
+When a node is marked Down after missing heartbeats, its jobs end ``NODE_FAIL``
+and a job submitted with ``--requeue`` goes back to the queue, but the job's
+nodes are not told to stop when they go Down. From this release, the controller stops that run when a
 node heartbeats again, even while the job is still waiting in the queue. Before,
 a node kept the run and its GPUs until the job ended or ran again, and refused
 every job placed on those GPUs in the meantime.

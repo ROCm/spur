@@ -402,8 +402,9 @@ on ``State=``, the REST node object carries a ``not_responding`` boolean, and
 ``spur health`` stars the node and counts it as unhealthy.
 
 The flag is the current leader's view of its heartbeats. It is blank for the
-grace window after a leadership change (see :ref:`node-liveness`), and a
-``DOWN`` node the leader has not heard from shows as ``down*``.
+grace window after a leadership change (see :ref:`node-liveness`), so a silent
+node can still take new work in that window. Once it ends, a ``DOWN`` node the
+leader has not heard from shows as ``down*``.
 
 Accounting History — ``sacct``
 -------------------------------

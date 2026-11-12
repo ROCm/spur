@@ -1,14 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Confirms a node is really gone before the leader marks it Down.
-//!
-//! Heartbeats live only in the leader's memory and often reach it through a
-//! follower, so silence cannot tell a dead node from a broken path or a
-//! struggling leader. The leader asks a silent node's agent directly, marks it
-//! Down only after it fails to answer on two consecutive passes, and marks no
-//! one Down when so many nodes fail to answer or miss heartbeats at once that
-//! the fault is likely its own.
+//! Confirms a node is really gone before the leader marks it Down. Heartbeats
+//! often reach the leader through a follower, so silence alone cannot tell a
+//! dead node from a broken path or a struggling leader.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -146,9 +141,8 @@ pub(crate) enum Verdict {
     MarkDown,
 }
 
-/// A node's run of consecutive failed probes: how many, when the first one in
-/// the run landed, so later failures can be checked for spacing, and the node's
-/// last heartbeat as of that first failure.
+/// A node's run of consecutive failed probes. `first` and `last_heartbeat` are
+/// taken at the run's first failure, to check later failures against.
 #[derive(Debug)]
 struct FailureRun {
     count: u32,
@@ -166,15 +160,12 @@ impl FailureRun {
     }
 }
 
-/// Per-node probe history across passes. Only consecutive failures count, so a
-/// node that answers, heartbeats, or stops being stale starts over. A second
-/// failure marks the node Down only when that probe ran at least `min_gap`
-/// after the first failed one, so a probe queued late in one pass and run early
-/// in the next cannot count one outage twice. Answering nodes map to when the
-/// leader last warned about them.
+/// Per-node probe history across passes. Only consecutive failures at least
+/// `min_gap` apart count, so one outage seen by back-to-back probes counts once.
 #[derive(Debug, Default)]
 pub(crate) struct StrikeTracker {
     failures: HashMap<String, FailureRun>,
+    /// Answering nodes, mapped to when the leader last warned about them.
     answering: HashMap<String, Instant>,
     min_gap: Duration,
 }
@@ -213,9 +204,8 @@ impl StrikeTracker {
                     *run = FailureRun::starting(now, last_heartbeat);
                 }
                 run.count += 1;
-                // A sweep that overran its tick lets the next start at once, so
-                // a node probed late in one and early in the next would strike
-                // twice in moments; the gap keeps the two a health pass apart.
+                // An overrun sweep lets the next start at once, which would
+                // strike a node twice in moments.
                 let spaced =
                     now.saturating_duration_since(run.first) + STRIKE_SPACING_SLACK >= self.min_gap;
                 if run.count >= FAILED_PROBES_TO_MARK_DOWN && spaced {
@@ -286,11 +276,8 @@ impl NodeLiveness {
         self.term = leading_term;
     }
 
-    /// One health pass: confirms which stale nodes are really gone, then applies
-    /// the pass with only those allowed to go Down. `still_leading` is re-checked
-    /// after the probes: a probe sweep can take seconds, and a leadership change
-    /// in that window means these decisions were judged by a leadership that no
-    /// longer holds, so the whole pass is dropped.
+    /// One health pass. `still_leading` is re-checked after the probes, which can
+    /// take seconds, so a pass judged under a lost leadership is dropped.
     pub(crate) async fn sweep<P: Prober, F: Fn() -> bool>(
         &mut self,
         cluster: &ClusterManager,
@@ -313,10 +300,8 @@ impl NodeLiveness {
         cluster.check_node_health(timeout_secs, mark_down)
     }
 
-    /// Probes every stale node that has an agent to ask, then judges the
-    /// silent-node limit by the nodes that did not answer. During a mass silence
-    /// every stale node is probed each pass, so a pass can overrun its tick: that
-    /// delays recoveries but marks nobody Down wrongly.
+    /// Judges the silent-node limit after probing, by the nodes that did not
+    /// answer. A mass silence can overrun the tick, which only delays recoveries.
     async fn confirm<P: Prober>(
         &mut self,
         cluster: &ClusterManager,

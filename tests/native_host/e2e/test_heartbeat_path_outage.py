@@ -1,14 +1,9 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E regression tests for jobs ended on healthy nodes after lost heartbeats.
-
-Heartbeats live only in the Raft leader's memory and often reach it through a
-follower, so the leader must not read their absence as a dead node. These tests
-break the heartbeat path in the two shapes seen in production and check that no
-job ends, cut the leader off from every node to check it blames itself, then
-check that a node whose agent is really gone still goes DOWN.
-"""
+"""E2E regression tests for jobs ended on healthy nodes after lost heartbeats:
+a broken heartbeat path must not read as a dead node, while a dead agent still
+goes DOWN."""
 
 import time
 

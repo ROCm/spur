@@ -177,12 +177,8 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
 
 @contextlib.contextmanager
 def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
-    """Drop one node's outbound traffic to every controller's client port.
-
-    The node's agent can no longer heartbeat anywhere, while controllers can
-    still reach the agent: the shape of a broken heartbeat path on a live node.
-    Always removes the rule on exit, including when the body raises.
-    """
+    """Drop one node's outbound traffic to every controller's client port, so its
+    agent cannot heartbeat but controllers can still reach it. Always undone on exit."""
     node = cluster.nodes[node_index]
     rule_args = f"-p tcp --dport {port} -j DROP"
     node.exec(f"sudo iptables -I OUTPUT {rule_args}")
@@ -194,12 +190,9 @@ def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = C
 
 @contextlib.contextmanager
 def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
-    """Drop inbound traffic to one controller's client port from every node.
-
-    Raft and the controller's own calls to agents keep working, so it stays
-    leader and can reach every agent, but no heartbeat reaches it, directly or
-    forwarded by a follower. Always removes the rules on exit.
-    """
+    """Drop inbound traffic to one controller's client port from every node, so no
+    heartbeat reaches it while Raft and its calls to agents keep working.
+    Always undone on exit."""
     controller = cluster.nodes[node_index]
     sources = ",".join(node.host for node in cluster.nodes)
     rule_args = f"-p tcp --dport {port} -s {sources} -j DROP"
@@ -212,12 +205,8 @@ def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = C
 
 @contextlib.contextmanager
 def isolate_controller(cluster: "SpurCluster", node_index: int):
-    """Cut one controller off from every node both ways, keeping Raft up.
-
-    Drops inbound traffic to its client port from every node and its outbound
-    calls to every agent, so it stays leader but can neither hear a heartbeat
-    nor reach an agent to probe. Always removes the rules on exit.
-    """
+    """Cut one controller off from every node both ways, keeping Raft up, so it can
+    neither hear a heartbeat nor probe an agent. Always undone on exit."""
     controller = cluster.nodes[node_index]
     hosts = ",".join(node.host for node in cluster.nodes)
     rules = [
