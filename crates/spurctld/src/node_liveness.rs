@@ -15,6 +15,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use spur_core::node::NodeSource;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -57,6 +58,7 @@ impl ProbeOutcome {
 pub(crate) struct ProbeTarget {
     pub(crate) node: String,
     pub(crate) endpoint: Option<String>,
+    pub(crate) last_heartbeat: Option<DateTime<Utc>>,
 }
 
 /// How a pass reaches a silent node, so the decision can be tested without one.
@@ -149,19 +151,31 @@ pub(crate) enum Verdict {
     MarkDown,
 }
 
-/// A node's run of consecutive failed probes: how many, and when the first one
-/// in the run landed, so later failures can be checked for spacing.
+/// A node's run of consecutive failed probes: how many, when the first one in
+/// the run landed, so later failures can be checked for spacing, and the node's
+/// last heartbeat as of that first failure.
 #[derive(Debug)]
 struct FailureRun {
     count: u32,
     first: Instant,
+    last_heartbeat: Option<DateTime<Utc>>,
+}
+
+impl FailureRun {
+    fn starting(now: Instant, last_heartbeat: Option<DateTime<Utc>>) -> Self {
+        Self {
+            count: 0,
+            first: now,
+            last_heartbeat,
+        }
+    }
 }
 
 /// Per-node probe history across passes. Only consecutive failures count, so a
-/// node that answers, or stops being stale, starts over. A second failure marks
-/// the node Down only when that probe ran at least `min_gap` after the first
-/// failed one, so a probe queued late in one pass and run early in the next
-/// cannot count one outage twice.
+/// node that answers, heartbeats, or stops being stale starts over. A second
+/// failure marks the node Down only when that probe ran at least `min_gap`
+/// after the first failed one, so a probe queued late in one pass and run early
+/// in the next cannot count one outage twice.
 #[derive(Debug, Default)]
 pub(crate) struct StrikeTracker {
     failures: HashMap<String, FailureRun>,
@@ -177,7 +191,13 @@ impl StrikeTracker {
         }
     }
 
-    pub(crate) fn record(&mut self, node: &str, outcome: &ProbeOutcome, now: Instant) -> Verdict {
+    pub(crate) fn record(
+        &mut self,
+        node: &str,
+        last_heartbeat: Option<DateTime<Utc>>,
+        outcome: &ProbeOutcome,
+        now: Instant,
+    ) -> Verdict {
         match outcome {
             ProbeOutcome::Alive => {
                 self.failures.remove(node);
@@ -187,10 +207,15 @@ impl StrikeTracker {
             }
             ProbeOutcome::Unreachable(_) => {
                 self.answering.remove(node);
-                let run = self.failures.entry(node.to_string()).or_insert(FailureRun {
-                    count: 0,
-                    first: now,
-                });
+                let run = self
+                    .failures
+                    .entry(node.to_string())
+                    .or_insert_with(|| FailureRun::starting(now, last_heartbeat));
+                // With a timeout shorter than a tick, a node can heartbeat between
+                // passes and be stale again by the next; it was up in between.
+                if run.last_heartbeat != last_heartbeat {
+                    *run = FailureRun::starting(now, last_heartbeat);
+                }
                 run.count += 1;
                 // A sweep that overran its tick lets the next start at once, so
                 // a node probed late in one and early in the next would strike
@@ -339,7 +364,10 @@ impl NodeLiveness {
             at,
         } = result;
         let node = target.node;
-        match self.strikes.record(&node, &outcome, at) {
+        match self
+            .strikes
+            .record(&node, target.last_heartbeat, &outcome, at)
+        {
             Verdict::Keep { first: true } => warn!(
                 node = %node,
                 "heartbeats from this node stopped reaching the leader, but its agent answers; not marking it Down"
@@ -382,6 +410,7 @@ fn split_by_source(cluster: &ClusterManager, names: &[String]) -> (Vec<String>, 
         targets.push(ProbeTarget {
             endpoint: crate::scheduler_loop::node_comm_http_url(&node),
             node: name.clone(),
+            last_heartbeat: node.last_heartbeat,
         });
     }
     (operator_managed, targets)
@@ -473,20 +502,32 @@ mod tests {
     fn a_node_is_marked_down_only_after_two_consecutive_failed_probes() {
         let mut strikes = StrikeTracker::default();
         let now = Instant::now();
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::MarkDown);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::Wait
+        );
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::MarkDown
+        );
     }
 
     #[test]
     fn an_answer_between_failures_starts_the_count_over() {
         let mut strikes = StrikeTracker::default();
         let now = Instant::now();
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive, now),
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::Wait
+        );
+        assert_eq!(
+            strikes.record("n1", None, &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::Wait
+        );
     }
 
     #[test]
@@ -494,16 +535,16 @@ mod tests {
         let mut strikes = StrikeTracker::default();
         let now = Instant::now();
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive, now),
+            strikes.record("n1", None, &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive, now),
+            strikes.record("n1", None, &ProbeOutcome::Alive, now),
             Verdict::Keep { first: false }
         );
         strikes.retain(&HashSet::new());
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive, now),
+            strikes.record("n1", None, &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
     }
@@ -512,14 +553,20 @@ mod tests {
     fn clearing_failures_keeps_the_answering_nodes() {
         let mut strikes = StrikeTracker::default();
         let now = Instant::now();
-        strikes.record("up", &ProbeOutcome::Alive, now);
-        assert_eq!(strikes.record("down", &unreachable(), now), Verdict::Wait);
+        strikes.record("up", None, &ProbeOutcome::Alive, now);
+        assert_eq!(
+            strikes.record("down", None, &unreachable(), now),
+            Verdict::Wait
+        );
 
         strikes.clear_failures();
 
-        assert_eq!(strikes.record("down", &unreachable(), now), Verdict::Wait);
         assert_eq!(
-            strikes.record("up", &ProbeOutcome::Alive, now),
+            strikes.record("down", None, &unreachable(), now),
+            Verdict::Wait
+        );
+        assert_eq!(
+            strikes.record("up", None, &ProbeOutcome::Alive, now),
             Verdict::Keep { first: false }
         );
     }
@@ -528,9 +575,15 @@ mod tests {
     fn a_node_that_stops_being_stale_loses_its_strike() {
         let mut strikes = StrikeTracker::default();
         let now = Instant::now();
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::Wait
+        );
         strikes.retain(&HashSet::new());
-        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), now),
+            Verdict::Wait
+        );
     }
 
     #[test]
@@ -538,16 +591,19 @@ mod tests {
         let gap = Duration::from_secs(15);
         let mut strikes = StrikeTracker::new(gap);
         let t0 = Instant::now();
-        assert_eq!(strikes.record("n1", &unreachable(), t0), Verdict::Wait);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), t0),
+            Verdict::Wait
+        );
         // A sweep that overran its tick probes again almost at once: the same
         // outage seen twice, not a second independent pass.
         assert_eq!(
-            strikes.record("n1", &unreachable(), t0 + Duration::from_secs(1)),
+            strikes.record("n1", None, &unreachable(), t0 + Duration::from_secs(1)),
             Verdict::Wait
         );
         // A genuine second pass, a health tick later, marks it Down.
         assert_eq!(
-            strikes.record("n1", &unreachable(), t0 + Duration::from_secs(16)),
+            strikes.record("n1", None, &unreachable(), t0 + Duration::from_secs(16)),
             Verdict::MarkDown
         );
     }
@@ -557,11 +613,48 @@ mod tests {
         let gap = Duration::from_secs(15);
         let mut strikes = StrikeTracker::new(gap);
         let t0 = Instant::now();
-        assert_eq!(strikes.record("n1", &unreachable(), t0), Verdict::Wait);
+        assert_eq!(
+            strikes.record("n1", None, &unreachable(), t0),
+            Verdict::Wait
+        );
         // Just under a full tick, within the spacing slack: a timer landing
         // early must not push Down a whole pass later.
         assert_eq!(
-            strikes.record("n1", &unreachable(), t0 + Duration::from_millis(14_700)),
+            strikes.record(
+                "n1",
+                None,
+                &unreachable(),
+                t0 + Duration::from_millis(14_700)
+            ),
+            Verdict::MarkDown
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_between_failures_starts_the_run_over() {
+        let gap = Duration::from_secs(15);
+        let mut strikes = StrikeTracker::new(gap);
+        let t0 = Instant::now();
+        let before = Some(Utc::now() - chrono::Duration::seconds(60));
+        let after = Some(Utc::now() - chrono::Duration::seconds(20));
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        assert_eq!(
+            strikes.record("n1", before, &unreachable(), at(0)),
+            Verdict::Wait
+        );
+        assert_eq!(
+            strikes.record("n1", after, &unreachable(), at(16)),
+            Verdict::Wait,
+            "a heartbeat landed between the two failures"
+        );
+        // The run restarted at the second failure, so spacing counts from there.
+        assert_eq!(
+            strikes.record("n1", after, &unreachable(), at(17)),
+            Verdict::Wait
+        );
+        assert_eq!(
+            strikes.record("n1", after, &unreachable(), at(32)),
             Verdict::MarkDown
         );
     }
@@ -585,6 +678,7 @@ mod tests {
             .map(|i| ProbeTarget {
                 node: format!("n{i}"),
                 endpoint: None,
+                last_heartbeat: None,
             })
             .collect()
     }
@@ -876,7 +970,7 @@ mod tests {
         assert_eq!(
             liveness
                 .strikes
-                .record("a", &ProbeOutcome::Alive, Instant::now()),
+                .record("a", None, &ProbeOutcome::Alive, Instant::now()),
             Verdict::Keep { first: false },
             "a node that kept answering through a trip is not new"
         );
@@ -966,6 +1060,43 @@ mod tests {
 
         assert!(evicted.is_empty());
         assert_eq!(state(&cm, "n1"), NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_between_failed_probes_starts_the_count_over() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1"]).await;
+        silent_for(&cm, &["n1"], 30);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        // A timeout shorter than a tick: n1 heartbeats between passes, yet is
+        // stale again by the next one.
+        let timeout_secs = 10;
+
+        liveness
+            .sweep(&cm, timeout_secs, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        silent_for(&cm, &["n1"], 20);
+        liveness
+            .sweep(&cm, timeout_secs, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        assert_eq!(
+            state(&cm, "n1"),
+            NodeState::Idle,
+            "failures either side of a heartbeat are not consecutive"
+        );
+
+        liveness
+            .sweep(&cm, timeout_secs, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        assert_eq!(prober.probed(), vec!["n1", "n1", "n1"]);
+        wait_for(
+            "a second failure with no heartbeat between marks down",
+            || {
+                cm.get_node("n1")
+                    .is_some_and(|n| n.state == NodeState::Down)
+            },
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1187,6 +1318,7 @@ mod tests {
         ProbeTarget {
             node: node.into(),
             endpoint: Some(format!("http://{addr}")),
+            last_heartbeat: None,
         }
     }
 
@@ -1236,6 +1368,7 @@ mod tests {
         let outcome = probe_agent(ProbeTarget {
             node: "n1".into(),
             endpoint: None,
+            last_heartbeat: None,
         })
         .await;
         assert!(matches!(outcome, ProbeOutcome::Unreachable(_)));

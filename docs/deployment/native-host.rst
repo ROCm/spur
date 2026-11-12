@@ -399,7 +399,8 @@ agent directly before marking it down:
   Look for ``heartbeat failed`` in the agent's log to find the broken path.
 - **The agent does not answer on two consecutive health passes**
   (``controller.health_tick_secs``, default 30; the second failed probe counts only if it ran
-  at least one pass after the first). The node is marked ``DOWN`` with reason
+  at least one pass after the first, and only if no heartbeat arrived between the two). The
+  node is marked ``DOWN`` with reason
   ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were submitted
   with ``--requeue``.
 - **Many nodes go silent at once.** Each pass probes every silent node first, then counts
