@@ -238,6 +238,7 @@ SpurJobs
 SSHes
 StatefulSet
 StatefulSets
+stderr
 stdin
 stdout
 StorageClass
