@@ -4455,6 +4455,21 @@ impl ClusterManager {
         self.recovery_holds.write().clear();
     }
 
+    /// On leadership gain, hold every Down or Error node until it reports to
+    /// this leader: a replicated heartbeat stamp says nothing about its jobs.
+    pub(crate) fn hold_down_nodes_until_reported(&self) {
+        let nodes = self.nodes.read();
+        let mut reports = self.stale_reporting_nodes.write();
+        let down = nodes
+            .values()
+            .filter(|n| matches!(n.state, NodeState::Down | NodeState::Error));
+        for node in down {
+            reports
+                .entry(node.name.clone())
+                .or_insert(NodeReport::Unknown);
+        }
+    }
+
     fn end_recovery_hold(&self, node: &str) {
         self.recovery_holds.write().remove(node);
     }
