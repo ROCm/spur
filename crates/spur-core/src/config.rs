@@ -423,7 +423,7 @@ pub struct ControllerConfig {
     pub dispatch_reject_cooldown_secs: u64,
 
     /// Ceiling on a single launch or allocation-register RPC to an agent (default 300, 0 disables).
-    /// Must exceed the slowest node prolog, which runs inside the launch call.
+    /// Must exceed the slowest node prolog plus the epilog bound; both can run in the launch call.
     #[serde(default = "default_dispatch_timeout_secs")]
     pub dispatch_timeout_secs: u64,
 
