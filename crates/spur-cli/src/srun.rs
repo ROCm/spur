@@ -679,7 +679,7 @@ fn build_srun_job_spec(
             nanos: 0,
         });
 
-    let environment = srun_dispatch_environment(args, std::env::vars().collect());
+    let environment = srun_dispatch_environment(args, crate::export_env::submission_env("srun"));
 
     let memory_mb = args
         .mem
@@ -934,7 +934,7 @@ async fn dispatch_step(
         eprintln!("{warning}");
     }
 
-    let environment = srun_dispatch_environment(args, std::env::vars().collect());
+    let environment = srun_dispatch_environment(args, crate::export_env::submission_env("srun"));
     validate_step_cpu_bind(&environment, ntasks)?;
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
@@ -1759,6 +1759,7 @@ pub(crate) async fn run_interactive_pty(
 
     let outcome: Result<i32> = 'session: {
         let mut last_err: Option<anyhow::Error> = None;
+        let mut announced_busy_slot = false;
 
         for attempt in 0..RECONNECT_ATTEMPTS {
             if attempt > 0 {
@@ -1877,6 +1878,12 @@ pub(crate) async fn run_interactive_pty(
                 Ok(Err(status))
                     if is_retryable_status(&status) && attempt < RECONNECT_ATTEMPTS - 1 =>
                 {
+                    // A stale session clears within a few retries but a live one
+                    // never does, so the user is told why nothing is happening yet.
+                    if status.code() == tonic::Code::AlreadyExists && !announced_busy_slot {
+                        eprintln!("srun: warning: {}; retrying...", status.message());
+                        announced_busy_slot = true;
+                    }
                     last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
                     continue;
                 }

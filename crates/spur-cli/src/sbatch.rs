@@ -874,8 +874,10 @@ pub(crate) fn build_sbatch_job_spec(
         .transpose()?;
 
     // Build environment
-    let mut environment =
-        crate::export_env::resolve_export_env(&args.export, std::env::vars().collect());
+    let mut environment = crate::export_env::resolve_export_env(
+        &args.export,
+        crate::export_env::submission_env("sbatch"),
+    );
 
     // Only a non-default mode is recorded, as in Slurm, so a plain job leaves any
     // user-set value alone. No SPUR_ twin: srun reads SPUR_EXPORT_ENV first, so a

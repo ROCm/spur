@@ -139,7 +139,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         work_dir: std::env::current_dir()
             .map(|dir| dir.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        environment: crate::export_env::without_credentials(std::env::vars().collect()),
+        environment: crate::export_env::without_credentials(crate::export_env::submission_env(
+            "salloc",
+        )),
     };
     let job_spec = build_salloc_job_spec(&args, nodelist, &submit_line, submission)?;
     let submit_user = job_spec.user.clone();

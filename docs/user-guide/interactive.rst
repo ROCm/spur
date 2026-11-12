@@ -197,7 +197,9 @@ locally. This is Slurm's ``LaunchParameters=use_interactive_step``.
 The shell runs inside the job's cgroup, with your submission directory,
 environment, and the allocation's ``SPUR_*`` / ``SLURM_*`` variables. It does
 not hold any of the allocation's resources, so ``srun`` steps started from it
-can use all of them. Exiting the shell releases the allocation, and ``salloc``
+can use all of them. Once the shell is up, Ctrl-C goes to it like any other
+keystroke instead of cancelling the allocation; while the allocation is still
+pending, Ctrl-C cancels it as usual. Exiting the shell releases the allocation, and ``salloc``
 exits with the shell's exit code. If the job ends first (time limit,
 ``scancel``), the node ends the shell and ``salloc`` exits.
 
@@ -205,8 +207,9 @@ Limitations:
 
 - A node runs one interactive terminal per job at a time. While the ``salloc``
   shell is open on the first node, another ``srun --pty`` (nested, or
-  ``srun --jobid <id> --overlap --pty`` from another terminal) on that node is
-  refused. Use ``-w`` to open it on another allocated node.
+  ``srun --jobid <id> --overlap --pty`` from another terminal) on that node
+  warns that a session is already active and is refused after about ten
+  seconds of retries. Use ``-w`` to open it on another allocated node.
 - Under JWT authentication the shell on the node does not inherit
   ``$SPUR_AUTH_TOKEN``, so ``srun`` from it reads ``~/.spur/token``, which must
   be readable on the node. ``[auth] plugin = "spur"`` needs no token.

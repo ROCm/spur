@@ -5,6 +5,39 @@
 //! `--export` grammar so the two entry points stay identical.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+
+/// The caller's environment, for a job spec. A job spec carries strings, so a
+/// variable whose name or value is not UTF-8 is left out and named on stderr
+/// instead of aborting the command.
+pub(crate) fn submission_env(tool: &str) -> HashMap<String, String> {
+    let (env, skipped) = utf8_env(std::env::vars_os());
+    if !skipped.is_empty() {
+        eprintln!(
+            "{tool}: warning: not forwarding environment variables that are not valid UTF-8: {}",
+            skipped.join(", ")
+        );
+    }
+    env
+}
+
+fn utf8_env(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut env = HashMap::new();
+    let mut skipped = Vec::new();
+    for (key, value) in vars {
+        match (key.into_string(), value.into_string()) {
+            (Ok(key), Ok(value)) => {
+                env.insert(key, value);
+            }
+            (Ok(key), Err(_)) => skipped.push(key),
+            (Err(key), _) => skipped.push(key.to_string_lossy().into_owned()),
+        }
+    }
+    skipped.sort();
+    (env, skipped)
+}
 
 /// Whether `spec` is the default `ALL` mode (case-insensitive, as in Slurm).
 pub(crate) fn is_export_all(spec: &str) -> bool {
@@ -122,6 +155,22 @@ mod tests {
             let named = resolve_export_env(&format!("NONE,{cred}"), source);
             assert_eq!(named[*cred], "secret", "{cred} not forwarded when named");
         }
+    }
+
+    #[test]
+    fn utf8_env_skips_and_names_variables_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = || OsString::from_vec(vec![b'x', 0xff]);
+        let (env, skipped) = utf8_env([
+            (OsString::from("HOME"), OsString::from("/home/me")),
+            (OsString::from("BAD_VALUE"), bad()),
+            (bad(), OsString::from("1")),
+        ]);
+        assert_eq!(env, [("HOME".to_string(), "/home/me".to_string())].into());
+        assert_eq!(
+            skipped,
+            vec!["BAD_VALUE".to_string(), "x\u{FFFD}".to_string()]
+        );
     }
 
     #[test]
