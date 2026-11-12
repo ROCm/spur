@@ -413,6 +413,13 @@ agent directly before marking it down:
 Nodes managed by the Kubernetes operator are not checked this way; they are marked ``DOWN``
 on the heartbeat timeout alone.
 
+The not-responding flag is the current leader's view: each leader builds it from the
+heartbeats it receives, and a controller that loses leadership drops its flags. After a
+leadership change the flag stays blank for a grace window of
+``controller.heartbeat_timeout_secs`` (at least one health pass), while the new leader
+waits to hear from the agents; nodes are not marked ``DOWN`` in that window either. Once
+it ends, a ``DOWN`` node the leader has not heard from shows as ``down*``.
+
 Joining Worker Nodes
 --------------------
 

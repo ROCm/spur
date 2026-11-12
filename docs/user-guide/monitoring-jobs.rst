@@ -389,10 +389,14 @@ A trailing ``*`` on the state (``idle*``, ``mix*``, ``down*``) marks a node the
 controller is not currently hearing from: its heartbeats have gone stale, so it
 is given no new work until they resume, while its running jobs are untouched.
 Filter on it with ``-t no_respond``, ``--dead`` (``-d``, only non-responding
-nodes), or ``--responding`` (``-r``, only responding nodes). ``scontrol show
-node`` shows the same condition as a ``+NOT_RESPONDING`` suffix on ``State=``,
-the REST node object carries a ``not_responding`` boolean, and ``spur health``
-stars the node and counts it as unhealthy.
+nodes), or ``--responding`` (``-r``, only responding nodes).
+``scontrol show node`` shows the same condition as a ``+NOT_RESPONDING`` suffix
+on ``State=``, the REST node object carries a ``not_responding`` boolean, and
+``spur health`` stars the node and counts it as unhealthy.
+
+The flag is the current leader's view of its heartbeats. It is blank for the
+grace window after a leadership change (see :ref:`node-liveness`), and a
+``DOWN`` node the leader has not heard from shows as ``down*``.
 
 Accounting History — ``sacct``
 -------------------------------

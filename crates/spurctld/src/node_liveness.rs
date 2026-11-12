@@ -186,11 +186,12 @@ impl StrikeTracker {
     }
 }
 
-/// The health loop's liveness state. Leader-local: reset whenever the term changes.
+/// The health loop's liveness state. Leader-local: see [`Self::observe_term`].
 #[derive(Debug)]
 pub(crate) struct NodeLiveness {
     strikes: StrikeTracker,
     max_stale_fraction: f64,
+    term: Option<u64>,
 }
 
 impl NodeLiveness {
@@ -198,11 +199,20 @@ impl NodeLiveness {
         Self {
             strikes: StrikeTracker::new(min_strike_gap),
             max_stale_fraction,
+            term: None,
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    /// Called every health tick with the term this controller leads, or `None`.
+    /// Leader-local state belongs to the term that built it, so a new term or a
+    /// lost leadership discards strikes and not-responding flags.
+    pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
+        if self.term == leading_term {
+            return;
+        }
         self.strikes.clear();
+        cluster.clear_not_responding();
+        self.term = leading_term;
     }
 
     /// One health pass: confirms which stale nodes are really gone, then applies
@@ -789,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reset_forgets_earlier_failed_probes() {
+    async fn a_new_term_forgets_failed_probes_from_the_last_one() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
@@ -797,15 +807,49 @@ mod tests {
         let prober = ScriptedProber::default();
         let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
+        liveness.observe_term(&cm, Some(1));
         liveness
             .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
-        liveness.reset();
+        liveness.observe_term(&cm, Some(2));
         liveness
             .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
 
         assert_eq!(state(&cm, "n1"), NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_leadership_clears_not_responding_flags_and_strikes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        silence(&cm, &["n1"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        let flagged = |cm: &ClusterManager| cm.get_node("n1").unwrap().not_responding;
+
+        liveness.observe_term(&cm, Some(1));
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        assert!(flagged(&cm));
+        liveness.observe_term(&cm, Some(1));
+        assert!(flagged(&cm), "the same term keeps its flags");
+
+        liveness.observe_term(&cm, None);
+        assert!(!flagged(&cm), "a lost leadership must not keep its flags");
+        liveness.observe_term(&cm, Some(2));
+        assert!(!flagged(&cm));
+
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        assert_eq!(
+            state(&cm, "n1"),
+            NodeState::Idle,
+            "the strike from the lost term must not count"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

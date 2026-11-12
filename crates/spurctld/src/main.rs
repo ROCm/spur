@@ -260,24 +260,17 @@ async fn main() -> anyhow::Result<()> {
             max_stale_fraction,
             std::time::Duration::from_secs(health_tick_secs),
         );
-        let mut liveness_term = None;
         loop {
             interval.tick().await;
             // Two snapshots: the watcher can lag a just-won election, so the
             // term equality inside `policy` skips the pass rather than trust it.
             let leader_since = *leader_since_rx.borrow();
             let live_term = health_raft.current_term();
-            let Some(mark_down) = grace.policy(leader_since, live_term, std::time::Instant::now())
-            else {
+            let policy = grace.policy(leader_since, live_term, std::time::Instant::now());
+            liveness.observe_term(&health_cluster, policy.as_ref().map(|_| live_term));
+            let Some(mark_down) = policy else {
                 continue;
             };
-            // Failed probes and not-responding flags from another term were
-            // judged by another leadership.
-            if liveness_term != Some(live_term) {
-                liveness.reset();
-                health_cluster.clear_not_responding();
-                liveness_term = Some(live_term);
-            }
             let evicted = liveness
                 .sweep(
                     &health_cluster,

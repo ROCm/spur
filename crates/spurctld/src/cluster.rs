@@ -5316,22 +5316,20 @@ impl ClusterManager {
         self.apply_health_actions(actions)
     }
 
-    /// Flags a node NOT_RESPONDING when its heartbeat is stale and clears the
-    /// flag on one heard from within the timeout. A node with no heartbeat on
-    /// record (already Down) is left alone. A flagged node keeps its running
-    /// jobs but takes no new work until heartbeats resume (Slurm's `*`).
+    /// Flags a node NOT_RESPONDING when its heartbeat is stale or there is none
+    /// on record (a Down node the leader has not heard since), and clears the
+    /// flag on one heard from within the timeout. A flagged node keeps its
+    /// running jobs but takes no new work until heartbeats resume (Slurm's `*`).
     fn refresh_not_responding(&self, timeout_secs: u64, now: DateTime<Utc>) {
         let threshold = chrono::Duration::seconds(timeout_secs as i64);
         let mut nodes = self.nodes.write();
         for node in nodes.values_mut() {
-            if let Some(hb) = node.last_heartbeat {
-                node.not_responding = now - hb > threshold;
-            }
+            node.not_responding = node.last_heartbeat.is_none_or(|hb| now - hb > threshold);
         }
     }
 
-    /// Clear NOT_RESPONDING on every node, on leadership (re)gain: a new
-    /// leadership must recompute it from the heartbeats it itself sees.
+    /// Clear NOT_RESPONDING on every node when leadership changes hands: only
+    /// the current leader can judge it, from the heartbeats it itself sees.
     pub(crate) fn clear_not_responding(&self) {
         for node in self.nodes.write().values_mut() {
             node.not_responding = false;
@@ -35818,6 +35816,51 @@ state = "UP"
 
         cm.clear_not_responding();
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    async fn down_node_without_heartbeat(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        assert_eq!(cm.get_node("n1").unwrap().last_heartbeat, None);
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_flags_a_down_node_the_leader_has_not_heard_and_a_heartbeat_clears_it() {
+        for policy in [
+            super::MarkDownPolicy::Allowed,
+            super::MarkDownPolicy::Only(HashSet::new()),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = down_node_without_heartbeat(&dir).await;
+
+            cm.check_node_health(90, policy.clone());
+            assert!(
+                cm.get_node("n1").unwrap().not_responding,
+                "{policy:?} should flag a down node with no heartbeat"
+            );
+
+            cm.update_heartbeat("n1", 0, 8000);
+            assert!(!cm.get_node("n1").unwrap().not_responding);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_window_does_not_flag_a_down_node_with_no_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
