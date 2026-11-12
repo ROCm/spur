@@ -28437,6 +28437,40 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_victim_runs_out_its_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        let signaled_at = Utc::now();
+        let grace = PreemptPending {
+            preemption_claim: None,
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: preemptor,
+            preempt_qos: Some("pool".into()),
+            mode: PreemptMode::Requeue,
+            run_attempt: cm.get_job(victim).unwrap().run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(cm.signal_preemption(grace, victim).unwrap());
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(
+            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            "the sibling must not take the room while the preemptor's victim is in its grace"
+        );
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_preemptor_keeps_its_grp_node_claim_while_its_freed_node_is_earmarked() {
         let dir = TempDir::new().unwrap();
         let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
