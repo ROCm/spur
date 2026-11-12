@@ -16,14 +16,19 @@ from cluster import (
     job_state,
     parse_job_id,
     wait_job_state,
+    wait_until,
 )
 
 GRACE_SECS = max(HA_HEARTBEAT_TIMEOUT_SECS, HA_HEALTH_TICK_SECS)
+# Fixed in spurd, not configurable.
+HEARTBEAT_INTERVAL_SECS = 30
 # Covers the timeout plus two more health passes, which is when a silent node
 # would be marked DOWN, with margin for pass alignment.
 OUTAGE_SECS = HA_HEARTBEAT_TIMEOUT_SECS + 2 * HA_HEALTH_TICK_SECS + 30
 # A dead agent's node fails one probe, waits one pass, then fails the second.
 DOWN_WITHIN_SECS = HA_HEARTBEAT_TIMEOUT_SECS + 3 * HA_HEALTH_TICK_SECS + 30
+# The flag clears at the first health pass after a heartbeat lands.
+FLAG_CLEARS_WITHIN_SECS = HEARTBEAT_INTERVAL_SECS + HA_HEALTH_TICK_SECS + 30
 JOB_SECS = 1800
 
 
@@ -130,6 +135,22 @@ class TestHeartbeatPathOutage:
         log = cluster.spurctld_log(leader)[log_start:]
         assert "agent answers" in log, "the leader never confirmed the silent node"
         assert "node marked DOWN (heartbeat timeout)" not in log
+
+        wait_until(
+            lambda: "NOT_RESPONDING"
+            not in cluster.cli(["scontrol", "show", "node", name], controller_addr=addr),
+            timeout_s=FLAG_CLEARS_WITHIN_SECS,
+            desc=f"{name} to stop being flagged once its heartbeats resume",
+        )
+        # A short job can finish between polls, so a completed run also counts.
+        wait_until(
+            lambda: job_state(
+                cluster.cli(["squeue", "-t", "all"], controller_addr=addr), pinned_id
+            )
+            in ("R", "CD"),
+            timeout_s=60,
+            desc=f"the job pinned to {name} to start once the flag clears",
+        )
 
     def test_the_leader_marks_nobody_down_when_it_cannot_hear_any_node(self, ha_cluster):
         cluster = ha_cluster
