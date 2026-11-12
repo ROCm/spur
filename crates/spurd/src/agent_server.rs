@@ -7256,6 +7256,7 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
+        let mut prolog_ctx = None;
         if let Some(ref prolog) = self.hooks.prolog {
             let ctx = spur_core::hooks::HookContext {
                 job_id,
@@ -7283,12 +7284,20 @@ impl SlurmAgent for AgentService {
                     failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
                 }));
             }
+            prolog_ctx = Some(ctx);
         }
 
         if let Some(plan) = pmix_plan.as_ref() {
             if pmix_per_local_rank_env.is_none() {
-                mpi_plugin::apply_pmix_setup_fork_env(&self.mpi_host, plan, task_offset, &mut env)
-                    .map_err(Status::failed_precondition)?;
+                if let Err(e) = mpi_plugin::apply_pmix_setup_fork_env(
+                    &self.mpi_host,
+                    plan,
+                    task_offset,
+                    &mut env,
+                ) {
+                    self.run_epilog_after_failed_launch(prolog_ctx).await;
+                    return Err(Status::failed_precondition(e));
+                }
             }
         }
 
@@ -7329,6 +7338,7 @@ impl SlurmAgent for AgentService {
                     None
                 }
                 AllocationCgroup::Refuse(reason) => {
+                    self.run_epilog_after_failed_launch(prolog_ctx).await;
                     return Err(Status::resource_exhausted(format!(
                         "cgroup setup failed for pty job: {reason}"
                     )));
@@ -7346,6 +7356,7 @@ impl SlurmAgent for AgentService {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
+                    self.run_epilog_after_failed_launch(prolog_ctx).await;
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -7649,6 +7660,7 @@ impl SlurmAgent for AgentService {
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
                 self.drain_on_node_fault(&e, job_id);
+                self.run_epilog_after_failed_launch(prolog_ctx).await;
 
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
@@ -8349,6 +8361,7 @@ impl SlurmAgent for AgentService {
         // — once per allocation on the node, before the extern stepd (and thus
         // any step workload) starts. Pairs with the node Epilog the extern
         // stepd runs on teardown (owns_job_lifetime(STEP_EXTERN)).
+        let mut prolog_ctx = None;
         if let Some(ref prolog) = self.hooks.prolog {
             let ctx = spur_core::hooks::HookContext {
                 job_id: req.job_id,
@@ -8379,6 +8392,7 @@ impl SlurmAgent for AgentService {
                     error: format!("prolog failed: {e:#}"),
                 }));
             }
+            prolog_ctx = Some(ctx);
         }
 
         let runtime_descriptor = if supervise_allocation {
@@ -8424,7 +8438,7 @@ impl SlurmAgent for AgentService {
             let admission = self
                 .admit_step_launch(req.job_id, req.run_attempt, spur_core::step::STEP_EXTERN)
                 .await;
-            let (_, mut descriptor) = launch_stepd(
+            let launched = launch_stepd(
                 &config,
                 req.run_attempt,
                 &self.reporter.controller_addr,
@@ -8446,11 +8460,17 @@ impl SlurmAgent for AgentService {
                 },
                 &admission,
             )
-            .await
-            .map_err(|error| {
-                self.drain_on_node_fault(&error, req.job_id);
-                Status::unavailable(format!("failed to start allocation stepd: {error}"))
-            })?;
+            .await;
+            let mut descriptor = match launched {
+                Ok((_, descriptor)) => descriptor,
+                Err(error) => {
+                    self.drain_on_node_fault(&error, req.job_id);
+                    self.run_epilog_after_failed_launch(prolog_ctx).await;
+                    return Err(Status::unavailable(format!(
+                        "failed to start allocation stepd: {error}"
+                    )));
+                }
+            };
 
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
@@ -10834,11 +10854,41 @@ impl AgentService {
     /// without blocking the caller's own failure response on the RPC.
     fn drain_on_node_fault(&self, error: &executor::LaunchError, job_id: u32) {
         if let Some(drain_reason) = error.drain_reason() {
-            let controller = self.reporter.controller_addr.clone();
-            let node_name = self.reporter.hostname.clone();
-            tokio::spawn(async move {
-                request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
-            });
+            self.request_drain(drain_reason, job_id);
+        }
+    }
+
+    fn request_drain(&self, reason: String, job_id: u32) {
+        let controller = self.reporter.controller_addr.clone();
+        let node_name = self.reporter.hostname.clone();
+        tokio::spawn(async move {
+            request_node_drain(&controller, &node_name, &reason, job_id).await;
+        });
+    }
+
+    /// Undoes the node prolog of a launch that failed before any process came
+    /// to own the job's teardown; nothing else would ever run its epilog.
+    async fn run_epilog_after_failed_launch(
+        &self,
+        prolog_ctx: Option<spur_core::hooks::HookContext>,
+    ) {
+        let (Some(epilog), Some(prolog_ctx)) = (self.hooks.epilog.as_deref(), prolog_ctx) else {
+            return;
+        };
+        let ctx = spur_core::hooks::HookContext {
+            script_context: "epilog_slurmd".into(),
+            ..prolog_ctx
+        };
+        let result = spur_core::hooks::run_hook_bounded(
+            epilog,
+            &ctx,
+            self.hooks.epilog_timeout(),
+            |_, _| {},
+        )
+        .await;
+        if let Err(e) = result {
+            error!(job_id = ctx.job_id, error = %e, "epilog hook failed after a failed launch — requesting node drain");
+            self.request_drain(EPILOG_FAILED_DRAIN_REASON.into(), ctx.job_id);
         }
     }
 
@@ -17445,6 +17495,108 @@ mod tests {
             resp.error.contains("No such file or directory"),
             "the cause chain must survive into the reported error, got {:?}",
             resp.error
+        );
+    }
+
+    fn recording_hook_script(target: &std::path::Path) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "#!/bin/bash\necho \"$SPUR_SCRIPT_CONTEXT $SPUR_JOB_ID\" >> {}",
+            target.display()
+        )
+        .unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// An agent whose prolog and epilog append to `record`, and whose
+    /// supervised launch of `job_id`'s `step_id` fails after the prolog: a file
+    /// sits where that step's runtime session directory belongs.
+    fn agent_failing_after_prolog(
+        record: &std::path::Path,
+        state_dir: &std::path::Path,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+    ) -> (AgentService, [tempfile::TempPath; 2]) {
+        let session = crate::stepd::StepdStore::new(state_dir)
+            .claim_session_dir(job_id, 0, step_id)
+            .unwrap();
+        std::fs::remove_dir(&session).unwrap();
+        std::fs::write(&session, b"").unwrap();
+        let prolog = recording_hook_script(record);
+        let epilog = recording_hook_script(record);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                epilog: Some(epilog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_supervised_launch()
+        .with_runtime_state_dir(state_dir);
+        (svc, [prolog, epilog])
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_fails_after_the_prolog_runs_the_epilog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let (svc, _hooks) =
+            agent_failing_after_prolog(&record, dir.path(), 77, spur_core::step::STEP_BATCH);
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 77,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "unlaunched".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a failed launch is a launch outcome")
+            .into_inner();
+
+        assert!(!resp.success, "the launch must fail: {resp:?}");
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "prolog_slurmd 77\nepilog_slurmd 77\n",
+            "what the prolog set up must be undone when no job came to own it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_srun_allocation_that_fails_after_the_prolog_runs_the_epilog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let (svc, _hooks) =
+            agent_failing_after_prolog(&record, dir.path(), 78, spur_core::step::STEP_EXTERN);
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 78,
+            cpus: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("the allocation's supervisor cannot start");
+
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "prolog_slurmd 78\nepilog_slurmd 78\n",
+            "what the prolog set up must be undone when no allocation came to own it"
         );
     }
 
