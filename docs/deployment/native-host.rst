@@ -472,6 +472,10 @@ unavailable`` when it cannot report its jobs at all. The node takes no new work 
 operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
 reclaim cancels keep running in the meantime.
 
+The hold's clock runs only while the node keeps sending heartbeats and stays held. A node that
+goes silent again, is resumed by an operator, or is removed starts a fresh hold if it later
+returns still reporting such work.
+
 Joining Worker Nodes
 --------------------
 
