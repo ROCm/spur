@@ -5381,7 +5381,7 @@ impl ClusterManager {
             &mut actions,
             &self.stale_reporting_nodes.read(),
             &mut self.recovery_holds.write(),
-            std::time::Duration::from_secs(timeout_secs),
+            recovery_hold_cap(timeout_secs, &self.config()),
             std::time::Instant::now(),
         );
         self.apply_health_actions(actions)
@@ -12234,6 +12234,18 @@ pub(crate) fn stale_nodes_at(
 }
 
 const HOLD_RELEASE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a node may report ended jobs before it is drained. A node still
+/// killing, cleaning up, or running an epilog gets that whole budget plus one
+/// heartbeat to carry its clean report.
+pub(crate) fn recovery_hold_cap(
+    heartbeat_timeout_secs: u64,
+    config: &spur_core::config::SlurmConfig,
+) -> std::time::Duration {
+    let budget = u64::from(config.complete_wait_floor_secs())
+        .saturating_add(spur_core::config::HEARTBEAT_INTERVAL_SECS);
+    std::time::Duration::from_secs(heartbeat_timeout_secs.max(budget))
+}
 
 /// What a node's latest heartbeat said about jobs the controller has ended. A
 /// node absent from the stale-report map reported clean.
@@ -36176,6 +36188,35 @@ state = "UP"
         super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, started + cap);
 
         assert_eq!(actions, vec![drain("stuck", "Agent job list unavailable")]);
+    }
+
+    fn default_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap()
+    }
+
+    #[test]
+    fn the_hold_cap_covers_the_agent_kill_and_cleanup_budget_plus_a_heartbeat() {
+        let config = default_config();
+        let timeout = config.controller.effective_heartbeat_timeout_secs();
+        let budget = u64::from(config.complete_wait_floor_secs())
+            + spur_core::config::HEARTBEAT_INTERVAL_SECS;
+        assert!(
+            budget > timeout,
+            "at defaults the agent budget is the larger"
+        );
+
+        let cap = super::recovery_hold_cap(timeout, &config);
+
+        assert_eq!(cap, std::time::Duration::from_secs(budget));
+        // 221 s kill wait, cleanup, and epilog, plus a 30 s heartbeat.
+        assert_eq!(cap, std::time::Duration::from_secs(251));
+    }
+
+    #[test]
+    fn the_hold_cap_is_the_heartbeat_timeout_when_that_is_longer() {
+        let cap = super::recovery_hold_cap(600, &default_config());
+
+        assert_eq!(cap, std::time::Duration::from_secs(600));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -15,15 +15,15 @@ from cluster import (
     wait_until,
 )
 
-# Also the recovery hold cap, past which a node not yet reporting clean is drained;
-# leave room for its clean heartbeat to land just after a health tick.
-HEARTBEAT_TIMEOUT_SECS = 60
+HEARTBEAT_TIMEOUT_SECS = 40
 # Missed beats past the timeout, then two failed liveness probes a health tick apart.
 NODE_DOWN_BOUND = 180
 # Up to one 30s heartbeat interval (the first may fail on the dead connection) plus the 30s health tick.
 RECLAIM_BOUND = 90
-# The node stays Down until a heartbeat reports the old run gone, one more 30s interval.
-NODE_RECOVERY_BOUND = RECLAIM_BOUND + 30
+# The controller's recovery hold cap: the default 221s kill, cleanup, and epilog budget plus a 30s heartbeat.
+RECOVERY_HOLD_CAP_SECS = max(HEARTBEAT_TIMEOUT_SECS, 221 + 30)
+# The hold starts once the node is heard again and ends by the cap, so recovery can take both.
+NODE_RECOVERY_BOUND = RECLAIM_BOUND + RECOVERY_HOLD_CAP_SECS
 
 
 def pid_alive(node, pid):
