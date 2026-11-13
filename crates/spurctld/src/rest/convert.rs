@@ -181,12 +181,15 @@ mod tests {
         assert_eq!(json["preempt_time"], signaled_at.timestamp());
         assert_eq!(json["end_time"], deadline.timestamp());
 
+        let mut finished = job.clone();
         let ended = signaled_at + Duration::seconds(10);
-        job.end_time = Some(ended);
-        assert_eq!(job_to_json(&job)["end_time"], ended.timestamp());
+        finished.end_time = Some(ended);
+        finished.preempt_pending = None;
+        let finished = job_to_json(&finished);
+        assert_eq!(finished["end_time"], ended.timestamp());
+        assert!(finished["preempt_time"].is_null());
 
         job.run_attempt = 1;
-        job.end_time = None;
         let next_run = job_to_json(&job);
         assert!(
             next_run["preempt_time"].is_null(),

@@ -1379,7 +1379,7 @@ impl Job {
     /// inside a preemption grace, the grace deadline.
     pub fn reported_end_time(&self) -> Option<DateTime<Utc>> {
         self.end_time
-            .or(self.preempt_grace().map(|pending| pending.deadline))
+            .or_else(|| self.preempt_grace().map(|pending| pending.deadline))
     }
 
     /// The allocated nodes still charged for this job, in allocation order.
