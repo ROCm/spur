@@ -463,8 +463,8 @@ leadership change, a ``DOWN`` node stays down until its first heartbeat to the n
 reports a clean job list.
 
 The hold gives the node time to finish killing and cleaning up: it lasts the longer of
-``controller.heartbeat_timeout_secs`` and the node's kill and cleanup budget plus one
-30-second heartbeat interval for the clean report to arrive. That budget is the larger of
+``controller.heartbeat_timeout_secs`` and the node's kill, cleanup, and epilog budget plus
+one 30-second heartbeat interval for the clean report to arrive. That budget is the larger of
 ``scheduler.kill_wait_secs`` and ``scheduler.timeout_kill_wait_secs``, plus
 ``cgroup.cleanup_timeout_secs``, plus the ``hooks.epilog_timeout_secs`` bound, so the hold
 lasts about four minutes at defaults. The cap is checked on each health pass, so a hold
@@ -476,10 +476,12 @@ report its jobs at all. The node takes no new work until an
 operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
 reclaim cancels keep running in the meantime.
 
-While held, the node shows as ``down`` with no ``*``, since its heartbeats arrive, and keeps the
-reason it went down with, usually ``Not responding``. The leader logs ``holding node
-recovery until it reports a clean job list`` once when the hold starts, with the jobs it
-is waiting on (``StaleJobs``) or ``Unknown`` when the node could not list its jobs.
+While held, the node shows as ``down`` (or ``error``, for a node held in that state) with no
+``*``, since its heartbeats arrive, and keeps the reason it went down with, usually ``Not
+responding``. The leader logs ``holding node recovery until it reports a clean job list``
+once when the hold starts, with the jobs it is waiting on (``StaleJobs``) or ``Unknown``
+when the node has not yet sent this leader a complete job list: at registration, after a
+leadership change, or when it could not list its jobs.
 
 The hold's clock runs only while the node keeps sending heartbeats and stays held. A node that
 goes silent again, is resumed by an operator, or is removed starts a fresh hold if it later
