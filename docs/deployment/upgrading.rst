@@ -828,6 +828,12 @@ which keeps new work off it, and asks the node's agent directly. See :ref:`node-
   trips it), the leader assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
   needs ``scontrol update nodename=<nodes> state=down``. Alert on
   ``spur_nodes_liveness_breaker_tripped``, or set the fraction to ``1`` to turn the check off.
+- **Node state strings can carry the flag.** ``sinfo`` ``%t`` and ``%T`` add a trailing
+  ``*`` (``idle*``, ``down*``), ``scontrol show node`` adds ``+NOT_RESPONDING`` to
+  ``State=``, and ``spur health`` stars the node. A ``DOWN`` node the leader has not heard
+  from since shows as ``down*``, which covers every node marked ``DOWN`` for not responding.
+  Scripts that compare ``sinfo -h -o %t`` to ``down`` or ``idle`` must strip a trailing
+  ``*``.
 - **Older clients do not show the flag.** It is a new field in the node reply, so an
   ``sinfo`` or ``scontrol`` from an earlier release shows no ``*`` or ``+NOT_RESPONDING`` and
   lacks ``-d``, ``-r``, and ``-t no_respond``.

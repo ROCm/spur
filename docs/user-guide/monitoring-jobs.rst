@@ -404,7 +404,11 @@ on ``State=``, the REST node object carries a ``not_responding`` boolean, and
 The flag is the current leader's view of its heartbeats. It is blank for the
 grace window after a leadership change (see :ref:`node-liveness`), so a silent
 node can still take new work in that window. Once it ends, a ``DOWN`` node the
-leader has not heard from shows as ``down*``.
+leader has not heard from shows as ``down*``. A follower never sets it: the REST
+API answers node reads from the controller it reaches, so ``not_responding`` is
+``false`` for every node when that is a follower, and the CLI shows no ``*``
+when a follower serves a read itself because it cannot forward it to the leader.
+Query the leader for this flag.
 
 Accounting History — ``sacct``
 -------------------------------
