@@ -963,7 +963,7 @@ impl RaftHandle {
     }
 
     /// Whether this node is still the leader of `term`. The term alone is not
-    /// enough: a leader can step down, or its core stop, without a term change.
+    /// enough: a stopped Raft core keeps its term, but no longer counts as leader.
     pub fn leads_term(&self, term: u64) -> bool {
         self.is_leader() && self.current_term() == term
     }

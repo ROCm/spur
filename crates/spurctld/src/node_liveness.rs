@@ -133,6 +133,13 @@ impl Suspects {
     }
 }
 
+/// A pass whose suspects exceeded the silent-node limit.
+#[derive(Debug)]
+struct Trip {
+    suspects: Suspects,
+    watched: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// The agent answered; `warn` is true on the first pass of this silence and
@@ -334,11 +341,11 @@ impl NodeLiveness {
         still_leading: F,
         now: DateTime<Utc>,
     ) -> Vec<JobFinalized> {
-        let (mark_down, tripped) = match mark_down {
+        let (mark_down, trip) = match mark_down {
             MarkDownPolicy::Allowed => {
                 let stale = cluster.stale_nodes(timeout_secs, self.health_tick, now);
-                let (confirmed, tripped) = self.confirm(cluster, stale, prober).await;
-                (MarkDownPolicy::Only(confirmed), Some(tripped))
+                let (confirmed, trip) = self.confirm(cluster, stale, prober).await;
+                (MarkDownPolicy::Only(confirmed), Some(trip))
             }
             other => (other, None),
         };
@@ -348,57 +355,64 @@ impl NodeLiveness {
             cluster.set_silent_answering_nodes(0);
             return Vec::new();
         }
-        if let Some(tripped) = tripped {
-            cluster.set_liveness_breaker_tripped(tripped);
+        if let Some(trip) = trip {
+            self.report_breaker(cluster, trip.as_ref());
         }
         cluster.set_silent_answering_nodes(self.strikes.answering.len());
         cluster.check_node_health_at(timeout_secs, mark_down, now)
     }
 
     /// Judges the silent-node limit after probing, by the nodes that did not
-    /// answer; returns the nodes confirmed gone and whether the limit tripped. A
-    /// mass silence can overrun the tick, which only delays recoveries.
+    /// answer; returns the nodes confirmed gone and the trip, if any. A mass
+    /// silence can overrun the tick, which only delays recoveries.
     async fn confirm<P: Prober>(
         &mut self,
         cluster: &ClusterManager,
         stale: StaleNodes,
         prober: &P,
-    ) -> (HashSet<String>, bool) {
+    ) -> (HashSet<String>, Option<Trip>) {
         let stale_names: HashSet<String> = stale.names.iter().cloned().collect();
         self.strikes.retain(&stale_names);
         if stale_names.is_empty() {
-            self.log_breaker_recovery();
-            return (HashSet::new(), false);
+            return (HashSet::new(), None);
         }
         let (operator_managed, targets) = split_by_source(cluster, &stale.names);
         let results = probe_all(targets, prober).await;
 
         let suspects = Suspects::count(&results, &operator_managed, &stale);
         if breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction) {
-            if self.breaker_log_due(Instant::now()) {
-                error!(
-                    failed_probes = suspects.failed_probes,
-                    operator_managed = suspects.operator_managed,
-                    recently_silent = suspects.recently_silent,
-                    watched = stale.watched,
-                    "too many nodes went silent in one health pass; suspecting the control plane and marking none of them Down"
-                );
-            }
             self.record_answers(results);
             self.strikes.clear_failures();
-            return (HashSet::new(), true);
+            let trip = Trip {
+                suspects,
+                watched: stale.watched,
+            };
+            return (HashSet::new(), Some(trip));
         }
-        self.log_breaker_recovery();
 
         let mut confirmed: HashSet<String> = operator_managed.into_iter().collect();
         confirmed.extend(self.judge_probes(results));
-        (confirmed, false)
+        (confirmed, None)
     }
 
-    fn log_breaker_recovery(&mut self) {
-        if self.breaker_recovered() {
-            info!(
-                "the silent-node limit is no longer exceeded; marking unreachable nodes Down again"
+    /// Publishes a pass's breaker state, logging a trip or a recovery.
+    fn report_breaker(&mut self, cluster: &ClusterManager, trip: Option<&Trip>) {
+        cluster.set_liveness_breaker_tripped(trip.is_some());
+        let Some(Trip { suspects, watched }) = trip else {
+            if self.breaker_recovered() {
+                info!(
+                    "the silent-node limit is no longer exceeded; marking unreachable nodes Down again"
+                );
+            }
+            return;
+        };
+        if self.breaker_log_due(Instant::now()) {
+            error!(
+                failed_probes = suspects.failed_probes,
+                operator_managed = suspects.operator_managed,
+                recently_silent = suspects.recently_silent,
+                watched,
+                "too many nodes went silent in one health pass; suspecting the control plane and marking none of them Down"
             );
         }
     }
@@ -1381,6 +1395,10 @@ mod tests {
             .await;
 
         assert!(!cm.node_metrics().liveness_breaker_tripped);
+        assert!(
+            liveness.breaker_logged.is_none(),
+            "a dropped pass must not log a trip"
+        );
     }
 
     #[test]
@@ -1688,8 +1706,10 @@ mod tests {
             let (_stream, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await
         });
-        let outcome = probe_agent(target("n1", addr)).await;
-        assert!(matches!(outcome, ProbeOutcome::Unreachable(_)));
+        let ProbeOutcome::Unreachable(reason) = probe_agent(target("n1", addr)).await else {
+            panic!("an agent that never answers must not count as alive");
+        };
+        assert!(reason.starts_with("no answer within"), "{reason}");
     }
 
     #[tokio::test]
