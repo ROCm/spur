@@ -76,23 +76,17 @@ impl Prober for AgentProbe {
 }
 
 pub(crate) async fn probe_agent(target: ProbeTarget) -> ProbeOutcome {
-    probe_agent_within(target, NODE_PROBE_TIMEOUT).await
-}
-
-/// [`probe_agent`] with an explicit bound, so tests can exercise a silent
-/// agent without waiting out the production one.
-async fn probe_agent_within(target: ProbeTarget, timeout: Duration) -> ProbeOutcome {
     let Some(endpoint) = target.endpoint else {
         return ProbeOutcome::Unreachable("node has no address to probe".into());
     };
     let ping = crate::agent_client::ping_hostname(endpoint);
-    match tokio::time::timeout(timeout, ping).await {
+    match tokio::time::timeout(NODE_PROBE_TIMEOUT, ping).await {
         Ok(Ok(hostname)) if hostname == target.node => ProbeOutcome::Alive,
         Ok(Ok(hostname)) => ProbeOutcome::Unreachable(format!(
             "the agent at the node's address answered as {hostname}"
         )),
         Ok(Err(e)) => ProbeOutcome::Unreachable(e.to_string()),
-        Err(_) => ProbeOutcome::Unreachable(format!("no answer within {timeout:?}")),
+        Err(_) => ProbeOutcome::Unreachable(format!("no answer within {NODE_PROBE_TIMEOUT:?}")),
     }
 }
 
@@ -1571,7 +1565,9 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    // The paused clock jumps to the next timer while the probe waits on the
+    // socket, so the probe's own bound runs out without a real wait.
+    #[tokio::test(start_paused = true)]
     async fn the_probe_gives_up_on_an_agent_that_never_answers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1579,7 +1575,7 @@ mod tests {
             let (_stream, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await
         });
-        let outcome = probe_agent_within(target("n1", addr), Duration::from_millis(300)).await;
+        let outcome = probe_agent(target("n1", addr)).await;
         assert!(matches!(outcome, ProbeOutcome::Unreachable(_)));
     }
 
