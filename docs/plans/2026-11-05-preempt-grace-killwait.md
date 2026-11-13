@@ -251,7 +251,6 @@ behaviour and are marked `xfail` until it is fixed (see the test inventory).
   `CancelJob`.
 - Grace on `spur-k8s` nodes, and `scancel --signal` there currently deleting the job's Pods.
 - Honour a user `--signal` as the warning signal (Slurm's `send_user_signal`).
-- Expose `preempt_time` and the grace `EndTime` through REST.
 - Reservation end like Slurm: end `TIMEOUT`, stop immediately and use the timeout wait.
 - Change `update_partition` from positional arguments to a patch type; it already takes several
   `Option<Option<_>>` parameters.
