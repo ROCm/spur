@@ -8516,7 +8516,12 @@ mod tests {
             JobState::Pending,
             JobState::Cancelled,
         ));
-        cluster.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![94] });
+        cluster.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![94],
+        });
         assert_eq!(job_state(&cluster, 94), None);
         let delivered = Utc::now();
         cluster
