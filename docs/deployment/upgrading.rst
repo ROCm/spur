@@ -1009,6 +1009,12 @@ capability. A victim on such a node gets no grace and is preempted at once, and
 the controller logs a warning naming the node, so setting ``GraceTime`` before
 the agents are upgraded silently does nothing for jobs on those nodes.
 
+**SIGTERM once per stop applies to runs started after the upgrade.** A stopping
+run receives the deadline SIGTERM once per node (see :doc:`/user-guide/monitoring-jobs`).
+``spurstepd`` outlives a ``spurd`` upgrade, so a run started before its node's
+``spurd`` was upgraded, or on a node still running the old build, still gets a
+SIGTERM on each repeated stop until it ends.
+
 **Kubernetes operator nodes get no grace.** Victims on nodes managed by
 ``spur-k8s`` are preempted at once whatever the QOS or partition ``GraceTime``.
 

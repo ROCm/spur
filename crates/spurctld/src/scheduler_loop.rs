@@ -3712,18 +3712,50 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     }
 }
 
-/// Whether the grace finalizer still owns `job`: a second kill sequence from a
-/// watchdog would race it. Once the deadline and the final kill wait have both
-/// passed the finalizer has failed, and the watchdogs take over as the backstop.
-fn inside_preemption_grace(
+#[derive(Debug, PartialEq, Eq)]
+enum GracePhase {
+    None,
+    /// The grace finalizer still owns the run; a second kill sequence from a
+    /// watchdog would race it.
+    Inside,
+    /// The deadline and the final kill wait have both passed, so the finalizer
+    /// has not ended the run.
+    Overdue,
+}
+
+fn preemption_grace_phase(
     sched: &spur_core::config::SchedulerConfig,
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
+) -> GracePhase {
+    let Some(pending) = job.preempt_grace() else {
+        return GracePhase::None;
+    };
+    let wait = chrono::Duration::seconds(i64::from(graceful_kill_wait_secs(sched, job)));
+    if now < pending.deadline + wait {
+        GracePhase::Inside
+    } else {
+        GracePhase::Overdue
+    }
+}
+
+/// Whether a watchdog must leave `job` to its preemption grace instead of
+/// applying its own limit. Once the warning is out the run ends only as a
+/// preemption, so an overdue grace is finished here and retried on the next
+/// tick if that fails.
+async fn defer_to_preemption_grace(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
 ) -> bool {
-    job.preempt_grace().is_some_and(|pending| {
-        let wait = chrono::Duration::seconds(i64::from(graceful_kill_wait_secs(sched, job)));
-        now < pending.deadline + wait
-    })
+    match preemption_grace_phase(&cluster.config().scheduler, job, now) {
+        GracePhase::None => false,
+        GracePhase::Inside => true,
+        GracePhase::Overdue => {
+            finalize_running_grace(cluster, job).await;
+            true
+        }
+    }
 }
 
 /// Terminate `job` if it has outlived its time limit as of `now`. A job holding
@@ -3733,7 +3765,7 @@ async fn expire_job_if_overdue(
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
 ) {
-    if inside_preemption_grace(&cluster.config().scheduler, job, now) {
+    if defer_to_preemption_grace(cluster, job, now).await {
         return;
     }
     let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
@@ -3856,7 +3888,7 @@ async fn reap_inactive_job(
     limit_secs: u32,
     now: DateTime<Utc>,
 ) {
-    if inside_preemption_grace(&cluster.config().scheduler, job, now) {
+    if defer_to_preemption_grace(cluster, job, now).await {
         return;
     }
     info!(
@@ -4218,8 +4250,10 @@ pub async fn send_cancel_to_nodes(
     signal: i32,
 ) {
     let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+    for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(
+            cluster.clone(),
+            node.name,
             agent_addr,
             job_id,
             run_attempt,
@@ -4273,8 +4307,10 @@ pub async fn cancel_job_on_nodes(
 ) {
     let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
     let mut set = tokio::task::JoinSet::new();
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+    for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(
+            cluster.clone(),
+            node.name,
             agent_addr,
             job_id,
             run_attempt,
@@ -4429,10 +4465,13 @@ fn resolve_agents(
     agents
 }
 
-/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
-/// timeouts are logged, never propagated: a cancel is best-effort cleanup and
-/// must not block the caller past the timeout.
+/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`, and remember a
+/// delivery so the heartbeat reclaim does not repeat it. Errors and timeouts are
+/// logged, never propagated: a cancel is best-effort cleanup and must not block
+/// the caller past the timeout.
 async fn cancel_one_agent(
+    cluster: Arc<ClusterManager>,
+    node: String,
     agent_addr: String,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
@@ -4440,28 +4479,8 @@ async fn cancel_one_agent(
     kill_wait_secs: u32,
 ) {
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone()).await {
-            Ok(mut client) => {
-                if let Err(e) = client
-                    .cancel_job(AgentCancelJobRequest {
-                        job_id,
-                        signal,
-                        run_attempt,
-                        kill_wait_secs,
-                    })
-                    .await
-                {
-                    warn!(
-                        job_id,
-                        signal,
-                        agent = %agent_addr,
-                        error = %e,
-                        "CancelJob RPC failed"
-                    );
-                } else {
-                    info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
-                }
-            }
+        let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+            Ok(client) => client,
             Err(e) => {
                 warn!(
                     job_id,
@@ -4469,19 +4488,58 @@ async fn cancel_one_agent(
                     error = %e,
                     "failed to connect to agent for cancel"
                 );
+                return false;
             }
+        };
+        let request = AgentCancelJobRequest {
+            job_id,
+            signal,
+            run_attempt,
+            kill_wait_secs,
+        };
+        if let Err(e) = client.cancel_job(request).await {
+            warn!(
+                job_id,
+                signal,
+                agent = %agent_addr,
+                error = %e,
+                "CancelJob RPC failed"
+            );
+            return false;
         }
+        info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
+        true
     };
-    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
-        .await
-        .is_err()
-    {
-        warn!(
+    match tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt).await {
+        Ok(true) => record_stop_delivered(&cluster, job_id, run_attempt, &node),
+        Ok(false) => {}
+        Err(_) => warn!(
             job_id,
             agent = %agent_addr,
             "CancelJob RPC timed out"
-        );
+        ),
     }
+}
+
+/// Remember a delivered stop, keeping it only as long as any reclaim window
+/// could still consult it (the longer of the two kill waits).
+fn record_stop_delivered(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node: &str,
+) {
+    let longest_wait = cluster
+        .config()
+        .scheduler
+        .longest_effective_kill_wait_secs();
+    cluster.recent_stops().record(
+        job_id,
+        run_attempt,
+        node,
+        chrono::Utc::now(),
+        crate::server::cancel_reclaim_grace(longest_wait),
+    );
 }
 
 /// Deliver `signals`, in order, to every node in `node_names` without any of the
@@ -7420,6 +7478,89 @@ pub(crate) mod tests {
             crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report]).await;
 
             assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
+        fn stop_recorded(cm: &ClusterManager, job: &spur_core::job::Job, node: &str) -> bool {
+            cm.recent_stops().delivered_within(
+                job.job_id,
+                job.run_attempt,
+                node,
+                chrono::Duration::hours(1),
+                chrono::Utc::now(),
+            )
+        }
+
+        /// The run stays reported through its kill wait, so every heartbeat names it again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_heartbeat_reclaim_does_not_resend_a_stop_the_node_just_received() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+            cm.requeue_job_by_user(job.job_id, "", true, true).unwrap();
+            settle(&cm, job.job_id, spur_core::job::JobState::Pending);
+            let report = spur_proto::proto::RunningJobStatus {
+                job_id: job.job_id,
+                run_attempt: job.run_attempt,
+                ..Default::default()
+            };
+
+            for _ in 0..3 {
+                crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report.clone()])
+                    .await;
+            }
+
+            assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_delivered_cancel_is_recorded_for_its_run_and_node_whatever_the_signal() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "graceful", "n1");
+            let other = run_on(&cm, "other", "n1");
+            assert!(!stop_recorded(&cm, &job, "n1"));
+
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 9).await;
+
+            assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+            assert!(stop_recorded(&cm, &job, "n1"));
+            assert!(!stop_recorded(&cm, &job, "n2"));
+            assert!(!stop_recorded(&cm, &other, "n1"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_fire_and_forget_cancel_is_recorded_once_delivered() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "graceful", "n1");
+
+            send_cancel_to_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 0).await;
+
+            wait_for("the cancel is delivered and recorded", || {
+                stop_recorded(&cm, &job, "n1")
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_never_reached_the_agent_is_not_recorded() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let unreachable = TcpIncoming::bind("127.0.0.1:0".parse().unwrap())
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            register_node_at(&cm, "n1", unreachable);
+            let job = run_on(&cm, "graceful", "n1");
+
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 0).await;
+
+            assert!(!stop_recorded(&cm, &job, "n1"));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11170,35 +11311,136 @@ pub(crate) mod tests {
                 assert!(f.cancels.lock().unwrap().is_empty());
             }
 
+            /// What a cancel-mode grace ends as when the watchdog, not the
+            /// finalizer, finishes it: the same COMPLETING hand-off, graceful
+            /// cancel and node hold as an immediate preemption.
+            fn assert_finished_as_a_cancel_preemption(f: &GraceFixture) {
+                wait_for("graceful cancel delivered", || {
+                    !f.cancels.lock().unwrap().is_empty()
+                });
+                assert_eq!(f.cancel_summary(), [(0, 5, f.victim.run_attempt)]);
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Completing);
+                assert_eq!(job.preempted_by, Some(f.hunter.job_id));
+                assert_eq!(job.preempt_qos.as_deref(), Some("high"));
+                assert_eq!(job.held_nodes(), ["n1".to_string()], "nodes stay held");
+                assert!(job.preempt_pending.is_none());
+                assert!(job.time_limit_signaled_at.is_none());
+                assert!(f.signals.lock().unwrap().is_empty());
+            }
+
+            fn assert_finished_as_a_requeue_preemption(f: &GraceFixture) {
+                wait_for("graceful cancel delivered", || {
+                    !f.cancels.lock().unwrap().is_empty()
+                });
+                assert_eq!(f.cancel_summary(), [(0, 5, f.victim.run_attempt)]);
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Pending);
+                assert_eq!(job.preempted_by, Some(f.hunter.job_id));
+                assert!(job.preempt_pending.is_none());
+                assert!(job.time_limit_signaled_at.is_none());
+            }
+
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn time_limit_watchdog_expires_a_capped_grace_the_finalizer_never_ended() {
+            async fn time_limit_watchdog_finishes_a_capped_grace_the_finalizer_never_ended() {
                 let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
 
                 expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
 
-                wait_for("graceful cancel delivered", || {
-                    !f.cancels.lock().unwrap().is_empty()
-                });
-                let job = f.cm.get_job(f.victim.job_id).unwrap();
-                assert_eq!(job.state, JobState::Completing);
-                assert!(job.time_limit_signaled_at.is_some());
-                assert!(job.preempt_pending.is_none());
+                assert_finished_as_a_cancel_preemption(&f);
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn time_limit_watchdog_expires_a_grace_whose_time_limit_was_lowered_after_it_started(
+            async fn time_limit_watchdog_requeues_a_capped_requeue_grace_the_finalizer_never_ended()
+            {
+                let f = victim_in_a_capped_grace(PreemptMode::Requeue).await;
+
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+
+                assert_finished_as_a_requeue_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_finishes_an_overdue_grace_whose_time_limit_is_far_off() {
+                let f =
+                    victim_in_grace(PreemptMode::Cancel, Some(chrono::Duration::hours(1))).await;
+
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+
+                assert_finished_as_a_cancel_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_finishes_an_overdue_grace_on_a_job_with_no_time_limit() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+
+                assert_finished_as_a_cancel_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_finishes_a_grace_whose_time_limit_was_lowered_after_it_started(
             ) {
                 let f =
                     victim_in_grace(PreemptMode::Cancel, Some(chrono::Duration::hours(1))).await;
                 let mut lowered = f.victim.clone();
                 lowered.spec.time_limit = Some(chrono::Duration::minutes(1));
 
-                expire_job_if_overdue(&f.cm, &lowered, f.deadline() + chrono::Duration::seconds(5))
-                    .await;
+                expire_job_if_overdue(&f.cm, &lowered, after_the_final_kill_wait(&f)).await;
 
+                assert_finished_as_a_cancel_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_never_times_out_a_grace_whose_preemption_is_refused() {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
+                let mut superseded = f.victim.clone();
+                superseded.run_attempt += 1;
+                superseded
+                    .preempt_pending
+                    .as_mut()
+                    .expect("the victim carries its grace")
+                    .run_attempt += 1;
+
+                expire_job_if_overdue(&f.cm, &superseded, after_the_final_kill_wait(&f)).await;
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Running);
+                assert!(job.preempt_pending.is_some());
+                assert!(job.time_limit_signaled_at.is_none());
+
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+                assert_finished_as_a_cancel_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_still_times_out_a_run_whose_grace_was_for_an_earlier_run()
+            {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_slice(&f.cm.snapshot_state().unwrap()).unwrap();
+                let pending = snapshot["jobs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .map(|job| &mut job["preempt_pending"])
+                    .find(|pending| !pending.is_null())
+                    .expect("the victim carries its grace");
+                pending["run_attempt"] = (f.victim.run_attempt + 1).into();
+                let dir = TempDir::new().unwrap();
+                let restored = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                restored
+                    .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
+                    .unwrap();
+                let job = restored.get_job(f.victim.job_id).unwrap();
+                assert!(job.preempt_grace().is_none());
+
+                expire_job_if_overdue(&restored, &job, after_the_final_kill_wait(&f)).await;
+
+                let job = restored.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Completing);
                 assert!(job.time_limit_signaled_at.is_some());
+                assert!(job.preempted_by.is_none());
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11215,14 +11457,80 @@ pub(crate) mod tests {
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn inactive_watchdog_expires_a_grace_the_finalizer_never_ended() {
+            async fn inactive_watchdog_finishes_a_grace_the_finalizer_never_ended() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
 
                 reap_inactive_job(&f.cm, &f.victim, 300, after_the_final_kill_wait(&f)).await;
 
+                assert_finished_as_a_cancel_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn inactive_watchdog_requeues_a_requeue_grace_the_finalizer_never_ended() {
+                let f = victim_in_grace(PreemptMode::Requeue, None).await;
+
+                reap_inactive_job(&f.cm, &f.victim, 300, after_the_final_kill_wait(&f)).await;
+
+                assert_finished_as_a_requeue_preemption(&f);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_watchdog_finished_cancel_grace_that_never_reports_is_force_finished_like_any_completing_job(
+            ) {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+                assert_finished_as_a_cancel_preemption(&f);
+
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
-                assert_eq!(job.state, JobState::Completing);
-                assert!(job.time_limit_signaled_at.is_some());
+                let end = job.end_time.expect("a completing job has an end time");
+                let wait = chrono::Duration::seconds(60);
+                assert!(!completing_job_is_overdue(
+                    &job,
+                    end + wait - chrono::Duration::seconds(1),
+                    wait
+                ));
+                assert!(completing_job_is_overdue(&job, end + wait, wait));
+
+                force_finish_completing_job(&f.cm, &job).await;
+
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Cancelled);
+                assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+                assert_eq!(job.unreported_nodes, ["n1".to_string()]);
+                let node = f.cm.get_node("n1").unwrap();
+                assert_eq!(node.state, NodeState::Drain);
+                assert!(node.admin_locked);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn the_grace_phase_separates_no_grace_inside_and_overdue() {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
+                let sched = &f.cm.config().scheduler;
+                let overdue_at = after_the_final_kill_wait(&f);
+
+                assert_eq!(
+                    preemption_grace_phase(sched, &f.victim, f.deadline()),
+                    GracePhase::Inside
+                );
+                assert_eq!(
+                    preemption_grace_phase(
+                        sched,
+                        &f.victim,
+                        overdue_at - chrono::Duration::seconds(1)
+                    ),
+                    GracePhase::Inside
+                );
+                assert_eq!(
+                    preemption_grace_phase(sched, &f.victim, overdue_at),
+                    GracePhase::Overdue
+                );
+
+                let mut earlier_run = f.victim.clone();
+                earlier_run.run_attempt += 1;
+                assert_eq!(
+                    preemption_grace_phase(sched, &earlier_run, overdue_at),
+                    GracePhase::None
+                );
             }
         }
     }

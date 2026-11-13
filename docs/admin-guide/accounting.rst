@@ -1016,10 +1016,12 @@ Rules that follow from this:
   reclaim (:doc:`idle-fill-scheduling`) waits for the grace too.
 * **A grace shortened by the time limit** still ends as a preemption, not a
   time limit. The deadline is fixed when the warning is sent, so lowering the
-  job's ``TimeLimit`` during the grace does not shorten it. As a backstop, if
-  the job is still running once its deadline and the final kill wait have both
-  passed (for example because the preemption keeps failing), the time limit and
-  inactivity watchdogs stop it as they would any other job.
+  job's ``TimeLimit`` during the grace does not shorten it. Once the warning is
+  sent, the time limit and the inactivity limit no longer end the job. If the
+  scheduler has not finished the preemption by the deadline plus the kill wait
+  (for example because it keeps failing), those watchdogs finish it with the
+  same outcome as at the deadline and keep retrying until it succeeds, as Slurm
+  does.
 
 Where no grace is given, the victim is preempted at once and the controller
 continues as if ``GraceTime`` were ``0``:

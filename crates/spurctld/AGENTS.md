@@ -21,6 +21,7 @@ src/
   native_keys.rs           Process-wide Ed25519 signing keys: peer forwarding, node identity, execution credentials
   pmix_dispatch.rs         Multi-node PMIx prepare/release fan-out helpers
   dispatch_tracker.rs      Leader-local in-flight launch tracker (RAII drop guard)
+  recent_stops.rs          Leader-local record of stops delivered to agents; spaces out heartbeat-reclaim re-cancels
   association_cache.rs     Cached user/account associations from PostgreSQL (default QOS, memberships, limits)
   fairshare_cache.rs       Cached fairshare factors from PostgreSQL
   limits_cache.rs          Cached QOS definitions and GrpWall usage from PostgreSQL
@@ -183,10 +184,10 @@ Read RPCs are forwarded too (consistency with leader state), unless the request 
 10. Record cycle stats
 
 **Companion tasks (spawned alongside):**
-- `enforce_time_limits` — SIGTERM then SIGKILL with configurable grace (`effective_kill_wait_secs()` / `effective_timeout_kill_wait_secs()` from `SchedulerConfig`)
+- `enforce_time_limits` — SIGTERM then SIGKILL with configurable grace (`effective_kill_wait_secs()` / `effective_timeout_kill_wait_secs()` from `SchedulerConfig`). A run with a recorded preemption grace is never ended `TIMEOUT`: past `deadline + kill wait` the watchdog finishes the recorded preemption through `finalize_running_grace` and retries each tick (Slurm parity)
 - `enforce_completing_timeout` — reaps jobs stuck in `Completing` past a deadline
 - `manage_power` — node power state management
-- `enforce_inactive_limits` — reaps interactive allocations with no keepalive activity
+- `enforce_inactive_limits` — reaps interactive allocations with no keepalive activity; defers to an in-grace run the same way as `enforce_time_limits`
 
 **Topology:** rebuilt each scheduling cycle from live config (`cluster.config()`). `scontrol reconfigure` validates `[topology]` and the updated config is picked up on the next cycle. `TopologyConfig::build()` returns `None` unless `plugin` is `tree` or `block`. Two views:
 - `tree` — `TopologyTree::from_switches(&topo_config.switches)` — explicit switch hierarchy
@@ -399,6 +400,8 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 - The scheduler tracks `leader_since` via a watch channel to detect rapid lose-then-regain flips within a single tick
 
 **Dispatch cooldown:** After a resources-unavailable reject, a node is held out of dispatch for a cooldown period (`node_dispatch_cooldowns`). Leader-local, never persisted.
+
+**Recent stops:** `cancel_one_agent` records each successful `CancelJob` by (job, run attempt, node) in `RecentStops`, and heartbeat reclaim skips a run that got one within `cancel_reclaim_grace(kill_wait)`. Only reclaim consults it; other cancels are never suppressed. Leader-local, never persisted: a new leader may re-send once, which the node absorbs (a repeated stop sends no further SIGTERM).
 
 **Node registration serialization:** Per-node mutex (`node_registration_locks`) ensures concurrent (re-)registrations for the same node serialize, preventing a stale label diff from being applied over a fresh one.
 
