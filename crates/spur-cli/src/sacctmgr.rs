@@ -74,7 +74,7 @@ const SACCTMGR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// entity's fields in that one page.
 const ADD_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos, defaultqos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
@@ -89,7 +89,7 @@ Fields (key=value), by entity:
 /// immediately-preemptable).
 const MODIFY_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos, defaultqos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
@@ -102,7 +102,9 @@ Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
 This differs from preemptexempttime=0, which sets an explicit zero exemption.
 cleargracetime=1 likewise resets a QOS GraceTime to unset (inherit the
 partition's), unlike gracetime=0, which means no grace. It takes a boolean
-value (1/yes/true or 0/no/false) and cannot be combined with gracetime=.";
+value (1/yes/true or 0/no/false) and cannot be combined with gracetime=.
+qos=a,b replaces the allow-list. qos+=a adds a name and qos-=a removes one,
+keeping whatever was inherited. qos= with nothing after it inherits again.";
 
 /// `key=value` selectors `delete` accepts, per entity. Distinct from the write
 /// fields: delete only *selects* what to remove, and advertising a write field
@@ -117,15 +119,17 @@ Selectors (key=value), by entity:
 
 /// `key=value` filters `show` accepts, per entity. Mirrors what each handler
 /// actually honors: account honors only `format`; qos honors `name` and
-/// `format`; user and association honor the `account`/`user` filters but render
-/// a fixed-width table (no `format`).
+/// `format`; user honors the `account`/`user` filters; association honors those
+/// filters plus `format`.
 const SHOW_FIELDS_HELP: &str = "\
 Filters (key=value), by entity:
   account       format
   user          account, user
   qos           name, format
-  association   account, user
-  txn           action, actor, format";
+  association   account, user, format
+  txn           action, actor, format
+
+`assoc` is accepted as `association`.";
 
 #[derive(Subcommand, Debug)]
 pub enum SacctmgrCommand {
@@ -156,7 +160,7 @@ pub enum SacctmgrCommand {
     /// List/show entities
     #[command(after_help = SHOW_FIELDS_HELP)]
     Show {
-        /// Entity type: account, user, qos, association
+        /// Entity type: account, user, qos, association (assoc)
         entity: String,
         /// Optional `key=value` filters; a global flag may sit anywhere among them.
         params: Vec<String>,
@@ -249,6 +253,8 @@ const USER_KEYS: &[&str] = &[
     "adminlevel",
     "defaultqos",
     "qos",
+    "qos+",
+    "qos-",
     "maxrunningjobs",
     "maxjobs",
     "maxsubmitjobs",
@@ -275,6 +281,10 @@ const ACCOUNT_KEYS: &[&str] = &[
     "maxjobs",
     "grptres",
     "rawusage",
+    "qos",
+    "qos+",
+    "qos-",
+    "defaultqos",
 ];
 
 /// Selectors `delete account` / `delete qos` accept: the entity name only.
@@ -446,8 +456,9 @@ fn build_add_user_request(
         .cloned()
         .unwrap_or_else(|| "none".into());
     let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
-    let allowed_qos = p.get("qos").cloned().unwrap_or_default();
-    if !default_qos.is_empty()
+    let allowed_qos = qos_assignment(p)?.unwrap_or_default();
+    if assignment_is_exact(&allowed_qos)
+        && !default_qos.is_empty()
         && !allowed_qos.is_empty()
         && !allowed_qos
             .split(',')
@@ -529,6 +540,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .transpose()?
                 .unwrap_or(spur_core::accounting::INFINITE);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
+            let qos = qos_assignment(&p)?;
+            let default_qos = p.get("defaultqos").cloned();
 
             let mut client = connect(addr).await?;
             client
@@ -540,6 +553,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     fairshare_weight: Some(fairshare),
                     max_running_jobs: Some(max_jobs),
                     grp_tres: Some(grp_tres),
+                    allowed_qos: qos.clone(),
+                    default_qos,
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -552,6 +567,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 if parent.is_empty() { "root" } else { &parent },
                 fairshare
             );
+            if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
+                println!("  QOS        = {q}");
+            }
             println!(" Account added.");
             Ok(())
         }
@@ -796,6 +814,56 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
+/// `qos=a,b` replaces the list. `qos+=a` and `qos-=b` become `+a,-b`, which
+/// the controller applies on top of whatever is already inherited. An empty
+/// `qos=` clears the local edit so the parent list is used again.
+fn qos_assignment(p: &std::collections::HashMap<String, String>) -> Result<Option<String>> {
+    let assign = p.get("qos");
+    let add = p.get("qos+");
+    let remove = p.get("qos-");
+    if assign.is_some() && (add.is_some() || remove.is_some()) {
+        bail!("qos= replaces the list; qos+= and qos-= change it. Use one or the other");
+    }
+    if let Some(list) = assign {
+        return Ok(Some(list.clone()));
+    }
+    if add.is_none() && remove.is_none() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    if let Some(list) = add {
+        push_qos_ops(&mut parts, list, '+')?;
+    }
+    if let Some(list) = remove {
+        push_qos_ops(&mut parts, list, '-')?;
+    }
+    Ok(Some(parts.join(",")))
+}
+
+fn push_qos_ops(parts: &mut Vec<String>, list: &str, op: char) -> Result<()> {
+    let names: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        bail!("qos{op}= needs a QOS name");
+    }
+    for name in names {
+        parts.push(format!("{op}{name}"));
+    }
+    Ok(())
+}
+
+/// A `qos+=` / `qos-=` value is not the whole list, so it cannot be checked
+/// against defaultqos here. An exact `qos=` list can.
+fn assignment_is_exact(list: &str) -> bool {
+    !list
+        .split(',')
+        .map(str::trim)
+        .any(|token| token.starts_with('+') || token.starts_with('-'))
+}
+
 /// Build a partial-patch `CreateAccountRequest` for `modify account`: a field
 /// is `Some` only when the command restated it (so the server leaves every
 /// other column untouched), and an explicitly empty value clears it.
@@ -821,6 +889,8 @@ fn build_modify_account_request(
             .map(|(k, v)| parse_limit(k, v))
             .transpose()?,
         grp_tres: p.get("grptres").cloned(),
+        allowed_qos: qos_assignment(p)?,
+        default_qos: p.get("defaultqos").cloned(),
     })
 }
 
@@ -1010,9 +1080,13 @@ fn build_modify_user_request(
         .clone();
     let account = resolve_user_account(p)?;
     let default_qos = p.get("defaultqos").cloned();
-    let allowed_qos = p.get("qos").cloned();
+    let allowed_qos = qos_assignment(p)?;
     if let (Some(dq), Some(list)) = (default_qos.as_deref(), allowed_qos.as_deref()) {
-        if !dq.is_empty() && !list.is_empty() && !list.split(',').map(str::trim).any(|q| q == dq) {
+        if assignment_is_exact(list)
+            && !dq.is_empty()
+            && !list.is_empty()
+            && !list.split(',').map(str::trim).any(|q| q == dq)
+        {
             bail!("defaultqos={dq} must be included in qos={list}");
         }
     }
@@ -1044,14 +1118,19 @@ fn build_modify_user_request(
 /// Modify shares `add`'s upsert RPCs, but sends only the restated fields
 /// (proto3 presence) so the server preserves every unstated column.
 async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let p = parse_params(params);
+    let entity = entity.to_lowercase();
+    let p = if entity == "account" {
+        parse_modify_account_params(params)?
+    } else {
+        parse_params(params)
+    };
 
     // rawusage= is a separate RPC, not part of the normal upsert.
     if let Some(raw) = p.get("rawusage") {
-        return modify_raw_usage(entity, &p, raw, addr).await;
+        return modify_raw_usage(&entity, &p, raw, addr).await;
     }
 
-    match entity.to_lowercase().as_str() {
+    match entity.as_str() {
         "account" => {
             let req = build_modify_account_request(&p)?;
             let name = req.name.clone();
@@ -1148,9 +1227,32 @@ async fn modify_raw_usage(
     Ok(())
 }
 
+/// Accept Slurm's positional account selector in `modify account <name> set ...`
+/// without changing the generic key/value grammar used by other entities. A
+/// leading account key is the space-separated `key value` form, not a name.
+fn parse_modify_account_params(
+    params: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let Some(name) = params.first().filter(|param| {
+        !param.contains('=')
+            && !param.eq_ignore_ascii_case("where")
+            && !param.eq_ignore_ascii_case("set")
+            && !ACCOUNT_KEYS.contains(&param.to_lowercase().as_str())
+    }) else {
+        return Ok(parse_params(params));
+    };
+
+    let mut parsed = parse_params(&params[1..]);
+    if parsed.contains_key("name") || parsed.contains_key("account") {
+        bail!("account name specified both positionally and with name=/account=");
+    }
+    parsed.insert("name".into(), name.clone());
+    Ok(parsed)
+}
+
 /// Entities `show` prints as hardcoded fixed-width tables, with no field-spec table behind
 /// them. A new entity rendered that way belongs here.
-const FIXED_WIDTH_ENTITIES: [&str; 5] = ["user", "users", "association", "associations", "tres"];
+const FIXED_WIDTH_ENTITIES: [&str; 3] = ["user", "users", "tres"];
 
 /// Delimiting a fixed-width table hands a script padded text it cannot parse, so refuse it.
 /// Unknown entities fall through to `show`, which reports them itself.
@@ -1161,7 +1263,7 @@ fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle)
 
     bail!(
         "sacctmgr: delimited output (-p/-P) is not supported for '{entity}'. \
-         Supported entities: account, qos, txn"
+         Supported entities: account, qos, association, txn"
     )
 }
 
@@ -1303,8 +1405,9 @@ async fn show(
             }
             Ok(())
         }
-        "association" | "associations" => {
+        "association" | "associations" | "assoc" => {
             let (account_filter, user_filter) = list_user_filters(&p);
+            let fields = association_format_fields(p.get("format").map(String::as_str))?;
 
             let mut client = connect(addr).await?;
             // Bound the call: connect/keepalive timeouts do not cap a stalled
@@ -1312,8 +1415,8 @@ async fn show(
             // lock), so set a per-request deadline. The grpc-timeout header also
             // lets the server abort its own work. See AGENTS.md (no unbounded RPCs).
             let mut request = tonic::Request::new(ListUsersRequest {
-                account: account_filter,
-                user: user_filter,
+                account: account_filter.clone(),
+                user: user_filter.clone(),
                 associations: true,
             });
             request.set_timeout(SACCTMGR_RPC_TIMEOUT);
@@ -1321,27 +1424,23 @@ async fn show(
                 .list_users(request)
                 .await
                 .context("ListUsers RPC failed")?;
-
             let users = resp.into_inner().users;
 
-            if style.shows_header() {
-                println!(
-                    "{:<15} {:<20} {:<15} {:<10} {:<10}",
-                    "User", "Account", "Partition", "Share", "Default"
-                );
-                println!("{}", "-".repeat(70));
-            }
+            // A user filter names people, so the account's own row (blank user)
+            // does not belong in the result. Otherwise list the account even
+            // when it has no members: that row is where account QOS lives.
+            let accounts = if user_filter.is_empty() {
+                load_association_accounts(&mut client, &account_filter).await?
+            } else {
+                Vec::new()
+            };
 
-            for u in &users {
+            style.print_header(&fields);
+
+            for line in association_lines(&accounts, &users) {
                 println!(
                     "{}",
-                    format_association_row(
-                        &u.name,
-                        &u.account,
-                        &u.partition,
-                        u.fairshare,
-                        &u.default_qos,
-                    )
+                    style.row(&fields, &|spec| { resolve_association_field(&line, spec) })
                 );
             }
             Ok(())
@@ -1544,7 +1643,7 @@ fn fmt_txn_ts(ts: &prost_types::Timestamp) -> String {
 
 const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
 
-const ACCOUNT_ALL_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G %-10J";
+const ACCOUNT_ALL_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G %-10J %-40Q";
 
 fn account_header(spec: char) -> &'static str {
     match spec {
@@ -1556,6 +1655,7 @@ fn account_header(spec: char) -> &'static str {
         'G' => "GrpTRES",
         'J' => "MaxJobs",
         'C' => "Coords",
+        'Q' => "QOS",
         _ => "?",
     }
 }
@@ -1570,6 +1670,7 @@ fn account_field_spec(name: &str) -> Option<char> {
         "grptres" => Some('G'),
         "maxjobs" | "maxrunningjobs" => Some('J'),
         "coords" | "coordinators" | "coord" => Some('C'),
+        "qos" => Some('Q'),
         _ => None,
     }
 }
@@ -1585,7 +1686,7 @@ fn account_format_fields(
         ACCOUNT_ALL_FORMAT,
         &account_field_spec,
         &account_header,
-        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords",
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords, QOS",
     )
 }
 
@@ -1607,6 +1708,40 @@ fn append_coords_column(fields: &mut Vec<format_engine::FormatToken>) {
             header: "Coords".to_string(),
         },
     ));
+}
+
+async fn load_association_accounts(
+    client: &mut SlurmAccountingClient<crate::authclient::AuthChannel>,
+    account_filter: &str,
+) -> Result<Vec<AccountInfo>> {
+    let mut request = tonic::Request::new(ListAccountsRequest { shares: false });
+    request.set_timeout(SACCTMGR_RPC_TIMEOUT);
+    visible_association_accounts(client.list_accounts(request).await, account_filter)
+}
+
+/// Account rows are an addition to the user rows. A caller the controller
+/// denies the account list (`private_data = ["accounts"]`, coordinating
+/// nothing) still gets their user rows, just without the account definitions.
+/// `Unavailable` covers both the controller's cache-loading fence and a lost
+/// transport, which the CLI cannot tell apart, so the omission is reported.
+fn visible_association_accounts(
+    listed: Result<tonic::Response<ListAccountsResponse>, tonic::Status>,
+    account_filter: &str,
+) -> Result<Vec<AccountInfo>> {
+    match listed {
+        Ok(resp) => Ok(resp
+            .into_inner()
+            .accounts
+            .into_iter()
+            .filter(|a| account_filter.is_empty() || a.name == account_filter)
+            .collect()),
+        Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(Vec::new()),
+        Err(status) if status.code() == tonic::Code::Unavailable => {
+            eprintln!("sacctmgr: account rows omitted: {}", status.message());
+            Ok(Vec::new())
+        }
+        Err(status) => Err(status).context("ListAccounts RPC failed"),
+    }
 }
 
 /// `(accounts by user, users by account)`, names joined and sorted. A caller
@@ -1715,22 +1850,111 @@ fn format_user_row(u: &UserInfo) -> String {
     )
 }
 
-/// One `sacctmgr show association` row. Share is the association's fairshare
-/// weight; Default is its default QOS (empty when none is pinned). Partition is
-/// blank for an all-partitions association. Takes the columns as plain values
-/// rather than the whole `UserInfo` so the row builder stays decoupled from the
-/// RPC type. `share` is `None` when the controller does not report a weight (an
-/// older controller predating the field) — rendered blank rather than a
-/// misleading `0`; a real stored 0 arrives as `Some(0)` and renders "0".
-fn format_association_row(
-    user: &str,
-    account: &str,
-    partition: &str,
+struct AssociationLine {
+    user: String,
+    account: String,
+    partition: String,
+    /// `None` when the controller omits the weight; a stored 0 is `Some(0)`.
     share: Option<u32>,
-    default_qos: &str,
-) -> String {
-    let share = share.map(|w| w.to_string()).unwrap_or_default();
-    format!("{user:<15} {account:<20} {partition:<15} {share:<10} {default_qos:<10}",)
+    qos: String,
+    default_qos: String,
+}
+
+fn user_association_line(user: &UserInfo) -> AssociationLine {
+    AssociationLine {
+        user: user.name.clone(),
+        account: user.account.clone(),
+        partition: user.partition.clone(),
+        share: user.fairshare,
+        qos: user.allowed_qos.clone(),
+        default_qos: user.default_qos.clone(),
+    }
+}
+
+/// Account rows (blank user) followed by that account's users. `accounts` is
+/// empty when the listing is filtered to one user; only that user's rows are
+/// returned. A user whose account is missing from `accounts` is still appended.
+fn association_lines(accounts: &[AccountInfo], users: &[UserInfo]) -> Vec<AssociationLine> {
+    if accounts.is_empty() {
+        return users.iter().map(user_association_line).collect();
+    }
+    let mut lines = Vec::new();
+    let mut placed = std::collections::HashSet::new();
+    for account in accounts {
+        lines.push(AssociationLine {
+            user: String::new(),
+            account: account.name.clone(),
+            partition: String::new(),
+            // Same truncation `show account` uses for the Share column.
+            share: Some(account.fairshare_weight as u32),
+            qos: account.allowed_qos.clone(),
+            default_qos: account.default_qos.clone(),
+        });
+        for user in users.iter().filter(|u| u.account == account.name) {
+            placed.insert((user.name.clone(), user.account.clone()));
+            lines.push(user_association_line(user));
+        }
+    }
+    for user in users {
+        if placed.insert((user.name.clone(), user.account.clone())) {
+            lines.push(user_association_line(user));
+        }
+    }
+    lines
+}
+
+const ASSOCIATION_DEFAULT_FORMAT: &str = "%-15U %-20A %-15P %-10S %-30Q %-10D";
+
+fn association_header(spec: char) -> &'static str {
+    match spec {
+        'U' => "User",
+        'A' => "Account",
+        'P' => "Partition",
+        'S' => "Share",
+        'Q' => "QOS",
+        'D' => "Default",
+        _ => "?",
+    }
+}
+
+fn association_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "user" | "name" => Some('U'),
+        "account" => Some('A'),
+        "partition" => Some('P'),
+        "share" | "fairshare" | "fairshareweight" => Some('S'),
+        "qos" | "allowedqos" => Some('Q'),
+        "default" | "defaultqos" => Some('D'),
+        _ => None,
+    }
+}
+
+fn association_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        ASSOCIATION_DEFAULT_FORMAT,
+        ASSOCIATION_DEFAULT_FORMAT,
+        &association_field_spec,
+        &association_header,
+        "User, Account, Partition, Share, QOS, Default",
+    )
+}
+
+fn resolve_association_field(line: &AssociationLine, spec: char) -> String {
+    match spec {
+        'U' => line.user.clone(),
+        'A' => line.account.clone(),
+        'P' => line.partition.clone(),
+        'S' => line
+            .share
+            .map(|share| share.to_string())
+            .unwrap_or_default(),
+        'Q' => line.qos.clone(),
+        'D' => line.default_qos.clone(),
+        _ => "?".into(),
+    }
 }
 
 fn resolve_account_field(a: &AccountInfo, spec: char, coords: &str) -> String {
@@ -1743,6 +1967,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char, coords: &str) -> String {
         'G' => a.grp_tres.clone(),
         'J' => blank_if_unset(a.max_running_jobs),
         'C' => coords.to_string(),
+        'Q' => a.allowed_qos.clone(),
         _ => "?".into(),
     }
 }
@@ -2013,9 +2238,9 @@ mod tests {
 
     /// show help must match what each handler actually filters on: account
     /// honors only `format`; qos honors `name` (filter_qos_by_name) and `format`;
-    /// user and association honor `account`/`user`. Guards against advertising a
-    /// filter the handler ignores (e.g. account `name=`) or hiding one it honors
-    /// (qos `name`, the association filters).
+    /// user honors `account`/`user`; association adds `format`. Guards against
+    /// advertising a filter the handler ignores (e.g. account `name=`) or hiding
+    /// one it honors (qos `name`, the association filters).
     #[test]
     fn show_help_matches_each_handlers_real_filters() {
         let entities = parse_entity_help(SHOW_FIELDS_HELP);
@@ -2036,13 +2261,36 @@ mod tests {
         let assoc = fields_of("association");
         assert!(assoc.contains(&"account".to_string()));
         assert!(assoc.contains(&"user".to_string()));
+        assert!(assoc.contains(&"format".to_string()));
         assert!(!SHOW_FIELDS_HELP.contains("no filters"));
+    }
+
+    fn render_default_association(
+        user: &str,
+        account: &str,
+        partition: &str,
+        share: Option<u32>,
+        qos: &str,
+        default_qos: &str,
+    ) -> String {
+        let line = AssociationLine {
+            user: user.into(),
+            account: account.into(),
+            partition: partition.into(),
+            share,
+            qos: qos.into(),
+            default_qos: default_qos.into(),
+        };
+        format_engine::format_row(
+            &association_format_fields(None).expect("default association format is valid"),
+            &|spec| resolve_association_field(&line, spec),
+        )
     }
 
     #[test]
     fn association_row_renders_user_account_share_and_default() {
         // Partition is blank (all-partitions association) and so collapses out.
-        let row = format_association_row("amd", "carbonara", "", Some(1), "blocked");
+        let row = render_default_association("amd", "carbonara", "", Some(1), "", "blocked");
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols, vec!["amd", "carbonara", "1", "blocked"]);
     }
@@ -2050,14 +2298,14 @@ mod tests {
     #[test]
     fn association_row_share_blank_when_absent_but_zero_when_present() {
         // An older controller omits the weight (None) -> blank, not a misleading 0.
-        let absent = format_association_row("amd", "aac", "", None, "normal");
+        let absent = render_default_association("amd", "aac", "", None, "", "normal");
         assert_eq!(
             absent.split_whitespace().collect::<Vec<_>>(),
             vec!["amd", "aac", "normal"],
             "absent share must collapse out (blank), leaving no Share column value"
         );
         // A real stored 0 is distinct and renders "0".
-        let zero = format_association_row("amd", "aac", "", Some(0), "normal");
+        let zero = render_default_association("amd", "aac", "", Some(0), "", "normal");
         assert_eq!(
             zero.split_whitespace().collect::<Vec<_>>(),
             vec!["amd", "aac", "0", "normal"]
@@ -2066,9 +2314,208 @@ mod tests {
 
     #[test]
     fn association_row_shows_partition_when_scoped() {
-        let row = format_association_row("amd", "aac", "gpu", Some(4), "normal");
+        let row = render_default_association("amd", "aac", "gpu", Some(4), "", "normal");
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols, vec!["amd", "aac", "gpu", "4", "normal"]);
+    }
+
+    #[test]
+    fn association_row_shows_qos_allow_list() {
+        let row = render_default_association(
+            "",
+            "amd-collectives",
+            "",
+            Some(1),
+            "amd-collectives-qos,amd-burst-qos",
+            "",
+        );
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(
+            cols,
+            vec!["amd-collectives", "1", "amd-collectives-qos,amd-burst-qos"]
+        );
+    }
+
+    #[test]
+    fn association_format_selects_only_requested_qos_column() {
+        let fields = association_format_fields(Some("QOS")).unwrap();
+        let line = AssociationLine {
+            user: String::new(),
+            account: "amd-collectives".into(),
+            partition: String::new(),
+            share: Some(1),
+            qos: "amd-collectives-qos,amd-burst-qos".into(),
+            default_qos: String::new(),
+        };
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            format_engine::format_row(&fields, &|spec| resolve_association_field(&line, spec)),
+            "amd-collectives-qos,amd-burst-qos"
+        );
+    }
+
+    #[test]
+    fn association_format_rejects_unknown_column() {
+        assert!(association_format_fields(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn association_lines_include_account_qos_when_the_account_has_no_users() {
+        let accounts = vec![AccountInfo {
+            name: "amd-collectives".into(),
+            fairshare_weight: 1.0,
+            allowed_qos: "amd-collectives-qos,amd-burst-qos".into(),
+            ..Default::default()
+        }];
+        let lines = association_lines(&accounts, &[]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].user, "");
+        assert_eq!(lines[0].account, "amd-collectives");
+        assert_eq!(lines[0].qos, "amd-collectives-qos,amd-burst-qos");
+        assert_eq!(lines[0].default_qos, "");
+    }
+
+    #[test]
+    fn association_lines_keep_a_users_own_qos_under_the_account_row() {
+        let accounts = vec![AccountInfo {
+            name: "amd-collectives".into(),
+            fairshare_weight: 1.0,
+            allowed_qos: "amd-collectives-qos,amd-burst-qos".into(),
+            ..Default::default()
+        }];
+        let users = vec![UserInfo {
+            name: "alice".into(),
+            account: "amd-collectives".into(),
+            allowed_qos: "amd-burst-qos".into(),
+            default_qos: "amd-burst-qos".into(),
+            fairshare: Some(4),
+            ..Default::default()
+        }];
+        let lines = association_lines(&accounts, &users);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].user, "");
+        assert_eq!(lines[0].qos, "amd-collectives-qos,amd-burst-qos");
+        assert_eq!(lines[1].user, "alice");
+        assert_eq!(lines[1].qos, "amd-burst-qos");
+        assert_eq!(lines[1].share, Some(4));
+    }
+
+    #[test]
+    fn association_lines_skip_the_account_row_when_no_accounts_are_given() {
+        let users = vec![UserInfo {
+            name: "alice".into(),
+            account: "amd-collectives".into(),
+            allowed_qos: "amd-burst-qos".into(),
+            ..Default::default()
+        }];
+        let lines = association_lines(&[], &users);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].user, "alice");
+    }
+
+    fn listed_accounts(
+        names: &[&str],
+    ) -> Result<tonic::Response<ListAccountsResponse>, tonic::Status> {
+        Ok(tonic::Response::new(ListAccountsResponse {
+            accounts: names
+                .iter()
+                .map(|name| AccountInfo {
+                    name: (*name).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            partial: false,
+        }))
+    }
+
+    #[test]
+    fn association_accounts_are_dropped_when_the_caller_may_not_list_accounts() {
+        let denied = Err(tonic::Status::permission_denied(
+            "account definitions are visible to their coordinators",
+        ));
+        let accounts = visible_association_accounts(denied, "").expect("denial is not an error");
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn association_accounts_are_dropped_while_the_controller_is_unavailable() {
+        let loading = Err(tonic::Status::unavailable(
+            "association cache is still loading",
+        ));
+        let accounts = visible_association_accounts(loading, "").expect("user rows still print");
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn association_accounts_surface_other_failures() {
+        let failed = Err(tonic::Status::internal("database error"));
+        let err = visible_association_accounts(failed, "").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ListAccounts RPC failed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn association_accounts_honor_the_account_filter() {
+        let all = visible_association_accounts(listed_accounts(&["physics", "chemistry"]), "")
+            .expect("listing succeeds");
+        assert_eq!(all.len(), 2);
+
+        let one =
+            visible_association_accounts(listed_accounts(&["physics", "chemistry"]), "physics")
+                .expect("listing succeeds");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "physics");
+    }
+
+    #[test]
+    fn modify_account_accepts_a_positional_name() {
+        let p = parse_modify_account_params(&[
+            "amd-collectives".into(),
+            "set".into(),
+            "qos=highprio,normal".into(),
+        ])
+        .unwrap();
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.name, "amd-collectives");
+        assert_eq!(req.allowed_qos.as_deref(), Some("highprio,normal"));
+    }
+
+    #[test]
+    fn modify_account_rejects_ambiguous_positional_name() {
+        let err = parse_modify_account_params(&[
+            "amd-collectives".into(),
+            "name=other".into(),
+            "set".into(),
+            "qos=highprio".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("specified both"));
+    }
+
+    #[test]
+    fn modify_account_keeps_the_space_separated_key_value_form() {
+        let p = parse_modify_account_params(&[
+            "fairshare".into(),
+            "80".into(),
+            "where".into(),
+            "name=ml".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.get("name").map(String::as_str), Some("ml"));
+        assert_eq!(p.get("fairshare").map(String::as_str), Some("80"));
+
+        let p = parse_modify_account_params(&[
+            "name".into(),
+            "ml".into(),
+            "set".into(),
+            "qos=normal".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.get("name").map(String::as_str), Some("ml"));
+        assert_eq!(p.get("qos").map(String::as_str), Some("normal"));
     }
 
     #[test]
@@ -2270,6 +2717,10 @@ mod tests {
             "maxrunningjobs",
             "maxjobs",
             "grptres",
+            "qos",
+            "qos+",
+            "qos-",
+            "defaultqos",
         ];
         for field in parsed_fields {
             let p = parse_params(&["name=acct".into(), format!("{field}=1")]);
@@ -2457,6 +2908,52 @@ mod tests {
         assert_eq!(req.parent_account, None);
         assert_eq!(req.max_running_jobs, None);
         assert_eq!(req.grp_tres, None);
+        assert_eq!(req.allowed_qos, None);
+    }
+
+    #[test]
+    fn build_modify_account_request_sets_qos_allow_list() {
+        let p = parse_params(&[
+            "name=amd-collectives".into(),
+            "set".into(),
+            "qos=amd-collectives-qos,amd-burst-qos".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(
+            req.allowed_qos.as_deref(),
+            Some("amd-collectives-qos,amd-burst-qos")
+        );
+        assert_eq!(req.fairshare_weight, None);
+    }
+
+    #[test]
+    fn build_modify_account_request_empty_qos_clears() {
+        let p = parse_params(&["name=amd-collectives".into(), "qos=".into()]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.allowed_qos.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_modify_account_request_adds_and_removes_qos_names() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "set".into(),
+            "qos+=expedite".into(),
+            "qos-=standby".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.allowed_qos.as_deref(), Some("+expedite,-standby"));
+    }
+
+    #[test]
+    fn build_modify_account_request_rejects_mixing_qos_forms() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "qos=burst".into(),
+            "qos+=expedite".into(),
+        ]);
+        let err = build_modify_account_request(&p).unwrap_err();
+        assert!(err.to_string().contains("one or the other"), "{err}");
     }
 
     #[test]
@@ -3083,6 +3580,8 @@ mod tests {
             fairshare_weight: 5.0,
             max_running_jobs: 10,
             grp_tres: "node=4,cpu=256".into(),
+            allowed_qos: String::new(),
+            default_qos: String::new(),
         }
     }
 
@@ -3202,6 +3701,7 @@ mod tests {
         let header = format_engine::format_header(&fields);
         assert!(header.contains("MaxJobs"), "all header: {header}");
         assert!(header.contains("GrpTRES"), "all header: {header}");
+        assert!(header.contains("QOS"), "all header: {header}");
     }
 
     #[test]
@@ -3852,6 +4352,38 @@ mod tests {
         assert!(
             err.to_string().contains("not supported for 'user'"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_account_rawusage_accepts_a_positional_name() {
+        // Port 1 is closed: a resolved name fails while connecting, a missing
+        // one fails earlier with "name= required".
+        let err = modify(
+            "account",
+            &["physics".into(), "set".into(), "rawusage=0".into()],
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("port 1 is closed");
+
+        assert!(
+            err.to_string().contains("failed to connect"),
+            "positional name must reach rawusage, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assoc_is_accepted_as_association() {
+        // Port 1 is closed, so a recognized entity fails while connecting. An
+        // unrecognized name fails first with "unknown entity".
+        let err = show("assoc", &[], "http://127.0.0.1:1", style_from(&[]), false)
+            .await
+            .expect_err("assoc must reach the controller");
+
+        assert!(
+            err.to_string().contains("failed to connect"),
+            "assoc must be accepted as association, got: {err}"
         );
     }
 

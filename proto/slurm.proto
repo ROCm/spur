@@ -1973,6 +1973,16 @@ message CreateAccountRequest {
   // to no-limit; any other value (including a literal 0) is stored as-is.
   optional uint32 max_running_jobs = 6;
   optional string grp_tres = 7;
+  // QOS edit for this account. Unset preserves the stored edit. Empty inherits
+  // from the parent again. "a,b" replaces the parent's list. "+a,-b" adds and
+  // removes names without forgetting the parent, so a later change above still
+  // flows down. A user with no edit of their own is the last step of the same
+  // walk. Reads return the evaluated names, not this raw edit.
+  optional string allowed_qos = 8;
+  // Default QOS for this account and its children, used when a user has none
+  // of their own. Unset preserves it; empty clears it back to the parent's.
+  // A job may use it only when it is also on the evaluated allow-list.
+  optional string default_qos = 9;
 }
 
 message DeleteAccountRequest {
@@ -2002,6 +2012,12 @@ message AccountInfo {
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
   string grp_tres = 7;
+  // Evaluated QOS names this account may use, including what it inherits.
+  // Empty when no list is set from here up to the top.
+  string allowed_qos = 8;
+  // Evaluated default QOS: this account's own, or the nearest parent's.
+  // Empty when none is set.
+  string default_qos = 9;
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave
@@ -2026,9 +2042,11 @@ message AddUserRequest {
   optional string max_tres_per_job = 8;
   optional string grp_tres = 9;
   optional uint32 max_wall_minutes = 10;
-  // Comma-separated QOS names this association may use. Unset preserves the
-  // stored allow-list; explicit empty clears it back to unrestricted.
-  // default_qos must be a member when both are set in the same request.
+  // QOS edit for this association, same forms as CreateAccountRequest.allowed_qos.
+  // Unset preserves the stored edit; empty inherits from the account again.
+  // With no edit stored anywhere above the user, any QOS is allowed.
+  // default_qos must be a member of an exact qos= list when both are set in
+  // the same request.
   optional string allowed_qos = 11;
   // Max submitted (pending + running) jobs across all users in the account.
   optional uint32 grp_submit_jobs = 12;
@@ -2086,7 +2104,12 @@ message UserInfo {
   string account = 2;
   string admin_level = 3;
   string default_account = 4;
+  // The user's own default, or the nearest account default when they have
+  // none. Empty when neither is set.
   string default_qos = 5;
+  // Effective allow-list: the user's edit on top of the account chain. Empty
+  // when no list is set anywhere above them. Writing this back as
+  // AddUserRequest.allowed_qos would store an inherited list as the user's own.
   string allowed_qos = 6;
   // Per-association limits (read-back of what `sacctmgr add/modify user` set).
   // Numeric fields use the INFINITE sentinel (4294967295) for "no limit"; a

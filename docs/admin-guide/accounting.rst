@@ -28,7 +28,11 @@ each builds on the one before it:
   ``sacctmgr``; the cluster already exists once the controller is running.
 - **Account** — a group that owns usage and limits (a project, team, or lab).
   Accounts form a tree: an account may have a **parent** account, and limits and
-  fairshare flow down the hierarchy.
+  fairshare flow down the hierarchy. An account may carry a QOS allow-list and a
+  default QOS. Both travel down the tree: a child account and a user who set
+  nothing of their own use the nearest parent's. ``qos=`` on a lower account or
+  on a user replaces that inherited list. ``qos+=`` adds a name and ``qos-=``
+  removes one, and a later change to the parent still flows through.
 - **User** — a person who submits jobs. A user is attached to one or more
   accounts.
 - **Association** — the tuple ``(cluster, account, user, partition)`` that binds
@@ -168,7 +172,7 @@ Modify an account
 
 .. code-block:: bash
 
-   sacctmgr modify account name=ml set fairshare=80
+   sacctmgr modify account ml set fairshare=80 qos=highprio,normal
 
 Delete an account
 ~~~~~~~~~~~~~~~~~~
@@ -237,6 +241,23 @@ Account keys
    * - ``grptres``
      - ``""``
      - Aggregate TRES cap for the account (see `TRES`_).
+   * - ``qos``
+     - unset (inherit)
+     - Allow-list of QOS this account may use. Unset inherits the parent's list.
+       ``qos=a,b`` replaces it, for this account and anyone below who does not
+       set their own. ``qos+=a`` adds a name and ``qos-=a`` removes one, keeping
+       the inherited names. ``qos=`` with nothing after it inherits again, and
+       so does removing the last name of a list set with ``qos=``. Removing
+       every name you inherited leaves no QOS allowed. A user who sets nothing
+       of their own uses this evaluated list, both in ``sacctmgr show`` and
+       when a job is admitted. A QOS name may not start with ``+`` or ``-``,
+       which mark an add or remove.
+   * - ``defaultqos``
+     - unset (inherit)
+     - QOS used when a user in this account (or a child account) does not set
+       their own and does not name one on the job. The nearest account that
+       sets one wins. The job is rejected if that QOS is not on the evaluated
+       allow-list. Set ``defaultqos=`` empty to inherit again.
 
 .. note::
 
@@ -324,7 +345,9 @@ accounts the caller coordinates (see :ref:`private-data`).
 ``show user`` also prints the per-association limits (``MaxJobs``,
 ``MaxSubmit``, ``GrpSubmit``, ``MaxWall``, ``MaxTRES``, ``GrpTRES``), so you can
 read back what ``add``/``modify user`` set. An unset limit renders as a blank
-cell.
+cell. The ``QOS`` column is the evaluated allow-list: the user's own edit
+applied on top of the account chain. ``Def QOS`` is the user's own default, or
+the nearest account's when the user has none.
 
 .. code-block:: text
 
@@ -335,28 +358,40 @@ cell.
 Show associations
 ~~~~~~~~~~~~~~~~~~
 
-``show association`` lists each ``(user, account)`` association as its own row,
-an association-first view of the same data ``show user`` presents user-first.
-Filter by ``account=`` and/or ``user=``.
+``show association`` lists each account and each ``(user, account)`` association
+as its own row. ``list`` is the same command as ``show``, and ``assoc`` is
+accepted as ``association``. The account row has a blank ``User``. Filter by
+``account=`` and/or ``user=``. A ``user=`` filter omits the account row. Use
+``format=`` to select columns (for example, ``format=QOS``).
+
+With ``private_data = ["accounts"]``, a User who coordinates no account gets
+the user rows without the account rows, because account definitions are visible
+only to coordinators (see `Show accounts`_). If the controller cannot list
+accounts yet (for example, while it is still loading after a restart), the user
+rows still print, and a warning on stderr says the account rows were omitted.
 
 .. code-block:: bash
 
-   sacctmgr show association account=ml user=alice
+   sacctmgr show association account=ml
 
-The columns are ``User``, ``Account``, ``Partition``, ``Share`` (this
-``(user, account)`` association's own fairshare weight, stored on the
-association and distinct from the account's weight — changing the account's
-weight does not change it), and ``Default`` (the association's default QOS).
-``Partition`` is blank for an all-partitions association. ``Share`` is blank only
-when the controller does not report a weight (an older controller predating the
-column); a stored weight of ``0`` renders ``0``.
+The columns are ``User``, ``Account``, ``Partition``, ``Share``, ``QOS``, and
+``Default``. On a user row, ``Share`` is that association's own fairshare
+weight (distinct from the account's weight — changing the account's weight
+does not change it) and ``Default`` is the association's default QOS. On the
+account row, ``Share`` is the account's fairshare weight and ``QOS`` is the
+account's evaluated allow-list, including what it inherits from its parent.
+``Default`` on that row is the account's own default QOS, or the nearest
+parent's. ``Partition`` is blank for an all-partitions association.
+``Share`` is blank only when the controller does not report a weight (an older
+controller predating the column); a stored weight of ``0`` renders ``0``.
 
 .. code-block:: text
 
-   User            Account              Partition       Share      Default
-   ----------------------------------------------------------------------
-   alice           ml                                   1          highprio
-   carol           ml                                   1
+   User            Account              Partition       Share      QOS                            Default
+   ---------------------------------------------------------------------------------------------------------
+                   ml                                   50         highprio,normal
+   alice           ml                                   1          highprio,normal                highprio
+   carol           ml                                   1          highprio,normal
 
 User keys
 ~~~~~~~~~
@@ -381,11 +416,16 @@ User keys
        ``Administrator``/``SuperUser``). Any other value is rejected. Only the
        admin level currently confers privilege.
    * - ``defaultqos``
-     - ``""``
-     - QOS applied when the user does not request one.
+     - inherited
+     - QOS applied when the user does not request one. When unset, the user
+       uses the nearest account's ``defaultqos``. A job is rejected if that
+       QOS is not on the evaluated allow-list.
    * - ``qos``
-     - ``""``
-     - Comma-separated allow-list of QOS the user may request.
+     - inherited
+     - QOS the user may request. When unset, the user uses the account's
+       evaluated list, including what that account inherited. ``qos=a,b``
+       replaces it. ``qos+=a`` adds a name and ``qos-=a`` removes one.
+       ``qos=`` with nothing after it inherits again.
    * - ``maxrunningjobs`` (alias ``maxjobs``)
      - unset (no limit)
      - Maximum jobs running at once for this association. See
@@ -1223,11 +1263,16 @@ How a job's QOS is resolved
 At submit, Spur resolves the job's QOS in this order, matching Slurm:
 
 1. **Explicit** ``--qos`` on the job. The named QOS must exist **and** be
-   permitted for the association (present in the association's allow-list or its
-   default). Otherwise the job is rejected with ``QOS 'X' does not exist`` or
-   ``QOS 'X' is not permitted for user '…' under account '…'``.
-2. Otherwise the **association's default QOS**, if it still exists. A stale
-   default (deleted QOS) is ignored with a warning.
+   permitted. The usable names are the user's edit applied on top of the
+   account's evaluated list (itself inherited down the account tree). With no
+   list set anywhere above the user, any QOS may be named; the default is only
+   what the job gets when it names none. A default does not add a name that
+   the list left out. Otherwise the job is rejected with ``QOS 'X' does not
+   exist`` or ``QOS 'X' is not permitted for user '…' under account '…'``.
+2. Otherwise the **default QOS**: the user's own, or the nearest account's
+   when the user has none. It is used only when it still exists and is
+   permitted by the rule above. A default that exists but is not permitted
+   rejects the job. A stale default (deleted QOS) is ignored with a warning.
 3. Otherwise the cluster fallback **``accounting.default_qos``**. A configured
    fallback that exists but is not permitted for the association is ignored with
    a warning.
@@ -1278,8 +1323,10 @@ Associations
 
 An association is the ``(cluster, account, user, partition)`` tuple. Associations
 are created implicitly by ``sacctmgr add user`` — there is no standalone ``add
-association`` command. Inspect them through ``sacctmgr show user``, which lists
-each user's account, default account, QOS, and per-association limits.
+association`` command. ``sacctmgr show association`` lists each account and each
+user association, including share, the QOS allow-list, and default QOS.
+``sacctmgr show user`` lists each person with their account, default account,
+effective QOS, and per-association limits.
 
 Limits resolve in two layers:
 
@@ -1295,7 +1342,8 @@ Limits resolve in two layers:
   reason even when a QOS limit also applies.
 
 Associations are managed via ``add user`` and inspected via ``sacctmgr show
-user`` (see `Managing users`_).
+association`` or ``sacctmgr show user`` (see `Show associations`_ and
+`Managing users`_).
 
 How a job's account is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1464,9 +1512,9 @@ delimited output as unambiguous only when the fields you select cannot contain `
 
 .. note::
 
-   ``-p`` and ``-P`` work for ``show account``, ``show qos``, and ``show txn``.
-   For ``show user``, ``show association``, and ``show tres``, Spur does not model
-   the columns, so it refuses the flag with an error naming the entity rather than
+   ``-p`` and ``-P`` work for ``show account``, ``show qos``, ``show association``,
+   and ``show txn``. For ``show user`` and ``show tres``, Spur does not model the
+   columns, so it refuses the flag with an error naming the entity rather than
    printing padded text a script cannot parse. ``-n`` works for every entity.
 
    Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came

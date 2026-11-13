@@ -10,6 +10,8 @@ use sqlx::{PgPool, QueryBuilder, Row};
 use spur_core::end_reason::EndReason;
 use spur_core::job::{effective_gpus, effective_memory_mb, Job, JobId};
 
+use super::qos_level;
+
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
 /// unique index, so concurrent runs against a shared database must not overlap.
@@ -171,6 +173,11 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS flags TEXT NOT NULL DEFAULT '';
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+-- NULL inherits from the parent. A plain list replaces it. A list of
+-- +name/-name adds and removes without freezing the parent's names.
+-- default_qos NULL likewise inherits the nearest parent's default.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS default_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
@@ -1597,6 +1604,8 @@ pub struct AccountUpdate<'a> {
     pub fairshare: Option<i32>,
     pub max_running_jobs: Option<Option<i32>>,
     pub grp_tres: Option<Option<&'a str>>,
+    pub allowed_qos: Option<Option<&'a str>>,
+    pub default_qos: Option<Option<&'a str>>,
 }
 
 /// Create or update an account, writing only the fields set in `u`. `modify`
@@ -1626,6 +1635,12 @@ pub async fn upsert_account<'a>(
     }
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.allowed_qos {
+        updates.push(("allowed_qos", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.default_qos {
+        updates.push(("default_qos", SqlVal::NullText(v)));
     }
     upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
@@ -1685,10 +1700,42 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
         .collect())
 }
 
+/// The stored QOS edit, not the evaluated list. No row and a NULL column
+/// are both "inherit".
+pub async fn account_allowed_qos(
+    conn: &mut PgConnection,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT allowed_qos FROM accounts WHERE name = $1")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.and_then(|row| row.get("allowed_qos")))
+}
+
+/// The user's own stored QOS edit on the partition-less association.
+pub async fn user_allowed_qos(
+    conn: &mut PgConnection,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT allowed_qos FROM associations \
+         WHERE user_name = $1 AND account = $2 \
+             AND (partition_name IS NULL OR partition_name = '') \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user)
+    .bind(account)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.and_then(|row| row.get("allowed_qos")))
+}
+
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres FROM accounts ORDER BY name"
+        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres, allowed_qos, default_qos FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1701,6 +1748,8 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             grp_tres: r.get("grp_tres"),
+            allowed_qos: r.get("allowed_qos"),
+            default_qos: r.get("default_qos"),
         })
         .collect())
 }
@@ -1715,6 +1764,11 @@ pub struct AccountRecord {
     pub max_running_jobs: Option<i32>,
     /// Account resource allocation as a TRES string; None = unlimited.
     pub grp_tres: Option<String>,
+    /// Raw QOS edit for the account. None means inherit. A plain list
+    /// replaces the parent; `+name`/`-name` adds or removes.
+    pub allowed_qos: Option<String>,
+    /// This account's own default QOS. None means inherit the parent's.
+    pub default_qos: Option<String>,
 }
 
 /// Update the partition-less association's columns, inserting the row if none
@@ -1903,10 +1957,13 @@ pub async fn remove_user(
     Ok(associations.rows_affected() + users.rows_affected())
 }
 
-/// List users, joining each one's own association row for `default_qos`/
-/// `allowed_qos`. `DISTINCT ON ... a.id DESC` picks the newest row if legacy
-/// duplicates exist (pre-dating the add_user upsert fix); it never touches
-/// the others.
+/// List users, joining each one's own association row for `default_qos` and
+/// the raw QOS edit. The returned `allowed_qos` is the evaluated list: the
+/// user's edit applied on top of the account chain. `None` means no list
+/// anywhere above them. `default_qos` is the user's own default, or the
+/// nearest account default when they have none. `DISTINCT ON ... a.id DESC`
+/// picks the newest row if legacy duplicates exist (pre-dating the add_user
+/// upsert fix); it never touches the others.
 pub async fn list_users(
     pool: &PgPool,
     account: Option<&str>,
@@ -1947,7 +2004,7 @@ pub async fn list_users_visible(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
+    let mut users: Vec<UserRecord> = rows
         .iter()
         .map(|r| UserRecord {
             name: r.get("name"),
@@ -1965,7 +2022,46 @@ pub async fn list_users_visible(
             partition: r.get("partition_name"),
             fairshare_weight: r.get("fairshare_weight"),
         })
-        .collect())
+        .collect();
+    apply_qos_inheritance(pool, &mut users).await?;
+    Ok(users)
+}
+
+/// Evaluated QOS list and default for every account, keyed by name. Takes the
+/// full set so a child still inherits from a parent the caller may not see.
+pub fn account_effects(records: &[AccountRecord]) -> HashMap<String, qos_level::AccountEffect> {
+    let nodes: Vec<qos_level::AccountNode<'_>> = records
+        .iter()
+        .map(|account| qos_level::AccountNode {
+            name: &account.name,
+            parent: account.parent.as_deref(),
+            qos: account.allowed_qos.as_deref(),
+            default_qos: account.default_qos.as_deref(),
+        })
+        .collect();
+    qos_level::evaluate_accounts(&nodes)
+}
+
+/// Replace each user's raw QOS edit with the evaluated list, and fill in a
+/// default QOS inherited from the account chain. The raw cells stay in the
+/// database; this only changes what readers see.
+async fn apply_qos_inheritance(pool: &PgPool, users: &mut [UserRecord]) -> anyhow::Result<()> {
+    if users.is_empty() {
+        return Ok(());
+    }
+    let accounts = list_accounts(pool).await?;
+    let effects = account_effects(&accounts);
+    let unrestricted = qos_level::EffectiveQos::unrestricted();
+    for user in users.iter_mut() {
+        let effect = effects.get(&user.account);
+        let account_qos = effect.map_or(&unrestricted, |effect| &effect.qos);
+        user.allowed_qos =
+            qos_level::effective_user(user.allowed_qos.as_deref(), account_qos).restriction();
+        if user.default_qos.is_none() {
+            user.default_qos = effect.and_then(|effect| effect.default_qos.clone());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1975,6 +2071,11 @@ pub struct UserRecord {
     pub admin_level: String,
     pub default_account: Option<String>,
     pub default_qos: Option<String>,
+    /// Evaluated allow-list: the user's edit on top of the account chain.
+    /// `None` means no list is set anywhere above them, so any QOS is allowed.
+    /// `Some("")` means a list is set and every name was removed. Not the
+    /// stored cell, so writing it back would pin an inherited list as the
+    /// user's own.
     pub allowed_qos: Option<String>,
     pub max_running_jobs: Option<i32>,
     pub max_submit_jobs: Option<i32>,
@@ -4569,6 +4670,175 @@ mod job_history_tests {
             .bind(&account)
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_inherits_account_qos_unless_the_user_sets_one() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qosinherit_user_{pid}");
+        let account = format!("spur_qosinherit_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some("acct-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let inherited = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(Some("user-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let own = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(own[0].allowed_qos.as_deref(), Some("user-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let cleared = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(cleared[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_walks_the_account_tree_and_applies_edits() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qostree_user_{pid}");
+        let parent = format!("spur_qostree_parent_{pid}");
+        let child = format!("spur_qostree_child_{pid}");
+
+        let cleanup = || async {
+            sqlx::query("DELETE FROM associations WHERE user_name = $1")
+                .bind(&user)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM users WHERE name = $1")
+                .bind(&user)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM accounts WHERE name = $1 OR name = $2")
+                .bind(&parent)
+                .bind(&child)
+                .execute(&pool)
+                .await?;
+            anyhow::Ok(())
+        };
+        cleanup().await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &parent,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some("normal,burst")),
+                default_qos: Some(Some("normal")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &child,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                parent: Some(Some(&parent)),
+                allowed_qos: Some(Some("+expedite,-burst")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &child,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                allowed_qos: Some(Some("+extra")),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let users = list_users(&pool, Some(&child), Some(&user)).await?;
+        assert_eq!(users.len(), 1);
+        assert_eq!(
+            users[0].allowed_qos.as_deref(),
+            Some("normal,expedite,extra")
+        );
+        assert_eq!(users[0].default_qos.as_deref(), Some("normal"));
+
+        let effects = account_effects(&list_accounts(&pool).await?);
+        assert_eq!(effects[&child].qos.display(), "normal,expedite");
+        assert_eq!(effects[&child].default_qos.as_deref(), Some("normal"));
+
+        cleanup().await?;
         Ok(())
     }
 
