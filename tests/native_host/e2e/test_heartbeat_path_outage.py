@@ -27,9 +27,11 @@ HEARTBEAT_INTERVAL_SECS = 30
 OUTAGE_SECS = HA_HEARTBEAT_TIMEOUT_SECS + 2 * HA_HEALTH_TICK_SECS + 30
 # A dead agent's node fails one probe, waits one pass, then fails the second.
 DOWN_WITHIN_SECS = HA_HEARTBEAT_TIMEOUT_SECS + 3 * HA_HEALTH_TICK_SECS + 30
-# The flag clears at the first health pass after a heartbeat lands.
+# The flag clears when the next heartbeat lands.
 FLAG_CLEARS_WITHIN_SECS = HEARTBEAT_INTERVAL_SECS + HA_HEALTH_TICK_SECS + 30
 JOB_SECS = 1800
+# The leader's warning about a silent node whose agent answers its probe.
+ANSWERING_NODE_LOG = "heartbeats from this node are not reaching the leader"
 
 
 def _settled_leader(cluster) -> int:
@@ -133,7 +135,7 @@ class TestHeartbeatPathOutage:
         assert nodes.get(name) != "down", f"{name} was marked down:\n{nodes}"
         assert job_state(jobs, job_id) == "R", f"job {job_id} ended:\n{jobs}"
         log = cluster.spurctld_log(leader)[log_start:]
-        assert "agent answers" in log, "the leader never confirmed the silent node"
+        assert ANSWERING_NODE_LOG in log, "the leader never confirmed the silent node"
         assert "node marked DOWN (heartbeat timeout)" not in log
 
         wait_until(
@@ -164,7 +166,7 @@ class TestHeartbeatPathOutage:
             time.sleep(OUTAGE_SECS)
 
         log = _assert_nobody_went_down(cluster, leader, jobs_by_node, log_start)
-        assert "agent answers" in log, "the leader never confirmed the silent nodes"
+        assert ANSWERING_NODE_LOG in log, "the leader never confirmed the silent nodes"
 
     def test_the_breaker_trips_when_the_leader_can_reach_no_node(self, ha_cluster):
         cluster = ha_cluster
