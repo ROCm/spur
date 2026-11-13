@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
                     hb_timeout,
                     mark_down,
                     &node_liveness::AgentProbe,
-                    || health_raft.current_term() == live_term,
+                    || health_raft.leads_term(live_term),
                 )
                 .await;
             for fin in &evicted {
