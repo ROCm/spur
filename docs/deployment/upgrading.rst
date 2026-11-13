@@ -865,7 +865,11 @@ agent on that node, which reports the run it holds; with either side from an
 earlier release, the old behavior stays. The recovery hold that keeps a returning
 node ``DOWN`` until it reports a clean job list applies to earlier agents too: one
 that still reports a job the controller ended is held, and drained at the cap if
-that job does not stop. Only upgraded agents report ``running_jobs_incomplete`` when
+that job does not stop. A node drained at the cap is admin-locked, with reason
+``Kill task failed (JobId=...)`` or ``Agent job list unavailable``, and takes no work
+until an operator runs ``scontrol update nodename=<node> state=resume``, so scripts that
+watch ``sinfo -R`` or resume nodes automatically should expect these reasons. Only
+upgraded agents report ``running_jobs_incomplete`` when
 they cannot list their jobs in full, though. An earlier agent sends an empty list
 when its job map is busy, which reads as clean, so its hold can end while an ended
 run is still going. An upgraded agent also stops the old

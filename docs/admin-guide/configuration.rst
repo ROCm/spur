@@ -256,8 +256,8 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        (see :ref:`requeued-run-upgrade-notes` for older agents). Also bounds how
        long a returning node's recovery is held while it still reports runs the
        controller ended or requeued, after which it is drained for an operator:
-       the hold lasts this long, or the node's kill and cleanup budget plus one
-       heartbeat interval if that is longer. See :ref:`node-liveness`.
+       the hold lasts this long, or the node's kill, cleanup, and epilog budget
+       plus one heartbeat interval if that is longer. See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``

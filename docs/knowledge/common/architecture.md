@@ -393,8 +393,8 @@ force-completed). A leadership grace period prevents false positives
 immediately after election. A returning DOWN or ERROR node stays down
 while its heartbeats report runs the controller ended, or cannot list its
 jobs; the leader cancels those runs and drains the node (admin-locked) if
-it is not clean by the hold cap, `max(heartbeat_timeout_secs, kill and
-cleanup budget + one heartbeat interval)`.
+it is not clean by the hold cap, `max(heartbeat_timeout_secs, kill,
+cleanup, and epilog budget + one heartbeat interval)`.
 
 **Inventory refresh:** spurd periodically re-discovers local hardware
 (GPU topology changes from partition switches). Changes are debounced
