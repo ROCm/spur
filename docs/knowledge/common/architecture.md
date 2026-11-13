@@ -364,7 +364,8 @@ override the exit-code-based decision.
       |
       |--- heartbeat arrives: update last_seen, resources, running jobs
       |--- heartbeat timeout: flagged not-responding; DOWN after two failed probes
-      |--- heartbeat recovered: state -> IDLE (unless admin-locked)
+      |--- heartbeat recovered: state -> IDLE (unless admin-locked) once
+      |    it reports a clean job list; DRAIN at the hold cap otherwise
       |
       v
   AdminSetState(Drain) ---> DRAINING (if jobs running) or DRAIN (if idle)
@@ -389,7 +390,11 @@ probes a health pass apart is marked DOWN, unless so many nodes are silent at
 once that the leader suspects itself (`max_stale_node_fraction`).
 Running jobs on a DOWN node are evicted (cancel sent to agents, steps
 force-completed). A leadership grace period prevents false positives
-immediately after election.
+immediately after election. A returning DOWN or ERROR node stays down
+while its heartbeats report runs the controller ended, or cannot list its
+jobs; the leader cancels those runs and drains the node (admin-locked) if
+it is not clean by the hold cap, `max(heartbeat_timeout_secs, kill and
+cleanup budget + one heartbeat interval)`.
 
 **Inventory refresh:** spurd periodically re-discovers local hardware
 (GPU topology changes from partition switches). Changes are debounced
