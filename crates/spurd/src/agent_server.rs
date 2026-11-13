@@ -3844,12 +3844,12 @@ fn build_container_launch(
             req.username
         },
         home_dir: req.home_dir,
+        withheld_socket: None,
         device_plan: req.device_plan,
     };
     crate::container::maybe_bind_auth_socket(
-        &mut cfg.mounts,
+        &mut cfg,
         cluster_id,
-        req.uid,
         allow_root_jobs,
         req.auth_socket,
     )
@@ -6826,12 +6826,12 @@ impl SlurmAgent for AgentService {
                     username
                 },
                 home_dir,
+                withheld_socket: None,
                 device_plan: None, // set after GRES allocation
             };
             crate::container::maybe_bind_auth_socket(
-                &mut cfg.mounts,
+                &mut cfg,
                 &self.cluster_id,
-                uid,
                 self.allow_root_jobs,
                 spec.container_auth_socket,
             )
@@ -9176,12 +9176,12 @@ impl SlurmAgent for AgentService {
                     username
                 },
                 home_dir,
+                withheld_socket: None,
                 device_plan: container_device_plan,
             };
             crate::container::maybe_bind_auth_socket(
-                &mut container_cfg.mounts,
+                &mut container_cfg,
                 &self.cluster_id,
-                step_uid,
                 self.allow_root_jobs,
                 c.auth_socket,
             )
@@ -17220,6 +17220,7 @@ mod tests {
             gid: 1000,
             username: "testuser".into(),
             home_dir: "/home/testuser".into(),
+            withheld_socket: None,
             device_plan: None,
         };
         let cfg = executor::JobLaunchConfig {

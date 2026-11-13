@@ -14,6 +14,7 @@
 //! - NVIDIA: bind-mount /dev/nvidia* + libnvidia-container or driver libs
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -154,26 +155,30 @@ pub struct ContainerConfig {
     pub gid: u32,
     pub username: String,
     pub home_dir: String,
+    /// Mint socket that no bind source may resolve to or contain; set when the
+    /// container was not granted it.
+    #[serde(default)]
+    pub withheld_socket: Option<PathBuf>,
     /// Registry-based device injection plan (replaces mount_hw_devices when present).
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
 }
 
 /// Bind-mount the host mint socket so nested `srun` can mint, for a container
 /// whose owner asked for it (`granted`). Host UID 0 does not receive the socket
-/// unless root jobs are explicitly allowed. Without the grant, a user bind
-/// mount that would expose the socket anyway (the socket itself or a directory
-/// holding it) is refused rather than silently honoured.
+/// unless root jobs are explicitly allowed. Without the grant, a bind that
+/// would expose the socket anyway (the socket itself or a directory holding
+/// it), whether a user mount or the home mount, is refused here and again at
+/// mount time against the pinned source.
 pub fn maybe_bind_auth_socket(
-    mounts: &mut Vec<BindMount>,
+    config: &mut ContainerConfig,
     cluster_id: &str,
-    uid: u32,
     allow_root_jobs: bool,
     granted: bool,
 ) -> anyhow::Result<()> {
     if !granted {
-        return refuse_auth_socket_mounts(mounts, cluster_id);
+        return withhold_auth_socket(config, cluster_id);
     }
-    if cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
+    if cluster_id.is_empty() || (config.uid == 0 && !allow_root_jobs) {
         return Ok(());
     }
     let Ok(path) = spur_core::native_mint::resolve_socket_path(cluster_id) else {
@@ -183,10 +188,10 @@ pub fn maybe_bind_auth_socket(
         return Ok(());
     }
     let displayed = path.display().to_string();
-    if mounts.iter().any(|m| m.source == displayed) {
+    if config.mounts.iter().any(|m| m.source == displayed) {
         return Ok(());
     }
-    mounts.push(BindMount {
+    config.mounts.push(BindMount {
         source: displayed.clone(),
         target: displayed,
         readonly: false,
@@ -194,7 +199,7 @@ pub fn maybe_bind_auth_socket(
     Ok(())
 }
 
-fn refuse_auth_socket_mounts(mounts: &[BindMount], cluster_id: &str) -> anyhow::Result<()> {
+fn withhold_auth_socket(config: &mut ContainerConfig, cluster_id: &str) -> anyhow::Result<()> {
     if cluster_id.is_empty() {
         return Ok(());
     }
@@ -202,17 +207,24 @@ fn refuse_auth_socket_mounts(mounts: &[BindMount], cluster_id: &str) -> anyhow::
         return Ok(());
     };
     let socket = std::fs::canonicalize(&socket).unwrap_or(socket);
-    for m in mounts {
-        let src = Path::new(&m.source);
-        let src = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-        if socket.starts_with(&src) {
-            anyhow::bail!(
-                "container mount '{}' would expose the credential socket {}, which \
-                 --container-auth-socket makes available; drop the mount or pass the flag",
-                m.source,
-                socket.display()
-            );
-        }
+    let home = config.mount_home.then_some(config.home_dir.as_str());
+    let sources = config.mounts.iter().map(|m| m.source.as_str()).chain(home);
+    for source in sources {
+        let real = std::fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
+        refuse_if_exposes(&real, source, &socket)?;
+    }
+    config.withheld_socket = Some(socket);
+    Ok(())
+}
+
+fn refuse_if_exposes(real: &Path, source: &str, socket: &Path) -> anyhow::Result<()> {
+    if socket.starts_with(real) {
+        anyhow::bail!(
+            "container mount '{}' would expose the credential socket {}, which \
+             --container-auth-socket makes available; drop the mount or pass the flag",
+            source,
+            socket.display()
+        );
     }
     Ok(())
 }
@@ -522,10 +534,35 @@ pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow
 }
 
 fn bind_mount(rootfs: &Path, source: &Path, target: &str, readonly: bool) -> anyhow::Result<()> {
-    create_mount_target(rootfs, target, source)?;
+    bind_mount_withholding(rootfs, source, target, readonly, None)
+}
+
+/// Bind `source` after pinning it with an `O_PATH` descriptor: the withheld
+/// socket check and the mount both act on that one object, so the path cannot
+/// be re-pointed between them.
+fn bind_mount_withholding(
+    rootfs: &Path,
+    source: &Path,
+    target: &str,
+    readonly: bool,
+    withheld: Option<&Path>,
+) -> anyhow::Result<()> {
+    let pin = nix::fcntl::open(
+        source,
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("open mount source {}", source.display()))?;
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
+    if let Some(socket) = withheld {
+        let real = std::fs::read_link(&pinned)
+            .with_context(|| format!("resolve mount source {}", source.display()))?;
+        refuse_if_exposes(&real, &source.display().to_string(), socket)?;
+    }
+    create_mount_target(rootfs, target, &pinned)?;
     let dest = rootfs.join(target.trim_start_matches('/'));
     nix::mount::mount(
-        Some(source),
+        Some(&pinned),
         &dest,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
@@ -688,20 +725,24 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
 }
 
 /// Process user-specified `--container-mounts` with source-type detection.
-pub fn mount_user_binds(rootfs: &Path, mounts: &[BindMount]) -> anyhow::Result<()> {
+pub fn mount_user_binds(
+    rootfs: &Path,
+    mounts: &[BindMount],
+    withheld: Option<&Path>,
+) -> anyhow::Result<()> {
     for m in mounts {
         let source = Path::new(&m.source);
-        bind_mount(rootfs, source, &m.target, m.readonly)
+        bind_mount_withholding(rootfs, source, &m.target, m.readonly, withheld)
             .with_context(|| format!("user mount {}:{}", m.source, m.target))?;
     }
     Ok(())
 }
 
 /// Bind-mount user home directory into the rootfs.
-pub fn mount_home(rootfs: &Path, home_dir: &str) -> anyhow::Result<()> {
+pub fn mount_home(rootfs: &Path, home_dir: &str, withheld: Option<&Path>) -> anyhow::Result<()> {
     let source = Path::new(home_dir);
     if source.is_dir() {
-        bind_mount(rootfs, source, home_dir, false)
+        bind_mount_withholding(rootfs, source, home_dir, false, withheld)
             .with_context(|| format!("mount home {}", home_dir))?;
     }
     Ok(())
@@ -1155,11 +1196,11 @@ pub fn container_init(
     }
 
     setup_shadow(rootfs, config)?;
-    mount_user_binds(rootfs, &config.mounts)?;
+    mount_user_binds(rootfs, &config.mounts, config.withheld_socket.as_deref())?;
     mount_dns(rootfs, &config.mounts)?;
 
     if config.mount_home {
-        mount_home(rootfs, &config.home_dir)?;
+        mount_home(rootfs, &config.home_dir, config.withheld_socket.as_deref())?;
     }
 
     let hook_env = run_hooks(rootfs)?;
@@ -1189,20 +1230,50 @@ mod tests {
 
     // --- Credential mint socket ---
 
-    fn auth_socket_mounts(uid: u32, granted: bool) -> Vec<BindMount> {
+    fn test_config(uid: u32) -> ContainerConfig {
+        ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid,
+            gid: uid,
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
+            withheld_socket: None,
+            device_plan: None,
+        }
+    }
+
+    /// Run `maybe_bind_auth_socket` with a socket at `<tempdir>/auth.sock`.
+    fn with_auth_socket<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("auth.sock");
         std::fs::write(&socket, b"").unwrap();
         let prev = std::env::var_os(spur_core::native_mint::AUTH_SOCKET_ENV);
         std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, &socket);
-        let mut mounts = Vec::new();
-        maybe_bind_auth_socket(&mut mounts, "cluster", uid, false, granted).unwrap();
+        let out = f(dir.path());
         match prev {
             Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
             None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
         }
-        mounts
+        out
+    }
+
+    fn auth_socket_mounts(uid: u32, granted: bool) -> Vec<BindMount> {
+        with_auth_socket(|_| {
+            let mut cfg = test_config(uid);
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, granted).unwrap();
+            cfg.mounts
+        })
     }
 
     #[test]
@@ -1224,24 +1295,16 @@ mod tests {
     }
 
     fn ungranted_with_user_mount(source: impl Fn(&Path) -> PathBuf) -> anyhow::Result<()> {
-        let _guard = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("auth.sock");
-        std::fs::write(&socket, b"").unwrap();
-        let prev = std::env::var_os(spur_core::native_mint::AUTH_SOCKET_ENV);
-        std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, &socket);
-        let src = source(dir.path()).display().to_string();
-        let mut mounts = vec![BindMount {
-            source: src.clone(),
-            target: src,
-            readonly: true,
-        }];
-        let res = maybe_bind_auth_socket(&mut mounts, "cluster", 1000, false, false);
-        match prev {
-            Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
-            None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
-        }
-        res
+        with_auth_socket(|dir| {
+            let src = source(dir).display().to_string();
+            let mut cfg = test_config(1000);
+            cfg.mounts = vec![BindMount {
+                source: src.clone(),
+                target: src,
+                readonly: true,
+            }];
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, false)
+        })
     }
 
     #[test]
@@ -1259,6 +1322,96 @@ mod tests {
     #[test]
     fn an_ungranted_auth_socket_allows_unrelated_mounts() {
         assert!(ungranted_with_user_mount(|d| d.join("other")).is_ok());
+    }
+
+    fn ungranted_with_home(
+        home: impl Fn(&Path) -> PathBuf,
+        mount_home: bool,
+    ) -> anyhow::Result<()> {
+        with_auth_socket(|dir| {
+            let mut cfg = test_config(1000);
+            cfg.mount_home = mount_home;
+            cfg.home_dir = home(dir).display().to_string();
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, false)
+        })
+    }
+
+    #[test]
+    fn an_ungranted_auth_socket_refuses_a_home_mount_that_holds_it() {
+        let err = ungranted_with_home(|d| d.to_path_buf(), true).unwrap_err();
+        assert!(err.to_string().contains("credential socket"), "{err}");
+        assert!(ungranted_with_home(|_| PathBuf::from("/"), true).is_err());
+    }
+
+    #[test]
+    fn an_ungranted_auth_socket_ignores_a_home_that_is_not_mounted() {
+        assert!(ungranted_with_home(|d| d.to_path_buf(), false).is_ok());
+        assert!(ungranted_with_home(|d| d.join("other"), true).is_ok());
+    }
+
+    #[test]
+    fn an_ungranted_container_withholds_the_socket_at_mount_time() {
+        let cfg = with_auth_socket(|dir| {
+            let mut cfg = test_config(1000);
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, false).unwrap();
+            assert_eq!(
+                cfg.withheld_socket.as_deref(),
+                Some(
+                    std::fs::canonicalize(dir.join("auth.sock"))
+                        .unwrap()
+                        .as_path()
+                )
+            );
+            cfg
+        });
+        let granted = with_auth_socket(|_| {
+            let mut cfg = test_config(1000);
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, true).unwrap();
+            cfg
+        });
+        assert!(cfg.withheld_socket.is_some());
+        assert!(granted.withheld_socket.is_none());
+    }
+
+    #[test]
+    fn a_source_swapped_to_the_socket_after_validation_is_refused_when_bound() {
+        with_auth_socket(|dir| {
+            let mut cfg = test_config(1000);
+            let benign = dir.join("benign");
+            std::fs::create_dir(&benign).unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&benign, &link).unwrap();
+            cfg.mounts = vec![BindMount {
+                source: link.display().to_string(),
+                target: "/data".into(),
+                readonly: false,
+            }];
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, false).unwrap();
+
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(dir, &link).unwrap();
+
+            let rootfs = tempfile::tempdir().unwrap();
+            let err = mount_user_binds(rootfs.path(), &cfg.mounts, cfg.withheld_socket.as_deref())
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("credential socket"), "{err:#}");
+        });
+    }
+
+    #[test]
+    fn home_mount_is_refused_at_mount_time_when_it_resolves_to_the_socket_dir() {
+        with_auth_socket(|dir| {
+            let mut cfg = test_config(1000);
+            maybe_bind_auth_socket(&mut cfg, "cluster", false, false).unwrap();
+            let rootfs = tempfile::tempdir().unwrap();
+            let err = mount_home(
+                rootfs.path(),
+                &dir.display().to_string(),
+                cfg.withheld_socket.as_deref(),
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("credential socket"), "{err:#}");
+        });
     }
 
     // --- Mount parsing ---
@@ -1683,6 +1836,7 @@ mod tests {
             gid: 1000,
             username: "alice".into(),
             home_dir: "/home/alice".into(),
+            withheld_socket: None,
             device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();
@@ -1724,6 +1878,7 @@ mod tests {
             gid: 1000,
             username: "alice".into(),
             home_dir: "/home/alice".into(),
+            withheld_socket: None,
             device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();
