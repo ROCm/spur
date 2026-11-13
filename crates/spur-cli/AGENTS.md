@@ -168,6 +168,7 @@ output (`-p`/`-P`). Commands: `add`, `modify`, `delete`, `show`, `list`.
 
 - `show job/node/partition/reservation/config/assoc_mgr/federation/steps`
 - `create/update/delete` for partitions and reservations
+- `delete NodeName=<hostlist|ALL>` (also `delete node <hostlist|ALL>`) uses native node removal without force
 - `hold`, `release`, `suspend`, `resume`, `requeue`
 - `reconfigure` -- live config reload
 - `show hostnames/hostlist/hostlistsorted` -- pure-local transforms

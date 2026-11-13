@@ -79,7 +79,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             node,
             force,
             reason,
-        } => cmd_remove(&controller, node, force, reason).await,
+        } => remove_nodes(&controller, node, force, reason).await,
     }
 }
 
@@ -204,19 +204,25 @@ async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String
     Ok(())
 }
 
-async fn cmd_remove(
+pub(crate) async fn remove_nodes(
     controller: &str,
     node_pattern: String,
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
+    validate_removal_pattern(&node_pattern)?;
     let nodes = expand_node_pattern(&node_pattern)?;
+    if nodes.as_ref().is_some_and(Vec::is_empty) {
+        bail!("invalid node name pattern: no nodes specified");
+    }
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
-    let nodes = if let Some(nodes) = nodes {
+    let mut nodes = if let Some(nodes) = nodes {
         nodes
     } else {
         resolve_node_names(&mut client, &node_pattern).await?
     };
+    let mut seen = std::collections::HashSet::new();
+    nodes.retain(|name| seen.insert(name.clone()));
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -260,6 +266,28 @@ async fn cmd_remove(
             nodes.len(),
             failed.join(", ")
         );
+    }
+    Ok(())
+}
+
+fn validate_removal_pattern(pattern: &str) -> Result<()> {
+    let mut in_brackets = false;
+    let mut has_component = false;
+    for ch in pattern.chars() {
+        match ch {
+            '[' if !in_brackets => {
+                in_brackets = true;
+                has_component = false;
+            }
+            ']' if in_brackets && has_component => in_brackets = false,
+            ',' if has_component => has_component = false,
+            '[' | ']' | ',' => bail!("invalid node name pattern: empty or malformed component"),
+            ch if !ch.is_whitespace() => has_component = true,
+            _ => {}
+        }
+    }
+    if in_brackets || !has_component {
+        bail!("invalid node name pattern: empty or malformed component");
     }
     Ok(())
 }
@@ -368,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_all_forces_every_registered_node() {
+    async fn remove_all_preserves_force_and_reason_for_every_registered_node() {
         let (addr, capture) = crate::mock_controller::spawn().await;
         capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
 
@@ -379,6 +407,8 @@ mod tests {
             "remove".into(),
             "ALL".into(),
             "--force".into(),
+            "--reason".into(),
+            "decommissioned".into(),
         ])
         .await
         .unwrap();
@@ -386,6 +416,10 @@ mod tests {
         assert_eq!(
             capture.deregister_node_calls(),
             vec![("n1".to_string(), true), ("n2".to_string(), true)]
+        );
+        assert_eq!(
+            capture.deregister_node_reasons(),
+            vec!["decommissioned", "decommissioned"]
         );
     }
 

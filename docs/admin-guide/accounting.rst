@@ -1491,6 +1491,48 @@ An allocated node reports ``DRAINING`` until its last CPU or device allocation
 is released, then reports ``DRAINED`` in ``scontrol show node`` while keeping
 the administrative reason. An empty node enters ``DRAINED`` immediately.
 
+To remove a departed node's record, use any of these forms. Removal works
+even when its agent or container no longer exists:
+
+.. code-block:: bash
+
+   scontrol delete NodeName=gpu001
+   scontrol delete node=gpu001
+   scontrol delete node gpu001
+   spur node remove gpu001
+
+These commands use the existing native node-removal RPC and its checks for
+allocated running, completing, or suspended jobs. Drain a node and wait for
+its jobs to finish before removing it. ``NodeName=`` accepts a hostname,
+a comma-separated list, a hostlist such as ``gpu[001-004]``, or ``ALL`` for
+every registered node. A malformed hostlist with an empty component, such as
+``gpu[]`` or ``gpu[1,]``, is rejected before connecting.
+Overlapping targets are removed once, in the order of
+their first appearance. A failed removal is reported per node; remaining
+nodes are still attempted, and the command exits unsuccessfully if any
+removal fails. An empty cluster with ``ALL`` is also an error.
+
+``scontrol delete`` accepts one entity and one target as ``key=value`` or
+``key value``. Entity keys are ``NodeName``, ``PartitionName``, and
+``ReservationName``; like Slurm, they ignore case and accept any prefix of at
+least three characters. For example, ``nod``, ``node``, and ``NODENAME`` all
+select nodes, ``par`` and ``partition`` select partitions, and ``res`` and
+``reservation`` select reservations. Target names retain their case. A target
+is required: ``scontrol delete node`` alone is an error. Node targets accept
+the same host lists and ``ALL`` in either syntax. Named Slurm ``NodeSet`` groups
+are not expanded.
+
+For a removal reason or to evict active jobs, use
+``spur node remove <hostlist> --reason "decommissioned"`` or its ``--force``
+option. Node removal requires Administrator when the caller has a verified
+identity; see :ref:`privileged-operations`.
+
+Removal does not stop the agent or change ``spur.conf``. An agent that
+registers again can recreate the node record. Slurm restricts this command
+to dynamic nodes without running jobs or reservation membership; Spur uses
+its native registered-node removal rules and does not currently guard
+reservation membership.
+
 .. note::
 
    Partitions can also be created, updated, and deleted at runtime with
