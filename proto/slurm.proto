@@ -589,6 +589,8 @@ message PartitionInfo {
   optional uint64 def_mem_per_node = 50;
   optional uint64 def_mem_per_cpu = 51;
   optional uint64 def_mem_per_gpu = 52;
+  // Partition QOS whose limits bound every job in the partition; empty = none.
+  string qos = 53;
 }
 
 // ============================================================
@@ -2287,6 +2289,7 @@ message CreatePartitionRequest {
   optional uint64 def_mem_per_node = 23;
   optional uint64 def_mem_per_cpu = 24;
   optional uint64 def_mem_per_gpu = 25;
+  string qos = 26;  // partition QOS; empty = none
 }
 
 message UpdatePartitionRequest {
@@ -2337,6 +2340,7 @@ message UpdatePartitionRequest {
   optional uint64 def_mem_per_node = 33;
   optional uint64 def_mem_per_cpu = 34;
   optional uint64 def_mem_per_gpu = 35;
+  optional string qos = 36;  // partition QOS; absent = no change, empty = clear
 }
 
 message DeletePartitionRequest {

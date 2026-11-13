@@ -1270,6 +1270,10 @@ pub struct PartitionConfig {
     pub deny_qos: Vec<String>,
     #[serde(default)]
     pub allow_qos: Vec<String>,
+    /// Partition QOS: its limits (e.g. `MaxTRESPU`) bound every job in the
+    /// partition, whatever its account or job QOS.
+    #[serde(default)]
+    pub qos: Option<String>,
     #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
@@ -3094,6 +3098,7 @@ impl SlurmConfig {
                 deny_accounts: pc.deny_accounts.clone(),
                 deny_qos: pc.deny_qos.clone(),
                 allow_qos: pc.allow_qos.clone(),
+                qos: pc.qos.clone().filter(|q| !q.is_empty()),
                 priority_tier: pc.priority_tier,
                 preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
                     .unwrap_or(None),

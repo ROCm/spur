@@ -3349,6 +3349,7 @@ impl SlurmController for ControllerService {
             preempt_mode,
             preempt_exempt_time: req.preempt_exempt_time,
             grace_time: req.grace_time,
+            qos: Some(req.qos).filter(|q| !q.is_empty()),
             ..Default::default()
         };
         limits.apply_to(&mut partition);
@@ -3469,6 +3470,7 @@ impl SlurmController for ControllerService {
                 },
                 grace_time,
                 limits,
+                req.qos.map(|q| Some(q).filter(|q| !q.is_empty())),
             )
             .map_err(partition_rpc_status)?;
 
@@ -5838,6 +5840,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         def_mem_per_node: part.def_mem_per_node,
         def_mem_per_cpu: part.def_mem_per_cpu,
         def_mem_per_gpu: part.def_mem_per_gpu,
+        qos: part.qos.clone().unwrap_or_default(),
     }
 }
 

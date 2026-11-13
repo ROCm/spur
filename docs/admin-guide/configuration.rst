@@ -1671,6 +1671,14 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
      - [string]
      - ``[]``
      - Accounts denied submission to this partition (deny-list).
+   * - ``qos``
+     - string or null
+     - ``null`` (none)
+     - Partition QOS. Its limits apply to every job in the partition on top of the
+       job's own QOS, and its usage is counted across all accounts and job QOSes,
+       so ``MaxTRESPU`` on it caps what one user holds in the partition however
+       many accounts they submit from. See :ref:`partition-qos`. Set at runtime
+       with ``scontrol update PartitionName=<name> QOS=<qos>``; ``QOS=`` clears it.
    * - ``priority_tier``
      - integer
      - ``0``

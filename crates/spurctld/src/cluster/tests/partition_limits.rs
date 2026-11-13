@@ -55,7 +55,7 @@ fn update_limits(
 ) -> Result<(), PartitionError> {
     cm.update_partition(
         name, None, None, None, None, None, None, None, false, None, None, None, None, None, None,
-        None, None, None, None, limits,
+        None, None, None, None, limits, None,
     )
 }
 
@@ -810,6 +810,7 @@ fn limits_entry(state: Option<&str>, limits: PartitionLimitsUpdate) -> WalOperat
         is_default: None,
         preempt_exempt_time: None,
         grace_time: None,
+        qos: None,
         resource_limits: Some(limits),
     }
 }

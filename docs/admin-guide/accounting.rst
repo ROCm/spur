@@ -613,6 +613,58 @@ QOS keys
      - Comma-separated QOS flags. ``DenyOnLimit`` is supported (see
        :ref:`deny-on-limit`).
 
+.. _partition-qos:
+
+Partition QOS: capping a user across accounts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job QOS counts usage per QOS, and an association counts it per account, so a
+user who submits from several accounts, each with its own team QOS, is never
+summed in one place. A partition QOS closes that gap. Attach a QOS to a partition
+and its limits apply to every job in the partition, in addition to the job's own
+QOS, with usage counted over every job running there whatever its account or job
+QOS.
+
+.. code-block:: bash
+
+   sacctmgr add qos name=usercap maxtresperuser=node=8,gres/gpu=64
+   scontrol update PartitionName=gpu QOS=usercap
+
+or in ``spur.conf``:
+
+.. code-block:: toml
+
+   [[partitions]]
+   name = "gpu"
+   nodes = "gpu[001-064]"
+   qos = "usercap"
+
+A user over the cap waits with the usual QOS reason (``QOSMaxNodePerUserLimit``,
+``QOSMaxGRESPerUser``, …); other users and other partitions are unaffected.
+``scontrol show partition`` prints the partition QOS as ``QoS=``.
+
+How it behaves:
+
+- Every resource and running-job limit of the partition QOS applies:
+  ``MaxTRESPU``, ``MaxJobsPU``, ``MaxTRESPJ``, ``GrpTRES`` and ``MaxWall``.
+  Submit-count limits (``MaxSubmitJobsPU``, ``MaxSubmitJobsPA``, ``GrpSubmit``)
+  and ``GrpWall`` on a partition QOS are not enforced.
+- A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
+  partitions whose QOS still admits it, and waits only when none does. Until it is
+  placed, it counts against every candidate partition's QOS for the rest of that
+  scheduling pass, so a later job in the same pass may wait one pass longer.
+- Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
+  idle capacity past it: the cap bounds what a user holds, borrowed or not.
+- A partition QOS that names no defined QOS holds the partition's jobs with
+  ``InvalidQOS`` rather than silently lifting the cap. While the QOS cache is
+  still loading, the partition's jobs wait with ``AccountingUnavailable``.
+- The same QOS may be both a partition QOS and a job QOS; both checks then apply.
+- Several partitions may name the same partition QOS, and a user's usage in all of
+  them adds up against it. Naming one QOS on every partition caps a user across the
+  whole cluster.
+- A partition QOS needs accounting. With accounting disabled no QOS is defined, so
+  the partition QOS has no effect.
+
 .. _deny-on-limit:
 
 How limits are enforced at submit

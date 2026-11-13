@@ -972,8 +972,10 @@ Reading it:
   ``MaxSubmitJobsPU``, ``MaxTRESPU``), and the per-account submit cap
   ``MaxSubmitJobsPA``. An association caps each ``(user, account)`` pair on its
   own, so its per-user caps and its ``MaxTRESPJ`` ride on each ``User=`` line
-  instead. ``MaxTRESPJ`` bounds one job; ``MaxTRESPU``, or ``MaxTRES`` on an
-  association ``User=`` line, bounds that user's total. ``MaxSubmitJobsPA`` and
+  instead. ``MaxTRESPJ`` bounds one job and ``MaxTRESPU`` bounds a user's total
+  within the QOS. An association carries no per-user TRES cap, so ``MaxTRES`` on
+  a ``User=`` line always reads ``N``; a cap on one user across accounts is a
+  :ref:`partition QOS <partition-qos>`. ``MaxSubmitJobsPA`` and
   ``GrpWall`` are QOS-only and never appear in association records.
 * ``Grp*`` figures are the whole scope's, summed across every user, and stay on
   the scope line. ``GrpWall`` is the QOS's wall-clock budget beside the spend

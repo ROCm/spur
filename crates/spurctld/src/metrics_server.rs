@@ -191,6 +191,7 @@ mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),

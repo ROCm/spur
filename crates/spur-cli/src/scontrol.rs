@@ -164,6 +164,9 @@ pub enum ScontrolCommand {
         /// its QOS leaves the grace time unset (0 = no grace; omit to leave unset)
         #[arg(long)]
         grace_time: Option<u32>,
+        /// Partition QOS whose limits bound every job in the partition
+        #[arg(long, default_value = "")]
+        qos: String,
     },
     /// Update a partition
     #[command(name = "update-partition")]
@@ -252,6 +255,9 @@ pub enum ScontrolCommand {
         /// Clear the partition's grace_time, leaving it unset.
         #[arg(long, conflicts_with = "grace_time")]
         clear_grace_time: bool,
+        /// Set the partition QOS; an empty value clears it
+        #[arg(long)]
+        qos: Option<String>,
     },
     /// Delete a partition
     #[command(name = "delete-partition")]
@@ -431,6 +437,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             preempt_mode,
             preempt_exempt_time,
             grace_time,
+            qos,
         } => {
             create_partition(
                 &args.controller,
@@ -452,6 +459,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &preempt_mode,
                 preempt_exempt_time,
                 grace_time,
+                &qos,
                 PartitionLimitArgs::default(),
             )
             .await
@@ -484,6 +492,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             clear_preempt_exempt_time,
             grace_time,
             clear_grace_time,
+            qos,
         } => {
             let selector_map = match selector {
                 Some(ref s) => parse_selector(s)?,
@@ -517,6 +526,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 clear_preempt_exempt_time,
                 grace_time,
                 clear_grace_time,
+                qos,
                 ..Default::default()
             };
             update_partition(&args.controller, req).await
@@ -1423,6 +1433,7 @@ struct PartitionCreateParams {
     preempt_mode: String,
     preempt_exempt_time: Option<u32>,
     grace_time: Option<u32>,
+    qos: String,
     limits: PartitionLimitArgs,
 }
 
@@ -1431,7 +1442,8 @@ struct PartitionCreateParams {
 ///
 /// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
 /// MaxTime, DefaultTime, MaxNodes, MinNodes, AllowAccounts, AllowGroups,
-/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode, PreemptExemptTime, GraceTime.
+/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode, PreemptExemptTime, GraceTime,
+/// QOS.
 fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreateParams> {
     let mut parsed = PartitionCreateParams {
         name: String::new(),
@@ -1451,6 +1463,7 @@ fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreatePar
         preempt_mode: String::new(),
         preempt_exempt_time: None,
         grace_time: None,
+        qos: String::new(),
         limits: PartitionLimitArgs::default(),
     };
 
@@ -1489,10 +1502,11 @@ fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreatePar
                             .map_err(|_| invalid_value("GraceTime", value))?,
                     );
                 }
+                "qos" => parsed.qos = value.into(),
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
-                | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+                | "maxcpuspersocket" | "jobdefaults" | "tres" => {}
                 other => {
                     if !parsed.limits.parse_key(other, value)? {
                         eprintln!("scontrol create partition: unknown key '{}'", other)
@@ -1531,6 +1545,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         &p.preempt_mode,
         p.preempt_exempt_time,
         p.grace_time,
+        &p.qos,
         p.limits,
     )
     .await?;
@@ -1867,6 +1882,7 @@ fn partition_update_request(
     let mut clear_preempt_exempt_time = false;
     let mut grace_time: Option<u32> = None;
     let mut clear_grace_time = false;
+    let mut qos: Option<String> = None;
     let mut limits = PartitionLimitArgs::default();
 
     for param in params {
@@ -1918,10 +1934,11 @@ fn partition_update_request(
             "cleargracetime" => {
                 clear_grace_time = crate::boolean::parse_bool(key, value).map_err(|_| invalid())?
             }
+            "qos" => qos = Some(value.into()),
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
             | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
-            | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+            | "maxcpuspersocket" | "jobdefaults" | "tres" => {}
             other => {
                 if !limits.parse_key(other, value)? {
                     bail!("scontrol update: update of this parameter is not supported: '{param}'")
@@ -1975,6 +1992,7 @@ fn partition_update_request(
         def_mem_per_node: limits.def_mem_per_node,
         def_mem_per_cpu: limits.def_mem_per_cpu,
         def_mem_per_gpu: limits.def_mem_per_gpu,
+        qos,
     })
 }
 
@@ -2198,6 +2216,7 @@ async fn create_partition(
     preempt_mode: &str,
     preempt_exempt_time: Option<u32>,
     grace_time: Option<u32>,
+    qos: &str,
     limits: PartitionLimitArgs,
 ) -> Result<()> {
     let channel = crate::authclient::connect(controller)
@@ -2232,6 +2251,7 @@ async fn create_partition(
             def_mem_per_node: limits.def_mem_per_node.filter(|v| *v != 0),
             def_mem_per_cpu: limits.def_mem_per_cpu.filter(|v| *v != 0),
             def_mem_per_gpu: limits.def_mem_per_gpu.filter(|v| *v != 0),
+            qos: qos.to_string(),
         })
         .await
         .context("failed to create partition")?;
@@ -2459,6 +2479,15 @@ fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
     if !part.deny_qos.is_empty() {
         let _ = writeln!(out, "   DenyQos={}", part.deny_qos);
     }
+    let _ = writeln!(
+        out,
+        "   QoS={}",
+        if part.qos.is_empty() {
+            "N/A"
+        } else {
+            &part.qos
+        }
+    );
     let _ = writeln!(out, "   State={}", part.state.to_uppercase());
     let _ = writeln!(out, "   Nodes={}", part.nodes);
     let _ = writeln!(
@@ -3658,6 +3687,31 @@ mod tests {
         assert!(zero.contains(" GraceTime=0\n"), "{zero}");
         let unset = format_partition_detail(&part(None));
         assert!(!unset.contains("GraceTime"), "{unset}");
+    }
+
+    #[test]
+    fn partition_qos_is_set_on_create_and_set_or_cleared_on_update() {
+        let created = parse_partition_create_params(&p(&["PartitionName=gpu", "QOS=usercap"]))
+            .expect("valid parameters");
+        assert_eq!(created.qos, "usercap");
+
+        let set = partition_update_request(&p(&["PartitionName=gpu", "QOS=usercap"])).unwrap();
+        assert_eq!(set.qos.as_deref(), Some("usercap"));
+        let cleared = partition_update_request(&p(&["PartitionName=gpu", "QOS="])).unwrap();
+        assert_eq!(cleared.qos.as_deref(), Some(""));
+        let untouched = partition_update_request(&p(&["PartitionName=gpu"])).unwrap();
+        assert_eq!(untouched.qos, None);
+    }
+
+    #[test]
+    fn show_partition_names_the_partition_qos() {
+        let part = |qos: &str| spur_proto::proto::PartitionInfo {
+            name: "gpu".into(),
+            qos: qos.into(),
+            ..Default::default()
+        };
+        assert!(format_partition_detail(&part("usercap")).contains("   QoS=usercap\n"));
+        assert!(format_partition_detail(&part("")).contains("   QoS=N/A\n"));
     }
 
     #[test]
