@@ -4846,6 +4846,7 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
         env: spec.container_env.clone(),
         entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         remap_root: spec.container_remap_root,
+        auth_socket: spec.container_auth_socket,
     })
 }
 
@@ -4866,6 +4867,7 @@ fn resolve_step_container(
                 env.extend(step.env);
                 step.env = env;
             }
+            step.auth_socket |= job_spec.container_auth_socket;
             Some(step)
         }
         None => container_spec_from_job_spec(job_spec),
@@ -5182,6 +5184,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.container_entrypoint)
         },
         container_remap_root: spec.container_remap_root,
+        container_auth_socket: spec.container_auth_socket,
         burst_buffer: if spec.burst_buffer.is_empty() {
             None
         } else {
@@ -6827,6 +6830,55 @@ mod tests {
         let eff = resolve_step_container(Some(step), &job).expect("effective container");
         assert_eq!(eff.env.get("A").map(String::as_str), Some("parent"));
         assert_eq!(eff.env.get("B").map(String::as_str), Some("step"));
+    }
+
+    #[test]
+    fn resolve_step_container_carries_the_jobs_auth_socket_grant() {
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        job.container_auth_socket = true;
+        assert!(
+            resolve_step_container(None, &job)
+                .expect("inherit")
+                .auth_socket
+        );
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            ..Default::default()
+        };
+        assert!(
+            resolve_step_container(Some(step), &job)
+                .expect("override")
+                .auth_socket,
+            "a step image inherits the socket the job was granted"
+        );
+        job.container_auth_socket = false;
+        assert!(
+            !resolve_step_container(None, &job)
+                .expect("inherit")
+                .auth_socket
+        );
+    }
+
+    #[test]
+    fn a_step_image_inherits_the_auth_socket_grant_of_an_allocation_without_an_image() {
+        let mut job = owned_job("u", "/w");
+        job.container_auth_socket = true;
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            ..Default::default()
+        };
+        assert!(
+            resolve_step_container(Some(step.clone()), &job)
+                .expect("override")
+                .auth_socket
+        );
+        job.container_auth_socket = false;
+        assert!(
+            !resolve_step_container(Some(step), &job)
+                .expect("override")
+                .auth_socket
+        );
     }
 
     #[test]

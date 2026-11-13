@@ -184,6 +184,12 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_remap_root: bool,
 
+    /// Mount the node's credential mint socket into the container, so a nested
+    /// srun there can authenticate (anything in the container can then act on
+    /// the cluster as you)
+    #[arg(long)]
+    pub container_auth_socket: bool,
+
     /// Prolog script to run locally before step dispatch
     #[arg(long)]
     pub prolog: Option<String>,
@@ -762,6 +768,7 @@ fn build_srun_job_spec(
             .and_then(|a| a.container_entrypoint.clone())
             .unwrap_or_default(),
         container_remap_root: container.is_some_and(|a| a.container_remap_root),
+        container_auth_socket: container.is_some_and(|a| a.container_auth_socket),
         srun_job: true,
         pty: args.pty,
         client_keepalive: true,
@@ -796,6 +803,7 @@ fn container_spec_from_srun_args(args: &SrunArgs) -> Option<ContainerSpec> {
             .collect(),
         entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
         remap_root: args.container_remap_root,
+        auth_socket: args.container_auth_socket,
     })
 }
 
@@ -2387,6 +2395,44 @@ mod tests {
         let warnings = pty_step_unsupported_warnings(&args, &matches);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--mem"), "{warnings:?}");
+    }
+
+    #[test]
+    fn container_auth_socket_reaches_the_standalone_job_spec() {
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let (args, _) = parse_srun(&[
+            "srun",
+            "--container-image",
+            "img.sqsh",
+            "--container-auth-socket",
+            "true",
+        ]);
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").unwrap();
+        assert!(spec.container_auth_socket);
+
+        let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").unwrap();
+        assert!(!spec.container_auth_socket);
+    }
+
+    #[test]
+    fn container_auth_socket_reaches_the_step_container_spec() {
+        let (args, _) = parse_srun(&[
+            "srun",
+            "--container-image",
+            "img.sqsh",
+            "--container-auth-socket",
+            "true",
+        ]);
+        let spec = container_spec_from_srun_args(&args).expect("an image was given");
+        assert!(spec.auth_socket);
+
+        let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
+        assert!(!container_spec_from_srun_args(&args).unwrap().auth_socket);
     }
 
     #[test]

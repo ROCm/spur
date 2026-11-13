@@ -766,6 +766,8 @@ pub struct JobSpec {
     pub container_env: HashMap<String, String>,
     pub container_entrypoint: Option<String>,
     pub container_remap_root: bool,
+    #[serde(default)]
+    pub container_auth_socket: bool,
 
     // Burst buffer
     pub burst_buffer: Option<String>,
@@ -879,6 +881,7 @@ impl Default for JobSpec {
             container_env: HashMap::new(),
             container_entrypoint: None,
             container_remap_root: false,
+            container_auth_socket: false,
             burst_buffer: None,
             begin_time: None,
             deadline: None,

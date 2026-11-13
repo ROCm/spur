@@ -246,6 +246,12 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_remap_root")]
     pub container_remap_root: bool,
 
+    /// Mount the node's credential mint socket into the container, so a nested
+    /// srun there can authenticate (anything in the container can then act on
+    /// the cluster as you)
+    #[arg(long, overrides_with = "container_auth_socket")]
+    pub container_auth_socket: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -546,6 +552,7 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(container_mount_home, "container_mount_home");
     fallback!(container_entrypoint, "container_entrypoint");
     fallback!(container_remap_root, "container_remap_root");
+    fallback!(container_auth_socket, "container_auth_socket");
     fallback!(wait, "wait");
     fallback!(controller, "controller");
     fallback!(script, "script");
@@ -949,6 +956,7 @@ pub(crate) fn build_sbatch_job_spec(
             .collect(),
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
+        container_auth_socket: args.container_auth_socket,
         burst_buffer: args.bb.unwrap_or_default(),
         licenses: args.licenses,
         mail_type: args
@@ -1334,6 +1342,18 @@ echo "hello world"
         // Bool flags: directive sets, CLI re-sets — must not error.
         let args = parse_merged(&["--exclusive"], &["sbatch", "--exclusive"]);
         assert!(args.exclusive);
+    }
+
+    #[test]
+    fn container_auth_socket_comes_from_a_directive_and_reaches_the_job_spec() {
+        let args = parse_merged(&["--container-auth-socket"], &["sbatch", "--wrap=true"]);
+        assert!(args.container_auth_socket);
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("build spec");
+        assert!(spec.container_auth_socket);
+
+        let args = parse_merged(&[], &["sbatch", "--wrap=true"]);
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("build spec");
+        assert!(!spec.container_auth_socket, "the socket is opt-in");
     }
 
     // Guarded because `--time` also resolves from SPUR_TIMELIMIT, which a test
