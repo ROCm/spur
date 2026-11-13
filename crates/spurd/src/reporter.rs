@@ -59,6 +59,10 @@ fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How long a heartbeat waits for the running-job set before reporting it
+/// incomplete; well inside the 30-second beat interval.
+const HELD_JOBS_READ_BUDGET: Duration = Duration::from_millis(400);
+
 /// The run a held job belongs to, so a reclaim can target that run alone.
 pub trait HeldRun {
     fn run_attempt(&self) -> u32;
@@ -66,19 +70,20 @@ pub trait HeldRun {
 
 /// Source of the (job id, run attempt) pairs this node currently holds. The
 /// controller decides from its own authoritative state whether any is stale.
+#[tonic::async_trait]
 pub trait HeldJobs: Send + Sync {
-    fn held_jobs(&self) -> Vec<(u32, u32)>;
+    async fn held_jobs(&self) -> Vec<(u32, u32)>;
 }
 
+#[tonic::async_trait]
 impl<T: HeldRun + Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn held_jobs(&self) -> Vec<(u32, u32)> {
-        match self.try_lock() {
-            Ok(jobs) => jobs
-                .iter()
-                .map(|(job_id, job)| (*job_id, job.run_attempt()))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+    async fn held_jobs(&self) -> Vec<(u32, u32)> {
+        // lock() is FIFO-fair; a try_lock would lose to every queued waiter in a burst.
+        self.lock()
+            .await
+            .iter()
+            .map(|(job_id, job)| (*job_id, job.run_attempt()))
+            .collect()
     }
 }
 
@@ -437,9 +442,13 @@ impl NodeReporter {
         spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
     }
 
-    /// (job id, run attempt) pairs this heartbeat would report, from the shared running map.
-    pub fn held_jobs(&self) -> Vec<(u32, u32)> {
-        self.held_jobs.held_jobs()
+    /// (job id, run attempt) pairs this heartbeat would report, from the shared
+    /// running map. `None` when the map stayed locked for the read budget, which
+    /// must not be reported as "no jobs".
+    pub async fn held_jobs(&self) -> Option<Vec<(u32, u32)>> {
+        tokio::time::timeout(HELD_JOBS_READ_BUDGET, self.held_jobs.held_jobs())
+            .await
+            .ok()
     }
 
     pub fn snapshot_resources(&self) -> ResourceSet {
@@ -593,41 +602,13 @@ impl NodeReporter {
         loop {
             interval.tick().await;
 
-            let (load, free_mem) = read_system_metrics();
-            self.cpu_load.store(load as u64, Ordering::Relaxed);
-            self.free_memory_mb.store(free_mem, Ordering::Relaxed);
-            let current_token = read_recover(&self.node_token).clone();
-            let running_jobs = build_running_jobs(self.held_jobs(), &self.held_job_gpu_ids());
             let reporter = Arc::clone(&self);
             if let Err(e) = tokio::task::spawn_blocking(move || reporter.apply_spec_layout()).await
             {
                 warn!(error = %e, "spec layout apply task failed");
             }
-            let (core_layout_fingerprint, spec_enforcement_error) = {
-                let spec = lock_recover(&self.spec);
-                (
-                    spec.held_fingerprint(),
-                    spec.enforcement_error().unwrap_or_default(),
-                )
-            };
-            let req = spur_proto::proto::HeartbeatRequest {
-                hostname: self.hostname.clone(),
-                cpu_load: load,
-                free_memory_mb: free_mem,
-                running_jobs,
-                node_token: current_token,
-                wg_pubkey: self.wg_pubkey(),
-                k0s_status: self.k0s_status.get().map(|s| {
-                    let (unit_active, restart_count, install_secs) = s.take_for_heartbeat();
-                    spur_proto::proto::K0sNodeStatus {
-                        unit_active,
-                        restart_count,
-                        install_duration_seconds: install_secs,
-                    }
-                }),
-                core_layout_fingerprint,
-                spec_enforcement_error,
-            };
+            let req = self.heartbeat_request().await;
+            let (load, free_mem) = (req.cpu_load, req.free_memory_mb);
 
             match self.send_heartbeat(req).await {
                 Ok(resp) => {
@@ -655,6 +636,43 @@ impl NodeReporter {
                 }
                 Err(e) => warn!(error = %e, "heartbeat failed"),
             }
+        }
+    }
+
+    /// One heartbeat's payload, taken after the spec layout was applied so it
+    /// reports the fingerprint now held.
+    async fn heartbeat_request(&self) -> spur_proto::proto::HeartbeatRequest {
+        let (load, free_mem) = read_system_metrics();
+        self.cpu_load.store(load as u64, Ordering::Relaxed);
+        self.free_memory_mb.store(free_mem, Ordering::Relaxed);
+        let held = self.held_jobs().await;
+        let running_jobs_incomplete = held.is_none();
+        let running_jobs = build_running_jobs(held.unwrap_or_default(), &self.held_job_gpu_ids());
+        let (core_layout_fingerprint, spec_enforcement_error) = {
+            let spec = lock_recover(&self.spec);
+            (
+                spec.held_fingerprint(),
+                spec.enforcement_error().unwrap_or_default(),
+            )
+        };
+        spur_proto::proto::HeartbeatRequest {
+            hostname: self.hostname.clone(),
+            cpu_load: load,
+            free_memory_mb: free_mem,
+            running_jobs,
+            running_jobs_incomplete,
+            node_token: read_recover(&self.node_token).clone(),
+            wg_pubkey: self.wg_pubkey(),
+            k0s_status: self.k0s_status.get().map(|s| {
+                let (unit_active, restart_count, install_secs) = s.take_for_heartbeat();
+                spur_proto::proto::K0sNodeStatus {
+                    unit_active,
+                    restart_count,
+                    install_duration_seconds: install_secs,
+                }
+            }),
+            core_layout_fingerprint,
+            spec_enforcement_error,
         }
     }
 
@@ -2554,19 +2572,125 @@ mod tests {
         }
     }
 
-    #[test]
-    fn held_jobs_accepts_send_but_not_sync_values() {
+    #[tokio::test]
+    async fn held_jobs_accepts_send_but_not_sync_values() {
         // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
         let map: Mutex<HashMap<u32, CellRun>> =
             Mutex::new(HashMap::from([(7, CellRun(std::cell::Cell::new(2)))]));
-        assert_eq!(map.held_jobs(), vec![(7, 2)]);
+        assert_eq!(HeldJobs::held_jobs(&map).await, vec![(7, 2)]);
+    }
+
+    fn running_map(job_id: u32, run: u32) -> Arc<Mutex<HashMap<u32, CellRun>>> {
+        Arc::new(Mutex::new(HashMap::from([(
+            job_id,
+            CellRun(std::cell::Cell::new(run)),
+        )])))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_map_locked_past_the_read_budget_reads_as_unknown_not_empty() {
+        let running = running_map(7, 3);
+        let reporter = test_reporter_holding(running.clone());
+        let start = tokio::time::Instant::now();
+
+        let held = running.lock().await;
+        assert_eq!(reporter.held_jobs().await, None);
+        assert_eq!(start.elapsed(), HELD_JOBS_READ_BUDGET);
+
+        drop(held);
+        assert_eq!(reporter.held_jobs().await, Some(vec![(7, 3)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_flags_its_job_list_incomplete_while_the_running_map_stays_locked() {
+        let running = running_map(7, 3);
+        let reporter = test_reporter_holding(running.clone());
+        let job_ids = |req: &spur_proto::proto::HeartbeatRequest| {
+            req.running_jobs
+                .iter()
+                .map(|j| j.job_id)
+                .collect::<Vec<_>>()
+        };
+
+        let held = running.lock().await;
+        let req = reporter.heartbeat_request().await;
+        assert!(req.running_jobs_incomplete);
+        assert!(job_ids(&req).is_empty());
+
+        drop(held);
+        let req = reporter.heartbeat_request().await;
+        assert!(!req.running_jobs_incomplete);
+        assert_eq!(job_ids(&req), vec![7]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_waits_out_a_lock_released_within_the_read_budget() {
+        let running = running_map(7, 3);
+        let reporter = test_reporter_holding(running.clone());
+
+        let held = running.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(HELD_JOBS_READ_BUDGET - Duration::from_millis(1)).await;
+            drop(held);
+        });
+        assert_eq!(reporter.held_jobs().await, Some(vec![(7, 3)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_waits_its_turn_behind_a_burst_on_the_running_map() {
+        let running = running_map(7, 3);
+        let reporter = test_reporter_holding(running.clone());
+        let hold = Duration::from_millis(70);
+        let start = tokio::time::Instant::now();
+
+        // A burst that re-takes the lock back to back, plus a waiter queued
+        // before the reporter: only a fair wait is served inside the budget.
+        let first = running.clone().lock_owned().await;
+        let burster = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            drop(first);
+            for _ in 0..10 {
+                let _g = burster.lock().await;
+                tokio::time::sleep(hold).await;
+            }
+        });
+        let ahead = running.clone();
+        tokio::spawn(async move {
+            let _g = ahead.lock().await;
+            tokio::time::sleep(hold).await;
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(reporter.held_jobs().await, Some(vec![(7, 3)]));
+        assert_eq!(
+            start.elapsed(),
+            hold * 2,
+            "served right after the waiter queued ahead of it"
+        );
     }
 
     fn test_reporter(resources: ResourceSet) -> NodeReporter {
         test_reporter_with_addr(resources, "http://localhost:6817".into())
     }
 
+    fn test_reporter_holding(running: Arc<Mutex<HashMap<u32, CellRun>>>) -> NodeReporter {
+        test_reporter_with(rset(8, 0, vec![]), "http://localhost:6817".into(), running)
+    }
+
     fn test_reporter_with_addr(resources: ResourceSet, controller_addr: String) -> NodeReporter {
+        test_reporter_with(
+            resources,
+            controller_addr,
+            Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
+        )
+    }
+
+    fn test_reporter_with(
+        resources: ResourceSet,
+        controller_addr: String,
+        held_jobs: Arc<dyn HeldJobs>,
+    ) -> NodeReporter {
         NodeReporter::new(
             "test-node".into(),
             controller_addr,
@@ -2581,7 +2705,7 @@ mod tests {
             String::new(),
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
-            Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
+            held_jobs,
             ReporterTimeouts::default(),
         )
     }

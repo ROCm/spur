@@ -28,6 +28,15 @@ spur_nodes_unknown 0
 # HELP spur_nodes_suspended Number of nodes in suspended state.
 # TYPE spur_nodes_suspended gauge
 spur_nodes_suspended 0
+# HELP spur_nodes_not_responding Number of nodes the leader is not hearing heartbeats from, in any state.
+# TYPE spur_nodes_not_responding gauge
+spur_nodes_not_responding 0
+# HELP spur_nodes_liveness_breaker_tripped 1 if the last health pass marked no node down because too many went silent at once.
+# TYPE spur_nodes_liveness_breaker_tripped gauge
+spur_nodes_liveness_breaker_tripped 0
+# HELP spur_nodes_silent_answering Number of nodes kept up because their agent answers the leader though their heartbeats do not reach it.
+# TYPE spur_nodes_silent_answering gauge
+spur_nodes_silent_answering 0
 # HELP spur_nodes_cpus Total CPUs across all nodes.
 # TYPE spur_nodes_cpus gauge
 spur_nodes_cpus 12

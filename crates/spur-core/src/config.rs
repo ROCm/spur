@@ -355,8 +355,10 @@ pub struct ControllerConfig {
     #[serde(default = "default_raft_listen_addr")]
     pub raft_listen_addr: String,
 
-    /// Seconds without a heartbeat before a node is marked Down.
-    /// Defaults to 90 when absent.
+    /// Seconds without a heartbeat before the leader checks on a node. A node
+    /// whose agent still answers is kept; one that fails two checks a health
+    /// pass apart is marked Down. Defaults to 90 when absent. Also the
+    /// shortest recovery hold before a node still reporting ended jobs is drained.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
@@ -364,6 +366,14 @@ pub struct ControllerConfig {
     /// `[controller] health_tick_secs` (default: 30).
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
+
+    /// Largest fraction of watched nodes that may be suspect in one health pass
+    /// before the leader suspects its own connectivity and marks none Down
+    /// (default: 0.5; 1.0 disables the check). Suspects fail a liveness probe or
+    /// are operator-managed past the timeout; nodes that only missed a heartbeat
+    /// count only in a pass with one of those.
+    #[serde(default = "default_max_stale_node_fraction")]
+    pub max_stale_node_fraction: f64,
 
     /// Maximum automatic requeues (excluding preemption) before a job is held
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
@@ -430,6 +440,10 @@ fn default_max_batch_requeue() -> u32 {
 
 fn default_health_tick_secs() -> u64 {
     30
+}
+
+fn default_max_stale_node_fraction() -> f64 {
+    0.5
 }
 
 fn default_terminal_job_retention_secs() -> u64 {
@@ -534,6 +548,7 @@ impl Default for ControllerConfig {
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
             health_tick_secs: default_health_tick_secs(),
+            max_stale_node_fraction: default_max_stale_node_fraction(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
@@ -555,14 +570,16 @@ impl ControllerConfig {
     }
 
     /// A warning when a shutdown drain can outlast agent heartbeats: the draining controller
-    /// answers none, yet keeps checking node health, so it marks nodes DOWN and fails their jobs.
+    /// answers none, yet keeps checking node health, so it flags nodes not responding and can
+    /// mark operator-managed nodes, which it cannot probe, DOWN.
     pub fn shutdown_grace_warning(&self) -> Option<String> {
         let timeout = self.effective_heartbeat_timeout_secs();
         if self.shutdown_grace_secs == 0 {
             return Some(format!(
                 "[controller] shutdown_grace_secs = 0 lets a shutdown drain outlast \
                  heartbeat_timeout_secs ({timeout}s); the draining controller answers no \
-                 heartbeats, so it would mark nodes DOWN and fail their jobs"
+                 heartbeats, so it would flag nodes not responding and could mark \
+                 operator-managed nodes DOWN"
             ));
         }
         // A node's last heartbeat can be one interval old at the signal, and the flush follows.
@@ -573,7 +590,7 @@ impl ControllerConfig {
         Some(format!(
             "[controller] shutdown_grace_secs ({}s) is within {margin}s of heartbeat_timeout_secs \
              ({timeout}s); the draining controller answers no heartbeats, so a full drain would \
-             mark nodes DOWN and fail their jobs",
+             flag nodes not responding and could mark operator-managed nodes DOWN",
             self.shutdown_grace_secs
         ))
     }
@@ -2529,12 +2546,22 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
-        // Zero makes every heartbeat instantly stale, so the first health pass
-        // past the grace window marks every registered node Down.
+        // Zero makes every heartbeat instantly stale, so every node would be
+        // flagged not responding and take no new work.
         if self.controller.heartbeat_timeout_secs == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "controller.heartbeat_timeout_secs".into(),
                 value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Phrased as a positive range test so NaN, which fails every
+        // comparison, is rejected along with values outside (0, 1].
+        let fraction = self.controller.max_stale_node_fraction;
+        let fraction_in_range = fraction > 0.0 && fraction <= 1.0;
+        if !fraction_in_range {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_stale_node_fraction".into(),
+                value: format!("{fraction} (must be greater than 0 and at most 1)"),
             });
         }
         // Zero would clamp every launch-failure hold to zero, restoring the tight
@@ -5752,6 +5779,33 @@ heartbeat_timeout_secs = 120
     }
 
     #[test]
+    fn controller_config_max_stale_node_fraction_defaults_and_parses() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
+
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = 1.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 1.0);
+    }
+
+    #[test]
+    fn controller_config_rejects_an_out_of_range_max_stale_node_fraction() {
+        for bad in ["0.0", "-0.5", "1.5", "nan"] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("controller.max_stale_node_fraction"),
+                "{bad}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn controller_config_rejects_a_zero_health_tick() {
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 0\n",
@@ -5799,6 +5853,7 @@ max_batch_requeue = 5
         .expect("a pre-upgrade config must still validate");
         assert_eq!(config.controller.health_tick_secs, 30);
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
     }
 
     #[test]
