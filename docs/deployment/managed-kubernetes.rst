@@ -131,10 +131,12 @@ cluster uses ``cluster.control_plane_node`` as its bootstrap and fills any remai
 control-plane slots from the lowest-named nodes. The configured bootstrap must be
 registered and in the selected node scope, or the request is rejected.
 
-The first control-plane node is the etcd bootstrap. Repeating ``spur k8s up``
-preserves the recorded bootstrap and control-plane set, even if the config default
-has changed. Tear down the cluster with ``spur k8s down --reset`` before selecting
-a different control plane.
+The first control-plane node is the etcd bootstrap. Once at least one node has a
+k0s role, repeating bare ``spur k8s up`` preserves the recorded bootstrap and
+control-plane set, even if the config default has changed. Before role assignment,
+repeat the original replica count or explicit set to preserve the HA selection.
+Tear down the cluster with ``spur k8s down --reset`` before selecting a different
+control plane.
 
 .. important::
 
