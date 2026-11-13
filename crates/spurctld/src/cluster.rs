@@ -12332,13 +12332,18 @@ pub(crate) fn withhold_recoveries(
             actions.push(HealthAction::Recover { name, old_state });
             continue;
         };
-        let since = previous.get(&name).copied().unwrap_or(now);
+        let started = previous.get(&name).copied();
+        let since = started.unwrap_or(now);
         holds.insert(name.clone(), since);
         let held_for = now.saturating_duration_since(since);
         // Passes land on a fixed tick, so the one due exactly at the cap can run a
         // hair early; the slack keeps the decision from slipping a whole pass.
         if held_for + HOLD_CAP_SLACK < cap {
-            info!(node = %name, "holding node recovery until it reports a clean job list");
+            if started.is_none() {
+                info!(node = %name, report = ?report, cap_secs = cap.as_secs(), "holding node recovery until it reports a clean job list");
+            } else {
+                debug!(node = %name, report = ?report, "node recovery still held");
+            }
             continue;
         }
         actions.push(HealthAction::Drain {
