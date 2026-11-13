@@ -1570,7 +1570,7 @@ pub struct ClusterConfig {
     /// HA control-plane count (1, 3, or 5). Overridden per-invocation by `spur k8s up --replicas`.
     #[serde(default = "default_control_plane_replicas")]
     pub control_plane_replicas: u32,
-    /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
+    /// k0s release to install/run (e.g. "v1.36.5+k0s.0", or "latest"). Pinned to a known-good
     /// version by default; bumped per spur release. spurd installs this if the binary is missing.
     #[serde(default = "default_k0s_version")]
     pub k0s_version: String,
