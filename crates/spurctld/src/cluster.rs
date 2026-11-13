@@ -22,7 +22,7 @@ use spur_core::accounting::{
     AccountLimits, PerUserCaps, Qos, ScopeLimitUsage, TresRecord, TresType, UserLimitUsage,
 };
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::config::{EnforcePartLimits, HealthCheck, NodeInventory, SlurmConfig};
 use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
@@ -606,6 +606,9 @@ pub struct ClusterManager {
         RwLock<BTreeMap<(JobId, u64), spur_core::preemption_usage::PreemptionRelease>>,
     preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
+    node_inventory: RwLock<Option<NodeInventory>>,
+    startup_node_inventory: NodeInventory,
+    reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
     /// partitions with the same name from re-appearing on restart.
@@ -1020,6 +1023,7 @@ impl ClusterManager {
         if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
             external.load_block_file().map_err(anyhow::Error::msg)?;
         }
+        let startup_node_inventory = config.admission.node_inventory()?;
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -1041,6 +1045,9 @@ impl ClusterManager {
             preemption_confirmations: RwLock::new(BTreeMap::new()),
             preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
+            node_inventory: RwLock::new(None),
+            startup_node_inventory,
+            reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
@@ -2948,7 +2955,7 @@ impl ClusterManager {
         // exclusion can apply first, so the apply's refusal is the answer that counts.
         if !resp.job_started {
             anyhow::bail!(
-                "job {} lost a concurrent reservation race or now excludes a chosen node",
+                "job {} lost a concurrent reservation race or a chosen node is no longer eligible",
                 job_id
             );
         }
@@ -4189,6 +4196,9 @@ impl ClusterManager {
         capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
+        self.check_node_inventory(&name)?;
+        self.initialize_node_inventory()?;
+        self.check_node_inventory(&name)?;
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
@@ -4219,21 +4229,23 @@ impl ClusterManager {
                             && existing.version.as_deref() != Some(version.as_str()))
                         || existing.capabilities != capabilities;
                     if needs_update {
-                        self.propose(WalOperation::NodeUpdate {
-                            name: name.clone(),
-                            hostname: hostname.clone(),
-                            // Resend the raw detected report: NodeUpdate apply stores
-                            // this into detected_resources, so sending the clamped
-                            // total here would corrupt the raw inventory.
-                            resources: existing.detected_resources.clone(),
-                            address,
-                            port,
-                            wg_pubkey,
-                            version,
-                            source: source.clone(),
-                            capabilities,
-                        })
-                        .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        let response = self
+                            .propose(WalOperation::NodeUpdate {
+                                name: name.clone(),
+                                hostname: hostname.clone(),
+                                // Resend the raw detected report: NodeUpdate apply stores
+                                // this into detected_resources, so sending the clamped
+                                // total here would corrupt the raw inventory.
+                                resources: existing.detected_resources.clone(),
+                                address,
+                                port,
+                                wg_pubkey,
+                                version,
+                                source: source.clone(),
+                                capabilities,
+                            })
+                            .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        reject_excluded_registration(&response, &name)?;
                         info!(node = %name, "node comm address or metadata updated");
                     }
                     if existing.source != source {
@@ -4244,18 +4256,20 @@ impl ClusterManager {
                 }
             }
             RegistrationAction::Update => {
-                self.propose(WalOperation::NodeUpdate {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                let response = self
+                    .propose(WalOperation::NodeUpdate {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        source: source.clone(),
+                        capabilities,
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -4264,19 +4278,21 @@ impl ClusterManager {
                 self.warn_partition_cap_overcommit(&name);
             }
             RegistrationAction::Register => {
-                self.propose(WalOperation::NodeRegister {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    labels,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                let response = self
+                    .propose(WalOperation::NodeRegister {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        labels,
+                        source: source.clone(),
+                        capabilities,
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
@@ -4284,6 +4300,75 @@ impl ClusterManager {
                 info!(node = %name, "node registered");
                 self.warn_partition_cap_overcommit(&name);
             }
+        }
+        self.check_node_inventory(&name)
+    }
+
+    fn initialize_node_inventory(&self) -> Result<(), RegisterNodeError> {
+        if self.node_inventory.read().is_some() || self.startup_node_inventory.names.is_none() {
+            return Ok(());
+        }
+        let _reconfigure = self.reconfigure_lock.lock();
+        if self.node_inventory.read().is_some() {
+            return Ok(());
+        }
+        self.validate_node_inventory(&self.startup_node_inventory)
+            .map_err(|error| {
+                RegisterNodeError::PermissionDenied(format!(
+                    "cannot initialize admission.node_names: {error}"
+                ))
+            })?;
+        let response = self
+            .propose(WalOperation::NodeInventoryUpdate {
+                inventory: self.startup_node_inventory.clone(),
+                initialize: true,
+            })
+            .map_err(|error| RegisterNodeError::Internal(error.to_string()))?;
+        if let Some(error) = response.node_inventory_error {
+            return Err(RegisterNodeError::PermissionDenied(format!(
+                "cannot initialize admission.node_names: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn committed_inventory_excludes(&self, name: &str) -> bool {
+        self.node_inventory
+            .read()
+            .as_ref()
+            .and_then(|i| i.names.as_ref())
+            .is_some_and(|names| !names.contains(name))
+    }
+
+    fn k0s_inventory_error<'a>(
+        &self,
+        nodes: &HashMap<String, Node>,
+        references: impl IntoIterator<Item = &'a String>,
+    ) -> Option<String> {
+        // Legacy logs can reference nodes before registration; only a committed
+        // inventory enables the reciprocal fence against roster deletions.
+        let inventory = self.node_inventory.read();
+        let inventory = inventory.as_ref()?;
+        references
+            .into_iter()
+            .find(|name| {
+                !nodes.contains_key(*name)
+                    || inventory.names.as_ref().is_some_and(|names| !names.contains(*name))
+            })
+            .map(|name| format!("Kubernetes membership references node '{name}' absent from the committed node inventory"))
+    }
+
+    pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
+        let inventory = self.node_inventory.read();
+        let effective = inventory.as_ref().unwrap_or(&self.startup_node_inventory);
+        if effective
+            .names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+        {
+            return Err(RegisterNodeError::PermissionDenied(format!(
+                "node {name} is absent from admission.node_names"
+            )));
         }
         Ok(())
     }
@@ -5209,13 +5294,16 @@ impl ClusterManager {
         // both observe the same prior phase and double-count the transition.
         let _accounting = self.k0s_phase_accounting.lock();
         let from = self.k0s.read().phase;
-        self.propose(WalOperation::K0sSetPhase {
+        let response = self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
             control_plane_nodes,
             member_nodes,
             reset_requested,
         })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         if from != phase {
             let cluster = self.config().cluster_name.clone();
             self.k8s_metrics
@@ -5238,7 +5326,10 @@ impl ClusterManager {
     /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
     /// narrow it (see the `cluster_add_nodes` handler guard).
     pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        let response = self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         Ok(())
     }
 
@@ -6607,6 +6698,7 @@ impl ClusterManager {
     /// their startup config. Per-field scope: docs/admin-guide/configuration.rst,
     /// "Applying configuration changes" section.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let _reconfigure = self.reconfigure_lock.lock();
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
@@ -6681,6 +6773,17 @@ impl ClusterManager {
                  restarting all controllers: {}",
                 restart_only.join(", ")
             );
+        }
+        let inventory = new_config.admission.node_inventory()?;
+        self.validate_node_inventory(&inventory)?;
+        let mut reconcile_inventory = inventory.names.is_some()
+            || self.startup_node_inventory.names.is_some()
+            || self.node_inventory.read().is_some();
+        if !reconcile_inventory {
+            // Default-only reloads must not introduce a new WAL operation during
+            // rolling upgrades, but an earlier queued roster still needs clearing.
+            self.wait_for_node_inventory_writes()?;
+            reconcile_inventory = self.node_inventory.read().is_some();
         }
         let conf_partitions = new_config.build_partitions();
 
@@ -6761,6 +6864,18 @@ impl ClusterManager {
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
+        // A timed-out earlier write can still apply; order even an unchanged
+        // desired roster after it instead of trusting a pre-proposal comparison.
+        if reconcile_inventory {
+            let response = self.propose(WalOperation::NodeInventoryUpdate {
+                inventory,
+                initialize: false,
+            })?;
+            if let Some(error) = response.node_inventory_error {
+                anyhow::bail!("reconfigure: {error}");
+            }
+        }
+
         // Re-derive the config-total pools. Availability is computed as total
         // minus in-use elsewhere, so swapping the totals cannot strand
         // capacity already held by running jobs.
@@ -6795,6 +6910,59 @@ impl ClusterManager {
         Ok(())
     }
 
+    fn wait_for_node_inventory_writes(&self) -> anyhow::Result<()> {
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Raft is not initialized"))?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(self.propose_timeout, async {
+                    // OpenRaft publishes metrics after processing this FIFO callback,
+                    // including earlier uncommitted writes that a read index can miss.
+                    let mut metrics = raft.metrics();
+                    let mut metrics = raft
+                        .with_raft_state(move |_| {
+                            metrics.mark_unchanged();
+                            metrics
+                        })
+                        .await?;
+                    metrics.changed().await?;
+                    let last = metrics.borrow().last_log_index;
+                    raft.wait(None)
+                        .applied_index_at_least(last, "node inventory reload")
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("reconfigure: waiting for prior Raft writes timed out")
+                })?
+            })
+        })
+    }
+
+    fn validate_node_inventory(&self, inventory: &NodeInventory) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        let reservations = self.reservations.read();
+        let removed =
+            inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
+        // Heartbeats can change the local used-view; it must not decide whether
+        // a committed roster applies on one replica but is refused on another.
+        for name in removed {
+            let node = &nodes[&name];
+            if node.alloc_resources.cpus > 0
+                || node.alloc_resources.memory_mb > 0
+                || node.alloc_resources.has_devices()
+            {
+                anyhow::bail!("node '{name}' still has allocated resources");
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
         if res.end_time <= res.start_time {
@@ -6818,6 +6986,9 @@ impl ClusterManager {
         let resp = self
             .propose(WalOperation::ReservationCreate { reservation: res })
             .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = resp.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         if !resp.reservation_created {
             return Err(ReservationError::already_exists(format!(
                 "reservation '{}' already exists",
@@ -6895,17 +7066,21 @@ impl ClusterManager {
         self.validate_reservation_storage_overlap(&preview, Some(name))
             .map_err(|e| ReservationError::invalid(e.to_string()))?;
 
-        self.propose(WalOperation::ReservationUpdate {
-            name: name.to_string(),
-            duration_minutes,
-            add_nodes: add_expanded,
-            remove_nodes: remove_nodes.to_vec(),
-            add_users: add_users.to_vec(),
-            remove_users: remove_users.to_vec(),
-            add_accounts: add_accounts.to_vec(),
-            remove_accounts: remove_accounts.to_vec(),
-        })
-        .map_err(|e| ReservationError::raft(e.to_string()))?;
+        let response = self
+            .propose(WalOperation::ReservationUpdate {
+                name: name.to_string(),
+                duration_minutes,
+                add_nodes: add_expanded,
+                remove_nodes: remove_nodes.to_vec(),
+                add_users: add_users.to_vec(),
+                remove_users: remove_users.to_vec(),
+                add_accounts: add_accounts.to_vec(),
+                remove_accounts: remove_accounts.to_vec(),
+            })
+            .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = response.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         Ok(())
     }
 
@@ -9020,6 +9195,16 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
+                // The committed roster enables this fence; earlier log entries
+                // must retain their original placement behavior on replay.
+                if let Some(name) = node_names
+                    .iter()
+                    .find(|name| !nodes.contains_key(*name))
+                    .filter(|_| self.node_inventory.read().is_some())
+                {
+                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto a removed node");
+                    return ClientResponse::default();
+                }
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
                 // second propose for the same job must not double-charge nodes.
                 // Not gated on job state — a legitimate JobStart can apply against
@@ -9037,6 +9222,12 @@ impl ClusterManager {
                 {
                     warn!(job_id = *job_id, node = %node, "refusing a JobStart onto an excluded node");
                     return ClientResponse::default();
+                }
+                if node_names
+                    .iter()
+                    .any(|name| self.committed_inventory_excludes(name))
+                {
+                    return response;
                 }
                 response.job_started = true;
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -9535,6 +9726,16 @@ impl ClusterManager {
                 source,
                 capabilities,
             } => {
+                if self
+                    .node_inventory
+                    .read()
+                    .as_ref()
+                    .and_then(|i| i.names.as_ref())
+                    .is_some_and(|names| !names.contains(name))
+                {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
@@ -9599,6 +9800,10 @@ impl ClusterManager {
                 source,
                 capabilities,
             } => {
+                if self.committed_inventory_excludes(name) {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
                 if let Some(node) = nodes.get_mut(name) {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
@@ -9765,6 +9970,34 @@ impl ClusterManager {
                     reason = reason.as_deref().unwrap_or(""),
                     "node removed from cluster"
                 );
+            }
+            WalOperation::NodeInventoryUpdate {
+                inventory,
+                initialize,
+            } => {
+                if *initialize && self.node_inventory.read().is_some() {
+                    return response;
+                }
+                let reservations = self.reservations.read();
+                let removed = match inventory_removals(
+                    inventory,
+                    &nodes,
+                    &jobs,
+                    &reservations,
+                    &self.k0s.read(),
+                ) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        response.node_inventory_error = Some(error.to_string());
+                        return response;
+                    }
+                };
+                for name in removed {
+                    nodes.remove(&name);
+                    self.k8s_metrics
+                        .remove_node(&self.config().cluster_name, &name);
+                }
+                *self.node_inventory.write() = Some(inventory.clone());
             }
             WalOperation::TokenCreate { token } => {
                 self.tokens.write().insert(token.id.clone(), token.clone());
@@ -9944,6 +10177,14 @@ impl ClusterManager {
                 self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
+                if reservation.nodes.iter().any(|name| {
+                    self.committed_inventory_excludes(name)
+                        || (self.node_inventory.read().is_some() && !nodes.contains_key(name))
+                }) {
+                    response.node_inventory_error =
+                        Some("reservation contains a node absent from admission.node_names".into());
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 if reservations.iter().any(|r| r.name == reservation.name) {
                     warn!(
@@ -9966,6 +10207,14 @@ impl ClusterManager {
                 add_accounts,
                 remove_accounts,
             } => {
+                if add_nodes.iter().any(|name| {
+                    self.committed_inventory_excludes(name)
+                        || (self.node_inventory.read().is_some() && !nodes.contains_key(name))
+                }) {
+                    response.node_inventory_error =
+                        Some("reservation contains a node absent from admission.node_names".into());
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 Self::apply_reservation_update_locked(
                     reservations.as_mut(),
@@ -10037,6 +10286,10 @@ impl ClusterManager {
                 }
             }
             WalOperation::K0sMemberNodesAdd { nodes: add } => {
+                if let Some(error) = self.k0s_inventory_error(&nodes, add.iter()) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut k0s = self.k0s.write();
                 k0s.member_nodes = crate::cluster_k8s::merge_member_nodes(&k0s.member_nodes, add);
             }
@@ -10052,6 +10305,16 @@ impl ClusterManager {
                 member_nodes,
                 reset_requested,
             } => {
+                if *phase != spur_core::k0s::K0sPhase::Down {
+                    let references = control_plane_node
+                        .iter()
+                        .chain(control_plane_nodes)
+                        .chain(member_nodes);
+                    if let Some(error) = self.k0s_inventory_error(&nodes, references) {
+                        response.node_inventory_error = Some(error);
+                        return response;
+                    }
+                }
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 k0s.reset_requested = *reset_requested;
@@ -10123,6 +10386,69 @@ pub struct LayoutDelivery {
     pub error: String,
 }
 
+fn reject_excluded_registration(
+    response: &ClientResponse,
+    name: &str,
+) -> Result<(), RegisterNodeError> {
+    if response.node_registration_rejected {
+        return Err(RegisterNodeError::PermissionDenied(format!(
+            "node {name} is absent from admission.node_names"
+        )));
+    }
+    Ok(())
+}
+
+fn inventory_removals(
+    inventory: &NodeInventory,
+    nodes: &HashMap<String, Node>,
+    jobs: &HashMap<JobId, Job>,
+    reservations: &[Reservation],
+    k0s: &spur_core::k0s::K0sClusterState,
+) -> anyhow::Result<Vec<String>> {
+    let Some(names) = &inventory.names else {
+        return Ok(Vec::new());
+    };
+    let mut removed: Vec<_> = nodes
+        .keys()
+        .filter(|name| !names.contains(*name))
+        .cloned()
+        .collect();
+    removed.sort();
+    let held: HashSet<_> = jobs
+        .values()
+        .filter(|job| !job.state.is_finalized())
+        .flat_map(Job::held_nodes)
+        .collect();
+    let reserved: HashMap<_, _> = reservations
+        .iter()
+        .flat_map(|reservation| {
+            reservation
+                .nodes
+                .iter()
+                .map(move |name| (name, &reservation.name))
+        })
+        .collect();
+    for name in &removed {
+        if held.contains(name) {
+            anyhow::bail!(
+                "node '{name}' still has job allocations; drain it and wait for completion"
+            );
+        }
+        let node = &nodes[name];
+        if let Some(reservation) = reserved.get(name) {
+            anyhow::bail!(
+                "node '{name}' belongs to reservation '{reservation}'; remove that reference first"
+            );
+        }
+        if node.k0s_role.is_some()
+            || (k0s.phase != spur_core::k0s::K0sPhase::Down && k0s.is_member(name))
+        {
+            anyhow::bail!("node '{name}' belongs to the managed Kubernetes cluster; remove that membership first");
+        }
+    }
+    Ok(removed)
+}
+
 const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Snapshot data for Raft serialization.
@@ -10131,6 +10457,8 @@ const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::fro
 struct ClusterSnapshot {
     #[serde(default)]
     preemption_usage: preemption_usage::UsageLedger,
+    #[serde(default)]
+    node_inventory: Option<NodeInventory>,
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
@@ -10298,8 +10626,10 @@ impl StateMachineApply for ClusterManager {
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
         let preemption_usage = self.preemption_usage.read().clone();
+        let node_inventory = self.node_inventory.read().clone();
         let snap = ClusterSnapshot {
             preemption_usage,
+            node_inventory,
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
@@ -10318,6 +10648,7 @@ impl StateMachineApply for ClusterManager {
 
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
+        *self.node_inventory.write() = snap.node_inventory;
 
         // Fold in the persisted high-water mark so evicting the high-id tail
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
@@ -12542,6 +12873,50 @@ fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<J
 }
 
 #[cfg(test)]
+pub(crate) mod node_test_fixtures {
+    use super::ClusterManager;
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+
+    pub(crate) fn register(cluster: &ClusterManager, names: &[&str]) {
+        for name in names {
+            if cluster.get_node(name).is_some() {
+                continue;
+            }
+            cluster.apply_operation(&WalOperation::NodeRegister {
+                name: (*name).into(),
+                hostname: (*name).into(),
+                resources: spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 1,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: Default::default(),
+                source: Default::default(),
+                capabilities: Vec::new(),
+            });
+        }
+    }
+
+    pub(crate) fn restore_without_node(cluster: &ClusterManager, name: &str) {
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&cluster.snapshot_state().unwrap()).unwrap();
+        snapshot["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|node| node["name"] != name);
+        cluster
+            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
+            .unwrap();
+        assert!(cluster.get_node(name).is_none());
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod gated {
     use std::sync::Arc;
 
@@ -12576,7 +12951,15 @@ pub(crate) mod gated {
         dir: &TempDir,
         config: SlurmConfig,
     ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
-        let mut cm = ClusterManager::new(config, dir.path()).unwrap();
+        cluster_with_config_path(dir, config, None).await
+    }
+
+    pub(crate) async fn cluster_with_config_path(
+        dir: &TempDir,
+        config: SlurmConfig,
+        path: Option<std::path::PathBuf>,
+    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+        let mut cm = ClusterManager::new_with_config_path(config, dir.path(), path).unwrap();
         cm.propose_timeout = std::time::Duration::from_millis(200);
         let cm = Arc::new(cm);
         let gate = Arc::new(ApplyGate::default());
@@ -12922,6 +13305,921 @@ pub(crate) mod tests {
             panic!("expected InvalidArgument, got {err:?}");
         };
         assert!(msg.contains(&format!("({code})")), "got: {msg}");
+    }
+
+    fn inventory(names: &[&str]) -> NodeInventory {
+        NodeInventory {
+            names: Some(names.iter().map(|name| (*name).into()).collect()),
+        }
+    }
+
+    fn inventory_update(names: &[&str]) -> WalOperation {
+        WalOperation::NodeInventoryUpdate {
+            inventory: inventory(names),
+            initialize: false,
+        }
+    }
+
+    fn inventory_registration(name: &str) -> WalOperation {
+        WalOperation::NodeRegister {
+            name: name.into(),
+            hostname: name.into(),
+            resources: ResourceSet {
+                cpus: 4,
+                ..Default::default()
+            },
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_deletes_and_persists_and_can_reenable() {
+        let dir = TempDir::new().unwrap();
+        let base = "cluster_name = 'test'\n[admission]\nnode_names = ['n[1-2]']\n";
+        let (cm, path) = test_cluster_with_conf_file(&dir, base).await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1", "n2"])));
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = ['n1']\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_node("n2").is_none());
+        assert!(matches!(
+            try_register_node(&cm, "n2", 4, 8000),
+            Err(RegisterNodeError::PermissionDenied(_))
+        ));
+        let restored_dir = TempDir::new().unwrap();
+        let restored = ClusterManager::new(test_config(), restored_dir.path()).unwrap();
+        restored
+            .restore_from_snapshot(&cm.snapshot_state().unwrap())
+            .unwrap();
+        assert!(restored.check_node_inventory("n2").is_err());
+        assert!(restored.get_node("n2").is_none());
+        assert_eq!(restored.get_nodes().len(), 1);
+        std::fs::write(&path, base).unwrap();
+        cm.reconfigure().unwrap();
+        assert!(
+            cm.get_node("n2").is_none(),
+            "roster must not invent a live agent"
+        );
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_nodes().is_empty());
+        std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+        cm.reconfigure().unwrap();
+        try_register_node(&cm, "dynamic", 4, 8000).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_can_clear_uninitialized_startup_roster() {
+        for roster in ["[]", "['n1']"] {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                &format!("cluster_name = 'test'\n[admission]\nnode_names = {roster}\n"),
+            )
+            .await;
+            let startup_config = cm.config().as_ref().clone();
+            assert_eq!(*cm.node_inventory.read(), None);
+            assert!(cm.check_node_inventory("dynamic").is_err());
+            std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+            cm.reconfigure().unwrap();
+            try_register_node(&cm, "dynamic", 4, 8000).unwrap();
+            assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+            let restored = ClusterManager::new(startup_config, dir.path()).unwrap();
+            restored
+                .restore_from_snapshot(&cm.snapshot_state().unwrap())
+                .unwrap();
+            assert!(restored.check_node_inventory("another").is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_inventory_rejects_stale_k0s_membership_before_success_or_metrics() {
+        use spur_core::k0s::K0sPhase;
+        for selection in 0..4 {
+            let dir = TempDir::new().unwrap();
+            let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+            cm.apply_operation(&inventory_registration("n1"));
+            cm.apply_operation(&inventory_registration("n2"));
+            cm.apply_operation(&inventory_update(&["n1", "n2"]));
+            if selection == 3 {
+                cm.apply_operation(&WalOperation::K0sSetPhase {
+                    phase: K0sPhase::Provisioning,
+                    control_plane_node: Some("n1".into()),
+                    control_plane_nodes: vec!["n1".into()],
+                    member_nodes: vec!["n1".into()],
+                    reset_requested: false,
+                });
+            }
+            let before = cm.k0s_state();
+            let metrics = || {
+                let body =
+                    spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
+                let mut lines: Vec<_> = body.lines().map(str::to_owned).collect();
+                lines.sort_unstable();
+                lines
+            };
+            let metrics_before = metrics();
+            let recorder = Arc::new(RecordingApplier {
+                inner: cm.clone(),
+                ops: parking_lot::Mutex::new(Vec::new()),
+                before_apply: |cluster, op| {
+                    if matches!(
+                        op,
+                        WalOperation::K0sSetPhase { .. } | WalOperation::K0sMemberNodesAdd { .. }
+                    ) {
+                        assert!(cluster
+                            .apply_operation(&inventory_update(&["n1"]))
+                            .node_inventory_error
+                            .is_none());
+                    }
+                },
+            });
+            let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder)
+                .await
+                .unwrap();
+            handle
+                .raft
+                .wait(None)
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .unwrap();
+            cm.set_raft(handle.raft);
+            let result = if selection == 3 {
+                cm.add_k0s_member_nodes(vec!["n2".into()])
+            } else {
+                cm.set_k0s_phase(
+                    K0sPhase::Provisioning,
+                    Some(if selection == 0 { "n2" } else { "n1" }.into()),
+                    if selection == 1 {
+                        vec!["n2".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    if selection == 2 {
+                        vec!["n2".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    false,
+                )
+            };
+            assert!(result.unwrap_err().to_string().contains("n2"));
+            assert!(cm.get_node("n2").is_none());
+            assert_eq!(
+                serde_json::to_value(cm.k0s_state()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(metrics(), metrics_before);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_without_node_inventory_preserves_dynamic_nodes() {
+        let dir = TempDir::new().unwrap();
+        let (cm, path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = 'test'\n[[nodes]]\nnames = 'n1'\ncpus = 2\n",
+        )
+        .await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "dynamic", 4, 8000).unwrap();
+        std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(cm.get_nodes().len(), 2);
+        assert_eq!(*cm.node_inventory.read(), None);
+        assert_eq!(cm.get_node("n1").unwrap().total_resources.cpus, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_orders_same_roster_after_prior_update() {
+        for explicit in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("spur.conf");
+            let roster = if explicit {
+                "[admission]\nnode_names = ['n1', 'n2']\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                &path,
+                format!(
+                    "cluster_name = 'test'\n{roster}\n[[partitions]]\nname = 'default'\nnodes = 'n[1-2]'\ndefault = true\n"
+                ),
+            )
+            .unwrap();
+            let config = SlurmConfig::load_from_file(&path).unwrap();
+            let cm = Arc::new(
+                ClusterManager::new_with_config_path(config, dir.path(), Some(path)).unwrap(),
+            );
+            let recorder = Arc::new(RecordingApplier {
+                inner: cm.clone(),
+                ops: parking_lot::Mutex::new(Vec::new()),
+                before_apply: |cluster, op| {
+                    if matches!(op, WalOperation::PartitionUpdate { .. }) {
+                        // A prior timed-out write may apply after the retry's
+                        // initial comparison but before its partition write.
+                        assert!(cluster
+                            .apply_operation(&inventory_update(&["n1"]))
+                            .node_inventory_error
+                            .is_none());
+                        assert!(cluster.get_node("n2").is_none());
+                    }
+                },
+            });
+            let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder)
+                .await
+                .unwrap();
+            handle
+                .raft
+                .wait(None)
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .unwrap();
+            cm.set_raft(handle.raft);
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+
+            if !explicit {
+                cm.propose(WalOperation::NodeInventoryUpdate {
+                    inventory: NodeInventory::default(),
+                    initialize: false,
+                })
+                .unwrap();
+            }
+            cm.reconfigure().unwrap();
+
+            let desired = if explicit {
+                inventory(&["n1", "n2"])
+            } else {
+                NodeInventory::default()
+            };
+            assert_eq!(*cm.node_inventory.read(), Some(desired.clone()));
+            assert!(cm.get_node("n2").is_none());
+            cm.check_node_inventory("n2").unwrap();
+            let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+            restored
+                .restore_from_snapshot(&cm.snapshot_state().unwrap())
+                .unwrap();
+            assert_eq!(*restored.node_inventory.read(), Some(desired));
+            restored.check_node_inventory("n2").unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            assert!(cm.get_node("n2").is_some());
+        }
+    }
+
+    #[test]
+    fn node_inventory_legacy_clear_still_initializes_dynamic_state() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let clear = serde_json::from_str(
+            r#"{"NodeInventoryUpdate":{"inventory":{"names":null},"initialize":false}}"#,
+        )
+        .unwrap();
+        assert!(cm.apply_operation(&clear).node_inventory_error.is_none());
+        assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconfigure_node_inventory_waits_for_timed_out_initial_roster() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("spur.conf");
+        std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+        let config = SlurmConfig::load_from_file(&path).unwrap();
+        let (cm, gate) = gated::cluster_with_config_path(&dir, config, Some(path)).await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        let closed = gate.close();
+        let error = cm.propose(inventory_update(&["n1"])).unwrap_err();
+        assert!(error.is::<OutcomeUnknown>());
+
+        let error = cm.reconfigure().unwrap_err();
+        assert!(error.to_string().contains("prior Raft writes timed out"));
+        assert_eq!(*cm.node_inventory.read(), None);
+        drop(closed);
+
+        cm.reconfigure().unwrap();
+        assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+        cm.check_node_inventory("n2").unwrap();
+        assert!(cm.get_node("n2").is_none());
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        assert!(cm.get_node("n2").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_refuses_held_pending_placement_without_swapping_config() {
+        let dir = TempDir::new().unwrap();
+        let (cm, path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = 'test'\n[admission]\nnode_names = ['n1']\n",
+        )
+        .await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        let mut job = Job::new(42, JobSpec::default());
+        job.allocated_nodes = vec!["n1".into()];
+        cm.jobs.write().insert(42, job);
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+        )
+        .unwrap();
+        assert!(cm
+            .reconfigure()
+            .unwrap_err()
+            .to_string()
+            .contains("job allocations"));
+        assert!(cm.get_node("n1").is_some());
+        assert_eq!(cm.config().admission.node_names, Some(vec!["n1".into()]));
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_rechecks_allocation_after_preflight() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("spur.conf");
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = ['n1']\n",
+        )
+        .unwrap();
+        let config = SlurmConfig::load_from_file(&path).unwrap();
+        let cm = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(path.clone())).unwrap(),
+        );
+        let recorder = Arc::new(RecordingApplier {
+            inner: cm.clone(),
+            ops: parking_lot::Mutex::new(Vec::new()),
+            before_apply: |cluster, op| {
+                if matches!(
+                    op,
+                    WalOperation::NodeInventoryUpdate {
+                        initialize: false,
+                        ..
+                    }
+                ) {
+                    let response = cluster.apply_operation(&WalOperation::job_start(
+                        42,
+                        vec!["n1".into()],
+                        ResourceAllocations::with_scalar(1, 100),
+                        HashMap::from([("n1".into(), ResourceAllocations::with_scalar(1, 100))]),
+                    ));
+                    assert!(response.job_started);
+                }
+            },
+        });
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder)
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(None)
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cm.set_raft(handle.raft);
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 42,
+            spec: Box::new(JobSpec::default()),
+        });
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+        )
+        .unwrap();
+        assert!(cm
+            .reconfigure()
+            .unwrap_err()
+            .to_string()
+            .contains("job allocations"));
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        assert_eq!(cm.get_job(42).unwrap().allocated_nodes, vec!["n1"]);
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+        assert_eq!(cm.config().admission.node_names, Some(vec!["n1".into()]));
+    }
+
+    #[test]
+    fn node_inventory_apply_refuses_busy_reserved_and_k0s_nodes_atomically() {
+        for state in [
+            JobState::Pending,
+            JobState::Running,
+            JobState::Completing,
+            JobState::Suspended,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+            cm.apply_operation(&inventory_registration("n1"));
+            cm.apply_operation(&inventory_registration("n2"));
+            let mut job = Job::new(42, JobSpec::default());
+            job.state = state;
+            job.allocated_nodes = vec!["n2".into()];
+            cm.jobs.write().insert(42, job);
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+            assert!(cm
+                .apply_operation(&inventory_update(&[]))
+                .node_inventory_error
+                .unwrap()
+                .contains("job allocations"));
+            assert_eq!(cm.get_nodes().len(), 2);
+            assert_eq!(*cm.node_inventory.read(), None);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before,
+                "rejection must preserve the entire allocation in {state:?}"
+            );
+        }
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&inventory_registration("n1"));
+        let reservation: Reservation = serde_json::from_str(r#"{"name":"maintenance","start_time":"2099-01-01T00:00:00Z","end_time":"2099-01-02T00:00:00Z","nodes":["n1"],"accounts":[],"users":[]}"#).unwrap();
+        cm.apply_operation(&WalOperation::ReservationCreate { reservation });
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap()
+            .contains("reservation"));
+        cm.reservations.write().clear();
+        cm.nodes.write().get_mut("n1").unwrap().k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap()
+            .contains("Kubernetes"));
+        assert!(cm.get_node("n1").is_some());
+        cm.nodes.write().get_mut("n1").unwrap().k0s_role = None;
+        cm.k0s.write().phase = spur_core::k0s::K0sPhase::Provisioning;
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap()
+            .contains("Kubernetes"));
+        assert!(cm.get_node("n1").is_some());
+    }
+
+    #[test]
+    fn committed_node_inventory_fences_late_registration_placement_and_reservation() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&inventory_registration("n1"));
+        cm.apply_operation(&inventory_update(&[]));
+        assert!(
+            cm.apply_operation(&inventory_registration("n1"))
+                .node_registration_rejected
+        );
+        let update = WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                ..Default::default()
+            },
+            address: "node.invalid".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: NodeSource::NativeHost,
+            capabilities: Vec::new(),
+        };
+        assert!(cm.apply_operation(&update).node_registration_rejected);
+        cm.jobs.write().insert(42, Job::new(42, JobSpec::default()));
+        let placement = WalOperation::job_start(
+            42,
+            vec!["n1".into()],
+            ResourceAllocations::with_scalar(1, 100),
+            HashMap::new(),
+        );
+        assert!(!cm.apply_operation(&placement).job_started);
+        assert!(cm.get_job(42).unwrap().allocated_nodes.is_empty());
+        let mut reservation: Reservation = serde_json::from_str(r#"{"name":"maintenance","start_time":"2099-01-01T00:00:00Z","end_time":"2099-01-02T00:00:00Z","nodes":["n1"],"accounts":[],"users":[]}"#).unwrap();
+        assert!(cm
+            .apply_operation(&WalOperation::ReservationCreate {
+                reservation: reservation.clone()
+            })
+            .node_inventory_error
+            .is_some());
+        assert!(cm.get_reservations().is_empty());
+        reservation.nodes.clear();
+        cm.apply_operation(&WalOperation::ReservationCreate { reservation });
+        assert!(cm
+            .apply_operation(&WalOperation::ReservationUpdate {
+                name: "maintenance".into(),
+                duration_minutes: 0,
+                add_nodes: vec!["n1".into()],
+                remove_nodes: Vec::new(),
+                add_users: Vec::new(),
+                remove_users: Vec::new(),
+                add_accounts: Vec::new(),
+                remove_accounts: Vec::new(),
+            })
+            .node_inventory_error
+            .is_some());
+        assert!(cm.get_reservations()[0].nodes.is_empty());
+        assert!(cm.get_nodes().is_empty());
+        cm.apply_operation(&WalOperation::NodeInventoryUpdate {
+            inventory: inventory(&["n1"]),
+            initialize: true,
+        });
+        assert_eq!(
+            *cm.node_inventory.read(),
+            Some(inventory(&[])),
+            "late bootstrap cannot overwrite reconfigure"
+        );
+        cm.apply_operation(&WalOperation::NodeInventoryUpdate {
+            inventory: NodeInventory::default(),
+            initialize: false,
+        });
+        assert!(cm.check_node_inventory("n1").is_ok());
+        assert!(!cm.apply_operation(&placement).job_started);
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored
+            .restore_from_snapshot(&cm.snapshot_state().unwrap())
+            .unwrap();
+        assert_eq!(
+            *restored.node_inventory.read(),
+            Some(NodeInventory::default())
+        );
+        assert!(!restored.apply_operation(&placement).job_started);
+        assert!(
+            !restored
+                .apply_operation(&inventory_registration("n1"))
+                .node_registration_rejected
+        );
+        assert!(restored.apply_operation(&placement).job_started);
+    }
+
+    fn inventory_resource_cases() -> [ResourceAllocations; 3] {
+        [
+            ResourceAllocations::with_scalar(1, 0),
+            ResourceAllocations::with_scalar(0, 100),
+            ResourceAllocations {
+                devices: HashMap::from([(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(1)],
+                )]),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_inventory_initialization_preserves_local_resource_preflight() {
+        for resources in inventory_resource_cases() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.admission.node_names = Some(vec!["n1".into()]);
+            let cm = test_cluster_with_config(&dir, config).await;
+            cm.apply_operation(&inventory_registration("old"));
+            cm.nodes.write().get_mut("old").unwrap().alloc_resources = resources.clone();
+            let error = try_register_node(&cm, "n1", 4, 8000).unwrap_err();
+            assert!(matches!(error, RegisterNodeError::PermissionDenied(_)));
+            assert!(error.to_string().contains("allocated resources"));
+            assert_eq!(*cm.node_inventory.read(), None);
+            assert_eq!(cm.get_node("old").unwrap().alloc_resources, resources);
+            assert!(cm.get_node("n1").is_none());
+
+            cm.nodes.write().get_mut("old").unwrap().alloc_resources = Default::default();
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            assert!(cm.get_node("old").is_none());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_refuses_local_resources_then_retries() {
+        for resources in inventory_resource_cases() {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+            )
+            .await;
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            cm.nodes.write().get_mut("n2").unwrap().alloc_resources = resources.clone();
+            std::fs::write(
+                &path,
+                "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+            )
+            .unwrap();
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+            assert!(cm
+                .reconfigure()
+                .unwrap_err()
+                .to_string()
+                .contains("allocated resources"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                cm.config().admission.node_names,
+                Some(vec!["n1".into(), "n2".into()])
+            );
+
+            cm.nodes.write().get_mut("n2").unwrap().alloc_resources = Default::default();
+            cm.reconfigure().unwrap();
+            assert!(cm.get_nodes().is_empty());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_preserves_reservation_then_retries() {
+        let dir = TempDir::new().unwrap();
+        let (cm, path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+        )
+        .await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        let reservation: Reservation = serde_json::from_str(r#"{"name":"maintenance","start_time":"2099-01-01T00:00:00Z","end_time":"2099-01-02T00:00:00Z","nodes":["n2"],"accounts":[],"users":[]}"#).unwrap();
+        cm.create_reservation(reservation).unwrap();
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+        )
+        .unwrap();
+        let before: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        assert!(cm
+            .reconfigure()
+            .unwrap_err()
+            .to_string()
+            .contains("reservation"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            cm.config().admission.node_names,
+            Some(vec!["n1".into(), "n2".into()])
+        );
+
+        cm.delete_reservation("maintenance").unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_nodes().is_empty());
+        assert!(cm.get_reservations().is_empty());
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_preserves_kubernetes_then_retries() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+
+        for assigned_role in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+            )
+            .await;
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            if assigned_role {
+                cm.assign_node_k0s("n2", K0sRole::Worker, "192.0.2.2", "192.0.2.0/24")
+                    .unwrap();
+            } else {
+                cm.set_k0s_phase(
+                    K0sPhase::Provisioning,
+                    Some("n2".into()),
+                    vec!["n2".into()],
+                    vec!["n2".into()],
+                    false,
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                &path,
+                "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+            )
+            .unwrap();
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+            assert!(cm
+                .reconfigure()
+                .unwrap_err()
+                .to_string()
+                .contains("Kubernetes"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                cm.config().admission.node_names,
+                Some(vec!["n1".into(), "n2".into()])
+            );
+
+            if assigned_role {
+                cm.clear_node_k0s("n2").unwrap();
+            } else {
+                cm.set_k0s_phase(K0sPhase::Down, None, Vec::new(), Vec::new(), false)
+                    .unwrap();
+            }
+            cm.reconfigure().unwrap();
+            assert!(cm.get_nodes().is_empty());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+        }
+    }
+
+    #[test]
+    fn node_inventory_removes_nodes_with_finalized_legacy_preemption_history() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&inventory_registration("n1"));
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy")),
+        });
+        let slice = ResourceAllocations::with_scalar(1, 0);
+        cm.apply_operation(&WalOperation::job_start(
+            1,
+            vec!["n1".into()],
+            slice.clone(),
+            HashMap::from([("n1".into(), slice)]),
+        ));
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let old: WalOperation = serde_json::from_str(
+            r#"{"JobComplete":{"job_id":1,"exit_code":-1,"state":"PREEMPTED"}}"#,
+        )
+        .unwrap();
+        cm.apply_operation(&old);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Preempted);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_none());
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_job(1).unwrap().allocated_nodes, vec!["n1"]);
+    }
+
+    #[test]
+    fn node_inventory_apply_ignores_replica_local_gpu_accounting() {
+        let leader_dir = TempDir::new().unwrap();
+        let follower_dir = TempDir::new().unwrap();
+        let leader = ClusterManager::new(test_config(), leader_dir.path()).unwrap();
+        let follower = ClusterManager::new(test_config(), follower_dir.path()).unwrap();
+        let stable_ids = [0x63_0000, 0x83_0000];
+        let mut ops: Vec<_> = gpu_id_change_ops(&stable_ids, &[0, 1], &stable_ids)
+            .into_iter()
+            .take(3)
+            .collect();
+        ops.push(WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        ops.push(WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        });
+        for op in &ops {
+            leader.apply_operation(op);
+            follower.apply_operation(op);
+        }
+        assert_eq!(leader.get_job(1).unwrap().state, JobState::Completed);
+        assert!(leader.validate_node_inventory(&inventory(&[])).is_ok());
+        leader.reconcile_node_gpu_allocations("n1", &[(1, stable_ids.to_vec())]);
+        for cluster in [&leader, &follower] {
+            assert!(cluster
+                .apply_operation(&inventory_update(&[]))
+                .node_inventory_error
+                .is_none());
+            assert!(cluster.get_node("n1").is_none());
+            assert_eq!(*cluster.node_inventory.read(), Some(inventory(&[])));
+        }
+    }
+
+    #[test]
+    fn node_inventory_k0s_guards_preserve_legacy_replay_and_teardown() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut phase = WalOperation::K0sSetPhase {
+            phase: K0sPhase::Provisioning,
+            control_plane_node: Some("n1".into()),
+            control_plane_nodes: vec!["n1".into()],
+            member_nodes: vec!["n1".into()],
+            reset_requested: false,
+        };
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        cm.apply_operation(&inventory_update(&["n1"]));
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_some());
+        assert!(cm
+            .apply_operation(&WalOperation::K0sMemberNodesAdd {
+                nodes: vec!["n1".into()]
+            })
+            .node_inventory_error
+            .is_some());
+        cm.apply_operation(&inventory_registration("n1"));
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_some());
+        if let WalOperation::K0sSetPhase { phase, .. } = &mut phase {
+            *phase = K0sPhase::Down;
+        }
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_none());
+        assert!(cm.apply_operation(&phase).node_inventory_error.is_none());
+        assert_eq!(cm.k0s_state().phase, K0sPhase::Down);
+        assert!(cm.k0s_state().member_nodes.is_empty());
+    }
+
+    #[test]
+    fn node_inventory_preserves_legacy_missing_node_placement_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        node_test_fixtures::register(&cm, &["n1", "n2"]);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy-placement")),
+        });
+        let removal =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null,"at":null}}"#)
+                .unwrap();
+        let placement = serde_json::from_str(
+            r#"{"JobStart":{"job_id":1,"nodes":["n1","n2"],"resources":{"cpus":2,"memory_mb":2000,"devices":{}},"per_node_alloc":{"n1":{"cpus":1,"memory_mb":1000,"devices":{}},"n2":{"cpus":1,"memory_mb":1000,"devices":{}}},"run_attempt":1}}"#,
+        ).unwrap();
+        cm.apply_operation(&removal);
+        assert!(cm.apply_operation(&placement).job_started);
+        assert!(cm.get_node("n1").is_none());
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
+        assert_eq!(cm.get_job(1).unwrap().allocated_nodes, vec!["n1", "n2"]);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let completion = serde_json::from_str(
+            r#"{"JobComplete":{"job_id":1,"exit_code":0,"state":"COMPLETED"}}"#,
+        )
+        .unwrap();
+        cm.apply_operation(&completion);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(*cm.node_inventory.read(), None);
+    }
+
+    #[test]
+    fn node_inventory_old_snapshot_and_completed_history_remain_compatible() {
+        let old_response: ClientResponse = serde_json::from_str("{}").unwrap();
+        assert!(old_response.node_inventory_error.is_none());
+        assert!(!old_response.node_registration_rejected);
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.restore_from_snapshot(
+            br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(*cm.node_inventory.read(), None);
+        cm.apply_operation(&inventory_registration("n1"));
+        let mut job = Job::new(42, JobSpec::default());
+        job.state = JobState::Completed;
+        job.allocated_nodes = vec!["n1".into()];
+        cm.jobs.write().insert(42, job);
+        cm.next_job_id.store(43, Ordering::Relaxed);
+        assert!(cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .is_none());
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.get_job(42).unwrap().allocated_nodes, vec!["n1"]);
+        assert_eq!(restored.next_job_id.load(Ordering::Relaxed), 43);
+        assert_eq!(*restored.node_inventory.read(), Some(inventory(&[])));
+        assert!(restored.get_nodes().is_empty());
     }
 
     /// Build a cluster backed by a real spur.conf on disk so `reconfigure()`
@@ -13629,7 +14927,11 @@ state = "UP"
             "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
@@ -13647,7 +14949,11 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.jobs_private());
 
         std::fs::write(
@@ -13656,7 +14962,11 @@ state = "UP"
              private_data = [\"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.users_private());
         assert!(cm.config().auth.accounts_private());
         assert!(cm.config().auth.reservations_private());
@@ -13670,7 +14980,10 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"nodes\"]\n",
         )
         .unwrap();
-        cm.reconfigure()
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
             .expect_err("an unsupported category must not go live");
         assert!(
             cm.config().auth.accounts_private(),
@@ -13690,7 +15003,11 @@ state = "UP"
             "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
@@ -13714,7 +15031,11 @@ state = "UP"
             "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let avail = cm.available_licenses();
         assert_eq!(
@@ -39896,6 +41217,7 @@ state = "UP"
 
         let snap = ClusterSnapshot {
             preemption_usage: Default::default(),
+            node_inventory: None,
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),

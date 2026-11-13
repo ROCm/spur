@@ -2600,6 +2600,9 @@ impl SlurmController for ControllerService {
         let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
 
         let req = request.into_inner();
+        self.cluster
+            .check_node_inventory(&req.hostname)
+            .map_err(register_node_rpc_status)?;
         let mut resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
         // Carry the agent's reported CPU topology into the inventory so the
         // controller can compute this node's core layout. Absent
@@ -2621,11 +2624,13 @@ impl SlurmController for ControllerService {
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
-        self.cluster
-            .register_node(
+        let cluster = self.cluster.clone();
+        let hostname = req.hostname.clone();
+        tokio::task::spawn_blocking(move || {
+            cluster.register_node(
                 // NodeName and NodeHostname are the same until agents can supply both.
                 req.hostname.clone(),
-                req.hostname.clone(),
+                req.hostname,
                 resources,
                 agent_addr,
                 agent_port,
@@ -2636,11 +2641,14 @@ impl SlurmController for ControllerService {
                 req.capabilities,
                 caller_privileged,
             )
-            .map_err(register_node_rpc_status)?;
+        })
+        .await
+        .map_err(|error| Status::internal(format!("node registration task failed: {error}")))?
+        .map_err(register_node_rpc_status)?;
 
         // Deliver the node's freshly computed layout so the agent can enforce
         // spec cores/memory immediately, before its first heartbeat.
-        let delivery = self.cluster.node_layout_delivery(&req.hostname);
+        let delivery = self.cluster.node_layout_delivery(&hostname);
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -3502,8 +3510,10 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "reconfigure")?;
 
-        self.cluster
-            .reconfigure()
+        let cluster = self.cluster.clone();
+        tokio::task::spawn_blocking(move || cluster.reconfigure())
+            .await
+            .map_err(|error| Status::internal(format!("reconfigure task failed: {error}")))?
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(()))
@@ -7287,6 +7297,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7611,6 +7622,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7691,6 +7703,7 @@ mod tests {
             .await
             .unwrap();
         cluster.set_raft(handle.raft);
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7776,6 +7789,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -7937,6 +7951,7 @@ mod tests {
                 op,
             );
         };
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let cancelled_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
@@ -7994,6 +8009,7 @@ mod tests {
         config.scheduler.kill_wait_secs = 5;
         config.scheduler.timeout_kill_wait_secs = 30;
         let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -8063,6 +8079,7 @@ mod tests {
         let mut config = test_slurm_config();
         config.scheduler.kill_wait_secs = 30;
         let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        crate::cluster::node_test_fixtures::register(&cluster, &["n1", "n2"]);
         let apply = |op: &WalOperation| {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
@@ -8225,6 +8242,7 @@ mod tests {
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
+        crate::cluster::node_test_fixtures::register(cluster, nodes);
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
         if cluster.get_job(id).is_none() {
@@ -8471,7 +8489,11 @@ mod tests {
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n",
         )
         .unwrap();
-        cluster.reconfigure().unwrap();
+        let reloading = cluster.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         // The live config reflects the new key (proving reconfigure did swap
         // config)...
@@ -8521,8 +8543,18 @@ mod tests {
         dir: &tempfile::TempDir,
         config: spur_core::config::SlurmConfig,
     ) -> ControllerService {
+        test_service_with_config_path(dir, config, None).await
+    }
+
+    async fn test_service_with_config_path(
+        dir: &tempfile::TempDir,
+        config: spur_core::config::SlurmConfig,
+        config_path: Option<std::path::PathBuf>,
+    ) -> ControllerService {
         use crate::cluster::ClusterManager;
-        let cluster = std::sync::Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let cluster = std::sync::Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), config_path).unwrap(),
+        );
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
             .await
             .unwrap();
@@ -8912,6 +8944,145 @@ mod tests {
         test_service_with(dir, config).await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_enforces_node_inventory_in_both_admission_modes() {
+        use spur_core::config::AdmissionMode;
+        for mode in [AdmissionMode::Open, AdmissionMode::Token] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = step_test_config();
+            config.admission.mode = mode.clone();
+            config.admission.node_names = Some(vec!["n1".into()]);
+            let svc = test_service_with(&dir, config).await;
+            let join_token = if mode == AdmissionMode::Token {
+                svc.cluster.create_token(None).unwrap().1
+            } else {
+                String::new()
+            };
+            let rejected = svc
+                .register_agent(Request::new(RegisterAgentRequest {
+                    hostname: "unlisted".into(),
+                    address: "unresolvable.invalid".into(),
+                    join_token: join_token.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(rejected.code(), tonic::Code::PermissionDenied);
+            assert!(rejected.message().contains("admission.node_names"));
+            if mode == AdmissionMode::Token {
+                let denied = svc
+                    .register_agent(Request::new(RegisterAgentRequest {
+                        hostname: "n1".into(),
+                        address: "127.0.0.1".into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(denied.code(), tonic::Code::Unauthenticated);
+            }
+            let response = svc
+                .register_agent(Request::new(RegisterAgentRequest {
+                    hostname: "n1".into(),
+                    address: "127.0.0.1".into(),
+                    join_token,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.accepted);
+            assert!(svc.cluster.get_node("n1").is_some());
+            assert!(svc.cluster.get_node("unlisted").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_roster_registrations_keep_current_thread_runtime_responsive() {
+        use spur_core::config::AdmissionMode;
+
+        for mode in [AdmissionMode::Open, AdmissionMode::Token] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = step_test_config();
+            config.admission.mode = mode.clone();
+            config.admission.node_names = Some(vec!["n[1-3]".into()]);
+            let svc = test_service_with(&dir, config).await;
+            let token = if mode == AdmissionMode::Token {
+                let cluster = svc.cluster.clone();
+                tokio::task::spawn_blocking(move || cluster.create_token(None).unwrap().1)
+                    .await
+                    .unwrap()
+            } else {
+                String::new()
+            };
+            let register = |hostname: &str| {
+                svc.register_agent(Request::new(RegisterAgentRequest {
+                    hostname: hostname.into(),
+                    address: "127.0.0.1".into(),
+                    join_token: token.clone(),
+                    ..Default::default()
+                }))
+            };
+            let (first, second, third) =
+                tokio::join!(register("n1"), register("n2"), register("n3"));
+
+            for response in [first, second, third] {
+                assert!(response.unwrap().into_inner().accepted);
+            }
+            assert_eq!(svc.cluster.get_nodes().len(), 3);
+            for name in ["n1", "n2", "n3"] {
+                assert!(svc.cluster.get_node(name).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_roster_reconfigures_keep_current_thread_runtime_responsive() {
+        use spur_core::config::SlurmConfig;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spur.conf");
+        let config_text = |names: &str| {
+            format!(
+                "cluster_name = 'test'\n[admission]\nnode_names = [{names}]\n\
+                 [[partitions]]\nname = 'default'\ndefault = true\nnodes = 'ALL'\n"
+            )
+        };
+        std::fs::write(&path, config_text("'n1', 'n2'")).unwrap();
+        let config = SlurmConfig::load_from_file(&path).unwrap();
+        let svc = test_service_with_config_path(&dir, config, Some(path.clone())).await;
+        for hostname in ["n1", "n2"] {
+            assert!(
+                svc.register_agent(Request::new(RegisterAgentRequest {
+                    hostname: hostname.into(),
+                    address: "127.0.0.1".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+            );
+        }
+
+        std::fs::write(&path, config_text("'n1'")).unwrap();
+        let (first, second, third) = tokio::join!(
+            svc.reconfigure(admin_request(())),
+            svc.reconfigure(admin_request(())),
+            svc.reconfigure(admin_request(())),
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        assert_eq!(svc.cluster.get_nodes().len(), 1);
+        assert!(svc.cluster.get_node("n1").is_some());
+        assert!(svc.cluster.get_node("n2").is_none());
+        assert!(svc.cluster.check_node_inventory("n2").is_err());
+        assert_eq!(
+            svc.cluster.config().admission.node_names,
+            Some(vec!["n1".into()])
+        );
+    }
+
     // Open admission must not mint an identity for a caller-asserted hostname —
     // otherwise anyone can claim to be any node and fence that node's job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9292,6 +9463,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
+        crate::cluster::node_test_fixtures::register(&svc.cluster, &["n1"]);
         let job_id = svc
             .cluster
             .submit_job(spur_core::job::JobSpec {
@@ -9311,6 +9483,7 @@ mod tests {
                 [("n1".into(), resources)].into_iter().collect(),
             )
             .unwrap();
+        crate::cluster::node_test_fixtures::restore_without_node(&svc.cluster, "n1");
         assert!(svc.cluster.get_node("n1").is_none());
 
         let error = svc
@@ -11244,7 +11417,7 @@ mod tests {
         };
         spec.srun_job = true;
         let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
-        // Allocate to a real node plus a ghost node that is never registered.
+        crate::cluster::node_test_fixtures::register(&svc.cluster, &["ghost"]);
         let res = ResourceAllocations::with_scalar(2, 4000);
         let per_node: std::collections::HashMap<_, _> = [
             ("n1".to_string(), res.clone()),
@@ -11262,6 +11435,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
+        crate::cluster::node_test_fixtures::restore_without_node(&svc.cluster, "ghost");
         let steps_before = svc.cluster.get_steps(job_id).len();
         // Simulate the client's retry loop: each attempt returns retryable Unavailable and must
         // leave the step count unchanged (the pre-fix bug created one step per attempt).

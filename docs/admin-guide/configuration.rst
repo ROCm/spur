@@ -110,8 +110,9 @@ and the plugin set also require a daemon restart.
 **Leader-only, in an HA cluster.** ``reconfigure`` is handled by the Raft leader and
 swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
-Kubernetes they re-read the same Secret). ``[[partitions]]`` is the exception —
-partition changes replicate through the write-ahead log — but a follower re-derives
+Kubernetes they re-read the same Secret). ``[[partitions]]`` and the optional
+``admission.node_names`` roster are exceptions: their changes replicate through
+the write-ahead log. A follower still re-derives
 node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
 ``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks.
 Allocation-derived node states also reflect each controller's resource caps. In
@@ -1940,7 +1941,8 @@ matches, and the first matching entry wins.
    stays in the inventory as ``down`` with the reason ``agent shutdown``. It
    returns to service when the agent registers and sends heartbeats again. An
    operator drain is kept through the restart. This differs from Slurm, where
-   ``NodeName=`` lines in ``slurm.conf`` define the roster.
+   ``NodeName=`` lines in ``slurm.conf`` define the roster. For configuration-driven
+   removal in Spur, see :ref:`configured-node-roster`.
 
 Resuming a node with ``scontrol update NodeName=<node> State=RESUME`` (or
 ``State=IDLE``) clears its administrative hold. The displayed state reflects
@@ -2269,7 +2271,7 @@ Controls which nodes may register with the controller.
    * - ``mode``
      - string
      - ``"open"``
-     - Node admission mode. ``open`` lets any node register; ``token`` requires a
+     - Node admission mode. ``open`` requires no join token; ``token`` requires a
        registering ``spurd`` to present a valid admission token. Job completion
        reports are not node-authenticated: in either mode, any caller that
        passes RPC authentication can report a job finished by naming one of its
@@ -2278,6 +2280,77 @@ Controls which nodes may register with the controller.
        controller acts on it only when it carries the reporting node's own node
        token. Every other completion report, including one for the same
        ``srun --pty`` job, is taken on trust.
+
+   * - ``node_names``
+     - string[]
+     - unset
+     - Optional authoritative node roster, expressed as node names or Slurm
+       hostlist expressions. Applies in both admission modes. Omitted preserves
+       dynamic registration; an explicit empty list permits no nodes.
+
+.. _configured-node-roster:
+
+Configuration-driven node removal
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, registered nodes remain in the inventory until explicitly removed
+with ``spur node remove <node>``. ``[[nodes]]`` entries describe resource limits
+and scheduling policy; deleting one does not delete a registered node.
+
+To manage the inventory through ``spur.conf``, set an explicit roster:
+
+.. code-block:: toml
+
+   [admission]
+   mode = "open"  # or "token"; the roster is enforced in either mode
+   node_names = ["compute[01-04]", "service-a"]
+
+After editing the roster, run ``scontrol reconfigure``. Registered nodes absent
+from the new list are deleted, including DOWN nodes whose agent or container is
+already gone. The controller rejects a roster change if any node to be deleted
+still holds job allocations, has allocated resources, belongs to a reservation,
+or belongs to the managed Kubernetes cluster. Drain those nodes, wait for their allocations
+to finish, and remove reservation and Kubernetes membership first. The roster
+and its deletions commit together; a refusal leaves both unchanged. Other
+configuration changes, such as partition updates, are separate operations.
+
+A reconfigure timeout has an unknown outcome: its roster update may still
+commit. Keep the desired roster in the file and retry after the controller
+recovers. Each reconfigure orders that roster after earlier queued updates,
+even when it initially appears unchanged.
+
+The committed roster also rejects later registration of an excluded name, so a
+still-running or recreated agent cannot recreate a deleted record. To admit it
+again, restore its name and reconfigure. Adding names does not create node
+records: each permitted agent must register. A token is still required when
+``mode = "token"``. The roster applies to all node sources; it does not provide a
+mixed static/dynamic inventory mode.
+
+``node_names = []`` deliberately deletes every removable registered node and
+rejects every new registration. Removing the field and running
+``scontrol reconfigure`` restores dynamic registration without recreating deleted
+records. Names support letters, digits, dots, underscores, and hyphens; the roster
+is bounded to 100,000 distinct names of at most 255 bytes each. Wildcards and label selectors belong in the
+existing policy sections, not this roster.
+
+The first permitted registration on a cluster with an explicit roster commits
+that roster before admitting the node, using the same deletion safeguards.
+Once committed, the roster is restored from Raft and snapshots and remains
+authoritative across leader changes and controller restarts. A changed file
+alone does not replace it: distribute the updated file to every controller and
+run ``scontrol reconfigure``. All controllers must support the roster WAL
+operation before enabling this feature.
+
+In Slurm, the global static ``NodeName=`` definitions are an authoritative roster
+by default; there is no separate deletion-enabling knob. Slurm 24.11 and later
+support removing static nodes through ``scontrol reconfigure`` after draining
+and removing their configuration references. Older versions require the
+controller restart procedure. Dynamic Slurm nodes are different: absence from
+static configuration does not delete them. See the `Slurm node-removal FAQ
+<https://slurm.schedmd.com/faq.html#rem_nodes>`_. Spur makes roster management
+explicit to preserve existing deployments that discover nodes dynamically.
+Removing only a partition membership is not a global node deletion in either
+configuration model.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
