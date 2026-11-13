@@ -1805,6 +1805,7 @@ async fn a_node_the_job_finished_on_no_longer_charges_the_cap() {
         signal: 0,
         at: None,
         run_attempt: cm.get_job(id).unwrap().run_attempt,
+        launch_detail: None,
     });
     assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
     assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n2".into(), 8)]));

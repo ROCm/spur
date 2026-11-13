@@ -277,6 +277,7 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     };
     cm.apply_operation(&report);
     cm.apply_operation(&report);
@@ -290,6 +291,7 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     });
     assert_eq!(
         (
@@ -327,6 +329,7 @@ fn capacity_released_after_requester_launch_is_unused() {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     });
     assert_eq!(
         cm.preemption_usage()
@@ -481,6 +484,7 @@ fn success_before_late_release_survives_a_snapshot() {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     });
     assert_eq!(other.preemption_usage().unused_total(), 1);
     assert_eq!(other.preemption_usage().open, 0);
@@ -588,6 +592,7 @@ fn cancelled_requester_is_retained_until_its_warned_victims_release_capacity() {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     });
     assert_eq!(
         cm.get_job(10)

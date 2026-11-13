@@ -2708,13 +2708,25 @@ impl SlurmController for ControllerService {
         // `Job::derived_completion`.
         let completion_result = if !req.reporting_node.is_empty() && reports_whole_job(req.step_id)
         {
-            Some(self.cluster.node_complete(
-                req.job_id,
-                &req.reporting_node,
-                req.exit_code,
-                req.signal,
-                req.run_attempt,
-            ))
+            let launch_detail =
+                spur_core::end_reason::launch_failure_detail_from_message(&req.message);
+            Some(match launch_detail {
+                Some(detail) => self.cluster.node_complete_with_launch_detail(
+                    req.job_id,
+                    &req.reporting_node,
+                    req.exit_code,
+                    req.signal,
+                    req.run_attempt,
+                    Some(detail),
+                ),
+                None => self.cluster.node_complete(
+                    req.job_id,
+                    &req.reporting_node,
+                    req.exit_code,
+                    req.signal,
+                    req.run_attempt,
+                ),
+            })
         } else {
             None
         };
@@ -8134,6 +8146,7 @@ mod tests {
                 signal: 0,
                 run_attempt: 0,
                 at: Some(signaled_at),
+                launch_detail: None,
             });
             apply(&WalOperation::JobPreemptCancel {
                 preemption_claim: None,
