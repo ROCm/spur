@@ -1441,7 +1441,10 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        stays the caller's own jobs. ``squeue -u other``, ``squeue -j``,
        ``sacct -u other``, ``sacct -j`` for another user's job, and
        ``scontrol show job`` print nothing; ``sstat``, ``scontrol show step``,
-       and REST ``/job/{id}`` report it as not found.
+       and REST ``/job/{id}`` report it as not found. Job-control commands
+       (``scontrol suspend``, ``scontrol resume``, ``scancel``) answer
+       "not found" for a job the caller may not see, exactly as for a job that
+       does not exist, whatever its state or owner.
    * - ``"usage"``
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is

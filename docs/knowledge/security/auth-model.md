@@ -283,6 +283,9 @@ Consequences for authorization:
 - `PrivateData` scoping: anonymous callers get `ReadScope::All` (unrestricted
   view), so `private_data` categories only restrict identified non-operator
   users.
+- Under `private_data = ["jobs"]`, `SuspendJob`, `ResumeJob` and `CancelJob`
+  answer NOT_FOUND ("job N not found") for a job the caller may not see,
+  identical to a nonexistent id and checked before any state or ownership check.
 - Job spec binding (`bind_job_spec`): unauthenticated callers are left as-is,
   meaning the client-supplied `user`/`uid`/`gid` is trusted.
 

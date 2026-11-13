@@ -1165,6 +1165,20 @@ impl ControllerService {
         job_read_scope(&self.cluster, identity).permits(owner)
     }
 
+    /// The job `job_id`, or the same NOT_FOUND a nonexistent id gets when `identity` may not
+    /// see it, so a job-control RPC never confirms the existence, state or owner of a hidden job.
+    /// Call it before any state or ownership check.
+    fn job_visible_to(
+        &self,
+        job_id: spur_core::job::JobId,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<spur_core::job::Job, Status> {
+        self.cluster
+            .get_job(job_id)
+            .filter(|job| self.caller_may_see_job(&job.spec.user, identity))
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))
+    }
+
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
@@ -1752,6 +1766,8 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
+        self.job_visible_to(job_id, __identity.as_ref())?;
+
         let canceller = if is_daemon_caller(__identity.as_ref(), &req.user) {
             crate::cluster::Canceller::system()
         } else {
@@ -1897,12 +1913,8 @@ impl SlurmController for ControllerService {
             &audit,
             Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
         );
-        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
-        // precondition failure. Snapshot up-front for agent dispatch.
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        // Snapshot up-front for agent dispatch.
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
         let actor = spur_core::end_reason::Actor {
             user: req.user.clone(),
             uid: trusted_uid(__identity.as_ref()),
@@ -1939,13 +1951,9 @@ impl SlurmController for ControllerService {
             &audit,
             Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
         );
-        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
-        // precondition failure. Allocation is retained across resume, so this
-        // up-front snapshot's allocated_nodes is still valid for agent dispatch.
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        // Allocation is retained across resume, so this up-front snapshot's
+        // allocated_nodes is still valid for agent dispatch.
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
         if let Err(e) = self.cluster.resume_job_for(
             job_id,
             &req.user,
@@ -12515,6 +12523,266 @@ mod tests {
             .await
             .expect_err("the root username is not an internal caller");
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// Alice's jobs, one per state a job-control RPC can meet, plus an id that was never issued.
+    struct AliceJobs {
+        pending: u32,
+        running: u32,
+        suspended: u32,
+        terminal: u32,
+        missing: u32,
+    }
+
+    async fn await_job_state(svc: &ControllerService, job_id: u32, state: JobState) {
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(state) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("job {job_id} never reached {state:?}");
+    }
+
+    async fn alice_jobs_in_every_state(svc: &ControllerService) -> AliceJobs {
+        use spur_core::resource::ResourceAllocations;
+
+        let running = running_job_owned_by(svc, "alice").await;
+
+        let suspended = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: HashMap<_, _> = [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(suspended, vec!["n1".into()], res, per_node)
+            .unwrap();
+        await_job_state(svc, suspended, JobState::Running).await;
+        svc.cluster
+            .suspend_job_by(
+                suspended,
+                spur_core::end_reason::Actor {
+                    user: "alice".into(),
+                    uid: None,
+                },
+                false,
+            )
+            .unwrap();
+        await_job_state(svc, suspended, JobState::Suspended).await;
+
+        let terminal = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        svc.cluster
+            .cancel_job_for(
+                terminal,
+                crate::cluster::Canceller::user("alice", None),
+                false,
+            )
+            .unwrap();
+        await_job_state(svc, terminal, JobState::Cancelled).await;
+
+        let pending = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        await_job_state(svc, pending, JobState::Pending).await;
+
+        AliceJobs {
+            pending,
+            running,
+            suspended,
+            terminal,
+            missing: 999_999,
+        }
+    }
+
+    fn as_caller<T>(inner: T, who: &spur_core::auth::Identity) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(who.clone());
+        req
+    }
+
+    async fn suspend_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = SuspendJobRequest {
+            job_id,
+            user: who.user.clone(),
+        };
+        svc.suspend_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn resume_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = ResumeJobRequest {
+            job_id,
+            user: who.user.clone(),
+        };
+        svc.resume_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn cancel_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = CancelJobRequest {
+            job_id,
+            signal: 0,
+            user: who.user.clone(),
+        };
+        svc.cancel_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    fn assert_not_found(result: Result<(), Status>, job_id: u32, what: &str) {
+        let err = result.expect_err(what);
+        assert_eq!(err.code(), Code::NotFound, "{what}: {err}");
+        assert_eq!(err.message(), format!("job {job_id} not found"), "{what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_answer_hidden_jobs_as_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        let cases = [
+            ("a nonexistent job", jobs.missing),
+            ("a pending job", jobs.pending),
+            ("a running job", jobs.running),
+            ("a suspended job", jobs.suspended),
+            ("a terminal job", jobs.terminal),
+        ];
+        for (what, id) in cases {
+            assert_not_found(
+                suspend_as(&svc, id, &bob).await,
+                id,
+                &format!("suspend {what}"),
+            );
+            assert_not_found(
+                resume_as(&svc, id, &bob).await,
+                id,
+                &format!("resume {what}"),
+            );
+            assert_not_found(
+                cancel_as(&svc, id, &bob).await,
+                id,
+                &format!("cancel {what}"),
+            );
+        }
+
+        for (id, state) in [
+            (jobs.pending, JobState::Pending),
+            (jobs.running, JobState::Running),
+            (jobs.suspended, JobState::Suspended),
+            (jobs.terminal, JobState::Cancelled),
+        ] {
+            assert_eq!(svc.cluster.get_job(id).unwrap().state, state);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_state_answers_for_the_owner_under_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let alice = viewer("alice", false);
+
+        let err = suspend_as(&svc, jobs.pending, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = resume_as(&svc, jobs.running, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not suspended"), "{err}");
+
+        let err = cancel_as(&svc, jobs.terminal, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("job {} is already Cancelled", jobs.terminal)
+        );
+
+        suspend_as(&svc, jobs.running, &alice).await.unwrap();
+        resume_as(&svc, jobs.suspended, &alice).await.unwrap();
+        cancel_as(&svc, jobs.pending, &alice).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_full_access_for_operators_and_daemons_under_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("dave", "Operator");
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let dave = viewer("dave", false);
+
+        let err = suspend_as(&svc, jobs.pending, &dave).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = cancel_as(&svc, jobs.terminal, &dave).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        assert_not_found(
+            cancel_as(&svc, jobs.missing, &dave).await,
+            jobs.missing,
+            "an operator cancelling a nonexistent job",
+        );
+
+        suspend_as(&svc, jobs.running, &dave).await.unwrap();
+        resume_as(&svc, jobs.suspended, &dave).await.unwrap();
+
+        svc.cancel_job(Request::new(CancelJobRequest {
+            job_id: jobs.pending,
+            signal: 0,
+            user: String::new(),
+        }))
+        .await
+        .expect("the in-cluster daemon is not subject to private_data");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_state_and_owner_answers_without_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        let err = suspend_as(&svc, jobs.pending, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = suspend_as(&svc, jobs.running, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = resume_as(&svc, jobs.suspended, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = cancel_as(&svc, jobs.terminal, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        let err = cancel_as(&svc, jobs.pending, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        assert_not_found(
+            cancel_as(&svc, jobs.missing, &bob).await,
+            jobs.missing,
+            "a nonexistent job",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
