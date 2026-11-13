@@ -403,9 +403,10 @@ agent must answer with the node's own name to count as alive:
   finished jobs can stay running. The leader logs a warning naming the node and how long
   it has been silent (``silent_for``), saying its heartbeats are not reaching the leader
   but its agent still answers. The warning repeats about every 10 minutes while the
-  condition lasts, and ``spur_nodes_not_responding`` counts such nodes (see
-  :ref:`node-metrics`). Look for ``heartbeat failed`` in the agent's log to find the
-  broken path, and drain the node if it cannot be fixed soon.
+  condition lasts, and the leader's ``spur_nodes_silent_answering`` gauge counts such
+  nodes; ``spur_nodes_not_responding`` counts every node the leader is not hearing,
+  ``DOWN`` ones included (see :ref:`node-metrics`). Look for ``heartbeat failed`` in the
+  agent's log to find the broken path, and drain the node if it cannot be fixed soon.
 - **The agent does not answer on two consecutive health passes**
   (``controller.health_tick_secs``, default 30; the second failed probe counts only if it ran
   at least one pass after the first, and only if no heartbeat arrived between the two). The

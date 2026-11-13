@@ -1294,6 +1294,11 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
      - ``1`` while the leader's last health pass marked no node ``DOWN``
        because too many nodes went silent at once, otherwise ``0``. See
        :ref:`node-liveness`.
+   * - ``spur_nodes_silent_answering``
+     - Number of nodes the leader keeps up because their agent answers its
+       liveness probe though their heartbeats do not reach it. Such a node can
+       hold finished jobs as running, so alert if this stays above ``0``. Set
+       only by the leader. See :ref:`node-liveness`.
    * - ``spur_nodes_cpus`` / ``spur_nodes_cpus_alloc``
      - Total and allocated CPUs across all nodes.
    * - ``spur_nodes_memory_bytes`` / ``spur_nodes_memory_alloc_bytes``

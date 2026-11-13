@@ -820,8 +820,9 @@ which keeps new work off it, and asks the node's agent directly. See :ref:`node-
 - **A node whose heartbeats cannot reach a controller is no longer marked** ``DOWN``. If its
   agent answers, it stays up and flagged, keeping its running jobs, until its heartbeats
   resume. Such an agent often cannot report job completions either, so its finished jobs can
-  stay running. The leader warns about the node every 10 minutes and
-  ``spur_nodes_not_responding`` counts it.
+  stay running. The leader warns about the node every 10 minutes and the new
+  ``spur_nodes_silent_answering`` gauge counts it. ``spur_nodes_not_responding`` counts
+  every node the leader is not hearing, ``DOWN`` ones included, so alert on the new gauge.
 - **A mass silence marks no node** ``DOWN``. When the nodes that fail their probe or, in a
   pass where a probe fails, miss a heartbeat exceed ``controller.max_stale_node_fraction`` (default ``0.5``) of
   the watched nodes, rounded down but never below one node (so a single silent node never

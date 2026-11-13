@@ -291,7 +291,7 @@ impl NodeLiveness {
 
     /// Called every health tick with the term this controller leads, or `None`.
     /// Leader-local state belongs to the term that built it, so a new term or a
-    /// lost leadership discards strikes, not-responding flags, and the breaker.
+    /// lost leadership discards strikes, not-responding flags, and the gauges.
     pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
         if self.term == leading_term {
             return;
@@ -300,6 +300,7 @@ impl NodeLiveness {
         self.breaker_logged = None;
         cluster.clear_not_responding();
         cluster.set_liveness_breaker_tripped(false);
+        cluster.set_silent_answering_nodes(0);
         self.term = leading_term;
     }
 
@@ -344,11 +345,13 @@ impl NodeLiveness {
         if !still_leading() {
             self.strikes.clear();
             cluster.set_liveness_breaker_tripped(false);
+            cluster.set_silent_answering_nodes(0);
             return Vec::new();
         }
         if let Some(tripped) = tripped {
             cluster.set_liveness_breaker_tripped(tripped);
         }
+        cluster.set_silent_answering_nodes(self.strikes.answering.len());
         cluster.check_node_health_at(timeout_secs, mark_down, now)
     }
 
@@ -1412,6 +1415,47 @@ mod tests {
         let metrics = cm.node_metrics();
         assert!(!metrics.liveness_breaker_tripped);
         assert_eq!(metrics.not_responding, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_silent_answering_gauge_counts_kept_nodes_until_they_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["a1", "a2", "d1", "h1", "h2"]).await;
+        silence(&cm, &["a1", "a2", "d1"]);
+        let prober = ScriptedProber::answering(&["a1", "a2"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+
+        pass(&mut liveness, &cm, &prober).await;
+        let metrics = cm.node_metrics();
+        assert_eq!(metrics.silent_answering, 2, "d1 failed its probe");
+        assert_eq!(metrics.not_responding, 3);
+
+        silent_for(&cm, &["a1"], 0);
+        pass(&mut liveness, &cm, &prober).await;
+        assert_eq!(cm.node_metrics().silent_answering, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_silent_answering_gauge_clears_on_a_new_term_and_a_dropped_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["a1", "h1"]).await;
+        silence(&cm, &["a1"]);
+        let prober = ScriptedProber::answering(&["a1"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        pass(&mut liveness, &cm, &prober).await;
+        assert_eq!(cm.node_metrics().silent_answering, 1);
+
+        liveness.observe_term(&cm, Some(2));
+        assert_eq!(cm.node_metrics().silent_answering, 0);
+
+        pass(&mut liveness, &cm, &prober).await;
+        assert_eq!(cm.node_metrics().silent_answering, 1);
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || false)
+            .await;
+        assert_eq!(cm.node_metrics().silent_answering, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

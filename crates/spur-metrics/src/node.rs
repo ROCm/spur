@@ -51,6 +51,9 @@ pub struct NodeMetricsSnapshot {
     /// Whether the leader's last health pass withheld every Down because too
     /// many nodes went silent at once. Set by the controller, not [`Self::collect`].
     pub liveness_breaker_tripped: bool,
+    /// Silent nodes the leader keeps up because their agent still answers its
+    /// probe. Set by the controller, not [`Self::collect`].
+    pub silent_answering: u64,
 }
 
 /// Map [`NodeState`] to a stable index in [`NodeMetricsSnapshot::by_state`]

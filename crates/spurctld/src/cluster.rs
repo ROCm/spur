@@ -649,6 +649,9 @@ pub struct ClusterManager {
     /// Whether the leader's last health pass withheld every Down because too many
     /// nodes went silent at once. Leader-local, like the not-responding flags.
     liveness_breaker_tripped: AtomicBool,
+    /// Silent nodes the leader keeps up because their agent answered its last
+    /// probe. Leader-local, like the breaker.
+    silent_answering_nodes: AtomicU64,
     raft: RwLock<Option<SpurRaft>>,
     /// This controller's durable start counter; orders layout deliveries when a
     /// restarted leader keeps its Raft term.
@@ -1051,6 +1054,7 @@ impl ClusterManager {
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
             liveness_breaker_tripped: AtomicBool::new(false),
+            silent_answering_nodes: AtomicU64::new(0),
             raft: RwLock::new(None),
             boot_epoch: AtomicU64::new(0),
             layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
@@ -1833,6 +1837,7 @@ impl ClusterManager {
         let nodes = self.nodes.read();
         NodeMetricsSnapshot {
             liveness_breaker_tripped: self.liveness_breaker_tripped.load(Ordering::Relaxed),
+            silent_answering: self.silent_answering_nodes.load(Ordering::Relaxed),
             ..NodeMetricsSnapshot::collect(nodes.values())
         }
     }
@@ -5355,6 +5360,11 @@ impl ClusterManager {
     pub(crate) fn set_liveness_breaker_tripped(&self, tripped: bool) {
         self.liveness_breaker_tripped
             .store(tripped, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_silent_answering_nodes(&self, count: usize) {
+        self.silent_answering_nodes
+            .store(count as u64, Ordering::Relaxed);
     }
 
     /// The stale nodes a health pass would mark Down, read before anything is
