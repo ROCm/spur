@@ -838,9 +838,11 @@ which keeps new work off it, and asks the node's agent directly. See :ref:`node-
   from since shows as ``down*``, which covers every node marked ``DOWN`` for not responding.
   Scripts that compare ``sinfo -h -o %t`` to ``down`` or ``idle`` must strip a trailing
   ``*``.
-- **Older clients do not show the flag.** It is a new field in the node reply, so an
+- **Mixed versions do not show the flag.** It is a new field in the node reply, so an
   ``sinfo`` or ``scontrol`` from an earlier release shows no ``*`` or ``+NOT_RESPONDING`` and
-  lacks ``-d``, ``-r``, and ``-t no_respond``.
+  lacks ``-d``, ``-r``, and ``-t no_respond``. A new client against an older controller
+  shows no ``*`` either, and ``sinfo -d`` and ``-t no_respond`` match no node, because an
+  older controller never sets the flag.
 
 No configuration change is needed. The flag lives only in the leader's memory, so no Raft
 entry is added and rolling back is safe; an older controller ignores

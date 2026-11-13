@@ -408,11 +408,10 @@ agent must answer with the node's own name to count as alive:
   ``DOWN`` ones included (see :ref:`node-metrics`). Look for ``heartbeat failed`` in the
   agent's log to find the broken path, and drain the node if it cannot be fixed soon.
 - **The agent does not answer on two consecutive health passes**
-  (``controller.health_tick_secs``, default 30; the second failed probe counts only if it ran
-  at least one pass after the first, and only if no heartbeat arrived between the two). The
-  node is marked ``DOWN`` with reason
-  ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were submitted
-  with ``--requeue``.
+  (``controller.health_tick_secs``, default 30; the second failed probe counts only if it
+  ran at least one pass after the first, and only if no heartbeat arrived between the two).
+  The node is marked ``DOWN`` with reason ``Not responding``, and its jobs end
+  ``NODE_FAIL``, or are requeued if they were submitted with ``--requeue``.
 - **Many nodes go silent at once.** Each pass probes every silent node first, then counts
   the suspects: nodes that failed their probe, operator-managed nodes past the timeout
   (they cannot be probed), and nodes not yet past the timeout that have missed a
@@ -424,16 +423,19 @@ agent must answer with the node's own name to count as alive:
   timeout first. Those nodes count
   only in a pass where a probe failed or an operator-managed node is past the timeout, so
   an outage in which every agent answers does not trip the limit. A node whose agent
-  answered is never a suspect. When the suspects exceed
+  answered is never a suspect. One dead node beside healthy nodes that have only missed a
+  heartbeat can still trip the limit for a pass; a trip discards failed probes, so that node
+  goes ``DOWN`` about a pass later. When the suspects exceed
   ``controller.max_stale_node_fraction`` (default half) of the watched nodes, rounded down
   but never below one, the leader assumes the fault is on its side, marks none of them
   ``DOWN``, logs ``suspecting the control plane`` at error level (on the trip, then about
   every 10 minutes while it lasts), and sets the ``spur_nodes_liveness_breaker_tripped``
   gauge to ``1`` until a pass that does not trip, which logs ``the silent-node limit is no
   longer exceeded``. A leadership change while the limit is tripped resets this log, so
-  that trip gets no such line; the gauge stays accurate. Watched nodes are those not ``DOWN``, drained (``drain``), or
-  suspended; draining (``drng``) and operator-managed nodes are watched. Draining part of the
-  cluster to ``drain`` lowers the number of suspects it takes. Silent nodes are still
+  that trip gets no such line; the gauge stays accurate. Watched nodes are those not
+  ``DOWN``, drained (``drain``), or suspended; draining (``drng``) and operator-managed
+  nodes are watched. Draining part of the cluster to ``drain`` lowers the number of suspects
+  it takes. Silent nodes are still
   probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
   the two-probe rule above. To mark nodes down sooner, use
   ``scontrol update nodename=<node> state=down``.
