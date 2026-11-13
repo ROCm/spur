@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The named input of `ClusterManager::update_partition`.
+//! The named input of `ClusterManager::update_partition`, and the replicated
+//! partition-update entries built from it or from `spur.conf`.
 
 use std::collections::HashMap;
 
-use spur_core::partition_limits::PartitionLimitsUpdate;
+use spur_core::partition::{Partition, PartitionClears};
+use spur_core::partition_limits::{PartitionLimitsUpdate, PartitionResourceLimits};
 use spur_core::wal::WalOperation;
 
 use crate::cluster::PartitionError;
@@ -42,14 +44,19 @@ pub struct PartitionPatch {
 impl PartitionPatch {
     /// Builds the replicated entry for this patch, parsing the raw time strings.
     pub fn into_wal(self, name: &str) -> Result<WalOperation, PartitionError> {
-        let max_time_minutes = parse_clearable_minutes(self.max_time.as_deref(), "time")?;
-        let default_time_minutes =
-            parse_clearable_minutes(self.default_time.as_deref(), "default_time")?;
-        let max_nodes = if self.clear_max_nodes {
-            Some(None)
+        let (max_time_minutes, clear_max_time) =
+            split_clear(parse_clearable_minutes(self.max_time.as_deref(), "time")?);
+        let (default_time_minutes, clear_default_time) = split_clear(parse_clearable_minutes(
+            self.default_time.as_deref(),
+            "default_time",
+        )?);
+        let (max_nodes, clear_max_nodes) = if self.clear_max_nodes {
+            (None, true)
         } else {
-            self.max_nodes.map(Some)
+            (self.max_nodes, false)
         };
+        let (preempt_exempt_time, clear_preempt_exempt_time) =
+            split_clear(self.preempt_exempt_time);
         let resource_limits =
             (self.limits != PartitionLimitsUpdate::default()).then_some(self.limits);
 
@@ -70,11 +77,58 @@ impl PartitionPatch {
             priority_tier: self.priority_tier,
             preempt_mode: self.preempt_mode,
             is_default: self.is_default,
-            preempt_exempt_time: self.preempt_exempt_time,
+            preempt_exempt_time,
             grace_time: self.grace_time,
+            clear: PartitionClears {
+                max_time: clear_max_time,
+                default_time: clear_default_time,
+                max_nodes: clear_max_nodes,
+                preempt_exempt_time: clear_preempt_exempt_time,
+            },
             resource_limits,
         })
     }
+}
+
+/// The entry that makes a partition match its `spur.conf` definition. A limit the
+/// config leaves out is cleared; `preempt_exempt_time` and `grace_time` are only
+/// pushed when set, so an unset one keeps whatever an admin applied at runtime.
+pub fn wal_from_config(part: &Partition) -> WalOperation {
+    let preempt_mode = spur_core::partition::preempt_mode_str(part.preempt_mode);
+    WalOperation::PartitionUpdate {
+        name: part.name.clone(),
+        nodes: Some(part.nodes.clone()),
+        selector: Some(part.selector.clone()),
+        state: Some(part.state.to_string()),
+        max_time_minutes: part.max_time_minutes,
+        default_time_minutes: part.default_time_minutes,
+        max_nodes: part.max_nodes,
+        min_nodes: Some(part.min_nodes),
+        allow_accounts: Some(part.allow_accounts.clone()),
+        allow_groups: Some(part.allow_groups.clone()),
+        deny_accounts: Some(part.deny_accounts.clone()),
+        deny_qos: Some(part.deny_qos.clone()),
+        allow_qos: Some(part.allow_qos.clone()),
+        priority_tier: Some(part.priority_tier),
+        preempt_mode: Some(preempt_mode.to_string()),
+        is_default: Some(part.is_default),
+        preempt_exempt_time: part.preempt_exempt_time,
+        grace_time: part.grace_time.map(Some),
+        clear: PartitionClears {
+            max_time: part.max_time_minutes.is_none(),
+            default_time: part.default_time_minutes.is_none(),
+            max_nodes: part.max_nodes.is_none(),
+            preempt_exempt_time: false,
+        },
+        resource_limits: Some(PartitionLimitsUpdate::replacing(
+            &PartitionResourceLimits::of(part),
+        )),
+    }
+}
+
+/// Splits a clearable value into the value to set and whether to clear.
+fn split_clear(value: Option<Option<u32>>) -> (Option<u32>, bool) {
+    (value.flatten(), value == Some(None))
 }
 
 /// `None` leaves the field alone, `Some(None)` clears it, `Some(Some(m))` sets it.
@@ -123,6 +177,7 @@ mod tests {
             is_default,
             preempt_exempt_time,
             grace_time,
+            clear,
             resource_limits,
         } = wal
         else {
@@ -146,52 +201,91 @@ mod tests {
         assert_eq!(is_default, None);
         assert_eq!(preempt_exempt_time, None);
         assert_eq!(grace_time, None);
+        assert_eq!(clear, PartitionClears::default());
         assert_eq!(resource_limits, None);
     }
 
-    fn max_and_default_time(patch: PartitionPatch) -> (Option<Option<u32>>, Option<Option<u32>>) {
-        match patch.into_wal("p").unwrap() {
+    /// The four legacy limits of an entry: the values to set, then the clears.
+    #[derive(Debug, PartialEq)]
+    struct LimitEntry {
+        max_time: Option<u32>,
+        default_time: Option<u32>,
+        max_nodes: Option<u32>,
+        preempt_exempt_time: Option<u32>,
+        clear: PartitionClears,
+    }
+
+    fn limits_of(wal: WalOperation) -> LimitEntry {
+        match wal {
             WalOperation::PartitionUpdate {
                 max_time_minutes,
                 default_time_minutes,
+                max_nodes,
+                preempt_exempt_time,
+                clear,
                 ..
-            } => (max_time_minutes, default_time_minutes),
+            } => LimitEntry {
+                max_time: max_time_minutes,
+                default_time: default_time_minutes,
+                max_nodes,
+                preempt_exempt_time,
+                clear,
+            },
             other => panic!("expected a PartitionUpdate entry, got {other:?}"),
         }
+    }
+
+    fn limit_entry(patch: PartitionPatch) -> LimitEntry {
+        limits_of(patch.into_wal("p").unwrap())
     }
 
     #[test]
     fn infinite_and_unlimited_times_clear_the_limit() {
         for raw in ["INFINITE", "infinite", "UNLIMITED", "Unlimited"] {
-            let (max, default) = max_and_default_time(PartitionPatch {
+            let entry = limit_entry(PartitionPatch {
                 max_time: Some(raw.into()),
                 default_time: Some(raw.into()),
                 ..Default::default()
             });
-            assert_eq!(max, Some(None), "max_time {raw}");
-            assert_eq!(default, Some(None), "default_time {raw}");
+            assert_eq!(
+                entry,
+                LimitEntry {
+                    max_time: None,
+                    default_time: None,
+                    max_nodes: None,
+                    preempt_exempt_time: None,
+                    clear: PartitionClears {
+                        max_time: true,
+                        default_time: true,
+                        ..Default::default()
+                    },
+                },
+                "{raw}"
+            );
         }
     }
 
     #[test]
     fn a_numeric_time_sets_the_limit_in_minutes() {
-        let (max, default) = max_and_default_time(PartitionPatch {
+        let entry = limit_entry(PartitionPatch {
             max_time: Some("90".into()),
             default_time: Some("1-00:00:00".into()),
             ..Default::default()
         });
-        assert_eq!(max, Some(Some(90)));
-        assert_eq!(default, Some(Some(1440)));
+        assert_eq!(entry.max_time, Some(90));
+        assert_eq!(entry.default_time, Some(1440));
+        assert_eq!(entry.clear, PartitionClears::default());
     }
 
     #[test]
     fn an_unset_time_is_left_alone_while_the_other_is_set() {
-        let (max, default) = max_and_default_time(PartitionPatch {
+        let entry = limit_entry(PartitionPatch {
             default_time: Some("30".into()),
             ..Default::default()
         });
-        assert_eq!(max, None);
-        assert_eq!(default, Some(Some(30)));
+        assert_eq!(entry.max_time, None);
+        assert_eq!(entry.default_time, Some(30));
+        assert_eq!(entry.clear, PartitionClears::default());
     }
 
     #[test]
@@ -216,40 +310,57 @@ mod tests {
         assert_eq!(err, PartitionError::invalid("invalid default_time: later"));
     }
 
-    fn max_nodes_of(patch: PartitionPatch) -> Option<Option<u32>> {
-        match patch.into_wal("p").unwrap() {
-            WalOperation::PartitionUpdate { max_nodes, .. } => max_nodes,
-            other => panic!("expected a PartitionUpdate entry, got {other:?}"),
-        }
-    }
-
     #[test]
     fn max_nodes_sets_clears_or_is_left_alone() {
-        assert_eq!(max_nodes_of(PartitionPatch::default()), None);
-        assert_eq!(
-            max_nodes_of(PartitionPatch {
-                max_nodes: Some(8),
-                ..Default::default()
-            }),
-            Some(Some(8))
-        );
-        assert_eq!(
-            max_nodes_of(PartitionPatch {
-                clear_max_nodes: true,
-                ..Default::default()
-            }),
-            Some(None)
-        );
+        let untouched = limit_entry(PartitionPatch::default());
+        assert_eq!(untouched.max_nodes, None);
+        assert!(!untouched.clear.max_nodes);
+
+        let set = limit_entry(PartitionPatch {
+            max_nodes: Some(8),
+            ..Default::default()
+        });
+        assert_eq!(set.max_nodes, Some(8));
+        assert!(!set.clear.max_nodes);
+
+        let cleared = limit_entry(PartitionPatch {
+            clear_max_nodes: true,
+            ..Default::default()
+        });
+        assert_eq!(cleared.max_nodes, None);
+        assert!(cleared.clear.max_nodes);
     }
 
     #[test]
     fn clearing_max_nodes_wins_over_a_value() {
-        let max_nodes = max_nodes_of(PartitionPatch {
+        let entry = limit_entry(PartitionPatch {
             max_nodes: Some(8),
             clear_max_nodes: true,
             ..Default::default()
         });
-        assert_eq!(max_nodes, Some(None));
+        assert_eq!(entry.max_nodes, None);
+        assert!(entry.clear.max_nodes);
+    }
+
+    #[test]
+    fn preempt_exempt_time_sets_clears_or_is_left_alone() {
+        let untouched = limit_entry(PartitionPatch::default());
+        assert_eq!(untouched.preempt_exempt_time, None);
+        assert!(!untouched.clear.preempt_exempt_time);
+
+        let set = limit_entry(PartitionPatch {
+            preempt_exempt_time: Some(Some(120)),
+            ..Default::default()
+        });
+        assert_eq!(set.preempt_exempt_time, Some(120));
+        assert!(!set.clear.preempt_exempt_time);
+
+        let cleared = limit_entry(PartitionPatch {
+            preempt_exempt_time: Some(None),
+            ..Default::default()
+        });
+        assert_eq!(cleared.preempt_exempt_time, None);
+        assert!(cleared.clear.preempt_exempt_time);
     }
 
     #[test]
@@ -310,8 +421,65 @@ mod tests {
         assert_eq!(allow_qos, strings(&["allow-qos"]));
         assert_eq!(priority_tier, Some(7));
         assert_eq!(preempt_mode.as_deref(), Some("REQUEUE"));
-        assert_eq!(preempt_exempt_time, Some(Some(120)));
+        assert_eq!(preempt_exempt_time, Some(120));
         assert_eq!(grace_time, Some(None));
         assert_eq!(resource_limits, Some(limits));
+    }
+
+    #[test]
+    fn a_config_partition_without_limits_clears_them() {
+        let entry = limits_of(wal_from_config(&Partition::default()));
+        assert_eq!(
+            entry,
+            LimitEntry {
+                max_time: None,
+                default_time: None,
+                max_nodes: None,
+                preempt_exempt_time: None,
+                clear: PartitionClears {
+                    max_time: true,
+                    default_time: true,
+                    max_nodes: true,
+                    preempt_exempt_time: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_config_partition_with_limits_sets_them() {
+        let entry = limits_of(wal_from_config(&Partition {
+            max_time_minutes: Some(120),
+            default_time_minutes: Some(30),
+            max_nodes: Some(4),
+            preempt_exempt_time: Some(60),
+            ..Default::default()
+        }));
+        assert_eq!(
+            entry,
+            LimitEntry {
+                max_time: Some(120),
+                default_time: Some(30),
+                max_nodes: Some(4),
+                preempt_exempt_time: Some(60),
+                clear: PartitionClears::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_config_partition_leaves_an_unset_grace_time_alone() {
+        let grace = |part: &Partition| match wal_from_config(part) {
+            WalOperation::PartitionUpdate { grace_time, .. } => grace_time,
+            other => panic!("expected a PartitionUpdate entry, got {other:?}"),
+        };
+        assert_eq!(grace(&Partition::default()), None);
+        assert_eq!(
+            grace(&Partition {
+                grace_time: Some(30),
+                ..Default::default()
+            }),
+            Some(Some(30))
+        );
     }
 }

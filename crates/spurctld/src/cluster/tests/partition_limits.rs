@@ -6,7 +6,7 @@
 use super::*;
 use spur_core::config::EnforcePartLimits;
 use spur_core::job::PartitionTresOvershoot;
-use spur_core::partition_limits::MemoryAdjustment;
+use spur_core::partition_limits::{MemoryAdjustment, PartitionLimitsUpdate};
 
 const GIB: u64 = 1024;
 
@@ -813,6 +813,7 @@ fn limits_entry(state: Option<&str>, limits: PartitionLimitsUpdate) -> WalOperat
         is_default: None,
         preempt_exempt_time: None,
         grace_time: None,
+        clear: Default::default(),
         resource_limits: Some(limits),
     }
 }
