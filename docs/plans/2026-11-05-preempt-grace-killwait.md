@@ -32,7 +32,7 @@ This work adds:
   partition grace. A single requested partition needs no lookup.
 - The effective grace is capped at the seconds left before the victim's own time limit. A victim with
   no time limit is not capped. A Requeue-mode victim with less time remaining than its grace therefore
-  always requeues at the capped deadline and never ends `TIMEOUT`, even when the finalizer runs late
+  always requeues at the capped deadline and never ends `TIMEOUT`, even when the grace-end pass runs late
   (see "Watchdog backstop").
 - Applies to `cancel` and `requeue` preemption only. Suspend preemption never gets a grace.
 - The warning is SIGCONT then SIGTERM, delivered to `srun` steps only. The batch script is not
@@ -211,11 +211,11 @@ grace for its current attempt, inside its grace, or overdue, and both watchdogs 
 - While `now < deadline + kill wait` the watchdogs leave the job to `finalize_expired_graces`, so a second
   kill sequence does not race it.
 - Past that the grace-end pass has not run or has failed, and the watchdogs call `finalize_running_grace`,
-  the finalizer's own path (`preempt_victim_now` with the recorded mode and provenance). This holds
+  the same path the grace-end pass uses (`preempt_victim_now` with the recorded mode and provenance). This holds
   whether or not the time limit has been reached, so it also covers a limit lowered mid-grace (the cap is
   applied only when the warning is sent). They never expire such a run `TIMEOUT`.
 - A failed finish is logged and retried on the next tick; there is no fallback to `TIMEOUT`.
-- A race with the finalizer is harmless: the loser's proposal is refused at apply as no longer running
+- A race with the grace-end pass is harmless: the loser's proposal is refused at apply as no longer running
   that attempt and sends nothing.
 - A grace recorded for an earlier attempt does not count, so the normal time-limit path applies.
 
