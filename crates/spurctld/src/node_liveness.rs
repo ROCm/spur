@@ -385,7 +385,12 @@ impl NodeLiveness {
             self.report_breaker(cluster, trip.as_ref());
         }
         cluster.set_silent_answering_nodes(self.strikes.answering.len());
-        cluster.check_node_health_at(timeout_secs, mark_down, start.wall_now())
+        cluster.check_node_health_at(
+            timeout_secs,
+            mark_down,
+            start.wall_now(),
+            std::time::Instant::now(),
+        )
     }
 
     /// Judges the silent-node limit after probing, by the nodes that did not
@@ -1744,6 +1749,32 @@ mod tests {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_term_restarts_recovery_holds_from_the_last_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_node_state(&cm, "n1", NodeState::Down);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        cm.record_node_report("n1", Some(crate::cluster::NodeReport::StaleJobs(vec![1])));
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        liveness.observe_term(&cm, Some(1));
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        assert!(cm.is_recovery_held("n1"));
+        liveness.observe_term(&cm, Some(1));
+        assert!(cm.is_recovery_held("n1"), "the same term keeps its holds");
+
+        liveness.observe_term(&cm, Some(2));
+        assert!(
+            !cm.is_recovery_held("n1"),
+            "a hold started under another term must not count toward this one's cap"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
