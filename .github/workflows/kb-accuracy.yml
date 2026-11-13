@@ -1,8 +1,8 @@
 name: KB Accuracy
 
 on:
-  pull_request:
-    branches: [main]
+  pull_request_target:
+    branches: [main, user/bhatturu/kb-prt-base]
     types: [labeled]
 
 concurrency:
@@ -26,7 +26,7 @@ jobs:
       - name: Check out trusted checker from base branch
         env:
           BASE_REF: ${{ github.base_ref }}
-        run: git checkout "origin/${BASE_REF}" -- scripts/check-kb-accuracy.sh 2>/dev/null || true
+        run: git checkout "origin/${BASE_REF}" -- scripts/check-kb-accuracy.sh
       - name: Check KB accuracy against diff
         env:
           KB_API_KEY: ${{ secrets.KB_API_KEY }}
