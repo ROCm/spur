@@ -9,37 +9,32 @@ root-owned canary on the node is unchanged. Only the agent must be root, which
 the ``cgroup_cluster`` fixture enforces.
 """
 
-import os
 import time
 
 import pytest
 
 
-def _sudo() -> str:
-    """Sudo prefix mirroring SpurCluster._sudo_prefix (password via -S, else -n)."""
-    pw = os.environ.get("SPUR_TEST_SSH_PASSWORD", "")
-    if pw:
-        escaped = pw.replace("'", "'\"'\"'")
-        return f"echo '{escaped}' | sudo -S "
-    return "sudo -n "
-
-
 @pytest.fixture
 def canary(cgroup_cluster):
     """A root-owned folder holding a root-owned file on node 0, outside anything a job may write."""
-    node = cgroup_cluster.nodes[0]
+    cluster = cgroup_cluster
+    node = cluster.nodes[0]
+    sudo = cluster._sudo_prefix()
     base = f"/var/tmp/spur-e2e-canary-{time.time_ns()}"
+    # One `sudo sh -c`, so the root shell generates the content itself: the sudo
+    # prefix may already feed the password on stdin (sudo -S), so piping ORIGINAL
+    # into a sudo'd `tee` would write the password into this file, not the content.
     node.exec(
-        f"{_sudo()}mkdir -m 755 {base} && "
-        f"echo ORIGINAL | {_sudo()}tee {base}/file >/dev/null && "
-        f"{_sudo()}chmod 644 {base}/file"
+        f"{sudo}sh -c 'mkdir -m 755 {base} && "
+        f"echo ORIGINAL > {base}/file && chmod 644 {base}/file'"
     )
     yield base
-    node.exec_allow_fail(f"{_sudo()}rm -rf {base}")
+    node.exec_allow_fail(f"{sudo}rm -rf {base}")
 
 
-def _ownership(node, path: str) -> str:
-    return node.exec(f"{_sudo()}stat -c '%U:%G %a' {path}").strip()
+def _ownership(cluster, path: str) -> str:
+    node = cluster.nodes[0]
+    return node.exec(f"{cluster._sudo_prefix()}stat -c '%U:%G %a' {path}").strip()
 
 
 def _allocation_on_node0(cluster) -> list[str]:
@@ -62,10 +57,10 @@ class TestRootScratchWritesIgnorePlantedLinks:
         code, out = cluster.salloc_run(body, salloc_args=_allocation_on_node0(cluster))
 
         assert code == 0, out
-        assert _ownership(node, canary) == "root:root 755", (
+        assert _ownership(cluster, canary) == "root:root 755", (
             "root must never create, chmod or chown a step folder in the job's work dir"
         )
-        listing = node.exec(f"{_sudo()}ls -A {canary}").split()
+        listing = node.exec(f"{cluster._sudo_prefix()}ls -A {canary}").split()
         assert listing == ["file"], f"no step script may land in the planted folder: {listing}"
 
     def test_a_job_cannot_plant_links_in_its_spool_folder(self, cgroup_cluster, canary):
@@ -85,5 +80,5 @@ class TestRootScratchWritesIgnorePlantedLinks:
         assert "REFUSED" in out and "PLANTED" not in out, (
             f"the job's spool folder must not accept entries from the job:\n{out}"
         )
-        assert _ownership(node, f"{canary}/file") == "root:root 644"
-        assert node.exec(f"{_sudo()}cat {canary}/file").strip() == "ORIGINAL"
+        assert _ownership(cluster, f"{canary}/file") == "root:root 644"
+        assert node.exec(f"{cluster._sudo_prefix()}cat {canary}/file").strip() == "ORIGINAL"

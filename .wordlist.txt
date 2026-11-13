@@ -351,6 +351,7 @@ StorageClass
 strigger
 subcommand
 subcommands
+subdirectory
 submitter's
 submitters
 subnet

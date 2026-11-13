@@ -1,21 +1,22 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Files spurd writes for a job while it holds root: scripts, wrappers and step
-//! output. Every name is resolved against an open directory handle, so a link
-//! the job's user planted is replaced, never followed.
+//! Files spurd writes for a job while it holds root: scripts, wrappers, step
+//! output and container mount points. Every name is resolved against an open
+//! directory handle, so no link the job's user planted leads root out of it.
 
-use std::ffi::OsStr;
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{openat, renameat, OFlag};
-use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
-use nix::unistd::{fchown, unlinkat, Gid, Uid, UnlinkatFlags};
+use nix::fcntl::{openat, readlinkat, renameat, AtFlags, OFlag};
+use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, Mode};
+use nix::unistd::{fchown, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
 
 /// An open directory scratch files are created in by name.
 pub(crate) struct ScratchDir {
@@ -86,6 +87,28 @@ impl ScratchDir {
     pub(crate) fn set_mode(&self, mode: u32) -> io::Result<()> {
         Ok(fchmod(&self.fd, Mode::from_bits_truncate(mode))?)
     }
+
+    /// The filesystem this directory lives on.
+    pub(crate) fn device(&self) -> io::Result<u64> {
+        Ok(fstat(&self.fd)?.st_dev)
+    }
+
+    pub(crate) fn symlink(&self, target: &str, name: &str) -> io::Result<()> {
+        Ok(symlinkat(target, &self.fd, name)?)
+    }
+}
+
+impl AsFd for ScratchDir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// What a mount point has to be to take its mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountPoint {
+    Dir,
+    File,
 }
 
 /// Write `content` to `name` through a fresh file renamed into place, so a
@@ -146,6 +169,95 @@ pub(crate) fn read_scratch(dir: &ScratchDir, name: &str) -> io::Result<Vec<u8>> 
     Ok(content)
 }
 
+/// Open the mount point `path` names inside `root` as the container will see it
+/// once `root` is its `/`, creating what is missing. Links are followed, but an
+/// absolute one restarts at `root` and `..` stops there, so none leads out.
+pub(crate) fn open_mount_point(
+    root: &ScratchDir,
+    path: &Path,
+    kind: MountPoint,
+) -> io::Result<OwnedFd> {
+    let mut walked: Vec<ScratchDir> = Vec::new();
+    let mut pending = steps(path);
+    let mut links = 0;
+    while let Some(step) = pending.pop_front() {
+        let Step::Name(name) = step else {
+            walked.pop();
+            continue;
+        };
+        let dir = walked.last().unwrap_or(root);
+        let last = pending.is_empty();
+        match fstatat(&dir.fd, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                links += 1;
+                if links > MAX_LINKS {
+                    return Err(Errno::ELOOP.into());
+                }
+                let link = PathBuf::from(readlinkat(&dir.fd, name.as_os_str())?);
+                if link.is_absolute() {
+                    walked.clear();
+                }
+                let mut expanded = steps(&link);
+                expanded.append(&mut pending);
+                pending = expanded;
+            }
+            Ok(_) | Err(Errno::ENOENT) if last && kind == MountPoint::File => {
+                return open_file_mount_point(dir, &name);
+            }
+            Ok(_) | Err(Errno::ENOENT) => {
+                let subdir = dir.subdir(&name, 0o755)?;
+                if last {
+                    return Ok(subdir.fd);
+                }
+                walked.push(subdir);
+            }
+            Err(errno) => return Err(errno.into()),
+        }
+    }
+    match (kind, walked.pop()) {
+        (MountPoint::File, _) => Err(Errno::EISDIR.into()),
+        (MountPoint::Dir, Some(dir)) => Ok(dir.fd),
+        (MountPoint::Dir, None) => root.fd.try_clone(),
+    }
+}
+
+/// The kernel's own limit on links followed in one lookup.
+const MAX_LINKS: u32 = 40;
+
+enum Step {
+    Parent,
+    Name(OsString),
+}
+
+fn steps(path: &Path) -> VecDeque<Step> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(Step::Name(name.to_os_string())),
+            Component::ParentDir => Some(Step::Parent),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
+/// A file mount point only has to exist, so one already there keeps its content.
+fn open_file_mount_point(dir: &ScratchDir, name: &OsStr) -> io::Result<OwnedFd> {
+    match create_exclusive(dir, name, 0o644) {
+        Ok(_) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+        Err(error) => return Err(error),
+    }
+    let fd = openat(
+        &dir.fd,
+        name,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    if fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(Errno::ELOOP.into());
+    }
+    Ok(fd)
+}
+
 pub(crate) fn unlink_scratch(dir: &ScratchDir, name: &str) -> io::Result<()> {
     match unlinkat(&dir.fd, name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
@@ -175,19 +287,28 @@ pub(crate) fn may_claim_spool_dir(daemon_is_root: bool, owner_uid: u32, job_uid:
     !daemon_is_root || owner_uid == 0 || (job_uid != 0 && owner_uid == job_uid)
 }
 
-/// Open a spool file for reading without following a symlink at its name.
+/// Open a spool file for reading. A legacy agent may have handed its folder to the
+/// job, so the name is untrusted: a symlink is refused (`O_NOFOLLOW`), a FIFO cannot
+/// stall the open (`O_NONBLOCK`), and a non-regular file is rejected after `fstat`.
 pub(crate) async fn open_spool_file(path: &Path) -> io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .await
+        .await?;
+    if !file.metadata().await?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
-fn create_exclusive(dir: &ScratchDir, name: &str, mode: u32) -> io::Result<File> {
+fn create_exclusive(dir: &ScratchDir, name: impl AsRef<OsStr>, mode: u32) -> io::Result<File> {
     let fd = openat(
         &dir.fd,
-        name,
+        name.as_ref(),
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::from_bits_truncate(mode),
     )?;
@@ -369,6 +490,121 @@ mod tests {
         assert_eq!(mode_of(&temp.path().join("step0.out")), 0o600);
     }
 
+    fn mount_point(root: &tempfile::TempDir, path: &str, kind: MountPoint) -> io::Result<OwnedFd> {
+        open_mount_point(&scratch(root), Path::new(path), kind)
+    }
+
+    fn inode_at(path: &Path) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())
+    }
+
+    fn inode_of(fd: &OwnedFd) -> u64 {
+        fstat(fd).unwrap().st_ino
+    }
+
+    fn inside(root: &tempfile::TempDir, host_path: &Path) -> PathBuf {
+        root.path().join(host_path.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn a_mount_point_behind_a_relative_image_link_is_where_the_link_leads() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.path().join("lib")).unwrap();
+
+        let point = mount_point(&root, "/lib/firmware", MountPoint::Dir).unwrap();
+
+        assert_eq!(
+            inode_of(&point),
+            inode_at(&root.path().join("usr/lib/firmware"))
+        );
+    }
+
+    #[test]
+    fn an_absolute_image_link_leads_into_the_image_not_onto_the_host() {
+        let root = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("opt")).unwrap();
+        std::os::unix::fs::symlink(host.path(), root.path().join("opt/rocm")).unwrap();
+
+        let point = mount_point(&root, "/opt/rocm/lib", MountPoint::Dir).unwrap();
+
+        assert_eq!(
+            inode_of(&point),
+            inode_at(&inside(&root, host.path()).join("lib"))
+        );
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn dot_dot_stops_at_the_image_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let rootfs = parent.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::os::unix::fs::symlink("../../../..", rootfs.join("up")).unwrap();
+        let root = ScratchDir::open(&rootfs).unwrap();
+
+        open_mount_point(&root, Path::new("/../escape"), MountPoint::Dir).unwrap();
+        open_mount_point(&root, Path::new("/up/by-link"), MountPoint::Dir).unwrap();
+
+        assert!(rootfs.join("escape").is_dir());
+        assert!(rootfs.join("by-link").is_dir());
+        assert!(!parent.path().join("escape").exists());
+        assert!(!parent.path().join("by-link").exists());
+    }
+
+    #[test]
+    fn a_link_loop_in_the_image_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("b", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("a", root.path().join("b")).unwrap();
+
+        let error =
+            mount_point(&root, "/a/data", MountPoint::Dir).expect_err("a loop never resolves");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
+    }
+
+    #[test]
+    fn a_missing_file_mount_point_is_created_empty() {
+        let root = tempfile::tempdir().unwrap();
+
+        let point = mount_point(&root, "/etc/hosts", MountPoint::File).unwrap();
+
+        let created = root.path().join("etc/hosts");
+        assert_eq!(inode_of(&point), inode_at(&created));
+        assert_eq!(std::fs::read(&created).unwrap(), b"");
+    }
+
+    #[test]
+    fn an_existing_file_mount_point_keeps_its_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        std::fs::write(root.path().join("etc/hosts"), "127.0.0.1 localhost\n").unwrap();
+
+        mount_point(&root, "/etc/hosts", MountPoint::File).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("etc/hosts")).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
+    }
+
+    #[test]
+    fn a_file_mount_point_behind_an_absolute_link_stays_inside_the_image() {
+        let root = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host_file = host.path().join("hosts");
+        std::fs::write(&host_file, "ORIGINAL").unwrap();
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink(&host_file, root.path().join("etc/hosts")).unwrap();
+
+        let point = mount_point(&root, "/etc/hosts", MountPoint::File).unwrap();
+
+        assert_eq!(inode_of(&point), inode_at(&inside(&root, &host_file)));
+        assert_eq!(std::fs::read_to_string(&host_file).unwrap(), "ORIGINAL");
+    }
+
     #[test]
     fn a_symlinked_subdirectory_is_refused() {
         let temp = tempfile::tempdir().unwrap();
@@ -502,5 +738,20 @@ mod tests {
         open_spool_file(&regular)
             .await
             .expect("a regular spool file opens");
+    }
+
+    // O_NONBLOCK keeps the open from stalling on a FIFO; the fstat then rejects
+    // it. Without O_NONBLOCK this test would hang on the open, so it also guards
+    // that flag.
+    #[tokio::test]
+    async fn a_fifo_planted_as_a_spool_file_is_refused_without_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let planted = temp.path().join("step0.out");
+        nix::unistd::mkfifo(&planted, Mode::from_bits_truncate(0o600)).unwrap();
+
+        let error = open_spool_file(&planted)
+            .await
+            .expect_err("a FIFO is not a spool file and must not be read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 }

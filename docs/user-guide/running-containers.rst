@@ -86,6 +86,27 @@ An interactive shell in a container with your home directory mounted:
 
    srun --container-image ubuntu:22.04 --container-mount-home bash
 
+How the Image Is Treated
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The node agent prepares the container as root before handing it to you, so it
+never lets anything in your image lead that work onto the node itself:
+
+- A mount destination (``--container-mounts``, ``--container-mount-home``) is
+  resolved the way the container will see it: links in the image are followed
+  inside the image. With ``/lib -> usr/lib`` in the image, a mount on
+  ``/lib/modules`` lands on the image's ``/usr/lib/modules``; an absolute link
+  such as ``/data -> /scratch`` leads to the image's own ``/scratch``, never the
+  node's.
+- The container refuses to start when the image's ``/dev``, ``/proc``,
+  ``/sys``, ``/tmp``, ``/etc`` or ``/run`` is a link, or when ``/etc/passwd``
+  or ``/etc/group`` is one.
+- A user name or home directory containing ``:`` or a control character such
+  as a newline is refused, since it would corrupt the container's
+  ``/etc/passwd``.
+- The image's ``/etc/resolv.conf`` is replaced with the node's DNS settings,
+  even when the image ships it as a link.
+
 Environment Inside the Container
 --------------------------------
 
