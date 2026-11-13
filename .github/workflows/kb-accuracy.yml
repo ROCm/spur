@@ -1,0 +1,40 @@
+name: KB Accuracy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+concurrency:
+  group: kb-accuracy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kb-accuracy:
+    name: Knowledge Base Accuracy (LLM)
+    runs-on: [self-hosted, amd-internal]
+    if: contains(github.event.pull_request.labels.*.name, 'kb-check')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Check out trusted checker from base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git checkout "origin/${BASE_REF}" -- scripts/check-kb-accuracy.sh 2>/dev/null || true
+      - name: Check KB accuracy against diff
+        env:
+          KB_API_KEY: ${{ secrets.KB_API_KEY }}
+          KB_BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          rc=0; scripts/check-kb-accuracy.sh || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::notice::KB accuracy check could not run (exit 2) — not a gate"
+            exit 0
+          fi
+          exit "$rc"
