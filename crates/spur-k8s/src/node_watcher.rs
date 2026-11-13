@@ -125,6 +125,9 @@ pub async fn run(
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
+                        boot_time: None,
+                        no_held_jobs: None,
+                        recovery_down_since: None,
                         hostname: name.clone(),
                         resources: Some(resources),
                         version: "spur-k8s-operator".into(),

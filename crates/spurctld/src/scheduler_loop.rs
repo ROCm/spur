@@ -7151,6 +7151,8 @@ mod tests {
             use spur_core::wal::WalOperation;
 
             cm.apply_operation(&WalOperation::NodeRegister {
+                boot_time: None,
+                observed_at: None,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {

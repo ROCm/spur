@@ -324,10 +324,52 @@ mod tests {
     // Exact bytes pin each new field's tag: a renumbered field still round-trips
     // through prost but would break old and new peers on the wire.
     #[test]
+    fn registration_recovery_fields_are_additive() {
+        use prost::Message;
+        let old = crate::proto::RegisterAgentRequest::decode(&b"\x0a\x02n1"[..]).unwrap();
+        assert_eq!(old.boot_time, None);
+        assert_eq!(old.no_held_jobs, None);
+        assert_eq!(old.recovery_down_since, None);
+        let request = crate::proto::RegisterAgentRequest {
+            boot_time: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            no_held_jobs: Some(true),
+            recovery_down_since: Some(prost_types::Timestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.encode_to_vec(),
+            [0x5a, 0x02, 0x08, 0x01, 0x60, 0x01, 0x6a, 0x02, 0x08, 0x02]
+        );
+        assert_eq!(
+            crate::proto::RegisterAgentRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn new_fields_use_their_assigned_tags() {
         use prost::Message;
-        let reregister = crate::proto::HeartbeatResponse { reregister: true };
+        let reregister = crate::proto::HeartbeatResponse {
+            reregister: true,
+            ..Default::default()
+        };
         assert_eq!(reregister.encode_to_vec(), [0x08, 0x01]);
+        let old = crate::proto::HeartbeatResponse::decode(&b"\x08\x01"[..]).unwrap();
+        assert_eq!(old.recovery_down_since, None);
+        let challenge = crate::proto::HeartbeatResponse {
+            recovery_down_since: Some(prost_types::Timestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(challenge.encode_to_vec(), [0x12, 0x02, 0x08, 0x02]);
 
         let topology = crate::proto::RegisterAgentRequest {
             topology: Some(Default::default()),

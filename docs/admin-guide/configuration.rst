@@ -252,6 +252,16 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
        stopped when they heartbeat again, or when the job is relaunched there
        (see :ref:`requeued-run-upgrade-notes` for older agents).
+   * - ``return_to_service``
+     - integer (0, 1, or 2)
+     - none
+     - Live
+     - Policy for an existing DOWN node registering again: ``0`` requires an
+       administrative resume, ``1`` permits recovery from nonresponse with a boot
+       predating its last response, and ``2`` permits recovery regardless of the
+       DOWN reason. Drains remain held. Unset preserves Spur's existing heartbeat
+       recovery; Slurm defaults to ``0``. See :ref:`return-to-service` for agent
+       requirements and differences.
    * - ``health_tick_secs``
      - integer
      - ``30``
@@ -1912,8 +1922,9 @@ matches, and the first matching entry wins.
    node with ``spur node remove <node>``, which takes a
    :ref:`cluster admin <privileged-operations>`. When ``spurd`` stops, the node
    stays in the inventory as ``down`` with the reason ``agent shutdown``. It
-   returns to service when the agent registers and sends heartbeats again. An
-   operator drain is kept through the restart. This differs from Slurm, where
+   returns to service when the agent registers and sends heartbeats again unless
+   an explicit :ref:`return-to-service` policy holds it. An operator drain is
+   kept through the restart. This differs from Slurm, where
    ``NodeName=`` lines in ``slurm.conf`` define the roster.
 
 Resuming a node with ``scontrol update NodeName=<node> State=RESUME`` (or

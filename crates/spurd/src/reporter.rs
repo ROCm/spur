@@ -18,6 +18,16 @@ use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+fn boot_time_from_stat(stat: &str) -> Option<prost_types::Timestamp> {
+    let seconds = stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "btime")
+            .then(|| fields.next()?.parse::<i64>().ok())
+            .flatten()
+    })?;
+    (seconds > 0).then_some(prost_types::Timestamp { seconds, nanos: 0 })
+}
+
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
 /// controller connection. A caller with its own config (spurd's `[spurd]` section) should
 /// build this from it; [`Default`] reproduces today's fixed values for tests and any
@@ -70,6 +80,10 @@ pub trait HeldJobs: Send + Sync {
     fn held_jobs(&self) -> Vec<(u32, u32)>;
 }
 
+pub trait RecoveryInventory: Send + Sync {
+    fn no_held_jobs(&self) -> Option<bool>;
+}
+
 impl<T: HeldRun + Send> HeldJobs for Mutex<HashMap<u32, T>> {
     fn held_jobs(&self) -> Vec<(u32, u32)> {
         match self.try_lock() {
@@ -100,9 +114,11 @@ pub struct NodeReporter {
     /// peers were persisted by `spur net add-peer` and exempt them from the k0s reconcile's prune.
     pub wg_config_dir: std::path::PathBuf,
     node_token: RwLock<String>,
+    boot_time: Option<prost_types::Timestamp>,
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
+    recovery_inventory: std::sync::OnceLock<Arc<dyn RecoveryInventory>>,
     /// The live per-node allocation, read each heartbeat for the translated GPU
     /// stable_ids each held job occupies so the controller can converge its
     /// used-view. Authoritative post-translation source (an adopted legacy job's
@@ -160,7 +176,11 @@ impl NodeReporter {
             wg_iface,
             wg_config_dir,
             node_token: RwLock::new(String::new()),
+            boot_time: std::fs::read_to_string("/proc/stat")
+                .ok()
+                .and_then(|stat| boot_time_from_stat(&stat)),
             held_jobs,
+            recovery_inventory: std::sync::OnceLock::new(),
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
             last_failed_endpoint: std::sync::Mutex::new(None),
@@ -489,12 +509,28 @@ impl NodeReporter {
         self.register_with(&self.snapshot_resources()).await
     }
 
-    fn registration_request(&self, resources: &ResourceSet) -> RegisterAgentRequest {
+    pub fn set_recovery_inventory(&self, inventory: Arc<dyn RecoveryInventory>) {
+        let _ = self.recovery_inventory.set(inventory);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registration_request(&self, resources: &ResourceSet) -> RegisterAgentRequest {
+        self.recovery_registration_request(resources, None)
+    }
+
+    pub(crate) fn recovery_registration_request(
+        &self,
+        resources: &ResourceSet,
+        recovery_down_since: Option<prost_types::Timestamp>,
+    ) -> RegisterAgentRequest {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
         RegisterAgentRequest {
             hostname: self.hostname.clone(),
+            recovery_down_since,
+            boot_time: self.boot_time,
+            no_held_jobs: self.recovery_inventory.get().and_then(|i| i.no_held_jobs()),
             resources: Some(resource_to_proto(resources)),
             version: env!("CARGO_PKG_VERSION").into(),
             address: self.node_address.ip.clone(),
@@ -512,8 +548,16 @@ impl NodeReporter {
     /// the reporter baseline, so a failed register leaves the baseline unchanged
     /// and the next tick re-detects the same delta and retries.
     pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
+        self.register_for_recovery(resources, None).await
+    }
+
+    async fn register_for_recovery(
+        &self,
+        resources: &ResourceSet,
+        recovery_down_since: Option<prost_types::Timestamp>,
+    ) -> anyhow::Result<()> {
         let ticket = lock_recover(&self.spec).begin_registration();
-        let req = self.registration_request(resources);
+        let req = self.recovery_registration_request(resources, recovery_down_since);
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
             .await
@@ -637,7 +681,13 @@ impl NodeReporter {
                     // a changed spec policy is redelivered without a restart.
                     if resp.reregister {
                         info!("controller requested re-registration; re-registering");
-                        if let Err(e) = self.register().await {
+                        if let Err(e) = self
+                            .register_for_recovery(
+                                &self.snapshot_resources(),
+                                resp.recovery_down_since,
+                            )
+                            .await
+                        {
                             warn!(error = %e, "controller-requested re-registration failed");
                         }
                     }
@@ -2584,6 +2634,24 @@ mod tests {
             Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
             ReporterTimeouts::default(),
         )
+    }
+
+    #[test]
+    fn registration_reports_boot_without_certifying_an_uninitialized_inventory() {
+        let mut reporter = test_reporter(rset(8, 1024, vec![]));
+        reporter.boot_time = boot_time_from_stat("cpu 1 2 3\nbtime 1700000000\nprocesses 9\n");
+        let request = reporter.registration_request(&reporter.snapshot_resources());
+        assert_eq!(
+            request.boot_time,
+            Some(prost_types::Timestamp {
+                seconds: 1700000000,
+                nanos: 0
+            })
+        );
+        assert_eq!(request.no_held_jobs, None);
+        for stat in ["", "btime invalid", "btime 0", "btime -1"] {
+            assert_eq!(boot_time_from_stat(stat), None);
+        }
     }
 
     #[test]

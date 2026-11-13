@@ -360,6 +360,10 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
+    /// Explicit Slurm ReturnToService policy (0, 1, 2); unset preserves legacy recovery.
+    #[serde(default)]
+    pub return_to_service: Option<u8>,
+
     /// Seconds between node-health passes. Configured in TOML as
     /// `[controller] health_tick_secs` (default: 30).
     #[serde(default = "default_health_tick_secs")]
@@ -533,6 +537,7 @@ impl Default for ControllerConfig {
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
+            return_to_service: None,
             health_tick_secs: default_health_tick_secs(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
@@ -2527,6 +2532,16 @@ impl SlurmConfig {
             return Err(ConfigError::InvalidValue {
                 field: "controller.health_tick_secs".into(),
                 value: "0 (must be at least 1)".into(),
+            });
+        }
+        if self
+            .controller
+            .return_to_service
+            .is_some_and(|mode| mode > 2)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.return_to_service".into(),
+                value: "must be 0, 1, or 2".into(),
             });
         }
         // Zero makes every heartbeat instantly stale, so the first health pass
@@ -5725,6 +5740,25 @@ dispatch_reject_cooldown_secs = 0
             0,
             "zero (disabled) must be accepted"
         );
+    }
+
+    #[test]
+    fn return_to_service_is_explicit_and_validated() {
+        let old = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(old.controller.return_to_service, None);
+        for mode in 0..=2 {
+            let config = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[controller]\nreturn_to_service = {mode}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.controller.return_to_service, Some(mode));
+        }
+        for value in ["3", "-1", "true", "\"1\""] {
+            assert!(SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[controller]\nreturn_to_service = {value}\n"
+            ))
+            .is_err());
+        }
     }
 
     #[test]

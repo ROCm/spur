@@ -2989,7 +2989,8 @@ impl StepdStore {
             Err(error) => return Err(error),
         };
         Ok(entries
-            .flatten()
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|entry| entry.file_name() != "cleanup")
             .filter(|entry| match entry.file_type() {
                 Ok(kind) => kind.is_dir(),

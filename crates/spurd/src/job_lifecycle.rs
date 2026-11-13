@@ -43,6 +43,14 @@ impl<K: Eq + Hash + Clone> Default for KeyedLifecycle<K> {
 }
 
 impl<K: Eq + Hash + Clone> KeyedLifecycle<K> {
+    pub(crate) fn certify_idle(&self, inspect: impl FnOnce() -> Option<bool>) -> Option<bool> {
+        let entries = self.entries.try_lock().ok()?;
+        if entries.values().any(|entry| Arc::strong_count(entry) > 1) {
+            return Some(false);
+        }
+        inspect()
+    }
+
     pub(crate) async fn acquire(&self, key: K) -> KeyedLifecycleGuard<K> {
         let entry = lock_registry(&self.entries)
             .entry(key.clone())

@@ -1149,6 +1149,11 @@ message RegisterAgentRequest {
   // Optional agent features (e.g. "signal-job"), so the controller can avoid
   // calling RPCs an older agent does not implement.
   repeated string capabilities = 10;
+  google.protobuf.Timestamp boot_time = 11;
+  // Absent if the agent cannot certify a complete, empty allocation inventory.
+  optional bool no_held_jobs = 12;
+  // A heartbeat's DOWN event, received before sampling the empty inventory.
+  google.protobuf.Timestamp recovery_down_since = 13;
 }
 
 message RegisterAgentResponse {
@@ -1200,7 +1205,8 @@ message RunningJobStatus {
 }
 
 message HeartbeatResponse {
-  bool reregister = 1;               // held layout differs from the node's current one: register again
+  bool reregister = 1;               // refresh layout or validate return to service
+  google.protobuf.Timestamp recovery_down_since = 2;
 }
 
 message StepdRecoveryRequest {
