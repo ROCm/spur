@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{bail, Result};
 use tracing::warn;
@@ -10,7 +11,7 @@ use crate::cdi::cache::CdiCache;
 use crate::gres::cache::CountableGresPool;
 use crate::gres::cache::{ExpandedGresDevice, GresCache};
 use crate::inject::{
-    apply_spur_job_device_env, device_ids_for_gres, merge_edits_from_devices,
+    apply_spur_job_device_env, device_ids_for_gres, merge_edits_from_devices, rocr_ordered_gpu_ids,
     ContainerInjectionPlan, ContainerInjector, HostInjectionPlan, HostInjector, InjectActions,
 };
 use crate::registry::entry::{entry_matches_gres_name, from_cdi, DeviceCapability, DeviceEntry};
@@ -86,6 +87,7 @@ impl DeviceRegistry {
 
         let gpu_ids = device_ids_for_gres(&devices, gres_name);
         let mut host = HostInjector::plan(&edits, &gpu_ids);
+        host.gpu_ids = rocr_ordered_gpu_ids(&devices, gres_name, Path::new("/sys"));
         let mut container = ContainerInjector::plan(&edits, &gpu_ids, job_uid, job_gid);
         apply_spur_job_device_env(&mut host.env, &devices);
         apply_spur_job_device_env(&mut container.env, &devices);
