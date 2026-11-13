@@ -6775,12 +6775,15 @@ impl ClusterManager {
             );
         }
         let inventory = new_config.admission.node_inventory()?;
-        let inventory_changed = self.node_inventory.read().as_ref().map_or_else(
-            || inventory.names.is_some() || self.startup_node_inventory.names.is_some(),
-            |current| current != &inventory,
-        );
-        if inventory_changed {
-            self.validate_node_inventory(&inventory)?;
+        self.validate_node_inventory(&inventory)?;
+        let mut reconcile_inventory = inventory.names.is_some()
+            || self.startup_node_inventory.names.is_some()
+            || self.node_inventory.read().is_some();
+        if !reconcile_inventory {
+            // Default-only reloads must not introduce a new WAL operation during
+            // rolling upgrades, but an earlier queued roster still needs clearing.
+            self.wait_for_node_inventory_writes()?;
+            reconcile_inventory = self.node_inventory.read().is_some();
         }
         let conf_partitions = new_config.build_partitions();
 
@@ -6861,7 +6864,9 @@ impl ClusterManager {
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
-        if inventory_changed {
+        // A timed-out earlier write can still apply; order even an unchanged
+        // desired roster after it instead of trusting a pre-proposal comparison.
+        if reconcile_inventory {
             let response = self.propose(WalOperation::NodeInventoryUpdate {
                 inventory,
                 initialize: false,
@@ -6903,6 +6908,39 @@ impl ClusterManager {
 
         info!("reconfigure: applied spur.conf on the leader (followers converge on restart; see docs/admin-guide/configuration.rst, \"Applying configuration changes\", for per-field reload scope)");
         Ok(())
+    }
+
+    fn wait_for_node_inventory_writes(&self) -> anyhow::Result<()> {
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Raft is not initialized"))?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(self.propose_timeout, async {
+                    // OpenRaft publishes metrics after processing this FIFO callback,
+                    // including earlier uncommitted writes that a read index can miss.
+                    let mut metrics = raft.metrics();
+                    let mut metrics = raft
+                        .with_raft_state(move |_| {
+                            metrics.mark_unchanged();
+                            metrics
+                        })
+                        .await?;
+                    metrics.changed().await?;
+                    let last = metrics.borrow().last_log_index;
+                    raft.wait(None)
+                        .applied_index_at_least(last, "node inventory reload")
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("reconfigure: waiting for prior Raft writes timed out")
+                })?
+            })
+        })
     }
 
     fn validate_node_inventory(&self, inventory: &NodeInventory) -> anyhow::Result<()> {
@@ -12913,7 +12951,15 @@ pub(crate) mod gated {
         dir: &TempDir,
         config: SlurmConfig,
     ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
-        let mut cm = ClusterManager::new(config, dir.path()).unwrap();
+        cluster_with_config_path(dir, config, None).await
+    }
+
+    pub(crate) async fn cluster_with_config_path(
+        dir: &TempDir,
+        config: SlurmConfig,
+        path: Option<std::path::PathBuf>,
+    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+        let mut cm = ClusterManager::new_with_config_path(config, dir.path(), path).unwrap();
         cm.propose_timeout = std::time::Duration::from_millis(200);
         let cm = Arc::new(cm);
         let gate = Arc::new(ApplyGate::default());
@@ -13458,6 +13504,121 @@ pub(crate) mod tests {
         assert_eq!(cm.get_nodes().len(), 2);
         assert_eq!(*cm.node_inventory.read(), None);
         assert_eq!(cm.get_node("n1").unwrap().total_resources.cpus, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_orders_same_roster_after_prior_update() {
+        for explicit in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("spur.conf");
+            let roster = if explicit {
+                "[admission]\nnode_names = ['n1', 'n2']\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                &path,
+                format!(
+                    "cluster_name = 'test'\n{roster}\n[[partitions]]\nname = 'default'\nnodes = 'n[1-2]'\ndefault = true\n"
+                ),
+            )
+            .unwrap();
+            let config = SlurmConfig::load_from_file(&path).unwrap();
+            let cm = Arc::new(
+                ClusterManager::new_with_config_path(config, dir.path(), Some(path)).unwrap(),
+            );
+            let recorder = Arc::new(RecordingApplier {
+                inner: cm.clone(),
+                ops: parking_lot::Mutex::new(Vec::new()),
+                before_apply: |cluster, op| {
+                    if matches!(op, WalOperation::PartitionUpdate { .. }) {
+                        // A prior timed-out write may apply after the retry's
+                        // initial comparison but before its partition write.
+                        assert!(cluster
+                            .apply_operation(&inventory_update(&["n1"]))
+                            .node_inventory_error
+                            .is_none());
+                        assert!(cluster.get_node("n2").is_none());
+                    }
+                },
+            });
+            let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder)
+                .await
+                .unwrap();
+            handle
+                .raft
+                .wait(None)
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .unwrap();
+            cm.set_raft(handle.raft);
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+
+            if !explicit {
+                cm.propose(WalOperation::NodeInventoryUpdate {
+                    inventory: NodeInventory::default(),
+                    initialize: false,
+                })
+                .unwrap();
+            }
+            cm.reconfigure().unwrap();
+
+            let desired = if explicit {
+                inventory(&["n1", "n2"])
+            } else {
+                NodeInventory::default()
+            };
+            assert_eq!(*cm.node_inventory.read(), Some(desired.clone()));
+            assert!(cm.get_node("n2").is_none());
+            cm.check_node_inventory("n2").unwrap();
+            let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+            restored
+                .restore_from_snapshot(&cm.snapshot_state().unwrap())
+                .unwrap();
+            assert_eq!(*restored.node_inventory.read(), Some(desired));
+            restored.check_node_inventory("n2").unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            assert!(cm.get_node("n2").is_some());
+        }
+    }
+
+    #[test]
+    fn node_inventory_legacy_clear_still_initializes_dynamic_state() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let clear = serde_json::from_str(
+            r#"{"NodeInventoryUpdate":{"inventory":{"names":null},"initialize":false}}"#,
+        )
+        .unwrap();
+        assert!(cm.apply_operation(&clear).node_inventory_error.is_none());
+        assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconfigure_node_inventory_waits_for_timed_out_initial_roster() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("spur.conf");
+        std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
+        let config = SlurmConfig::load_from_file(&path).unwrap();
+        let (cm, gate) = gated::cluster_with_config_path(&dir, config, Some(path)).await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        let closed = gate.close();
+        let error = cm.propose(inventory_update(&["n1"])).unwrap_err();
+        assert!(error.is::<OutcomeUnknown>());
+
+        let error = cm.reconfigure().unwrap_err();
+        assert!(error.to_string().contains("prior Raft writes timed out"));
+        assert_eq!(*cm.node_inventory.read(), None);
+        drop(closed);
+
+        cm.reconfigure().unwrap();
+        assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
+        cm.check_node_inventory("n2").unwrap();
+        assert!(cm.get_node("n2").is_none());
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        assert!(cm.get_node("n2").is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14766,7 +14927,11 @@ state = "UP"
             "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
@@ -14784,7 +14949,11 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.jobs_private());
 
         std::fs::write(
@@ -14793,7 +14962,11 @@ state = "UP"
              private_data = [\"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.users_private());
         assert!(cm.config().auth.accounts_private());
         assert!(cm.config().auth.reservations_private());
@@ -14807,7 +14980,10 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"nodes\"]\n",
         )
         .unwrap();
-        cm.reconfigure()
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
             .expect_err("an unsupported category must not go live");
         assert!(
             cm.config().auth.accounts_private(),
@@ -14827,7 +15003,11 @@ state = "UP"
             "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
@@ -14851,7 +15031,11 @@ state = "UP"
             "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let avail = cm.available_licenses();
         assert_eq!(

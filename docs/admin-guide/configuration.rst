@@ -2314,6 +2314,11 @@ to finish, and remove reservation and Kubernetes membership first. The roster
 and its deletions commit together; a refusal leaves both unchanged. Other
 configuration changes, such as partition updates, are separate operations.
 
+A reconfigure timeout has an unknown outcome: its roster update may still
+commit. Keep the desired roster in the file and retry after the controller
+recovers. Each reconfigure orders that roster after earlier queued updates,
+even when it initially appears unchanged.
+
 The committed roster also rejects later registration of an excluded name, so a
 still-running or recreated agent cannot recreate a deleted record. To admit it
 again, restore its name and reconfigure. Adding names does not create node
