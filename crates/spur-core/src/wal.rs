@@ -7,7 +7,7 @@ use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::{NodeSource, NodeState};
-use crate::partition::Partition;
+use crate::partition::{Partition, PartitionClears};
 use crate::partition_limits::{MemoryAdjustment, PartitionLimitsUpdate};
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -401,9 +401,14 @@ pub enum WalOperation {
         nodes: Option<String>,
         selector: Option<HashMap<String, String>>,
         state: Option<String>,
-        max_time_minutes: Option<Option<u32>>,
-        default_time_minutes: Option<Option<u32>>,
-        max_nodes: Option<Option<u32>>,
+        // These three limits and `preempt_exempt_time` below are always serialized,
+        // so old entries hold `null` for "unchanged"; removing one goes through `clear`.
+        #[serde(default)]
+        max_time_minutes: Option<u32>,
+        #[serde(default)]
+        default_time_minutes: Option<u32>,
+        #[serde(default)]
+        max_nodes: Option<u32>,
         min_nodes: Option<u32>,
         allow_accounts: Option<Vec<String>>,
         allow_groups: Option<Vec<String>>,
@@ -414,13 +419,16 @@ pub enum WalOperation {
         preempt_mode: Option<String>,
         is_default: Option<bool>,
         #[serde(default)]
-        preempt_exempt_time: Option<Option<u32>>,
+        preempt_exempt_time: Option<u32>,
         #[serde(
             default,
             deserialize_with = "clear_or_set",
             skip_serializing_if = "Option::is_none"
         )]
         grace_time: Option<Option<u32>>,
+        /// Limits to remove; wins over a value for the same limit.
+        #[serde(default, skip_serializing_if = "PartitionClears::is_empty")]
+        clear: PartitionClears,
         /// Merged into the partition's limits when the entry applies.
         #[serde(default)]
         resource_limits: Option<PartitionLimitsUpdate>,
@@ -1638,22 +1646,30 @@ mod deregistration_wal_tests {
                 ..
             } => {
                 assert_eq!(state.as_deref(), Some("DRAIN"));
-                assert_eq!(preempt_exempt_time, Some(Some(120)));
+                assert_eq!(preempt_exempt_time, Some(120));
                 assert_eq!(grace_time, None, "absent means leave unchanged");
             }
             _ => panic!("wrong variant"),
         }
     }
 
-    fn partition_update_with_grace(grace_time: Option<Option<u32>>) -> WalOperation {
+    /// `[max_time, default_time, max_nodes, preempt_exempt_time]`.
+    type Limits = [Option<u32>; 4];
+
+    fn partition_update(
+        limits: Limits,
+        clear: PartitionClears,
+        grace_time: Option<Option<u32>>,
+    ) -> WalOperation {
+        let [max_time_minutes, default_time_minutes, max_nodes, preempt_exempt_time] = limits;
         WalOperation::PartitionUpdate {
             name: "gpu".into(),
             nodes: None,
             selector: None,
             state: None,
-            max_time_minutes: None,
-            default_time_minutes: None,
-            max_nodes: None,
+            max_time_minutes,
+            default_time_minutes,
+            max_nodes,
             min_nodes: None,
             allow_accounts: None,
             allow_groups: None,
@@ -1663,10 +1679,15 @@ mod deregistration_wal_tests {
             priority_tier: None,
             preempt_mode: None,
             is_default: None,
-            preempt_exempt_time: None,
+            preempt_exempt_time,
             grace_time,
+            clear,
             resource_limits: None,
         }
+    }
+
+    fn partition_update_with_grace(grace_time: Option<Option<u32>>) -> WalOperation {
+        partition_update([None; 4], PartitionClears::default(), grace_time)
     }
 
     // The log stores JSON, where a bare `Option<Option<_>>` cannot tell a clear
@@ -1702,6 +1723,144 @@ mod deregistration_wal_tests {
         assert_eq!(replayed(CLEAR), Some(None), "null clears the grace time");
         assert_eq!(replayed(SET), Some(Some(600)));
         assert_eq!(replayed(ABSENT), None, "an absent key leaves it unchanged");
+    }
+
+    fn replayed_limits(json: &str) -> (Limits, PartitionClears) {
+        match serde_json::from_str(json).expect("must deserialize") {
+            WalOperation::PartitionUpdate {
+                max_time_minutes,
+                default_time_minutes,
+                max_nodes,
+                preempt_exempt_time,
+                clear,
+                ..
+            } => (
+                [
+                    max_time_minutes,
+                    default_time_minutes,
+                    max_nodes,
+                    preempt_exempt_time,
+                ],
+                clear,
+            ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    const ALL_CLEARS: PartitionClears = PartitionClears {
+        max_time: true,
+        default_time: true,
+        max_nodes: true,
+        preempt_exempt_time: true,
+    };
+
+    // The four legacy limits are always serialized, so every old entry carries
+    // `null` for "unchanged". It must stay "unchanged", never a clear.
+    // Never regenerate.
+    #[test]
+    fn partition_update_legacy_limit_fields_read_null_as_unchanged_and_numbers_as_sets() {
+        const NULLS: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"UP","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"grace_time":null,"resource_limits":null}}"#;
+        const NUMBERS: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":90,"default_time_minutes":30,"max_nodes":8,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":120}}"#;
+        const PRE_PREEMPT_EXEMPT: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"UP","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null}}"#;
+
+        assert_eq!(
+            replayed_limits(NULLS),
+            ([None; 4], PartitionClears::default())
+        );
+        assert_eq!(
+            replayed_limits(NUMBERS),
+            (
+                [Some(90), Some(30), Some(8), Some(120)],
+                PartitionClears::default()
+            )
+        );
+        assert_eq!(
+            replayed_limits(PRE_PREEMPT_EXEMPT),
+            ([None; 4], PartitionClears::default())
+        );
+    }
+
+    // A clear is the case a bare `Option<Option<_>>` loses in JSON, which the
+    // leader never sees because it applies its in-memory copy.
+    #[test]
+    fn partition_update_limit_clears_survive_the_log() {
+        let clears = [
+            PartitionClears {
+                max_time: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                default_time: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                max_nodes: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                preempt_exempt_time: true,
+                ..Default::default()
+            },
+            ALL_CLEARS,
+        ];
+        for clear in clears {
+            let json = serde_json::to_string(&partition_update([None; 4], clear, None)).unwrap();
+            assert_eq!(replayed_limits(&json), ([None; 4], clear), "{json}");
+        }
+    }
+
+    #[test]
+    fn partition_update_limit_sets_survive_the_log() {
+        let limits = [Some(90), Some(0), Some(8), Some(120)];
+        let json =
+            serde_json::to_string(&partition_update(limits, PartitionClears::default(), None))
+                .unwrap();
+        assert_eq!(
+            replayed_limits(&json),
+            (limits, PartitionClears::default()),
+            "{json}"
+        );
+    }
+
+    // Frozen wire form of a clear entry: an older controller reading it ignores
+    // `clear` and keeps the limit. Never regenerate.
+    #[test]
+    fn partition_update_clear_wire_format_is_frozen() {
+        const CLEAR: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"clear":{"max_time":true,"default_time":false,"max_nodes":true,"preempt_exempt_time":false},"resource_limits":null}}"#;
+        let expected = PartitionClears {
+            max_time: true,
+            max_nodes: true,
+            ..Default::default()
+        };
+
+        assert_eq!(replayed_limits(CLEAR), ([None; 4], expected));
+        let op = partition_update([None; 4], expected, None);
+        assert_eq!(serde_json::to_string(&op).unwrap(), CLEAR);
+    }
+
+    // Without clears the entry must serialize as it did before the field existed.
+    #[test]
+    fn partition_update_without_clears_omits_the_clear_key() {
+        let json = serde_json::to_string(&partition_update(
+            [Some(60), None, None, None],
+            PartitionClears::default(),
+            None,
+        ))
+        .unwrap();
+        assert!(!json.contains("clear"), "{json}");
+    }
+
+    #[test]
+    fn partition_update_ignores_unknown_keys() {
+        const WITH_FUTURE_KEY: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":60,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"clear":{"max_nodes":true,"a_future_flag":true},"a_future_field":1}}"#;
+        let expected = PartitionClears {
+            max_nodes: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            replayed_limits(WITH_FUTURE_KEY),
+            ([Some(60), None, None, None], expected)
+        );
     }
 
     // These entries are already in deployed logs, so a change to how they read

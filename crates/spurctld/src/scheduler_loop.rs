@@ -6404,6 +6404,7 @@ pub(crate) mod tests {
 
     pub(crate) mod dispatch_trigger_tests {
         use super::*;
+        use crate::partition_patch::PartitionPatch;
         use spur_core::config::SlurmConfig;
         use spur_core::node::{NodeSource, NodeState};
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -9256,8 +9257,11 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             cm.update_partition(
-                "p", None, None, None, None, None, None, None, false, None, None, None, None, None,
-                None, None, None, None, None, raise,
+                "p",
+                PartitionPatch {
+                    limits: raise,
+                    ..Default::default()
+                },
             )
             .unwrap();
             assert!(process_assignment(cm.clone(), planned, false).await);

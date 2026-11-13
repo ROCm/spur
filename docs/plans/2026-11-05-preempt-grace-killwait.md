@@ -253,8 +253,6 @@ behaviour and are marked `xfail` until it is fixed (see the test inventory).
 - Honour a user `--signal` as the warning signal (Slurm's `send_user_signal`).
 - Expose `preempt_time` and the grace `EndTime` through REST.
 - Reservation end like Slurm: end `TIMEOUT`, stop immediately and use the timeout wait.
-- Change `update_partition` from positional arguments to a patch type; it already takes several
-  `Option<Option<_>>` parameters.
 - Requeue-mode preemption and `scontrol requeue` free the node when the requeue commits, while the
   old run is still in its kill wait; release the nodes without completing the run instead.
 - The "one node finished, stop the others" step in `report_job_status` is fire-and-forget with no

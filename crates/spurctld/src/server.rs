@@ -23,6 +23,7 @@ use spur_proto::proto::*;
 use crate::accounting::txn;
 use crate::audit::{annotate, Annotation};
 use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
+use crate::partition_patch::PartitionPatch;
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
@@ -3443,33 +3444,33 @@ impl SlurmController for ControllerService {
         // Match create_partition's "0 means unset, not literally zero" rule.
         let min_nodes = req.min_nodes.map(|mn| if mn == 0 { 1 } else { mn });
 
+        let patch = PartitionPatch {
+            nodes: req.nodes,
+            selector,
+            state,
+            is_default: req.is_default,
+            max_time,
+            default_time: req.default_time,
+            max_nodes,
+            clear_max_nodes,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            deny_accounts,
+            deny_qos,
+            allow_qos,
+            priority_tier: req.priority_tier,
+            preempt_mode,
+            preempt_exempt_time: if req.clear_preempt_exempt_time {
+                Some(None)
+            } else {
+                req.preempt_exempt_time.map(Some)
+            },
+            grace_time,
+            limits,
+        };
         self.cluster
-            .update_partition(
-                &req.name,
-                req.nodes,
-                selector,
-                state,
-                req.is_default,
-                max_time,
-                req.default_time,
-                max_nodes,
-                clear_max_nodes,
-                min_nodes,
-                allow_accounts,
-                allow_groups,
-                deny_accounts,
-                deny_qos,
-                allow_qos,
-                req.priority_tier,
-                preempt_mode,
-                if req.clear_preempt_exempt_time {
-                    Some(None)
-                } else {
-                    req.preempt_exempt_time.map(Some)
-                },
-                grace_time,
-                limits,
-            )
+            .update_partition(&req.name, patch)
             .map_err(partition_rpc_status)?;
 
         Ok(Response::new(()))

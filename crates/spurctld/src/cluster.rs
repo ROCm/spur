@@ -30,10 +30,8 @@ use spur_core::job::{
     PendingReason, PreemptPending, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
-use spur_core::partition_limits::{
-    candidate_requests, PartitionLimitsUpdate, PartitionResourceLimits,
-};
+use spur_core::partition::{patched_limit, requested_partition_names, Partition, PreemptMode};
+use spur_core::partition_limits::candidate_requests;
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
     QosCheckResult,
@@ -54,6 +52,7 @@ use crate::accounting::{
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
+use crate::partition_patch::PartitionPatch;
 use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
@@ -6481,29 +6480,10 @@ impl ClusterManager {
     }
 
     /// Update fields of an existing partition (persisted via Raft).
-    #[allow(clippy::too_many_arguments)]
     pub fn update_partition(
         &self,
         name: &str,
-        nodes: Option<String>,
-        selector: Option<std::collections::HashMap<String, String>>,
-        state: Option<String>,
-        is_default: Option<bool>,
-        max_time: Option<String>,
-        default_time: Option<String>,
-        max_nodes: Option<u32>,
-        clear_max_nodes: bool,
-        min_nodes: Option<u32>,
-        allow_accounts: Option<Vec<String>>,
-        allow_groups: Option<Vec<String>>,
-        deny_accounts: Option<Vec<String>>,
-        deny_qos: Option<Vec<String>>,
-        allow_qos: Option<Vec<String>>,
-        priority_tier: Option<u32>,
-        preempt_mode: Option<String>,
-        preempt_exempt_time: Option<Option<u32>>,
-        grace_time: Option<Option<u32>>,
-        limits: PartitionLimitsUpdate,
+        patch: PartitionPatch,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -6511,62 +6491,9 @@ impl ClusterManager {
                 name
             )));
         }
-        limits.validate().map_err(PartitionError::invalid)?;
-        let resource_limits = (limits != PartitionLimitsUpdate::default()).then_some(limits);
-
-        let max_time_minutes = if let Some(ref t) = max_time {
-            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
-                Some(None)
-            } else {
-                let m = spur_core::config::parse_time_minutes(t)
-                    .ok_or_else(|| PartitionError::invalid(format!("invalid time: {}", t)))?;
-                Some(Some(m))
-            }
-        } else {
-            None
-        };
-
-        let default_time_minutes = if let Some(ref t) = default_time {
-            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
-                Some(None)
-            } else {
-                let m = spur_core::config::parse_time_minutes(t).ok_or_else(|| {
-                    PartitionError::invalid(format!("invalid default_time: {}", t))
-                })?;
-                Some(Some(m))
-            }
-        } else {
-            None
-        };
-
-        let max_nodes_wal = if clear_max_nodes {
-            Some(None)
-        } else {
-            max_nodes.map(Some)
-        };
-
-        self.propose(WalOperation::PartitionUpdate {
-            name: name.to_string(),
-            nodes,
-            selector,
-            state,
-            max_time_minutes,
-            default_time_minutes,
-            max_nodes: max_nodes_wal,
-            min_nodes,
-            allow_accounts,
-            allow_groups,
-            deny_accounts,
-            deny_qos,
-            allow_qos,
-            priority_tier,
-            preempt_mode,
-            is_default,
-            preempt_exempt_time,
-            grace_time,
-            resource_limits,
-        })
-        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        patch.limits.validate().map_err(PartitionError::invalid)?;
+        self.propose(patch.into_wal(name)?)
+            .map_err(|e| PartitionError::raft(e.to_string()))?;
         self.warn_partition_cap_overcommits_in(name);
         Ok(())
     }
@@ -6732,33 +6659,8 @@ impl ClusterManager {
             .iter()
             .filter(|p| current_names.contains(&p.name))
         {
-            let preempt_str = spur_core::partition::preempt_mode_str(part.preempt_mode);
-            self.propose(WalOperation::PartitionUpdate {
-                name: part.name.clone(),
-                nodes: Some(part.nodes.clone()),
-                selector: Some(part.selector.clone()),
-                state: Some(part.state.to_string()),
-                max_time_minutes: Some(part.max_time_minutes),
-                default_time_minutes: Some(part.default_time_minutes),
-                max_nodes: Some(part.max_nodes),
-                min_nodes: Some(part.min_nodes),
-                allow_accounts: Some(part.allow_accounts.clone()),
-                allow_groups: Some(part.allow_groups.clone()),
-                deny_accounts: Some(part.deny_accounts.clone()),
-                deny_qos: Some(part.deny_qos.clone()),
-                allow_qos: Some(part.allow_qos.clone()),
-                priority_tier: Some(part.priority_tier),
-                preempt_mode: Some(preempt_str.to_string()),
-                is_default: Some(part.is_default),
-                // Only push a WAL change when TOML explicitly sets the field;
-                // absent means "leave whatever the runtime WAL already has".
-                preempt_exempt_time: part.preempt_exempt_time.map(Some),
-                grace_time: part.grace_time.map(Some),
-                resource_limits: Some(PartitionLimitsUpdate::replacing(
-                    &PartitionResourceLimits::of(part),
-                )),
-            })
-            .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
+            self.propose(crate::partition_patch::wal_from_config(part))
+                .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
         // Re-derive the config-total pools. Availability is computed as total
@@ -9842,6 +9744,7 @@ impl ClusterManager {
                 is_default,
                 preempt_exempt_time,
                 grace_time,
+                clear,
                 resource_limits,
             } => {
                 {
@@ -9862,15 +9765,14 @@ impl ClusterManager {
                                 _ => spur_core::partition::PartitionState::Inactive,
                             };
                         }
-                        if let Some(mt) = max_time_minutes {
-                            part.max_time_minutes = *mt;
-                        }
-                        if let Some(dt) = default_time_minutes {
-                            part.default_time_minutes = *dt;
-                        }
-                        if let Some(mn) = max_nodes {
-                            part.max_nodes = *mn;
-                        }
+                        part.max_time_minutes =
+                            patched_limit(part.max_time_minutes, *max_time_minutes, clear.max_time);
+                        part.default_time_minutes = patched_limit(
+                            part.default_time_minutes,
+                            *default_time_minutes,
+                            clear.default_time,
+                        );
+                        part.max_nodes = patched_limit(part.max_nodes, *max_nodes, clear.max_nodes);
                         if let Some(mn) = min_nodes {
                             part.min_nodes = *mn;
                         }
@@ -9901,9 +9803,11 @@ impl ClusterManager {
                         if let Some(def) = is_default {
                             part.is_default = *def;
                         }
-                        if let Some(et) = preempt_exempt_time {
-                            part.preempt_exempt_time = *et;
-                        }
+                        part.preempt_exempt_time = patched_limit(
+                            part.preempt_exempt_time,
+                            *preempt_exempt_time,
+                            clear.preempt_exempt_time,
+                        );
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
                         }
@@ -12632,6 +12536,7 @@ pub(crate) mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    mod partition_clears;
     mod partition_limits;
 
     #[test]
@@ -41405,7 +41310,7 @@ state = "UP"
             nodes: None,
             selector: None,
             state: Some("DRAIN".into()),
-            max_time_minutes: Some(Some(2880)),
+            max_time_minutes: Some(2880),
             default_time_minutes: None,
             max_nodes: None,
             min_nodes: None,
@@ -41419,6 +41324,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            clear: Default::default(),
             resource_limits: None,
         });
 
@@ -41544,6 +41450,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            clear: Default::default(),
             resource_limits: None,
         });
 
@@ -41591,6 +41498,7 @@ state = "UP"
             is_default: Some(true),
             preempt_exempt_time: None,
             grace_time: None,
+            clear: Default::default(),
             resource_limits: None,
         });
 
@@ -41641,25 +41549,10 @@ state = "UP"
         let update = |grace_time: Option<Option<u32>>| {
             cm.update_partition(
                 "gpu",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                grace_time,
-                PartitionLimitsUpdate::default(),
+                PartitionPatch {
+                    grace_time,
+                    ..Default::default()
+                },
             )
         };
         update(None).unwrap();

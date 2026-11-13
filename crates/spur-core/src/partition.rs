@@ -291,6 +291,35 @@ pub fn max_priority_tier(spec: Option<&str>, partitions: &[Partition]) -> u32 {
         .unwrap_or(1)
 }
 
+/// Limits a partition update removes. The legacy limit fields of the update entry
+/// cannot carry a clear through JSON, so each clear is its own flag; a set flag wins
+/// over a value set for the same limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionClears {
+    #[serde(default)]
+    pub max_time: bool,
+    #[serde(default)]
+    pub default_time: bool,
+    #[serde(default)]
+    pub max_nodes: bool,
+    #[serde(default)]
+    pub preempt_exempt_time: bool,
+}
+
+impl PartitionClears {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The limit after an update: cleared, else the new value, else unchanged.
+pub fn patched_limit(current: Option<u32>, set: Option<u32>, clear: bool) -> Option<u32> {
+    if clear {
+        return None;
+    }
+    set.or(current)
+}
+
 impl Default for Partition {
     fn default() -> Self {
         Self {
@@ -327,6 +356,46 @@ impl Default for Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patched_limit_clears_sets_or_keeps() {
+        assert_eq!(patched_limit(Some(60), None, false), Some(60));
+        assert_eq!(patched_limit(Some(60), Some(90), false), Some(90));
+        assert_eq!(patched_limit(Some(60), Some(0), false), Some(0));
+        assert_eq!(patched_limit(Some(60), None, true), None);
+        assert_eq!(patched_limit(None, Some(90), false), Some(90));
+        assert_eq!(patched_limit(None, None, false), None);
+    }
+
+    #[test]
+    fn a_clear_wins_over_a_value_for_the_same_limit() {
+        assert_eq!(patched_limit(Some(60), Some(90), true), None);
+    }
+
+    #[test]
+    fn clears_are_empty_only_when_no_flag_is_set() {
+        assert!(PartitionClears::default().is_empty());
+        for clears in [
+            PartitionClears {
+                max_time: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                default_time: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                max_nodes: true,
+                ..Default::default()
+            },
+            PartitionClears {
+                preempt_exempt_time: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!clears.is_empty(), "{clears:?}");
+        }
+    }
 
     #[test]
     fn admits_requires_up_and_every_static_limit() {
