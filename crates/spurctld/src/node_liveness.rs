@@ -1089,47 +1089,66 @@ mod tests {
         assert_eq!(probed, vec!["s1", "s1", "s2", "s2"]);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_staggered_mass_failure_trips_before_early_nodes_go_down_at_a_short_timeout() {
-        let dir = TempDir::new().unwrap();
-        let cm = cluster_of(&dir, &["e1", "e2", "l1", "l2"]).await;
+    const STAGGERED_NODES: [&str; 4] = ["e1", "e2", "l1", "l2"];
+
+    /// Passes at C+9, C+24 and C+39 with a 45 s timeout and a 15 s tick. e1 and
+    /// e2 last beat at C-22; l1 and l2 at C, or up to each pass if `late_beating`.
+    /// Returns whether each pass tripped the limit.
+    async fn run_staggered_failure(
+        cm: &ClusterManager,
+        prober: &ScriptedProber,
+        late_beating: bool,
+    ) -> Vec<bool> {
         let (tick, timeout_secs) = (Duration::from_secs(15), 45);
         let mut liveness = NodeLiveness::new(0.5, tick);
         // The passes run moments apart in real time; their wall clock is injected.
         liveness.strikes.min_gap = Duration::ZERO;
-        liveness.observe_term(&cm, Some(1));
-        let prober = ScriptedProber::default();
-        // Heartbeats stop at C: e1 and e2 last beat at C-22, l1 and l2 at C.
+        liveness.observe_term(cm, Some(1));
         let c = Utc::now();
-        let nodes = ["e1", "e2", "l1", "l2"];
-        for name in &nodes[..2] {
-            set_last_heartbeat(&cm, name, Some(c - chrono::Duration::seconds(22)));
+        let (early, late) = STAGGERED_NODES.split_at(2);
+        for name in early {
+            set_last_heartbeat(cm, name, Some(c - chrono::Duration::seconds(22)));
         }
-        for name in &nodes[2..] {
-            set_last_heartbeat(&cm, name, Some(c));
+        for name in late {
+            set_last_heartbeat(cm, name, Some(c));
         }
 
+        let mut tripped = Vec::new();
         for secs_after_c in [9, 24, 39] {
+            let wall = c + chrono::Duration::seconds(secs_after_c);
+            if late_beating {
+                for name in late {
+                    set_last_heartbeat(cm, name, Some(wall));
+                }
+            }
             liveness
                 .sweep_at(
-                    &cm,
+                    cm,
                     timeout_secs,
                     MarkDownPolicy::Allowed,
-                    &prober,
+                    prober,
                     || true,
                     PassStart {
-                        wall: c + chrono::Duration::seconds(secs_after_c),
+                        wall,
                         at: Instant::now(),
                     },
                 )
                 .await;
-            assert_all_up(&cm, &nodes);
-            assert_eq!(
-                cm.node_metrics().liveness_breaker_tripped,
-                secs_after_c == 39,
-                "breaker at C+{secs_after_c}"
-            );
+            tripped.push(cm.node_metrics().liveness_breaker_tripped);
         }
+        tripped
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staggered_mass_failure_trips_before_early_nodes_go_down_at_a_short_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &STAGGERED_NODES).await;
+        let prober = ScriptedProber::default();
+
+        let tripped = run_staggered_failure(&cm, &prober, false).await;
+
+        assert_eq!(tripped, [false, false, true], "breaker at C+9, C+24, C+39");
+        assert_all_up(&cm, &STAGGERED_NODES);
         let mut probed = prober.probed();
         probed.sort();
         assert_eq!(
@@ -1137,6 +1156,22 @@ mod tests {
             ["e1", "e1", "e2", "e2"],
             "e1 and e2 failed at C+24 and C+39"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn early_nodes_reach_their_second_strike_in_a_staggered_timeline_with_late_nodes_healthy()
+    {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &STAGGERED_NODES).await;
+        let prober = ScriptedProber::default();
+
+        let tripped = run_staggered_failure(&cm, &prober, true).await;
+
+        assert_eq!(tripped, [false, false, false]);
+        wait_for("e1 and e2 marked down at C+39", || {
+            state(&cm, "e1") == NodeState::Down && state(&cm, "e2") == NodeState::Down
+        });
+        assert_all_up(&cm, &["l1", "l2"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
