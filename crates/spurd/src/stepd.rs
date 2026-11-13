@@ -1222,9 +1222,14 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Records why a launch never produced a workload, on the node and to the user.
+/// `uid`/`gid` own the `--error` stream: it is the user's own path, so it is
+/// opened as the user, never as the root supervisor that could be steered
+/// through a symlink into a file the user cannot write.
 pub(crate) fn record_launch_failure(
     session_dir: &Path,
     stderr_path: &str,
+    uid: u32,
+    gid: u32,
     error: &dyn std::fmt::Display,
 ) {
     let failure_path = session_dir.join(FAILURE_FILE);
@@ -1232,17 +1237,17 @@ pub(crate) fn record_launch_failure(
         tracing::warn!(%write_error, path = %failure_path.display(),
             "failed to record stepd failure");
     }
-    // Only append to a stream the launch already opened: creating it here would
-    // leave a root-owned file the job's own user cannot read.
-    if stderr_path.is_empty() || !Path::new(stderr_path).exists() {
+    if stderr_path.is_empty() {
         return;
     }
-    match fs::OpenOptions::new().append(true).open(stderr_path) {
-        Ok(mut file) => {
-            let _ = writeln!(file, "spurstepd: {error}");
-        }
-        Err(write_error) => tracing::warn!(%write_error, stderr_path,
-            "failed to report a launch failure to the job's error stream"),
+    // As the job user: a stream the launch never opened stays absent, and a
+    // stream the user cannot write (a planted symlink) is refused, not followed.
+    let line = format!("spurstepd: {error}\n");
+    if let Err(write_error) =
+        crate::executor::append_as_user(uid, gid, stderr_path, line.as_bytes())
+    {
+        tracing::warn!(%write_error, stderr_path,
+            "failed to report a launch failure to the job's error stream");
     }
 }
 
@@ -2319,6 +2324,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
+    // Captured before `launch_spec` is consumed below: a failure reported after
+    // the launch still writes the user's error stream as the user.
+    let (fail_uid, fail_gid) = (launch_spec.uid, launch_spec.gid);
     let hooks = launch_spec.hooks.clone();
     let spank = load_runtime_spank(&launch_spec.plugstack_path);
     let hook_context = spur_core::hooks::HookContext {
@@ -2367,7 +2375,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // Nothing launched, so only the session's own artifacts need clearing
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
-            record_launch_failure(&session_dir, &stderr_path, &error);
+            record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
             if spur_core::step::owns_job_lifetime(step_id) {
                 crate::executor::cleanup_job_spool(job_id);
             } else {
@@ -2379,7 +2387,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // The workload never ran, so nothing will report an exit and the watchdog
     // synthesises a SIGKILL — record the real reason the way a failed spawn does.
     let cleanup_failed_launch = |error: &dyn std::fmt::Display| {
-        record_launch_failure(&session_dir, &stderr_path, error);
+        record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, error);
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
@@ -2532,7 +2540,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     };
     if let Err(error) = result {
         teardown(cgroup).await?;
-        record_launch_failure(&session_dir, &stderr_path, &error);
+        record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
         return Err(error.into());
     }
     let snapshot = session.snapshot().await;
@@ -5842,6 +5850,8 @@ mod tests {
         record_launch_failure(
             &session_dir,
             stderr_path.to_str().expect("utf-8 path"),
+            0,
+            0,
             &"failed to start the PMIx server: plugin not found",
         );
 
@@ -5868,6 +5878,8 @@ mod tests {
         record_launch_failure(
             &session_dir,
             stderr_path.to_str().expect("utf-8 path"),
+            0,
+            0,
             &"failed before the launch opened its streams",
         );
 
@@ -5887,7 +5899,7 @@ mod tests {
 
         assert_eq!(store.recorded_failure(21, 1, 4), None);
 
-        record_launch_failure(&session_dir, "", &"the node cannot host this plugin");
+        record_launch_failure(&session_dir, "", 0, 0, &"the node cannot host this plugin");
         assert_eq!(
             store.recorded_failure(21, 1, 4).as_deref(),
             Some("the node cannot host this plugin")

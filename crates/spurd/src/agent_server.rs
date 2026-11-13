@@ -3889,6 +3889,7 @@ fn stage_fresh_container_step(
     ctx: FreshContainerContext,
     job_id: u32,
     step_script: &str,
+    step_scripts: Option<&StepScriptCleanup>,
 ) -> Result<
     (
         executor::ContainerLaunchConfig,
@@ -3896,6 +3897,7 @@ fn stage_fresh_container_step(
     ),
     Status,
 > {
+    let (uid, gid) = (ctx.uid, ctx.gid);
     let mut container_env = c.env.clone();
     maybe_deny_gpu_env(&mut container_env, &ctx.gpu_devices);
     let (launch, rootfs_mode) = build_container_launch(
@@ -3924,17 +3926,29 @@ fn stage_fresh_container_step(
             rootfs_base: ctx.rootfs_base,
         },
     )?;
-    // `executor::launch_job`'s container path execs this fixed in-container
-    // path unconditionally for every freshly-containerized step.
-    let container_script = format!("{}/tmp/spur_job_{job_id}.sh", launch.rootfs.display());
-    std::fs::write(&container_script, step_script)
-        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&container_script, std::fs::Permissions::from_mode(0o755));
-    }
+    stage_fresh_step_files(&launch.rootfs, job_id, step_script, step_scripts, uid, gid)?;
     Ok((launch, rootfs_mode))
+}
+
+/// Stage what a fresh container's step runs inside its rootfs: the entry script
+/// `executor::launch_job`'s container path execs, and any generated step scripts
+/// at their host paths, which pivot_root otherwise hides.
+fn stage_fresh_step_files(
+    rootfs: &std::path::Path,
+    job_id: u32,
+    step_script: &str,
+    step_scripts: Option<&StepScriptCleanup>,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Status> {
+    crate::container::write_entry_script(rootfs, &format!("spur_job_{job_id}.sh"), step_script)
+        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
+    if let Some(scripts) = step_scripts {
+        scripts.stage_in_rootfs(rootfs, uid, gid).map_err(|e| {
+            Status::internal(format!("failed to stage step scripts in container: {e}"))
+        })?;
+    }
+    Ok(())
 }
 
 /// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
@@ -6841,18 +6855,12 @@ impl SlurmAgent for AgentService {
             .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
             // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
-            let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
-            std::fs::write(&container_script, &script).map_err(|e| {
-                Status::internal(format!("failed to write container script: {}", e))
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &container_script,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+            crate::container::write_entry_script(
+                &rootfs,
+                &format!("spur_job_{job_id}.sh"),
+                &script,
+            )
+            .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
 
             rootfs_path = Some(rootfs);
             container_config = Some(cfg);
@@ -8916,6 +8924,7 @@ impl SlurmAgent for AgentService {
                         },
                         job_id,
                         &step_script,
+                        _step_script_guard.as_ref(),
                     )?;
                     supervised_rootfs_mode = Some(rootfs_mode);
                     Some(launch)
@@ -9226,22 +9235,12 @@ impl SlurmAgent for AgentService {
                 })?;
                 format!("#!/bin/bash\n{joined}\n")
             };
-            let script_in_rootfs = format!(
-                "{}/tmp/spur_step_{}_{}.sh",
-                rootfs.display(),
-                job_id,
-                step_id
-            );
-            std::fs::write(&script_in_rootfs, &step_script_content)
-                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &script_in_rootfs,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+            crate::container::write_entry_script(
+                &rootfs,
+                &format!("spur_step_{job_id}_{step_id}.sh"),
+                &step_script_content,
+            )
+            .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
 
             // Script path inside the container (after pivot_root, host paths are gone).
             let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
@@ -9335,18 +9334,24 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back, which is what bounds it in memory.
+        // reading the spool files back, which is what bounds it in memory. Read
+        // through open_spool_file so a link or FIFO planted at the name (a legacy
+        // folder may be the job's) is refused rather than followed or blocked on.
         let read_back = |path: String| async move {
-            match tokio::fs::read(&path).await {
-                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-                Err(e) => {
-                    // Don't fail the step over a read-back error, but log it so a
-                    // missing response body can be correlated with a filesystem
-                    // fault rather than looking like the step produced no output.
-                    warn!(path = %path, error = %e, "failed to read back step output");
-                    String::new()
-                }
-            }
+            use tokio::io::AsyncReadExt;
+            let read = async {
+                let mut file = crate::scratch::open_spool_file(std::path::Path::new(&path)).await?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await?;
+                Ok::<String, std::io::Error>(String::from_utf8_lossy(&bytes).into_owned())
+            };
+            read.await.unwrap_or_else(|e| {
+                // Don't fail the step over a read-back error, but log it so a
+                // missing response body can be correlated with a filesystem
+                // fault rather than looking like the step produced no output.
+                warn!(path = %path, error = %e, "failed to read back step output");
+                String::new()
+            })
         };
         let stdout = read_back(stdout_path).await;
         Ok(Response::new(RunCommandResponse {
@@ -10007,6 +10012,7 @@ impl SlurmAgent for AgentService {
                                 },
                                 init.job_id,
                                 &script,
+                                None,
                             )?;
                             container_rootfs_mode = Some(rootfs_mode);
                             fresh_container_env = Some(env);
@@ -18911,6 +18917,63 @@ mod tests {
                 content
             );
         }
+    }
+
+    #[test]
+    fn a_fresh_container_step_is_staged_without_following_links_in_its_image() {
+        let rootfs = tempfile::TempDir::new().unwrap();
+        let host = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join("tmp")).unwrap();
+
+        let staged = stage_fresh_step_files(rootfs.path(), 7, "#!/bin/bash\ntrue\n", None, 0, 0);
+
+        assert!(
+            staged.is_err(),
+            "a linked /tmp in the image must not be followed"
+        );
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+    }
+
+    // pivot_root hides the host's copies, so a fresh container's wrapper must be
+    // staged where its entry script will look for it.
+    #[test]
+    fn a_fresh_container_step_gets_its_generated_scripts_beside_its_entry_script() {
+        let rootfs = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
+        let spool = tempfile::TempDir::new().unwrap();
+        let dir = crate::scratch::ScratchDir::open(spool.path()).unwrap();
+        crate::scratch::write_scratch(
+            &dir,
+            "wrapper_0_1.sh",
+            b"#!/bin/bash\necho wrapped\n",
+            crate::scratch::ScratchOwner::Daemon,
+            0o700,
+        )
+        .unwrap();
+        let entry = format!(
+            "#!/bin/bash\nexec bash {}\n",
+            dir.join("wrapper_0_1.sh").display()
+        );
+        let scripts = StepScriptCleanup {
+            dir,
+            names: vec!["wrapper_0_1.sh".into()],
+        };
+
+        stage_fresh_step_files(rootfs.path(), 7, &entry, Some(&scripts), 0, 0)
+            .expect("stage the step");
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.path().join("tmp/spur_job_7.sh")).unwrap(),
+            entry
+        );
+        let staged = rootfs
+            .path()
+            .join(spool.path().strip_prefix("/").unwrap())
+            .join("wrapper_0_1.sh");
+        assert_eq!(
+            std::fs::read_to_string(staged).unwrap(),
+            "#!/bin/bash\necho wrapped\n"
+        );
     }
 
     // A container image is user-supplied, and an absolute link inside it would

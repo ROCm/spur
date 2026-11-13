@@ -560,7 +560,7 @@ taken over by root the next time the new agent writes to it, so no drain is need
 **Spool root ownership.** With a root ``spurd``, ``/var/spool/spur`` should be owned by
 root and not writable by group or others; ``spurd`` logs a warning at startup when it is
 not. If ``spurctld`` runs as an unprivileged user on the same node and shares that
-directory, move its state out first; see :ref:`spool-root-ownership`.
+directory, move its state out first; see :ref:`spool root ownership <spool-root-ownership>`.
 
 Reserved step IDs aligned to Slurm
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
