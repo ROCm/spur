@@ -863,9 +863,12 @@ every job placed on those GPUs in the meantime.
 Stopping the run on heartbeat needs both an upgraded controller and an upgraded
 agent on that node, which reports the run it holds; with either side from an
 earlier release, the old behavior stays. The recovery hold that keeps a returning
-node ``DOWN`` until it reports a clean job list relies on upgraded agents, which
-report ``running_jobs_incomplete`` when they cannot list their jobs in full; with an
-earlier agent, the node returns to service as it did before. An upgraded agent also stops the old
+node ``DOWN`` until it reports a clean job list applies to earlier agents too: one
+that still reports a job the controller ended is held, and drained at the cap if
+that job does not stop. Only upgraded agents report ``running_jobs_incomplete`` when
+they cannot list their jobs in full, though. An earlier agent sends an empty list
+when its job map is busy, which reads as clean, so its hold can end while an ended
+run is still going. An upgraded agent also stops the old
 run's processes, including its ``srun`` steps, when the job is placed back on
 the same node, which an earlier agent could miss for a run without a cgroup
 (``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
