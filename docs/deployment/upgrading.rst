@@ -871,11 +871,16 @@ until an operator runs ``scontrol update nodename=<node> state=resume``, so scri
 watch ``sinfo -R`` or resume nodes automatically should expect these reasons. Only
 upgraded agents report ``running_jobs_incomplete`` when they cannot list their jobs
 in full, though. An earlier agent sends an empty list when its job map is busy,
-which reads as clean, so its hold can end while an ended run is still going. An
-upgraded agent also stops the old run's processes, including its ``srun`` steps,
-when the job is placed back on the same node, which an earlier agent could miss for
-a run without a cgroup (``[cgroup] enabled = false``, or ``spurd`` cannot create
-cgroups, for example when not running as root).
+which reads as clean, so its hold can end while an ended run is still going. A job
+entry with run attempt ``0`` (an agent too old to report the run sends ``0`` for every
+job) is judged like any other: it holds the node if the controller ended the job or
+placed it on other nodes. The exception is a job back in the queue: its entry is
+neither stopped (a cancel without an attempt could hit the job's next launch) nor held
+for, so it reads as clean. An upgraded agent also stops the old run's
+processes, including its ``srun`` steps, when the job is placed back on the same node,
+which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example when not
+running as root).
 
 Before accepting a replacement attempt, the agent fences every older attempt
 it can discover in its tracked sessions, persisted session descriptors, and
