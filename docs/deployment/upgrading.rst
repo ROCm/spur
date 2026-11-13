@@ -822,8 +822,8 @@ which keeps new work off it, and asks the node's agent directly. See :ref:`node-
   resume. Such an agent often cannot report job completions either, so its finished jobs can
   stay running. The leader warns about the node every 10 minutes and
   ``spur_nodes_not_responding`` counts it.
-- **A mass silence marks no node** ``DOWN``. When the nodes that fail their probe or miss a
-  heartbeat in one pass exceed ``controller.max_stale_node_fraction`` (default ``0.5``) of
+- **A mass silence marks no node** ``DOWN``. When the nodes that fail their probe or, in a
+  pass where a probe fails, miss a heartbeat exceed ``controller.max_stale_node_fraction`` (default ``0.5``) of
   the watched nodes, rounded down but never below one node (so a single silent node never
   trips it), the leader assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
   needs ``scontrol update nodename=<nodes> state=down``. Alert on

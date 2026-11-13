@@ -415,7 +415,9 @@ agent must answer with the node's own name to count as alive:
 - **Many nodes go silent at once.** Each pass probes every silent node first, then counts
   the suspects: nodes that failed their probe, operator-managed nodes past the timeout
   (they cannot be probed), and nodes not yet past the timeout that have missed a
-  heartbeat (silent for more than 45 seconds). A node whose agent answered is never a
+  heartbeat (silent for more than 45 seconds). Those last count only in a pass where a
+  probe failed or an operator-managed node is past the timeout, so an outage in which
+  every agent answers does not trip the limit. A node whose agent answered is never a
   suspect. When the suspects exceed ``controller.max_stale_node_fraction`` (default half)
   of the watched nodes, rounded down but never below one, the leader assumes the fault is
   on its side, marks none of them ``DOWN``, logs ``suspecting the control plane`` at

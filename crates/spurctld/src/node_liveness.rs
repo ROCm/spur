@@ -115,13 +115,22 @@ struct Suspects {
 impl Suspects {
     fn count(results: &[ProbeResult], operator_managed: &[String], stale: &StaleNodes) -> Self {
         let counted = |node: &String| !stale.suspended.contains(node);
+        let failed_probes = results
+            .iter()
+            .filter(|r| !r.outcome.is_alive() && counted(&r.target.node))
+            .count();
+        let operator_managed = operator_managed.iter().filter(|n| counted(n)).count();
+        // With no node to mark Down, a heartbeat-path outage would trip on the
+        // nodes that have only missed a beat, raising a false alarm.
+        let recently_silent = if failed_probes + operator_managed > 0 {
+            stale.recently_silent
+        } else {
+            0
+        };
         Self {
-            failed_probes: results
-                .iter()
-                .filter(|r| !r.outcome.is_alive() && counted(&r.target.node))
-                .count(),
-            operator_managed: operator_managed.iter().filter(|n| counted(n)).count(),
-            recently_silent: stale.recently_silent,
+            failed_probes,
+            operator_managed,
+            recently_silent,
         }
     }
 
@@ -981,6 +990,22 @@ mod tests {
         let mut probed = prober.probed();
         probed.sort();
         assert_eq!(probed, vec!["s1", "s1", "s2", "s2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missed_heartbeats_do_not_trip_the_breaker_when_every_probe_answers() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["s1", "r1", "r2", "r3", "h1"]).await;
+        // A heartbeat-path outage with staggered last heartbeats: every agent answers.
+        silent_for(&cm, &["s1"], 100);
+        silent_for(&cm, &["r1", "r2", "r3"], 60);
+        let prober = ScriptedProber::answering(&["s1"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+
+        pass(&mut liveness, &cm, &prober).await;
+
+        assert!(!cm.node_metrics().liveness_breaker_tripped);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
