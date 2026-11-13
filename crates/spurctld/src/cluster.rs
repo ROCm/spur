@@ -12082,14 +12082,16 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
 }
 
 /// Bounds on the silence past one heartbeat interval that counts as a missed
-/// beat. The floor keeps a healthy node's late beat from counting; past the
-/// ceiling a beat is plainly missed, however long the timeout.
+/// beat. The floor is a compromise: a healthy beat can be later still (its RPC
+/// bound plus a retry), but a higher floor starts counting later at short
+/// timeouts. Past the ceiling a beat is plainly missed, however long the timeout.
 const MISSED_HEARTBEAT_MIN_SLACK_SECS: u64 = 5;
 const MISSED_HEARTBEAT_MAX_SLACK_SECS: u64 = 15;
 
 /// Seconds of silence after which a watched node that is not yet stale counts
-/// as having missed a heartbeat. Such a node goes stale within a tick, so a
-/// staggered mass failure trips the limit before an early node's second strike.
+/// as having missed a heartbeat. Unless the ceiling applies, such a node goes
+/// stale within a tick, so a staggered mass failure trips the limit before an
+/// early node's second strike. With a timeout at or under the floor it never fires.
 pub(crate) fn missed_heartbeat_secs(timeout_secs: u64, health_tick: std::time::Duration) -> u64 {
     let interval = spur_core::config::HEARTBEAT_INTERVAL_SECS;
     timeout_secs.saturating_sub(health_tick.as_secs()).clamp(

@@ -418,7 +418,10 @@ agent must answer with the node's own name to count as alive:
   (they cannot be probed), and nodes not yet past the timeout that have missed a
   heartbeat. A node has missed a heartbeat once it has been silent for longer than
   ``heartbeat_timeout_secs`` minus ``health_tick_secs``, kept between 35 and 45 seconds
-  (45 at the defaults), so it goes past the timeout within about one pass. Those nodes count
+  (45 at the defaults). When that comes to under 45, such a node goes past the timeout
+  within about one pass; at the 45-second cap it can take longer. With
+  ``heartbeat_timeout_secs`` of 35 or less, no node counts this way, because it is past the
+  timeout first. Those nodes count
   only in a pass where a probe failed or an operator-managed node is past the timeout, so
   an outage in which every agent answers does not trip the limit. A node whose agent
   answered is never a suspect. When the suspects exceed
@@ -427,7 +430,8 @@ agent must answer with the node's own name to count as alive:
   ``DOWN``, logs ``suspecting the control plane`` at error level (on the trip, then about
   every 10 minutes while it lasts), and sets the ``spur_nodes_liveness_breaker_tripped``
   gauge to ``1`` until a pass that does not trip, which logs ``the silent-node limit is no
-  longer exceeded``. Watched nodes are those not ``DOWN``, drained (``drain``), or
+  longer exceeded``. A leadership change while the limit is tripped resets this log, so
+  that trip gets no such line; the gauge stays accurate. Watched nodes are those not ``DOWN``, drained (``drain``), or
   suspended; draining (``drng``) and operator-managed nodes are watched. Draining part of the
   cluster to ``drain`` lowers the number of suspects it takes. Silent nodes are still
   probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
