@@ -9670,6 +9670,18 @@ mod tests {
         .await
         .expect("heartbeat");
         assert!(svc.cluster.reports_stale_jobs("n1"));
+
+        // Named stale ids still need reclaiming, so they outrank the incomplete flag.
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            running_jobs_incomplete: true,
+            ..beat(&[30]).into_inner()
+        }))
+        .await
+        .expect("heartbeat");
+        assert_eq!(
+            svc.cluster.node_report("n1"),
+            Some(crate::cluster::NodeReport::StaleJobs(vec![30]))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

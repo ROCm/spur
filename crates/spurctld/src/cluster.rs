@@ -4443,6 +4443,11 @@ impl ClusterManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn node_report(&self, node: &str) -> Option<NodeReport> {
+        self.stale_reporting_nodes.read().get(node).cloned()
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_recovery_held(&self, node: &str) -> bool {
         self.recovery_holds.read().contains_key(node)
     }
@@ -5366,17 +5371,23 @@ impl ClusterManager {
         timeout_secs: u64,
         mark_down: MarkDownPolicy,
     ) -> Vec<JobFinalized> {
-        self.check_node_health_at(timeout_secs, mark_down, Utc::now())
+        self.check_node_health_at(
+            timeout_secs,
+            mark_down,
+            Utc::now(),
+            std::time::Instant::now(),
+        )
     }
 
-    /// Recovery waits while [`withhold_recoveries`] holds a node. Staleness is
-    /// re-judged here, when the pass applies, so a node confirmed gone that has
-    /// heartbeated since is kept. Returns finalized jobs for cancel RPCs.
+    /// Recovery waits while [`withhold_recoveries`] holds a node, timed by the
+    /// monotonic `hold_clock` so a wall-clock step cannot cut a hold short. Staleness
+    /// is re-judged here, so a node confirmed gone that has heartbeated since is kept.
     pub(crate) fn check_node_health_at(
         &self,
         timeout_secs: u64,
         mark_down: MarkDownPolicy,
         now: DateTime<Utc>,
+        hold_clock: std::time::Instant,
     ) -> Vec<JobFinalized> {
         let mut actions = {
             let nodes = self.nodes.read();
@@ -5411,7 +5422,7 @@ impl ClusterManager {
             &self.stale_reporting_nodes.read(),
             &mut self.recovery_holds.write(),
             recovery_hold_cap(timeout_secs, &self.config()),
-            std::time::Instant::now(),
+            hold_clock,
         );
         self.apply_health_actions(actions)
     }
@@ -36458,6 +36469,39 @@ state = "UP"
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_past_the_hold_cap_drains_and_admin_locks_the_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+        let now = Utc::now();
+        set_last_heartbeat(&cm, "n1", Some(now));
+        cm.record_node_report("n1", Some(super::NodeReport::StaleJobs(vec![7])));
+        let started = std::time::Instant::now();
+        let cap = super::recovery_hold_cap(90, &cm.config());
+        // The policy a liveness sweep passes after confirming no node gone.
+        let pass = |at| {
+            cm.check_node_health_at(90, super::MarkDownPolicy::Only(HashSet::new()), now, at);
+        };
+
+        pass(started);
+        pass(started + cap - std::time::Duration::from_secs(1));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        assert!(cm.is_recovery_held("n1"));
+
+        pass(started + cap);
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.admin_locked);
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("Kill task failed (JobId=7)")
+        );
+        assert_eq!(node.reason_uid, Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2602,6 +2602,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_flags_its_job_list_incomplete_while_the_running_map_stays_locked() {
+        let running = running_map(7, 3);
+        let reporter = test_reporter_holding(running.clone());
+        let job_ids = |req: &spur_proto::proto::HeartbeatRequest| {
+            req.running_jobs
+                .iter()
+                .map(|j| j.job_id)
+                .collect::<Vec<_>>()
+        };
+
+        let held = running.lock().await;
+        let req = reporter.heartbeat_request().await;
+        assert!(req.running_jobs_incomplete);
+        assert!(job_ids(&req).is_empty());
+
+        drop(held);
+        let req = reporter.heartbeat_request().await;
+        assert!(!req.running_jobs_incomplete);
+        assert_eq!(job_ids(&req), vec![7]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_heartbeat_waits_out_a_lock_released_within_the_read_budget() {
         let running = running_map(7, 3);
         let reporter = test_reporter_holding(running.clone());
