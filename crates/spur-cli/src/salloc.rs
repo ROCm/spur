@@ -98,6 +98,11 @@ pub struct SallocArgs {
     #[arg(long)]
     pub exclusive: bool,
 
+    /// Let other users start sessions in this allocation with `srun --jobid`:
+    /// comma-separated usernames, and/or `@account` for every member of the job's account
+    #[arg(long, value_name = "USERS")]
+    pub share_with: Option<String>,
+
     /// Controller address
     #[arg(
         long,
@@ -328,6 +333,7 @@ fn build_salloc_job_spec(
         interactive: true,
         client_keepalive: true,
         environment: HashMap::new(),
+        share_with: crate::sbatch::share_with_entries(args.share_with.as_deref())?,
         ..Default::default()
     })
 }

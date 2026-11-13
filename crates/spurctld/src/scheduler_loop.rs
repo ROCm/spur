@@ -2630,6 +2630,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         initial_winsize: None,
         submit_line: s.submit_line.clone().unwrap_or_default(),
         client_keepalive: s.client_keepalive,
+        share_with: s.share.entries(),
     }
 }
 
@@ -2880,6 +2881,7 @@ async fn dispatch_to_agent(
         initial_winsize: None,
         submit_line: spec.submit_line.clone().unwrap_or_default(),
         client_keepalive: spec.client_keepalive,
+        share_with: spec.share.entries(),
     };
 
     let response = client

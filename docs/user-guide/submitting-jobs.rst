@@ -189,6 +189,12 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--exclusive``
      -
      - Do not share allocated nodes with other jobs. Default off.
+   * - ``--share-with``
+     -
+     - Let other users start sessions in the job with ``srun --jobid``:
+       comma-separated usernames, and/or ``@account`` for every member of the
+       job's account. Named users must be in the job's account when
+       accounting is enabled. Also on ``salloc``. See :ref:`sharing-a-job`.
    * - ``--topology``
      -
      - Prefer locality with ``block`` or ``tree``; ``none`` skips the hint.

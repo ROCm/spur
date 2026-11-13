@@ -364,6 +364,10 @@ message JobSpec {
   // srun/salloc set it; the K8s operator, third-party API clients, and CLIs
   // older than v0.9 leave it false and stay exempt.
   bool client_keepalive = 86;
+
+  // Other users who may start sessions inside the job: usernames, plus
+  // "@account" for every member of the job's account.
+  repeated string share_with = 87;
 }
 
 message JobInfo {
@@ -501,6 +505,8 @@ message JobInfo {
   // def_mem_per_gpu set it. Empty when memory is not sized per GPU.
   string mem_per_tres = 92;
   PreemptionUsage preemption_usage = 93;
+
+  repeated string share_with = 94;  // See JobSpec.share_with
 }
 
 message NodeInfo {
@@ -876,6 +882,7 @@ message UpdateJobRequest {
   optional string qos = 8;
   string user = 9;   // Requesting user; verified identity must own the job; the controller/admin credential overrides
   optional string exclude = 10;  // Hostlist expression replacing the job's excluded nodes; "" clears. Pending jobs only.
+  optional string share_with = 11;  // Comma-separated users and/or "@account" replacing the job's share list; "" clears.
 }
 
 message RequeueJobRequest {
@@ -1753,6 +1760,7 @@ message InitSession {
   ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
   bool non_interactive = 10;    // Client stdin is not a TTY: input-stream close is stdin-EOF (drain output), not a hangup (SIGHUP)
   string execution_credential = 11; // Controller-signed step credential for a PTY launch; empty for attach
+  string join_grant = 12; // See CreateJobStepResponse.join_grant
 }
 
 message InteractiveInput {
@@ -2206,6 +2214,7 @@ message JobStepInfo {
   string name = 3;
   string state = 4;
   uint32 num_tasks = 5;
+  string joined_by = 6;  // Set when someone other than the job owner started the step
 }
 
 message GetJobStepsRequest {
@@ -2240,6 +2249,7 @@ message CreateJobStepResponse {
   string node_addr = 2;        // Address of the first resolved step node; host:port for agent
   ContainerSpec container = 3; // Effective container for the step (step's own, else inherited from the job); empty image = host
   string execution_credential = 4; // Controller-signed step credential; empty when plugin is jwt
+  string join_grant = 5; // Controller-signed grant for a user who does not own the job, when there is no step credential
 }
 
 message CompleteJobStepRequest {

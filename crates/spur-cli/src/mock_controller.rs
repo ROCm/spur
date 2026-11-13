@@ -256,6 +256,7 @@ mock_controller_impl! {
                 node_addr: self.capture.create_step_node_addr.lock().unwrap().clone(),
                 container: None,
                 execution_credential: String::new(),
+                join_grant: String::new(),
             }))
         }
 

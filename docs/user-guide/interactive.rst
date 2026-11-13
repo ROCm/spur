@@ -123,6 +123,10 @@ Examples:
    ``--jobid`` requires ``--overlap``; ``--jobid`` alone is an error.
    ``--input``/``-i`` is ignored in step mode.
 
+Each ``srun --jobid`` is its own step, so a job can have several sessions open
+on one node at once — for example ``watch -n1 rocm-smi`` in one terminal next
+to a shell in another.
+
 Interactive Allocation — ``salloc``
 ------------------------------------
 
@@ -261,6 +265,59 @@ the local login name, matching step-mode ``srun`` under JWT authentication.
    sattach 1024
    sattach 1024 --output-only --output stderr
 
+.. _sharing-a-job:
+
+Sharing a Job with Other Users
+------------------------------
+
+A job's owner can let other users start sessions inside it, for example to
+inspect a live run or use spare GPUs in an allocation, with ``--share-with`` on
+``salloc`` or ``sbatch``. It takes comma-separated usernames, and/or
+``@account`` for every member of the job's account:
+
+.. code-block:: bash
+
+   salloc -N1 --gres=gpu:8 --share-with=bob,carol      # alice
+   srun --jobid 1024 --overlap --pty bash              # bob, from a login node
+
+With accounting enabled, a job is shared only within its account: a named
+user must be associated with the job's account, both when the list is set and
+at every join, so removing them from the account ends their access. To share
+with someone from another team, an account coordinator first adds them to the
+account (``sacctmgr add user name=bob account=<account>``); their work in the
+job is then charged to that account like any member's. Without accounting there
+are no accounts to check: any named user may join, and ``@account`` admits
+nobody.
+
+The owner can change the list while the job runs; an empty value stops
+sharing:
+
+.. code-block:: bash
+
+   scontrol update JobId=1024 ShareWith=@account
+   scontrol update JobId=1024 ShareWith=
+
+A user the job is shared with can:
+
+* look the job up with ``scontrol show job`` and ``scontrol show steps`` even
+  when :ref:`private_data <private-data>` hides other users' jobs;
+* open sessions with ``srun --jobid <id> --overlap [--pty] <command>``. A
+  session runs as the joining user, with their uid, groups, home directory and
+  shell, inside the job's cgroup and with the job's GPUs. It inherits the
+  job's ``SPUR_*``/``SLURM_*`` and GPU visibility variables, never the owner's
+  own environment.
+
+Only the owner (or an operator) can update, suspend, requeue or cancel the
+job. ``scontrol show steps <id>`` names the user who started each joined
+session (``JoinedBy=``). Cancelling the job ends every session in it.
+
+Joining needs a verified identity: a JWT token or ``[auth] plugin = "spur"``
+credentials. A username asserted without a credential never opens a session in
+a job owned by another user. The joining user also needs an account on the node.
+
+A job that runs in a container (``--container-image``) cannot be joined by
+other users yet, because their uid is not mapped inside it.
+
 Standalone ``srun --pty`` Lifecycle
 -----------------------------------
 
@@ -330,7 +387,9 @@ administrator restarting or upgrading ``spurd`` does not kill it. An allocation
 stays held, a running ``srun`` step keeps running and still reports its exit
 status. A terminal is the exception: the allocation and its supervisors survive,
 but a terminal already open inside it ends, and you reconnect by running
-``srun --pty`` again. A step that *finishes* while the agent is down is covered
+``srun --pty`` again. The ``srun`` that opened a terminal keeps retrying for a
+few seconds and resumes it if the agent comes back in time; a later ``srun``
+opens a new session rather than taking over another one's terminal. A step that *finishes* while the agent is down is covered
 too: its supervisor records the exit durably, that record is kept for ten
 minutes after the step settles, and the restarted agent answers the waiting
 caller with the exit and the step's output instead of reporting the step as

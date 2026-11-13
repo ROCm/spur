@@ -185,6 +185,11 @@ pub enum WalOperation {
         job_id: JobId,
         exclude: Option<String>,
     },
+    /// Replace who besides the owner may run work inside a job.
+    JobShareUpdate {
+        job_id: JobId,
+        share: crate::share::JobShare,
+    },
     /// Back off a job that failed dispatch before ever leaving Pending, where
     /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
     /// if the job has since left Pending.
@@ -693,6 +698,7 @@ impl WalOperation {
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
+            | Self::JobShareUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }
@@ -743,6 +749,7 @@ impl WalOperation {
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
+            | Self::JobShareUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }
@@ -796,6 +803,35 @@ mod job_state_change_wal_tests {
             back,
             WalOperation::JobExcludeUpdate { job_id: 7, exclude: Some(ref e) } if e == "n[1-2]"
         ));
+    }
+
+    #[test]
+    fn job_share_update_has_a_frozen_wire_form() {
+        let op = WalOperation::JobShareUpdate {
+            job_id: 7,
+            share: crate::share::JobShare {
+                users: vec!["bob".into()],
+                account: true,
+            },
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"JobShareUpdate":{"job_id":7,"share":{"users":["bob"],"account":true}}}"#
+        );
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            WalOperation::JobShareUpdate { job_id: 7, ref share } if share.account && share.users == ["bob"]
+        ));
+    }
+
+    #[test]
+    fn job_spec_without_a_share_reads_as_unshared() {
+        let mut value = serde_json::to_value(crate::job::JobSpec::default()).unwrap();
+        value.as_object_mut().unwrap().remove("share");
+        let spec: crate::job::JobSpec = serde_json::from_value(value).unwrap();
+        assert!(spec.share.is_empty());
     }
 
     #[test]
@@ -2344,6 +2380,7 @@ mod evict_wal_tests {
             exit_code: None,
             pty: false,
             job_shell: false,
+            joined_by: None,
         };
         let op = WalOperation::JobStepCreate {
             step: Box::new(step.clone()),

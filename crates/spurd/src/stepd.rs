@@ -1630,8 +1630,12 @@ async fn try_notify_agent(
 }
 
 /// Only a terminal's own supervisor has an agent coming to take its pty master.
-fn awaits_pty_handoff(step_id: spur_core::step::StepId, deposited: bool) -> bool {
-    deposited && step_id == spur_core::step::STEP_INTERACTIVE
+fn awaits_pty_handoff(
+    step_id: spur_core::step::StepId,
+    pty_step_id: Option<spur_core::step::StepId>,
+    deposited: bool,
+) -> bool {
+    deposited && (pty_step_id.is_some() || step_id == spur_core::step::STEP_INTERACTIVE)
 }
 
 /// Replies to a reclaim, and only a master that was actually sent counts as claimed.
@@ -2433,7 +2437,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     let session = Arc::new(Stepd::new(job, job_id, run_attempt, step_id));
     session.adopt_cgroup(launched_cgroup).await;
-    if awaits_pty_handoff(step_id, deposited) {
+    if awaits_pty_handoff(step_id, descriptor.pty_step_id, deposited) {
         session.await_pty_handoff(pty_handoff);
     }
     let capability = descriptor.capability.clone();
@@ -6866,11 +6870,13 @@ mod tests {
     #[test]
     fn only_a_deposited_terminal_awaits_a_handoff() {
         use spur_core::step::{STEP_BATCH, STEP_EXTERN, STEP_INTERACTIVE};
-        assert!(awaits_pty_handoff(STEP_INTERACTIVE, true));
-        assert!(!awaits_pty_handoff(STEP_INTERACTIVE, false));
-        assert!(!awaits_pty_handoff(STEP_BATCH, true));
-        assert!(!awaits_pty_handoff(STEP_EXTERN, true));
-        assert!(!awaits_pty_handoff(3, true));
+        assert!(awaits_pty_handoff(STEP_INTERACTIVE, None, true));
+        assert!(!awaits_pty_handoff(STEP_INTERACTIVE, None, false));
+        assert!(awaits_pty_handoff(3, Some(3), true));
+        assert!(!awaits_pty_handoff(3, Some(3), false));
+        assert!(!awaits_pty_handoff(STEP_BATCH, None, true));
+        assert!(!awaits_pty_handoff(STEP_EXTERN, None, true));
+        assert!(!awaits_pty_handoff(3, None, true));
     }
 
     fn gate_descriptor() -> StepdDescriptor {
