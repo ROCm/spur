@@ -771,9 +771,7 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
-    /// Secondary order among preemption victims of equal QOS priority: keys in
-    /// precedence order (`fewest_jobs`, `least_work`, `hash`),
-    /// applied after QOS priority and before node name. `[]` ranks by node name.
+    /// Keys ranking equal-QOS-priority victims, in precedence order; `[]` leaves node-name order.
     #[serde(default = "default_preempt_victim_order")]
     pub preempt_victim_order: Vec<crate::partition::VictimOrderKey>,
     /// Master switch for idle-fill scheduling. `false` (default) means no
@@ -4962,7 +4960,7 @@ inactive_limit_secs = 20
         let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
         assert_eq!(
             unset.scheduler.preempt_victim_order,
-            [FewestJobs, LeastWork, Hash]
+            [LeastWork, FewestJobs, Hash]
         );
         assert_eq!(
             SchedulerConfig::default().preempt_victim_order,

@@ -185,7 +185,7 @@ priority, so a high-priority idle-fill job outranks a low-priority burst job. Th
 reverse is refused: a burst job never displaces a dearer borrowed run.
 
 Between runs of equal priority, reclaim ranks nodes with the keys of
-``scheduler.preempt_victim_order`` (fewest jobs, least work, then a hash by
+``scheduler.preempt_victim_order`` (least work, fewest jobs, then a hash by
 default), and node name breaks any remaining tie; see :doc:`accounting`.
 
 The comparison is the QOS's ``priority``, not the job's computed priority. A job's

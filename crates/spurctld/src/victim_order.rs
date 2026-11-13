@@ -13,22 +13,22 @@ use spur_core::job::{Job, JobId};
 use spur_core::partition::VictimOrderKey;
 
 /// What evicting one running job costs, read once per scheduling pass.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VictimFacts {
-    /// Seconds the current run has lasted; 0 when no start time is recorded.
-    pub elapsed_secs: f64,
+    /// Seconds the current run has done work: suspended time excluded, 0 if never started.
+    pub elapsed_secs: u64,
     /// Nodes the job holds, so a wide job's lost work scales with its width.
     pub nodes: u32,
 }
 
 impl VictimFacts {
     const UNKNOWN: Self = Self {
-        elapsed_secs: 0.0,
+        elapsed_secs: 0,
         nodes: 1,
     };
 
-    fn work(&self) -> f64 {
-        self.elapsed_secs * f64::from(self.nodes)
+    fn work(&self) -> u64 {
+        self.elapsed_secs.saturating_mul(u64::from(self.nodes))
     }
 }
 
@@ -38,11 +38,11 @@ pub(crate) fn victim_facts(running: &[Job], now: DateTime<Utc>) -> HashMap<JobId
         .iter()
         .map(|job| {
             let elapsed_secs = job
-                .start_time
-                .map_or(0.0, |started| (now - started).num_seconds().max(0) as f64);
+                .run_time_at(now)
+                .map_or(0, |ran| u64::try_from(ran.num_seconds()).unwrap_or(0));
             let facts = VictimFacts {
                 elapsed_secs,
-                nodes: job.allocated_nodes.len().max(1) as u32,
+                nodes: u32::try_from(job.allocated_nodes.len().max(1)).unwrap_or(u32::MAX),
             };
             (job.job_id, facts)
         })
@@ -51,12 +51,12 @@ pub(crate) fn victim_facts(running: &[Job], now: DateTime<Utc>) -> HashMap<JobId
 
 /// What taking a node would cost, and how many nodes it frees. Jobs already in the
 /// victim set cost nothing more.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NodeRank {
     new_jobs: u32,
-    work: f64,
+    work: u64,
     /// Nodes the pick empties and the preemptor still needs; at least 1.
-    freed: u32,
+    pub(crate) freed: u32,
     hash: u64,
 }
 
@@ -89,40 +89,82 @@ impl<'a> VictimOrder<'a> {
     /// What taking a node holding `new_jobs` would cost, when it empties `freed`
     /// nodes.
     pub(crate) fn rank(&self, hash: u64, new_jobs: &[JobId], freed: u32) -> NodeRank {
-        let mut rank = NodeRank {
-            new_jobs: new_jobs.len() as u32,
-            work: 0.0,
-            freed: freed.max(1),
+        let work = new_jobs
+            .iter()
+            .map(|id| self.facts.get(id).unwrap_or(&VictimFacts::UNKNOWN).work())
+            .fold(0u64, u64::saturating_add);
+        debug_assert!(freed >= 1, "a pick always frees its own node");
+        NodeRank {
+            new_jobs: u32::try_from(new_jobs.len()).unwrap_or(u32::MAX),
+            work,
+            freed,
             hash,
-        };
-        for id in new_jobs {
-            let facts = self.facts.get(id).unwrap_or(&VictimFacts::UNKNOWN);
-            rank.work += facts.work();
         }
-        rank
     }
 
-    /// `Less` when the node ranked `a` should be taken before `b`: the first key that
-    /// tells them apart decides, and `Equal` leaves the tie to the caller. Jobs and
-    /// work compare per node freed, cross-multiplied.
+    /// `Less` when `a` should be taken before `b`; `Equal` leaves the tie to the caller.
+    #[cfg(test)]
     pub(crate) fn compare(&self, a: &NodeRank, b: &NodeRank) -> Ordering {
-        let (fa, fb) = (f64::from(a.freed), f64::from(b.freed));
-        self.keys
-            .iter()
-            .map(|key| match key {
-                VictimOrderKey::FewestJobs => (u64::from(a.new_jobs) * u64::from(b.freed))
-                    .cmp(&(u64::from(b.new_jobs) * u64::from(a.freed))),
-                VictimOrderKey::LeastWork => (a.work * fb).total_cmp(&(b.work * fa)),
-                VictimOrderKey::Hash => a.hash.cmp(&b.hash),
-            })
-            .find(|ordering| ordering.is_ne())
-            .unwrap_or(Ordering::Equal)
+        self.key(a).cmp(&self.key(b))
+    }
+
+    /// `rank` as a value that orders on its own, so a search can keep nodes in a heap.
+    pub(crate) fn key(&self, rank: &NodeRank) -> RankKey {
+        RankKey(
+            self.keys
+                .iter()
+                .map(|key| match key {
+                    VictimOrderKey::FewestJobs => {
+                        KeyPart::PerFreed(u64::from(rank.new_jobs), rank.freed)
+                    }
+                    VictimOrderKey::LeastWork => KeyPart::PerFreed(rank.work, rank.freed),
+                    VictimOrderKey::Hash => KeyPart::Hash(rank.hash),
+                })
+                .collect(),
+        )
     }
 }
 
-/// A 64-bit hash of the preemptor and node that never changes between runs or
-/// toolchains, unlike a std hasher: FNV-1a with fixed constants, then a finalizer
-/// so names that differ in one trailing byte still land far apart.
+/// The configured keys' values for one node, compared in list order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RankKey(Vec<KeyPart>);
+
+/// One key's value. An amount per node freed compares as a fraction, in integers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum KeyPart {
+    PerFreed(u64, u32),
+    Hash(u64),
+}
+
+impl Ord for KeyPart {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (*self, *other) {
+            (Self::PerFreed(a, a_freed), Self::PerFreed(b, b_freed)) => {
+                (u128::from(a) * u128::from(b_freed)).cmp(&(u128::from(b) * u128::from(a_freed)))
+            }
+            (Self::Hash(a), Self::Hash(b)) => a.cmp(&b),
+            (Self::PerFreed(..), Self::Hash(_)) => Ordering::Less,
+            (Self::Hash(_), Self::PerFreed(..)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for KeyPart {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for KeyPart {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for KeyPart {}
+
+/// FNV-1a plus a finalizer: stable across runs and toolchains, unlike a std hasher, and
+/// names differing in one trailing byte still land far apart.
 fn stable_hash(preemptor: JobId, node: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in preemptor.to_le_bytes().iter().chain(node.as_bytes()) {
@@ -140,8 +182,9 @@ fn stable_hash(preemptor: JobId, node: &str) -> u64 {
 mod tests {
     use super::*;
     use spur_core::job::JobSpec;
+    use spur_core::partition::DEFAULT_VICTIM_ORDER;
 
-    fn facts(elapsed_secs: f64, nodes: u32) -> VictimFacts {
+    fn facts(elapsed_secs: u64, nodes: u32) -> VictimFacts {
         VictimFacts {
             elapsed_secs,
             nodes,
@@ -186,9 +229,9 @@ mod tests {
     #[test]
     fn jobs_and_work_compare_per_node_freed() {
         let t = table(&[
-            (10, facts(3600.0, 4)),
-            (20, facts(3600.0, 1)),
-            (21, facts(3600.0, 1)),
+            (10, facts(3600, 4)),
+            (20, facts(3600, 1)),
+            (21, facts(3600, 1)),
         ]);
         let wide = ("n1", &[10][..], 4);
         let narrow = ("n5", &[20][..], 1);
@@ -261,9 +304,9 @@ mod tests {
     fn least_work_takes_the_cheaper_work_first_and_scales_with_width() {
         let keys = [VictimOrderKey::LeastWork];
         let t = table(&[
-            (10, facts(3600.0, 1)),
-            (20, facts(1000.0, 1)),
-            (30, facts(1000.0, 8)),
+            (10, facts(3600, 1)),
+            (20, facts(1000, 1)),
+            (30, facts(1000, 8)),
         ]);
         assert_eq!(
             order_of(&keys, &t, &[], ("n1", &[10]), ("n2", &[20])),
@@ -306,11 +349,7 @@ mod tests {
     #[test]
     fn keys_apply_in_the_order_listed_and_later_keys_only_break_ties() {
         // n1 adds one job of old work; n2 adds two jobs of fresh work.
-        let t = table(&[
-            (10, facts(3600.0, 1)),
-            (20, facts(10.0, 1)),
-            (21, facts(10.0, 1)),
-        ]);
+        let t = table(&[(10, facts(3600, 1)), (20, facts(10, 1)), (21, facts(10, 1))]);
         let n1 = ("n1", &[10][..]);
         let n2 = ("n2", &[20, 21][..]);
         let jobs_first = [VictimOrderKey::FewestJobs, VictimOrderKey::LeastWork];
@@ -319,7 +358,7 @@ mod tests {
         assert_eq!(order_of(&work_first, &t, &[], n1, n2), Ordering::Greater);
 
         // A tie on the first key falls through to the next.
-        let t = table(&[(10, facts(500.0, 1)), (20, facts(100.0, 1))]);
+        let t = table(&[(10, facts(500, 1)), (20, facts(100, 1))]);
         assert_eq!(
             order_of(&jobs_first, &t, &[], ("n1", &[10]), ("n2", &[20])),
             Ordering::Greater,
@@ -336,7 +375,7 @@ mod tests {
 
     #[test]
     fn an_empty_key_list_never_separates_nodes() {
-        let t = table(&[(10, facts(9.0, 4)), (20, facts(0.0, 1))]);
+        let t = table(&[(10, facts(9, 4)), (20, facts(0, 1))]);
         assert_eq!(
             order_of(&[], &t, &[], ("n1", &[10]), ("n2", &[20])),
             Ordering::Equal
@@ -373,11 +412,27 @@ mod tests {
         let skewed = running_job(3, &["n3"], Some(-30), now);
 
         let f = victim_facts(&[hit, unstarted, skewed], now);
-        assert_eq!(f[&1], facts(600.0, 2));
-        assert_eq!(f[&2], facts(0.0, 1), "no start time and no nodes recorded");
+        assert_eq!(f[&1], facts(600, 2));
+        assert_eq!(f[&2], facts(0, 1), "no start time and no nodes recorded");
         assert_eq!(
-            f[&3].elapsed_secs, 0.0,
+            f[&3].elapsed_secs, 0,
             "a start time in the future is not negative work"
+        );
+    }
+
+    #[test]
+    fn time_spent_suspended_is_not_work() {
+        let now = Utc::now();
+        let mut resumed = running_job(1, &["n1"], Some(7200), now);
+        resumed.suspended_secs = 115 * 60;
+        let steady = running_job(2, &["n2"], Some(3600), now);
+
+        let f = victim_facts(&[resumed, steady], now);
+        assert_eq!(f[&1], facts(300, 1));
+        assert_eq!(
+            order_of(&DEFAULT_VICTIM_ORDER, &f, &[], ("n1", &[1]), ("n2", &[2])),
+            Ordering::Less,
+            "five minutes of work goes before an hour"
         );
     }
 }
