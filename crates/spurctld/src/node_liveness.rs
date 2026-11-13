@@ -447,11 +447,16 @@ impl NodeLiveness {
             .collect()
     }
 
-    /// Records only the nodes that answered, so a node that keeps answering
-    /// through a tripped pass is not reported as newly silent afterwards.
+    /// Records the nodes that answered, so a node that keeps answering through a
+    /// tripped pass is not reported as newly silent afterwards. A failed probe
+    /// strikes nothing, but the node no longer counts as answering.
     fn record_answers(&mut self, results: Vec<ProbeResult>) {
-        for result in results.into_iter().filter(|r| r.outcome.is_alive()) {
-            self.judge(result);
+        for result in results {
+            if result.outcome.is_alive() {
+                self.judge(result);
+            } else {
+                self.strikes.answering.remove(&result.target.node);
+            }
         }
     }
 
@@ -1515,6 +1520,26 @@ mod tests {
         silent_for(&cm, &["a1"], 0);
         pass(&mut liveness, &cm, &prober).await;
         assert_eq!(cm.node_metrics().silent_answering, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_silent_answering_gauge_drops_a_node_whose_probe_fails_in_a_tripped_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["a1", "d1", "d2", "h1", "h2"]).await;
+        silence(&cm, &["a1"]);
+        let prober = ScriptedProber::answering(&["a1"]);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        pass(&mut liveness, &cm, &prober).await;
+        assert_eq!(cm.node_metrics().silent_answering, 1);
+
+        silence(&cm, &["d1", "d2"]);
+        prober.answering.lock().clear();
+        pass(&mut liveness, &cm, &prober).await;
+
+        let metrics = cm.node_metrics();
+        assert!(metrics.liveness_breaker_tripped);
+        assert_eq!(metrics.silent_answering, 0, "a1 stopped answering");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
