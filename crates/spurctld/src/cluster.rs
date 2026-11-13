@@ -13568,6 +13568,8 @@ pub(crate) mod tests {
             job.state = state;
             job.allocated_nodes = vec!["n2".into()];
             cm.jobs.write().insert(42, job);
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
             assert!(cm
                 .apply_operation(&inventory_update(&[]))
                 .node_inventory_error
@@ -13575,6 +13577,11 @@ pub(crate) mod tests {
                 .contains("job allocations"));
             assert_eq!(cm.get_nodes().len(), 2);
             assert_eq!(*cm.node_inventory.read(), None);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before,
+                "rejection must preserve the entire allocation in {state:?}"
+            );
         }
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
@@ -13695,25 +13702,180 @@ pub(crate) mod tests {
         assert!(restored.apply_operation(&placement).job_started);
     }
 
+    fn inventory_resource_cases() -> [ResourceAllocations; 3] {
+        [
+            ResourceAllocations::with_scalar(1, 0),
+            ResourceAllocations::with_scalar(0, 100),
+            ResourceAllocations {
+                devices: HashMap::from([(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(1)],
+                )]),
+                ..Default::default()
+            },
+        ]
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node_inventory_initialization_preserves_local_resource_preflight() {
+        for resources in inventory_resource_cases() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.admission.node_names = Some(vec!["n1".into()]);
+            let cm = test_cluster_with_config(&dir, config).await;
+            cm.apply_operation(&inventory_registration("old"));
+            cm.nodes.write().get_mut("old").unwrap().alloc_resources = resources.clone();
+            let error = try_register_node(&cm, "n1", 4, 8000).unwrap_err();
+            assert!(matches!(error, RegisterNodeError::PermissionDenied(_)));
+            assert!(error.to_string().contains("allocated resources"));
+            assert_eq!(*cm.node_inventory.read(), None);
+            assert_eq!(cm.get_node("old").unwrap().alloc_resources, resources);
+            assert!(cm.get_node("n1").is_none());
+
+            cm.nodes.write().get_mut("old").unwrap().alloc_resources = Default::default();
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            assert!(cm.get_node("old").is_none());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_refuses_local_resources_then_retries() {
+        for resources in inventory_resource_cases() {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+            )
+            .await;
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            cm.nodes.write().get_mut("n2").unwrap().alloc_resources = resources.clone();
+            std::fs::write(
+                &path,
+                "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+            )
+            .unwrap();
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+            assert!(cm
+                .reconfigure()
+                .unwrap_err()
+                .to_string()
+                .contains("allocated resources"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                cm.config().admission.node_names,
+                Some(vec!["n1".into(), "n2".into()])
+            );
+
+            cm.nodes.write().get_mut("n2").unwrap().alloc_resources = Default::default();
+            cm.reconfigure().unwrap();
+            assert!(cm.get_nodes().is_empty());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_preserves_reservation_then_retries() {
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.admission.node_names = Some(vec!["n1".into()]);
-        let cm = test_cluster_with_config(&dir, config).await;
-        cm.apply_operation(&inventory_registration("old"));
-        cm.nodes
-            .write()
-            .get_mut("old")
-            .unwrap()
-            .alloc_resources
-            .cpus = 1;
-        let error = try_register_node(&cm, "n1", 4, 8000).unwrap_err();
-        assert!(matches!(error, RegisterNodeError::PermissionDenied(_)));
-        assert!(error.to_string().contains("allocated resources"));
-        assert_eq!(*cm.node_inventory.read(), None);
-        assert!(cm.get_node("old").is_some());
-        assert!(cm.get_node("n1").is_none());
+        let (cm, path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+        )
+        .await;
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        let reservation: Reservation = serde_json::from_str(r#"{"name":"maintenance","start_time":"2099-01-01T00:00:00Z","end_time":"2099-01-02T00:00:00Z","nodes":["n2"],"accounts":[],"users":[]}"#).unwrap();
+        cm.create_reservation(reservation).unwrap();
+        std::fs::write(
+            &path,
+            "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+        )
+        .unwrap();
+        let before: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        assert!(cm
+            .reconfigure()
+            .unwrap_err()
+            .to_string()
+            .contains("reservation"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            cm.config().admission.node_names,
+            Some(vec!["n1".into(), "n2".into()])
+        );
+
+        cm.delete_reservation("maintenance").unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_nodes().is_empty());
+        assert!(cm.get_reservations().is_empty());
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_node_inventory_preserves_kubernetes_then_retries() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+
+        for assigned_role in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (cm, path) = test_cluster_with_conf_file(
+                &dir,
+                "cluster_name = 'test'\n[admission]\nnode_names = ['n1', 'n2']\n",
+            )
+            .await;
+            try_register_node(&cm, "n1", 4, 8000).unwrap();
+            try_register_node(&cm, "n2", 4, 8000).unwrap();
+            if assigned_role {
+                cm.assign_node_k0s("n2", K0sRole::Worker, "192.0.2.2", "192.0.2.0/24")
+                    .unwrap();
+            } else {
+                cm.set_k0s_phase(
+                    K0sPhase::Provisioning,
+                    Some("n2".into()),
+                    vec!["n2".into()],
+                    vec!["n2".into()],
+                    false,
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                &path,
+                "cluster_name = 'test'\n[admission]\nnode_names = []\n",
+            )
+            .unwrap();
+            let before: serde_json::Value =
+                serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+            assert!(cm
+                .reconfigure()
+                .unwrap_err()
+                .to_string()
+                .contains("Kubernetes"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&cm.snapshot_state().unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                cm.config().admission.node_names,
+                Some(vec!["n1".into(), "n2".into()])
+            );
+
+            if assigned_role {
+                cm.clear_node_k0s("n2").unwrap();
+            } else {
+                cm.set_k0s_phase(K0sPhase::Down, None, Vec::new(), Vec::new(), false)
+                    .unwrap();
+            }
+            cm.reconfigure().unwrap();
+            assert!(cm.get_nodes().is_empty());
+            assert_eq!(*cm.node_inventory.read(), Some(inventory(&[])));
+        }
     }
 
     #[test]

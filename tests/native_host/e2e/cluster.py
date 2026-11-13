@@ -1368,11 +1368,12 @@ class SpurCluster:
             f"within {timeout}s"
         )
 
-    def restart_controller(self):
+    def restart_controller(self, *, expected_nodes: list[str] | None = None):
         """Restart spurctld without touching the agents. State is recovered
         from the Raft log on the existing state-dir. Waits for the controller
         to answer queries again (does not require nodes to be idle, since a
-        suspended job keeps its allocation)."""
+        suspended job keeps its allocation). ``expected_nodes`` supports tests
+        that have intentionally removed part or all of the inventory."""
         if self.ha_controller_count > 1:
             # Node 0 is hardcoded below, and sinfo would be answered by any
             # peer, so the readiness poll proves nothing under HA.
@@ -1380,8 +1381,9 @@ class SpurCluster:
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
         self._start_controller()
+        expected = set(self.node_names if expected_nodes is None else expected_nodes)
         wait_until(
-            lambda: set(self.node_names) <= self.sinfo_nodes().keys(),
+            lambda: expected <= self.sinfo_nodes().keys(),
             timeout_s=60, interval_s=2,
             desc="controller recovery after restart", tolerate=(Exception,),
         )
