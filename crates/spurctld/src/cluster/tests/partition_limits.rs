@@ -54,8 +54,11 @@ fn update_limits(
     limits: PartitionLimitsUpdate,
 ) -> Result<(), PartitionError> {
     cm.update_partition(
-        name, None, None, None, None, None, None, None, false, None, None, None, None, None, None,
-        None, None, None, None, limits,
+        name,
+        PartitionPatch {
+            limits,
+            ..Default::default()
+        },
     )
 }
 

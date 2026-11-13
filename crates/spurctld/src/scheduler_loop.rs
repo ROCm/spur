@@ -9256,8 +9256,11 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             cm.update_partition(
-                "p", None, None, None, None, None, None, None, false, None, None, None, None, None,
-                None, None, None, None, None, raise,
+                "p",
+                crate::partition_patch::PartitionPatch {
+                    limits: raise,
+                    ..Default::default()
+                },
             )
             .unwrap();
             assert!(process_assignment(cm.clone(), planned, false).await);
