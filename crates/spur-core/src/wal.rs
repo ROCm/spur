@@ -185,6 +185,22 @@ pub enum WalOperation {
         job_id: JobId,
         exclude: Option<String>,
     },
+    /// Replace the user-editable fields of a job (`scontrol update`): each `Some` field
+    /// is written on every replica, so the change survives a leader change and a replay.
+    /// `time_limit_secs` is the new total limit in seconds from the job's start.
+    JobSpecUpdate {
+        job_id: JobId,
+        #[serde(default)]
+        time_limit_secs: Option<i64>,
+        #[serde(default)]
+        partition: Option<String>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        account: Option<String>,
+        #[serde(default)]
+        qos: Option<String>,
+    },
     /// Back off a job that failed dispatch before ever leaving Pending, where
     /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
     /// if the job has since left Pending.
@@ -693,6 +709,7 @@ impl WalOperation {
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
+            | Self::JobSpecUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }
@@ -743,6 +760,7 @@ impl WalOperation {
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
             | Self::JobExcludeUpdate { .. }
+            | Self::JobSpecUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobLaunchFailureDetail { .. }
             | Self::NodeRegister { .. }

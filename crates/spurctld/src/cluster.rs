@@ -5013,23 +5013,34 @@ impl ClusterManager {
             })?;
         }
 
-        // Non-WAL-tracked fields: update directly
-        let mut jobs = self.jobs.write();
-        if let Some(job) = jobs.get_mut(&job_id) {
-            if let Some(tl) = time_limit {
-                job.spec.time_limit = Some(tl);
-            }
-            if let Some(part) = partition {
-                job.spec.partition = Some(part);
-            }
-            if let Some(c) = comment {
-                job.spec.comment = Some(c);
-            }
-            if let Some(a) = account {
-                job.spec.account = Some(a);
-            }
-            if let Some(q) = qos {
-                job.spec.qos = Some(q);
+        // Replicated like the priority above: a field written only into this
+        // controller's memory is lost when another controller becomes leader.
+        if time_limit.is_some()
+            || partition.is_some()
+            || comment.is_some()
+            || account.is_some()
+            || qos.is_some()
+        {
+            let op = WalOperation::JobSpecUpdate {
+                job_id,
+                time_limit_secs: time_limit.map(|tl| tl.num_seconds()),
+                partition,
+                comment,
+                account,
+                qos,
+            };
+            if self.all_members_support(crate::raft::CAP_JOB_SPEC_UPDATE) {
+                self.propose(op)?;
+            } else {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!(
+                        "a Raft member does not support replicated job updates; applying \
+                         scontrol update on this controller only until all members are \
+                         upgraded (ROCm/spur#1056)"
+                    )
+                });
+                self.apply_operation(&op);
             }
         }
         info!(job_id, "job updated");
@@ -8032,6 +8043,16 @@ impl ClusterManager {
     }
 
     #[allow(clippy::result_large_err)]
+    /// Whether every other Raft member can apply the log-entry kind named by `cap`.
+    fn all_members_support(&self, cap: &str) -> bool {
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::raft::all_members_support(&raft, cap))
+        })
+    }
+
     fn propose(&self, mut op: WalOperation) -> anyhow::Result<ClientResponse> {
         // Stamped at the one chokepoint into the log rather than at each call
         // site, so no operation can reach it undated and be re-dated on replay.
@@ -9456,6 +9477,32 @@ impl ClusterManager {
                     if job.state == JobState::Pending && !job.holds_a_placement() {
                         job.spec.exclude = exclude.clone();
                         response.exclude_applied = true;
+                    }
+                }
+            }
+            WalOperation::JobSpecUpdate {
+                job_id,
+                time_limit_secs,
+                partition,
+                comment,
+                account,
+                qos,
+            } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if let Some(secs) = time_limit_secs {
+                        job.spec.time_limit = Some(chrono::Duration::seconds(*secs));
+                    }
+                    if let Some(p) = partition {
+                        job.spec.partition = Some(p.clone());
+                    }
+                    if let Some(c) = comment {
+                        job.spec.comment = Some(c.clone());
+                    }
+                    if let Some(a) = account {
+                        job.spec.account = Some(a.clone());
+                    }
+                    if let Some(q) = qos {
+                        job.spec.qos = Some(q.clone());
                     }
                 }
             }
@@ -33521,6 +33568,26 @@ state = "UP"
             err.downcast_ref::<JobUpdateRefusal>(),
             Some(JobUpdateRefusal::FailedPrecondition(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_limit_update_is_applied_by_the_log_entry_alone() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("extend"));
+
+        // A follower or a replay sees only the entry; it must reach the same limit.
+        cm.apply_operation(&WalOperation::JobSpecUpdate {
+            job_id: id,
+            time_limit_secs: Some(3 * 86400),
+            partition: None,
+            comment: Some("kept".into()),
+            account: None,
+            qos: None,
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.time_limit, Some(chrono::Duration::days(3)));
+        assert_eq!(job.spec.comment.as_deref(), Some("kept"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

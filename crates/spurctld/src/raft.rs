@@ -68,6 +68,82 @@ pub(crate) fn raft_client(
         .max_encoding_message_size(RAFT_MAX_MESSAGE_SIZE)
 }
 
+/// Optional log-entry kinds a controller can apply, advertised over the Raft
+/// port. A leader proposes one of these only after every other member lists it,
+/// because an older controller rejects an entry kind it does not know and the
+/// replication to it stalls.
+pub const CAP_JOB_SPEC_UPDATE: &str = "job_spec_update";
+pub(crate) const RAFT_CAPABILITIES: &[&str] = &[CAP_JOB_SPEC_UPDATE];
+
+/// True when every other member of the current Raft membership (voters and
+/// learners) lists `cap`. A member that cannot be reached, or that answers
+/// UNIMPLEMENTED because it predates the capability RPC, counts as not supporting.
+pub async fn all_members_support(raft: &SpurRaft, cap: &str) -> bool {
+    let (me, others) = {
+        let m = raft.metrics();
+        let m = m.borrow();
+        let others: Vec<(NodeId, String)> = m
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| **id != m.id)
+            .map(|(id, n)| (*id, n.addr.clone()))
+            .collect();
+        (m.id, others)
+    };
+    let mut probes = tokio::task::JoinSet::new();
+    for (id, addr) in others {
+        let cap = cap.to_string();
+        probes.spawn(async move { (id, member_lists(&addr, &cap).await) });
+    }
+    let mut all = true;
+    while let Some(done) = probes.join_next().await {
+        match done {
+            Ok((_, true)) => {}
+            Ok((id, false)) => {
+                debug!(
+                    node = me,
+                    member = id,
+                    cap,
+                    "member does not list the capability"
+                );
+                all = false;
+            }
+            Err(_) => all = false,
+        }
+    }
+    all
+}
+
+async fn member_lists(addr: &str, cap: &str) -> bool {
+    let url = if addr.starts_with("http") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let Ok(endpoint) = tonic::transport::Channel::from_shared(url) else {
+        return false;
+    };
+    let Ok(channel) = endpoint
+        .connect_timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(1))
+        .connect()
+        .await
+    else {
+        return false;
+    };
+    let Ok(resp) = raft_client(channel)
+        .capabilities(spur_proto::raft_proto::RaftRequest {
+            payload: Vec::new(),
+        })
+        .await
+    else {
+        return false;
+    };
+    serde_json::from_slice::<Vec<String>>(&resp.into_inner().payload)
+        .map(|caps| caps.iter().any(|c| c == cap))
+        .unwrap_or(false)
+}
+
 /// Set when a committed WAL entry transitions a job to a terminal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobFinalized {
