@@ -1303,12 +1303,8 @@ fn partition_usage_from_jobs<'a>(
     now: DateTime<Utc>,
     waits: ReleaseWaits,
 ) -> PartitionNodeUsage {
-    use spur_core::job::JobState;
     let mut usage = PartitionNodeUsage::new();
-    let holding = jobs.into_iter().filter(|j| {
-        j.occupies_resources() || matches!(j.state, JobState::Suspended | JobState::Completing)
-    });
-    for job in holding {
+    for job in jobs.into_iter().filter(|j| j.holds_allocation()) {
         let Some(partition) = charged_partition(job, partitions).filter(|p| is_capped(p)) else {
             continue;
         };

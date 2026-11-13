@@ -105,6 +105,47 @@ async fn partitions_sharing_a_partition_qos_add_up_one_users_usage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_job_keeps_charging_the_partition_qos() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 2).await;
+    let suspended = run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
+    run_on(&cm, gpu_job("alice", "acct-b", "qb"), "n2");
+    cm.suspend_job(suspended, "alice").unwrap();
+    settle(&cm, suspended, JobState::Suspended);
+
+    let third = submit_and_wait(&cm, gpu_job("alice", "acct-a", "qa"));
+
+    assert!(schedulable(&cm, third).is_none());
+    assert_eq!(
+        cm.get_job(third).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_in_its_kill_wait_charges_the_partition_qos_until_its_node_reports() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 2).await;
+    let stopping = run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
+    run_on(&cm, gpu_job("alice", "acct-b", "qb"), "n2");
+    cm.cancel_job(stopping, "alice").unwrap();
+    settle(&cm, stopping, JobState::Completing);
+
+    let third = submit_and_wait(&cm, gpu_job("alice", "acct-a", "qa"));
+    assert!(schedulable(&cm, third).is_none());
+
+    cm.apply_operation(&WalOperation::JobNodeComplete {
+        job_id: stopping,
+        node_name: "n1".into(),
+        exit_code: 0,
+        signal: 15,
+        at: None,
+        run_attempt: 0,
+    });
+    assert!(schedulable(&cm, third).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_job_qos_alone_would_have_let_the_third_job_run() {
     let dir = TempDir::new().unwrap();
     let cm = capped_cluster(&dir, 2).await;

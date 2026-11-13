@@ -11868,7 +11868,7 @@ impl PartitionQosView {
         let mut grp: HashMap<&str, RunningTresAccumulator<'_>> = HashMap::new();
         let mut per_user: HashMap<(&str, &str), RunningTresAccumulator<'_>> = HashMap::new();
         let mut user_jobs: HashMap<(&str, &str), u32> = HashMap::new();
-        for job in jobs.values().filter(|j| j.occupies_resources()) {
+        for job in jobs.values().filter(|j| j.holds_allocation()) {
             let Some(partition) = crate::scheduler_loop::charged_partition(job, partitions) else {
                 continue;
             };
@@ -12251,8 +12251,12 @@ impl<'a> RunningTresAccumulator<'a> {
         if job.allocated_nodes.is_empty() {
             self.unplaced_nodes += job.spec.num_nodes as u64;
         } else {
-            self.distinct_nodes
-                .extend(job.allocated_nodes.iter().map(String::as_str));
+            self.distinct_nodes.extend(
+                job.allocated_nodes
+                    .iter()
+                    .filter(|node| job.is_held_on(node))
+                    .map(String::as_str),
+            );
         }
     }
 
