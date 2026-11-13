@@ -657,7 +657,13 @@ How it behaves:
   placed, it counts against every candidate partition's QOS for the rest of that
   scheduling pass, so a later job in the same pass may wait one pass longer.
 - Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
-  idle capacity past it: the cap bounds what a user holds, borrowed or not.
+  idle capacity past it: the cap bounds what a user holds, borrowed or not. A
+  suspended job, and one still in its kill wait, count until each of their nodes
+  is released.
+- ``scontrol reconfigure`` keeps a partition QOS set with ``scontrol update``
+  when ``spur.conf`` has no ``qos`` key for that partition, so a reload never
+  lifts the cap. A ``qos`` value in ``spur.conf`` replaces it, and ``qos = ""``
+  clears it.
 - A partition QOS that names no defined QOS holds the partition's jobs with
   ``InvalidQOS`` rather than silently lifting the cap. While the QOS cache is
   still loading, the partition's jobs wait with ``AccountingUnavailable``.

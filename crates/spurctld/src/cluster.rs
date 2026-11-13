@@ -7148,7 +7148,11 @@ impl ClusterManager {
                 resource_limits: Some(PartitionLimitsUpdate::replacing(
                     &PartitionResourceLimits::of(part),
                 )),
-                qos: Some(part.qos.clone()),
+                qos: new_config
+                    .partitions
+                    .iter()
+                    .find(|pc| pc.name == part.name)
+                    .and_then(spur_core::config::PartitionConfig::qos_update),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -14083,6 +14087,55 @@ pub(crate) mod tests {
         std::fs::write(&conf_path, format!("{base}grace_time = 0\n")).unwrap();
         cm.reconfigure().unwrap();
         assert_eq!(gpu(&cm), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_keeps_a_runtime_partition_qos_unless_the_conf_sets_one() {
+        let dir = TempDir::new().unwrap();
+        let base = "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\nnodes = \"ALL\"\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, base).await;
+        let gpu_qos = |cm: &Arc<ClusterManager>| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .qos
+        };
+        cm.update_partition(
+            "gpu",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            PartitionLimitsUpdate::default(),
+            Some(Some("usercap".into())),
+        )
+        .unwrap();
+
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm).as_deref(), Some("usercap"));
+
+        std::fs::write(&conf_path, format!("{base}qos = \"teamcap\"\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm).as_deref(), Some("teamcap"));
+
+        std::fs::write(&conf_path, format!("{base}qos = \"\"\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm), None);
     }
 
     #[tokio::test]

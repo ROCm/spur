@@ -1722,6 +1722,8 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        so ``MaxTRESPU`` on it caps what one user holds in the partition however
        many accounts they submit from. See :ref:`partition-qos`. Set at runtime
        with ``scontrol update PartitionName=<name> QOS=<qos>``; ``QOS=`` clears it.
+       ``scontrol reconfigure`` leaves a runtime QOS in place when this key is
+       absent; ``qos = ""`` clears it.
    * - ``priority_tier``
      - integer
      - ``0``
