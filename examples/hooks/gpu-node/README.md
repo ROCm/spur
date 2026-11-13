@@ -24,7 +24,8 @@ Jobs that start Docker containers must label them
 `spur_job_id=${SPUR_JOB_ID}`. See [DOCKER_CONTAINERS.md](DOCKER_CONTAINERS.md).
 
 `exporter-prolog.sh` and `exporter-epilog.sh` write and remove per-GPU JSON
-under `/var/run/exporter/` for AMD Device Metrics Exporter. An exporter
+under `/var/run/exporter/` for AMD Device Metrics Exporter, one file per GPU
+named by its render ID. An exporter
 failure is logged and does not fail the job. A prolog or epilog health
 failure does: prolog exit 1 drains the node before launch, and epilog exit 1
 drains it when job-owned residue remains.

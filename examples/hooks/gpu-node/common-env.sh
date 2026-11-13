@@ -90,6 +90,35 @@ normalize_gpu_list() {
     done
 }
 
+# Prints the render ID of each GPU in a SPUR_JOB_GPUS list, one per line.
+# Spur builds those ids from each GPU's KFD topology entry; 0.13-0.15 and 0.16+
+# number GPU partitions differently, so both forms are matched.
+gpu_render_ids() {
+    local -A render=()
+    local -a gpus=()
+    local props key value minor domain loc gpu
+    for props in "${SPUR_SYS_ROOT}"/class/kfd/kfd/topology/nodes/*/properties; do
+        [[ -r "$props" ]] || continue
+        minor=0 domain=0 loc=0
+        while read -r key value; do
+            case "$key" in
+                drm_render_minor) minor=$value ;;
+                domain) domain=$value ;;
+                location_id) loc=$value ;;
+            esac
+        done <"$props"
+        (( minor > 0 )) || continue
+        render[$(( (domain << 24) | (loc << 8) ))]=$minor
+        render[$(( (domain << 24) | ((loc & ~7) << 8) | (loc & 7) ))]=$minor
+    done
+    IFS=',' read -r -a gpus <<<"${1:-}"
+    for gpu in "${gpus[@]}"; do
+        if [[ -n "$gpu" && -n "${render[$gpu]:-}" ]]; then
+            printf '%s\n' "${render[$gpu]}"
+        fi
+    done
+}
+
 # Agent sends 0 when the user omitted --mem / CPU count. That is "unset", not invalid.
 normalize_optional_count() {
     local name="$1" value="${2:-}"

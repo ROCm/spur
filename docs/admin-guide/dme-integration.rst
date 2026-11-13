@@ -19,8 +19,9 @@ How it works
 ------------
 
 The exporter watches a directory (default ``/var/run/exporter``) for files
-named after the render ID of a GPU (``0``, ``1``, ...). Each file is a small
-JSON document describing the job currently using that GPU:
+named after the render ID of a GPU: the ``N`` of its ``/dev/dri/renderD<N>``.
+Each file is a small JSON document describing the job currently using that
+GPU:
 
 .. list-table::
    :header-rows: 1
@@ -35,15 +36,21 @@ JSON document describing the job currently using that GPU:
    * - ``SLURM_JOB_PARTITION``
      - the ``job_partition`` metric label
    * - ``CUDA_VISIBLE_DEVICES``
-     - which GPU render ID(s) the file's content applies to
+     - which GPUs get those labels
 
-A Spur ``prolog`` hook writes this file when a job starts on a GPU; the
-matching ``epilog`` hook deletes it when the job ends. Spur's hook
-environment already twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION`` into
-``SLURM_JOB_ID``/``SLURM_JOB_PARTITION`` automatically, so the scripts below
-can use those directly. ``SLURM_JOB_USER`` and ``CUDA_VISIBLE_DEVICES`` have
-no such twin — they're built from ``SPUR_JOB_USER`` and ``SPUR_JOB_GPUS``
-(see :ref:`hooks-config` below).
+A Spur ``prolog`` hook writes one file per GPU when a job starts; the
+matching ``epilog`` hook deletes them when the job ends. Deleting a file
+clears the labels only of the GPU the file is named after, so each file must
+list only its own render ID in ``CUDA_VISIBLE_DEVICES``. A file that lists
+other GPUs leaves their labels behind after the job ends, or takes them from
+another job.
+
+Spur's hook environment already twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION``
+into ``SLURM_JOB_ID``/``SLURM_JOB_PARTITION``, so the scripts below use those
+directly. ``SLURM_JOB_USER`` comes from ``SPUR_JOB_USER``. The render IDs come
+from ``SPUR_JOB_GPUS``, which holds Spur's internal GPU ids rather than
+render IDs or GPU indices: the scripts map each id to its render ID through
+the kernel's GPU topology under ``/sys/class/kfd``.
 
 .. important::
 
@@ -74,11 +81,13 @@ must exist at the path ``spurd`` loads (``/etc/spur/spur.conf`` by default,
 or wherever ``-f`` points) and contain this ``[hooks]`` block.
 
 The scripts must be **fully-qualified paths** (Spur does not search ``$PATH``
-for hook scripts) and **executable**:
+for hook scripts), **executable**, and owned by root. From a checkout of the
+Spur repository:
 
 .. code-block:: bash
 
-   sudo chmod 0755 /usr/share/exporter/slurm-prolog.sh /usr/share/exporter/slurm-epilog.sh
+   sudo install -D -o root -g root -m 0755 -t /usr/share/exporter \
+     examples/hooks/dme/slurm-prolog.sh examples/hooks/dme/slurm-epilog.sh
 
 Restart ``spurd`` after editing ``spur.conf`` — hooks are only read at agent
 startup:
@@ -90,59 +99,36 @@ startup:
 Example scripts
 ----------------
 
-Adjust ``EXPORT_DIR`` only if the exporter container mounts a different host
-path.
+The scripts live in ``examples/hooks/dme/`` in the Spur repository, and the
+end-to-end tests run these same files. Adjust ``EXPORT_DIR`` only if the
+exporter container mounts a different host path.
 
 ``slurm-prolog.sh``
 ~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: bash
-
-   #!/bin/bash
-   #
-   # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-   # SPDX-License-Identifier: Apache-2.0
-   #
-
-   EXPORT_DIR="/var/run/exporter"
-
-   # AMD GPU render-node minor numbers start at 128, while SPUR_JOB_GPUS
-   # reports the 0-based logical device index Spur schedules against.
-   IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
-   RENDER_IDS=()
-   for gpu in "${GPU_IDS[@]}"; do
-       RENDER_IDS+=("$((gpu % 128))")
-   done
-   CUDA_VISIBLE_DEVICES=$(IFS=','; echo "${RENDER_IDS[*]}")
-
-   [ -d "${EXPORT_DIR}" ] || exit 0
-   for id in "${RENDER_IDS[@]}"; do
-       printf '{"SLURM_JOB_ID":"%s","SLURM_JOB_USER":"%s","SLURM_JOB_PARTITION":"%s","CUDA_VISIBLE_DEVICES":"%s"}' \
-           "${SLURM_JOB_ID}" "${SPUR_JOB_USER}" "${SLURM_JOB_PARTITION}" "${CUDA_VISIBLE_DEVICES}" \
-           > "${EXPORT_DIR}/${id}"
-   done
+.. literalinclude:: ../../examples/hooks/dme/slurm-prolog.sh
+   :language: bash
 
 ``slurm-epilog.sh``
 ~~~~~~~~~~~~~~~~~~~~
 
-Identical GPU ID derivation as the prolog; removes the tracking file instead
-of writing it:
+Same GPU lookup as the prolog; removes the files instead of writing them:
+
+.. literalinclude:: ../../examples/hooks/dme/slurm-epilog.sh
+   :language: bash
+
+Replacing older scripts
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Earlier versions of these scripts computed ``SPUR_JOB_GPUS`` modulo 128.
+Spur's GPU ids are not GPU indices, so that put every job's labels on GPU
+``0``, left labels behind after jobs ended, and could show one job's labels on
+another job's GPU. After installing the scripts above, remove the files the
+old scripts left, once, while no jobs run on the node:
 
 .. code-block:: bash
 
-   #!/bin/bash
-   #
-   # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-   # SPDX-License-Identifier: Apache-2.0
-   #
-
-   EXPORT_DIR="/var/run/exporter"
-
-   IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
-   [ -d "${EXPORT_DIR}" ] || exit 0
-   for gpu in "${GPU_IDS[@]}"; do
-       rm -f "${EXPORT_DIR}/$((gpu % 128))"
-   done
+   sudo find /var/run/exporter -maxdepth 1 -type f -name '[0-9]*' -delete
 
 Running the exporter container
 --------------------------------
@@ -173,16 +159,20 @@ the live metric:
    sbatch --partition=gpu --gpus=1 --wrap="sleep 30"
 
    # while the job is RUNNING:
-   cat /var/run/exporter/0
+   ls /var/run/exporter/
+   cat /var/run/exporter/128
    docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
 
-Expected file content (values will match your job):
+Expect one file per GPU of the job, named by its render ID. Which render ID a
+GPU has depends on the node; ``128`` here is an example. Expected file
+content (values will match your job):
 
 .. code-block:: text
 
-   {"SLURM_JOB_ID":"8","SLURM_JOB_USER":"user","SLURM_JOB_PARTITION":"gpu","CUDA_VISIBLE_DEVICES":"0"}
+   {"SLURM_JOB_ID":"8","SLURM_JOB_USER":"user","SLURM_JOB_PARTITION":"gpu","CUDA_VISIBLE_DEVICES":"128"}
 
-Expected metric line, with the job's real ID/user/partition populated:
+Expected metric line, with the job's real ID/user/partition populated on that
+GPU's series only:
 
 .. code-block:: text
 
