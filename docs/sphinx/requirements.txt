@@ -217,7 +217,7 @@ smmap==5.0.3
     # via gitdb
 snowballstemmer==3.1.1
     # via sphinx
-soupsieve==2.9.1
+soupsieve==4.0
     # via
     #   beautifulsoup4
     #   pyspelling
