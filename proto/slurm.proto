@@ -2364,6 +2364,7 @@ message CreateReservationRequest {
   repeated string users = 6;
   repeated string flags = 7;
   string user = 8;            // requesting user; must be an operator, and is recorded as the owner
+  string end_time = 9;        // ISO 8601; mutually exclusive with duration_minutes
 }
 
 message UpdateReservationRequest {
@@ -2376,6 +2377,7 @@ message UpdateReservationRequest {
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
   string user = 9;              // requesting user; must be an operator, who may update any reservation
+  string end_time = 10;         // ISO 8601; mutually exclusive with duration_minutes
 }
 
 message DeleteReservationRequest {

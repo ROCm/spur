@@ -48,6 +48,7 @@ pub enum ScontrolCommand {
     /// Examples:
     ///   scontrol create PartitionName=gpu Nodes=n[1-4] MaxTime=24:00:00 State=UP
     ///   scontrol create ReservationName=maint StartTime=now Duration=60 Nodes=n1
+    ///   scontrol create ReservationName=maint StartTime=2026-12-01T00:00:00Z EndTime=2026-12-02T00:00:00Z Nodes=n1
     Create {
         /// key=value pairs (e.g. PartitionName=gpu Nodes=n1 MaxTime=4:00:00)
         #[arg(trailing_var_arg = true)]
@@ -276,9 +277,12 @@ pub enum ScontrolCommand {
         /// Start time (ISO 8601 or "now")
         #[arg(long, default_value = "now")]
         start_time: String,
-        /// Duration: whole minutes, Slurm time (H:MM, H:MM:SS, D-HH:MM:SS), or suffixed (90m, 1h30m, 30s); UNLIMITED/INFINITE not supported
-        #[arg(long)]
-        duration: String,
+        /// Duration: whole minutes, Slurm time (H:MM, H:MM:SS, D-HH:MM:SS), or suffixed (90m, 1h30m, 30s); UNLIMITED/INFINITE not supported. Mutually exclusive with --end-time.
+        #[arg(long, group = "time_bound")]
+        duration: Option<String>,
+        /// End time (ISO 8601); mutually exclusive with --duration
+        #[arg(long, group = "time_bound")]
+        end_time: Option<String>,
         /// Comma-separated node names
         #[arg(long)]
         nodes: String,
@@ -298,9 +302,12 @@ pub enum ScontrolCommand {
         /// Reservation name
         #[arg(long)]
         name: String,
-        /// New duration: whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); any zero-length value (e.g. 0, 00:00:00) leaves it unchanged; UNLIMITED/INFINITE not supported
+        /// New duration: whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); any zero-length value (e.g. 0, 00:00:00) leaves it unchanged; UNLIMITED/INFINITE not supported. Mutually exclusive with --end-time.
         #[arg(long, default_value = "0")]
         duration: String,
+        /// End time (ISO 8601); mutually exclusive with --duration (when --duration is non-zero)
+        #[arg(long)]
+        end_time: Option<String>,
         /// Comma-separated nodes to add
         #[arg(long, default_value = "")]
         add_nodes: String,
@@ -532,18 +539,26 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             name,
             start_time,
             duration,
+            end_time,
             nodes,
             accounts,
             users,
             flags,
         } => {
             crate::privilege::require_privileged("manage reservations")?;
-            let duration = parse_reservation_duration(&duration)?;
+            if duration.is_none() && end_time.is_none() {
+                bail!("either --duration or --end-time is required");
+            }
+            let duration_minutes = match &duration {
+                Some(d) => parse_reservation_duration(d)?,
+                None => 0,
+            };
             create_reservation(
                 &args.controller,
                 &name,
                 &start_time,
-                duration,
+                duration_minutes,
+                end_time.as_deref().unwrap_or(""),
                 &nodes,
                 &accounts,
                 &users,
@@ -554,6 +569,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         ScontrolCommand::UpdateReservation {
             name,
             duration,
+            end_time,
             add_nodes,
             remove_nodes,
             add_users,
@@ -563,10 +579,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         } => {
             crate::privilege::require_privileged("manage reservations")?;
 
-            // Any zero-length value (default "0", or an explicit "00:00:00" etc.)
-            // resolves to 0, which the controller treats as "leave duration
-            // unchanged"; there is no zero-length reservation to set.
             let duration = parse_reservation_duration(&duration)?;
+            if duration > 0 && end_time.is_some() {
+                bail!("--duration and --end-time are mutually exclusive");
+            }
             let channel = crate::authclient::connect(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
@@ -582,6 +598,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     add_accounts: split_csv(&add_accounts),
                     remove_accounts: split_csv(&remove_accounts),
                     user: crate::interactive::current_user()?,
+                    end_time: end_time.unwrap_or_default(),
                 })
                 .await
                 .context("failed to update reservation")?;
@@ -1552,6 +1569,7 @@ struct ReservationCreateParams {
     name: String,
     start_time: String,
     duration_minutes: u32,
+    end_time: String,
     nodes: String,
     accounts: String,
     users: String,
@@ -1564,6 +1582,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
     let mut name = String::new();
     let mut start_time = "now".to_string();
     let mut duration: Option<String> = None;
+    let mut end_time: Option<String> = None;
     let mut nodes = String::new();
     let mut accounts = String::new();
     let mut users = String::new();
@@ -1575,6 +1594,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
                 "reservationname" => name = value.into(),
                 "starttime" => start_time = value.into(),
                 "duration" => duration = Some(value.into()),
+                "endtime" => end_time = Some(value.into()),
                 "nodes" => nodes = value.into(),
                 "accounts" => accounts = value.into(),
                 "users" => users = value.into(),
@@ -1588,15 +1608,23 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
         anyhow::bail!("scontrol create: ReservationName= is required");
     }
 
-    let duration_minutes = match duration {
-        Some(d) => parse_reservation_duration(&d)?,
-        None => anyhow::bail!("scontrol create: Duration= is required"),
+    if duration.is_some() && end_time.is_some() {
+        anyhow::bail!("scontrol create: Duration= and EndTime= are mutually exclusive");
+    }
+    if duration.is_none() && end_time.is_none() {
+        anyhow::bail!("scontrol create: either Duration= or EndTime= is required");
+    }
+
+    let duration_minutes = match &duration {
+        Some(d) => parse_reservation_duration(d)?,
+        None => 0,
     };
 
     Ok(ReservationCreateParams {
         name,
         start_time,
         duration_minutes,
+        end_time: end_time.unwrap_or_default(),
         nodes,
         accounts,
         users,
@@ -1614,6 +1642,7 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
         &p.name,
         &p.start_time,
         p.duration_minutes,
+        &p.end_time,
         &p.nodes,
         &p.accounts,
         &p.users,
@@ -2340,14 +2369,14 @@ async fn create_reservation(
     name: &str,
     start_time: &str,
     duration: u32,
+    end_time: &str,
     nodes: &str,
     accounts: &str,
     users: &str,
     flags: &str,
 ) -> Result<()> {
-    // Privilege is gated by callers; this is the last input guard.
-    if duration == 0 {
-        bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
+    if duration == 0 && end_time.is_empty() {
+        bail!("either --duration or --end-time is required");
     }
 
     let channel = crate::authclient::connect(controller)
@@ -2386,6 +2415,7 @@ async fn create_reservation(
             users: user_list,
             flags: flag_list,
             user: crate::interactive::current_user()?,
+            end_time: end_time.to_string(),
         })
         .await
         .context("failed to create reservation")?;
@@ -4354,13 +4384,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_reservation_create_params_requires_duration() {
+    fn parse_reservation_create_params_requires_duration_or_end_time() {
         let params = p(&["ReservationName=r1", "StartTime=now", "Nodes=n1"]);
         let err = parse_reservation_create_params(&params).unwrap_err();
         assert!(
-            err.to_string().contains("Duration= is required"),
+            err.to_string()
+                .contains("either Duration= or EndTime= is required"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_reservation_create_params_rejects_both_duration_and_end_time() {
+        let params = p(&[
+            "ReservationName=r1",
+            "StartTime=now",
+            "Duration=60",
+            "EndTime=2026-12-01T00:00:00Z",
+            "Nodes=n1",
+        ]);
+        let err = parse_reservation_create_params(&params).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reservation_create_params_accepts_end_time() {
+        let params = p(&[
+            "ReservationName=r1",
+            "StartTime=2026-12-01T00:00:00Z",
+            "EndTime=2026-12-02T00:00:00Z",
+            "Nodes=n1",
+        ]);
+        let parsed = parse_reservation_create_params(&params).unwrap();
+        assert_eq!(parsed.name, "r1");
+        assert_eq!(parsed.duration_minutes, 0);
+        assert_eq!(parsed.end_time, "2026-12-02T00:00:00Z");
     }
 
     #[test]
@@ -4374,6 +4432,7 @@ mod tests {
         let parsed = parse_reservation_create_params(&params).unwrap();
         assert_eq!(parsed.name, "r1");
         assert_eq!(parsed.duration_minutes, 30 * 24 * 60);
+        assert!(parsed.end_time.is_empty());
     }
 
     #[test]
