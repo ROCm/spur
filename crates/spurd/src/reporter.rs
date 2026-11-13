@@ -60,7 +60,7 @@ fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 /// How long a heartbeat waits for the running-job set before reporting it
-/// incomplete; 400 ms, well inside the 30-second beat interval.
+/// incomplete; well inside the 30-second beat interval.
 const HELD_JOBS_READ_BUDGET: Duration = Duration::from_millis(400);
 
 /// The run a held job belongs to, so a reclaim can target that run alone.

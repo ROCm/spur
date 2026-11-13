@@ -319,9 +319,8 @@ impl NodeLiveness {
     }
 
     /// Called every health tick with the term this controller leads, or `None`.
-    /// Leader-local state belongs to the term that built it, so a new term or a
-    /// lost leadership discards strikes, not-responding flags, the gauges, and
-    /// node reports and recovery holds.
+    /// Leader-local state belongs to the term that built it, so a new term or a lost
+    /// leadership discards strikes, not-responding flags, gauges, reports, and holds.
     pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
         if self.term == leading_term {
             return;
