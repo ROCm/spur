@@ -135,24 +135,33 @@ pub fn outcome_from_status(result: &Result<(), Status>) -> TxnOutcome {
 pub fn create_details(
     start_time: &str,
     duration_minutes: u32,
+    end_time: &str,
     nodes: &[String],
     accounts: &[String],
     users: &[String],
     flags: &[String],
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "start_time": start_time,
-        "duration_minutes": duration_minutes,
         "nodes": nodes,
         "accounts": accounts,
         "users": users,
         "flags": flags,
-    })
+    });
+    if duration_minutes > 0 {
+        v["duration_minutes"] = serde_json::json!(duration_minutes);
+    }
+    if !end_time.is_empty() {
+        v["end_time"] = serde_json::json!(end_time);
+    }
+    v
 }
 
 /// Details for a reservation update attempt (the requested deltas).
+#[allow(clippy::too_many_arguments)]
 pub fn update_details(
     duration_minutes: u32,
+    end_time: &str,
     add_nodes: &[String],
     remove_nodes: &[String],
     add_users: &[String],
@@ -160,15 +169,21 @@ pub fn update_details(
     add_accounts: &[String],
     remove_accounts: &[String],
 ) -> serde_json::Value {
-    serde_json::json!({
-        "duration_minutes": duration_minutes,
+    let mut v = serde_json::json!({
         "add_nodes": add_nodes,
         "remove_nodes": remove_nodes,
         "add_users": add_users,
         "remove_users": remove_users,
         "add_accounts": add_accounts,
         "remove_accounts": remove_accounts,
-    })
+    });
+    if duration_minutes > 0 {
+        v["duration_minutes"] = serde_json::json!(duration_minutes);
+    }
+    if !end_time.is_empty() {
+        v["end_time"] = serde_json::json!(end_time);
+    }
+    v
 }
 
 /// `state` is absent when only labels change.
@@ -277,10 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn create_details_captures_requested_values() {
+    fn create_details_captures_requested_values_with_duration() {
         let v = create_details(
             "now",
             60,
+            "",
             &["n1".into(), "n2".into()],
             &["acct".into()],
             &["alice".into()],
@@ -288,9 +304,26 @@ mod tests {
         );
         assert_eq!(v["start_time"], "now");
         assert_eq!(v["duration_minutes"], 60);
+        assert!(v.get("end_time").is_none());
         assert_eq!(v["nodes"], serde_json::json!(["n1", "n2"]));
         assert_eq!(v["users"], serde_json::json!(["alice"]));
         assert_eq!(v["flags"], serde_json::json!(["MAINT"]));
+    }
+
+    #[test]
+    fn create_details_captures_requested_values_with_end_time() {
+        let v = create_details(
+            "2026-12-01T00:00:00Z",
+            0,
+            "2026-12-02T00:00:00Z",
+            &["n1".into()],
+            &[],
+            &["alice".into()],
+            &[],
+        );
+        assert_eq!(v["start_time"], "2026-12-01T00:00:00Z");
+        assert!(v.get("duration_minutes").is_none());
+        assert_eq!(v["end_time"], "2026-12-02T00:00:00Z");
     }
 
     #[test]

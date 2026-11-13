@@ -1548,6 +1548,59 @@ refused: give an explicit limit.
    scontrol update JobId=1024 ExcNodeList=        # clear the exclusions
    scontrol update NodeName=node01 State=drain Reason="maintenance"
 
+Managing Reservations
+---------------------
+
+Operators (root, ``sudo``/``wheel`` members, or cluster admins) can create,
+update, and delete node reservations. See the reservation authorization section
+in :doc:`/admin-guide/configuration` for the full model.
+
+**Creating a reservation** — specify when it ends with either ``--duration`` or
+``--end-time`` (ISO 8601 timestamp). The two are mutually exclusive:
+
+.. code-block:: bash
+
+   # Duration: whole minutes, Slurm time, or suffixed
+   scontrol create-reservation --name=maint --start-time=now --duration=01:00:00 \
+       --nodes=node[01-04] --users=alice,bob
+
+   # End time: ISO 8601 timestamp (alternative to --duration)
+   scontrol create-reservation --name=patch-window \
+       --start-time=2027-03-01T00:00:00Z --end-time=2027-03-02T00:00:00Z \
+       --nodes=node[01-04]
+
+   # Slurm inline syntax accepts both Duration= and EndTime=
+   scontrol create ReservationName=maint StartTime=now Duration=60 Nodes=node01
+   scontrol create ReservationName=patch StartTime=2027-03-01T00:00:00Z \
+       EndTime=2027-03-02T00:00:00Z Nodes=node01
+
+**Updating a reservation** — change the end time or duration, and add or remove
+nodes, users, and accounts:
+
+.. code-block:: bash
+
+   # Extend by setting a new end time
+   scontrol update-reservation --name=maint --end-time=2027-03-01T06:00:00Z
+
+   # Or set a new duration (minutes from the original start time)
+   scontrol update-reservation --name=maint --duration=02:00:00
+
+   # Add/remove nodes and users
+   scontrol update-reservation --name=maint --add-nodes=node05 --add-users=carol
+
+**Deleting a reservation:**
+
+.. code-block:: bash
+
+   scontrol delete-reservation maint
+
+**Listing reservations:**
+
+.. code-block:: bash
+
+   scontrol show reservation              # all reservations
+   scontrol show reservation maint        # one by name
+
 See Also
 --------
 

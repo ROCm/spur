@@ -6834,6 +6834,7 @@ impl ClusterManager {
         &self,
         name: &str,
         duration_minutes: u32,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
         add_nodes: &[String],
         remove_nodes: &[String],
         add_users: &[String],
@@ -6841,6 +6842,12 @@ impl ClusterManager {
         add_accounts: &[String],
         remove_accounts: &[String],
     ) -> Result<(), ReservationError> {
+        if duration_minutes > 0 && end_time.is_some() {
+            return Err(ReservationError::invalid(
+                "duration and end_time are mutually exclusive; specify one, not both",
+            ));
+        }
+
         let mut preview = self
             .reservations
             .read()
@@ -6851,13 +6858,12 @@ impl ClusterManager {
                 ReservationError::not_found(format!("reservation '{}' not found", name))
             })?;
 
-        if duration_minutes > 0 {
+        if let Some(et) = end_time {
+            preview.end_time = et;
+        } else if duration_minutes > 0 {
             preview.end_time =
                 preview.start_time + chrono::Duration::minutes(duration_minutes as i64);
         }
-        // Unreachable today (start_time is immutable and create rejects zero
-        // spans), but guard explicitly so a future editable start_time can't
-        // silently reintroduce a zero-length, instantly-purged reservation.
         if preview.end_time <= preview.start_time {
             return Err(ReservationError::invalid(
                 "reservation duration must be positive",
@@ -6904,6 +6910,7 @@ impl ClusterManager {
             remove_users: remove_users.to_vec(),
             add_accounts: add_accounts.to_vec(),
             remove_accounts: remove_accounts.to_vec(),
+            end_time,
         })
         .map_err(|e| ReservationError::raft(e.to_string()))?;
         Ok(())
@@ -7257,6 +7264,7 @@ impl ClusterManager {
         reservations: &mut [Reservation],
         name: &str,
         duration_minutes: u32,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
         add_nodes: &[String],
         remove_nodes: &[String],
         add_users: &[String],
@@ -7267,7 +7275,9 @@ impl ClusterManager {
         let Some(res) = reservations.iter_mut().find(|r| r.name == name) else {
             return;
         };
-        if duration_minutes > 0 {
+        if let Some(et) = end_time {
+            res.end_time = et;
+        } else if duration_minutes > 0 {
             res.end_time = res.start_time + chrono::Duration::minutes(duration_minutes as i64);
         }
         for node in add_nodes {
@@ -9965,12 +9975,14 @@ impl ClusterManager {
                 remove_users,
                 add_accounts,
                 remove_accounts,
+                end_time,
             } => {
                 let mut reservations = self.reservations.write();
                 Self::apply_reservation_update_locked(
                     reservations.as_mut(),
                     name,
                     *duration_minutes,
+                    *end_time,
                     add_nodes,
                     remove_nodes,
                     add_users,
@@ -26865,6 +26877,7 @@ state = "UP"
             remove_users: Vec::new(),
             add_accounts: Vec::new(),
             remove_accounts: Vec::new(),
+            end_time: None,
         });
         let updated = cm
             .get_reservations()
@@ -27026,7 +27039,7 @@ state = "UP"
         })
         .unwrap();
 
-        cm.update_reservation("r1", 30, &[], &[], &[], &[], &[], &[])
+        cm.update_reservation("r1", 30, None, &[], &[], &[], &[], &[], &[])
             .expect("update must not depend on the recorded owner");
         cm.delete_reservation("r1")
             .expect("delete must not depend on the recorded owner");
