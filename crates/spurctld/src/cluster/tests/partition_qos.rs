@@ -246,6 +246,118 @@ async fn an_undefined_partition_qos_holds_jobs_when_accounting_is_on() {
     );
 }
 
+#[test]
+fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
+    let mut at_cap = TresRecord::new();
+    at_cap.set(TresType::Node, 2);
+    let view = PartitionQosView {
+        by_partition: HashMap::from([(
+            "gpu".to_string(),
+            (
+                "usercap".to_string(),
+                Some(Qos {
+                    name: "usercap".into(),
+                    limits: node_cap(2),
+                    ..Default::default()
+                }),
+            ),
+        )]),
+        usage: HashMap::from([(
+            "usercap".to_string(),
+            PartitionQosUsage {
+                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
+                ..Default::default()
+            },
+        )]),
+        defaults: vec!["gpu".to_string()],
+        ..Default::default()
+    };
+    let mut job = Job::new(
+        1,
+        JobSpec {
+            partition: None,
+            ..gpu_job("alice", "acct-a", "qa")
+        },
+    );
+
+    assert_eq!(
+        view.admit(&mut job, &PassReservations::default()),
+        Err(PendingReason::QosMaxNodePerUserLimit)
+    );
+    assert_eq!(
+        view.qos_names(&job),
+        BTreeSet::from(["usercap".to_string()])
+    );
+}
+
+#[test]
+fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
+    let mut at_cap = TresRecord::new();
+    at_cap.set(TresType::Node, 2);
+    let partitions = vec![
+        Partition {
+            name: "gpu".into(),
+            nodes: "ALL".into(),
+            is_default: true,
+            qos: Some("usercap".into()),
+            ..Default::default()
+        },
+        Partition {
+            name: "cpu".into(),
+            nodes: "ALL".into(),
+            is_default: true,
+            ..Default::default()
+        },
+    ];
+    let view = PartitionQosView {
+        by_partition: HashMap::from([(
+            "gpu".to_string(),
+            (
+                "usercap".to_string(),
+                Some(Qos {
+                    name: "usercap".into(),
+                    limits: node_cap(2),
+                    ..Default::default()
+                }),
+            ),
+        )]),
+        usage: HashMap::from([(
+            "usercap".to_string(),
+            PartitionQosUsage {
+                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
+                ..Default::default()
+            },
+        )]),
+        defaults: vec!["gpu".to_string(), "cpu".to_string()],
+        ..Default::default()
+    };
+    let mut job = Job::new(
+        1,
+        JobSpec {
+            partition: None,
+            ..gpu_job("alice", "acct-a", "qa")
+        },
+    );
+
+    let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions)
+        .into_iter()
+        .map(|mut probe| {
+            assert_eq!(view.admit(&mut probe, &PassReservations::default()), Ok(()));
+            let admitted = QuotaVerdict::Admitted {
+                account: AccountAdmitted {
+                    charge: 1,
+                    admits_without_credit: true,
+                },
+                qos_charge: 1,
+            };
+            (probe, admitted)
+        })
+        .collect();
+    QuotaClaim::of_admitted(&outcomes).unwrap().narrow(&mut job);
+
+    assert_eq!(job.spec.partition.as_deref(), Some("cpu"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
     let dir = TempDir::new().unwrap();

@@ -8293,7 +8293,7 @@ impl ClusterManager {
 
     fn runs_under_a_partition_qos(&self, job: &Job) -> bool {
         let partitions = self.partitions.read();
-        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), &partitions)
+        spur_sched::partition_cap::candidate_partitions(job, &partitions)
             .iter()
             .any(|p| p.qos.as_deref().is_some_and(|q| !q.is_empty()))
     }
@@ -11767,10 +11767,14 @@ fn account_block_with(
 }
 
 /// The job reshaped per request it could run with, in order, each limited to the requested
-/// partitions admitting it with that request; a job that requested none keeps its own list.
+/// partitions admitting it with that request. A job that names no partition is limited to
+/// the defaults it would be placed in; one that no requested partition admits keeps its list.
 fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
     let requested =
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
+    let unnamed = requested_partition_names(job.spec.partition.as_deref())
+        .next()
+        .is_none();
     let admitting: Vec<&Partition> = requested
         .into_iter()
         .filter(|p| p.admits(&job.spec))
@@ -11786,7 +11790,7 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
         .map(|request| {
             let mut probe = job.clone();
             probe.spec = request.spec;
-            if narrows {
+            if narrows || (unnamed && !request.partitions.is_empty()) {
                 probe.spec.partition = Some(request.partitions.join(","));
             }
             probe
@@ -11847,6 +11851,8 @@ struct PartitionQosView {
     /// Partition name to its QOS name and record; `None` when no such QOS is defined.
     by_partition: HashMap<String, (String, Option<Qos>)>,
     usage: HashMap<String, PartitionQosUsage>,
+    /// Where a job that names no partition is placed, so it is gated there too.
+    defaults: Vec<String>,
     /// An undefined partition QOS holds the partition's jobs rather than lifting the cap.
     unknown_blocks: bool,
 }
@@ -11906,8 +11912,25 @@ impl PartitionQosView {
         Self {
             by_partition,
             usage,
+            defaults: partitions
+                .iter()
+                .filter(|p| p.is_default)
+                .map(|p| p.name.clone())
+                .collect(),
             unknown_blocks,
         }
+    }
+
+    /// The partitions `job` may be placed in: the ones it requested, or the
+    /// defaults when it requested none, as the placer resolves them.
+    fn candidate_names(&self, job: &Job) -> Vec<String> {
+        let requested: Vec<String> = requested_partition_names(job.spec.partition.as_deref())
+            .map(str::to_string)
+            .collect();
+        if requested.is_empty() {
+            return self.defaults.clone();
+        }
+        requested
     }
 
     /// Narrows `job` to the requested partitions whose QOS admits it; `Err` with the
@@ -11920,9 +11943,7 @@ impl PartitionQosView {
         if self.by_partition.is_empty() {
             return Ok(());
         }
-        let requested: Vec<String> = requested_partition_names(job.spec.partition.as_deref())
-            .map(str::to_string)
-            .collect();
+        let requested = self.candidate_names(job);
         let mut admitted = Vec::new();
         let mut refusal = None;
         for name in &requested {
@@ -11990,7 +12011,8 @@ impl PartitionQosView {
 
     /// The distinct partition QOSes `job` is charged against if it runs.
     fn qos_names(&self, job: &Job) -> BTreeSet<String> {
-        requested_partition_names(job.spec.partition.as_deref())
+        self.candidate_names(job)
+            .iter()
             .filter_map(|p| self.by_partition.get(p).map(|(name, _)| name.clone()))
             .collect()
     }
@@ -12072,7 +12094,7 @@ impl QuotaClaim {
     /// Restrict the job to the partitions whose request was admitted, and pass
     /// on the nodes the gates credited it with.
     fn narrow(&self, job: &mut Job) {
-        if job.spec.partition.is_some() && !self.partitions.is_empty() {
+        if !self.partitions.is_empty() {
             job.spec.partition = Some(self.partitions.join(","));
         }
         job.preferred_nodes.clone_from(&self.preferred_nodes);
