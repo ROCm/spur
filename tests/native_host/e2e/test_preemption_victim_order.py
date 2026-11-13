@@ -172,6 +172,8 @@ class TestVictimOrder:
         resumed = _start_victim(c, jobs, "vo-resumed", old)
         c.scontrol("suspend", str(resumed))
         wait_job_state(c, resumed, "S", timeout=_WAIT_RUN)
+        # Counting wall time, the resumed job would be the older one by a whole gap.
+        time.sleep(_AGE_GAP_SECS)
         steady = _start_victim(c, jobs, "vo-steady", fresh)
         time.sleep(_AGE_GAP_SECS)
         c.scontrol("resume", str(resumed))
