@@ -317,7 +317,10 @@ Communication uses line-delimited JSON over a Unix socket at
 
 - **`StepdRequest`**: `Hello` (handshake with instance ID), `QueryState`,
   `Start`, `SignalAllocation`, `Shutdown` (cancels before Start; after Start,
-  triggers begin_teardown internally — cgroup-first SIGTERM).
+  triggers begin_teardown internally — cgroup-first SIGTERM, sent once per run:
+  a repeated Shutdown during teardown sends nothing more unless the first
+  reached no process). Unsupervised steps and jobs follow the same once-only
+  rule in `graceful_cancel`; explicit signals are always delivered.
 - **`StepdResponse`**: `Hello`, `State` (runtime snapshot), `Acknowledged`,
   `Rejected`.
 - **`AgentNotification`**: sent over the *agent* socket
