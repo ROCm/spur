@@ -1244,8 +1244,9 @@ Fair-share scheduling
 ---------------------
 
 Fair-share scores determine how the scheduler prioritizes pending jobs. A user
-who has consumed less than their entitled share receives a boost; one who has
-consumed more is penalized. The score is computed from three inputs:
+who has consumed more than their entitled share is penalized; one who has consumed
+less — or none at all — starts at a neutral or share-proportional factor. The
+score is computed from three inputs:
 
 - **Account hierarchy** — accounts form a tree, and each account's effective
   share is its weight divided by the sum of its sibling weights, scaled by its
@@ -1263,12 +1264,29 @@ consumed more is penalized. The score is computed from three inputs:
 
 The ``usagefactor`` on a job's QOS multiplies both CPU and GPU billable usage.
 
+**Fair-share factor formula:**
+
+Each user gets a **per-user cap** = ``max(user_share * 10.0, 1.0)``, where
+``user_share`` is the user's effective share of the cluster (from the account
+hierarchy and per-user weights). The factor is then:
+
+- **Idle** (usage below epsilon): ``factor = user_cap``. A user with 50% of the
+  cluster gets 5.0; a user with 1% gets 1.0 (the floor). Zero-share users
+  stay at 0.0.
+- **Active**: ``factor = min(user_share / actual_share, user_cap)``, where
+  ``actual_share`` = the user's usage / total cluster usage. When usage equals
+  fair share, factor = 1.0 (neutral). Overuse drives the factor below 1.0.
+
+In oversubscribed clusters where most users have shares below 0.1, the per-user
+cap floors at 1.0. All idle and under-share users start at 1.0 (neutral), and
+differentiation comes from other priority factors (age, partition tier, base
+priority). Penalization begins once a user exceeds their fair share.
+
 **Differences from Slurm's fair-share:**
 
-- Spur's fair-share factor ranges from 0 to 100 (capped), where 1.0 means "you
-  have used exactly your share." Slurm's ranges from 0 to 1, with 0.5 as the
-  midpoint. The **ranking** of users is the same — both agree on who is over-
-  and under-using — but the raw numbers are on different scales.
+- Spur's fair-share factor ranges from 0 to 10 (per-user cap), where 1.0 means
+  "you have used exactly your share." Slurm's Classic ranges from 0 to 1, with
+  0.5 as the midpoint. Slurm's Fair Tree uses a rank-based approach.
 - ``sshare -l`` includes a ``GPURawUsage`` column showing GPU-seconds alongside
   ``CPURawUsage``. The ``RawUsage`` column is CPU-seconds only (not the combined
   billable total).
