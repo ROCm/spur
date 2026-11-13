@@ -21648,7 +21648,7 @@ mod tests {
         );
 
         assert_eq!(
-            reporter.held_jobs(),
+            reporter.held_jobs().await,
             Some(Vec::new()),
             "reporter sees no jobs before registration"
         );
@@ -21671,7 +21671,7 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_jobs(),
+            reporter.held_jobs().await,
             Some(vec![(77, 9)]),
             "reporter's heartbeat must observe the agent-registered allocation-only job and its run"
         );
