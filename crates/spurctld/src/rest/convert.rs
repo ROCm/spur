@@ -169,6 +169,7 @@ mod tests {
         let signaled_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let deadline = signaled_at + Duration::seconds(60);
         job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
             signaled_at,
             deadline,
             preempted_by: 9,
