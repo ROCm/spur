@@ -808,6 +808,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    While its victims run out their grace or drain, and for the post-release
    passes, the preemptor also keeps its share of its QOS and account
    ``grptres`` caps, so another job under the same cap can't take that room.
+   It keeps the share only while its node list, excluded nodes and partitions
+   still allow one of those nodes, so a preemptor whose ``ExcNodeList=`` is
+   updated to exclude them gives the room back.
 
    A handoff whose victims are still running out a grace, or draining after
    cancel preemption, survives a controller restart. Once a requeue takes effect, its

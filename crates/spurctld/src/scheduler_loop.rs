@@ -10,7 +10,6 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
-use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -1642,11 +1641,18 @@ async fn try_preempt_with_handoffs(
         .collect();
 
     for pending in unscheduled {
+        // With this pass's packing hint, as placement reads it, so only victims on
+        // nodes the job could start on this pass are offered.
+        let placement = spur_sched::node_match::NodePlacement::new(pending);
         // Scoped to the nodes this job could actually use: a victim wedged
         // elsewhere must not block preemption across the whole cluster.
         let waiting_on_release = draining_victims.iter().any(|victim| {
             preemptor_awaiting_release(victim) == Some(pending.job_id)
-                && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
+                && preempt_overlaps_pending_nodes(
+                    &placement,
+                    &victim.allocated_nodes,
+                    cluster_nodes,
+                )
         });
         if waiting_on_release {
             continue;
@@ -1661,7 +1667,11 @@ async fn try_preempt_with_handoffs(
         // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
-            if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
+            if !preempt_overlaps_pending_nodes(
+                &placement,
+                &candidate.allocated_nodes,
+                cluster_nodes,
+            ) {
                 continue;
             }
 
@@ -2442,41 +2452,22 @@ pub(crate) fn preemptor_awaiting_release(
     }
 }
 
-/// True when `candidate` occupies a node the pending job could target.
+/// True when one of `occupied` is a node the pending job behind `pending` could be
+/// placed on, by placement's reading of its `--nodelist`, `--exclude` and partitions.
+/// Node state, features and capacity are left to the caller.
 pub(crate) fn preempt_overlaps_pending_nodes(
-    pending: &spur_core::job::Job,
-    candidate: &spur_core::job::Job,
+    pending: &spur_sched::node_match::NodePlacement<'_>,
+    occupied: &[String],
     nodes: &[spur_core::node::Node],
 ) -> bool {
-    if candidate.allocated_nodes.is_empty() {
+    if occupied.is_empty() {
         return false;
     }
-    let occupied: HashSet<&str> = candidate
-        .allocated_nodes
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    if let Some(ref nodelist) = pending.spec.nodelist {
-        return nodelist
-            .split(',')
-            .map(str::trim)
-            .any(|n| occupied.contains(n));
-    }
-
-    let partitions: Vec<&str> =
-        requested_partition_names(pending.spec.partition.as_deref()).collect();
-
+    let occupied: HashSet<&str> = occupied.iter().map(String::as_str).collect();
     nodes.iter().any(|node| {
-        if !occupied.contains(node.name.as_str()) {
-            return false;
-        }
-        if partitions.is_empty() {
-            return true;
-        }
-        partitions
-            .iter()
-            .any(|p| node.partitions.iter().any(|np| np == p))
+        occupied.contains(node.name.as_str())
+            && pending.allows_name(&node.name)
+            && pending.in_partition(node)
     })
 }
 
@@ -5628,6 +5619,64 @@ pub(crate) mod tests {
         let mut job = job_in_partitions(partition);
         job.allocated_nodes = nodes.iter().map(|n| n.to_string()).collect();
         job
+    }
+
+    /// Whether a victim on `victim_node` is one `pending` could use, among n1 to n3 in
+    /// "batch" and n4 in "debug".
+    fn victim_node_usable(pending: JobSpec, victim_node: &str) -> bool {
+        let nodes = [
+            node_in("n1", &["batch"]),
+            node_in("n2", &["batch"]),
+            node_in("n3", &["batch"]),
+            node_in("n4", &["debug"]),
+        ];
+        let pending = job_with_spec(pending);
+        preempt_overlaps_pending_nodes(
+            &spur_sched::node_match::NodePlacement::new(&pending),
+            &[victim_node.to_string()],
+            &nodes,
+        )
+    }
+
+    #[test]
+    fn a_victim_on_a_node_the_pending_job_excludes_is_not_offered() {
+        let spec = JobSpec {
+            exclude: Some("n[1-2]".into()),
+            ..Default::default()
+        };
+        assert!(!victim_node_usable(spec.clone(), "n2"));
+        assert!(victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_on_a_node_in_the_pending_jobs_nodelist_range_is_offered() {
+        let spec = JobSpec {
+            nodelist: Some("n[1-2]".into()),
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec.clone(), "n2"));
+        assert!(!victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_outside_a_nodelist_shorter_than_the_node_count_is_offered() {
+        let spec = JobSpec {
+            nodelist: Some("n1".into()),
+            num_nodes: 2,
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_on_a_listed_node_outside_the_pending_jobs_partition_is_not_offered() {
+        let spec = JobSpec {
+            partition: Some("batch".into()),
+            nodelist: Some("n1,n4".into()),
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec.clone(), "n1"));
+        assert!(!victim_node_usable(spec, "n4"));
     }
 
     #[test]

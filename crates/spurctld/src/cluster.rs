@@ -5846,21 +5846,24 @@ impl ClusterManager {
                     .iter()
                     .filter(|candidate| {
                         let id = candidate.job.job_id;
-                        let drains = draining_by_owner.get(&id).is_some_and(|victims| {
-                            victims.iter().any(|victim| {
-                                crate::scheduler_loop::preempt_overlaps_pending_nodes(
-                                    &candidate.job,
-                                    victim,
-                                    &node_list,
-                                )
-                            })
-                        });
-                        let earmarked = freed_by_owner.get(&id).is_some_and(|nodes| {
-                            nodes
+                        let (victims, freed) =
+                            (draining_by_owner.get(&id), freed_by_owner.get(&id));
+                        if victims.is_none() && freed.is_none() {
+                            return false;
+                        }
+                        // `new` reads only the job's own filters here: no packing hint is
+                        // set until the gates below run.
+                        let placement = spur_sched::node_match::NodePlacement::new(&candidate.job);
+                        let could_use = |nodes: &[String]| {
+                            crate::scheduler_loop::preempt_overlaps_pending_nodes(
+                                &placement, nodes, &node_list,
+                            )
+                        };
+                        victims.is_some_and(|victims| {
+                            victims
                                 .iter()
-                                .any(|node| job_requests_node(&candidate.job, node, &node_list))
-                        });
-                        drains || earmarked
+                                .any(|victim| could_use(&victim.allocated_nodes))
+                        }) || freed.is_some_and(|freed| could_use(freed))
                     })
                     .map(|candidate| candidate.job.job_id)
                     .collect()
@@ -10519,23 +10522,6 @@ enum GateOutcome {
     /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
     /// to bypass tagging in any other gate.
     DropUntagged,
-}
-
-/// Whether `node` is a node this pending job could be placed on: named directly
-/// in its `--nodelist`, or part of a partition it requested. Mirrors the
-/// node-overlap scoping of `preempt_overlaps_pending_nodes` for a single node.
-fn job_requests_node(job: &Job, node: &str, nodes: &[Node]) -> bool {
-    if let Some(ref nodelist) = job.spec.nodelist {
-        return nodelist.split(',').map(str::trim).any(|n| n == node);
-    }
-    let partitions: Vec<&str> = requested_partition_names(job.spec.partition.as_deref()).collect();
-    nodes.iter().any(|n| {
-        n.name == node
-            && (partitions.is_empty()
-                || partitions
-                    .iter()
-                    .any(|p| n.partitions.iter().any(|np| np == p)))
-    })
 }
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
@@ -28548,7 +28534,11 @@ state = "UP"
     /// `grp_node_cluster` with room for one more node, under preemption, where "pool"
     /// may evict "burst".
     async fn pool_over_burst_cluster(dir: &TempDir) -> Arc<ClusterManager> {
-        let cm = grp_node_cluster_with(dir, 2, GrpCap::Qos, preempting_config()).await;
+        pool_over_burst_cluster_capped(dir, 2).await
+    }
+
+    async fn pool_over_burst_cluster_capped(dir: &TempDir, cap: u64) -> Arc<ClusterManager> {
+        let cm = grp_node_cluster_with(dir, cap, GrpCap::Qos, preempting_config()).await;
         let mut pool = cm.qos_cache().get("pool").expect("pool QOS inserted");
         pool.priority = 10_000;
         pool.preempt = vec!["burst".into()];
@@ -28597,12 +28587,32 @@ state = "UP"
     async fn preemptor_with_draining_victim(
         dir: &TempDir,
     ) -> (Arc<ClusterManager>, JobId, JobId, JobId) {
-        let cm = pool_over_burst_cluster(dir).await;
+        preemptor_listing(pool_over_burst_cluster(dir).await, 1, "n2").await
+    }
+
+    /// As `preemptor_with_draining_victim`, for a preemptor of `nodes` nodes listing
+    /// `nodelist`.
+    async fn preemptor_listing(
+        cm: Arc<ClusterManager>,
+        nodes: u32,
+        nodelist: &str,
+    ) -> (Arc<ClusterManager>, JobId, JobId, JobId) {
         let victim = run_burst_job(&cm, "n2");
-        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", nodes, Some(nodelist)));
         let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
         evict_for(&cm, preemptor, victim).await;
         (cm, victim, preemptor, sibling)
+    }
+
+    fn assert_the_preemptor_keeps_the_room(cm: &ClusterManager, preemptor: JobId, sibling: JobId) {
+        let (classification, unclaimed) = classify_with_trials(cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(dispatched(cm, &classification, &unclaimed).is_empty());
     }
 
     /// An unpinned preemptor whose victim on n2 has finished, leaving n2 earmarked for
@@ -28776,6 +28786,49 @@ state = "UP"
             });
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_that_excludes_its_victims_node_leaves_its_room_to_its_sibling() {
+        let dir = TempDir::new().unwrap();
+        let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
+        cm.update_job(
+            preemptor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("n2".into()),
+        )
+        .unwrap();
+        wait_for("exclusion applied", || {
+            cm.get_job(preemptor)
+                .is_some_and(|job| job.spec.exclude.as_deref() == Some("n2"))
+        });
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_listing_its_victims_node_in_a_range_keeps_its_grp_node_claim() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let (cm, _victim, preemptor, sibling) = preemptor_listing(cm, 1, "n[1-2]").await;
+        assert_the_preemptor_keeps_the_room(&cm, preemptor, sibling);
+    }
+
+    /// A nodelist shorter than the node count only names nodes the job must have,
+    /// so a victim on a node outside it can still be the one the job waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_whose_victim_is_outside_its_short_nodelist_keeps_its_grp_node_claim() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster_capped(&dir, 3).await;
+        let (cm, _victim, preemptor, sibling) = preemptor_listing(cm, 2, "n3").await;
+        assert_the_preemptor_keeps_the_room(&cm, preemptor, sibling);
     }
 
     /// Two jobs with room for one, each pinned behind its own burst job. Once one of
