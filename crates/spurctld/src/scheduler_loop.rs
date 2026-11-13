@@ -999,7 +999,8 @@ pub(crate) fn compute_job_allocation(
 const MAX_CLAIM_ROUNDS: usize = 8;
 
 /// Admission claims quota before placement, so a job that then cannot start would
-/// hold headroom from the jobs behind it; reclassify with such jobs unclaimed.
+/// hold headroom from the jobs behind it; reclassify with such jobs unclaimed, except
+/// preemptors whose eviction is still in flight.
 pub(crate) fn classify_without_phantom_claims(
     cluster: &ClusterManager,
     mut trial: impl FnMut(&crate::cluster::PendingJobClassification) -> HashSet<spur_core::job::JobId>,
@@ -1025,6 +1026,7 @@ pub(crate) fn classify_without_phantom_claims(
             .iter()
             .map(|job| job.job_id)
             .filter(|id| !placed.contains(id) && !unclaimed.contains(id))
+            .filter(|id| !classification.evicting.contains(id))
             .collect();
         if newly_unclaimed.is_empty() {
             break;

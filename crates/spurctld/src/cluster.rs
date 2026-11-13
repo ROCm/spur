@@ -820,6 +820,10 @@ pub(crate) struct PendingJobClassification {
     /// A QOS or account limit refused a job while earlier candidates held claims on
     /// it, so a claim that never turns into a start may be what blocked it.
     pub(crate) claims_blocked: bool,
+    /// Preemptors whose victim is still stopping or whose freed node is earmarked for
+    /// them. The claim rounds keep their claims, so the room they evicted for isn't
+    /// given to another job under the same limit.
+    pub(crate) evicting: HashSet<JobId>,
 }
 
 /// Whether a QOS is holding more nodes than its group node cap allows, counting its
@@ -5822,6 +5826,7 @@ impl ClusterManager {
 
         // Queue precedence offers a preemptor placement before ordinary bystanders;
         // node handoffs keep every other job, bar co-owners, off its released capacity.
+        // A hoisted preemptor also keeps its quota claim through the claim rounds.
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
@@ -6147,6 +6152,7 @@ impl ClusterManager {
             bb_stage_candidates,
             idle_fill_candidates,
             claims_blocked,
+            evicting: hoisted,
         }
     }
 
@@ -13548,6 +13554,7 @@ state = "UP"
                 bb_stage_candidates: vec![],
                 idle_fill_candidates: vec![],
                 claims_blocked: false,
+                evicting: HashSet::new(),
             };
             let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
             let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
@@ -28389,8 +28396,11 @@ state = "UP"
         classification: &PendingJobClassification,
         unclaimed: &HashSet<JobId>,
     ) -> Vec<JobId> {
-        let (nodes, partitions, reservations) =
-            (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
+        let (nodes, partitions, reservations) = (
+            cm.nodes_off_dispatch_cooldown(&classification.jobs),
+            cm.get_partitions(),
+            cm.get_reservations(),
+        );
         let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
             fabric: None,
@@ -28533,6 +28543,267 @@ state = "UP"
         assert!(unclaimed.is_empty());
         assert_eq!(admitted(&classification), vec![waiting]);
         assert!(!admitted(&classification).contains(&fits));
+    }
+
+    /// `grp_node_cluster` with room for one more node, under preemption, where "pool"
+    /// may evict "burst".
+    async fn pool_over_burst_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = grp_node_cluster_with(dir, 2, GrpCap::Qos, preempting_config()).await;
+        let mut pool = cm.qos_cache().get("pool").expect("pool QOS inserted");
+        pool.priority = 10_000;
+        pool.preempt = vec!["burst".into()];
+        cm.qos_cache().insert(pool);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm
+    }
+
+    fn run_burst_job(cm: &ClusterManager, node: &str) -> JobId {
+        let mut spec = basic_spec("burst");
+        spec.qos = Some("burst".into());
+        spec.nodelist = Some(node.into());
+        let id = submit_and_wait(cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        id
+    }
+
+    async fn evict_for(cm: &Arc<ClusterManager>, preemptor: JobId, victim: JobId) {
+        let job = cm.get_job(preemptor).expect("preemptor submitted");
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&job],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(cm, victim, JobState::Completing);
+        assert_eq!(cm.get_job(victim).unwrap().preempted_by, Some(preemptor));
+    }
+
+    /// A preemptor pinned to n2 whose victim there is still stopping, and a sibling in
+    /// its QOS that could start on n3. Returns (cluster, victim, preemptor, sibling).
+    async fn preemptor_with_draining_victim(
+        dir: &TempDir,
+    ) -> (Arc<ClusterManager>, JobId, JobId, JobId) {
+        let cm = pool_over_burst_cluster(dir).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        evict_for(&cm, preemptor, victim).await;
+        (cm, victim, preemptor, sibling)
+    }
+
+    /// An unpinned preemptor whose victim on n2 has finished, leaving n2 earmarked for
+    /// it, and which still can't start: n2 is on dispatch cooldown, n3 runs a job it
+    /// may not evict and n4 is too small for it. Its sibling fits n4.
+    /// Returns (cluster, preemptor, sibling).
+    async fn preemptor_with_earmarked_node(dir: &TempDir) -> (Arc<ClusterManager>, JobId, JobId) {
+        let cm = pool_over_burst_cluster(dir).await;
+        register_node(&cm, "n4", 4, 128000);
+        let victim = run_burst_job(&cm, "n2");
+        run_job_on(&cm, "not-evictable", "n3");
+        let mut wide = pool_job("preemptor", 1, None);
+        wide.cpus_per_task = 8;
+        let preemptor = submit_and_wait(&cm, wide);
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        evict_for(&cm, preemptor, victim).await;
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+        cm.cool_down_node_for("n2", std::time::Duration::from_secs(3600));
+        assert!(cm
+            .preempt_freed_nodes_raw()
+            .get("n2")
+            .is_some_and(|owners| owners.contains_key(&preemptor)));
+        (cm, preemptor, sibling)
+    }
+
+    /// One pass up to its evictions. Jobs go to `try_preempt` as in the loop: admitted,
+    /// not started, with the pass's off-cooldown nodes.
+    async fn preempt_for_unstarted(cm: &Arc<ClusterManager>) -> PendingJobClassification {
+        cm.tick_preempt_freed_earmarks();
+        let (classification, unclaimed) = classify_with_trials(cm);
+        let started = dispatched(cm, &classification, &unclaimed);
+        let unstarted: Vec<&Job> = classification
+            .jobs
+            .iter()
+            .filter(|job| !started.contains(&job.job_id))
+            .collect();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.nodes_off_dispatch_cooldown(&classification.jobs),
+            &unstarted,
+            &cm.config().scheduler,
+        )
+        .await;
+        classification
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_victim_drains() {
+        let dir = TempDir::new().unwrap();
+        let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(
+            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            "the sibling must not take the room while the preemptor's victim drains"
+        );
+
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+        cm.tick_preempt_freed_earmarks();
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            dispatched(&cm, &classification, &unclaimed),
+            vec![preemptor]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_victim_runs_out_its_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        let signaled_at = Utc::now();
+        let grace = PreemptPending {
+            preemption_claim: None,
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: preemptor,
+            preempt_qos: Some("pool".into()),
+            mode: PreemptMode::Requeue,
+            run_attempt: cm.get_job(victim).unwrap().run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(cm.signal_preemption(grace, victim).unwrap());
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(
+            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            "the sibling must not take the room while the preemptor's victim is in its grace"
+        );
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_freed_node_is_earmarked() {
+        let dir = TempDir::new().unwrap();
+        let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
+        cm.tick_preempt_freed_earmarks();
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(dispatched(&cm, &classification, &unclaimed).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_releases_its_grp_node_claim_once_its_earmark_expires() {
+        let dir = TempDir::new().unwrap();
+        let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
+        for _ in 0..ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+            cm.tick_preempt_freed_earmarks();
+        }
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(unclaimed, HashSet::from([preemptor]));
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+    }
+
+    /// Once the preemptor leaves the queue mid-eviction, nothing keeps its claim and
+    /// the sibling takes the room while the victim is still stopping.
+    async fn assert_sibling_gets_the_room_once_the_preemptor_leaves(
+        leave: impl FnOnce(&ClusterManager, JobId),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
+        leave(&cm, preemptor);
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(admitted(&classification), vec![sibling]);
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_preemptor_leaves_its_grp_node_room_to_its_sibling() {
+        assert_sibling_gets_the_room_once_the_preemptor_leaves(|cm, preemptor| {
+            cm.cancel_job_as_system(preemptor).unwrap();
+            settle(cm, preemptor, JobState::Cancelled);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_preemptor_leaves_its_grp_node_room_to_its_sibling() {
+        assert_sibling_gets_the_room_once_the_preemptor_leaves(|cm, preemptor| {
+            cm.hold_job(preemptor).unwrap();
+            wait_for("preemptor held", || {
+                cm.get_job(preemptor)
+                    .is_some_and(|job| job.pending_reason == PendingReason::Held)
+            });
+        })
+        .await;
+    }
+
+    /// Two jobs with room for one, each pinned behind its own burst job. Once one of
+    /// them has evicted, the other is refused by the cap and so is never offered a
+    /// victim of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_node_of_grp_node_room_evicts_one_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let victims = [run_burst_job(&cm, "n2"), run_burst_job(&cm, "n3")];
+        let first = submit_and_wait(&cm, pool_job("first", 1, Some("n2")));
+        let second = submit_and_wait(&cm, pool_job("second", 1, Some("n3")));
+
+        preempt_for_unstarted(&cm).await;
+        settle(&cm, victims[0], JobState::Completing);
+        assert_eq!(cm.get_job(victims[0]).unwrap().preempted_by, Some(first));
+
+        let classification = preempt_for_unstarted(&cm).await;
+        assert_eq!(
+            cm.get_job(victims[1]).unwrap().state,
+            JobState::Running,
+            "one node of room needs one eviction"
+        );
+        assert_eq!(
+            admitted(&classification),
+            vec![first],
+            "the cap refuses {second}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
