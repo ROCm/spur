@@ -20,8 +20,11 @@ HEARTBEAT_TIMEOUT_SECS = 40
 NODE_DOWN_BOUND = 180
 # Up to one 30s heartbeat interval (the first may fail on the dead connection) plus the 30s health tick.
 RECLAIM_BOUND = 90
-# The controller's recovery hold cap: the default 221s kill, cleanup, and epilog budget plus a 30s heartbeat.
-RECOVERY_HOLD_CAP_SECS = max(HEARTBEAT_TIMEOUT_SECS, 221 + 30)
+# The controller's recovery hold cap (spurctld `recovery_hold_cap`): the kill, cleanup, and
+# epilog budget (`SlurmConfig::complete_wait_floor_secs`, 221s at defaults) plus a 30s
+# heartbeat. Update this if those defaults change.
+COMPLETE_WAIT_FLOOR_SECS = 221
+RECOVERY_HOLD_CAP_SECS = max(HEARTBEAT_TIMEOUT_SECS, COMPLETE_WAIT_FLOOR_SECS + 30)
 # The hold starts once the node is heard again and ends by the cap, so recovery can take both.
 NODE_RECOVERY_BOUND = RECLAIM_BOUND + RECOVERY_HOLD_CAP_SECS
 
