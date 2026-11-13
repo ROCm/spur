@@ -1103,9 +1103,9 @@ it brings its partition back under ``max_tres_per_node``, and every job on it is
 eligible victim; emptying it evicts every job on it, so a node shared with an
 ineligible job, or with a suspended or completing one, is never chosen. The set is
 worked out in memory first, and nothing is evicted unless the pending job would then
-start on the freed nodes under the normal placement rules. When no set passes,
-nothing is evicted. If a later eviction fails partway, the victims already evicted
-stay evicted.
+start on the freed and already idle nodes under the normal placement rules. When no
+set passes, nothing is evicted. If a later eviction fails partway, the victims
+already evicted stay evicted.
 
 Nodes are added to the set one at a time, cheapest first, in this order:
 
