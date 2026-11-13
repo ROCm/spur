@@ -2637,9 +2637,8 @@ impl SlurmController for ControllerService {
             )
             .map_err(register_node_rpc_status)?;
 
-        // Hold the node's recovery until its first heartbeat enumerates its jobs:
-        // a just-restarted agent may still be adopting runtime supervisors, and a
-        // clean report cannot be assumed before one arrives.
+        // Registered with no heartbeat yet is not a clean report: hold the node's
+        // recovery until a heartbeat enumerates its jobs.
         self.cluster
             .record_node_report(&req.hostname, Some(crate::cluster::NodeReport::Unknown));
 
@@ -2772,10 +2771,8 @@ impl SlurmController for ControllerService {
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
-        // Noted before the heartbeat lands, so a health pass never sees the node
-        // back without also seeing it is not a clean report. An incomplete job
-        // list (a contended lock on the agent) is Unknown, not clean, so a busy
-        // read cannot release the hold with jobs still on the node.
+        // Recorded before the heartbeat lands, so a health pass never sees the node
+        // back without its report. An incomplete list is Unknown, never clean.
         let stale_runs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
         let report = if !stale_runs.is_empty() {
             let mut job_ids: Vec<u32> = stale_runs.iter().map(|r| r.job_id).collect();

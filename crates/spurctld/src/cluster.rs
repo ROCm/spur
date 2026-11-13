@@ -4420,10 +4420,8 @@ impl ClusterManager {
         self.interactive_last_seen.read().get(&job_id).copied()
     }
 
-    /// Record what `node`'s latest heartbeat said about jobs the controller
-    /// ended: `None` is a clean report (clears any hold), `Some` holds its
-    /// recovery. Ignored for an unknown node, so a report cannot resurrect one
-    /// the controller already dropped.
+    /// Record `node`'s latest report: `None` is clean and clears any hold. A
+    /// `Some` for an unknown node is ignored so it cannot resurrect a dropped one.
     pub(crate) fn record_node_report(&self, node: &str, report: Option<NodeReport>) {
         match report {
             None => {
@@ -5536,7 +5534,7 @@ impl ClusterManager {
                         info!(node = %name, "skipping hold-cap drain: node changed since the health pass");
                         continue;
                     }
-                    warn!(node = %name, reason = %reason, "node drained: jobs the controller ended were not released within the hold cap");
+                    warn!(node = %name, reason = %reason, "node drained: no clean job report within the recovery hold cap");
                     // Admin-locked so it will not auto-recover; an operator clears
                     // it with `scontrol update state=resume` once the node is sound.
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
@@ -9748,7 +9746,7 @@ impl ClusterManager {
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.capabilities = capabilities.clone();
-                    // A stamp would recover a Down node at the next pass, on any
+                    // A stamp would recover a Down or Error node at the next pass, on any
                     // leader or after replay, before a heartbeat reports its jobs.
                     if !matches!(node.state, NodeState::Down | NodeState::Error) {
                         node.last_heartbeat = Some(Utc::now());
@@ -12144,9 +12142,8 @@ pub(crate) enum HealthAction {
         name: String,
         old_state: NodeState,
     },
-    /// A returning node that never released jobs the controller ended within the
-    /// hold cap: drained (admin-locked) with `reason` so an operator resumes it,
-    /// rather than recovered with processes that would not die.
+    /// A returning node with no clean job report within the hold cap: drained
+    /// (admin-locked) with `reason` for an operator to resume, not recovered.
     Drain {
         name: String,
         old_state: NodeState,
@@ -12274,7 +12271,7 @@ pub(crate) fn stale_nodes_at(
     }
 }
 
-const HOLD_RELEASE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+const HOLD_CAP_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a node may report ended jobs before it is drained. A node still
 /// killing, cleaning up, or running an epilog gets that whole budget plus one
@@ -12302,9 +12299,8 @@ pub(crate) enum NodeReport {
 }
 
 /// Withholds recovery from nodes that did not report clean, so nothing new lands
-/// beside jobs the reclaim cancel has not stopped. `holds` keeps when each hold
-/// began; past `cap` the node is drained for an operator instead, so a job that
-/// will not die neither keeps it Down forever nor gets new work beside it.
+/// beside jobs the reclaim cancel has not stopped. Past `cap` the node is drained
+/// instead, so a job that will not die does not keep it Down forever.
 pub(crate) fn withhold_recoveries(
     actions: &mut Vec<HealthAction>,
     reporting_stale: &HashMap<String, NodeReport>,
@@ -12329,31 +12325,36 @@ pub(crate) fn withhold_recoveries(
         let held_for = now.saturating_duration_since(since);
         // Passes land on a fixed tick, so the one due exactly at the cap can run a
         // hair early; the slack keeps the decision from slipping a whole pass.
-        if held_for + HOLD_RELEASE_SLACK < cap {
-            info!(node = %name, "holding node recovery until it releases jobs the controller ended");
+        if held_for + HOLD_CAP_SLACK < cap {
+            info!(node = %name, "holding node recovery until it reports a clean job list");
             continue;
         }
-        // Past the cap and still not a clean report: drain it for an operator
-        // instead of recovering with jobs that would not die.
-        let reason = match report {
-            NodeReport::StaleJobs(ids) => {
-                let ids = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                format!("Kill task failed (JobId={ids})")
-            }
-            NodeReport::Unknown => "Agent job list unavailable".to_string(),
-        };
-        warn!(
-            node = %name,
-            held_secs = held_for.as_secs(),
-            reason = %reason,
-            "draining a node that did not release jobs the controller ended within the hold cap"
-        );
         actions.push(HealthAction::Drain {
             name,
             old_state,
-            reason,
+            reason: drain_reason(report),
         });
     }
+}
+
+/// Job ids named in a `Kill task failed` reason, so `scontrol show node` stays readable.
+const DRAIN_REASON_MAX_JOB_IDS: usize = 5;
+
+pub(crate) fn drain_reason(report: &NodeReport) -> String {
+    let ids = match report {
+        NodeReport::StaleJobs(ids) => ids,
+        NodeReport::Unknown => return "Agent job list unavailable".to_string(),
+    };
+    let mut listed: Vec<String> = ids
+        .iter()
+        .take(DRAIN_REASON_MAX_JOB_IDS)
+        .map(u32::to_string)
+        .collect();
+    let more = ids.len().saturating_sub(DRAIN_REASON_MAX_JOB_IDS);
+    if more > 0 {
+        listed.push(format!("+{more} more"));
+    }
+    format!("Kill task failed (JobId={})", listed.join(","))
 }
 
 pub(crate) fn evaluate_node_health(
@@ -36233,6 +36234,20 @@ state = "UP"
         super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, started + cap);
 
         assert_eq!(actions, vec![drain("stuck", "Agent job list unavailable")]);
+    }
+
+    #[test]
+    fn a_drain_reason_lists_up_to_five_job_ids() {
+        let reason = super::drain_reason(&super::NodeReport::StaleJobs(vec![1, 2, 3, 4, 5]));
+
+        assert_eq!(reason, "Kill task failed (JobId=1,2,3,4,5)");
+    }
+
+    #[test]
+    fn a_drain_reason_counts_the_job_ids_past_the_first_five() {
+        let reason = super::drain_reason(&super::NodeReport::StaleJobs((1..=8).collect()));
+
+        assert_eq!(reason, "Kill task failed (JobId=1,2,3,4,5,+3 more)");
     }
 
     #[test]

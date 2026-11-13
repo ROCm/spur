@@ -357,7 +357,8 @@ pub struct ControllerConfig {
 
     /// Seconds without a heartbeat before the leader checks on a node. A node
     /// whose agent still answers is kept; one that fails two checks a health
-    /// pass apart is marked Down. Defaults to 90 when absent.
+    /// pass apart is marked Down. Defaults to 90 when absent. Also the
+    /// shortest recovery hold before a node still reporting ended jobs is drained.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 

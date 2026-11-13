@@ -81,9 +81,8 @@ class TestRequeuedRunReclaim:
                 assert pid_alive(node, old_pid), "the run outlives its node going Down"
 
             wait_node_state(cluster, name, ["idle", "mix", "alloc"], timeout=NODE_RECOVERY_BOUND)
-            wait_until(
-                lambda: not pid_alive(node, old_pid),
-                timeout_s=RECLAIM_BOUND, desc="the requeued job's old run to be stopped",
+            assert not pid_alive(node, old_pid), (
+                "the node returned to service while the requeued job's old run was still alive"
             )
             assert job_state(cluster.squeue_all(), job_id) == "PD", (
                 "the job itself stays queued; only its stale run is released"
