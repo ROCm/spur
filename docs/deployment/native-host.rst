@@ -108,10 +108,14 @@ The two daemons are configured with command-line flags. The most common are belo
      - Directory for this agent's own persisted runtime state (job supervisor
        sessions that survive an ``spurd`` restart). Falls back to
        ``[controller] state_dir`` from the config file. Also settable via
-       ``SPUR_STEPD_STATE_DIR``. Sessions live in a ``runtime/`` subdirectory
-       the agent owns, so sharing the controller's directory is safe and is the
-       default. Give each ``spurd`` its own path when co-locating multiple
-       agents on one host (e.g. dev/test setups) — two agents must not share one.
+       ``SPUR_STEPD_STATE_DIR``. A root ``spurd`` reads each session's launch
+       spec from the ``runtime/`` subdirectory here and runs it as root, so this
+       directory must be root-owned and not writable by others — ``spurd`` warns
+       at startup when it is not (see :ref:`spool root ownership
+       <spool-root-ownership>`). Do not point
+       it at a directory a non-root ``spurctld`` owns; give ``spurctld`` its own
+       ``--state-dir`` and keep this one root-owned. Give each ``spurd`` its own
+       path when co-locating multiple agents on one host — two must not share one.
    * - ``--log-level <LEVEL>``
      - ``info``
      - Log verbosity.
@@ -311,6 +315,26 @@ Enable and start it:
 
    systemctl daemon-reload
    systemctl enable --now spurctld
+
+.. _spool-root-ownership:
+
+.. note::
+
+   On a node that also runs a root ``spurd``, ``/var/spool/spur`` holds every job's
+   spool folder and, in its ``runtime/`` subdirectory, each supervisor's launch spec
+   (the uid and script root runs). Keep it owned by root and not writable by group or
+   others: the account that can write it can swap a job's folder or a launch spec and
+   so act as root on that node. ``spurd`` logs a warning at startup when the spool root
+   or its ``--state-dir`` is not. To run ``spurctld`` as an unprivileged user on such a
+   node, give it its own state directory instead of handing it ``/var/spool/spur``:
+
+   .. code-block:: bash
+
+      sudo install -d -o spur -g spur -m 700 /var/lib/spur
+      spurctld -f /etc/spur/spur.conf --state-dir /var/lib/spur
+
+   An existing controller keeps its Raft log in ``<state-dir>/raft``; stop it and move
+   that directory to the new location before restarting with the new ``--state-dir``.
 
 .. _spurctld-fatal-raft-error:
 

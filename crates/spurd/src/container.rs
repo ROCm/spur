@@ -14,6 +14,7 @@
 //! - NVIDIA: bind-mount /dev/nvidia* + libnvidia-container or driver libs
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -471,61 +472,112 @@ pub fn cleanup_rootfs(base: &str, mode: &RootfsMode) {
 }
 
 /// Creates a file or directory at the mount-point destination to match the
-/// source type — bind mounts require the target to already exist.
-pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow::Result<()> {
-    let dest = rootfs.join(target.trim_start_matches('/'));
-    if source.is_dir() {
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("creating mount target dir {}", dest.display()))?;
+/// source type — bind mounts require the target to already exist. Returns a
+/// handle to it, which a mount through [`fd_path`] cannot be redirected from.
+pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow::Result<OwnedFd> {
+    let root = crate::scratch::ScratchDir::open(rootfs)
+        .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
+    let kind = if source.is_dir() {
+        crate::scratch::MountPoint::Dir
     } else {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent dirs for {}", dest.display()))?;
-        }
-        if !dest.exists() {
-            std::fs::File::create(&dest)
-                .with_context(|| format!("creating mount target file {}", dest.display()))?;
-        }
-    }
-    Ok(())
+        crate::scratch::MountPoint::File
+    };
+    crate::scratch::open_mount_point(&root, Path::new(target), kind)
+        .with_context(|| format!("creating mount target {target} in {}", rootfs.display()))
+}
+
+/// A path the kernel resolves to `point` itself, so a mount through it lands
+/// there whatever has since been renamed or linked along the way it was found.
+fn fd_path(point: &impl AsFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", point.as_fd().as_raw_fd()))
 }
 
 fn bind_mount(rootfs: &Path, source: &Path, target: &str, readonly: bool) -> anyhow::Result<()> {
-    create_mount_target(rootfs, target, source)?;
-    let dest = rootfs.join(target.trim_start_matches('/'));
+    let point = create_mount_target(rootfs, target, source)?;
     nix::mount::mount(
         Some(source),
-        &dest,
+        &fd_path(&point),
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     )
-    .with_context(|| format!("bind mount {} -> {}", source.display(), dest.display()))?;
+    .with_context(|| format!("bind mount {} -> {target}", source.display()))?;
 
     if readonly {
+        // `point` still names what lies beneath the new mount; reopening the
+        // target lands on the mount itself, which is what has to turn read-only.
+        let mounted = create_mount_target(rootfs, target, source)?;
         nix::mount::mount(
             None::<&str>,
-            &dest,
+            &fd_path(&mounted),
             None::<&str>,
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
         )
-        .with_context(|| format!("remount readonly {}", dest.display()))?;
+        .with_context(|| format!("remount readonly {target}"))?;
     }
     Ok(())
 }
 
+/// Reopen `name` now that a mount sits on it. Anything renamed in under that name
+/// since lives on `parent`'s own filesystem, so it is refused rather than filled.
+fn open_fresh_mount(
+    parent: &crate::scratch::ScratchDir,
+    name: &str,
+) -> std::io::Result<crate::scratch::ScratchDir> {
+    let mounted = parent.subdir(std::ffi::OsStr::new(name), 0o755)?;
+    if mounted.device()? == parent.device()? {
+        return Err(std::io::Error::other(format!(
+            "{} is not the mount just made",
+            mounted.path().display()
+        )));
+    }
+    Ok(mounted)
+}
+
+/// The folders the container's pseudo-filesystems mount onto.
+struct PseudoFsDirs {
+    root: crate::scratch::ScratchDir,
+    proc: crate::scratch::ScratchDir,
+    sys: crate::scratch::ScratchDir,
+    dev: crate::scratch::ScratchDir,
+    run: crate::scratch::ScratchDir,
+}
+
+/// The image is the user's, so a linked one of these refuses the container
+/// rather than letting root create or mount through the link.
+fn prepare_pseudo_fs_dirs(rootfs: &Path) -> anyhow::Result<PseudoFsDirs> {
+    let root = crate::scratch::ScratchDir::open(rootfs)
+        .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
+    let prepare = |name: &str, mode: u32| {
+        root.subdir(std::ffi::OsStr::new(name), mode)
+            .with_context(|| format!("prepare /{name} in the container rootfs"))
+    };
+    let (proc, sys, dev, run) = (
+        prepare("proc", 0o755)?,
+        prepare("sys", 0o755)?,
+        prepare("dev", 0o755)?,
+        prepare("run", 0o755)?,
+    );
+    prepare("tmp", 0o1777)?;
+    prepare("etc", 0o755)?;
+    Ok(PseudoFsDirs {
+        root,
+        proc,
+        sys,
+        dev,
+        run,
+    })
+}
+
 /// Set up /proc, /sys, /dev, and /run inside the container rootfs.
 pub fn mount_filesystems(rootfs: &Path) -> anyhow::Result<()> {
-    let dirs = ["dev", "proc", "sys", "tmp", "etc", "run"];
-    for d in &dirs {
-        std::fs::create_dir_all(rootfs.join(d)).ok();
-    }
+    let dirs = prepare_pseudo_fs_dirs(rootfs)?;
 
     // /proc
     nix::mount::mount(
         Some("proc"),
-        &rootfs.join("proc"),
+        &fd_path(&dirs.proc),
         Some("proc"),
         MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         None::<&str>,
@@ -535,7 +587,7 @@ pub fn mount_filesystems(rootfs: &Path) -> anyhow::Result<()> {
     // /sys (read-only)
     nix::mount::mount(
         Some("sysfs"),
-        &rootfs.join("sys"),
+        &fd_path(&dirs.sys),
         Some("sysfs"),
         MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RDONLY,
         None::<&str>,
@@ -545,80 +597,101 @@ pub fn mount_filesystems(rootfs: &Path) -> anyhow::Result<()> {
     // /dev (tmpfs, mode=755)
     nix::mount::mount(
         Some("tmpfs"),
-        &rootfs.join("dev"),
+        &fd_path(&dirs.dev),
         Some("tmpfs"),
         MsFlags::MS_NOEXEC | MsFlags::MS_STRICTATIME,
         Some("mode=755"),
     )
     .context("mount /dev tmpfs")?;
-
-    // /dev/pts
-    let devpts = rootfs.join("dev/pts");
-    std::fs::create_dir_all(&devpts).ok();
-    nix::mount::mount(
-        Some("devpts"),
-        &devpts,
-        Some("devpts"),
-        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID,
-        Some("newinstance,ptmxmode=0666,mode=620"),
-    )
-    .unwrap_or_else(|e| warn!(error = %e, "mount devpts (non-critical)"));
-
-    // /dev/shm
-    let devshm = rootfs.join("dev/shm");
-    std::fs::create_dir_all(&devshm).ok();
-    nix::mount::mount(
-        Some("tmpfs"),
-        &devshm,
-        Some("tmpfs"),
-        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some("mode=1777,size=50%"),
-    )
-    .unwrap_or_else(|e| warn!(error = %e, "mount /dev/shm (non-critical)"));
+    let dev = open_fresh_mount(&dirs.root, "dev").context("open the container's /dev tmpfs")?;
+    populate_dev(&dev);
 
     // /run
     nix::mount::mount(
         Some("tmpfs"),
-        &rootfs.join("run"),
+        &fd_path(&dirs.run),
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=755"),
     )
     .unwrap_or_else(|e| warn!(error = %e, "mount /run (non-critical)"));
 
+    Ok(())
+}
+
+/// Only this mount namespace sees the fresh /dev tmpfs, so once it is held as
+/// `dev`, nothing in it can have been planted or swapped.
+fn populate_dev(dev: &crate::scratch::ScratchDir) {
+    for (name, fstype, flags, data) in [
+        (
+            "pts",
+            "devpts",
+            MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID,
+            "newinstance,ptmxmode=0666,mode=620",
+        ),
+        (
+            "shm",
+            "tmpfs",
+            MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            "mode=1777,size=50%",
+        ),
+    ] {
+        let mounted = dev
+            .subdir(std::ffi::OsStr::new(name), 0o755)
+            .map_err(anyhow::Error::from)
+            .and_then(|dir| {
+                Ok(nix::mount::mount(
+                    Some(fstype),
+                    &fd_path(&dir),
+                    Some(fstype),
+                    flags,
+                    Some(data),
+                )?)
+            });
+        if let Err(e) = mounted {
+            warn!(error = %e, "mount /dev/{name} (non-critical)");
+        }
+    }
+
     // Essential device nodes — bind-mount from host
-    for dev in &["null", "zero", "full", "random", "urandom", "tty"] {
-        let host = PathBuf::from(format!("/dev/{}", dev));
-        let target = rootfs.join(format!("dev/{}", dev));
-        if host.exists() {
-            if !target.exists() {
-                std::fs::File::create(&target).ok();
-            }
-            nix::mount::mount(
+    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+        let host = Path::new("/dev").join(name);
+        if !host.exists() {
+            continue;
+        }
+        let bound = crate::scratch::open_mount_point(
+            dev,
+            Path::new(name),
+            crate::scratch::MountPoint::File,
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(|node| {
+            Ok(nix::mount::mount(
                 Some(&host),
-                &target,
+                &fd_path(&node),
                 None::<&str>,
                 MsFlags::MS_BIND,
                 None::<&str>,
-            )
-            .unwrap_or_else(|e| warn!(dev, error = %e, "bind mount /dev device"));
+            )?)
+        });
+        if let Err(e) = bound {
+            warn!(dev = name, error = %e, "bind mount /dev device");
         }
     }
 
     // /dev/console — only if a tty is attached
-    let console = rootfs.join("dev/console");
-    if !console.exists() {
-        std::fs::File::create(&console).ok();
+    crate::scratch::open_mount_point(dev, Path::new("console"), crate::scratch::MountPoint::File)
+        .ok();
+
+    for (target, name) in [
+        ("/proc/self/fd", "fd"),
+        ("/proc/self/fd/0", "stdin"),
+        ("/proc/self/fd/1", "stdout"),
+        ("/proc/self/fd/2", "stderr"),
+        ("/dev/pts/ptmx", "ptmx"),
+    ] {
+        dev.symlink(target, name).ok();
     }
-
-    let dev = rootfs.join("dev");
-    std::os::unix::fs::symlink("/proc/self/fd", dev.join("fd")).ok();
-    std::os::unix::fs::symlink("/proc/self/fd/0", dev.join("stdin")).ok();
-    std::os::unix::fs::symlink("/proc/self/fd/1", dev.join("stdout")).ok();
-    std::os::unix::fs::symlink("/proc/self/fd/2", dev.join("stderr")).ok();
-    std::os::unix::fs::symlink("/dev/pts/ptmx", dev.join("ptmx")).ok();
-
-    Ok(())
 }
 
 /// Apply a registry-based container device injection plan.
@@ -744,14 +817,86 @@ nameserver 8.8.8.8\n";
     filtered.join("\n") + "\n"
 }
 
+/// Write a fresh container's entry script into its rootfs's `/tmp`, still
+/// reachable after pivot_root. The rootfs comes from a user's image, or a named
+/// container shared across jobs, so nothing in it may be followed.
+pub(crate) fn write_entry_script(
+    rootfs: &Path,
+    name: &str,
+    content: &str,
+) -> std::io::Result<PathBuf> {
+    let tmp = crate::scratch::open_dir_beneath(rootfs, Path::new("tmp"), 0o1777)?;
+    crate::scratch::write_scratch(
+        &tmp,
+        name,
+        content.as_bytes(),
+        crate::scratch::ScratchOwner::Daemon,
+        0o755,
+    )
+}
+
+/// The image is the user's, so a link at resolv.conf is replaced, not written through.
+fn write_resolv_conf(rootfs: &Path, content: &str) -> std::io::Result<()> {
+    let etc = crate::scratch::open_dir_beneath(rootfs, Path::new("etc"), 0o755)?;
+    crate::scratch::write_scratch(
+        &etc,
+        "resolv.conf",
+        content.as_bytes(),
+        crate::scratch::ScratchOwner::Daemon,
+        0o644,
+    )?;
+    Ok(())
+}
+
+/// These become whole lines of passwd and group, where a line break or ':'
+/// would let the job write entries of its own choosing.
+fn passwd_field_is_safe(value: &str) -> bool {
+    !value.chars().any(|c| c == ':' || c.is_control())
+}
+
+/// Add `line` to `etc/<name>` unless it already lists `account`. The file is
+/// replaced rather than appended to, so a link the image left there is never followed.
+fn add_account_line(
+    etc: &crate::scratch::ScratchDir,
+    name: &str,
+    account: &str,
+    line: &str,
+) -> anyhow::Result<()> {
+    let content = match crate::scratch::read_scratch(etc, name) {
+        Ok(content) => String::from_utf8_lossy(&content).into_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read the container's /etc/{name}"))
+        }
+    };
+    if content
+        .lines()
+        .any(|existing| existing.starts_with(&format!("{account}:")))
+    {
+        return Ok(());
+    }
+    let mut updated = content;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(line);
+    crate::scratch::write_scratch(
+        etc,
+        name,
+        updated.as_bytes(),
+        crate::scratch::ScratchOwner::Daemon,
+        0o644,
+    )
+    .with_context(|| format!("write the container's /etc/{name}"))?;
+    Ok(())
+}
+
 /// Inject DNS/NSS config into the container, skipping any the user already mounted.
 pub fn mount_dns(rootfs: &Path, user_mounts: &[BindMount]) -> anyhow::Result<()> {
     let user_mounted = |target: &str| user_mounts.iter().any(|m| m.target == target);
 
     if !user_mounted("/etc/resolv.conf") {
-        std::fs::create_dir_all(rootfs.join("etc")).ok();
-        let cleaned = build_container_resolv_conf();
-        std::fs::write(rootfs.join("etc/resolv.conf"), &cleaned)
+        write_resolv_conf(rootfs, &build_container_resolv_conf())
             .unwrap_or_else(|e| warn!(error = %e, "failed to write container resolv.conf"));
     }
 
@@ -774,38 +919,38 @@ pub fn mount_dns(rootfs: &Path, user_mounts: &[BindMount]) -> anyhow::Result<()>
 /// Only appends if the user doesn't already exist. Creates the home
 /// directory inside the rootfs if it doesn't exist.
 pub fn setup_shadow(rootfs: &Path, config: &ContainerConfig) -> anyhow::Result<()> {
-    let passwd = rootfs.join("etc/passwd");
-    if passwd.is_file() {
-        let content = std::fs::read_to_string(&passwd).unwrap_or_default();
-        let has_user = content
-            .lines()
-            .any(|l| l.starts_with(&format!("{}:", config.username)));
-        if !has_user {
-            let entry = format!(
-                "{}:x:{}:{}::{}:/bin/bash\n",
-                config.username, config.uid, config.gid, config.home_dir
-            );
-            let mut f = std::fs::OpenOptions::new().append(true).open(&passwd)?;
-            std::io::Write::write_all(&mut f, entry.as_bytes())?;
+    for (field, value) in [
+        ("user name", &config.username),
+        ("home directory", &config.home_dir),
+    ] {
+        if !passwd_field_is_safe(value) {
+            bail!("container {field} {value:?} cannot appear in /etc/passwd");
         }
     }
-
-    let group = rootfs.join("etc/group");
-    if group.is_file() {
-        let content = std::fs::read_to_string(&group).unwrap_or_default();
-        let has_group = content
-            .lines()
-            .any(|l| l.starts_with(&format!("{}:", config.username)));
-        if !has_group {
-            let entry = format!("{}:x:{}:\n", config.username, config.gid);
-            let mut f = std::fs::OpenOptions::new().append(true).open(&group)?;
-            std::io::Write::write_all(&mut f, entry.as_bytes())?;
-        }
-    }
+    let etc = crate::scratch::open_dir_beneath(rootfs, Path::new("etc"), 0o755)
+        .context("open the container's /etc")?;
+    let user = &config.username;
+    add_account_line(
+        &etc,
+        "passwd",
+        user,
+        &format!(
+            "{user}:x:{}:{}::{}:/bin/bash\n",
+            config.uid, config.gid, config.home_dir
+        ),
+    )?;
+    add_account_line(&etc, "group", user, &format!("{user}:x:{}:\n", config.gid))?;
 
     // Ensure home directory exists inside rootfs
-    let home = rootfs.join(config.home_dir.trim_start_matches('/'));
-    std::fs::create_dir_all(&home).ok();
+    crate::scratch::ScratchDir::open(rootfs)
+        .and_then(|root| {
+            crate::scratch::open_mount_point(
+                &root,
+                Path::new(&config.home_dir),
+                crate::scratch::MountPoint::Dir,
+            )
+        })
+        .ok();
 
     Ok(())
 }
@@ -816,16 +961,30 @@ pub fn setup_shadow(rootfs: &Path, config: &ContainerConfig) -> anyhow::Result<(
 /// Hooks can inject env vars by appending KEY=VALUE lines to the file at
 /// $SPUR_HOOK_ENVIRON (also available as $ENROOT_ENVIRON for compatibility).
 pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
+    run_hooks_from(Path::new("/etc/spur/container.d"), rootfs)
+}
+
+const HOOK_ENVIRON: &str = ".spur_hook_environ";
+
+fn run_hooks_from(container_d: &Path, rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
     let mut extra_env = HashMap::new();
 
-    // Shared env file for hooks to write KEY=VALUE lines into
-    let hook_env_file = rootfs.join("tmp/.spur_hook_environ");
-
-    let hooks_dir = Path::new("/etc/spur/container.d/hooks.d");
+    let hooks_dir = container_d.join("hooks.d");
     if hooks_dir.is_dir() {
-        std::fs::write(&hook_env_file, "").ok();
+        // Shared env file for hooks to write KEY=VALUE lines into. Root's hooks
+        // open it by name, so it lives where only root can replace it.
+        let host_tmp = crate::scratch::ScratchDir::open(&std::env::temp_dir())
+            .context("open the host temp directory for the hook environment")?;
+        let env_name = format!("{HOOK_ENVIRON}.{}", uuid::Uuid::new_v4().simple());
+        crate::scratch::open_scratch_output(
+            &host_tmp,
+            &env_name,
+            crate::scratch::ScratchOwner::Daemon,
+        )
+        .context("create the hook environment file")?;
+        let hook_env_file = host_tmp.join(&env_name);
 
-        if let Ok(mut entries) = std::fs::read_dir(hooks_dir) {
+        if let Ok(mut entries) = std::fs::read_dir(&hooks_dir) {
             let mut scripts: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
@@ -851,8 +1010,8 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
             }
         }
 
-        if let Ok(content) = std::fs::read_to_string(&hook_env_file) {
-            for line in content.lines() {
+        if let Ok(content) = crate::scratch::read_scratch(&host_tmp, &env_name) {
+            for line in String::from_utf8_lossy(&content).lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
@@ -862,13 +1021,13 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
                 }
             }
         }
-        std::fs::remove_file(&hook_env_file).ok();
+        crate::scratch::unlink_scratch(&host_tmp, &env_name).ok();
     }
 
     // environ.d — parse KEY=VALUE lines and return them
-    let environ_dir = Path::new("/etc/spur/container.d/environ.d");
+    let environ_dir = container_d.join("environ.d");
     if environ_dir.is_dir() {
-        if let Ok(mut entries) = std::fs::read_dir(environ_dir) {
+        if let Ok(mut entries) = std::fs::read_dir(&environ_dir) {
             let mut files: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
@@ -894,9 +1053,9 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
     }
 
     // mounts.d — parse fstab-style "src dst" lines, mount with source-type detection
-    let mounts_dir = Path::new("/etc/spur/container.d/mounts.d");
+    let mounts_dir = container_d.join("mounts.d");
     if mounts_dir.is_dir() {
-        if let Ok(mut entries) = std::fs::read_dir(mounts_dir) {
+        if let Ok(mut entries) = std::fs::read_dir(&mounts_dir) {
             let mut files: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
@@ -1146,6 +1305,63 @@ pub fn container_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_entry_script_lands_in_the_rootfs_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
+
+        let path = write_entry_script(rootfs.path(), "spur_job_7.sh", "#!/bin/bash\ntrue\n")
+            .expect("write entry script");
+
+        assert_eq!(path, rootfs.path().join("tmp/spur_job_7.sh"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/bash\ntrue\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    // An image is user-supplied, so an absolute link inside it resolves against
+    // the host when root writes before pivot_root.
+    #[test]
+    fn an_entry_script_never_follows_a_symlinked_tmp() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join("tmp")).unwrap();
+
+        let error = write_entry_script(rootfs.path(), "spur_job_7.sh", "x")
+            .expect_err("a linked /tmp must not be followed");
+
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+    }
+
+    // A named container's /tmp outlives the job that wrote to it, so anyone
+    // who ran in it can leave a link at the next script's name.
+    #[test]
+    fn an_entry_script_replaces_a_link_planted_at_its_name() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("profile.sh");
+        std::fs::write(&target, "ORIGINAL").unwrap();
+        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
+        std::os::unix::fs::symlink(&target, rootfs.path().join("tmp/spur_job_7.sh")).unwrap();
+
+        let path = write_entry_script(rootfs.path(), "spur_job_7.sh", "#!/bin/bash\n")
+            .expect("write entry script");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ORIGINAL");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+    }
     use std::sync::{Mutex, MutexGuard};
 
     /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
@@ -1550,6 +1766,203 @@ mod tests {
         let target = rootfs.path().join("dev/link");
         assert!(target.exists(), "target file must exist for symlink source");
         assert!(target.is_file(), "target must be a file, not directory");
+    }
+
+    // The image is the user's, so its links are followed as the container will
+    // see them: inside the rootfs, never out to the host.
+    #[test]
+    fn a_mount_target_behind_an_image_link_stays_inside_the_image() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join("mnt")).unwrap();
+
+        create_mount_target(rootfs.path(), "/mnt/data", source.path()).unwrap();
+
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+        let inside = rootfs.path().join(host.path().strip_prefix("/").unwrap());
+        assert!(inside.join("data").is_dir());
+    }
+
+    #[test]
+    fn a_file_mount_target_behind_an_image_link_stays_inside_the_image() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("nologin");
+        std::fs::create_dir(rootfs.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink(&target, rootfs.path().join("etc/hosts")).unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+
+        create_mount_target(rootfs.path(), "/etc/hosts", source.path()).unwrap();
+
+        assert!(!target.exists(), "no file may appear where the link points");
+        assert!(rootfs
+            .path()
+            .join(target.strip_prefix("/").unwrap())
+            .is_file());
+    }
+
+    #[test]
+    fn a_mount_target_cannot_climb_out_of_the_rootfs() {
+        let parent = tempfile::tempdir().unwrap();
+        let rootfs = parent.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let source = tempfile::tempdir().unwrap();
+
+        create_mount_target(&rootfs, "/../escape", source.path()).unwrap();
+
+        assert!(!parent.path().join("escape").exists());
+        assert!(rootfs.join("escape").is_dir());
+    }
+
+    // Merged-/usr images reach /lib, /bin and /sbin through relative links, which
+    // mounts beneath them must keep following.
+    #[test]
+    fn a_mount_target_follows_the_images_own_relative_links() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", rootfs.path().join("lib")).unwrap();
+        let source = tempfile::tempdir().unwrap();
+
+        create_mount_target(rootfs.path(), "/lib/modules", source.path()).unwrap();
+
+        assert!(rootfs.path().join("usr/lib/modules").is_dir());
+    }
+
+    #[test]
+    fn a_folder_that_was_not_just_mounted_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("dev")).unwrap();
+        let root = crate::scratch::ScratchDir::open(rootfs.path()).unwrap();
+
+        assert!(open_fresh_mount(&root, "dev").is_err());
+    }
+
+    #[test]
+    fn pseudo_filesystem_dirs_are_never_prepared_through_a_link() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join("run")).unwrap();
+
+        assert!(prepare_pseudo_fs_dirs(rootfs.path()).is_err());
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn pseudo_filesystem_dirs_are_created_when_the_image_lacks_them() {
+        let rootfs = tempfile::tempdir().unwrap();
+        prepare_pseudo_fs_dirs(rootfs.path()).unwrap();
+        for dir in ["dev", "proc", "sys", "tmp", "etc", "run"] {
+            assert!(rootfs.path().join(dir).is_dir(), "{dir}");
+        }
+    }
+
+    #[test]
+    fn resolv_conf_replaces_a_link_in_the_image() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host_file = host.path().join("shadow");
+        std::fs::write(&host_file, "ORIGINAL").unwrap();
+        std::fs::create_dir(rootfs.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink(&host_file, rootfs.path().join("etc/resolv.conf")).unwrap();
+
+        write_resolv_conf(rootfs.path(), "nameserver 10.0.0.1\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&host_file).unwrap(), "ORIGINAL");
+        assert_eq!(
+            std::fs::read_to_string(rootfs.path().join("etc/resolv.conf")).unwrap(),
+            "nameserver 10.0.0.1\n"
+        );
+    }
+
+    // Hooks run as root and open their env file by name, so it must sit where
+    // the job's user cannot swap it for a link, which the rootfs is not.
+    #[test]
+    fn the_hook_environ_file_lives_outside_the_rootfs() {
+        let container_d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(container_d.path().join("hooks.d")).unwrap();
+        std::fs::write(
+            container_d.path().join("hooks.d/10-env.sh"),
+            "echo FOO=bar >> \"$SPUR_HOOK_ENVIRON\"\n\
+             echo SEEN=$SPUR_HOOK_ENVIRON >> \"$SPUR_HOOK_ENVIRON\"\n",
+        )
+        .unwrap();
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host_file = host.path().join("shadow");
+        std::fs::write(&host_file, "ORIGINAL").unwrap();
+        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
+        std::os::unix::fs::symlink(&host_file, rootfs.path().join("tmp/.spur_hook_environ"))
+            .unwrap();
+
+        let env = run_hooks_from(container_d.path(), rootfs.path()).unwrap();
+
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        let seen = Path::new(&env["SEEN"]);
+        assert!(!seen.starts_with(rootfs.path()), "{}", seen.display());
+        assert!(!seen.exists(), "the env file is removed once read");
+        assert_eq!(std::fs::read_to_string(&host_file).unwrap(), "ORIGINAL");
+    }
+
+    fn shadow_config(username: &str, home_dir: &str) -> ContainerConfig {
+        ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: username.into(),
+            home_dir: home_dir.into(),
+            device_plan: None,
+        }
+    }
+
+    #[test]
+    fn account_files_are_never_appended_through_a_link() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host_passwd = host.path().join("passwd");
+        std::fs::write(&host_passwd, "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+        std::fs::create_dir(rootfs.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink(&host_passwd, rootfs.path().join("etc/passwd")).unwrap();
+
+        assert!(setup_shadow(rootfs.path(), &shadow_config("alice", "/home/alice")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&host_passwd).unwrap(),
+            "root:x:0:0:root:/root:/bin/bash\n"
+        );
+    }
+
+    // These become whole lines of passwd and group, so a line break in them
+    // would let the job write accounts of its own choosing.
+    #[test]
+    fn a_home_dir_that_would_break_the_passwd_line_is_rejected() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+        let home = "/home/alice\nevil::0:0::/root:/bin/bash";
+
+        assert!(setup_shadow(rootfs.path(), &shadow_config("alice", home)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(etc.join("passwd")).unwrap(),
+            "root:x:0:0:root:/root:/bin/bash\n"
+        );
+    }
+
+    #[test]
+    fn passwd_fields_cannot_carry_a_line_break_or_a_separator() {
+        assert!(passwd_field_is_safe("/home/alice"));
+        assert!(!passwd_field_is_safe("/home/alice\nevil"));
+        assert!(!passwd_field_is_safe("/home/a:b"));
     }
 
     // --- setup_shadow ---

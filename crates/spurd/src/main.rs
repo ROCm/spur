@@ -115,6 +115,41 @@ fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
     }
 }
 
+/// Directories a root spurd reads and then acts on: the job spool root (scripts,
+/// wrappers) and the supervisor state dir (its `runtime/<session>/launch.json`
+/// names the uid and script root runs). Whoever can write one can act as root here.
+fn log_root_trusted_dirs(stepd_state_dir: &std::path::Path) {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let spool_root = spurd::executor::job_spool_root();
+    warn_if_untrusted(spool_root, "the job spool root");
+    // runtime/ here holds the launch specs root runs; renaming it aside needs
+    // only write access to this parent, so root owning runtime/ itself is not
+    // enough — this parent needs the same ownership as the spool root.
+    if stepd_state_dir != spool_root {
+        warn_if_untrusted(stepd_state_dir, "the supervisor state directory");
+    }
+}
+
+fn warn_if_untrusted(path: &std::path::Path, what: &str) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if spurd::executor::spool_root_is_trusted(metadata.uid(), metadata.mode()) {
+        return;
+    }
+    warn!(
+        path = %path.display(),
+        owner_uid = metadata.uid(),
+        mode = format!("{:o}", metadata.mode() & 0o7777),
+        "{what} is not root-owned or is writable by others, so that account can act as root \
+         on this node; make it root-owned 0755 and give spurctld its own --state-dir"
+    );
+}
+
 /// Whether a best-effort config load failed only because no file exists at the default
 /// path, which is the expected shape for an agent configured entirely by flags.
 ///
@@ -669,6 +704,7 @@ async fn main() -> anyhow::Result<()> {
     };
     log_memlock_status(limits.memlock);
     log_cgroup_status(&cgroup_config);
+    log_root_trusted_dirs(std::path::Path::new(&stepd_state_dir));
     let cluster_config = config
         .as_ref()
         .map(|c| c.cluster.clone())
@@ -727,9 +763,9 @@ async fn main() -> anyhow::Result<()> {
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
-    // stepd_state_dir is shared with spurctld's own state_dir when the operator
-    // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
-    // exclusively spurd's — use the runtime/ subdir spurd already owns.
+    // Shared with spurctld's state_dir unless --state-dir is set, so spurd owns
+    // only the runtime/ subdir here; the parent must still be root-owned (see
+    // log_root_trusted_dirs), or whoever owns it can swap in their own runtime/.
     stepd::create_private_dir_all(stepds.root())?;
     // Saved only now: the registration above is the first controller ack, and
     // the runtime dir may not have existed before this point.

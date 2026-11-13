@@ -1222,9 +1222,14 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Records why a launch never produced a workload, on the node and to the user.
+/// `uid`/`gid` own the `--error` stream: it is the user's own path, so it is
+/// opened as the user, never as the root supervisor that could be steered
+/// through a symlink into a file the user cannot write.
 pub(crate) fn record_launch_failure(
     session_dir: &Path,
     stderr_path: &str,
+    uid: u32,
+    gid: u32,
     error: &dyn std::fmt::Display,
 ) {
     let failure_path = session_dir.join(FAILURE_FILE);
@@ -1232,17 +1237,17 @@ pub(crate) fn record_launch_failure(
         tracing::warn!(%write_error, path = %failure_path.display(),
             "failed to record stepd failure");
     }
-    // Only append to a stream the launch already opened: creating it here would
-    // leave a root-owned file the job's own user cannot read.
-    if stderr_path.is_empty() || !Path::new(stderr_path).exists() {
+    if stderr_path.is_empty() {
         return;
     }
-    match fs::OpenOptions::new().append(true).open(stderr_path) {
-        Ok(mut file) => {
-            let _ = writeln!(file, "spurstepd: {error}");
-        }
-        Err(write_error) => tracing::warn!(%write_error, stderr_path,
-            "failed to report a launch failure to the job's error stream"),
+    // As the job user: a stream the launch never opened stays absent, and a
+    // stream the user cannot write (a planted symlink) is refused, not followed.
+    let line = format!("spurstepd: {error}\n");
+    if let Err(write_error) =
+        crate::executor::append_as_user(uid, gid, stderr_path, line.as_bytes())
+    {
+        tracing::warn!(%write_error, stderr_path,
+            "failed to report a launch failure to the job's error stream");
     }
 }
 
@@ -2164,18 +2169,38 @@ fn apply_multi_rank_pmix(
         spec.script = wrapper;
         return Ok(());
     }
-    crate::executor::write_job_scratch(
-        std::path::Path::new(&pmix.wrapper_path),
-        &wrapper,
-        spec.uid,
-        spec.gid,
-    )
-    .map_err(|error| {
+    write_pmix_wrapper(spec, &pmix.wrapper_path, &wrapper).map_err(|error| {
         anyhow::anyhow!(
             "failed to write the PMIx rank wrapper at {}: {error}",
             pmix.wrapper_path
         )
     })
+}
+
+/// The path arrives in launch.json, so it is honoured only inside the job's own
+/// spool folder, where a planted name cannot redirect the write.
+fn write_pmix_wrapper(
+    spec: &StepdLaunchSpec,
+    wrapper_path: &str,
+    wrapper: &str,
+) -> anyhow::Result<()> {
+    let dir = crate::executor::create_job_spool_dir(spec.job_id, spec.uid, spec.gid)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let path = Path::new(wrapper_path);
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|_| path.parent() == Some(dir.path()))
+        .ok_or_else(|| anyhow::anyhow!("not in the job spool {}", dir.path().display()))?;
+    crate::executor::write_spool_scratch(
+        &dir,
+        name,
+        wrapper,
+        crate::executor::job_scratch_owner(spec.uid, spec.gid),
+        "write",
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(())
 }
 
 /// Whether a failed probe proves nobody is listening. Any other failure may be
@@ -2299,6 +2324,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
+    // Captured before `launch_spec` is consumed below: a failure reported after
+    // the launch still writes the user's error stream as the user.
+    let (fail_uid, fail_gid) = (launch_spec.uid, launch_spec.gid);
     let hooks = launch_spec.hooks.clone();
     let spank = load_runtime_spank(&launch_spec.plugstack_path);
     let hook_context = spur_core::hooks::HookContext {
@@ -2347,7 +2375,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // Nothing launched, so only the session's own artifacts need clearing
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
-            record_launch_failure(&session_dir, &stderr_path, &error);
+            record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
             if spur_core::step::owns_job_lifetime(step_id) {
                 crate::executor::cleanup_job_spool(job_id);
             } else {
@@ -2359,7 +2387,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // The workload never ran, so nothing will report an exit and the watchdog
     // synthesises a SIGKILL — record the real reason the way a failed spawn does.
     let cleanup_failed_launch = |error: &dyn std::fmt::Display| {
-        record_launch_failure(&session_dir, &stderr_path, error);
+        record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, error);
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
@@ -2512,7 +2540,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     };
     if let Err(error) = result {
         teardown(cgroup).await?;
-        record_launch_failure(&session_dir, &stderr_path, &error);
+        record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
         return Err(error.into());
     }
     let snapshot = session.snapshot().await;
@@ -4289,6 +4317,47 @@ mod tests {
         assert_eq!(spec.io_mode, crate::executor::LaunchIo::Pty);
     }
 
+    #[test]
+    fn a_pmix_wrapper_in_the_job_spool_is_written() {
+        let mut spec = launch_spec();
+        spec.job_id = 987_654_330;
+        let spool = crate::executor::create_job_spool_dir(spec.job_id, spec.uid, spec.gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+        let wrapper_path = spool.join("wrapper_0_3.sh");
+
+        write_pmix_wrapper(
+            &spec,
+            &wrapper_path.to_string_lossy(),
+            "#!/bin/bash\nexec true\n",
+        )
+        .expect("a wrapper in the job spool is written");
+
+        assert_eq!(
+            std::fs::read_to_string(&wrapper_path).unwrap(),
+            "#!/bin/bash\nexec true\n"
+        );
+        crate::executor::cleanup_job_spool(spec.job_id);
+    }
+
+    // The path arrives in launch.json, so it is honoured only where a planted
+    // name cannot redirect the write.
+    #[test]
+    fn a_pmix_wrapper_outside_the_job_spool_is_refused() {
+        let mut spec = launch_spec();
+        spec.job_id = 987_654_331;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let wrapper_path = elsewhere.path().join("wrapper_0_3.sh");
+
+        let written = write_pmix_wrapper(&spec, &wrapper_path.to_string_lossy(), "x");
+
+        assert!(
+            written.is_err(),
+            "a path outside the job spool must be refused"
+        );
+        assert!(!wrapper_path.exists());
+        crate::executor::cleanup_job_spool(spec.job_id);
+    }
+
     fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {
         StepdPmix {
             plan: spur_core::mpi::PmixLaunchPlan::local_tasks(
@@ -4309,7 +4378,7 @@ mod tests {
                 ..spur_core::config::MpiConfig::default()
             },
             user_script_path: "/tmp/.spur_user_42.sh".into(),
-            wrapper_path: "/tmp/.spur_step_42/wrapper_0_3.sh".into(),
+            wrapper_path: "/var/spool/spur/job42/wrapper_0_3.sh".into(),
         }
     }
 
@@ -4449,7 +4518,7 @@ mod tests {
                 ..spur_core::config::MpiConfig::default()
             },
             user_script_path: "/tmp/.spur_user_42.sh".into(),
-            wrapper_path: "/tmp/.spur_step_42/wrapper_0_3.sh".into(),
+            wrapper_path: "/var/spool/spur/job42/wrapper_0_3.sh".into(),
         });
 
         let restored: StepdLaunchSpec =
@@ -4463,7 +4532,7 @@ mod tests {
         assert_eq!(pmix.plan.local_procs.len(), 2);
         assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
         assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
-        assert_eq!(pmix.wrapper_path, "/tmp/.spur_step_42/wrapper_0_3.sh");
+        assert_eq!(pmix.wrapper_path, "/var/spool/spur/job42/wrapper_0_3.sh");
     }
 
     #[test]
@@ -5781,6 +5850,8 @@ mod tests {
         record_launch_failure(
             &session_dir,
             stderr_path.to_str().expect("utf-8 path"),
+            0,
+            0,
             &"failed to start the PMIx server: plugin not found",
         );
 
@@ -5807,6 +5878,8 @@ mod tests {
         record_launch_failure(
             &session_dir,
             stderr_path.to_str().expect("utf-8 path"),
+            0,
+            0,
             &"failed before the launch opened its streams",
         );
 
@@ -5826,7 +5899,7 @@ mod tests {
 
         assert_eq!(store.recorded_failure(21, 1, 4), None);
 
-        record_launch_failure(&session_dir, "", &"the node cannot host this plugin");
+        record_launch_failure(&session_dir, "", 0, 0, &"the node cannot host this plugin");
         assert_eq!(
             store.recorded_failure(21, 1, 4).as_deref(),
             Some("the node cannot host this plugin")
