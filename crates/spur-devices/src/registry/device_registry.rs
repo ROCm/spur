@@ -92,6 +92,33 @@ impl DeviceRegistry {
         Ok((host, container))
     }
 
+    /// The registry to inject from: `pinned` ids keep `previous`'s device even
+    /// where the new layout reuses the id; unreported `gres_name` ones drop.
+    pub fn with_pinned(
+        mut self,
+        previous: &DeviceRegistry,
+        gres_name: &str,
+        reported: &std::collections::HashSet<u64>,
+        pinned: &std::collections::HashSet<u64>,
+    ) -> DeviceRegistry {
+        // Exact name, as the reported inventory is built from it.
+        let is_gres = |e: &DeviceEntry| e.is_injectable() && e.gres_name == gres_name;
+        self.devices.retain(|e| {
+            !is_gres(e) || (reported.contains(&e.stable_id) && !pinned.contains(&e.stable_id))
+        });
+        let kept: Vec<DeviceEntry> = previous
+            .devices
+            .iter()
+            .filter(|e| is_gres(e) && pinned.contains(&e.stable_id))
+            .cloned()
+            .collect();
+        self.devices.extend(kept);
+        for (i, entry) in self.devices.iter_mut().enumerate() {
+            entry.index = i as u32;
+        }
+        self
+    }
+
     pub fn list(&self) -> &[DeviceEntry] {
         &self.devices
     }
@@ -135,6 +162,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         device_edits: expanded.device_edits.clone(),
         shared_edits: expanded.shared_edits.clone(),
         device_paths: expanded.device_paths.clone(),
+        topology: None,
         stable_id: 0,
     }
 }
@@ -160,6 +188,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         device_edits: Default::default(),
         shared_edits: Default::default(),
         device_paths: Vec::new(),
+        topology: None,
         stable_id: 0,
     }
 }
@@ -184,7 +213,11 @@ fn assign_device_ids(devices: &mut [DeviceEntry]) {
 
 fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
     match (&a.pci_bdf, &b.pci_bdf) {
-        (Some(a_bdf), Some(b_bdf)) => a_bdf.cmp(b_bdf),
+        // Partitions of one GPU share a BDF; tie-break so a refresh keeps the order.
+        (Some(a_bdf), Some(b_bdf)) => a_bdf
+            .cmp(b_bdf)
+            .then(a.stable_id.cmp(&b.stable_id))
+            .then_with(|| primary_device_path(a).cmp(primary_device_path(b))),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => primary_device_path(a).cmp(primary_device_path(b)),
@@ -254,6 +287,131 @@ mod tests {
     ) {
         let gres_cache = GresCache::from_entries(gres_entries);
         reg.populate(cdi_cache, &gres_cache);
+    }
+
+    fn partition_entry(stable_id: u64, render_node: &str) -> DeviceEntry {
+        let pool = crate::gres::cache::CountableGresPool {
+            gres_name: "gpu".into(),
+            resource_type: None,
+            capacity: 1,
+        };
+        let mut entry = countable_pool_entry(&pool);
+        entry.pci_bdf = Some("0000:11:00.0".into());
+        entry.stable_id = stable_id;
+        entry.device_edits.device_nodes.push(DeviceNode {
+            path: render_node.into(),
+            host_path: None,
+            r#type: None,
+            major: None,
+            minor: None,
+            file_mode: None,
+            permissions: None,
+            uid: None,
+            gid: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn a_pinned_id_the_new_layout_reuses_keeps_its_old_device() {
+        let gpu = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry
+        };
+        let previous = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD128"),
+                gpu(0x110001, "/dev/dri/renderD129"),
+            ],
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD200"),
+                gpu(0x110001, "/dev/dri/renderD201"),
+            ],
+        };
+        let pinned: HashSet<u64> = [0x110000].into();
+
+        let merged = candidate.with_pinned(&previous, "gpu", &pinned, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(entries, vec![(0x110000, "/dev/dri/renderD128")]);
+    }
+
+    #[test]
+    fn pinned_ids_come_from_the_previous_registry_and_only_reported_ids_stay() {
+        let gpu = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry
+        };
+        let mut nic = gpu(0x110003, "/dev/infiniband/uverbs0");
+        nic.gres_name = "nic".into();
+        let previous = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD128"),
+                gpu(0x120300, "/dev/dri/renderD131"),
+                gpu(0x110005, "/dev/dri/renderD133"),
+            ],
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD200"),
+                gpu(0x110001, "/dev/dri/renderD201"),
+                gpu(0x120000, "/dev/dri/renderD202"),
+                nic,
+            ],
+        };
+        let reported: HashSet<u64> = [0x110000, 0x110001, 0x120300].into();
+        let pinned: HashSet<u64> = [0x120300].into();
+
+        let merged = candidate.with_pinned(&previous, "gpu", &reported, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (0x110000, "/dev/dri/renderD200"),
+                (0x110001, "/dev/dri/renderD201"),
+                (0x110003, "/dev/infiniband/uverbs0"),
+                (0x120300, "/dev/dri/renderD131"),
+            ]
+        );
+        let indices: Vec<u32> = merged.list().iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cdi_sort_key_orders_partitions_of_one_bdf() {
+        let mut entries = [
+            partition_entry(0x110002, "/dev/dri/renderD130"),
+            partition_entry(0, "/dev/dri/renderD129"),
+            partition_entry(0x110001, "/dev/dri/renderD131"),
+            partition_entry(0, "/dev/dri/renderD128"),
+        ];
+        entries.sort_by(cdi_sort_key);
+        let order: Vec<(u64, &str)> = entries
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, "/dev/dri/renderD128"),
+                (0, "/dev/dri/renderD129"),
+                (0x110001, "/dev/dri/renderD131"),
+                (0x110002, "/dev/dri/renderD130"),
+            ]
+        );
     }
 
     fn make_amd_cache() -> CdiCache {

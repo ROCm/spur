@@ -20,6 +20,7 @@ struct Snapshot {
     limits: HashMap<(String, String), AccountLimits>,
     allowed_qos: HashMap<(String, String), HashSet<String>>,
     admin_level: HashMap<String, String>,
+    coordinators: HashSet<(String, String)>,
     loaded: bool,
 }
 
@@ -45,6 +46,39 @@ pub(crate) fn qos_permitted(allowed: &HashSet<String>, default: Option<&str>, qo
     (allowed.is_empty() && default.is_none()) || allowed.contains(qos) || default == Some(qos)
 }
 
+/// Direct coordinator assignments plus every account under them. Slurm gives
+/// a coordinator of an account the sub-accounts as well, and a cycle in the
+/// parent links must not walk forever.
+pub(crate) fn with_sub_accounts(
+    direct: impl IntoIterator<Item = (String, String)>,
+    parent_of: &HashMap<String, String>,
+) -> HashSet<(String, String)> {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (child, parent) in parent_of {
+        if !parent.is_empty() {
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+    }
+    let mut out = HashSet::new();
+    for (user, account) in direct {
+        let mut stack = vec![account];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(kids) = children.get(name.as_str()) {
+                stack.extend(kids.iter().copied().map(str::to_owned));
+            }
+            out.insert((user.clone(), name));
+        }
+    }
+    out
+}
+
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
@@ -55,6 +89,7 @@ impl AssociationCache {
                 limits: HashMap::new(),
                 allowed_qos: HashMap::new(),
                 admin_level: HashMap::new(),
+                coordinators: HashSet::new(),
                 loaded: false,
             }),
             kick: Notify::new(),
@@ -90,6 +125,41 @@ impl AssociationCache {
             return None;
         }
         snapshot.admin_level.get(user).cloned()
+    }
+
+    /// Accounts `user` belongs to. `None` when the cache has not loaded, so a
+    /// caller can hide account-scoped records instead of treating everyone as
+    /// a member.
+    pub fn accounts_for(&self, user: &str) -> Option<Vec<String>> {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return None;
+        }
+        let mut accounts: Vec<String> = snapshot
+            .memberships
+            .iter()
+            .filter(|(member, _)| member == user)
+            .map(|(_, account)| account.clone())
+            .collect();
+        accounts.sort_unstable();
+        Some(accounts)
+    }
+
+    /// Accounts `user` coordinates, including sub-accounts of a direct
+    /// assignment. `None` when the cache has not loaded.
+    pub fn coordinated_accounts(&self, user: &str) -> Option<Vec<String>> {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return None;
+        }
+        let mut accounts: Vec<String> = snapshot
+            .coordinators
+            .iter()
+            .filter(|(coordinator, _)| coordinator == user)
+            .map(|(_, account)| account.clone())
+            .collect();
+        accounts.sort_unstable();
+        Some(accounts)
     }
 
     /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
@@ -214,24 +284,8 @@ impl AssociationCache {
         all
     }
 
-    fn replace(
-        &self,
-        default_qos: HashMap<(String, String), String>,
-        default_account: HashMap<String, String>,
-        memberships: HashSet<(String, String)>,
-        limits: HashMap<(String, String), AccountLimits>,
-        allowed_qos: HashMap<(String, String), HashSet<String>>,
-        admin_level: HashMap<String, String>,
-    ) {
-        *self.snapshot.write() = Snapshot {
-            default_qos,
-            default_account,
-            memberships,
-            limits,
-            allowed_qos,
-            admin_level,
-            loaded: true,
-        };
+    fn replace(&self, snapshot: Snapshot) {
+        *self.snapshot.write() = snapshot;
     }
 
     /// Test-only seam: returns the cache to its pre-first-fetch state, as a freshly
@@ -246,6 +300,14 @@ impl AssociationCache {
     pub(crate) fn insert_association(&self, user: &str, account: &str) {
         let mut snap = self.snapshot.write();
         snap.memberships
+            .insert((user.to_owned(), account.to_owned()));
+        snap.loaded = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_coordinator(&self, user: &str, account: &str) {
+        let mut snap = self.snapshot.write();
+        snap.coordinators
             .insert((user.to_owned(), account.to_owned()));
         snap.loaded = true;
     }
@@ -320,7 +382,15 @@ impl AssociationCache {
             )
             .await
             {
-                Ok(Ok((qos, accounts, memberships, limits, allowed_qos, admin_level))) => {
+                Ok(Ok((
+                    qos,
+                    accounts,
+                    memberships,
+                    limits,
+                    allowed_qos,
+                    admin_level,
+                    coordinators,
+                ))) => {
                     info!(
                         default_qos = qos.len(),
                         default_account = accounts.len(),
@@ -328,9 +398,19 @@ impl AssociationCache {
                         limits = limits.len(),
                         allowed_qos = allowed_qos.len(),
                         admin_level = admin_level.len(),
+                        coordinators = coordinators.len(),
                         "association cache initialized"
                     );
-                    cache.replace(qos, accounts, memberships, limits, allowed_qos, admin_level);
+                    cache.replace(Snapshot {
+                        default_qos: qos,
+                        default_account: accounts,
+                        memberships,
+                        limits,
+                        allowed_qos,
+                        admin_level,
+                        coordinators,
+                        loaded: true,
+                    });
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "initial association fetch failed, will retry in background");
@@ -352,9 +432,24 @@ impl AssociationCache {
                 )
                 .await
                 {
-                    Ok(Ok((qos, accounts, memberships, limits, allowed_qos, admin_level))) => {
-                        cache.replace(qos, accounts, memberships, limits, allowed_qos, admin_level)
-                    }
+                    Ok(Ok((
+                        qos,
+                        accounts,
+                        memberships,
+                        limits,
+                        allowed_qos,
+                        admin_level,
+                        coordinators,
+                    ))) => cache.replace(Snapshot {
+                        default_qos: qos,
+                        default_account: accounts,
+                        memberships,
+                        limits,
+                        allowed_qos,
+                        admin_level,
+                        coordinators,
+                        loaded: true,
+                    }),
                     Ok(Err(e)) => {
                         warn!(error = %e, "association refresh failed, retaining stale data")
                     }
@@ -376,6 +471,23 @@ mod tests {
             cache.resolve("alice", Some("research")),
             (Some("research".into()), None, HashSet::new())
         );
+    }
+
+    #[test]
+    fn accounts_for_is_none_until_the_cache_loads() {
+        let cache = AssociationCache::new();
+        assert!(cache.accounts_for("alice").is_none());
+
+        cache.set_loaded_without_associations();
+        assert_eq!(cache.accounts_for("alice").as_deref(), Some([].as_slice()));
+
+        cache.insert_association("alice", "physics");
+        cache.insert_association("alice", "ml");
+        assert_eq!(
+            cache.accounts_for("alice").as_deref(),
+            Some(["ml".to_string(), "physics".to_string()].as_slice())
+        );
+        assert_eq!(cache.accounts_for("bob").as_deref(), Some([].as_slice()));
     }
 
     #[test]
@@ -442,14 +554,16 @@ mod tests {
     fn replace_swaps_the_whole_snapshot() {
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "old");
-        cache.replace(
-            HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
-            HashMap::from([("bob".to_string(), "eng".to_string())]),
-            HashSet::from([("bob".to_string(), "eng".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-        );
+        cache.replace(Snapshot {
+            default_qos: HashMap::from([(
+                ("bob".to_string(), "eng".to_string()),
+                "new".to_string(),
+            )]),
+            default_account: HashMap::from([("bob".to_string(), "eng".to_string())]),
+            memberships: HashSet::from([("bob".to_string(), "eng".to_string())]),
+            loaded: true,
+            ..Snapshot::default()
+        });
         assert_eq!(
             cache.resolve("alice", Some("research")),
             (None, None, HashSet::new())
@@ -488,14 +602,15 @@ mod tests {
     fn resolve_reads_account_and_qos_from_the_same_snapshot() {
         let cache = AssociationCache::new();
         cache.insert_default_account("alice", "research");
-        cache.replace(
-            HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
-            HashMap::new(),
-            HashSet::from([("bob".to_string(), "eng".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-        );
+        cache.replace(Snapshot {
+            default_qos: HashMap::from([(
+                ("bob".to_string(), "eng".to_string()),
+                "new".to_string(),
+            )]),
+            memberships: HashSet::from([("bob".to_string(), "eng".to_string())]),
+            loaded: true,
+            ..Snapshot::default()
+        });
         let (account, qos, _) = cache.resolve("alice", None);
         assert_eq!(
             account, None,
@@ -624,25 +739,62 @@ mod tests {
                 ..Default::default()
             },
         );
-        cache.replace(
-            HashMap::new(),
-            HashMap::new(),
-            HashSet::new(),
-            HashMap::from([(
+        cache.replace(Snapshot {
+            limits: HashMap::from([(
                 ("bob".to_string(), "eng".to_string()),
                 AccountLimits {
                     max_submit_jobs: Some(2),
                     ..Default::default()
                 },
             )]),
-            HashMap::new(),
-            HashMap::new(),
-        );
+            loaded: true,
+            ..Snapshot::default()
+        });
         assert_eq!(
             cache.limits("alice", "research"),
             AccountLimits::default(),
             "old limits must not survive the swap"
         );
         assert_eq!(cache.limits("bob", "eng").max_submit_jobs, Some(2));
+    }
+
+    #[test]
+    fn a_coordinator_also_covers_sub_accounts() {
+        let parents = HashMap::from([
+            ("physics".to_string(), "science".to_string()),
+            ("gpu".to_string(), "physics".to_string()),
+            ("chem".to_string(), "science".to_string()),
+        ]);
+        let got = with_sub_accounts(
+            [
+                ("alice".to_string(), "science".to_string()),
+                ("bob".to_string(), "physics".to_string()),
+            ],
+            &parents,
+        );
+        assert_eq!(
+            got,
+            HashSet::from([
+                ("alice".to_string(), "science".to_string()),
+                ("alice".to_string(), "physics".to_string()),
+                ("alice".to_string(), "gpu".to_string()),
+                ("alice".to_string(), "chem".to_string()),
+                ("bob".to_string(), "physics".to_string()),
+                ("bob".to_string(), "gpu".to_string()),
+            ])
+        );
+
+        let cycle = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ]);
+        let got = with_sub_accounts([("carol".to_string(), "a".to_string())], &cycle);
+        assert_eq!(
+            got,
+            HashSet::from([
+                ("carol".to_string(), "a".to_string()),
+                ("carol".to_string(), "b".to_string()),
+            ])
+        );
     }
 }

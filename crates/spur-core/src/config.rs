@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptType};
+use crate::partition::{Partition, PartitionState, PreemptType, TRES_CPU};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -252,12 +252,17 @@ pub struct RestApiConfig {
 /// All fields are optional — `None` means no hook is configured for that point.
 /// Paths must be fully qualified; no search path is set for security reasons.
 /// Hook lifecycle and failure semantics match Slurm.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
     /// Script run on compute nodes before job launch (Slurm `Prolog`).
     pub prolog: Option<String>,
     /// Script run on compute nodes at job termination (Slurm `Epilog`).
     pub epilog: Option<String>,
+    /// Seconds the compute-node `epilog` may run before its process group is
+    /// killed and the node drained. Bounded, unlike Slurm's `PrologEpilogTimeout`,
+    /// because the node is held for the job until the epilog ends.
+    #[serde(default = "default_epilog_timeout_secs")]
+    pub epilog_timeout_secs: u32,
     /// Script run on the controller at job allocation (Slurm `PrologSlurmctld`).
     pub prolog_slurmctld: Option<String>,
     /// Script run on the controller at job termination (Slurm `EpilogSlurmctld`).
@@ -276,6 +281,40 @@ pub struct HooksConfig {
     /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
     /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
     pub job_submit_lua: Option<String>,
+}
+
+/// Leaves the default `scheduler.complete_wait_secs` above
+/// [`SlurmConfig::complete_wait_floor_secs`] with the other defaults.
+pub fn default_epilog_timeout_secs() -> u32 {
+    120
+}
+
+/// Upper bound for `epilog_timeout_secs`. A node held for longer than a day
+/// for one job's epilog is a hang, not a slow epilog.
+pub const MAX_EPILOG_TIMEOUT_SECS: u32 = 86_400;
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            prolog: None,
+            epilog: None,
+            epilog_timeout_secs: default_epilog_timeout_secs(),
+            prolog_slurmctld: None,
+            epilog_slurmctld: None,
+            task_prolog: None,
+            task_epilog: None,
+            srun_prolog: None,
+            srun_epilog: None,
+            job_submit: None,
+            job_submit_lua: None,
+        }
+    }
+}
+
+impl HooksConfig {
+    pub fn epilog_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.epilog_timeout_secs))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +417,11 @@ pub struct ControllerConfig {
     /// How long to wait for a ping response before dropping the connection (default 10).
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
+
+    /// Seconds to let in-flight RPCs drain on SIGTERM/SIGINT before forcing shutdown (default 10, 0
+    /// waits indefinitely). An `srun` step holds its RPC open for the step's whole runtime.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -399,6 +443,20 @@ fn default_dispatch_reject_cooldown_secs() -> u64 {
 fn default_dispatch_timeout_secs() -> u64 {
     300
 }
+
+fn default_shutdown_grace_secs() -> u64 {
+    10
+}
+
+/// `heartbeat_timeout_secs` when unset.
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+
+/// How often `spurd` heartbeats the controller. Shared with the controller so
+/// `shutdown_grace_secs` can be checked against `heartbeat_timeout_secs`.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// How long `spurctld` waits for pending accounting writes once its shutdown drain ends.
+pub const SHUTDOWN_FLUSH_SECS: u64 = 5;
 
 /// Shared with `spurctld`'s agent channel builder, which needs these before any config is loaded.
 /// A dial budget or ping interval beyond this is indistinguishable from disabling it.
@@ -485,11 +543,41 @@ impl Default for ControllerConfig {
             agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
         }
     }
 }
 
 impl ControllerConfig {
+    pub fn effective_heartbeat_timeout_secs(&self) -> u64 {
+        self.heartbeat_timeout_secs
+            .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+    }
+
+    /// A warning when a shutdown drain can outlast agent heartbeats: the draining controller
+    /// answers none, yet keeps checking node health, so it marks nodes DOWN and fails their jobs.
+    pub fn shutdown_grace_warning(&self) -> Option<String> {
+        let timeout = self.effective_heartbeat_timeout_secs();
+        if self.shutdown_grace_secs == 0 {
+            return Some(format!(
+                "[controller] shutdown_grace_secs = 0 lets a shutdown drain outlast \
+                 heartbeat_timeout_secs ({timeout}s); the draining controller answers no \
+                 heartbeats, so it would mark nodes DOWN and fail their jobs"
+            ));
+        }
+        // A node's last heartbeat can be one interval old at the signal, and the flush follows.
+        let margin = HEARTBEAT_INTERVAL_SECS + SHUTDOWN_FLUSH_SECS;
+        if self.shutdown_grace_secs.saturating_add(margin) < timeout {
+            return None;
+        }
+        Some(format!(
+            "[controller] shutdown_grace_secs ({}s) is within {margin}s of heartbeat_timeout_secs \
+             ({timeout}s); the draining controller answers no heartbeats, so a full drain would \
+             mark nodes DOWN and fail their jobs",
+            self.shutdown_grace_secs
+        ))
+    }
+
     /// Client-facing controller endpoints, one per `hosts` entry, each combined
     /// with the port from `listen_addr`. Used for client-side failover across an
     /// HA quorum.
@@ -574,8 +662,8 @@ impl Default for AccountingConfig {
     }
 }
 
-/// Submit-time enforcement of partition wall-time (Slurm `EnforcePartLimits`):
-/// `No` admits over-limit jobs to pend, `All` needs all fit, `Any` needs one.
+/// Slurm `EnforcePartLimits` for limits a partition could never meet: `No` lets such jobs
+/// pend, `All`/`Any` need all/one requested partition to fit. Load alone never rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EnforcePartLimits {
@@ -628,6 +716,14 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
+    /// Seconds between SIGTERM and SIGKILL for every stop except a time or
+    /// inactivity limit. Values below [`MIN_EFFECTIVE_KILL_WAIT_SECS`] act as that.
+    #[serde(default = "default_kill_wait")]
+    pub kill_wait_secs: u32,
+    /// The same wait for a job stopped by its time limit or the inactivity
+    /// limit, i.e. one that ends `TIMEOUT`. Same floor as `kill_wait_secs`.
+    #[serde(default = "default_timeout_kill_wait")]
+    pub timeout_kill_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
@@ -680,6 +776,147 @@ pub struct SchedulerConfig {
     /// factor above cannot do because it scales with the team's own quota.
     #[serde(default)]
     pub idle_fill_max_cluster_fraction: f64,
+    /// TRES billing weights for fairshare usage computation, in the format
+    /// `"CPU=<w>,GRES/gpu=<w>"`.  Omitted weights default to 1.0.  Set
+    /// `CPU=0.0,GRES/gpu=1.0` for GPU-only billing on a GPU cluster.
+    #[serde(default)]
+    pub tres_billing_weights: String,
+    /// Periodic cluster-wide usage reset (Slurm `PriorityUsageResetPeriod`).
+    /// Valid: "none" (default), "daily", "weekly", "monthly", "quarterly", "yearly".
+    #[serde(default)]
+    pub usage_reset_period: UsageResetPeriod,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageResetPeriod {
+    #[default]
+    None,
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Yearly,
+}
+
+impl UsageResetPeriod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+            Self::Quarterly => "quarterly",
+            Self::Yearly => "yearly",
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UsageResetPeriod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "daily" => Ok(Self::Daily),
+            "weekly" => Ok(Self::Weekly),
+            "monthly" => Ok(Self::Monthly),
+            "quarterly" => Ok(Self::Quarterly),
+            "yearly" => Ok(Self::Yearly),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown usage_reset_period '{other}', expected none/daily/weekly/monthly/quarterly/yearly"
+            ))),
+        }
+    }
+}
+
+impl serde::Serialize for UsageResetPeriod {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Parsed TRES billing weights for fairshare computation.
+#[derive(Debug, Clone, Copy)]
+pub struct BillingWeights {
+    pub cpu: f64,
+    pub gpu: f64,
+}
+
+impl Default for BillingWeights {
+    fn default() -> Self {
+        Self { cpu: 1.0, gpu: 1.0 }
+    }
+}
+
+impl BillingWeights {
+    /// Parse Slurm-style `TRESBillingWeights` string, e.g.
+    /// `"CPU=0.0,GRES/gpu=1.0"`.  Unknown keys (including `Mem`) are silently
+    /// ignored (forward-compatible with future TRES types).  Omitted keys keep
+    /// their default.  An empty string yields the default weights.
+    pub fn parse(s: &str) -> Self {
+        let mut w = Self::default();
+        for token in s.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some((key, val)) = token.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_uppercase();
+            let val = val.trim();
+            let Ok(v) = val.parse::<f64>() else {
+                tracing::warn!(key = %key.trim(), value = %val, "TRESBillingWeights: unparseable value, skipping");
+                continue;
+            };
+            match key.as_str() {
+                "CPU" => w.cpu = v.max(0.0),
+                "GRES/GPU" => w.gpu = v.max(0.0),
+                _ => {
+                    tracing::warn!(key = %key, "TRESBillingWeights: unrecognized key, skipping");
+                }
+            }
+        }
+        w
+    }
+
+    /// Compute the weighted billing value from raw CPU and GPU seconds.
+    pub fn bill(&self, cpu_seconds: i64, gpu_seconds: i64) -> f64 {
+        self.cpu * cpu_seconds as f64 + self.gpu * gpu_seconds as f64
+    }
+}
+
+/// Largest accepted `scheduler.kill_wait_secs` and
+/// `scheduler.timeout_kill_wait_secs` (Slurm's `KillWait` ceiling).
+pub const MAX_KILL_WAIT_SECS: u32 = 65533;
+
+/// Floor applied to both kill waits: a shorter wait gives a job's SIGTERM
+/// handler no realistic chance to run before SIGKILL.
+pub const MIN_EFFECTIVE_KILL_WAIT_SECS: u32 = 5;
+
+impl SchedulerConfig {
+    /// The SIGTERM-to-SIGKILL wait to apply, with the floor enforced.
+    pub fn effective_kill_wait_secs(&self) -> u32 {
+        self.kill_wait_secs.max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// The SIGTERM-to-SIGKILL wait for a job stopped by a time or inactivity
+    /// limit, with the floor enforced.
+    pub fn effective_timeout_kill_wait_secs(&self) -> u32 {
+        self.timeout_kill_wait_secs
+            .max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// The longer of the two SIGTERM-to-SIGKILL waits, floors enforced.
+    pub fn longest_effective_kill_wait_secs(&self) -> u32 {
+        self.effective_kill_wait_secs()
+            .max(self.effective_timeout_kill_wait_secs())
+    }
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -702,6 +939,12 @@ fn default_time_limit() -> u32 {
 fn default_complete_wait() -> u32 {
     300
 }
+fn default_kill_wait() -> u32 {
+    5
+}
+fn default_timeout_kill_wait() -> u32 {
+    30
+}
 fn default_inactive_limit() -> u32 {
     300
 }
@@ -722,6 +965,8 @@ impl Default for SchedulerConfig {
             default_time_limit_minutes: 0,
             enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
+            kill_wait_secs: default_kill_wait(),
+            timeout_kill_wait_secs: default_timeout_kill_wait(),
             resv_overrun_minutes: 0,
             inactive_limit_secs: default_inactive_limit(),
             max_user_priority: default_max_user_priority(),
@@ -731,7 +976,15 @@ impl Default for SchedulerConfig {
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
             idle_fill_max_cluster_fraction: 0.0,
+            tres_billing_weights: String::new(),
+            usage_reset_period: UsageResetPeriod::None,
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn billing_weights(&self) -> BillingWeights {
+        BillingWeights::parse(&self.tres_billing_weights)
     }
 }
 
@@ -775,11 +1028,19 @@ impl AuthMode {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum PrivateData {
-    /// Hide other users' jobs and job steps from `squeue`, `scontrol show job`,
-    /// `scontrol show step`, and the REST job surface.
+    /// Hide other users' jobs from the live queue and from `sacct`.
     Jobs,
-    /// Pin `scontrol show assoc_mgr` to the scopes the caller takes part in.
+    /// Pin usage reads (`assoc_mgr`, `sshare`, `sreport` utilization) to the caller,
+    /// widened to the accounts a coordinator runs.
     Usage,
+    /// Pin `sacctmgr show user` to the caller. `show association` widens to the
+    /// accounts a coordinator runs.
+    Users,
+    /// List `sacctmgr show account` only to coordinators, and only the accounts they
+    /// coordinate.
+    Accounts,
+    /// Pin `scontrol show reservation` to reservations the caller can use.
+    Reservations,
     Unsupported(String),
 }
 
@@ -788,6 +1049,9 @@ impl From<String> for PrivateData {
         match name.as_str() {
             "jobs" => PrivateData::Jobs,
             "usage" => PrivateData::Usage,
+            "users" => PrivateData::Users,
+            "accounts" => PrivateData::Accounts,
+            "reservations" => PrivateData::Reservations,
             _ => PrivateData::Unsupported(name),
         }
     }
@@ -798,6 +1062,9 @@ impl From<PrivateData> for String {
         match category {
             PrivateData::Jobs => "jobs".into(),
             PrivateData::Usage => "usage".into(),
+            PrivateData::Users => "users".into(),
+            PrivateData::Accounts => "accounts".into(),
+            PrivateData::Reservations => "reservations".into(),
             PrivateData::Unsupported(name) => name,
         }
     }
@@ -873,6 +1140,21 @@ impl AuthConfig {
         self.private_data.contains(&PrivateData::Usage)
     }
 
+    /// Whether other users' accounting rows are hidden from an ordinary caller.
+    pub fn users_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Users)
+    }
+
+    /// Whether accounts the caller does not belong to are hidden.
+    pub fn accounts_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Accounts)
+    }
+
+    /// Whether reservations the caller cannot use are hidden.
+    pub fn reservations_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Reservations)
+    }
+
     /// A warning when `private_data` is set but a caller can bypass it by sending no credential.
     pub fn private_data_warning(&self) -> Option<&'static str> {
         if self.private_data.is_empty() || self.mode == AuthMode::Required {
@@ -880,7 +1162,8 @@ impl AuthConfig {
         }
         Some(
             "[auth] private_data restricts only callers that present a credential; without \
-             mode = \"required\", a caller that sends none still sees every job and scope",
+             mode = \"required\", a caller that sends none still sees every job, user, \
+             account, reservation, and usage scope",
         )
     }
 
@@ -894,7 +1177,10 @@ impl AuthConfig {
         match unsupported {
             Some(name) => Err(ConfigError::InvalidValue {
                 field: "auth.private_data".into(),
-                value: format!("{name:?} (supported: \"jobs\", \"usage\")"),
+                value: format!(
+                    "{name:?} (supported: \"jobs\", \"usage\", \"users\", \"accounts\", \
+                     \"reservations\")"
+                ),
             }),
             None => Ok(()),
         }
@@ -993,6 +1279,76 @@ pub struct PartitionConfig {
     /// `None` defers to `scheduler.preempt_exempt_time`.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+    /// Seconds a preempted job gets to wind down before it is killed. Used when
+    /// the victim's QOS leaves its grace time unset; the highest value among the
+    /// partitions the job runs in applies. `None` means unset.
+    #[serde(default)]
+    pub grace_time: Option<u32>,
+    /// Cumulative per-node cap on this partition's jobs, keyed by TRES
+    /// (`cpu`, `mem` in MiB, `gres/gpu`, `gres/gpu:<type>`).
+    #[serde(default)]
+    pub max_tres_per_node: BTreeMap<String, u64>,
+    /// Slurm `MaxCPUsPerNode`: shorthand for `max_tres_per_node.cpu`.
+    #[serde(default)]
+    pub max_cpus_per_node: Option<u32>,
+    /// Per-job memory policy (MiB), Slurm `MaxMemPerNode`/`MaxMemPerCPU`/
+    /// `DefMemPer*`. At most one `max_mem_*` and one `def_mem_*` may be set.
+    #[serde(default)]
+    pub max_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub max_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_gpu: Option<u64>,
+}
+
+impl PartitionConfig {
+    /// The per-node cap map with the `max_cpus_per_node` alias folded into
+    /// the `cpu` key. [`SlurmConfig::validate`] rejects setting both.
+    pub fn effective_max_tres_per_node(&self) -> BTreeMap<String, u64> {
+        let mut caps = self.max_tres_per_node.clone();
+        if let Some(cpus) = self.max_cpus_per_node {
+            caps.entry(TRES_CPU.to_string()).or_insert(u64::from(cpus));
+        }
+        caps
+    }
+
+    fn validate_cpu_cap_alias(&self) -> Result<(), ConfigError> {
+        // Two spellings of one cap would leave the effective value to a
+        // precedence rule an operator cannot see, so require exactly one.
+        let (Some(alias), Some(cpu)) =
+            (self.max_cpus_per_node, self.max_tres_per_node.get(TRES_CPU))
+        else {
+            return Ok(());
+        };
+        Err(ConfigError::InvalidValue {
+            field: format!("partitions.{}.max_cpus_per_node", self.name),
+            value: format!("{alias} conflicts with max_tres_per_node.cpu = {cpu} (set only one)"),
+        })
+    }
+
+    /// `scontrol` and the API read 0 as "unset", so a 0 here would mean
+    /// something else once fed back through them.
+    fn validate_nonzero_limit_knobs(&self) -> Result<(), ConfigError> {
+        let knobs = [
+            ("max_cpus_per_node", self.max_cpus_per_node.map(u64::from)),
+            ("max_mem_per_node", self.max_mem_per_node),
+            ("max_mem_per_cpu", self.max_mem_per_cpu),
+            ("def_mem_per_node", self.def_mem_per_node),
+            ("def_mem_per_cpu", self.def_mem_per_cpu),
+            ("def_mem_per_gpu", self.def_mem_per_gpu),
+        ];
+        let Some((knob, _)) = knobs.into_iter().find(|(_, value)| *value == Some(0)) else {
+            return Ok(());
+        };
+        Err(ConfigError::InvalidValue {
+            field: format!("partitions.{}.{knob}", self.name),
+            value: "0 (omit the key for no limit; to forbid a resource, set it to 0 in max_tres_per_node)".into(),
+        })
+    }
 }
 
 fn default_partition_state() -> String {
@@ -1018,7 +1374,7 @@ pub struct NodeConfig {
     pub memory_mb: u64,
     /// Memory (MiB) reserved for the OS/runtime, subtracted from detected memory
     /// so jobs cannot be packed into headroom the host needs. 0 = none.
-    #[serde(default)]
+    #[serde(default, alias = "mem_spec_limit")]
     pub reserved_memory_mb: u64,
     #[serde(default)]
     pub gres: Vec<String>,
@@ -1030,6 +1386,17 @@ pub struct NodeConfig {
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_one")]
     pub weight: u32,
+    /// Physical cores set aside for node services (Slurm `CoreSpecCount`).
+    #[serde(default)]
+    pub core_spec_count: Option<u32>,
+    /// OS CPU IDs set aside for node services, widened to whole cores.
+    /// Unlike Slurm's `CpuSpecList`, these are OS IDs, not abstract IDs.
+    #[serde(default)]
+    pub cpu_spec_list: Option<String>,
+    /// Keep spurd's threads off the spec CPUs (Slurm `SlurmdOffSpec`, inverted
+    /// default). Supervisors inherit the mask in effect when they are started.
+    #[serde(default = "default_true_fn")]
+    pub daemons_off_spec: bool,
 }
 
 /// Network / WireGuard mesh configuration.
@@ -1679,6 +2046,8 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// the plugin selectors. Slurm defaults permissive here, Spur enforcing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CgroupConfig {
+    #[serde(default = "default_cgroup_cleanup_timeout")]
+    pub cleanup_timeout_secs: u32,
     /// Master switch. When false, spurd creates no cgroup and applies no limits.
     #[serde(default = "default_true_fn")]
     pub enabled: bool,
@@ -1727,6 +2096,10 @@ pub struct CgroupConfig {
     pub extra_device_paths: Vec<String>,
 }
 
+pub fn default_cgroup_cleanup_timeout() -> u32 {
+    60
+}
+
 fn default_min_ram_mb() -> u64 {
     30
 }
@@ -1738,6 +2111,7 @@ fn default_allowed_ram_percent() -> u32 {
 impl Default for CgroupConfig {
     fn default() -> Self {
         Self {
+            cleanup_timeout_secs: default_cgroup_cleanup_timeout(),
             enabled: true,
             required: false,
             constrain_cores: true,
@@ -2094,13 +2468,57 @@ impl SlurmConfig {
         Ok(config)
     }
 
+    /// Seconds a node can need after SIGTERM before it reports completion: the
+    /// longer kill wait, the cgroup cleanup, then the bounded node epilog.
+    /// `scheduler.complete_wait_secs` should exceed this.
+    pub fn complete_wait_floor_secs(&self) -> u32 {
+        // Counted even when cgroups are disabled or no epilog is set here:
+        // nodes read their own config, so the controller's says nothing about theirs.
+        let epilog_ceiling = crate::hooks::bounded_hook_ceiling(self.hooks.epilog_timeout());
+        self.scheduler
+            .longest_effective_kill_wait_secs()
+            .saturating_add(self.cgroup.cleanup_timeout_secs)
+            .saturating_add(u32::try_from(epilog_ceiling.as_secs()).unwrap_or(u32::MAX))
+    }
+
+    /// Whether `scheduler.complete_wait_secs` would drain healthy nodes that
+    /// are still being killed or cleaned up. Not a validation error so
+    /// existing configs keep loading.
+    pub fn complete_wait_too_short(&self) -> bool {
+        self.scheduler.complete_wait_secs <= self.complete_wait_floor_secs()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(external) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.external.as_ref())
+        {
+            if external
+                .block_file
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "topology.external.block_file".into(),
+                    value: "requires an absolute file path".into(),
+                });
+            }
+        }
+
         if self.cluster_name.is_empty() {
             return Err(ConfigError::MissingField("cluster_name".into()));
         }
         if self.controller.max_batch_requeue == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "controller.max_batch_requeue".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Job id 0 marks a node-only drain report, so a real job must never get it.
+        if self.controller.first_job_id == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.first_job_id".into(),
                 value: "0 (must be at least 1)".into(),
             });
         }
@@ -2154,6 +2572,18 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Zero would kill the epilog the instant it starts, draining every node
+        // after every job. Past a day the node is stuck, not waiting out a
+        // slow epilog.
+        if !(1..=MAX_EPILOG_TIMEOUT_SECS).contains(&self.hooks.epilog_timeout_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "hooks.epilog_timeout_secs".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.hooks.epilog_timeout_secs, MAX_EPILOG_TIMEOUT_SECS
+                ),
+            });
+        }
         for pc in &self.partitions {
             crate::partition::parse_preempt_mode(&pc.preempt_mode).map_err(|value| {
                 ConfigError::InvalidValue {
@@ -2161,6 +2591,16 @@ impl SlurmConfig {
                     value,
                 }
             })?;
+            pc.validate_cpu_cap_alias()?;
+            pc.validate_nonzero_limit_knobs()?;
+        }
+        for partition in self.build_partitions() {
+            partition
+                .validate_resource_limits()
+                .map_err(|value| ConfigError::InvalidValue {
+                    field: format!("partitions.{}", partition.name),
+                    value,
+                })?;
         }
         // Keepalive detection is interval + timeout, so an hour-long interval silently disables
         // the liveness this exists to provide.
@@ -2282,6 +2722,17 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Same day-scale ceiling as `dispatch_timeout_secs`: a shutdown wait beyond
+        // a day is not a bounded drain.
+        if self.controller.shutdown_grace_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.shutdown_grace_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.shutdown_grace_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
         // Zero collapses the consumption window, so every QOS reads zero consumed
         // and every GrpWall budget silently stops applying while `sacctmgr show
         // qos` still displays the cap — the exact failure the limit exists to
@@ -2304,6 +2755,20 @@ impl SlurmConfig {
                 field: "cgroup.allowed_ram_percent".into(),
                 value: "0 (must be at least 1)".into(),
             });
+        }
+        for (field, value) in [
+            ("scheduler.kill_wait_secs", self.scheduler.kill_wait_secs),
+            (
+                "scheduler.timeout_kill_wait_secs",
+                self.scheduler.timeout_kill_wait_secs,
+            ),
+        ] {
+            if value > MAX_KILL_WAIT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_KILL_WAIT_SECS})"),
+                });
+            }
         }
         // A limit below the client's ping interval would reap a live client
         // between its own keepalives. Require at least two intervals of slack.
@@ -2571,6 +3036,34 @@ impl SlurmConfig {
                     ),
                 });
             }
+            let spec_count = nc.core_spec_count.is_some_and(|n| n > 0);
+            let spec_list = nc
+                .cpu_spec_list
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if spec_count && spec_list {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.cpu_spec_list", nc.names),
+                    value: "set core_spec_count or cpu_spec_list, not both".into(),
+                });
+            }
+            // Jobs join the enforced `spur` root only through managed cgroups.
+            if (spec_count || spec_list) && !self.cgroup.enabled {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.core_spec_count", nc.names),
+                    value: "spec cores require [cgroup] enabled = true so jobs join the \
+                            enforced cgroup root"
+                        .into(),
+                });
+            }
+            if let Some(list) = &nc.cpu_spec_list {
+                if let Err(e) = crate::cpu_topology::parse_cpu_list(list) {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("nodes.{}.cpu_spec_list", nc.names),
+                        value: format!("{list:?} ({e})"),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -2605,6 +3098,13 @@ impl SlurmConfig {
                 preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
                     .unwrap_or(None),
                 preempt_exempt_time: pc.preempt_exempt_time,
+                grace_time: pc.grace_time,
+                max_tres_per_node: pc.effective_max_tres_per_node(),
+                max_mem_per_node: pc.max_mem_per_node,
+                max_mem_per_cpu: pc.max_mem_per_cpu,
+                def_mem_per_node: pc.def_mem_per_node,
+                def_mem_per_cpu: pc.def_mem_per_cpu,
+                def_mem_per_gpu: pc.def_mem_per_gpu,
                 ..Default::default()
             })
             .collect()
@@ -2826,6 +3326,53 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn cgroup_cleanup_timeout_preserves_old_configs_and_accepts_overrides() {
+        let old: CgroupConfig = toml::from_str("enabled = true\nrequired = false\n").unwrap();
+        assert_eq!(old.cleanup_timeout_secs, 60);
+        for seconds in [0, 120] {
+            let config: CgroupConfig =
+                toml::from_str(&format!("cleanup_timeout_secs = {seconds}\n")).unwrap();
+            assert_eq!(config.cleanup_timeout_secs, seconds);
+        }
+    }
+
+    #[test]
+    fn epilog_timeout_defaults_for_old_configs_and_accepts_overrides() {
+        let old: HooksConfig = toml::from_str("epilog = \"/etc/spur/epilog.sh\"\n").unwrap();
+        assert_eq!(old.epilog_timeout_secs, default_epilog_timeout_secs());
+        assert_eq!(
+            HooksConfig::default().epilog_timeout(),
+            Duration::from_secs(120)
+        );
+        let configured: HooksConfig = toml::from_str("epilog_timeout_secs = 45\n").unwrap();
+        assert_eq!(configured.epilog_timeout(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn hooks_config_rejects_an_unusable_epilog_timeout() {
+        for seconds in [0, MAX_EPILOG_TIMEOUT_SECS + 1] {
+            let toml =
+                format!("cluster_name = \"test\"\n[hooks]\nepilog_timeout_secs = {seconds}\n");
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("hooks.epilog_timeout_secs"),
+                "unexpected error for {seconds}: {err}"
+            );
+        }
+        let toml = format!(
+            "cluster_name = \"test\"\n[hooks]\nepilog_timeout_secs = {MAX_EPILOG_TIMEOUT_SECS}\n"
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&toml)
+                .unwrap()
+                .hooks
+                .epilog_timeout_secs,
+            MAX_EPILOG_TIMEOUT_SECS,
+            "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
     fn node_config_parses_reserved_memory_mb() {
         let config = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 480000\nreserved_memory_mb = 32000\n",
@@ -2857,6 +3404,66 @@ mod tests {
             matches!(error, ConfigError::InvalidValue { ref field, .. } if field.contains("reserved_memory_mb")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn node_spec_settings_parse_with_defaults_and_alias() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n[001-512]\"\ncore_spec_count = 1\nmem_spec_limit = 16384\n",
+        )
+        .unwrap();
+        let nc = &config.nodes[0];
+        assert_eq!(nc.core_spec_count, Some(1));
+        assert_eq!(nc.cpu_spec_list, None);
+        assert_eq!(nc.reserved_memory_mb, 16384);
+        assert!(nc.daemons_off_spec);
+    }
+
+    #[test]
+    fn both_spec_settings_are_rejected() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\ncpu_spec_list = \"127,255\"\n",
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(msg.contains("cpu_spec_list"), "{msg}");
+    }
+
+    #[test]
+    fn spec_cores_require_cgroup_enabled() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[cgroup]\nenabled = false\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n",
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(msg.contains("cgroup"), "{msg}");
+    }
+
+    #[test]
+    fn spec_cores_pass_with_cgroup_enabled() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[cgroup]\nenabled = true\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes[0].core_spec_count, Some(1));
+    }
+
+    #[test]
+    fn unparsable_cpu_spec_list_is_rejected() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncpu_spec_list = \"1,\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn zero_or_blank_spec_settings_mean_unset_and_pass_validation() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 0\ncpu_spec_list = \"  \"\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes[0].core_spec_count, Some(0));
     }
 
     #[test]
@@ -4195,6 +4802,19 @@ deny_accounts = ["student"]
     }
 
     #[test]
+    fn config_partition_grace_time_loads() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\ngrace_time = 600\n\n\
+             [[partitions]]\nname = \"zero\"\ngrace_time = 0\n\n[[partitions]]\nname = \"unset\"\n",
+        )
+        .unwrap();
+        let parts = cfg.build_partitions();
+        assert_eq!(parts[0].grace_time, Some(600));
+        assert_eq!(parts[1].grace_time, Some(0));
+        assert_eq!(parts[2].grace_time, None);
+    }
+
+    #[test]
     fn partition_preempt_mode_typo_is_rejected_at_load() {
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\npreempt_mode = \"cancle\"\n",
@@ -4301,6 +4921,184 @@ inactive_limit_secs = 20
     }
 
     #[test]
+    fn kill_wait_defaults_to_5() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.kill_wait_secs, 5);
+        assert_eq!(SchedulerConfig::default().kill_wait_secs, 5);
+    }
+
+    #[test]
+    fn timeout_kill_wait_defaults_to_30() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.timeout_kill_wait_secs, 30);
+        assert_eq!(SchedulerConfig::default().timeout_kill_wait_secs, 30);
+    }
+
+    #[test]
+    fn defaults_reproduce_main_timings() {
+        let scheduler = SchedulerConfig::default();
+        assert_eq!(scheduler.effective_kill_wait_secs(), 5);
+        assert_eq!(scheduler.effective_timeout_kill_wait_secs(), 30);
+    }
+
+    #[test]
+    fn effective_kill_wait_floors_at_5() {
+        let with = |kill_wait_secs| SchedulerConfig {
+            kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn effective_timeout_kill_wait_floors_at_5() {
+        let with = |timeout_kill_wait_secs| SchedulerConfig {
+            timeout_kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_timeout_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    #[test]
+    fn timeout_kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.timeout_kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    /// What a [`config_with_waits`] fixture's 1 s epilog timeout adds to the
+    /// floor: the timeout, two 5 s kill graces, and the 1 s stderr drain.
+    const FIXTURE_EPILOG_SECS: u32 = 12;
+
+    fn config_with_waits(
+        kill_wait_secs: u32,
+        timeout_kill_wait_secs: u32,
+        cleanup_timeout_secs: u32,
+        complete_wait_secs: u32,
+    ) -> SlurmConfig {
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [scheduler]\n\
+             kill_wait_secs = {kill_wait_secs}\n\
+             timeout_kill_wait_secs = {timeout_kill_wait_secs}\n\
+             complete_wait_secs = {complete_wait_secs}\n\
+             [cgroup]\n\
+             cleanup_timeout_secs = {cleanup_timeout_secs}\n\
+             [hooks]\n\
+             epilog_timeout_secs = 1\n"
+        ))
+        .expect("fixture config must load")
+    }
+
+    #[test]
+    fn complete_wait_too_short_flags_a_wait_not_above_kill_wait_plus_cleanup() {
+        let epilog = FIXTURE_EPILOG_SECS;
+        assert!(config_with_waits(30, 0, 0, 30 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 0, 31 + epilog).complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 60, 90 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 60, 91 + epilog).complete_wait_too_short());
+        // The effective floor of 5 applies, so a configured 0 still counts as 5.
+        assert!(config_with_waits(0, 0, 0, 5 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(0, 0, 0, 6 + epilog).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_uses_the_larger_kill_wait() {
+        let epilog = FIXTURE_EPILOG_SECS;
+        assert!(config_with_waits(5, 40, 0, 35 + epilog).complete_wait_too_short());
+        assert!(!config_with_waits(5, 40, 0, 41 + epilog).complete_wait_too_short());
+        assert!(config_with_waits(40, 5, 0, 35 + epilog).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_counts_the_cgroup_cleanup_timeout() {
+        // A kill wait of 270 alone fits under 300, but a SIGKILLed job with a
+        // 35 s teardown does not.
+        assert!(config_with_waits(5, 270, 35, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 17, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 0, 300).complete_wait_too_short());
+    }
+
+    #[test]
+    fn the_fixture_epilog_term_matches_the_hook_ceiling() {
+        let ceiling = crate::hooks::bounded_hook_ceiling(Duration::from_secs(1));
+        assert_eq!(ceiling, Duration::from_secs(FIXTURE_EPILOG_SECS.into()));
+    }
+
+    #[test]
+    fn the_default_complete_wait_covers_the_default_kill_cleanup_and_epilog() {
+        let defaults = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        // 30 s timeout kill wait, 60 s cleanup, 120 s epilog plus its 11 s kill sequence.
+        assert_eq!(defaults.complete_wait_floor_secs(), 221);
+        assert_eq!(defaults.scheduler.complete_wait_secs, 300);
+        assert!(!defaults.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_floor_counts_the_epilog_timeout() {
+        let toml = "cluster_name = \"test\"\n\
+                    [hooks]\nepilog_timeout_secs = 250\n";
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.complete_wait_floor_secs(), 30 + 60 + 261);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_floor_counts_cleanup_even_with_cgroups_disabled() {
+        let toml = "cluster_name = \"test\"\n\
+                    [scheduler]\nkill_wait_secs = 30\ncomplete_wait_secs = 90\n\
+                    [cgroup]\nenabled = false\ncleanup_timeout_secs = 60\n\
+                    [hooks]\nepilog_timeout_secs = 1\n";
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.complete_wait_floor_secs(), 90 + FIXTURE_EPILOG_SECS);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_does_not_overflow_on_extreme_waits() {
+        let config = config_with_waits(MAX_KILL_WAIT_SECS, MAX_KILL_WAIT_SECS, u32::MAX, u32::MAX);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_not_above_kill_wait_plus_cleanup_still_loads() {
+        let toml = "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n";
+        let parsed = SlurmConfig::load_from_str(toml).expect("a legacy config must still load");
+        assert!(parsed.complete_wait_too_short());
+    }
+
+    #[test]
     fn controller_config_rejects_zero_max_batch_requeue() {
         let toml = r#"
 cluster_name = "test"
@@ -4311,6 +5109,16 @@ max_batch_requeue = 0
         let err = SlurmConfig::load_from_str(toml).unwrap_err();
         assert!(
             err.to_string().contains("max_batch_requeue"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_zero_first_job_id() {
+        let toml = "cluster_name = \"test\"\n[controller]\nfirst_job_id = 0\n";
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("first_job_id"),
             "unexpected error: {err}"
         );
     }
@@ -4485,6 +5293,24 @@ mode = "permissive"
         .unwrap();
         assert!(config.auth.jobs_private());
         assert!(config.auth.usage_private());
+        assert!(!config.auth.users_private());
+        assert!(!config.auth.accounts_private());
+        assert!(!config.auth.reservations_private());
+    }
+
+    #[test]
+    fn private_data_parses_users_accounts_and_reservations() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n\
+             private_data = [\"users\", \"accounts\", \"reservations\"]\n",
+        )
+        .unwrap();
+        assert!(config.auth.users_private());
+        assert!(config.auth.accounts_private());
+        assert!(config.auth.reservations_private());
+        assert!(!config.auth.jobs_private());
+        assert!(!config.auth.usage_private());
+        config.auth.check_private_data().unwrap();
     }
 
     #[test]
@@ -4506,7 +5332,8 @@ mode = "permissive"
     #[test]
     fn private_data_check_accepts_supported_categories() {
         let config = SlurmConfig::load_from_str(
-            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n\
+             private_data = [\"jobs\", \"usage\", \"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
         config.auth.check_private_data().unwrap();
@@ -4987,6 +5814,114 @@ listen_addr = "[::]:6817"
     }
 
     #[test]
+    fn controller_config_defaults_shutdown_grace_secs() {
+        let config = ControllerConfig::default();
+        assert_eq!(config.shutdown_grace_secs, 10);
+    }
+
+    #[test]
+    fn controller_config_parses_shutdown_grace_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = 30
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.shutdown_grace_secs, 30);
+    }
+
+    #[test]
+    fn controller_config_accepts_zero_shutdown_grace_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = 0
+"#;
+        assert_eq!(
+            SlurmConfig::load_from_str(toml)
+                .unwrap()
+                .controller
+                .shutdown_grace_secs,
+            0,
+            "zero (unbounded wait) must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_shutdown_grace_secs() {
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("shutdown_grace_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_falls_back_to_its_default() {
+        assert_eq!(
+            ControllerConfig::default().effective_heartbeat_timeout_secs(),
+            DEFAULT_HEARTBEAT_TIMEOUT_SECS
+        );
+        let set = ControllerConfig {
+            heartbeat_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(set.effective_heartbeat_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn default_shutdown_grace_leaves_room_before_the_heartbeat_timeout() {
+        assert_eq!(ControllerConfig::default().shutdown_grace_warning(), None);
+    }
+
+    #[test]
+    fn shutdown_grace_warns_once_a_drain_can_outlast_every_heartbeat() {
+        let limit = DEFAULT_HEARTBEAT_TIMEOUT_SECS - HEARTBEAT_INTERVAL_SECS - SHUTDOWN_FLUSH_SECS;
+        let at_limit = ControllerConfig {
+            shutdown_grace_secs: limit,
+            ..Default::default()
+        };
+        assert!(at_limit.shutdown_grace_warning().is_some());
+        let below = ControllerConfig {
+            shutdown_grace_secs: limit - 1,
+            ..Default::default()
+        };
+        assert_eq!(below.shutdown_grace_warning(), None);
+    }
+
+    #[test]
+    fn shutdown_grace_warning_follows_the_configured_heartbeat_timeout() {
+        let short = ControllerConfig {
+            heartbeat_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert!(
+            short.shutdown_grace_warning().is_some(),
+            "a 30s timeout leaves no room even for the default grace"
+        );
+    }
+
+    #[test]
+    fn unbounded_shutdown_grace_warns() {
+        let unbounded = ControllerConfig {
+            shutdown_grace_secs: 0,
+            ..Default::default()
+        };
+        assert!(unbounded.shutdown_grace_warning().is_some());
+    }
+
+    #[test]
     fn rlimits_default_is_unlimited() {
         let cfg = RlimitsConfig::default();
         assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
@@ -5057,5 +5992,294 @@ memlock = "inherit"
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Inherit
         );
+    }
+
+    #[test]
+    fn billing_weights_default_is_one_to_one() {
+        let w = BillingWeights::default();
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_gpu_only() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_mixed() {
+        let w = BillingWeights::parse("CPU=0.5, GRES/gpu=2.0");
+        assert_eq!(w.cpu, 0.5);
+        assert_eq!(w.gpu, 2.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_empty_is_default() {
+        let w = BillingWeights::parse("");
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_case_insensitive() {
+        let w = BillingWeights::parse("cpu=0.0,gres/GPU=3.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 3.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_ignores_unknown_keys() {
+        let w = BillingWeights::parse("CPU=0.0,Mem=0.5,GRES/gpu=1.0,GRES/nic=2.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_clamps_negative_to_zero() {
+        let w = BillingWeights::parse("CPU=-5.0,GRES/gpu=-1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 0.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_applies_weights() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.bill(20_390_400, 691_200), 691_200.0);
+        assert_eq!(w.bill(172_800, 691_200), 691_200.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_default_sums_cpu_gpu_only() {
+        let w = BillingWeights::default();
+        assert_eq!(w.bill(100, 200), 300.0);
+    }
+
+    #[test]
+    fn scheduler_config_billing_weights_accessor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+tres_billing_weights = "CPU=0.0,GRES/gpu=1.0"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let w = config.scheduler.billing_weights();
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn usage_reset_period_default_is_none() {
+        let toml = r#"cluster_name = "test""#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.usage_reset_period, UsageResetPeriod::None);
+    }
+
+    #[test]
+    fn usage_reset_period_parses_all_variants() {
+        for (input, expected) in [
+            ("daily", UsageResetPeriod::Daily),
+            ("weekly", UsageResetPeriod::Weekly),
+            ("monthly", UsageResetPeriod::Monthly),
+            ("quarterly", UsageResetPeriod::Quarterly),
+            ("yearly", UsageResetPeriod::Yearly),
+            ("MONTHLY", UsageResetPeriod::Monthly),
+            ("none", UsageResetPeriod::None),
+        ] {
+            let toml =
+                format!("cluster_name = \"test\"\n[scheduler]\nusage_reset_period = \"{input}\"");
+            let config = SlurmConfig::load_from_str(&toml).unwrap();
+            assert_eq!(
+                config.scheduler.usage_reset_period, expected,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_reset_period_rejects_invalid() {
+        let toml = r#"
+cluster_name = "test"
+[scheduler]
+usage_reset_period = "biweekly"
+"#;
+        assert!(SlurmConfig::load_from_str(toml).is_err());
+    }
+
+    fn load_partition(body: &str) -> Result<SlurmConfig, ConfigError> {
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"cpu\"\nnodes = \"n1\"\n{body}"
+        ))
+    }
+
+    fn rejected(body: &str) -> String {
+        match load_partition(body) {
+            Ok(_) => panic!("expected config load to fail for:\n{body}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_resource_caps_default_to_unlimited() {
+        let parts = load_partition("").unwrap().build_partitions();
+        let p = &parts[0];
+        assert!(p.max_tres_per_node.is_empty());
+        assert_eq!(p.max_mem_per_node, None);
+        assert_eq!(p.max_mem_per_cpu, None);
+        assert_eq!(p.def_mem_per_node, None);
+        assert_eq!(p.def_mem_per_cpu, None);
+        assert_eq!(p.def_mem_per_gpu, None);
+    }
+
+    #[test]
+    fn scalar_alias_alone_folds_into_cpu_tres_key() {
+        let parts = load_partition("max_cpus_per_node = 16\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([("cpu".to_string(), 16)])
+        );
+
+        let direct = load_partition("[partitions.max_tres_per_node]\ncpu = 16\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(parts[0].max_tres_per_node, direct[0].max_tres_per_node);
+    }
+
+    #[test]
+    fn scalar_alias_merges_with_other_tres_keys() {
+        let parts = load_partition(
+            "max_cpus_per_node = 8\n[partitions.max_tres_per_node]\nmem = 131072\n\"gres/gpu:a100\" = 2\n\"gres/gpu\" = 0\n",
+        )
+        .unwrap()
+        .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([
+                ("cpu".to_string(), 8),
+                ("gres/gpu".to_string(), 0),
+                ("gres/gpu:a100".to_string(), 2),
+                ("mem".to_string(), 131072),
+            ])
+        );
+    }
+
+    #[test]
+    fn partition_memory_knobs_are_carried_to_the_runtime_partition() {
+        let parts = load_partition("max_mem_per_cpu = 2048\ndef_mem_per_gpu = 8192\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(parts[0].max_mem_per_cpu, Some(2048));
+        assert_eq!(parts[0].def_mem_per_gpu, Some(8192));
+        assert_eq!(parts[0].max_mem_per_node, None);
+    }
+
+    #[test]
+    fn build_partitions_rejects_max_mem_per_node_and_max_mem_per_cpu_both_set() {
+        let err = rejected("max_mem_per_node = 65536\nmax_mem_per_cpu = 2048\n");
+        for needle in ["partitions.cpu", "max_mem_per_node", "max_mem_per_cpu"] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+
+        let per_node = load_partition("max_mem_per_node = 65536\n").unwrap();
+        assert_eq!(per_node.build_partitions()[0].max_mem_per_node, Some(65536));
+        let per_cpu = load_partition("max_mem_per_cpu = 2048\n").unwrap();
+        assert_eq!(per_cpu.build_partitions()[0].max_mem_per_cpu, Some(2048));
+    }
+
+    #[test]
+    fn a_zero_limit_knob_is_rejected_but_a_zero_tres_cap_is_kept() {
+        let knobs = [
+            "max_cpus_per_node",
+            "max_mem_per_node",
+            "max_mem_per_cpu",
+            "def_mem_per_node",
+            "def_mem_per_cpu",
+            "def_mem_per_gpu",
+        ];
+        for knob in knobs {
+            let err = rejected(&format!("{knob} = 0\n"));
+            for needle in [format!("partitions.cpu.{knob}"), "max_tres_per_node".into()] {
+                assert!(err.contains(&needle), "missing {needle:?} in: {err}");
+            }
+        }
+
+        let parts = load_partition("[partitions.max_tres_per_node]\ncpu = 0\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([("cpu".into(), 0)])
+        );
+    }
+
+    #[test]
+    fn build_partitions_rejects_conflicting_max_cpus_per_node_and_tres_cpu() {
+        let err = rejected("max_cpus_per_node = 64\n[partitions.max_tres_per_node]\ncpu = 32\n");
+        for needle in ["partitions.cpu", "max_cpus_per_node", "64", "cpu = 32"] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+
+        // Both spellings of the same cap are rejected even when they agree.
+        let err = rejected("max_cpus_per_node = 64\n[partitions.max_tres_per_node]\ncpu = 64\n");
+        assert!(err.contains("max_cpus_per_node"), "{err}");
+    }
+
+    #[test]
+    fn build_partitions_rejects_multiple_def_mem_set() {
+        let knobs = ["def_mem_per_node", "def_mem_per_cpu", "def_mem_per_gpu"];
+        for (i, a) in knobs.iter().enumerate() {
+            for b in &knobs[i + 1..] {
+                let err = rejected(&format!("{a} = 4096\n{b} = 1024\n"));
+                for needle in ["partitions.cpu", a, b] {
+                    assert!(err.contains(needle), "missing {needle:?} in: {err}");
+                }
+            }
+        }
+        let err = rejected("def_mem_per_node = 1\ndef_mem_per_cpu = 2\ndef_mem_per_gpu = 3\n");
+        assert!(err.contains("def_mem_per_gpu = 3"), "{err}");
+
+        for knob in knobs {
+            assert!(
+                load_partition(&format!("{knob} = 1024\n")).is_ok(),
+                "{knob} alone must load"
+            );
+        }
+    }
+
+    #[test]
+    fn build_partitions_rejects_malformed_max_tres_per_node_key() {
+        for key in ["cpus", "gres", "gres/gpu:", "disk", "CPU", "gres/gpu:a 100"] {
+            let err = rejected(&format!("[partitions.max_tres_per_node]\n\"{key}\" = 32\n"));
+            assert!(err.contains("partitions.cpu"), "{err}");
+            assert!(err.contains(&format!("{key:?}")), "missing key in: {err}");
+        }
+        for key in ["cpu", "mem", "gres/gpu", "gres/gpu:a100"] {
+            assert!(
+                load_partition(&format!("[partitions.max_tres_per_node]\n\"{key}\" = 32\n"))
+                    .is_ok(),
+                "{key} must load"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_partition_cap_fails_to_parse() {
+        let err = rejected("max_cpus_per_node = -1\n");
+        assert!(err.contains("max_cpus_per_node"), "{err}");
+        let err = rejected("[partitions.max_tres_per_node]\ncpu = -1\n");
+        assert!(err.to_lowercase().contains("invalid value"), "{err}");
+    }
+
+    #[test]
+    fn enforce_part_limits_keeps_its_meaning_with_caps_configured() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\nenforce_part_limits = \"any\"\n\n[[partitions]]\nname = \"cpu\"\nmax_cpus_per_node = 8\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.scheduler.enforce_part_limits, EnforcePartLimits::Any);
     }
 }

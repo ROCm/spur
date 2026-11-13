@@ -31,7 +31,7 @@ matrix:
   - pyspelling.filters.url:
 - name: Markdown
   sources:
-  - ['docs/**/*.md|!docs/_build/**']
+  - ['docs/**/*.md|!docs/_build/**|!docs/knowledge/**']
   expect_match: false
   aspell:
     lang: en

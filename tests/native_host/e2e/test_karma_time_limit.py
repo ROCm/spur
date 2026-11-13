@@ -70,8 +70,9 @@ class TestTimeLimitAccounting:
         assert job_id is not None
         wait_job(c, job_id, timeout=60)
         time.sleep(5)
+        # job_id is the int sbatch returned; psql() has no parameter binding.
         out = c.psql(
-            f"SELECT time_limit_secs FROM jobs WHERE job_id = {job_id}"
+            f"SELECT time_limit_secs FROM jobs WHERE job_id = {job_id}"  # nosec B608
         )
         assert out.strip() == "600", (
             f"expected time_limit_secs=600 in postgres, got {out.strip()!r}"
@@ -91,8 +92,9 @@ class TestTimeLimitAccounting:
         assert job_id is not None
         wait_job(c, job_id, timeout=60)
         time.sleep(5)
+        # job_id is the int sbatch returned; psql() has no parameter binding.
         out = c.psql(
-            f"SELECT time_limit_secs FROM jobs WHERE job_id = {job_id}"
+            f"SELECT time_limit_secs FROM jobs WHERE job_id = {job_id}"  # nosec B608
         )
         assert out.strip() == "30", (
             f"expected time_limit_secs=30 for --time=0:00:30, got {out.strip()!r}"

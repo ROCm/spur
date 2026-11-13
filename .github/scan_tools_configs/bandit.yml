@@ -20,6 +20,14 @@ exclude_dirs:
   - dist
   - node_modules
 
+# The repository's Python is test harness that drives the Spur CLIs as
+# subprocesses by name, so these fire on every helper. Shell-injection checks
+# (B602, B605) stay on. Bandit cannot scope a skip to a path.
+skips:
+  - B404
+  - B603
+  - B607
+
 # pytest reports failures through bare asserts, so B101 is noise under tests.
 # The leading */ also matches the baseline's .scan-target/ checkout prefix.
 assert_used:

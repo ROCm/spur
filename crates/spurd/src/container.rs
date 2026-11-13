@@ -158,19 +158,19 @@ pub struct ContainerConfig {
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
 }
 
-/// Bind-mount the host mint socket so nested `srun` can mint. Host UID 0 does
-/// not receive the socket unless root jobs are explicitly allowed. A container
-/// whose owner `withheld` it never gets it, and a user bind mount that would
-/// expose it anyway (the socket itself or a directory holding it) is refused
-/// rather than silently honoured.
+/// Bind-mount the host mint socket so nested `srun` can mint, for a container
+/// whose owner asked for it (`granted`). Host UID 0 does not receive the socket
+/// unless root jobs are explicitly allowed. Without the grant, a user bind
+/// mount that would expose the socket anyway (the socket itself or a directory
+/// holding it) is refused rather than silently honoured.
 pub fn maybe_bind_auth_socket(
     mounts: &mut Vec<BindMount>,
     cluster_id: &str,
     uid: u32,
     allow_root_jobs: bool,
-    withheld: bool,
+    granted: bool,
 ) -> anyhow::Result<()> {
-    if withheld {
+    if !granted {
         return refuse_auth_socket_mounts(mounts, cluster_id);
     }
     if cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
@@ -208,7 +208,7 @@ fn refuse_auth_socket_mounts(mounts: &[BindMount], cluster_id: &str) -> anyhow::
         if socket.starts_with(&src) {
             anyhow::bail!(
                 "container mount '{}' would expose the credential socket {}, which \
-                 --container-no-auth-socket withholds; drop the mount or the flag",
+                 --container-auth-socket makes available; drop the mount or pass the flag",
                 m.source,
                 socket.display()
             );
@@ -1189,7 +1189,7 @@ mod tests {
 
     // --- Credential mint socket ---
 
-    fn auth_socket_mounts(uid: u32, withheld: bool) -> Vec<BindMount> {
+    fn auth_socket_mounts(uid: u32, granted: bool) -> Vec<BindMount> {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("auth.sock");
@@ -1197,7 +1197,7 @@ mod tests {
         let prev = std::env::var_os(spur_core::native_mint::AUTH_SOCKET_ENV);
         std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, &socket);
         let mut mounts = Vec::new();
-        maybe_bind_auth_socket(&mut mounts, "cluster", uid, false, withheld).unwrap();
+        maybe_bind_auth_socket(&mut mounts, "cluster", uid, false, granted).unwrap();
         match prev {
             Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
             None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
@@ -1206,24 +1206,24 @@ mod tests {
     }
 
     #[test]
-    fn auth_socket_is_bound_for_a_non_root_container_by_default() {
-        let mounts = auth_socket_mounts(1000, false);
+    fn auth_socket_is_bound_for_a_non_root_container_that_asked_for_it() {
+        let mounts = auth_socket_mounts(1000, true);
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].source.ends_with("auth.sock"));
         assert_eq!(mounts[0].source, mounts[0].target);
     }
 
     #[test]
-    fn a_withheld_auth_socket_is_never_bound() {
-        assert!(auth_socket_mounts(1000, true).is_empty());
+    fn auth_socket_is_not_bound_unless_asked_for() {
+        assert!(auth_socket_mounts(1000, false).is_empty());
     }
 
     #[test]
     fn root_does_not_get_the_auth_socket_unless_root_jobs_are_allowed() {
-        assert!(auth_socket_mounts(0, false).is_empty());
+        assert!(auth_socket_mounts(0, true).is_empty());
     }
 
-    fn withheld_with_user_mount(source: impl Fn(&Path) -> PathBuf) -> anyhow::Result<()> {
+    fn ungranted_with_user_mount(source: impl Fn(&Path) -> PathBuf) -> anyhow::Result<()> {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("auth.sock");
@@ -1236,7 +1236,7 @@ mod tests {
             target: src,
             readonly: true,
         }];
-        let res = maybe_bind_auth_socket(&mut mounts, "cluster", 1000, false, true);
+        let res = maybe_bind_auth_socket(&mut mounts, "cluster", 1000, false, false);
         match prev {
             Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
             None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
@@ -1245,20 +1245,20 @@ mod tests {
     }
 
     #[test]
-    fn a_withheld_auth_socket_refuses_a_mount_of_the_socket() {
-        let err = withheld_with_user_mount(|d| d.join("auth.sock")).unwrap_err();
+    fn an_ungranted_auth_socket_refuses_a_mount_of_the_socket() {
+        let err = ungranted_with_user_mount(|d| d.join("auth.sock")).unwrap_err();
         assert!(err.to_string().contains("credential socket"), "{err}");
     }
 
     #[test]
-    fn a_withheld_auth_socket_refuses_a_mount_of_its_directory() {
-        assert!(withheld_with_user_mount(|d| d.to_path_buf()).is_err());
-        assert!(withheld_with_user_mount(|_| PathBuf::from("/")).is_err());
+    fn an_ungranted_auth_socket_refuses_a_mount_of_its_directory() {
+        assert!(ungranted_with_user_mount(|d| d.to_path_buf()).is_err());
+        assert!(ungranted_with_user_mount(|_| PathBuf::from("/")).is_err());
     }
 
     #[test]
-    fn a_withheld_auth_socket_allows_unrelated_mounts() {
-        assert!(withheld_with_user_mount(|d| d.join("other")).is_ok());
+    fn an_ungranted_auth_socket_allows_unrelated_mounts() {
+        assert!(ungranted_with_user_mount(|d| d.join("other")).is_ok());
     }
 
     // --- Mount parsing ---

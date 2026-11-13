@@ -93,7 +93,14 @@ pub fn install(plugin: &str, cluster_name: &str, mint_timeout: Duration) {
 }
 
 pub async fn wrap(channel: Channel) -> Result<ControllerClient, Status> {
-    let interceptor = match NATIVE_AUTH.get().cloned().flatten() {
+    wrap_with(channel, NATIVE_AUTH.get().cloned().flatten()).await
+}
+
+async fn wrap_with(
+    channel: Channel,
+    native_auth: Option<NativeAuth>,
+) -> Result<ControllerClient, Status> {
+    let interceptor = match native_auth {
         None => AgentControllerInterceptor::default(),
         Some(auth) => {
             let mut raw = spur_proto::controller_client(channel.clone());
@@ -196,13 +203,14 @@ mod tests {
     /// A transient Ping failure (here: Unimplemented, since this stand-in server never
     /// registers SlurmController) must not be collapsed into Unauthenticated — that
     /// would make `is_permanent_recovery_error` treat a retryable outage as permanent.
-    /// `NATIVE_AUTH` is a process-wide OnceLock set once here, like at real startup.
+    /// Passes the auth explicitly: setting the process-wide `NATIVE_AUTH` would make
+    /// every other test's mock controller fail the handshake.
     #[tokio::test]
     async fn wrap_preserves_the_real_status_code_on_a_failed_ping() {
-        let _ = NATIVE_AUTH.set(Some(NativeAuth {
+        let native_auth = Some(NativeAuth {
             socket: PathBuf::from("/nonexistent/auth.sock"),
             mint_timeout: Duration::from_secs(5),
-        }));
+        });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -221,7 +229,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = wrap(channel).await.unwrap_err();
+        let err = wrap_with(channel, native_auth).await.unwrap_err();
         assert_eq!(err.code(), Code::Unimplemented);
     }
 

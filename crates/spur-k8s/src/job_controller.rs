@@ -1017,7 +1017,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         container_env: spec.container_env.clone(),
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
-        container_no_auth_socket: spec.container_no_auth_socket,
+        container_auth_socket: spec.container_auth_socket,
         burst_buffer: spec.burst_buffer.clone().unwrap_or_default(),
         licenses: Vec::new(),
         mail_type: Vec::new(),
@@ -1777,6 +1777,8 @@ mod tests {
         requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
         get_nodes(pb::GetNodesRequest) -> pb::GetNodesResponse;
         get_node(pb::GetNodeRequest) -> pb::NodeInfo;
+        get_fabric_topology(()) -> pb::GetFabricTopologyResponse;
+        validate_block_file(pb::ValidateBlockFileRequest) -> pb::GetFabricTopologyResponse;
         update_node(pb::UpdateNodeRequest) -> ();
         drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
         deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;

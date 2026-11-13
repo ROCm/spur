@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+pub use spur_devices::topology::DeviceTopology;
 use std::collections::HashMap;
 
 /// GPU interconnect type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GpuLinkType {
     PCIe,
     XGMI,
@@ -13,7 +14,7 @@ pub enum GpuLinkType {
 }
 
 /// A single GPU resource.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GpuResource {
     pub device_id: u32,
     pub gpu_type: String,
@@ -26,6 +27,8 @@ pub struct GpuResource {
     /// keys on it.
     #[serde(default)]
     pub stable_id: u64,
+    #[serde(default)]
+    pub topology: Option<DeviceTopology>,
 }
 
 /// A set of compute resources (node-level inventory).
@@ -40,7 +43,27 @@ pub struct ResourceSet {
     /// for a different logical device is caught by a generation mismatch.
     #[serde(default)]
     pub generation: u64,
+    /// Shared monotonic capability: native fabric = 1, file = 2, GPU properties = 3.
+    #[serde(default)]
+    pub fabric_binding_version: u32,
+    #[serde(default)]
+    pub block_file_revision: Option<String>,
+    /// Agent-reported CPU topology. Belongs in a node's raw report
+    /// (`detected_resources`); `clamped` drops it when deriving schedulable
+    /// resources from that report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<crate::cpu_topology::CpuTopology>,
 }
+
+pub type InventoryFingerprint = (
+    u32,
+    u64,
+    Vec<GpuResource>,
+    Vec<(String, u64)>,
+    u32,
+    Option<String>,
+    Option<crate::cpu_topology::CpuTopology>,
+);
 
 /// Tracks consumed resources (per-node or per-job allocation accounting).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -54,6 +77,10 @@ pub struct ResourceAllocations {
     /// inventory, so a repartition between schedule and launch is caught.
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
+    pub fabric_binding: Option<crate::fabric_binding::FabricBinding>,
+    #[serde(default)]
+    pub gpu_binding: Option<crate::gpu_binding::GpuBinding>,
 }
 
 /// A single allocated device entry.
@@ -207,31 +234,54 @@ impl ResourceSet {
         }
     }
 
+    /// The same inventory with GPU ids moved to their current encoding.
+    pub fn with_renamed_gpus(&self, renamed: &HashMap<u64, u64>) -> ResourceSet {
+        let mut out = self.clone();
+        for gpu in &mut out.gpus {
+            if let Some(&id) = renamed.get(&gpu.stable_id) {
+                gpu.stable_id = id;
+            }
+        }
+        out
+    }
+
     /// Identity of the schedulable set, independent of `generation`. Two ticks
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
-    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<u64>, Vec<(String, u64)>) {
-        let mut gpu_ids: Vec<u64> = self.gpus.iter().map(|g| g.stable_id).collect();
-        gpu_ids.sort_unstable();
+    pub fn schedulable_fingerprint(&self) -> InventoryFingerprint {
+        let mut gpus = self.gpus.clone();
+        gpus.sort();
         let mut generic: Vec<(String, u64)> =
             self.generic.iter().map(|(k, v)| (k.clone(), *v)).collect();
         generic.sort();
-        (self.cpus, self.memory_mb, gpu_ids, generic)
+        (
+            self.cpus,
+            self.memory_mb,
+            gpus,
+            generic,
+            self.fabric_binding_version,
+            self.block_file_revision.clone(),
+            self.topology.clone(),
+        )
     }
 
     /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
-    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory.
-    /// The smaller of cap and (detected - reserved) wins; GPUs/generic are unaffected.
+    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory;
+    /// `spec_cpus` (cores set aside for node services) is subtracted from detected
+    /// CPUs before `cpus_cap` is applied. The smaller of cap and (detected - reserved)
+    /// wins; GPUs/generic are unaffected.
     pub fn clamped(
         &self,
         cpus_cap: u32,
         memory_cap_mb: u64,
         reserved_memory_mb: u64,
+        spec_cpus: u32,
     ) -> ResourceSet {
+        let usable = self.cpus.saturating_sub(spec_cpus);
         let cpus = if cpus_cap > 0 {
-            self.cpus.min(cpus_cap)
+            usable.min(cpus_cap)
         } else {
-            self.cpus
+            usable
         };
         let mem_cap = if memory_cap_mb > 0 {
             memory_cap_mb
@@ -245,6 +295,9 @@ impl ResourceSet {
             gpus: self.gpus.clone(),
             generic: self.generic.clone(),
             generation: self.generation,
+            fabric_binding_version: self.fabric_binding_version,
+            block_file_revision: self.block_file_revision.clone(),
+            topology: None,
         }
     }
 
@@ -262,6 +315,9 @@ impl ResourceSet {
         let avail_cpus = self.cpus.saturating_sub(allocated.cpus);
         let avail_mem = self.memory_mb.saturating_sub(allocated.memory_mb);
         if avail_cpus < request.cpus || avail_mem < request.memory_mb {
+            return false;
+        }
+        if !request.gpus.is_empty() && self.holds_unknown_gpu(allocated) {
             return false;
         }
 
@@ -302,6 +358,15 @@ impl ResourceSet {
         true
     }
 
+    /// An allocated id the inventory lost means a held device may now be
+    /// reported under another id, so none of this node's GPUs can be trusted free.
+    fn holds_unknown_gpu(&self, allocated: &ResourceAllocations) -> bool {
+        allocated
+            .device_ids("gpu")
+            .iter()
+            .any(|id| !self.gpus.iter().any(|g| g.stable_id == *id))
+    }
+
     /// Return unallocated device IDs for an injectable gres type.
     pub fn available_device_ids(
         &self,
@@ -316,6 +381,9 @@ impl ResourceSet {
             .unwrap_or_default();
 
         if gres_name == "gpu" {
+            if self.holds_unknown_gpu(allocated) {
+                return Vec::new();
+            }
             self.gpus
                 .iter()
                 .filter(|g| {
@@ -475,10 +543,62 @@ pub fn build_node_allocation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_inventory_json_deserializes_without_topology() {
+        let old = r#"{"cpus":8,"memory_mb":1024,"gpus":[{"device_id":0,"gpu_type":"amdgpu","memory_mb":4096,"peer_gpus":[],"link_type":"PCIe","stable_id":128}],"generic":{},"generation":7}"#;
+        let inventory: super::ResourceSet = serde_json::from_str(old).unwrap();
+        assert!(inventory.gpus[0].topology.is_none());
+        assert_eq!(inventory.generation, 7);
+        assert_eq!(inventory.gpus[0].stable_id, 128);
+    }
+
+    #[test]
+    fn with_renamed_gpus_moves_only_mapped_ids() {
+        let inventory = sample_inventory();
+        let renamed = HashMap::from([(0, 100)]);
+        let out = inventory.with_renamed_gpus(&renamed);
+        assert_eq!(out.gpus[0].stable_id, 100);
+        assert_eq!(out.gpus[1].stable_id, 1);
+    }
+
+    #[test]
+    fn inventory_fingerprint_tracks_membership_and_gpu_properties() {
+        use spur_devices::topology::{DeviceTopology, FabricObservation, ObservationStatus};
+        let mut a = sample_inventory();
+        a.gpus[0].topology = Some(DeviceTopology {
+            fabric: Some(FabricObservation {
+                status: ObservationStatus::Consistent,
+                fabric_domain_id: Some("15".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut b = a.clone();
+        b.generation += 1;
+        assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .fabric_domain_id = Some("16".into());
+        assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b = a.clone();
+        b.gpus[0].memory_mb += 1;
+        assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b = a.clone();
+        b.gpus.reverse();
+        assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+    }
+
     use super::*;
 
     fn sample_inventory() -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -488,6 +608,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![1],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -496,11 +617,13 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![0],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 1,
                 },
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -508,7 +631,7 @@ mod tests {
     fn clamp_no_config_is_identity() {
         // cpus=0, memory_mb=0, reserved=0 means "no limits configured".
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 0);
+        let clamped = detected.clamped(0, 0, 0, 0);
         assert_eq!(clamped.cpus, 64);
         assert_eq!(clamped.memory_mb, 256_000);
         // GPUs and generic pass through untouched.
@@ -518,7 +641,7 @@ mod tests {
     #[test]
     fn clamp_cpus_caps_below_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(32, 0, 0);
+        let clamped = detected.clamped(32, 0, 0, 0);
         assert_eq!(clamped.cpus, 32);
     }
 
@@ -526,28 +649,28 @@ mod tests {
     fn clamp_cpus_over_claim_capped_to_detected() {
         // Config asking for more CPUs than the host has cannot invent hardware.
         let detected = sample_inventory();
-        let clamped = detected.clamped(128, 0, 0);
+        let clamped = detected.clamped(128, 0, 0, 0);
         assert_eq!(clamped.cpus, 64);
     }
 
     #[test]
     fn clamp_memory_cap_below_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 200_000, 0);
+        let clamped = detected.clamped(0, 200_000, 0, 0);
         assert_eq!(clamped.memory_mb, 200_000);
     }
 
     #[test]
     fn clamp_memory_over_claim_capped_to_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 512_000, 0);
+        let clamped = detected.clamped(0, 512_000, 0, 0);
         assert_eq!(clamped.memory_mb, 256_000);
     }
 
     #[test]
     fn clamp_reserved_subtracts_from_detected() {
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 16_000);
+        let clamped = detected.clamped(0, 0, 16_000, 0);
         assert_eq!(clamped.memory_mb, 240_000);
     }
 
@@ -556,7 +679,7 @@ mod tests {
         // memory_mb cap = 250_000; detected - reserved = 256_000 - 16_000 = 240_000.
         // The smaller (reserved-derived) value wins.
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 250_000, 16_000);
+        let clamped = detected.clamped(0, 250_000, 16_000, 0);
         assert_eq!(clamped.memory_mb, 240_000);
     }
 
@@ -564,14 +687,59 @@ mod tests {
     fn clamp_reserved_saturates_at_zero() {
         // reserved >= detected must floor at 0, never underflow.
         let detected = sample_inventory();
-        let clamped = detected.clamped(0, 0, 999_999);
+        let clamped = detected.clamped(0, 0, 999_999, 0);
         assert_eq!(clamped.memory_mb, 0);
+    }
+
+    #[test]
+    fn clamped_removes_spec_cpus_before_the_cap() {
+        let detected = ResourceSet {
+            cpus: 256,
+            memory_mb: 2_000_000,
+            ..Default::default()
+        };
+        assert_eq!(detected.clamped(0, 0, 0, 2).cpus, 254);
+        // The cap limits schedulable CPUs, which already exclude spec CPUs.
+        assert_eq!(detected.clamped(200, 0, 0, 2).cpus, 200);
+        assert_eq!(detected.clamped(0, 0, 0, 300).cpus, 0);
+    }
+
+    #[test]
+    fn clamped_never_copies_the_topology() {
+        let detected = ResourceSet {
+            cpus: 2,
+            topology: Some(crate::cpu_topology::CpuTopology {
+                cores: vec![crate::cpu_topology::CoreInfo {
+                    socket: 0,
+                    numa_node: None,
+                    cpus: vec![0, 1],
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(detected.clamped(0, 0, 0, 0).topology.is_none());
+    }
+
+    #[test]
+    fn a_resource_set_without_topology_keeps_its_old_json_shape() {
+        let set = ResourceSet {
+            cpus: 4,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert!(json.get("topology").is_none(), "{json}");
+        let old = r#"{"cpus":4,"memory_mb":0,"gpus":[],"generic":{}}"#;
+        let decoded: ResourceSet = serde_json::from_str(old).unwrap();
+        assert!(decoded.topology.is_none());
+        assert_eq!(decoded.cpus, 4);
     }
 
     #[test]
     fn test_can_satisfy() {
         let avail = sample_inventory();
         let req = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 32,
             memory_mb: 128_000,
             gpus: vec![GpuResource {
@@ -580,10 +748,12 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(avail.can_satisfy(&req));
     }
@@ -597,6 +767,8 @@ mod tests {
             .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
 
         let req_one = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {
@@ -605,10 +777,12 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(inventory.can_satisfy_with_allocated(&allocated, &req_one));
 
@@ -620,6 +794,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -628,6 +803,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
             ],
@@ -670,6 +846,8 @@ mod tests {
     #[test]
     fn available_device_ids_returns_stable_ids_not_positional() {
         let inventory = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -679,6 +857,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128,
                 },
                 GpuResource {
@@ -687,11 +866,13 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
             generic: HashMap::new(),
             generation: 7,
+            topology: None,
         };
         // Nothing allocated: both stable ids are free.
         let free =
@@ -704,10 +885,56 @@ mod tests {
         assert_eq!(free, vec![129]);
     }
 
+    fn two_gpu_inventory(a: u64, b: u64) -> ResourceSet {
+        let mut inventory = sample_inventory();
+        inventory.gpus[0].stable_id = a;
+        inventory.gpus[1].stable_id = b;
+        inventory
+    }
+
+    #[test]
+    fn a_node_holding_an_id_it_no_longer_has_offers_no_gpu() {
+        let inventory = two_gpu_inventory(0x11_0000, 0x12_0000);
+
+        let orphaned = ResourceAllocations::from_device_ids("gpu", &[0x11_0100]);
+        assert!(inventory
+            .available_device_ids(&orphaned, "gpu", None)
+            .is_empty());
+
+        let held = ResourceAllocations::from_device_ids("gpu", &[0x11_0000]);
+        assert_eq!(
+            inventory.available_device_ids(&held, "gpu", None),
+            vec![0x12_0000]
+        );
+    }
+
+    #[test]
+    fn a_node_holding_an_id_it_no_longer_has_cannot_satisfy_a_gpu_request() {
+        let inventory = two_gpu_inventory(0x11_0000, 0x12_0000);
+        let mut one_gpu = ResourceSet {
+            cpus: 1,
+            ..Default::default()
+        };
+        one_gpu.gpus.push(inventory.gpus[0].clone());
+        let cpu_only = ResourceSet {
+            cpus: 1,
+            ..Default::default()
+        };
+
+        let orphaned = ResourceAllocations::from_device_ids("gpu", &[0x11_0100]);
+        assert!(!inventory.can_satisfy_with_allocated(&orphaned, &one_gpu));
+        assert!(inventory.can_satisfy_with_allocated(&orphaned, &cpu_only));
+
+        let held = ResourceAllocations::from_device_ids("gpu", &[0x11_0000]);
+        assert!(inventory.can_satisfy_with_allocated(&held, &one_gpu));
+    }
+
     #[test]
     fn test_build_node_allocation() {
         let inventory = sample_inventory();
         let request = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![GpuResource {
@@ -716,10 +943,12 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         assert_eq!(alloc.cpus, 8);
@@ -729,6 +958,8 @@ mod tests {
     #[test]
     fn test_build_node_allocation_multi_type() {
         let inventory = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -738,6 +969,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -746,6 +978,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 1,
                 },
                 GpuResource {
@@ -754,6 +987,7 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 2,
                 },
                 GpuResource {
@@ -762,13 +996,17 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 3,
                 },
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let request = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![
@@ -778,6 +1016,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -786,11 +1025,13 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 0,
                 },
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         let mut ids = alloc.device_ids("gpu");
@@ -827,17 +1068,21 @@ mod accounting_tests {
             memory_mb: 65536,
             peer_gpus: Vec::new(),
             link_type: GpuLinkType::XGMI,
+            topology: None,
             stable_id: device_id as u64,
         }
     }
 
     fn inventory() -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 131_072,
             gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
             generic: HashMap::from([("bandwidth".to_string(), 100u64)]),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -963,11 +1208,14 @@ mod accounting_tests {
     #[test]
     fn build_exclusive_allocation_omits_absent_gpus_and_zero_counts() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: Vec::new(),
             generic: HashMap::from([("licenses".to_string(), 0u64)]),
             generation: 0,
+            topology: None,
         };
         let alloc = build_exclusive_allocation(&inv, 1024);
 
@@ -982,6 +1230,8 @@ mod accounting_tests {
     #[test]
     fn build_exclusive_allocation_emits_stable_ids_not_positional() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 16,
             memory_mb: 1024,
             gpus: vec![
@@ -991,6 +1241,7 @@ mod accounting_tests {
                     memory_mb: 196_608,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128,
                 },
                 GpuResource {
@@ -999,11 +1250,13 @@ mod accounting_tests {
                     memory_mb: 196_608,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = build_exclusive_allocation(&inv, 1024);
 
@@ -1051,6 +1304,8 @@ mod accounting_tests {
     #[test]
     fn backfill_stable_ids_fills_legacy_zeros_only() {
         let mut inv = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![
@@ -1060,6 +1315,7 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -1068,6 +1324,7 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -1076,11 +1333,13 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         inv.backfill_stable_ids();
         let ids: Vec<u64> = inv.gpus.iter().map(|g| g.stable_id).collect();
@@ -1092,6 +1351,8 @@ mod accounting_tests {
     #[test]
     fn feasibility_subtracts_held_gpu_by_stable_id() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: vec![GpuResource {
@@ -1100,15 +1361,19 @@ mod accounting_tests {
                 memory_mb: 0,
                 peer_gpus: Vec::new(),
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 128,
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
         assert_eq!(allocated.allocated_count("gpu", Some("mi300x"), &inv), 1);
 
         let req = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {
@@ -1117,10 +1382,12 @@ mod accounting_tests {
                 memory_mb: 0,
                 peer_gpus: Vec::new(),
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         };
         assert!(
             !inv.can_satisfy_with_allocated(&allocated, &req),

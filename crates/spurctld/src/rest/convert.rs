@@ -2,17 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use spur_core::job::{Job, JobState};
-use spur_core::node::Node;
+use spur_core::node::{Node, NodeState};
 use spur_core::partition::Partition;
 
 pub fn job_to_json(job: &Job) -> serde_json::Value {
     serde_json::json!({
         "job_id": job.job_id,
+        "preemption_usage": {
+            "used": job.preemption_usage.used,
+            "unused": job.preemption_usage.unused_total(),
+            "open": job.preemption_usage.open,
+            "unused_by_cause": crate::metrics_proto::preemption_usage_to_proto(&job.preemption_usage).unused_by_cause.iter().map(|cause| serde_json::json!({
+                "reason": cause.reason, "initiator": cause.initiator, "count": cause.count,
+            })).collect::<Vec<_>>(),
+        },
         "idle_fill": job.idle_fill,
         "name": job.spec.name,
         "user_name": job.spec.user,
         "user_id": job.spec.uid,
         "partition": job.spec.partition,
+        "effective_partition": job.effective_partition,
         "account": job.spec.account,
         "job_state": job.state.display(),
         "state_reason": job.state_reason(),
@@ -45,14 +54,25 @@ pub fn node_to_json(
     node: &Node,
     planned: Option<(spur_core::job::JobId, chrono::DateTime<chrono::Utc>)>,
 ) -> serde_json::Value {
+    let layout_drain = node.layout_drain_reason();
+    let (state, reason, reason_uid, reason_time) = match &layout_drain {
+        Some(reason) => (NodeState::Drain.display(), Some(reason.clone()), None, None),
+        None => (
+            node.state.display(),
+            node.state_reason.clone(),
+            node.reason_uid,
+            node.reason_time.map(|t| t.to_rfc3339()),
+        ),
+    };
     serde_json::json!({
         "name": node.name,
-        "state": node.state.display(),
-        "reason": node.state_reason,
-        "reason_uid": node.reason_uid,
-        "reason_time": node.reason_time.map(|t| t.to_rfc3339()),
+        "state": state,
+        "reason": reason,
+        "reason_uid": reason_uid,
+        "reason_time": reason_time,
         "partitions": node.partitions,
-        "cpus": node.total_resources.cpus,
+        "cpus": node.cpu_tot(),
+        "effective_cpus": node.total_resources.cpus,
         "alloc_cpus": node.alloc_resources.cpus,
         "real_memory": node.total_resources.memory_mb,
         "free_mem": node.free_memory_mb,
@@ -77,6 +97,13 @@ pub fn partition_to_json(part: &Partition) -> serde_json::Value {
         "priority_tier": part.priority_tier,
         "allow_accounts": part.allow_accounts,
         "deny_accounts": part.deny_accounts,
+        "max_cpus_per_node": part.max_tres_per_node.get(spur_core::partition::TRES_CPU),
+        "max_tres_per_node": part.max_tres_per_node,
+        "max_mem_per_node": part.max_mem_per_node,
+        "max_mem_per_cpu": part.max_mem_per_cpu,
+        "def_mem_per_node": part.def_mem_per_node,
+        "def_mem_per_cpu": part.def_mem_per_cpu,
+        "def_mem_per_gpu": part.def_mem_per_gpu,
     })
 }
 
@@ -110,6 +137,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn job_to_json_reports_preemption_counts_and_causes() {
+        let mut job = Job::new(7, Default::default());
+        job.preemption_usage.open_one();
+        job.preemption_usage.settle(Some((
+            spur_core::preemption_usage::UnusedReason::Cancelled,
+            spur_core::preemption_usage::PreemptionInitiator::User,
+        )));
+        assert_eq!(
+            job_to_json(&job)["preemption_usage"],
+            serde_json::json!({
+                "used": 0, "unused": 1, "open": 0,
+                "unused_by_cause": [{"reason": "cancelled", "initiator": "user", "count": 1}],
+            })
+        );
+    }
+
+    #[test]
+    fn node_to_json_projects_a_core_layout_block_like_scontrol() {
+        let mut node = Node::new("n1".into(), Default::default());
+        node.state = NodeState::Idle;
+        node.layout_enforce_error = Some("root write failed".into());
+
+        let json = node_to_json(&node, None);
+        assert_eq!(json["state"], NodeState::Drain.display());
+        assert_eq!(
+            json["reason"],
+            "core-layout: not enforced: root write failed"
+        );
+    }
+
+    #[test]
     fn partition_to_json_includes_access_control_fields() {
         let part = Partition {
             name: "gpu".into(),
@@ -120,6 +178,46 @@ mod tests {
         let json = partition_to_json(&part);
         assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
         assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
+    }
+
+    #[test]
+    fn job_to_json_reports_the_effective_partition() {
+        let mut job = Job::new(
+            7,
+            spur_core::job::JobSpec {
+                partition: Some("cpu,wide".into()),
+                ..Default::default()
+            },
+        );
+        assert!(job_to_json(&job)["effective_partition"].is_null());
+        job.effective_partition = Some("wide".into());
+        let json = job_to_json(&job);
+        assert_eq!(json["partition"], "cpu,wide");
+        assert_eq!(json["effective_partition"], "wide");
+    }
+
+    #[test]
+    fn partition_to_json_includes_resource_limits() {
+        let part = Partition {
+            name: "cpu".into(),
+            max_tres_per_node: [("cpu".to_string(), 64), ("gres/gpu".to_string(), 0)].into(),
+            max_mem_per_cpu: Some(2048),
+            def_mem_per_node: Some(4096),
+            ..Default::default()
+        };
+        let json = partition_to_json(&part);
+        assert_eq!(json["max_cpus_per_node"], 64);
+        assert_eq!(
+            json["max_tres_per_node"],
+            serde_json::json!({"cpu": 64, "gres/gpu": 0})
+        );
+        assert_eq!(json["max_mem_per_cpu"], 2048);
+        assert_eq!(json["def_mem_per_node"], 4096);
+        assert!(json["max_mem_per_node"].is_null());
+
+        let plain = partition_to_json(&Partition::default());
+        assert!(plain["max_cpus_per_node"].is_null());
+        assert_eq!(plain["max_tres_per_node"], serde_json::json!({}));
     }
 
     #[test]

@@ -246,6 +246,12 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Restart
      - Seconds without a heartbeat before a node is marked Down. Unset by
        default; the controller applies a 90-second fallback when absent.
+       Jobs on a Down node end as ``NODE_FAIL`` (``CANCELLED`` if already
+       being cancelled); a job submitted with
+       ``--requeue`` goes back to the queue, and is held there after
+       ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
+       stopped when they heartbeat again, or when the job is relaunched there
+       (see :ref:`requeued-run-upgrade-notes` for older agents).
    * - ``health_tick_secs``
      - integer
      - ``30``
@@ -258,7 +264,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``5``
      - Live
      - Maximum automatic requeues (excluding preemption) before a job is held with
-       ``JobHoldMaxRequeue``. Must be ``>= 1``; ``0`` is a validation error.
+       ``JobHoldMaxRequeue``. A held job's resources are released at once; a
+       node that still runs its process is told to stop it on the node's next
+       heartbeat (see
+       :ref:`held jobs still running <held-job-still-running>`). Must be
+       ``>= 1``; ``0`` is a validation error.
    * - ``max_launch_backoff_secs``
      - integer
      - ``300``
@@ -275,7 +285,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``3600``
      - Live
      - How long a completed job stays in controller memory before eviction.
-       Accounting rows in PostgreSQL are unaffected.
+       Accounting rows in PostgreSQL are unaffected. With accounting enabled, a
+       job whose preemption counts are not yet exported can stay up to 24 hours
+       longer (see :ref:`preemption-outcome-export`).
    * - ``dispatch_reject_cooldown_secs``
      - integer
      - ``30``
@@ -329,6 +341,29 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        where each phase gets its own full budget. Raising this value
        toward its max therefore also raises how long a node can sit
        idle-but-charged after a failover.
+   * - ``shutdown_grace_secs``
+     - integer
+     - ``10``
+     - Restart
+     - How long ``spurctld`` waits, after ``SIGTERM`` or ``SIGINT``, for
+       in-flight RPCs to drain before forcing shutdown. An ``srun`` step holds
+       its RPC open for the step's whole runtime, so this bounds how long a
+       restart takes while steps are running. Range 0-86400; ``0`` waits
+       indefinitely, and a repeated ``SIGTERM`` or ``SIGINT`` does not end that
+       wait, only ``SIGKILL`` does.
+
+       The default suits most sites. Keep it well below
+       ``heartbeat_timeout_secs``: the draining controller answers no
+       heartbeats but still checks node health, so a grace within 35 seconds of
+       that timeout (one heartbeat interval plus the flush) lets a full drain
+       mark nodes DOWN and fail their jobs, and so can ``0``, whose drain has no
+       bound. ``spurctld`` warns at startup in either case. Also keep the grace,
+       plus up to 5 seconds for the accounting flush that follows, below your
+       service manager's stop timeout (systemd ``TimeoutStopSec``, Kubernetes
+       ``terminationGracePeriodSeconds``): a ``SIGKILL`` from that timeout skips
+       the flush. Requests still running when the grace period ends are only cut
+       off at exit, so the flush is best-effort for accounting rows they write
+       late.
 
 ``[spurd]``
 -----------
@@ -495,8 +530,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``1``
      - Restart
      - How often (seconds) the scheduler runs. The loop cadence and the
-       preemption requeue hold are fixed at startup; the launch-backoff base
-       does re-read this value live.
+       interval term of the requeue hold (``2 x interval_secs + 3``) are fixed at
+       startup; the launch-backoff base does re-read this value live.
    * - ``max_jobs_per_cycle``
      - integer
      - ``10000``
@@ -527,15 +562,69 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - string
      - ``NO``
      - Live
-     - Whether partition wall-time limits are enforced at submit. ``NO`` admits
-       over-limit jobs and lets them pend with a ``PartitionTimeLimit`` reason.
-       ``ALL`` rejects unless the job fits every requested partition; ``ANY``
-       rejects only when it fits none. Mirrors Slurm's ``EnforcePartLimits``.
+     - Whether partition limits are enforced at submit: wall time,
+       ``max_mem_per_node``, and requests a partition's per-node resource cap
+       could never hold (see :doc:`partition-resource-limits`). ``NO`` admits
+       over-limit jobs and lets them pend (``PartitionTimeLimit``,
+       ``PartitionConfig``, or ``PartitionTresLimit``). ``ALL`` rejects unless
+       the job fits every requested partition; ``ANY`` rejects only when it fits
+       none. A job over a cap only because of current load always pends,
+       whatever the setting. Mirrors Slurm's ``EnforcePartLimits``.
    * - ``complete_wait_secs``
      - integer
      - ``300``
      - Live
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
+       Nodes that have not confirmed completion are drained before their
+       resources are released. If that drain cannot be committed, the job
+       retains its allocation and the controller retries. A node reports only
+       after the job is killed, its cgroup cleanup finishes, and its node
+       epilog ends, so this should exceed the larger kill wait
+       (``kill_wait_secs`` or ``timeout_kill_wait_secs``) plus
+       ``[cgroup] cleanup_timeout_secs`` plus ``[hooks] epilog_timeout_secs``
+       and its 11 second kill sequence; the controller logs a warning when it
+       does not. See :ref:`the epilog timeout <epilog-timeout>`.
+   * - ``kill_wait_secs``
+     - integer
+     - ``5``
+     - Live
+     - Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
+       other than a time or inactivity limit: ``scancel``, ``scontrol requeue``,
+       preemption, idle-fill reclaim, reservation end, stopping the other nodes
+       of a job whose batch script has exited, and other graceful stops.
+       Ends early once the job's processes exit. Valid ``0``-``65533``; values
+       below 5 act as 5. ``complete_wait_secs`` should exceed the larger kill
+       wait (this or ``timeout_kill_wait_secs``) plus
+       ``[cgroup] cleanup_timeout_secs`` and the epilog bound, or a healthy
+       node still being killed, cleaned up, or in its epilog is drained when the
+       job is force-finished; the controller logs a warning when it does not.
+       Known issue: a requeued job (requeue-mode preemption,
+       ``scontrol requeue``) frees its nodes at once, while the old run is
+       still in its kill wait, so another job can be dispatched onto them
+       during that window. The window
+       can last up to ``kill_wait_secs``, so keep it low if that matters with
+       requeue-mode preemption. A requeued job itself is held out of the queue
+       for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
+       seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
+       Mirrors Slurm's ``KillWait`` for these stops, but does not yet reach
+       ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       ``scontrol show config`` prints the value in effect, floor applied, as
+       ``KillWait``.
+   * - ``timeout_kill_wait_secs``
+     - integer
+     - ``30``
+     - Live
+     - The same wait for a job stopped by its time limit or the inactivity limit
+       (``inactive_limit_secs``), the stops that end ``TIMEOUT``. A
+       time-limited batch job moves to COMPLETING straight away and spends this
+       wait there before ending ``TIMEOUT``. Valid ``0``-``65533``; values below
+       5 act as 5. ``complete_wait_secs`` should exceed the larger kill wait
+       (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs`` and
+       the epilog bound. In
+       Slurm, ``KillWait`` also covers time limits; here that part is this
+       setting. Does not yet reach ``srun`` steps
+       (:ref:`kill wait note <kill-wait-steps-caveat>`). ``scontrol show config``
+       prints the value in effect, floor applied, as ``TimeoutKillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -557,8 +646,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
        or without ``--pty``) whose client has sent no keepalive for this many
-       seconds, freeing the nodes. The reaper sends SIGTERM, waits a 30 second
-       grace, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       seconds, freeing the nodes. The reaper sends SIGTERM, then SIGKILLs after
+       up to ``timeout_kill_wait_secs``; the job ends ``TIMEOUT``, normally at
+       once (:ref:`kill wait note <kill-wait-steps-caveat>`). ``0`` disables reaping.
        Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
        ``scontrol show config``. Must be at least twice the client keepalive
        interval (60 seconds); smaller non-zero values are rejected at startup so a
@@ -636,7 +726,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 
    A pending job that needs more nodes than currently have free capacity is
    re-evaluated every scheduling cycle, but does not hold a reservation on
-   any node while it waits. In practice this means: as soon as any node the
+   any node while it waits (except nodes freed by its own cancel or requeue
+   preemption, described below). In practice this means: as soon as any node the
    job could use becomes free, that capacity is available to any other
    pending job that fits it right now — including one submitted after the
    larger job and with lower priority. A large multi-node job can therefore
@@ -663,14 +754,47 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    With those policy settings in place, a pending job that cannot find free
    capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
-   A node freed by a preemption is held for the job that triggered it: while the
-   victim drains and for the cycle it finally frees the node, the preemptor is
-   placed at the front of the pending queue so the backfill scheduler reserves
-   that node for it. A different pending job with a higher effective priority
-   (for instance, a larger fair-share) but no right to evict the victim cannot
-   take the node the preemption just freed. Eviction eligibility is decided on
-   QOS rank alone (allow-list plus ``priority``); fair-share and age order the
-   rest of the queue but neither authorizes nor redirects a preemption.
+   Cancel and requeue preemption hand the freed nodes to the job that
+   triggered the eviction; suspend preemption frees nothing and hands nothing
+   off. While the victims run out their preemption grace or drain, and for at
+   least two scheduling passes after the last one releases its resources,
+   other pending jobs cannot be placed on those nodes. A pass runs every
+   ``interval_secs``, or sooner when a submission wakes the scheduler, so the
+   post-release window can be well under ``interval_secs``. This protects a multi-node
+   preemptor whose victims finish at different times. Jobs queued behind the
+   preemptor still plan future starts on those nodes once the preemptor has a
+   planned start, but none of them starts there before it.
+
+   The handoff is held for the whole node, not only the released resources.
+   On nodes shared by several jobs, capacity left over beside the victim stays
+   unused by other pending jobs until every preemptor holding the node is
+   placed or its handoff ends.
+
+   Heterogeneous jobs are handled per component.
+
+   The exception is other preemptors whose own victims ran on the same node:
+   each of them may use the node, and they are not ordered against each other.
+   A job whose QOS could evict the preemptor is held off like any other job;
+   once the preemptor starts, it may preempt it under the usual rules.
+
+   A handoff ends when its preemptor starts, is cancelled or held, or is still
+   unplaced after the post-release passes. It is skipped for any pass in which
+   the preemptor is over its QOS group node quota or no longer fits the node. A
+   node in an active reservation is handed off only to a preemptor allowed to
+   use that reservation, and idle-fill reclaim creates no handoff.
+
+   A handoff whose victims are still running out a grace, or draining after
+   cancel preemption, survives a controller restart. Once a requeue takes effect, its
+   victim releases the remaining nodes at once, so the handoff is post-release
+   only. Post-release handoffs are kept in controller memory, so a restart or
+   leader change can drop one, or renew it for two more passes (longer if the
+   preemptor still has other victims in grace or draining). A renewed handoff
+   can also put back a preemptor whose hold had already ended, so it again
+   shares the node with any newer preemptor there.
+
+   Eviction eligibility uses the QOS allow-list and priority, plus the preempt
+   mode, exempt-time and reservation-tier rules. Fair-share and age only order the
+   queue; they never make a job eligible to preempt.
 
 .. note::
 
@@ -696,12 +820,16 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a 30 second grace, then SIGKILL. The SIGTERM is
-final: a client that reconnects during the grace does not save the allocation,
-and the job ends ``TIMEOUT`` however its processes exit. With the default, an
-abandoned allocation is signalled 270 to 310 seconds after its client is lost
-(the last ping can be up to 30 seconds old) and is finished within about 40
-seconds of the signal.
+allocation is reaped: SIGTERM, then SIGKILL after up to
+``timeout_kill_wait_secs`` (default 30 seconds). An allocation's own process
+exits on SIGTERM and its work runs in ``srun`` steps, which the wait does not
+yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`), so an allocation
+normally ends ``TIMEOUT`` within a moment of the SIGTERM, without spending the
+wait in ``COMPLETING`` (``CG``). The SIGTERM is final: a client that
+reconnects after it does not save the allocation, and the job ends ``TIMEOUT``
+however its processes exit. With the defaults, an abandoned allocation is
+signalled 270 to 310 seconds after its client is lost (the last ping can be up
+to 30 seconds old).
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground
@@ -1244,9 +1372,10 @@ admin signal apply.
 Job and usage visibility (``private_data``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-By default every caller sees every job and every ``scontrol show assoc_mgr``
-scope, as a stock ``slurm.conf`` does. That includes each job's ``command``, the
-first non-comment line of its batch script, so a credential written there is
+By default every caller sees every job, every user and account, every
+reservation, and every ``scontrol show assoc_mgr`` scope, as a stock
+``slurm.conf`` does. That includes each job's ``command``, the first
+non-comment line of its batch script, so a credential written there is
 readable by every user. ``private_data`` under ``[auth]`` is the equivalent of
 Slurm's ``PrivateData`` and narrows what a User sees.
 
@@ -1274,20 +1403,67 @@ Slurm's ``PrivateData`` and narrows what a User sees.
      - Hides from a User
    * - ``"jobs"``
      - Other users' jobs and steps: ``squeue``/``spur queue``, ``sprio``,
-       ``sstat``, ``scontrol show job``/``step``, the jobs that ``scancel -p``,
-       ``-A``, or ``-n`` selects, and REST ``/jobs`` and ``/job/{id}``.
-       ``squeue -u other``, ``squeue -j``, and ``scontrol show job`` print
-       nothing for another user's job; ``sstat``, ``scontrol show step``, and
-       REST ``/job/{id}`` report it as not found.
+       ``sstat``, ``sacct``/``spur history``, ``scontrol show job``/``step``,
+       the jobs that ``scancel -p``, ``-A``, or ``-n`` selects, and REST
+       ``/jobs`` and ``/job/{id}``. ``sreport job`` sizes follow the same rule
+       and total the jobs the caller can see. ``sreport preemptions`` is scoped
+       when either ``"jobs"`` or ``"usage"`` is private. A coordinator also sees jobs in
+       ``sacct`` and those reports for the accounts they coordinate. ``squeue``
+       stays the caller's own jobs. ``squeue -u other``, ``squeue -j``,
+       ``sacct -u other``, ``sacct -j`` for another user's job, and
+       ``scontrol show job`` print nothing; ``sstat``, ``scontrol show step``,
+       and REST ``/job/{id}`` report it as not found.
    * - ``"usage"``
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is
        replaced with their own name. ``Grp*`` totals still include every user's
-       jobs.
+       jobs. ``sshare`` omits other users' rows and keeps the User's own,
+       showing zero usage in an account they have not used. Account rows stay,
+       and their raw usage, account and cluster totals, ``NormUsage``, and
+       ``% of Tot`` are left blank rather than computed from the User's rows
+       alone.
+       ``sreport`` utilization leaves those same cells blank.
+       A coordinator also sees usage for the accounts they coordinate; those
+       rows are filled in, and cluster totals stay blank. A coordinator keeps
+       their own rows in other accounts too.
+       ``sreport preemptions`` shows only the caller's rows and coordinated
+       accounts. Preemption totals in ``sdiag`` and ``/metrics/scheduler`` are
+       cluster-wide aggregates and are not scoped.
+       ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
+       ``"users"`` also drops other users from ``sshare``.
+   * - ``"users"``
+     - ``sacctmgr show user`` lists only the caller, including for a coordinator.
+       ``show association`` lists the caller's rows, and a coordinator also sees
+       every association in the accounts they coordinate. ``user=`` for someone
+       else prints nothing unless that user is in a coordinated account.
+       ``sshare`` leaves the per-user ``NormShares`` blank when the list is not
+       the whole cluster.
+   * - ``"accounts"``
+     - ``sacctmgr show account`` lists only accounts the caller coordinates,
+       including sub-accounts of those accounts. A user who coordinates nothing
+       is denied. Until the association cache has loaded, the call returns
+       unavailable. ``sshare`` is not filtered by this category: it keeps the
+       full share tree, as in Slurm. Add a coordinator with
+       ``sacctmgr add coordinator account=<name> names=<user>``. The user must
+       already exist. ``show user withcoord`` and ``show account withcoord``
+       add a ``Coords`` column; ``show coordinator`` lists the same assignments.
+   * - ``"reservations"``
+     - ``scontrol show reservation`` lists reservations the caller is named on,
+       or whose accounts include one of the caller's. A reservation with no
+       users and no accounts stays visible. An account-only reservation is
+       hidden until the association cache has loaded. ``scontrol show node``
+       omits ``ActiveReservation`` for a hidden reservation, but ``sinfo`` and
+       ``smd`` still show the node as ``resv`` or ``maint``.
 
-``sacct``, ``sshare``, and ``sreport`` are not restricted by either category yet.
-Set both categories for the visibility closest to what Spur v0.13 and v0.14
-enforced:
+``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
+``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+The user rows ``sshare`` and ``sreport`` list follow ``"users"``. ``sreport``
+account rows follow ``"accounts"``. ``sshare`` account rows are the share
+tree and stay when ``"accounts"`` is set. QOS definitions
+(``sacctmgr show qos``) stay visible. A coordinator is not an operator: the
+extra rows are the accounts they coordinate, including sub-accounts. Set
+``"jobs"`` and ``"usage"`` for the visibility closest to what Spur v0.13 and
+v0.14 enforced:
 
 .. code-block:: toml
 
@@ -1298,7 +1474,9 @@ enforced:
 
 Operators and Administrators are exempt. Root is exempt only through a role
 (``cluster_admins``, ``admin_groups``, an accounting admin level, or
-``allow_uid_zero_administrator``), and account coordinators are not exempt.
+``allow_uid_zero_administrator``). An account coordinator is not exempt from a
+category; they see the accounts they coordinate and the accounts under those,
+as in Slurm. ``sshare`` still shows the full share tree.
 
 .. warning::
 
@@ -1310,9 +1488,18 @@ Operators and Administrators are exempt. Root is exempt only through a role
    agents from registering; on a JWT cluster ``private_data`` only hides data
    from users who keep their token set.
 
-``scontrol reconfigure`` applies a change on the leader, which serves every gRPC
-read. Followers keep their startup value for REST and for any read they serve
-while the leader is unreachable, so restart every controller after changing it.
+``scontrol reconfigure`` applies a change on the leader only, and every read the
+leader serves uses the new value immediately. Controller reads (``squeue``,
+``scontrol show job``/``node``/``reservation``/``assoc_mgr``) forward to the
+leader. Accounting reads (``sacct``, ``sacctmgr show user`` and
+``show account``, ``sshare``, ``sreport``, and ``sprio`` fairshare) are not
+forwarded, so a follower answers them with the ``private_data`` it loaded at
+startup. It does the same for REST, and for controller reads while the leader
+is unreachable. Restart every follower after changing ``private_data``.
+Upgrade ``sshare`` together with ``spurctld`` before enabling ``"users"`` or
+``"accounts"``. An older controller does not set ``scoped_to_user`` on those
+lists, so this ``sshare`` would divide by the filtered weights and print
+``NormShares`` as if they were the cluster total.
 ``spurctld`` refuses to start, or to reconfigure, on a category it does not
 support; agents and the CLI ignore unknown category names.
 
@@ -1364,7 +1551,10 @@ operator must be resolvable *on the controller*, not only on the login node.
 
 Ownership is not part of this decision. The creator is recorded as ``Owner`` for
 attribution and shown by ``scontrol show reservation``, but any operator may
-update or delete any reservation, matching Slurm's operator semantics.
+update or delete any reservation, matching Slurm's operator semantics. Listing
+is separate: with ``private_data = ["reservations"]``, a User's
+``scontrol show reservation`` returns only reservations they can use (see
+:ref:`private-data`).
 
 .. warning::
 
@@ -1554,6 +1744,55 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
        use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
        to revert to the global default.
+   * - ``grace_time``
+     - integer or null
+     - ``null`` (unset)
+     - Seconds a job preempted from this partition is given to wind down between
+       the preemption warning and the kill. It applies only when the victim's QOS
+       leaves ``GraceTime`` unset, and the QOS value wins otherwise, including an
+       explicit ``0``. A job requested in several partitions takes the highest value
+       among the ones its nodes belong to, so ``--partition=a,b`` running on
+       ``a`` gets ``a``'s value only. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and
+       ``requeue`` preemption and is capped at the victim's remaining time limit. A value in
+       ``spur.conf`` is applied on startup and ``scontrol reconfigure``; omitting
+       it later does not clear a value already set at runtime. Set it at runtime with
+       ``scontrol update PartitionName=<name> GraceTime=<secs>`` and revert it with
+       ``scontrol update PartitionName=<name> ClearGraceTime=yes``. See
+       :ref:`preemption grace time <qos-preempt-grace>`.
+   * - ``max_tres_per_node``
+     - table<string, integer>
+     - ``{}`` (unlimited)
+     - Cumulative cap on what all of this partition's jobs together may hold on
+       one node. Keys: ``cpu``, ``mem`` (MiB), ``"gres/gpu"``,
+       ``"gres/gpu:<type>"``; any other key is a load error. A missing key is
+       unlimited; ``0`` forbids that resource. Binds even on an idle node. See
+       :doc:`partition-resource-limits`.
+   * - ``max_cpus_per_node``
+     - integer
+     - unset (unlimited)
+     - Shorthand for ``max_tres_per_node.cpu`` (Slurm ``MaxCPUsPerNode``).
+       Setting both is a load error, even when the values agree.
+   * - ``max_mem_per_node``
+     - integer (MiB)
+     - unset
+     - Largest memory one job may use on one node (per job, not cumulative).
+       Mutually exclusive with ``max_mem_per_cpu``.
+   * - ``max_mem_per_cpu``
+     - integer (MiB)
+     - unset
+     - Largest memory per allocated CPU. A job asking for more is given more
+       CPUs rather than rejected. Mutually exclusive with ``max_mem_per_node``.
+   * - ``def_mem_per_node`` / ``def_mem_per_cpu`` / ``def_mem_per_gpu``
+     - integer (MiB)
+     - unset
+     - Memory a job gets in this partition when it requests none. At most one
+       of the three may be set.
+
+``max_cpus_per_node`` and the five memory knobs above must be greater than
+``0``; a ``0`` is a load error. Omit the key for no limit. ``scontrol`` and the
+API read ``0`` as "unset", so a ``0`` here would change meaning once shown and
+set again through them. To forbid a resource, set its key to ``0`` in
+``max_tres_per_node``.
 
 ``[[nodes]]``
 -------------
@@ -1601,11 +1840,44 @@ matches, and the first matching entry wins.
    * - ``reserved_memory_mb``
      - integer
      - ``0``
-     - Live
+     - Live; Restart on an entry that sets spec cores
      - Memory in MB held back from the detected total for the OS and runtime
        (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
        together with ``memory_mb``; the smaller resulting value wins. Must be less
        than ``memory_mb`` when both are set (rejected at config load otherwise).
+       Accepts the Slurm name ``mem_spec_limit`` as an alias. When the node also
+       sets spec cores it is enforced on the ``spur`` cgroup root, and changing it
+       is restart-only (see `Core and memory specialization`_).
+   * - ``core_spec_count``
+     - integer
+     - ``0``
+     - Restart
+     - Number of physical cores reserved for node services (e.g. a WEKA client)
+       and excluded from jobs — Slurm's ``CoreSpecCount``. Reserves whole cores
+       (every hyperthread), picked as Slurm does: the highest core index within a
+       socket first, alternating across sockets. ``CPUSpecList`` in
+       ``scontrol show node`` shows the CPUs chosen. ``0`` means unset. Mutually
+       exclusive with ``cpu_spec_list``.
+   * - ``cpu_spec_list``
+     - string
+     - ``""``
+     - Restart
+     - Specific OS CPU IDs reserved for node services, e.g. ``"127,255"`` —
+       Slurm's ``CpuSpecList`` (OS CPU IDs, not abstract indices). Every listed
+       CPU must be online, and the list is widened to whole cores, so a CPU's
+       hyperthread siblings are reserved with it. Mutually exclusive with
+       ``core_spec_count``.
+   * - ``daemons_off_spec``
+     - bool
+     - ``true``
+     - Restart
+     - Keep ``spurd``'s threads off the spec cores, so the daemon does not
+       contend with the service that owns them. ``spurstepd`` supervisors inherit
+       the mask in effect when they start; running supervisors are not re-pinned
+       when the setting changes. This differs from Slurm, where the daemons run
+       *on* the specialized cores unless ``SlurmdOffSpec`` is set: Spur defaults
+       to keeping them off, since the service that owns the cores (e.g. a WEKA
+       client) expects them to itself.
    * - ``gres``
      - [string]
      - ``[]``
@@ -1657,6 +1929,64 @@ resource policy, including live ``scontrol reconfigure``, agent inventory update
 and snapshot restore. Restored states reflect the current controller's resource
 caps; unavailable and administratively held states are preserved.
 
+Core and memory specialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``core_spec_count`` / ``cpu_spec_list`` and ``reserved_memory_mb`` reserve CPUs
+and memory on a node for services that run alongside jobs — a WEKA client
+frontend, for example. The controller computes the node's core layout from the
+CPU topology the agent reports, and ``spurd`` enforces it on the ``spur`` cgroup
+root, which every job runs under:
+
+* ``cpuset.cpus`` excludes the spec CPUs, so no job can land on them.
+* ``memory.high`` is set to the node's memory minus ``reserved_memory_mb``. It
+  only throttles jobs. ``memory.max`` is lowered to the same value only at a
+  moment when no job runs on the node, because lowering a hard limit below a
+  running job's usage can OOM-kill it. Until then the reservation is pending
+  (throttled, not hard-capped); drain the node once to make it hard right away.
+  A restarted ``spurd`` keeps a ``memory.max`` its predecessor set. Without
+  ``reserved_memory_mb`` the root's memory limits stay at ``max``.
+
+The service itself still has to pin to the reserved CPUs (e.g. WEKA's own
+``isolate_cpusets`` / frontend core setting); Spur guarantees only that jobs stay
+off them.
+
+**Prerequisites.** ``[cgroup] enabled = true`` is required: jobs join the
+enforced root only through managed cgroups, so spec cores with cgroups disabled
+are rejected at config load. A node refuses launches (``failed_precondition``)
+until its layout is written to the root.
+
+**Showing it.** ``scontrol show node`` reports ``CPUTot`` (all CPUs),
+``CPUEfctv`` (CPUs left for jobs), ``CoreSpecCount``, ``CPUSpecList`` (the source
+of truth for which CPUs are reserved) and ``MemSpecLimit``.
+
+**Changing it.** ``core_spec_count``, ``cpu_spec_list`` and ``daemons_off_spec``
+are restart-only, and so is ``reserved_memory_mb`` on an entry that sets spec
+cores, because the layout is part of the inventory agent and controller agree on.
+``scontrol reconfigure`` with such a change is rejected as a whole and applies
+nothing, including unrelated live edits in the same file. Change the settings and
+restart the controllers; agents pick up the new layout when they re-register.
+
+**When it cannot be enforced.** A node is excluded from scheduling and shown as
+``DRAIN`` with a ``core-layout:`` reason (in ``sinfo -R``, ``scontrol show node``
+and the REST API) when:
+
+* its settings cannot yield a layout — spec cores covering every core, a listed
+  CPU that is offline, no reported topology, or ``reserved_memory_mb`` covering
+  all of the node's memory. The node keeps the last layout it enforced, so running
+  jobs stay off the reserved CPUs;
+* ``spurd`` reports it cannot enforce the layout (``core-layout: not enforced:``),
+  for example because the root is not writable or the node's own ``[cgroup]`` is
+  disabled. A corrected policy still reaches such a node when it re-registers.
+
+This is derived state, not an operator drain, and clears once the cause is fixed.
+A restarted ``spurd`` leaves the root exactly as it found it until it has
+received the node's policy; if the controller cannot compute it, ``spurd`` keeps
+the existing limits and refuses new jobs. ``spurd`` resets only root limits it
+wrote itself (a marker in its state directory records them, and is removed if
+the root is gone after a reboot); limits an operator set on the ``spur`` root on
+a node without specialization are left alone.
+
 ``[network]``
 -------------
 
@@ -1687,9 +2017,13 @@ WireGuard mesh networking and the agent port.
    * - ``wg_interface``
      - string
      - ``"spur0"``
-     - Not implemented
-     - Superseded by the ``SPUR_WG_INTERFACE`` environment variable read by
-       ``spurd``, which defaults to ``spur0``.
+     - Restart, Agent restart
+     - WireGuard mesh interface name. ``spurd`` uses it to detect its mesh
+       address, report its mesh public key, and apply pushed mesh membership
+       to the live interface. The ``SPUR_WG_INTERFACE`` environment variable
+       overrides it for ``spurd``. With ``[cluster]`` and ``wg_enabled`` on,
+       ``spurctld`` reads peer endpoints from it. ``spur net`` takes
+       ``--interface`` instead and does not read this field.
    * - ``wg_port``
      - integer
      - ``51820``
@@ -1946,6 +2280,8 @@ converges to hardware changes without an agent restart — see
      - bool
      - ``true``
      - Discover GPUs from AMD KFD sysfs when the CDI cache is empty (AMD only).
+       Also refresh topology for matching AMD devices in on-disk CDI specs;
+       see :doc:`fabric-observation`.
    * - ``cdi_spec_dirs``
      - [string]
      - ``[]``
@@ -1987,14 +2323,78 @@ converges to the new device count without restarting ``spurd``.
 * A partition switch is a hardware constraint: it must be performed on a
   **drained, idle** node. Once the switch completes, the agent's next refresh
   picks up the new inventory and converges automatically.
+* Each partition of a partitioned GPU is one device. Its
+  ``spur.amd.com/pci-bdf`` annotation is the address of the parent GPU, which is
+  the same for all partitions and is the address that ``lspci`` shows. Its
+  ``spur.amd.com/stable-id`` annotation is different for each partition.
 
 .. note::
 
-   Convergence only sees changes on the AMD KFD auto-detect path
-   (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
-   (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
-   the reported inventory only changes if those specs are regenerated out of
-   band.
+   With ``auto_detect = true``, matching AMD devices receive live topology
+   observations even when on-disk CDI specs supply their injection edits.
+   Device selection and other static CDI metadata still require regenerating
+   those specs. With ``auto_detect = false``, all CDI metadata is re-read from
+   disk and changes only when the specs change. See :doc:`fabric-observation`
+   for the read-only fabric observation contract and its scheduling limits.
+   With ``auto_detect = false`` and no on-disk CDI specs, GPU inventory is empty;
+   GPU-property constraints require automatic discovery or equivalent CDI specs
+   containing the requested GPU properties.
+
+.. _gpu-partition-mode-change:
+
+Changing a GPU's partition mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A compute-partition change (SPX/CPX/QPX/DPX, in any direction) or a
+memory-partition change that reshapes the compute partitions is destructive to
+silicon identity. Perform it only on a node with no GPU jobs running.
+
+* ``spurd`` needs no restart: its periodic inventory refresh (see above)
+  picks up the new partitions and re-registers the node, and the controller
+  then schedules against the new layout.
+* With ``auto_detect = true``, ``spurd`` rewrites ``/etc/cdi/amd.json`` to
+  match the new hardware, but only if that file carries the
+  ``spur.amd.com/auto-detected: "true"`` annotation, which ``spur k8s up``
+  writes. A spec written by another tool is left untouched; ``spurd`` logs a
+  warning, and that tool must regenerate the spec itself.
+* If GPU jobs are still running when the partitions change, ``spurd`` keeps
+  reporting each partition they hold under its old id and advertises none of
+  that GPU's new partitions, nor an old partition a finished job released,
+  until every job that held the GPU before the change ends. This holds across
+  a ``spurd`` restart. The jobs themselves are not failed or requeued.
+
+**What an operator sees.** A fenced GPU shows up as fewer GPU GRES in
+``scontrol show node`` than the hardware has, and as an entry in
+``inventory-fences.json`` (below). When the change removes a partition a job
+holds, ``spurd`` also logs
+``allocated device changed; pinning held gpus, converging free pool only``;
+when the held partition keeps its id in the new layout, the fence is applied
+without that warning. If a fence outlasts the warning threshold (one hour),
+``spurd`` warns that a job may be leaking its pre-change partition.
+
+**State on disk.** ``spurd`` keeps two files under ``<state_dir>/runtime/``
+(``state_dir`` defaults to ``/var/spool/spur``):
+
+* ``inventory-baseline.json``: the last inventory the controller acknowledged.
+  A restart compares the fresh discovery against it to tell a re-encoding of
+  the same partitions from a partition change.
+* ``inventory-fences.json``: the fenced GPUs and the partitions their
+  pre-change jobs still hold.
+
+Neither file needs editing. If the baseline is missing, ``spurd`` falls back
+to the legacy id rule and still honours the fence file.
+
+**How a fence clears.** It lifts on its own when the last job that held the
+GPU before the change exits; the next refresh then advertises the new
+partitions. A ``spurd`` restart with no such job still running also drops it.
+To clear one held by a leaked job, cancel that job.
+
+**Known limits.**
+
+* A new ``srun`` step into a job whose GPU stayed fenced across a ``spurd``
+  restart is refused; the job's existing steps keep running.
+* A job already queued when the last holder of a fenced GPU exits can be
+  refused once on the released partition; it runs after the next refresh.
 
 ``[isolation]``
 ---------------
@@ -2051,8 +2451,16 @@ the device filter; each step runs in its own ``step_<n>`` leaf underneath it and
 inherits both, because cgroup v2 will not hold processes in a node whose
 children have controllers enabled. The limits are derived from the **per-node
 budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
-the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
-cgroups.
+the user requested. A step that asks for a share of its own adds a CPU cap,
+memory cap or device filter to its leaf on top of the job's
+(:ref:`step-own-share`); that needs root, ``enabled``, and the matching
+``constrain_*`` setting, or the step is refused. Kubernetes jobs are unaffected:
+there the kubelet owns the cgroups.
+
+``spurd`` also enables the ``io`` controller for job directories, so each
+``job_<id>_<attempt>`` has an ``io.stat`` with the job's block-device I/O.
+No I/O limits are set; a kernel without the controller only loses those
+statistics.
 
 .. warning::
 
@@ -2061,8 +2469,8 @@ cgroups.
    ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
    See :ref:`cgroup-containment-gaps` for what remains even then: a step leaf
-   carries no budget of its own, and the site-supplied task hooks run outside
-   the job cgroup.
+   carries no budget of its own unless the step asks for one, and the
+   site-supplied task hooks run outside the job cgroup.
 
 .. note::
 
@@ -2143,6 +2551,22 @@ cgroups.
      - Agent restart
      - Floor for the memory ceilings, in MiB. Guards against a tiny ``--mem``
        creating a cgroup so small the job dies during its own startup.
+   * - ``cleanup_timeout_secs``
+     - integer
+     - ``60``
+     - Agent restart (new jobs)
+     - Seconds to wait for job cgroup cleanup before requesting a node drain.
+       ``0`` requests a drain immediately if cleanup is incomplete. Cleanup
+       continues after the deadline; it does not authorize resource reuse.
+       Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
+       network filesystem unmounts), but keep ``[scheduler] complete_wait_secs``
+       above the larger kill wait plus this value plus the epilog bound
+       (``[hooks] epilog_timeout_secs`` and 11 seconds) so the agent, not a
+       force-finish, drains the node. The controller's warning checks its own
+       ``[cgroup] cleanup_timeout_secs``, while each agent uses the value in its
+       node's ``spur.conf`` (read at agent start, so ``scontrol reconfigure``
+       does not reach it). Set the controller's value to the largest any node
+       uses.
    * - ``oom_kill_job``
      - bool
      - ``true``
@@ -2326,7 +2750,8 @@ them, so a site's existing percentages carry over directly.
      -
    * - ``OOMKillStep``
      - ``oom_kill_job``
-     - Applies to the whole job; Spur has no per-step cgroups yet.
+     - Applies to the whole job, and to just the step when a step that set its
+       own ``--mem`` goes over it.
 
 Deliberate differences from Slurm:
 
@@ -2423,7 +2848,7 @@ OpenMetrics HTTP export from ``spurctld``.
 
 Prolog/epilog and job-submit scripts. Each field is an optional fully-qualified
 path; unset means no hook. The prolog/epilog fields map one-to-one to Slurm's
-parameters.
+parameters. A multi-tenant GPU node example is in ``examples/hooks/gpu-node/``.
 
 Reload scope follows whichever process executes the hook: controller hooks are
 live, node hooks need an agent restart, and ``srun`` hooks are read from the
@@ -2497,6 +2922,99 @@ submitting host on each invocation.
    ``reconfigure`` validates ``job_submit`` and ``job_submit_lua`` before swapping
    the config, so a broken submit hook is rejected rather than applied — the
    previous configuration stays in place and the command reports an error.
+
+.. _epilog-timeout:
+
+Epilog timeout
+~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 16 10 10 14 30
+
+   * - Field
+     - Slurm equivalent
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``epilog_timeout_secs``
+     - ``PrologEpilogTimeout``
+     - integer
+     - ``120``
+     - Agent restart (new jobs)
+     - Seconds the compute-node ``epilog`` may run, from 1 to 86400. At the
+       limit its whole process group gets ``SIGTERM``, and whatever remains of
+       the group 5 seconds later gets ``SIGKILL``. A timed-out epilog counts
+       as a failed one. A running job keeps the value captured at launch.
+
+Slurm leaves ``PrologEpilogTimeout`` unset, so its epilog may run forever.
+Spur bounds it because a job's node stays held until its epilog ends. The
+epilog is finished when the script's own process exits. Anything it leaves
+running in the background does not hold the node, and its ``stderr`` is logged
+for one more second.
+
+A cancelled or finished job's node is not released while its teardown is
+still running, with one exception after a ``spurd`` restart: a supervisor the
+restarted agent re-adopts has its job reported complete once the workload
+exits, possibly before its epilog runs. That node can be released mid-epilog,
+and an epilog failure may not drain it.
+
+The node agent normally force-reclaims a job's supervisor 30 seconds after a
+cancel. A supervisor waiting for its cgroup to empty, or running the node
+epilog, holds a lease that defers that reclaim:
+
+- The cleanup lease lasts what remains of ``[cgroup] cleanup_timeout_secs``,
+  plus 30 seconds for rootfs and spool removal.
+- The epilog lease lasts ``epilog_timeout_secs`` plus 11 seconds for the kill
+  sequence and output drain, plus 30 seconds for the SPANK exit hooks and the
+  completion report. A node with SPANK plugins but no epilog script gets the
+  30 seconds alone.
+
+When a supervisor drops a lease the reclaim was waiting on, the agent gives it
+another 30 seconds to report before reclaiming it. However long a supervisor's
+leases claim, the agent stops deferring after a full cleanup timeout plus the
+longest allowed epilog.
+
+The node is drained when its teardown does not confirm it is ready for
+another job. The drain reason is one of:
+
+``epilog script failed``
+   The epilog exited non-zero or hit ``epilog_timeout_secs``. The ``spurd`` log
+   says which.
+
+``job teardown did not complete before its supervisor was lost``
+   The supervisor that runs the node epilog (the batch or allocation step's)
+   recorded the job's exit, then was lost (crashed, or force-reclaimed) before
+   recording the epilog result. This covers every stage of teardown, including
+   ``task_epilog``, the cgroup wait, and the epilog itself. If the epilog was
+   running, its orphaned process group is killed first. The node also drains
+   with this reason when the agent cannot read or update the lost
+   supervisor's teardown record; the ``spurd`` log has the error.
+
+The agent recognizes the process group of an orphaned epilog by the random
+``SPUR_HOOK_GROUP_TOKEN`` each epilog run receives in its environment. A
+group none of whose processes still carry it is left running, since the agent
+cannot tell it from an unrelated group that reused the ID.
+
+``task_epilog`` has no timeout, as in Slurm. If a batch step's
+``task_epilog`` is still running when its supervisor is force-reclaimed after a
+cancel, the node is drained with the second reason.
+
+.. note::
+
+   Keep ``[scheduler] complete_wait_secs`` above the larger kill wait plus
+   ``[cgroup] cleanup_timeout_secs`` plus ``epilog_timeout_secs`` plus 11
+   seconds. The defaults satisfy this: 30 + 60 + 120 + 11 = 221, under 300.
+   Otherwise the controller force-finishes the job and drains the node before
+   a slow but healthy epilog has finished. The controller's warning checks its
+   own ``epilog_timeout_secs``, so set it to the largest any node uses.
+
+.. warning::
+
+   Upgrading from a release without this setting bounds every node epilog at
+   120 seconds. Before upgrading, raise ``epilog_timeout_secs`` on nodes
+   whose epilog can take longer, and ``complete_wait_secs`` with it.
 
 ``[notifications]``
 -------------------
@@ -2733,14 +3251,22 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    (string, e.g. ``"http://peer-ctrl:6817"``). Defaults to no peers.
 
 ``[topology]``
-   **Reload: Restart.** Optional switch-hierarchy configuration for locality-aware
-   scheduling.
+   **Reload: Live** on the controller; agents read the ``external.block_file``
+   path at startup and re-read the file's contents during inventory refresh. Optional block/tree configuration for locality-aware scheduling.
    ``plugin`` (string, default ``"none"``) selects the model: ``"tree"`` for a
-   switch hierarchy, ``"block"`` for fixed-size blocks, or ``"none"`` to disable.
+   switch hierarchy, ``"block"`` for flat groups, or ``"none"`` to disable.
    In tree mode, each ``[[topology.switches]]`` entry has ``name`` (string),
    ``nodes`` (hostlist pattern for a leaf switch), and ``switches`` (comma-separated
-   child switch names for an aggregation switch). In block mode, ``block_size``
-   (integer) sets the number of nodes per block. Defaults to no topology.
+   child switch names for an aggregation switch). Automatic native discovery or
+   the optional block file supplies whole-node leaves in block mode, and in tree
+   mode when no explicit switches are configured. Membership is refreshed each
+   scheduling cycle. In block mode without a membership source, ``block_size``
+   (integer, default ``18``) sets the number of nodes per block. It is not used to
+   infer vPods. ``[topology.external] block_file`` (absolute path, default unset)
+   adds whole-node ``BlockName=... Nodes=...`` groups for nodes without native
+   fabric observations; native discovery takes precedence. Defaults to no
+   topology. Jobs require single-block placement with
+   ``--constraint='same(gpu.fabric_domain_id)'``; see :doc:`fabric-observation`.
 
 ``[burst_buffer]``
    **Reload: Live.** Burst-buffer capacity. ``total_gb`` (integer, default ``0``)

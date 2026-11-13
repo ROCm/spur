@@ -11,7 +11,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CompleteJobStepRequest, ContainerSpec,
     CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec, JobState, RunStepRequest,
-    StreamJobOutputChunk, StreamJobOutputRequest, SubmitJobRequest,
+    StepResources, StreamJobOutputChunk, StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -94,7 +94,8 @@ pub struct SrunArgs {
     #[arg(long)]
     pub gpu_bind: Option<String>,
 
-    /// Required node features (e.g., "mi300x,nvlink")
+    /// Required node features and GPU predicates: gpu.<field><op><value>, same(gpu.<field>).
+    /// GPU predicates apply to new allocations only; steps inherit the allocation binding
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
@@ -183,10 +184,11 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_remap_root: bool,
 
-    /// Keep the node's credential mint socket out of the container, so nothing
-    /// in it can act on the cluster as you (nested srun there will fail)
+    /// Mount the node's credential mint socket into the container, so a nested
+    /// srun there can authenticate (anything in the container can then act on
+    /// the cluster as you)
     #[arg(long)]
-    pub container_no_auth_socket: bool,
+    pub container_auth_socket: bool,
 
     /// Prolog script to run locally before step dispatch
     #[arg(long)]
@@ -270,6 +272,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+
+    validate_step_constraints(
+        args.constraint.as_deref(),
+        args.jobid.is_some()
+            || std::env::var("SPUR_JOB_ID")
+                .ok()
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some(),
+    )?;
 
     // --jobid routing: two distinct use cases share --jobid.
     //
@@ -380,6 +391,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi, &submit_line).await
+}
+
+fn validate_step_constraints(constraint: Option<&str>, step_mode: bool) -> Result<()> {
+    let constraints =
+        spur_core::constraints::Constraints::parse(constraint).map_err(anyhow::Error::msg)?;
+    if step_mode && constraints.has_gpu() {
+        anyhow::bail!("a job step inherits its allocation's GPU binding; specify GPU property constraints on submit, alloc, or standalone run");
+    }
+    Ok(())
 }
 
 /// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
@@ -748,7 +768,7 @@ fn build_srun_job_spec(
             .and_then(|a| a.container_entrypoint.clone())
             .unwrap_or_default(),
         container_remap_root: container.is_some_and(|a| a.container_remap_root),
-        container_no_auth_socket: container.is_some_and(|a| a.container_no_auth_socket),
+        container_auth_socket: container.is_some_and(|a| a.container_auth_socket),
         srun_job: true,
         pty: args.pty,
         client_keepalive: true,
@@ -783,8 +803,73 @@ fn container_spec_from_srun_args(args: &SrunArgs) -> Option<ContainerSpec> {
             .collect(),
         entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
         remap_root: args.container_remap_root,
-        no_auth_socket: args.container_no_auth_socket,
+        auth_socket: args.container_auth_socket,
     })
+}
+
+/// What a step inside an allocation takes for itself, from the resource flags
+/// typed on this command line. An allocation exports its own sizing into every
+/// step's environment, so values that arrive only through env stay shared.
+fn step_resources_from_cli(args: &SrunArgs, matches: &ArgMatches) -> Result<Option<StepResources>> {
+    let cli = |id: &str| was_cli_set(matches, id);
+    let memory_mb = if cli("mem") {
+        args.mem.as_deref().map(parse_memory_mb).transpose()?
+    } else {
+        None
+    };
+    let gpu_flag = |id: &str, value: &Option<String>| -> Result<Option<u32>> {
+        match value {
+            Some(v) if cli(id) => step_gpu_count(v).map(Some),
+            _ => Ok(None),
+        }
+    };
+    let gpus = gpu_flag("gpus", &args.gpus)?;
+    let gpus_per_task = gpu_flag("gpus_per_task", &args.gpus_per_task)?;
+    let gres_gpus = if cli("gres") {
+        step_gres_gpu_count(&args.gres)?
+    } else {
+        None
+    };
+    let gpus_per_node = gpu_flag("gpus_per_node", &args.gpus_per_node)?;
+    let forms = [gpus, gpus_per_task, gres_gpus, gpus_per_node];
+    if forms.iter().flatten().count() > 1 {
+        anyhow::bail!(
+            "only one GPU request form (--gpus, --gpus-per-node, --gpus-per-task, or a gpu --gres) may be set"
+        );
+    }
+    let resources = StepResources {
+        cpus_per_task: cli("cpus_per_task").then_some(args.cpus_per_task),
+        memory_mb,
+        gpus,
+        gpus_per_node: gpus_per_node.or(gres_gpus),
+        gpus_per_task,
+    };
+    Ok((resources != StepResources::default()).then_some(resources))
+}
+
+/// A step's GPU count. Unlike a job's, zero is a request: the step gets no GPU.
+/// A step takes GPUs its job already holds, so it cannot ask for a type.
+fn step_gpu_count(value: &str) -> Result<u32> {
+    let value = value.trim();
+    let count = value.strip_prefix("gpu:").unwrap_or(value);
+    count
+        .parse()
+        .with_context(|| format!("a step's GPU request must be a plain count, got '{value}'"))
+}
+
+fn step_gres_gpu_count(gres: &[String]) -> Result<Option<u32>> {
+    let mut gpus = None;
+    for entry in gres {
+        match spur_core::resource::parse_gres(entry) {
+            Some((name, None, count)) if name == "gpu" => gpus = Some(count),
+            Some((name, Some(_), _)) if name == "gpu" => anyhow::bail!(
+                "a step's GPU request must be a plain count, got '{}'",
+                entry.trim()
+            ),
+            _ => {}
+        }
+    }
+    Ok(gpus)
 }
 
 fn install_ctrl_c_cancel(
@@ -883,6 +968,7 @@ struct StepDispatchParams<'a> {
     io: &'a ResolvedIoPaths,
     mpi: &'a str,
     user: &'a str,
+    resources: Option<StepResources>,
 }
 
 async fn dispatch_step(
@@ -953,6 +1039,7 @@ async fn dispatch_step(
         user: params.user.to_string(),
         container: container_spec_from_srun_args(args),
         execution_credential,
+        resources: params.resources,
     };
     let resp = run_step_with_retry(client, run_step_req, &args.controller)
         .await
@@ -1204,6 +1291,7 @@ async fn run_standalone_srun(
             io: &io,
             mpi,
             user: &owner,
+            resources: None,
         };
         let dispatch_result =
             dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
@@ -1938,6 +2026,17 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
         );
     }
 
+    let own_share = ["mem", "gres", "gpus", "gpus_per_node", "gpus_per_task"]
+        .iter()
+        .any(|id| crate::env_defaults::was_cli_set(matches, id));
+    if own_share {
+        warnings.push(
+            "srun: warning: a --pty step shares its job's memory and GPUs; \
+             --mem/--gres/--gpus* are ignored"
+                .into(),
+        );
+    }
+
     let nodelist = args.nodelist.as_deref().unwrap_or_default().trim();
     if nodelist.contains(',') {
         warnings.push(
@@ -2047,6 +2146,7 @@ async fn run_as_step(
         std::process::exit(result?);
     }
 
+    let resources = step_resources_from_cli(args, matches)?;
     let step_params = StepDispatchParams {
         args,
         explicit_num_nodes: was_cli_set(matches, "nodes").then_some(args.nodes),
@@ -2055,6 +2155,7 @@ async fn run_as_step(
         io: &io,
         mpi: step_mpi,
         user: &user,
+        resources,
     };
     let dispatch_result =
         dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
@@ -2151,6 +2252,16 @@ mod tests {
         assert!(step_unsupported_warnings(&args).is_empty());
     }
 
+    #[test]
+    fn same_fabric_constraints_are_allocation_only() {
+        for name in ["vpod_id", "fabric_domain_id"] {
+            let constraint = format!("same(gpu.{name})");
+            assert!(validate_step_constraints(Some(&constraint), false).is_ok());
+            assert!(validate_step_constraints(Some(&constraint), true).is_err());
+        }
+        assert!(validate_step_constraints(None, true).is_ok());
+    }
+
     /// Parse the way `main_with_args` does, so tests see the same `ArgMatches`
     /// the warning helpers consult for "did the user actually type this?".
     fn parse_srun(argv: &[&str]) -> (SrunArgs, ArgMatches) {
@@ -2204,7 +2315,90 @@ mod tests {
     }
 
     #[test]
-    fn container_no_auth_socket_reaches_the_standalone_job_spec() {
+    fn a_step_with_no_resource_flags_shares_its_job() {
+        let (args, matches) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
+        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+    }
+
+    #[test]
+    fn typed_resource_flags_become_the_steps_own_share() {
+        let (args, matches) = parse_srun(&[
+            "srun",
+            "-n",
+            "2",
+            "-c",
+            "4",
+            "--mem",
+            "8G",
+            "--gpus-per-node",
+            "1",
+            "true",
+        ]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.cpus_per_task, Some(4));
+        assert_eq!(resources.memory_mb, Some(8192));
+        assert_eq!(resources.gpus_per_node, Some(1));
+        assert_eq!(resources.gpus, None);
+        assert_eq!(resources.gpus_per_task, None);
+    }
+
+    #[test]
+    fn a_gpu_gres_is_a_per_node_count_and_zero_gpus_is_a_request() {
+        let (args, matches) = parse_srun(&["srun", "--gres", "gpu:2", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.gpus_per_node, Some(2));
+
+        let (args, matches) = parse_srun(&["srun", "--gpus", "0", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.gpus, Some(0), "zero means no GPU, not no request");
+    }
+
+    #[test]
+    fn a_step_cannot_pick_a_gpu_type_or_two_request_forms() {
+        for argv in [
+            &["srun", "--gpus", "mi300x:1", "true"][..],
+            &["srun", "--gres", "gpu:mi300x:1", "true"],
+            &["srun", "--gpus", "1", "--gpus-per-node", "1", "true"],
+            &["srun", "--gres", "gpu:1", "--gpus-per-task", "1", "true"],
+        ] {
+            let (args, matches) = parse_srun(argv);
+            assert!(
+                step_resources_from_cli(&args, &matches).is_err(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// An allocation exports its own sizing into every step's environment; taking
+    /// it as the step's request would hand each step the whole job's share.
+    #[test]
+    #[serial(env_injection)]
+    fn sizing_inherited_from_the_allocation_env_is_not_a_step_request() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_TASK", "8");
+        std::env::set_var("SPUR_MEM_PER_NODE", "16G");
+        std::env::set_var("SPUR_GPUS_PER_NODE", "8");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(args.cpus_per_task, 8, "env must reach args");
+        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+    }
+
+    #[test]
+    fn pty_step_warns_that_it_shares_memory_and_gpus() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--mem", "1G", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--mem"), "{warnings:?}");
+    }
+
+    #[test]
+    fn container_auth_socket_reaches_the_standalone_job_spec() {
         let io = ResolvedIoPaths {
             stdout: String::new(),
             stderr: String::new(),
@@ -2214,31 +2408,31 @@ mod tests {
             "srun",
             "--container-image",
             "img.sqsh",
-            "--container-no-auth-socket",
+            "--container-auth-socket",
             "true",
         ]);
         let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").unwrap();
-        assert!(spec.container_no_auth_socket);
+        assert!(spec.container_auth_socket);
 
         let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
         let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").unwrap();
-        assert!(!spec.container_no_auth_socket);
+        assert!(!spec.container_auth_socket);
     }
 
     #[test]
-    fn container_no_auth_socket_reaches_the_step_container_spec() {
+    fn container_auth_socket_reaches_the_step_container_spec() {
         let (args, _) = parse_srun(&[
             "srun",
             "--container-image",
             "img.sqsh",
-            "--container-no-auth-socket",
+            "--container-auth-socket",
             "true",
         ]);
         let spec = container_spec_from_srun_args(&args).expect("an image was given");
-        assert!(spec.no_auth_socket);
+        assert!(spec.auth_socket);
 
         let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
-        assert!(!container_spec_from_srun_args(&args).unwrap().no_auth_socket);
+        assert!(!container_spec_from_srun_args(&args).unwrap().auth_socket);
     }
 
     #[test]
@@ -3335,6 +3529,7 @@ mod tests {
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
             user: "tester",
+            resources: None,
         };
         dispatch_step(client, 1, &params).await
     }
@@ -3881,6 +4076,7 @@ mod tests {
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
             user: "tester",
+            resources: None,
         };
 
         let result = dispatch_step(&mut client, 1, &params).await.unwrap();

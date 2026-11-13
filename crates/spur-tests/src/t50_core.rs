@@ -1171,7 +1171,10 @@ address = "http://peer-a:6817"
         job.spec.num_nodes = 0;
 
         let cluster = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1410,19 +1413,25 @@ address = "http://peer-a:6817"
         use spur_core::resource::{ResourceAllocations, ResourceSet};
 
         let total = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256000,
             gpus: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = ResourceAllocations::with_scalar(60, 200000);
         let required = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 32,
             memory_mb: 128000,
             gpus: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
+            topology: None,
         };
 
         assert!(total.can_satisfy(&required));

@@ -19,10 +19,13 @@ subtrees:
           - entries:
               - file: admin-guide/configuration
               - file: admin-guide/rbac
+              - file: admin-guide/fabric-observation
               - file: admin-guide/accounting
+              - file: admin-guide/partition-resource-limits
               - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
               - file: admin-guide/karma-scoring
+              - file: admin-guide/tres-billing-weights
       - file: deployment/index
         subtrees:
           - entries:

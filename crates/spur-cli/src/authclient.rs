@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use spur_core::native_mint::{mint_blocking, resolve_socket_path};
+use spur_core::native_mint::{mint_blocking, resolve_socket_path, MintError};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -71,7 +71,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                     params.epoch,
                     params.timeout,
                 )
-                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                .map_err(|e| Status::unauthenticated(mint_failure_message(&e)))?;
                 let value = MetadataValue::try_from(format!("Bearer {token}")).map_err(|_| {
                     Status::unauthenticated("minted credential is not valid metadata")
                 })?;
@@ -84,6 +84,20 @@ impl tonic::service::Interceptor for AuthInterceptor {
             }
         }
         Ok(request)
+    }
+}
+
+/// A mint socket that is not there is the normal state inside a container whose
+/// job did not ask for it, so say that instead of telling the user to start the
+/// mint.
+fn mint_failure_message(error: &MintError) -> String {
+    match error {
+        MintError::Unavailable { path } => format!(
+            "credential mint not available in this container ({path}): the node's auth socket \
+             is mounted only when the job was submitted with --container-auth-socket; outside a \
+             container, start spurauthd or set SPUR_AUTH_SOCKET"
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -306,6 +320,13 @@ mod tests {
         };
         let err = i.call(Request::new(())).unwrap_err();
         assert_eq!(err.code(), Code::Unauthenticated);
+        assert!(
+            err.message()
+                .contains("credential mint not available in this container"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("--container-auth-socket"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::timefmt::format_timestamp as format_ts;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spur_core::accounting::TresRecord;
+use spur_core::partition::{typed_gpu_tres_key, TRES_CPU, TRES_GPU, TRES_MEM};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
 /// Administrative control commands.
@@ -29,10 +30,15 @@ pub struct ScontrolArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ScontrolCommand {
+    /// Inspect and validate read-only fabric membership
+    Topology {
+        #[command(subcommand)]
+        command: crate::fabric_cli::TopologyCommand,
+    },
     /// Show detailed information
     Show {
         /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
-        /// config, hostnames, hostlist, hostlistsorted
+        /// config, topology, hostnames, hostlist, hostlistsorted
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -154,6 +160,10 @@ pub enum ScontrolCommand {
         /// (0 = immediately preemptable; omit to use the global default)
         #[arg(long)]
         preempt_exempt_time: Option<u32>,
+        /// Seconds a preempted job gets to wind down before it is killed, when
+        /// its QOS leaves the grace time unset (0 = no grace; omit to leave unset)
+        #[arg(long)]
+        grace_time: Option<u32>,
     },
     /// Update a partition
     #[command(name = "update-partition")]
@@ -235,6 +245,13 @@ pub enum ScontrolCommand {
         /// global scheduler.preempt_exempt_time default.
         #[arg(long)]
         clear_preempt_exempt_time: bool,
+        /// Seconds a preempted job gets to wind down before it is killed, when
+        /// its QOS leaves the grace time unset. 0 is a valid value (no grace).
+        #[arg(long)]
+        grace_time: Option<u32>,
+        /// Clear the partition's grace_time, leaving it unset.
+        #[arg(long, conflicts_with = "grace_time")]
+        clear_grace_time: bool,
     },
     /// Delete a partition
     #[command(name = "delete-partition")]
@@ -320,6 +337,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<ScontrolArgs>(&args);
 
     match args.command {
+        ScontrolCommand::Topology { command } => {
+            crate::fabric_cli::run(&args.controller, command).await
+        }
         ScontrolCommand::Show { entity, name } => {
             let env = job_nodelist_env(|v| std::env::var(v).ok());
             if let Some(out) = show_hostlist(&entity, name.as_deref(), env.as_deref()) {
@@ -410,6 +430,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             priority_tier,
             preempt_mode,
             preempt_exempt_time,
+            grace_time,
         } => {
             create_partition(
                 &args.controller,
@@ -430,6 +451,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 priority_tier,
                 &preempt_mode,
                 preempt_exempt_time,
+                grace_time,
+                PartitionLimitArgs::default(),
             )
             .await
         }
@@ -459,6 +482,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             preempt_mode,
             preempt_exempt_time,
             clear_preempt_exempt_time,
+            grace_time,
+            clear_grace_time,
         } => {
             let selector_map = match selector {
                 Some(ref s) => parse_selector(s)?,
@@ -490,6 +515,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 preempt_mode,
                 preempt_exempt_time,
                 clear_preempt_exempt_time,
+                grace_time,
+                clear_grace_time,
+                ..Default::default()
             };
             update_partition(&args.controller, req).await
         }
@@ -570,9 +598,25 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
         "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
         ping.cluster_name, controller, ping.version
     );
-    // Omitted rather than shown as 0 when an older controller does not report it.
-    if let Some(secs) = ping.inactive_limit_secs {
-        out.push_str(&format!("InactiveLimit={secs}\n"));
+    // Omitted rather than shown as 0 when an older controller does not report them.
+    let optional_secs = [
+        ("InactiveLimit", ping.inactive_limit_secs),
+        ("KillWait", ping.kill_wait_secs),
+        ("TimeoutKillWait", ping.timeout_kill_wait_secs),
+    ];
+    for (key, secs) in optional_secs {
+        if let Some(secs) = secs {
+            out.push_str(&format!("{key}={secs}\n"));
+        }
+    }
+    if !ping.tres_billing_weights.is_empty() {
+        out.push_str(&format!(
+            "TRESBillingWeights={}\n",
+            ping.tres_billing_weights
+        ));
+    }
+    if !ping.usage_reset_period.is_empty() && ping.usage_reset_period != "none" {
+        out.push_str(&format!("UsageResetPeriod={}\n", ping.usage_reset_period));
     }
     out
 }
@@ -634,6 +678,16 @@ fn show_hostlist(
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
     let entity = entity.to_lowercase();
+    if entity == "topology" {
+        if name.is_some() {
+            bail!("show topology does not accept a name; use topology show");
+        }
+        return crate::fabric_cli::run(
+            controller,
+            crate::fabric_cli::TopologyCommand::Show { json: false },
+        )
+        .await;
+    }
     // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
     let job_ids = match entity.as_str() {
         "job" | "jobs" => parse_show_job_ids(name)?,
@@ -702,7 +756,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
                 println!(
                     "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
-                    total.map(|r| r.cpus).unwrap_or(0),
+                    cpu_tot(&node),
                     alloc.map(|r| r.cpus).unwrap_or(0),
                     total.map(|r| r.memory_mb).unwrap_or(0),
                     node.free_memory_mb,
@@ -716,6 +770,34 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .map(|g| format!("gpu:{}:1", g.gpu_type))
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
+                }
+                if let Some(resources) = total {
+                    println!(
+                        "   InventoryGeneration={} FabricBindingVersion={}",
+                        resources.generation, resources.fabric_binding_version
+                    );
+                    if let Some(revision) = &resources.block_file_revision {
+                        println!("   BlockFileRevision={revision}");
+                    }
+                    for gpu in &resources.gpus {
+                        print!("{}", format_gpu_topology(gpu));
+                    }
+                }
+                if !node.spec_cpus.is_empty() || node.core_spec_count > 0 || node.mem_spec_mb > 0 {
+                    // CPUEfctv is the schedulable CPU count (spec cores already
+                    // excluded upstream). Show whichever spec knobs are set.
+                    let mut parts =
+                        vec![format!("CPUEfctv={}", total.map(|r| r.cpus).unwrap_or(0))];
+                    if node.core_spec_count > 0 {
+                        parts.push(format!("CoreSpecCount={}", node.core_spec_count));
+                    }
+                    if !node.spec_cpus.is_empty() {
+                        parts.push(format!("CPUSpecList={}", node.spec_cpus));
+                    }
+                    if node.mem_spec_mb > 0 {
+                        parts.push(format!("MemSpecLimit={}", node.mem_spec_mb));
+                    }
+                    println!("   {}", parts.join(" "));
                 }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
@@ -746,77 +828,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get partitions")?;
 
             for part in resp.into_inner().partitions {
-                println!(
-                    "PartitionName={}{}",
-                    part.name,
-                    if part.is_default { " Default=YES" } else { "" }
-                );
-                println!(
-                    "   AllowGroups={} AllowAccounts={} AllowQos={}",
-                    if part.allow_groups.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_groups.clone()
-                    },
-                    if part.allow_accounts.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_accounts.clone()
-                    },
-                    if part.allow_qos.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_qos.clone()
-                    },
-                );
-                if !part.deny_accounts.is_empty() {
-                    println!("   DenyAccounts={}", part.deny_accounts);
-                }
-                if !part.deny_qos.is_empty() {
-                    println!("   DenyQos={}", part.deny_qos);
-                }
-                println!("   State={}", part.state.to_uppercase());
-                println!("   Nodes={}", part.nodes);
-                println!(
-                    "   TotalNodes={} TotalCPUs={}",
-                    part.total_nodes, part.total_cpus
-                );
-                println!(
-                    "   MaxTime={} DefaultTime={}",
-                    part.max_time
-                        .as_ref()
-                        .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
-                        .unwrap_or_else(|| "UNLIMITED".into()),
-                    part.default_time
-                        .as_ref()
-                        .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
-                        .unwrap_or_else(|| "UNLIMITED".into()),
-                );
-                println!(
-                    "   MinNodes={} MaxNodes={}",
-                    part.min_nodes,
-                    if part.max_nodes == 0 {
-                        "UNLIMITED".into()
-                    } else {
-                        part.max_nodes.to_string()
-                    },
-                );
-                print!(
-                    "   PreemptMode={} PriorityTier={}",
-                    if part.preempt_mode.is_empty() {
-                        "NONE"
-                    } else {
-                        &part.preempt_mode
-                    },
-                    part.priority_tier
-                );
-                if let Some(t) = part.preempt_exempt_time {
-                    if t > 0 {
-                        print!(" PreemptExemptTime={t}");
-                    }
-                }
-                println!();
-                println!();
+                print!("{}", format_partition_detail(&part));
             }
         }
         "reservation" | "reservations" => {
@@ -927,7 +939,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist, hostlistsorted",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, topology, hostnames, hostlist, hostlistsorted",
                 other
             );
         }
@@ -1174,10 +1186,99 @@ fn state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
+fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
+    use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
+    let Some(topology) = &gpu.topology else {
+        return String::new();
+    };
+    let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
+    let mut output = format!(
+        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}\n",
+        gpu.device_id,
+        gpu.stable_id,
+        text(topology.pci_bdf.as_deref()),
+        text(topology.pci_root.as_deref()),
+        topology
+            .numa_node
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        topology
+            .vram_bytes
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        gpu.gpu_type.escape_debug(),
+    );
+    let Some(fabric) = &topology.fabric else {
+        return output;
+    };
+    let status = match ObservationStatus::try_from(fabric.status) {
+        Ok(ObservationStatus::ObservationObserved) => "observed",
+        Ok(ObservationStatus::ObservationIncomplete) => "incomplete",
+        Ok(ObservationStatus::ObservationInconsistent) => "inconsistent",
+        Ok(ObservationStatus::ObservationUnavailable) => "unavailable",
+        _ => "unknown",
+    };
+    output.push_str(&format!(
+        "      FabricSource={} Observation={} PhysicalDomain={} FabricDomain={} Endpoint={} EndpointState={} Transport={}\n",
+        text(Some(&fabric.source)), status, text(fabric.physical_domain_id.as_deref()),
+        text(fabric.fabric_domain_id.as_deref()), text(fabric.endpoint_id.as_deref()),
+        text(fabric.endpoint_state.as_deref()), text(fabric.transport.as_deref()),
+    ));
+    output.push_str(&format!(
+        "      PhysicalCapacity={} FabricCapacity={} ActiveEndpoints=[{}] LocalEndpoints=[{}]\n",
+        fabric
+            .physical_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        fabric
+            .fabric_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        text(Some(&fabric.active_endpoints.join(","))),
+        text(Some(&fabric.local_endpoints.join(","))),
+    ));
+    if !fabric.issues.is_empty() {
+        let issues: Vec<_> = fabric
+            .issues
+            .iter()
+            .map(|issue| {
+                let kind = match ObservationIssueKind::try_from(issue.kind) {
+                    Ok(ObservationIssueKind::ObservationIssueMissing) => "missing",
+                    Ok(ObservationIssueKind::ObservationIssueUnreadable) => "unreadable",
+                    Ok(ObservationIssueKind::ObservationIssueMalformed) => "malformed",
+                    Ok(ObservationIssueKind::ObservationIssueTooLarge) => "too_large",
+                    Ok(ObservationIssueKind::ObservationIssueConflict) => "conflict",
+                    Ok(ObservationIssueKind::ObservationIssueChanged) => "changed",
+                    Ok(ObservationIssueKind::ObservationIssueUnavailable) => "unavailable",
+                    Ok(ObservationIssueKind::ObservationIssuePeerConflict) => "peer_conflict",
+                    _ => "unknown",
+                };
+                format!("{}:{kind}", text(Some(&issue.field)))
+            })
+            .collect();
+        output.push_str(&format!("      ObservationIssues={}\n", issues.join(",")));
+    }
+    output
+}
+
+/// Spur never isolates whole topology blocks, so only Slurm's default is accepted.
+fn reject_exclusive_topo(value: &str) -> Result<()> {
+    match value.to_ascii_lowercase().as_str() {
+        "no" | "0" | "false" => Ok(()),
+        "yes" | "1" | "true" => bail!("ExclusiveTopo=YES is not supported"),
+        _ => bail!("invalid value for ExclusiveTopo=: '{value}'"),
+    }
+}
+
 fn node_state_name(state: i32) -> &'static str {
     spur_core::node::NodeState::from_proto_i32(state)
         .map(|s| s.display_upper())
         .unwrap_or("UNKNOWN")
+}
+
+/// `CPUTot`: CPUs before spec cores are set aside; a controller that predates
+/// the field reports 0, so fall back to the schedulable count.
+fn cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
+    if node.cpu_tot > 0 {
+        return node.cpu_tot;
+    }
+    node.total_resources.as_ref().map_or(0, |r| r.cpus)
 }
 
 /// `State=` value for `scontrol show node`, composited the way real Slurm
@@ -1297,85 +1398,140 @@ async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
     }
 }
 
-/// Parse Slurm key=value pairs and call create_partition.
+/// The error for a `Key=value` parameter whose value does not parse.
+fn invalid_value(key: &str, value: &str) -> anyhow::Error {
+    anyhow::anyhow!("invalid value for {key}=: '{value}'")
+}
+
+/// Validated inputs for a Slurm-inline `scontrol create PartitionName=...`.
+#[derive(Debug)]
+struct PartitionCreateParams {
+    name: String,
+    nodes: String,
+    state: String,
+    is_default: bool,
+    max_time: String,
+    default_time: String,
+    max_nodes: Option<u32>,
+    min_nodes: u32,
+    allow_accounts: String,
+    allow_groups: String,
+    allow_qos: String,
+    deny_accounts: String,
+    deny_qos: String,
+    priority_tier: u32,
+    preempt_mode: String,
+    preempt_exempt_time: Option<u32>,
+    grace_time: Option<u32>,
+    limits: PartitionLimitArgs,
+}
+
+/// Parse Slurm key=value pairs into the create_partition inputs, split from the
+/// network call so a rejected value is unit-testable without a controller.
 ///
 /// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
 /// MaxTime, DefaultTime, MaxNodes, MinNodes, AllowAccounts, AllowGroups,
-/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode.
-async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
-    let mut name = String::new();
-    let mut nodes = String::new();
-    let mut state = "UP".to_string();
-    let mut is_default = false;
-    let mut max_time = String::new();
-    let mut default_time = String::new();
-    let mut max_nodes: Option<u32> = None;
-    let mut min_nodes: u32 = 1;
-    let mut allow_accounts = String::new();
-    let mut allow_groups = String::new();
-    let mut allow_qos = String::new();
-    let mut deny_accounts = String::new();
-    let mut deny_qos = String::new();
-    let mut priority_tier: u32 = 1;
-    let mut preempt_mode = String::new();
-    let mut preempt_exempt_time: Option<u32> = None;
+/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode, PreemptExemptTime, GraceTime.
+fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreateParams> {
+    let mut parsed = PartitionCreateParams {
+        name: String::new(),
+        nodes: String::new(),
+        state: "UP".to_string(),
+        is_default: false,
+        max_time: String::new(),
+        default_time: String::new(),
+        max_nodes: None,
+        min_nodes: 1,
+        allow_accounts: String::new(),
+        allow_groups: String::new(),
+        allow_qos: String::new(),
+        deny_accounts: String::new(),
+        deny_qos: String::new(),
+        priority_tier: 1,
+        preempt_mode: String::new(),
+        preempt_exempt_time: None,
+        grace_time: None,
+        limits: PartitionLimitArgs::default(),
+    };
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
             match key.to_lowercase().as_str() {
-                "partitionname" => name = value.into(),
-                "nodes" => nodes = value.into(),
-                "state" => state = value.to_uppercase(),
-                "default" => is_default = value.eq_ignore_ascii_case("yes"),
-                "maxtime" => max_time = value.into(),
-                "defaulttime" => default_time = value.into(),
-                "maxnodes" => max_nodes = value.parse().ok(),
-                "minnodes" => min_nodes = value.parse().unwrap_or(1),
-                "allowaccounts" => allow_accounts = value.into(),
-                "allowgroups" => allow_groups = value.into(),
-                "allowqos" => allow_qos = value.into(),
-                "denyaccounts" => deny_accounts = value.into(),
-                "denyqos" => deny_qos = value.into(),
-                "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
-                "preemptmode" => preempt_mode = value.to_uppercase(),
+                "partitionname" => parsed.name = value.into(),
+                "nodes" => parsed.nodes = value.into(),
+                "state" => parsed.state = value.to_uppercase(),
+                "default" => parsed.is_default = value.eq_ignore_ascii_case("yes"),
+                "maxtime" => parsed.max_time = value.into(),
+                "defaulttime" => parsed.default_time = value.into(),
+                "maxnodes" => parsed.max_nodes = value.parse().ok(),
+                "minnodes" => parsed.min_nodes = value.parse().unwrap_or(1),
+                "allowaccounts" => parsed.allow_accounts = value.into(),
+                "allowgroups" => parsed.allow_groups = value.into(),
+                "allowqos" => parsed.allow_qos = value.into(),
+                "denyaccounts" => parsed.deny_accounts = value.into(),
+                "denyqos" => parsed.deny_qos = value.into(),
+                "prioritytier" | "priorityjobfactor" => {
+                    parsed.priority_tier = value.parse().unwrap_or(1)
+                }
+                "preemptmode" => parsed.preempt_mode = value.to_uppercase(),
                 "preemptexempttime" => {
-                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
-                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
-                    })?);
+                    parsed.preempt_exempt_time = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| invalid_value("PreemptExemptTime", value))?,
+                    );
+                }
+                "exclusivetopo" => reject_exclusive_topo(value)?,
+                "gracetime" => {
+                    parsed.grace_time = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| invalid_value("GraceTime", value))?,
+                    );
                 }
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
-                other => eprintln!("scontrol create partition: unknown key '{}'", other),
+                | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
+                | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+                other => {
+                    if !parsed.limits.parse_key(other, value)? {
+                        eprintln!("scontrol create partition: unknown key '{}'", other)
+                    }
+                }
             }
         }
     }
 
-    if name.is_empty() {
+    if parsed.name.is_empty() {
         anyhow::bail!("scontrol create: PartitionName= is required");
     }
+    parsed.limits.drop_redundant_cpu_alias();
+    Ok(parsed)
+}
 
+async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
+    let p = parse_partition_create_params(params)?;
     create_partition(
         controller,
-        &name,
-        &nodes,
+        &p.name,
+        &p.nodes,
         "",
-        &state,
-        is_default,
-        &max_time,
-        &default_time,
-        max_nodes,
-        min_nodes,
-        &allow_accounts,
-        &allow_groups,
-        &deny_accounts,
-        &deny_qos,
-        &allow_qos,
-        priority_tier,
-        &preempt_mode,
-        preempt_exempt_time,
+        &p.state,
+        p.is_default,
+        &p.max_time,
+        &p.default_time,
+        p.max_nodes,
+        p.min_nodes,
+        &p.allow_accounts,
+        &p.allow_groups,
+        &p.deny_accounts,
+        &p.deny_qos,
+        &p.allow_qos,
+        p.priority_tier,
+        &p.preempt_mode,
+        p.preempt_exempt_time,
+        p.grace_time,
+        p.limits,
     )
     .await?;
 
@@ -1531,7 +1687,7 @@ fn parse_update(params: &[String]) -> Result<UpdateTarget> {
         let Some((key, value)) = param.split_once('=') else {
             bail!("scontrol update: invalid input: '{param}'");
         };
-        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        let invalid = || anyhow::anyhow!("scontrol update: {}", invalid_value(key, value));
         let key_lower = key.to_lowercase();
         match key_lower.as_str() {
             "state" | "reason" => first_node_only_param = first_node_only_param.or(Some(param)),
@@ -1683,8 +1839,14 @@ fn parse_node_state(state: &str) -> Result<i32> {
 /// Slurm keys accepted (all case-insensitive): PartitionName (required),
 /// Nodes, State, Default, MaxTime, DefaultTime, MaxNodes, MinNodes,
 /// AllowAccounts, AllowGroups, DenyAccounts, DenyQos, AllowQos,
-/// PriorityTier, PreemptMode.
+/// PriorityTier, PreemptMode, PreemptExemptTime, GraceTime, ClearGraceTime.
 async fn parse_and_update_partition(controller: &str, params: &[String]) -> Result<()> {
+    update_partition(controller, partition_update_request(params)?).await
+}
+
+fn partition_update_request(
+    params: &[String],
+) -> Result<spur_proto::proto::UpdatePartitionRequest> {
     let mut name = String::new();
     let mut nodes: Option<String> = None;
     let mut state: Option<String> = None;
@@ -1703,12 +1865,15 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut preempt_mode: Option<String> = None;
     let mut preempt_exempt_time: Option<u32> = None;
     let mut clear_preempt_exempt_time = false;
+    let mut grace_time: Option<u32> = None;
+    let mut clear_grace_time = false;
+    let mut limits = PartitionLimitArgs::default();
 
     for param in params {
         let Some((key, value)) = param.split_once('=') else {
             bail!("scontrol update: invalid input: '{param}'");
         };
-        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        let invalid = || anyhow::anyhow!("scontrol update: {}", invalid_value(key, value));
         match key.to_lowercase().as_str() {
             "partitionname" => name = value.into(),
             "nodes" => nodes = Some(value.into()),
@@ -1737,30 +1902,44 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
             }
             "preemptmode" => preempt_mode = Some(value.to_uppercase()),
             "preemptexempttime" => {
-                preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
-                    anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
-                })?);
+                preempt_exempt_time = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| invalid_value("PreemptExemptTime", value))?,
+                );
             }
             "clearpreemptexempttime" => {
                 clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
                     || value == "1"
                     || value.eq_ignore_ascii_case("true");
             }
+            "exclusivetopo" => reject_exclusive_topo(value)?,
+            "gracetime" => grace_time = Some(value.parse().map_err(|_| invalid())?),
+            "cleargracetime" => {
+                clear_grace_time = crate::boolean::parse_bool(key, value).map_err(|_| invalid())?
+            }
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-            | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
-            | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
-            _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
+            | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
+            | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+            other => {
+                if !limits.parse_key(other, value)? {
+                    bail!("scontrol update: update of this parameter is not supported: '{param}'")
+                }
+            }
         }
     }
 
     if name.is_empty() {
         anyhow::bail!("scontrol update: PartitionName= is required");
     }
+    if grace_time.is_some() && clear_grace_time {
+        bail!("scontrol update: GraceTime= cannot be combined with ClearGraceTime=yes");
+    }
+    limits.drop_redundant_cpu_alias();
 
     // An ACL is applied only when its key appeared; an empty value clears it.
-    let req = spur_proto::proto::UpdatePartitionRequest {
+    Ok(spur_proto::proto::UpdatePartitionRequest {
         name,
         nodes,
         selector: HashMap::new(), // selector not supported in inline syntax
@@ -1786,9 +1965,153 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         preempt_mode,
         preempt_exempt_time,
         clear_preempt_exempt_time,
-    };
+        grace_time,
+        clear_grace_time,
+        set_max_tres_per_node: limits.max_tres_per_node.is_some(),
+        max_tres_per_node: limits.max_tres_per_node.unwrap_or_default(),
+        max_cpus_per_node: limits.max_cpus_per_node,
+        max_mem_per_node: limits.max_mem_per_node,
+        max_mem_per_cpu: limits.max_mem_per_cpu,
+        def_mem_per_node: limits.def_mem_per_node,
+        def_mem_per_cpu: limits.def_mem_per_cpu,
+        def_mem_per_gpu: limits.def_mem_per_gpu,
+    })
+}
 
-    update_partition(controller, req).await
+/// `scontrol show partition` lines for resource caps and memory policy, in Slurm-style
+/// keys (e.g. `MaxTRESPerNode=cpu=64,mem=131072`, `MaxMemPerNode=UNLIMITED`).
+fn partition_limit_lines(part: &spur_proto::proto::PartitionInfo) -> [String; 2] {
+    let unlimited = |v: Option<String>| v.unwrap_or_else(|| "UNLIMITED".into());
+    let mut caps: Vec<_> = part.max_tres_per_node.iter().collect();
+    caps.sort();
+    let caps = caps
+        .iter()
+        .map(|(key, limit)| format!("{key}={limit}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let caps_line = format!(
+        "MaxCPUsPerNode={} MaxTRESPerNode={}",
+        unlimited(part.max_cpus_per_node.map(|v| v.to_string())),
+        if caps.is_empty() {
+            "UNLIMITED".into()
+        } else {
+            caps
+        },
+    );
+    let def_mem = [
+        ("DefMemPerNode", part.def_mem_per_node),
+        ("DefMemPerCPU", part.def_mem_per_cpu),
+        ("DefMemPerGPU", part.def_mem_per_gpu),
+    ]
+    .into_iter()
+    .find_map(|(name, v)| v.map(|v| format!("{name}={v}")))
+    .unwrap_or_else(|| "DefMemPerNode=UNLIMITED".into());
+    let max_mem = match (part.max_mem_per_cpu, part.max_mem_per_node) {
+        (Some(v), _) => format!("MaxMemPerCPU={v}"),
+        (None, v) => format!("MaxMemPerNode={}", unlimited(v.map(|v| v.to_string()))),
+    };
+    [caps_line, format!("{def_mem} {max_mem}")]
+}
+
+/// Partition resource caps and memory policy as Slurm-inline keys (memory in MiB). On
+/// update, `UNLIMITED` or 0 clears a knob and an empty `MaxTRESPerNode=` clears every cap.
+#[derive(Debug, Default, PartialEq)]
+struct PartitionLimitArgs {
+    max_cpus_per_node: Option<u32>,
+    max_tres_per_node: Option<HashMap<String, u64>>,
+    max_mem_per_node: Option<u64>,
+    max_mem_per_cpu: Option<u64>,
+    def_mem_per_node: Option<u64>,
+    def_mem_per_cpu: Option<u64>,
+    def_mem_per_gpu: Option<u64>,
+}
+
+impl PartitionLimitArgs {
+    /// Record `key=value` if `key` (lowercased) is a limit key; `Ok(false)`
+    /// when it is not one.
+    fn parse_key(&mut self, key: &str, value: &str) -> Result<bool> {
+        let invalid = || anyhow::anyhow!("invalid value for {key}=: '{value}'");
+        let count = |value: &str| -> Result<u64> {
+            if value.eq_ignore_ascii_case("UNLIMITED") {
+                return Ok(0);
+            }
+            value.trim().parse().map_err(|_| invalid())
+        };
+        let field = match key {
+            "maxcpuspernode" => {
+                let cpus = u32::try_from(count(value)?).map_err(|_| invalid())?;
+                self.max_cpus_per_node = Some(cpus);
+                return Ok(true);
+            }
+            "maxtrespernode" => {
+                let caps = if value.trim().eq_ignore_ascii_case("UNLIMITED") {
+                    HashMap::new()
+                } else {
+                    parse_tres_caps(value).map_err(|_| invalid())?
+                };
+                self.max_tres_per_node = Some(caps);
+                return Ok(true);
+            }
+            "maxmempernode" => &mut self.max_mem_per_node,
+            "maxmempercpu" => &mut self.max_mem_per_cpu,
+            "defmempernode" => &mut self.def_mem_per_node,
+            "defmempercpu" => &mut self.def_mem_per_cpu,
+            "defmempergpu" => &mut self.def_mem_per_gpu,
+            _ => return Ok(false),
+        };
+        *field = Some(count(value)?);
+        Ok(true)
+    }
+
+    /// Drop `MaxCPUsPerNode` when the map carries the same `cpu` cap: `show partition`
+    /// prints both, and pasting that back must not trip the "set only one" check.
+    fn drop_redundant_cpu_alias(&mut self) {
+        let cpu_cap = self
+            .max_tres_per_node
+            .as_ref()
+            .and_then(|caps| caps.get(TRES_CPU));
+        if let (Some(cpus), Some(&cap)) = (self.max_cpus_per_node, cpu_cap) {
+            if u64::from(cpus) == cap {
+                self.max_cpus_per_node = None;
+            }
+        }
+    }
+}
+
+/// `cpu=64,mem=131072,gres/gpu:a100=2` into a cap map; empty means no caps.
+fn parse_tres_caps(value: &str) -> Result<HashMap<String, u64>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (key, limit) = entry
+                .rsplit_once('=')
+                .with_context(|| format!("'{entry}' is not KEY=LIMIT"))?;
+            let limit = limit
+                .trim()
+                .parse()
+                .with_context(|| format!("'{entry}' has a non-numeric limit"))?;
+            Ok((normalize_tres_key(key.trim()), limit))
+        })
+        .collect()
+}
+
+/// Lowercase the `cpu`/`mem`/`gres/gpu` prefix but keep a GPU type's case, since
+/// types match the node's GRES names exactly. Unknown keys pass through for the
+/// controller to reject.
+fn normalize_tres_key(key: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    if [TRES_CPU, TRES_MEM, TRES_GPU].contains(&lower.as_str()) {
+        return lower;
+    }
+    let prefix_len = TRES_GPU.len() + 1;
+    match key.get(..prefix_len) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(&format!("{TRES_GPU}:")) => {
+            typed_gpu_tres_key(&key[prefix_len..])
+        }
+        _ => key.to_string(),
+    }
 }
 
 /// Update a node's state via the controller.
@@ -1874,6 +2197,8 @@ async fn create_partition(
     priority_tier: u32,
     preempt_mode: &str,
     preempt_exempt_time: Option<u32>,
+    grace_time: Option<u32>,
+    limits: PartitionLimitArgs,
 ) -> Result<()> {
     let channel = crate::authclient::connect(controller)
         .await
@@ -1899,6 +2224,14 @@ async fn create_partition(
             priority_tier,
             preempt_mode: preempt_mode.to_string(),
             preempt_exempt_time,
+            grace_time,
+            max_cpus_per_node: limits.max_cpus_per_node,
+            max_tres_per_node: limits.max_tres_per_node.unwrap_or_default(),
+            max_mem_per_node: limits.max_mem_per_node.filter(|v| *v != 0),
+            max_mem_per_cpu: limits.max_mem_per_cpu.filter(|v| *v != 0),
+            def_mem_per_node: limits.def_mem_per_node.filter(|v| *v != 0),
+            def_mem_per_cpu: limits.def_mem_per_cpu.filter(|v| *v != 0),
+            def_mem_per_gpu: limits.def_mem_per_gpu.filter(|v| *v != 0),
         })
         .await
         .context("failed to create partition")?;
@@ -2091,6 +2424,96 @@ fn actor_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+/// Render one partition for `scontrol show partition`.
+fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "PartitionName={}{}",
+        part.name,
+        if part.is_default { " Default=YES" } else { "" }
+    );
+    let _ = writeln!(
+        out,
+        "   AllowGroups={} AllowAccounts={} AllowQos={}",
+        if part.allow_groups.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_groups.clone()
+        },
+        if part.allow_accounts.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_accounts.clone()
+        },
+        if part.allow_qos.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_qos.clone()
+        },
+    );
+    if !part.deny_accounts.is_empty() {
+        let _ = writeln!(out, "   DenyAccounts={}", part.deny_accounts);
+    }
+    if !part.deny_qos.is_empty() {
+        let _ = writeln!(out, "   DenyQos={}", part.deny_qos);
+    }
+    let _ = writeln!(out, "   State={}", part.state.to_uppercase());
+    let _ = writeln!(out, "   Nodes={}", part.nodes);
+    let _ = writeln!(
+        out,
+        "   TotalNodes={} TotalCPUs={}",
+        part.total_nodes, part.total_cpus
+    );
+    let _ = writeln!(
+        out,
+        "   MaxTime={} DefaultTime={}",
+        part.max_time
+            .as_ref()
+            .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
+            .unwrap_or_else(|| "UNLIMITED".into()),
+        part.default_time
+            .as_ref()
+            .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
+            .unwrap_or_else(|| "UNLIMITED".into()),
+    );
+    let _ = writeln!(
+        out,
+        "   MinNodes={} MaxNodes={}",
+        part.min_nodes,
+        if part.max_nodes == 0 {
+            "UNLIMITED".into()
+        } else {
+            part.max_nodes.to_string()
+        },
+    );
+    let _ = write!(
+        out,
+        "   PreemptMode={} PriorityTier={}",
+        if part.preempt_mode.is_empty() {
+            "NONE"
+        } else {
+            &part.preempt_mode
+        },
+        part.priority_tier
+    );
+    if let Some(t) = part.preempt_exempt_time {
+        if t > 0 {
+            let _ = write!(out, " PreemptExemptTime={t}");
+        }
+    }
+    if let Some(t) = part.grace_time {
+        let _ = write!(out, " GraceTime={t}");
+    }
+    let _ = writeln!(out);
+    for line in partition_limit_lines(part) {
+        let _ = writeln!(out, "   {line}");
+    }
+    let _ = writeln!(out);
+    out
+}
+
 fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -2099,8 +2522,48 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     if !job.comment.is_empty() {
         let _ = writeln!(out, "   Comment={}", job.comment);
     }
+    let mut gpu_bindings: Vec<_> = job.gpu_bindings.iter().collect();
+    gpu_bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in gpu_bindings {
+        let ids: Vec<_> = binding
+            .gpus
+            .iter()
+            .map(|g| g.stable_id.to_string())
+            .collect();
+        let _ = writeln!(
+            out,
+            "   GpuPropertyNode={} Generation={} StableIds=[{}]",
+            node,
+            binding.generation,
+            ids.join(",")
+        );
+    }
+    let mut bindings: Vec<_> = job.fabric_bindings.iter().collect();
+    bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in bindings {
+        if let Some(key) = &binding.key {
+            let ids: Vec<_> = binding
+                .members
+                .iter()
+                .filter_map(|member| {
+                    member
+                        .device
+                        .as_ref()
+                        .map(|device| device.stable_id.to_string())
+                })
+                .collect();
+            if let Some(revision) = &binding.file_revision {
+                let _ = writeln!(out, "   BlockFileRevision={revision}");
+            }
+            let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}] BindingVersion={}", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","), binding.version);
+        }
+    }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
-    let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    let _ = write!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    if !job.effective_partition.is_empty() {
+        let _ = write!(out, " EffectivePartition={}", job.effective_partition);
+    }
+    out.push('\n');
     let _ = writeln!(
         out,
         "   JobState={} Reason={} Dependency={}",
@@ -2192,6 +2655,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         "   MinCPUsNode={} {mem_label}={}",
         job.min_cpus_node, min_mem
     );
+    if !job.mem_per_tres.is_empty() {
+        let _ = writeln!(out, "   MemPerTres={}", job.mem_per_tres);
+    }
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
     if !job.reservation.is_empty() {
         let _ = writeln!(out, "   Reservation={}", job.reservation);
@@ -2222,29 +2688,66 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_exit(job.derived_exit_code, 0),
         job.priority
     );
-    if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
-        let _ = writeln!(
+    if let Some(usage) = job
+        .preemption_usage
+        .as_ref()
+        .filter(|u| u.used > 0 || u.unused > 0 || u.open > 0)
+    {
+        let _ = write!(
             out,
-            "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
-            if job.preempted_by == 0 {
-                "N/A".to_string()
-            } else {
-                job.preempted_by.to_string()
-            },
-            if job.preempt_mode.is_empty() {
-                "N/A"
-            } else {
-                &job.preempt_mode
-            },
-            if job.preempt_qos.is_empty() {
-                "N/A"
-            } else {
-                &job.preempt_qos
-            },
+            "   PreemptionsUsed={} PreemptionsUnused={} PreemptionsOpen={}",
+            usage.used, usage.unused, usage.open
         );
+        let causes: Vec<String> = usage
+            .unused_by_cause
+            .iter()
+            .map(|c| format!("{}/{}:{}", c.reason, c.initiator, c.count))
+            .collect();
+        if !causes.is_empty() {
+            let _ = write!(out, " UnusedPreemptionCauses={}", causes.join(","));
+        }
+        let _ = writeln!(out);
+    }
+    if let Some(line) = preemption_line(job) {
+        let _ = writeln!(out, "{line}");
     }
     let _ = writeln!(out);
     out
+}
+
+/// Shown for a preempted job, and for one still inside its preemption grace,
+/// where only the signal time is known: `PreemptTime` is when the warning went
+/// out, and `EndTime` carries the deadline.
+fn preemption_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
+    let preempt_time = job
+        .preempt_time
+        .as_ref()
+        .map(|t| format!("PreemptTime={}", format_ts(Some(t))));
+    if job.preempted_by == 0 && job.preempt_mode.is_empty() {
+        return preempt_time.map(|t| format!("   {t}"));
+    }
+    let or_na = |s: &str| {
+        if s.is_empty() {
+            "N/A".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let preempted_by = if job.preempted_by == 0 {
+        "N/A".to_string()
+    } else {
+        job.preempted_by.to_string()
+    };
+    let mut line = format!(
+        "   PreemptedBy={preempted_by} PreemptMode={} PreemptQOS={}",
+        or_na(&job.preempt_mode),
+        or_na(&job.preempt_qos),
+    );
+    if let Some(t) = preempt_time {
+        line.push(' ');
+        line.push_str(&t);
+    }
+    Some(line)
 }
 
 fn gpu_tres_label(detail: &str) -> &'static str {
@@ -2259,7 +2762,141 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_detail_omits_zero_preemption_counts_and_prints_nonzero_causes() {
+        let mut job = spur_proto::proto::JobInfo::default();
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(Default::default());
+        assert!(!format_job_detail(&job).contains("PreemptionsUsed="));
+        job.preemption_usage = Some(spur_proto::proto::PreemptionUsage {
+            used: 2,
+            unused: 3,
+            open: 3,
+            unused_by_cause: vec![
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "cancelled".into(),
+                    initiator: "user".into(),
+                    count: 1,
+                },
+                spur_proto::proto::UnusedPreemptionCount {
+                    reason: "launch_failed".into(),
+                    initiator: "system".into(),
+                    count: 2,
+                },
+            ],
+        });
+        assert!(format_job_detail(&job).contains(
+            "   PreemptionsUsed=2 PreemptionsUnused=3 PreemptionsOpen=3 \
+             UnusedPreemptionCauses=cancelled/user:1,launch_failed/system:2\n"
+        ));
+    }
+
+    #[test]
+    fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
+        use spur_proto::proto::*;
+        let gpu = GpuResource {
+            stable_id: 128,
+            topology: Some(DeviceTopology {
+                pci_bdf: Some("0001:04:00.0".into()),
+                vram_bytes: Some(309_237_645_312),
+                fabric: Some(FabricObservation {
+                    source: "amd-ualink".into(),
+                    status: ObservationStatus::ObservationIncomplete as i32,
+                    physical_domain_id: Some("synthetic-pod".into()),
+                    active_endpoints: vec!["60".into(), "61".into()],
+                    issues: vec![ObservationIssue {
+                        field: "vpod_id".into(),
+                        kind: ObservationIssueKind::ObservationIssueMissing as i32,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let detail = super::format_gpu_topology(&gpu);
+        assert!(detail.contains("PCI=0001:04:00.0"));
+        assert!(detail.contains("NUMA=unknown VRAMBytes=309237645312"));
+        assert!(detail
+            .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
+        assert!(detail.contains("ActiveEndpoints=[60,61]"));
+        assert!(detail.contains("ObservationIssues=vpod_id:missing"));
+        assert!(super::format_gpu_topology(&GpuResource::default()).is_empty());
+    }
+
     use super::*;
+
+    #[test]
+    fn exclusive_topology_accepts_only_slurms_default() {
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=yes".into()],
+            vec!["ExclusiveTopo=YES".into(), "PartitionName=rack".into()],
+        ] {
+            let error = parse_partition_create_params(&params).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+            let error = partition_update_request(&params).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+        }
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=NO".into()],
+            vec!["ExclusiveTopo=no".into(), "PartitionName=rack".into()],
+        ] {
+            parse_partition_create_params(&params).expect("NO is Slurm's default");
+        }
+        let error = parse_partition_create_params(&[
+            "PartitionName=rack".into(),
+            "ExclusiveTopo=maybe".into(),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid value for ExclusiveTopo="));
+    }
+
+    #[test]
+    fn scontrol_show_job_prints_preempt_time_during_grace() {
+        let job = spur_proto::proto::JobInfo {
+            preempt_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            end_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_060,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let out = format_job_detail(&job);
+        let preempt_time = format!("   PreemptTime={}", format_ts(job.preempt_time.as_ref()));
+        assert!(
+            out.lines().any(|line| line == preempt_time),
+            "the grace line carries the deadline alone: {out}"
+        );
+        assert!(!out.contains("PreemptedBy"), "{out}");
+        let end_time = format!("EndTime={}", format_ts(job.end_time.as_ref()));
+        assert!(out.contains(&end_time), "{out}");
+    }
+
+    #[test]
+    fn scontrol_show_job_prints_no_preempt_time_without_a_grace() {
+        let plain = format_job_detail(&spur_proto::proto::JobInfo::default());
+        assert!(!plain.contains("PreemptTime"), "{plain}");
+
+        let preempted = format_job_detail(&spur_proto::proto::JobInfo {
+            preempted_by: 9,
+            preempt_mode: "Requeue".into(),
+            ..Default::default()
+        });
+        assert!(
+            preempted.contains("PreemptedBy=9 PreemptMode=Requeue"),
+            "{preempted}"
+        );
+        assert!(!preempted.contains("PreemptTime"), "{preempted}");
+    }
 
     #[test]
     fn show_job_names_who_suspended_or_requeued_it() {
@@ -2325,6 +2962,67 @@ mod tests {
         // Slurm prints a bare 0 when no per-node floor was requested.
         let unset = format_job_detail(&spur_proto::proto::JobInfo::default());
         assert!(unset.contains("MinMemoryNode=0\n"), "{unset}");
+    }
+
+    #[test]
+    fn job_detail_shows_the_effective_partition_only_once_chosen() {
+        let mut job = spur_proto::proto::JobInfo {
+            partition: "cpu,wide".into(),
+            qos: "normal".into(),
+            ..Default::default()
+        };
+        // Messages name the expected line rather than echoing the whole job
+        // detail, which carries job identity fields.
+        let pending = format_job_detail(&job);
+        let requested_only = "   Partition=cpu,wide QOS=normal\n";
+        assert!(
+            pending.contains(requested_only),
+            "missing {requested_only:?}"
+        );
+        assert!(
+            !pending.contains("EffectivePartition"),
+            "EffectivePartition shown before a partition was chosen"
+        );
+
+        job.effective_partition = "wide".into();
+        let running = format_job_detail(&job);
+        let chosen = "   Partition=cpu,wide QOS=normal EffectivePartition=wide\n";
+        assert!(running.contains(chosen), "missing {chosen:?}");
+    }
+
+    #[test]
+    fn job_detail_shows_the_binding_version_for_native_and_file_bindings() {
+        use spur_proto::proto::{FabricBinding, FabricBlockKey};
+        let mut job = spur_proto::proto::JobInfo::default();
+        for (node, version, revision) in [("n1", 1, None), ("n2", 2, Some("ab".repeat(32)))] {
+            job.fabric_bindings.insert(
+                node.into(),
+                FabricBinding {
+                    version,
+                    key: Some(FabricBlockKey::default()),
+                    file_revision: revision,
+                    ..Default::default()
+                },
+            );
+        }
+        let out = format_job_detail(&job);
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n1 ")
+                    && line.ends_with(" BindingVersion=1")),
+            "native binding must include BindingVersion=1 on its node's line"
+        );
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n2 ")
+                    && line.ends_with(" BindingVersion=2")),
+            "file binding must include BindingVersion=2 on its node's line"
+        );
+        assert_eq!(
+            out.matches("BlockFileRevision=").count(),
+            1,
+            "only the file binding should include a block file revision"
+        );
     }
 
     #[test]
@@ -2435,6 +3133,17 @@ mod tests {
     }
 
     #[test]
+    fn job_detail_shows_memory_per_gpu_as_mem_per_tres() {
+        let mut job = pending_pinned_job();
+        job.min_memory_node_mb = 0;
+        job.mem_per_tres = "gpu:8192".into();
+        let out = format_job_detail(&job);
+        let per_gpu = "MinMemoryNode=0\n   MemPerTres=gpu:8192\n";
+        assert!(out.contains(per_gpu), "missing {per_gpu:?}");
+        assert!(!format_job_detail(&pending_pinned_job()).contains("MemPerTres"));
+    }
+
+    #[test]
     fn job_detail_reports_unlimited_when_no_time_limit_is_set() {
         let out = format_job_detail(&pending_pinned_job());
         assert!(out.contains("TimeLimit=UNLIMITED"), "{out}");
@@ -2467,6 +3176,27 @@ mod tests {
         // An older controller does not report it; say nothing rather than 0.
         let legacy = format_config("http://ctld:6817", &ping(None));
         assert!(!legacy.contains("InactiveLimit"), "{legacy}");
+    }
+
+    #[test]
+    fn config_reports_the_controllers_kill_waits() {
+        let ping = spur_proto::proto::PingResponse {
+            kill_wait_secs: Some(5),
+            timeout_kill_wait_secs: Some(30),
+            ..Default::default()
+        };
+        let out = format_config("http://ctld:6817", &ping);
+        assert!(out.contains("KillWait=5\n"), "{out}");
+        assert!(out.contains("TimeoutKillWait=30\n"), "{out}");
+    }
+
+    #[test]
+    fn config_omits_kill_waits_an_older_controller_does_not_report() {
+        let legacy = format_config(
+            "http://ctld:6817",
+            &spur_proto::proto::PingResponse::default(),
+        );
+        assert!(!legacy.contains("KillWait"), "{legacy}");
     }
 
     #[test]
@@ -2793,6 +3523,141 @@ mod tests {
 
     fn p(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn update_partition_parses_grace_time() {
+        let req = partition_update_request(&p(&["PartitionName=gpu", "gracetime=600"])).unwrap();
+        assert_eq!(req.grace_time, Some(600));
+        assert!(!req.clear_grace_time);
+
+        let zero = partition_update_request(&p(&["PartitionName=gpu", "GraceTime=0"])).unwrap();
+        assert_eq!(zero.grace_time, Some(0), "an explicit zero is not unset");
+
+        let absent = partition_update_request(&p(&["PartitionName=gpu", "MaxTime=60"])).unwrap();
+        assert_eq!(absent.grace_time, None);
+        assert!(!absent.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_parses_clear_grace_time() {
+        let cleared =
+            partition_update_request(&p(&["PartitionName=gpu", "ClearGraceTime=yes"])).unwrap();
+        assert!(cleared.clear_grace_time);
+        assert_eq!(cleared.grace_time, None);
+
+        let no = partition_update_request(&p(&["PartitionName=gpu", "ClearGraceTime=no"])).unwrap();
+        assert!(!no.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_clear_grace_time_accepts_only_boolean_values() {
+        for yes in ["yes", "YES", "1", "true", "True"] {
+            let param = format!("ClearGraceTime={yes}");
+            let req = partition_update_request(&p(&["PartitionName=gpu", &param])).unwrap();
+            assert!(req.clear_grace_time, "{yes}");
+        }
+        for no in ["no", "0", "false"] {
+            let param = format!("ClearGraceTime={no}");
+            let req = partition_update_request(&p(&["PartitionName=gpu", &param])).unwrap();
+            assert!(!req.clear_grace_time, "{no}");
+        }
+        for typo in ["on", "2", "maybe", ""] {
+            let param = format!("ClearGraceTime={typo}");
+            let err = partition_update_request(&p(&["PartitionName=gpu", &param]))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("scontrol update: invalid value for ClearGraceTime=: '{typo}'")
+            );
+        }
+    }
+
+    #[test]
+    fn update_partition_rejects_a_grace_time_together_with_a_clear() {
+        let err = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "GraceTime=600",
+            "ClearGraceTime=yes",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "scontrol update: GraceTime= cannot be combined with ClearGraceTime=yes"
+        );
+
+        let kept = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "ClearGraceTime=no",
+            "GraceTime=600",
+        ]))
+        .unwrap();
+        assert_eq!(kept.grace_time, Some(600));
+        assert!(!kept.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_flags_reject_a_grace_time_together_with_a_clear() {
+        let both = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update-partition",
+            "--name",
+            "gpu",
+            "--grace-time",
+            "600",
+            "--clear-grace-time",
+        ]);
+        assert!(both.is_err());
+
+        let clear_only = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update-partition",
+            "--name",
+            "gpu",
+            "--clear-grace-time",
+        ]);
+        assert!(clear_only.is_ok());
+    }
+
+    #[test]
+    fn update_partition_rejects_a_malformed_grace_time() {
+        let err = partition_update_request(&p(&["PartitionName=gpu", "gracetime=soon"]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "scontrol update: invalid value for gracetime=: 'soon'");
+    }
+
+    #[test]
+    fn create_partition_rejects_a_malformed_grace_time() {
+        let err = parse_partition_create_params(&p(&["PartitionName=gpu", "GraceTime=soon"]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "invalid value for GraceTime=: 'soon'");
+    }
+
+    #[test]
+    fn create_partition_reads_a_grace_time() {
+        let parsed = parse_partition_create_params(&p(&["PartitionName=gpu", "GraceTime=45"]))
+            .expect("valid parameters");
+        assert_eq!(parsed.name, "gpu");
+        assert_eq!(parsed.grace_time, Some(45));
+    }
+
+    #[test]
+    fn show_partition_prints_grace_time_when_set() {
+        let part = |grace_time| spur_proto::proto::PartitionInfo {
+            name: "gpu".into(),
+            grace_time,
+            ..Default::default()
+        };
+        let set = format_partition_detail(&part(Some(600)));
+        assert!(set.contains(" GraceTime=600\n"), "{set}");
+        let zero = format_partition_detail(&part(Some(0)));
+        assert!(zero.contains(" GraceTime=0\n"), "{zero}");
+        let unset = format_partition_detail(&part(None));
+        assert!(!unset.contains("GraceTime"), "{unset}");
     }
 
     #[test]
@@ -3322,5 +4187,188 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn partition_limit_keys_parse_slurm_inline_values() {
+        let mut limits = PartitionLimitArgs::default();
+        for (key, value) in [
+            ("maxcpuspernode", "64"),
+            ("maxtrespernode", "cpu=64, mem=131072,gres/gpu:a100=2"),
+            ("maxmempernode", "65536"),
+            ("defmempercpu", "UNLIMITED"),
+        ] {
+            assert!(limits.parse_key(key, value).unwrap(), "{key}");
+        }
+        assert_eq!(
+            limits,
+            PartitionLimitArgs {
+                max_cpus_per_node: Some(64),
+                max_tres_per_node: Some(HashMap::from([
+                    ("cpu".to_string(), 64),
+                    ("mem".to_string(), 131_072),
+                    ("gres/gpu:a100".to_string(), 2),
+                ])),
+                max_mem_per_node: Some(65_536),
+                def_mem_per_cpu: Some(0),
+                ..Default::default()
+            }
+        );
+
+        assert!(!limits.parse_key("maxnodes", "4").unwrap());
+        assert!(limits.parse_key("maxmempercpu", "lots").is_err());
+        assert!(limits.parse_key("maxtrespernode", "cpu").is_err());
+        assert!(limits.parse_key("maxtrespernode", "cpu=x").is_err());
+
+        let mut clear = PartitionLimitArgs::default();
+        assert!(clear.parse_key("maxtrespernode", "").unwrap());
+        assert_eq!(clear.max_tres_per_node, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn show_partition_prints_limits_in_slurm_spelling() {
+        let plain = spur_proto::proto::PartitionInfo::default();
+        assert_eq!(
+            partition_limit_lines(&plain),
+            [
+                "MaxCPUsPerNode=UNLIMITED MaxTRESPerNode=UNLIMITED".to_string(),
+                "DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED".to_string(),
+            ]
+        );
+
+        let capped = spur_proto::proto::PartitionInfo {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: HashMap::from([
+                ("mem".to_string(), 131_072),
+                ("cpu".to_string(), 64),
+            ]),
+            def_mem_per_cpu: Some(1024),
+            max_mem_per_cpu: Some(2048),
+            ..Default::default()
+        };
+        assert_eq!(
+            partition_limit_lines(&capped),
+            [
+                "MaxCPUsPerNode=64 MaxTRESPerNode=cpu=64,mem=131072".to_string(),
+                "DefMemPerCPU=1024 MaxMemPerCPU=2048".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn max_tres_per_node_unlimited_clears_every_cap() {
+        for value in ["UNLIMITED", "unlimited", ""] {
+            let req = partition_update_request(&p(&[
+                "PartitionName=gpu",
+                &format!("MaxTRESPerNode={value}"),
+            ]))
+            .unwrap();
+            assert!(req.set_max_tres_per_node, "{value}");
+            assert!(req.max_tres_per_node.is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn max_tres_per_node_keys_are_case_insensitive_but_keep_the_gpu_type() {
+        let mut limits = PartitionLimitArgs::default();
+        limits
+            .parse_key(
+                "maxtrespernode",
+                "CPU=64,Mem=1024,GRES/GPU=8,Gres/Gpu:MI300X=4,License=1",
+            )
+            .unwrap();
+        assert_eq!(
+            limits.max_tres_per_node,
+            Some(HashMap::from([
+                ("cpu".to_string(), 64),
+                ("mem".to_string(), 1024),
+                ("gres/gpu".to_string(), 8),
+                ("gres/gpu:MI300X".to_string(), 4),
+                ("License".to_string(), 1),
+            ]))
+        );
+    }
+
+    #[test]
+    fn max_cpus_per_node_equal_to_the_map_cpu_cap_is_dropped() {
+        let req = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "MaxCPUsPerNode=64",
+            "MaxTRESPerNode=cpu=64,mem=1024",
+        ]))
+        .unwrap();
+        assert_eq!(req.max_cpus_per_node, None);
+        assert_eq!(req.max_tres_per_node.get("cpu"), Some(&64));
+
+        let created = parse_partition_create_params(&p(&[
+            "PartitionName=gpu",
+            "MaxTRESPerNode=CPU=64",
+            "MaxCPUsPerNode=64",
+        ]))
+        .unwrap();
+        assert_eq!(created.limits.max_cpus_per_node, None);
+    }
+
+    #[test]
+    fn max_cpus_per_node_differing_from_the_map_cpu_cap_is_still_rejected() {
+        let req = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "MaxCPUsPerNode=32",
+            "MaxTRESPerNode=cpu=64",
+        ]))
+        .unwrap();
+        assert_eq!(req.max_cpus_per_node, Some(32));
+        let err = spur_core::partition_limits::fold_max_cpus_per_node(
+            req.max_tres_per_node.into_iter().collect(),
+            req.max_cpus_per_node,
+        )
+        .unwrap_err();
+        assert!(err.contains("set only one"), "{err}");
+    }
+
+    #[test]
+    fn show_partition_limit_lines_parse_back_to_the_same_limits() {
+        let part = spur_proto::proto::PartitionInfo {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: HashMap::from([
+                ("cpu".to_string(), 64),
+                ("mem".to_string(), 131_072),
+                ("gres/gpu:MI300X".to_string(), 4),
+            ]),
+            def_mem_per_cpu: Some(1024),
+            max_mem_per_cpu: Some(2048),
+            ..Default::default()
+        };
+        let mut params = vec!["PartitionName=gpu".to_string()];
+        params.extend(
+            partition_limit_lines(&part)
+                .iter()
+                .flat_map(|line| line.split_whitespace().map(str::to_string)),
+        );
+
+        let req = partition_update_request(&params).unwrap();
+        assert!(req.set_max_tres_per_node);
+        assert_eq!(req.max_tres_per_node, part.max_tres_per_node);
+        assert_eq!(req.max_cpus_per_node, None);
+        assert_eq!(req.def_mem_per_cpu, Some(1024));
+        assert_eq!(req.max_mem_per_cpu, Some(2048));
+
+        let created = parse_partition_create_params(&params).unwrap();
+        assert_eq!(
+            created.limits.max_tres_per_node,
+            Some(part.max_tres_per_node.clone())
+        );
+        assert_eq!(created.limits.max_cpus_per_node, None);
+
+        let mut plain = vec!["PartitionName=gpu".to_string()];
+        plain.extend(
+            partition_limit_lines(&spur_proto::proto::PartitionInfo::default())
+                .iter()
+                .flat_map(|line| line.split_whitespace().map(str::to_string)),
+        );
+        let cleared = partition_update_request(&plain).unwrap();
+        assert!(cleared.set_max_tres_per_node);
+        assert!(cleared.max_tres_per_node.is_empty());
+        assert_eq!(cleared.max_cpus_per_node, Some(0));
     }
 }

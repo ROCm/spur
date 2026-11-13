@@ -124,18 +124,14 @@ The two daemons are configured with command-line flags. The most common are belo
    status is reported over the reconnect, so a job whose agent restarted
    mid-step still completes with the right exit code.
 
-   Two launches are still unsupervised and do **not** survive a restart: a step
-   given its own ``--container-image``, and an ``srun --pty`` that allocates its
-   own job. A terminal opened *inside* an existing allocation is supervised —
-   see :doc:`../user-guide/interactive`. A container step killed that way also
-   leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
-   supervised and survive a restart normally.
+   One launch is still unsupervised and does **not** survive a restart: an
+   ``srun --pty`` that allocates its own job. A terminal opened *inside* an
+   existing allocation is supervised — see :doc:`../user-guide/interactive`. A
+   step given its own ``--container-image`` is supervised like any other step.
 
    ``--mpi=pmix`` work survives a restart the same way: a job and an inner
    ``srun --mpi=pmix`` step each host their PMIx server inside their own
-   supervisor. A step given its own ``--container-image`` is the exception —
-   its server stays in ``spurd``, so restarting the agent breaks its
-   rendezvous along with the step itself.
+   supervisor.
 
    Before the controller will *fence* a supervisor belonging to a superseded
    run, the reporting node has to prove its identity, and that takes **two**
@@ -349,6 +345,18 @@ Enable and start it:
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install
    that way, adjust ``ExecStart`` to match — this unit assumes ``/usr/local/bin``.
 
+.. important::
+
+   After ``SIGTERM``, ``spurctld`` waits at most ``[controller] shutdown_grace_secs``
+   (default 10s) for in-flight RPCs to drain, then flushes accounting for up to 5 seconds
+   and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
+   what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
+   well below ``heartbeat_timeout_secs``, since the draining controller answers no
+   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
+   unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
+   flush.
+
 High Availability
 ~~~~~~~~~~~~~~~~~
 
@@ -546,6 +554,42 @@ Out of the box the job's cgroup gets:
 A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
 left unset.
 
+Job termination waits for all processes in the owned cgroup, including
+children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
+setting defaults to 60 seconds, matching Slurm's ``UnkillableStepTimeout``. The node agent blocks new launches while cleanup
+is pending. At the deadline, it requests a node drain independently of job
+completion, including when a supervisor is still busy with cleanup or exit hooks. An unreadable cgroup is treated as unresolved cleanup, rather than
+as empty.
+
+Pending cleanup is recorded on disk and retried after an agent or supervisor
+restart. The original deadline is preserved during recovery; the agent's
+force-reclaim timer does not prove that the workload has exited. The controller
+also drains unreported nodes before force-finishing a job at
+``complete_wait_secs``, so keep that above the larger kill wait plus
+``cleanup_timeout_secs``. The controller's warning for this uses its own
+``[cgroup] cleanup_timeout_secs``, so set it there to the largest value any
+node uses.
+The node remains drained for administrator investigation and explicit resume;
+resuming it does not bypass the agent's outstanding cleanup check.
+These guarantees require cgroup containment to be enabled and successfully
+established for the job. Upgrade controllers before node agents and supervisors
+so completion and timeout handling both enforce quarantine. A running job
+keeps the cleanup timeout captured at launch; changing the configuration applies
+to new jobs after the agent restarts.
+
+The node ``epilog`` is part of that teardown. While a job's supervisor is
+waiting for its cgroup to empty or running the epilog, it holds a lease that
+stops the agent from force-killing it, so a cancelled job's node is not handed
+back mid-epilog. The exception is a supervisor re-adopted after a ``spurd``
+restart: its job can be reported complete before its epilog runs, so its node
+can be released mid-epilog. The epilog is bounded by
+``[hooks] epilog_timeout_secs`` (default 120 seconds): its process group is
+terminated at the limit and the node is drained.
+A supervisor lost after the job exits but before its epilog finishes has any
+orphaned epilog killed and its node drained. See
+:ref:`the epilog timeout <epilog-timeout>` for the drain reasons and how this
+interacts with ``complete_wait_secs``.
+
 Inspect what a running job actually got:
 
 .. code-block:: bash
@@ -590,9 +634,11 @@ a granularity gap *inside* the job rather than a hole between jobs:
    * - What is missing
      - Where it stands
    * - Per-step **limits**
-     - Each step gets its own ``step_<n>`` cgroup, but that leaf carries no
-       budget of its own: it inherits the job's limits and device filter, so
-       every step in a job still draws on one shared budget. Where the host lets
+     - Each step gets its own ``step_<n>`` cgroup. A step that types
+       ``--cpus-per-task``, ``--mem`` or a GPU count gets those as limits of
+       its own on that leaf (:ref:`step-own-share`); any other step's leaf
+       carries no budget of its own: it inherits the job's limits and device
+       filter, so those steps still draw on one shared budget. Where the host lets
        the job delegate its controllers, per-step CPU and memory *readings* show
        up in the leaf's ``cpu.stat`` and ``memory.current``; Spur does not yet
        collect them into step accounting.
@@ -601,11 +647,10 @@ a granularity gap *inside* the job rather than a hole between jobs:
        step process that leaves that tree (``setsid``) is missed even though the
        step now has a cgroup that would catch it. Cancelling the whole *job* is
        exact, because that is a cgroup operation.
-   * - ``task_prolog`` / ``task_epilog`` for a containerized step
-     - A supervised step runs its task hooks as the job user inside its own
-       ``step_<n>`` cgroup. A containerized ``srun`` step still takes the legacy
-       launch path, where the hooks — like the container workload — run in the
-       parent job's leaf rather than a per-step ``step_<n>`` leaf.
+
+A step's ``task_prolog`` and ``task_epilog`` run as the job user inside the
+step's own ``step_<n>`` cgroup under its ``spurstepd``, whether or not the step
+gives its own ``--container-image``.
 
 Node-level ``prolog`` and ``epilog`` run uncontained, and that is by design:
 they run before the job's cgroup exists and after it is gone, and their purpose is

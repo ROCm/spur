@@ -40,6 +40,13 @@ pub struct SallocArgs {
     #[arg(short = 'c', long, default_value = "1")]
     pub cpus_per_task: u32,
 
+    /// Mount the node's credential mint socket into the container of each
+    /// `srun --container-image` step in this allocation, so a nested srun there
+    /// can authenticate (anything in the container can then act on the cluster
+    /// as you)
+    #[arg(long)]
+    pub container_auth_socket: bool,
+
     /// Memory per node (e.g., "4G", "4096M")
     #[arg(long)]
     pub mem: Option<String>,
@@ -66,7 +73,7 @@ pub struct SallocArgs {
     #[arg(long)]
     pub gpus_per_task: Option<String>,
 
-    /// Required node features (e.g., "mi300x,nvlink")
+    /// Required node features and GPU predicates: gpu.<field><op><value>, same(gpu.<field>)
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
@@ -325,6 +332,7 @@ fn build_salloc_job_spec(
         nodelist: nodelist.unwrap_or_default(),
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
+        container_auth_socket: args.container_auth_socket,
         interactive: true,
         client_keepalive: true,
         environment: HashMap::new(),
@@ -435,6 +443,17 @@ mod tests {
         let args = SallocArgs::parse_from(["salloc"]);
         let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
         assert!(spec.client_keepalive);
+    }
+
+    #[test]
+    fn container_auth_socket_reaches_the_allocation_job_spec() {
+        let args = SallocArgs::parse_from(["salloc", "--container-auth-socket"]);
+        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        assert!(spec.container_auth_socket);
+
+        let args = SallocArgs::parse_from(["salloc"]);
+        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        assert!(!spec.container_auth_socket, "the socket is opt-in");
     }
 
     #[test]

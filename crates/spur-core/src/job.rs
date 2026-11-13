@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 use crate::burst_buffer::BbStageState;
@@ -354,6 +354,9 @@ pub enum PendingReason {
     Resources,
     PartitionDown,
     PartitionNodeLimit,
+    /// Placing the job would push a partition past its `max_tres_per_node` cap. No Slurm
+    /// counterpart; the numbers go in `pending_reason_desc`.
+    PartitionTresLimit,
     PartitionTimeLimit,
     Dependency,
     NodeDown,
@@ -469,6 +472,7 @@ impl PendingReason {
             Self::Resources => "Resources",
             Self::PartitionDown => "PartitionDown",
             Self::PartitionNodeLimit => "PartitionNodeLimit",
+            Self::PartitionTresLimit => "PartitionTresLimit",
             Self::PartitionTimeLimit => "PartitionTimeLimit",
             Self::Dependency => "Dependency",
             Self::NodeDown => "NodeDown",
@@ -573,9 +577,97 @@ impl std::fmt::Display for PendingReason {
     }
 }
 
+/// One partition cap a job would overshoot on one node. `mem` values are MiB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionTresOvershoot {
+    pub node: String,
+    pub resource: String,
+    pub used: u64,
+    pub requested: u64,
+    pub limit: u64,
+}
+
+impl PartitionTresOvershoot {
+    fn total(&self) -> u64 {
+        self.used.saturating_add(self.requested)
+    }
+
+    fn is_over(&self) -> bool {
+        self.total() > self.limit
+    }
+
+    fn report_key(&self) -> (u8, &str) {
+        (
+            crate::partition::tres_key_report_rank(&self.resource),
+            &self.resource,
+        )
+    }
+
+    /// Overshoot relative to the limit, so nodes reported on different
+    /// resources compare without mixing units (CPUs vs. MiB).
+    fn relative_excess_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let excess = |o: &Self| u128::from(o.total() - o.limit);
+        let limit = |o: &Self| u128::from(o.limit.max(1));
+        (excess(self) * limit(other)).cmp(&(excess(other) * limit(self)))
+    }
+}
+
+/// `pending_reason_desc` for [`PendingReason::PartitionTresLimit`]: the node closest to
+/// fitting, its first over-limit key, and how many others are blocked; `None` if none is over.
+pub fn partition_tres_limit_desc(
+    partition: &str,
+    overshoots: &[PartitionTresOvershoot],
+) -> Option<String> {
+    let mut per_node: BTreeMap<&str, &PartitionTresOvershoot> = BTreeMap::new();
+    for o in overshoots.iter().filter(|o| o.is_over()) {
+        per_node
+            .entry(&o.node)
+            .and_modify(|cur| {
+                if o.report_key() < cur.report_key() {
+                    *cur = o;
+                }
+            })
+            .or_insert(o);
+    }
+    let closest = per_node
+        .values()
+        .min_by(|a, b| a.relative_excess_cmp(b).then_with(|| a.node.cmp(&b.node)))?;
+    let others = per_node.len() - 1;
+
+    let values = [
+        closest.used,
+        closest.requested,
+        closest.total(),
+        closest.limit,
+    ];
+    let is_mem = closest.resource == crate::partition::TRES_MEM;
+    let unit = match is_mem {
+        false => None,
+        true if values.iter().all(|v| v.is_multiple_of(1024)) => Some(("G", 1024)),
+        true => Some(("M", 1)),
+    };
+    let [used, requested, total, limit] = values.map(|v| match unit {
+        Some((suffix, div)) => format!("{}{suffix}", v / div),
+        None => v.to_string(),
+    });
+    let kind = if is_mem { " memory" } else { "" };
+    let mut desc = format!(
+        "Partition {partition}{kind} limit reached on {}: {} {used} in use + {requested} requested = {total} > max {limit}",
+        closest.node, closest.resource,
+    );
+    if others > 0 {
+        let noun = if others == 1 { "node" } else { "nodes" };
+        desc.push_str(&format!(" ({others} other {noun} also over limit)"));
+    }
+    Some(desc)
+}
+
 /// Job specification submitted by the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
+    /// Leader-stamped submission identity; absent in pre-upgrade entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
     pub name: String,
     pub partition: Option<String>,
     pub account: Option<String>,
@@ -590,6 +682,10 @@ pub struct JobSpec {
     pub cpus_per_task: u32,
     pub memory_per_node_mb: Option<u64>,
     pub memory_per_cpu_mb: Option<u64>,
+    /// Memory per allocated GPU (MiB). Never submitted: only a partition's
+    /// `def_mem_per_gpu` sets it, so each node's memory follows its GPU share.
+    #[serde(default)]
+    pub memory_per_gpu_mb: Option<u64>,
     pub gres: Vec<String>,
     /// GPU requests. At most one is set (see `gpu_request::resolve_gpu_demand`).
     /// `gpus` = total across the job, the others are per-node / per-task. A
@@ -627,7 +723,7 @@ pub struct JobSpec {
     pub dependency: Vec<String>,
     pub nodelist: Option<String>,
     pub exclude: Option<String>,
-    /// Node feature constraint (comma-separated, all must match).
+    /// Node features and optional same(gpu.fabric_domain_id) placement constraint.
     pub constraint: Option<String>,
 
     // MPI
@@ -671,7 +767,7 @@ pub struct JobSpec {
     pub container_entrypoint: Option<String>,
     pub container_remap_root: bool,
     #[serde(default)]
-    pub container_no_auth_socket: bool,
+    pub container_auth_socket: bool,
 
     // Burst buffer
     pub burst_buffer: Option<String>,
@@ -686,7 +782,7 @@ pub struct JobSpec {
     /// Spread job across least-loaded nodes.
     pub spread_job: bool,
     /// Topology-aware scheduling: "tree" (minimize switch hops) or
-    /// "block" (keep within one rack). None = default (no topology preference).
+    /// "block" (prefer one block). None = default (no topology preference).
     pub topology: Option<String>,
 
     // Kubernetes pod options
@@ -725,6 +821,7 @@ pub struct JobSpec {
 impl Default for JobSpec {
     fn default() -> Self {
         Self {
+            submitted_at: None,
             name: String::new(),
             partition: None,
             account: None,
@@ -737,6 +834,7 @@ impl Default for JobSpec {
             cpus_per_task: 1,
             memory_per_node_mb: None,
             memory_per_cpu_mb: None,
+            memory_per_gpu_mb: None,
             gres: Vec::new(),
             gpus: None,
             gpus_per_node: None,
@@ -783,7 +881,7 @@ impl Default for JobSpec {
             container_env: HashMap::new(),
             container_entrypoint: None,
             container_remap_root: false,
-            container_no_auth_socket: false,
+            container_auth_socket: false,
             burst_buffer: None,
             begin_time: None,
             deadline: None,
@@ -816,16 +914,18 @@ impl JobSpec {
     }
 }
 
-/// Total memory (MB) a job of `num_nodes` nodes requests, derived from
-/// either an explicit per-node request or a per-CPU request applied across
-/// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
-/// set.
+/// Total memory (MB) a job of `num_nodes` nodes requests: per-node, or per-CPU/per-GPU
+/// applied across its total CPUs/GPUs; 0 (unconstrained) if none is set.
 pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
     spec.memory_per_node_mb
         .map(|mem| mem * num_nodes as u64)
         .or_else(|| {
             spec.memory_per_cpu_mb
                 .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
+        })
+        .or_else(|| {
+            spec.memory_per_gpu_mb
+                .map(|mem| mem.saturating_mul(effective_gpus(spec, num_nodes)))
         })
         .unwrap_or(0)
 }
@@ -867,6 +967,24 @@ pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
     }
 }
 
+/// A running job that has been warned of preemption and may keep running until
+/// `deadline`. Replicated so every replica, and a new leader, honours the same
+/// grace period instead of restarting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreemptPending {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemption_claim: Option<crate::preemption_usage::PreemptionClaim>,
+    pub signaled_at: DateTime<Utc>,
+    pub deadline: DateTime<Utc>,
+    pub preempted_by: JobId,
+    pub preempt_qos: Option<String>,
+    /// `Cancel` or `Requeue`: how the run ends once the grace is over.
+    pub mode: crate::partition::PreemptMode,
+    pub run_attempt: u32,
+    /// Computed by the leader so a replay re-pends the job with the same hold.
+    pub requeue_hold_secs: u32,
+}
+
 /// One node's completion outcome for a job: the raw process wait status,
 /// split into exit code and terminating signal (0 = none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -878,6 +996,11 @@ pub struct NodeCompletion {
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub preemption_usage: crate::preemption_usage::PreemptionUsage,
+    /// Defer eviction when the last outcome arrives after job completion.
+    #[serde(default)]
+    pub preemption_usage_updated_at: Option<DateTime<Utc>>,
     pub job_id: JobId,
     pub spec: JobSpec,
     pub state: JobState,
@@ -961,6 +1084,10 @@ pub struct Job {
     #[serde(default)]
     pub cancel_signaled_at: Option<DateTime<Utc>>,
 
+    /// Set while the run is inside its preemption grace period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_pending: Option<PreemptPending>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -1031,6 +1158,16 @@ pub struct Job {
     #[serde(default)]
     pub idle_fill: bool,
 
+    /// Partition this run is charged to, chosen among the requested ones at start (`None`
+    /// while pending); caps count its usage against it until the job ends.
+    #[serde(default)]
+    pub effective_partition: Option<String>,
+
+    /// The request as submitted, kept while a partition's memory policy has adjusted the
+    /// spec, so a requeued run is re-adjusted from it rather than another partition's result.
+    #[serde(default)]
+    pub original_request: Option<crate::partition_limits::MemoryAdjustment>,
+
     /// Nodes the QOS/account grp-node admission check credited this job for
     /// reusing (they had spare capacity), recomputed fresh every scheduling
     /// pass. Consulted by `NodePlacement` as a nodelist fallback so placement
@@ -1062,14 +1199,17 @@ impl Job {
             // before the scheduler has evaluated the job.
             PendingReason::None
         };
+        let submit_time = spec.submitted_at.unwrap_or_else(Utc::now);
         Self {
+            preemption_usage: Default::default(),
+            preemption_usage_updated_at: None,
             job_id,
             spec,
             state,
             pending_reason,
             pending_reason_desc: None,
             priority,
-            submit_time: Utc::now(),
+            submit_time,
             start_time: None,
             end_time: None,
             allocated_nodes: Vec::new(),
@@ -1087,6 +1227,7 @@ impl Job {
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
+            preempt_pending: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -1103,6 +1244,8 @@ impl Job {
             preempt_mode: None,
             preempt_qos: None,
             idle_fill: false,
+            effective_partition: None,
+            original_request: None,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
         }
@@ -1209,6 +1352,13 @@ impl Job {
         final_state
     }
 
+    /// Whether a node reported the kernel OOM-killing its part of the run.
+    pub fn reported_oom(&self) -> bool {
+        self.node_completions
+            .values()
+            .any(|c| c.signal & OOM_SIGNAL_FLAG != 0)
+    }
+
     pub fn all_nodes_completed(&self) -> bool {
         !self.allocated_nodes.is_empty()
             && self.node_completions.len() == self.allocated_nodes.len()
@@ -1220,10 +1370,32 @@ impl Job {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
+    /// The preemption grace this run is still inside. A warning recorded for an
+    /// earlier run never counts against the current one.
+    pub fn preempt_grace(&self) -> Option<&PreemptPending> {
+        self.preempt_pending
+            .as_ref()
+            .filter(|pending| pending.run_attempt == self.run_attempt)
+    }
+
+    /// The allocated nodes still charged for this job, in allocation order.
+    pub fn held_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.is_held_on(node))
+            .cloned()
+            .collect()
+    }
+
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
     /// parent (interactive) or a batch parent keeps its own lifecycle instead.
     pub fn is_standalone_pty(&self) -> bool {
         self.spec.srun_job && self.spec.pty && !self.spec.interactive && self.srun_step_dispatch
+    }
+
+    /// A cancel-mode preemption victim still releasing its nodes to `preempted_by`.
+    pub fn is_draining_cancel_victim(&self) -> bool {
+        self.state == JobState::Completing && self.preempt_mode.as_deref() == Some("Cancel")
     }
 
     /// Whether a placement is already charged. `reserve_placement` charges while still
@@ -1241,6 +1413,13 @@ impl Job {
     pub fn occupies_resources(&self) -> bool {
         self.state == JobState::Running
             || (self.state == JobState::Pending && self.holds_a_placement())
+    }
+
+    /// A run the controller stopped for a time or inactivity limit that is still
+    /// inside its kill wait. It still holds its allocation, so a singleton or an
+    /// array throttle must keep treating it as running.
+    pub fn is_stopping_for_time_limit(&self) -> bool {
+        self.state == JobState::Completing && self.time_limit_signaled_at.is_some()
     }
 
     /// Earliest time the job may start: `--begin` when it falls after submit.
@@ -1487,6 +1666,30 @@ impl Job {
         self.suspended_by = None;
     }
 
+    /// Record a run's partition and reshape the spec to the request that
+    /// partition's memory policy produced, keeping the submitted one.
+    pub fn start_in_partition(
+        &mut self,
+        partition: Option<String>,
+        adjustment: Option<crate::partition_limits::MemoryAdjustment>,
+    ) {
+        self.effective_partition = partition;
+        let Some(adjustment) = adjustment else {
+            return;
+        };
+        self.original_request
+            .get_or_insert_with(|| crate::partition_limits::MemoryAdjustment::of(&self.spec));
+        adjustment.apply_to(&mut self.spec);
+    }
+
+    /// Undo [`Job::start_in_partition`] when the job goes back to pending.
+    pub fn leave_partition(&mut self) {
+        self.effective_partition = None;
+        if let Some(original) = self.original_request.take() {
+            original.apply_to(&mut self.spec);
+        }
+    }
+
     /// Set the scheduling reason, dropping any description the previous reason
     /// carried. Every write to `pending_reason` goes through here or
     /// [`Job::set_pending_reason_desc`]: a description left behind by an
@@ -1663,6 +1866,33 @@ mod tests {
             !job.occupies_resources(),
             "a node that already reported completion is no longer charged"
         );
+    }
+
+    #[test]
+    fn reported_oom_sees_the_flag_on_any_node() {
+        let mut job = make_job();
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 9 });
+        assert!(!job.reported_oom());
+
+        job.node_completions.insert(
+            "n2".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 9 | OOM_SIGNAL_FLAG,
+            },
+        );
+        assert!(job.reported_oom());
+    }
+
+    #[test]
+    fn held_nodes_leaves_out_the_nodes_that_reported() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
+
+        assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
     }
 
     #[test]
@@ -1882,6 +2112,21 @@ mod tests {
     }
 
     #[test]
+    fn effective_memory_mb_falls_back_to_per_gpu_over_the_gpu_total() {
+        let spec = JobSpec {
+            memory_per_gpu_mb: Some(1024),
+            num_nodes: 2,
+            num_tasks: 2,
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 2), 3072);
+    }
+
+    #[test]
     fn effective_memory_mb_prefers_per_node_over_per_cpu() {
         let spec = JobSpec {
             memory_per_node_mb: Some(2048),
@@ -2095,6 +2340,18 @@ mod tests {
         assert_eq!(signal, 11);
     }
 
+    #[test]
+    fn only_a_completing_run_signalled_for_a_limit_is_stopping_for_the_time_limit() {
+        let mut job = timed_out_job();
+        job.state = JobState::Running;
+        assert!(!job.is_stopping_for_time_limit());
+        job.state = JobState::Completing;
+        assert!(job.is_stopping_for_time_limit());
+        job.time_limit_signaled_at = None;
+        job.cancel_signaled_at = Some(Utc::now());
+        assert!(!job.is_stopping_for_time_limit());
+    }
+
     /// A job whose run the watchdog signalled for exhausting its time limit.
     fn timed_out_job() -> Job {
         let mut job = make_job();
@@ -2209,11 +2466,10 @@ mod tests {
         job.transition(JobState::Cancelled).unwrap();
     }
 
-    // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or
-    // snapshot must still deserialize, or spurctld crashes on restart.
-    #[test]
-    fn job_deserializes_without_cancel_signaled_at_field() {
-        let json = r#"{
+    /// A job as an older controller serialized it, before `cancel_signaled_at` and
+    /// `preempt_pending` existed. Never regenerate: a failure means the new field
+    /// needs a default, not a new fixture.
+    const FROZEN_PRE_GRACE_JOB: &str = r#"{
             "job_id": 7,
             "spec": {
                 "name": "old", "user": "alice", "uid": 0, "gid": 0,
@@ -2258,11 +2514,78 @@ mod tests {
             "time_limit_signaled_at": null,
             "suspended_secs": 0
         }"#;
+
+    // Replay of an older Raft log or snapshot must still deserialize, or
+    // spurctld crashes on restart.
+    #[test]
+    fn job_deserializes_without_cancel_signaled_at_field() {
+        let json = FROZEN_PRE_GRACE_JOB;
         let job: Job = serde_json::from_str(json).unwrap();
         assert_eq!(job.job_id, 7);
         assert_eq!(job.state, JobState::Running);
         assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
         assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[test]
+    fn a_frozen_job_from_before_preempt_pending_has_no_grace() {
+        let job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
+        assert!(job.preempt_pending.is_none());
+        assert!(job.spec.submitted_at.is_none());
+        assert!(job.preempt_grace().is_none());
+        assert_eq!(job.preemption_usage, Default::default());
+    }
+
+    #[test]
+    fn a_job_without_a_grace_omits_preempt_pending_when_serialized() {
+        let json = serde_json::to_value(make_job()).unwrap();
+        assert!(json.get("preempt_pending").is_none());
+    }
+
+    #[test]
+    fn a_pending_preemption_round_trips_on_the_job() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let pending = PreemptPending {
+            preemption_claim: None,
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: Some("high".into()),
+            mode: crate::partition::PreemptMode::Requeue,
+            run_attempt: 3,
+            requeue_hold_secs: 30,
+        };
+        let mut job = make_job();
+        job.preempt_pending = Some(pending.clone());
+        let back: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert_eq!(back.preempt_pending, Some(pending));
+    }
+
+    #[test]
+    fn preempt_grace_ignores_a_warning_recorded_for_an_earlier_run() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let mut job = make_job();
+        job.run_attempt = 2;
+        assert!(job.preempt_grace().is_none());
+
+        job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: None,
+            mode: crate::partition::PreemptMode::Cancel,
+            run_attempt: 1,
+            requeue_hold_secs: 0,
+        });
+        assert!(job.preempt_grace().is_none());
+
+        job.run_attempt = 1;
+        assert_eq!(job.preempt_grace().map(|p| p.preempted_by), Some(9));
     }
 
     #[test]
@@ -2438,6 +2761,17 @@ mod tests {
             JobState::from_proto(JobState::Requeued.to_proto()),
             JobState::Requeued
         );
+    }
+
+    #[test]
+    fn a_running_run_can_end_preempted_and_then_re_pend() {
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+
+        job.transition(JobState::Preempted).unwrap();
+        job.transition(JobState::Pending).unwrap();
+
+        assert_eq!(job.state, JobState::Pending);
     }
 
     #[test]
@@ -3025,5 +3359,247 @@ mod tests {
             },
         );
         assert_eq!(job.eligible_time(), job.submit_time);
+    }
+
+    fn overshoot(
+        node: &str,
+        resource: &str,
+        used: u64,
+        requested: u64,
+        limit: u64,
+    ) -> PartitionTresOvershoot {
+        PartitionTresOvershoot {
+            node: node.into(),
+            resource: resource.into(),
+            used,
+            requested,
+            limit,
+        }
+    }
+
+    #[test]
+    fn partition_tres_limit_displays_its_own_code() {
+        assert_eq!(
+            PendingReason::PartitionTresLimit.display(),
+            "PartitionTresLimit"
+        );
+    }
+
+    #[test]
+    fn descriptive_pending_reason_cpu_overshoot() {
+        let desc =
+            partition_tres_limit_desc("cpu", &[overshoot("n03", "cpu", 48, 24, 64)]).unwrap();
+        assert_eq!(
+            desc,
+            "Partition cpu limit reached on n03: cpu 48 in use + 24 requested = 72 > max 64"
+        );
+
+        let mut job = make_job();
+        job.set_pending_reason_desc(PendingReason::PartitionTresLimit, desc.clone());
+        assert_eq!(job.state_reason(), desc);
+        assert_eq!(job.state_reason_display(), desc);
+    }
+
+    #[test]
+    fn descriptive_pending_reason_typed_gpu_overshoot() {
+        let desc = partition_tres_limit_desc("gpu", &[overshoot("n07", "gres/gpu:a100", 2, 1, 2)]);
+        assert_eq!(
+            desc.as_deref(),
+            Some(
+                "Partition gpu limit reached on n07: gres/gpu:a100 2 in use + 1 requested = 3 > max 2"
+            )
+        );
+    }
+
+    #[test]
+    fn descriptive_pending_reason_memory_overshoot_closest_node() {
+        let gib = 1024;
+        let mut blocked = vec![overshoot("n03", "mem", 120 * gib, 16 * gib, 128 * gib)];
+        for (i, used) in (121..128).enumerate() {
+            blocked.push(overshoot(
+                &format!("n1{i}"),
+                "mem",
+                used * gib,
+                16 * gib,
+                128 * gib,
+            ));
+        }
+        assert_eq!(
+            partition_tres_limit_desc("cpu", &blocked).as_deref(),
+            Some(
+                "Partition cpu memory limit reached on n03: mem 120G in use + 16G requested = 136G > max 128G (7 other nodes also over limit)"
+            )
+        );
+
+        assert_eq!(
+            partition_tres_limit_desc("cpu", &blocked[..1]).as_deref(),
+            Some(
+                "Partition cpu memory limit reached on n03: mem 120G in use + 16G requested = 136G > max 128G"
+            )
+        );
+        assert!(partition_tres_limit_desc("cpu", &blocked[..2])
+            .unwrap()
+            .ends_with("(1 other node also over limit)"));
+    }
+
+    #[test]
+    fn descriptive_pending_reason_resource_ordering_multiple_keys() {
+        let gpu = overshoot("n05", "gres/gpu:a100", 4, 4, 1);
+        let mem = overshoot("n05", "mem", 100, 30, 128);
+        let cpu = overshoot("n05", "cpu", 60, 5, 64);
+
+        let all = partition_tres_limit_desc("p", &[gpu.clone(), mem.clone(), cpu]).unwrap();
+        assert!(all.contains(": cpu 60 in use"), "{all}");
+
+        let no_cpu = partition_tres_limit_desc("p", &[gpu.clone(), mem]).unwrap();
+        assert!(no_cpu.contains(": mem 100M in use"), "{no_cpu}");
+
+        let gpu_only = partition_tres_limit_desc("p", &[gpu]).unwrap();
+        assert!(gpu_only.contains(": gres/gpu:a100 4 in use"), "{gpu_only}");
+    }
+
+    #[test]
+    fn descriptive_pending_reason_ranks_nodes_by_relative_overshoot() {
+        // n01 is over by 1 CPU of 64; n02 by 2 MiB of 128 GiB. Comparing the
+        // raw numbers would pick n01, but n02 is far closer to fitting.
+        let blocked = [
+            overshoot("n01", "cpu", 64, 1, 64),
+            overshoot("n02", "mem", 131072, 2, 131072),
+        ];
+        let desc = partition_tres_limit_desc("p", &blocked).unwrap();
+        assert!(desc.contains("reached on n02"), "{desc}");
+        assert!(desc.ends_with("(1 other node also over limit)"), "{desc}");
+    }
+
+    #[test]
+    fn descriptive_pending_reason_ties_break_on_node_name() {
+        let blocked = [
+            overshoot("n09", "cpu", 8, 1, 8),
+            overshoot("n02", "cpu", 8, 1, 8),
+        ];
+        let desc = partition_tres_limit_desc("p", &blocked).unwrap();
+        assert!(desc.contains("reached on n02"), "{desc}");
+    }
+
+    #[test]
+    fn descriptive_pending_reason_uses_one_memory_unit_per_line() {
+        let desc =
+            partition_tres_limit_desc("p", &[overshoot("n1", "mem", 120 * 1024, 1500, 120 * 1024)])
+                .unwrap();
+        assert!(
+            desc.ends_with("mem 122880M in use + 1500M requested = 124380M > max 122880M"),
+            "{desc}"
+        );
+    }
+
+    #[test]
+    fn descriptive_pending_reason_zero_limit_reports_the_request() {
+        let desc = partition_tres_limit_desc("cpu", &[overshoot("n1", "gres/gpu", 0, 2, 0)]);
+        assert_eq!(
+            desc.as_deref(),
+            Some("Partition cpu limit reached on n1: gres/gpu 0 in use + 2 requested = 2 > max 0")
+        );
+    }
+
+    #[test]
+    fn descriptive_pending_reason_ignores_entries_within_the_limit() {
+        assert_eq!(partition_tres_limit_desc("p", &[]), None);
+        let fits = overshoot("n1", "cpu", 32, 32, 64);
+        assert_eq!(
+            partition_tres_limit_desc("p", std::slice::from_ref(&fits)),
+            None
+        );
+
+        let over = overshoot("n2", "cpu", 60, 8, 64);
+        let desc = partition_tres_limit_desc("p", &[fits, over]).unwrap();
+        assert!(desc.contains("reached on n2"), "{desc}");
+        assert!(!desc.contains("other"), "{desc}");
+    }
+
+    #[test]
+    fn descriptive_pending_reason_saturates_instead_of_overflowing() {
+        let desc =
+            partition_tres_limit_desc("p", &[overshoot("n1", "cpu", u64::MAX, 1, 64)]).unwrap();
+        assert!(desc.contains(&format!("= {} > max 64", u64::MAX)), "{desc}");
+    }
+
+    #[test]
+    fn effective_partition_defaults_to_none_and_survives_snapshot_round_trip() {
+        let mut job = make_job();
+        assert_eq!(job.effective_partition, None);
+
+        job.effective_partition = Some("cpu".into());
+        let value = serde_json::to_value(&job).expect("serialize job");
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.effective_partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn leaving_a_partition_restores_the_submitted_request() {
+        use crate::partition_limits::MemoryAdjustment;
+        let mut job = make_job();
+        let submitted = MemoryAdjustment::of(&job.spec);
+        let adjusted = MemoryAdjustment {
+            cpus_per_task: 6,
+            memory_per_node_mb: None,
+            memory_per_cpu_mb: Some(1707),
+            memory_per_gpu_mb: None,
+        };
+
+        job.start_in_partition(Some("a".into()), Some(adjusted));
+        assert_eq!(MemoryAdjustment::of(&job.spec), adjusted);
+        job.leave_partition();
+        assert_eq!(job.effective_partition, None);
+        assert_eq!(MemoryAdjustment::of(&job.spec), submitted);
+        assert_eq!(job.original_request, None);
+
+        job.start_in_partition(Some("b".into()), None);
+        assert_eq!(job.effective_partition.as_deref(), Some("b"));
+        assert_eq!(MemoryAdjustment::of(&job.spec), submitted);
+    }
+
+    #[test]
+    fn a_job_snapshot_without_an_effective_partition_still_deserializes() {
+        let mut value = serde_json::to_value(make_job()).expect("serialize job");
+        value
+            .as_object_mut()
+            .expect("job serializes as an object")
+            .remove("effective_partition");
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.effective_partition, None);
+    }
+
+    #[test]
+    fn partition_tres_limit_round_trips_through_serde() {
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::PartitionTresLimit);
+        let json = serde_json::to_string(&job).expect("serialize job");
+        let back: Job = serde_json::from_str(&json).expect("deserialize job");
+        assert_eq!(back.pending_reason, PendingReason::PartitionTresLimit);
+    }
+
+    // The variant name is the persisted and API-visible code; renaming it
+    // breaks WAL replay and every client matching on the reason.
+    #[test]
+    fn partition_tres_limit_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(PendingReason::PartitionTresLimit).unwrap(),
+            serde_json::json!("PartitionTresLimit")
+        );
+        let back: PendingReason =
+            serde_json::from_value(serde_json::json!("PartitionTresLimit")).unwrap();
+        assert_eq!(back, PendingReason::PartitionTresLimit);
+    }
+
+    #[test]
+    fn a_job_snapshot_from_before_partition_limits_deserializes_with_defaults() {
+        let mut value = serde_json::to_value(make_job()).expect("serialize job");
+        let fields = value.as_object_mut().expect("job serializes as an object");
+        for field in ["effective_partition", "original_request"] {
+            assert!(fields.remove(field).is_some(), "{field} must serialize");
+        }
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.effective_partition, None);
+        assert_eq!(back.original_request, None);
     }
 }

@@ -71,19 +71,26 @@ runs inside the container.
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
      - Map the job user to root inside the container.
-   * - ``--container-no-auth-socket``
-     - ``srun`` with ``--container-image`` (a step in a ``salloc`` allocation,
-       or a standalone ``srun``). Keep the node's credential mint socket out of
-       the container. By default it is bind-mounted so that a nested ``srun``
-       can authenticate; without it, nothing in the container can mint a
-       credential and act on the cluster as you. A step inside a standalone
-       ``srun`` allocation inherits the choice. A ``--container-mounts`` entry
-       that would bind the socket back in, either the socket itself or a
-       directory that contains it such as ``/run/spur``, is rejected. It has no
-       effect on a container started with ``--container-image`` on
-       ``sbatch``/``salloc`` itself, nor on a step that enters its job's
-       running container. Only meaningful under ``[auth] plugin = "spur"``, and
-       it does not hide a token file in a mounted home directory.
+   * - ``--container-auth-socket``
+     - On ``srun``, ``sbatch`` and ``salloc``. Mount the node's credential mint
+       socket into the container so that a nested ``srun`` inside it can
+       authenticate. Off by default: without it nothing in the container can
+       mint a credential, and a nested ``srun`` fails with "credential mint not
+       available in this container". With it, anything in the container can
+       act on the cluster as you. On ``salloc`` it applies to every
+       ``srun --container-image`` step of the allocation. A
+       ``--container-mounts`` entry that would bind the socket in without the
+       flag, either the socket itself or a directory that contains it such as
+       ``/run/spur``, is rejected. It has no effect on a step that enters its
+       job's running container. Only meaningful under ``[auth] plugin =
+       "spur"``, and it does not hide a token file in a mounted home directory.
+
+.. warning::
+
+   Breaking change: a container no longer gets the credential mint socket by
+   default. Workflows that run ``srun`` (or any other Spur command) from inside
+   a container must now pass ``--container-auth-socket`` on the job or step
+   that starts the container.
 
 A GPU training job with a read-only data mount:
 
@@ -186,6 +193,26 @@ the image from its containerized ``sbatch`` job:
 A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
 a fresh one.
+
+Isolating Steps From Each Other
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One allocation can run several unrelated containers side by side on a node, each
+kept apart from the others. Give each step its own image, its own share of the
+allocation (:ref:`see the step resource flags <step-own-share>`):
+
+.. code-block:: bash
+
+   salloc -N1 --gpus-per-node=8 --cpus-per-task=64 --mem=512G
+   # ...inside the allocation shell:
+   srun --container-image=inference.sqsh -c 16 --mem=128G --gpus=2 ./serve.sh &
+   srun --container-image=batch.sqsh -c 8 --mem=32G --gpus=1 ./process.sh &
+   wait
+
+Each such step has its own root filesystem, mount and PID namespaces, ``/tmp``
+and ``/dev/shm``, its own cgroup with the CPU, memory and GPU limits it asked
+for, and only its own GPUs. It still runs as your user and shares the node's
+network namespace with the rest of the allocation.
 
 Exec Into a Running Container Job
 ---------------------------------

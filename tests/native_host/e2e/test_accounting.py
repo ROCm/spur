@@ -60,6 +60,12 @@ class TestSacctNodeFailState:
         assert final_state == "NF", f"expected NODE_FAIL, got {final_state}"
         wait_node_gone(c, node0)
 
+        # The existing RUNNING row remains visible until the asynchronous end
+        # update commits its reason and state together.
+        end = _wait_end(c.cli, job_id)
+        assert end["reason"] == "NodeRemoved", end
+        assert end["detail"] == f"node {node0}: node-fail accounting test", end
+
         row = wait_sacct_row(c, job_id, "JobID,State")
         assert row.split()[1] == "NODE_FAIL", f"sacct displayed {row!r}, not NODE_FAIL"
 
@@ -74,10 +80,6 @@ class TestSacctNodeFailState:
         assert str(job_id) not in completed_out, (
             f"sacct --state=COMPLETED must not match a NODE_FAIL job: {completed_out!r}"
         )
-
-        end = _wait_end(c.cli, job_id)
-        assert end["reason"] == "NodeRemoved", end
-        assert end["detail"] == f"node {node0}: node-fail accounting test", end
 
 
 class TestSacctExitReporting:
@@ -138,6 +140,41 @@ def _submit(cluster, name: str, body: str, *flags: str) -> int:
     job_id = parse_job_id(cluster.sbatch(["-J", name, "-N", "1", *flags, script]))
     assert job_id is not None, f"{name}: submit failed"
     return job_id
+
+
+class TestSacctUnstartedMetadata:
+    def test_pending_cancel_retains_submission_without_execution(self, accounting_cluster):
+        c = accounting_cluster
+        account = "pending_accounting"
+        owner = c.nodes[0].user
+        c.sacctmgr(["add", "account", f"name={account}"])
+        c.sacctmgr(["add", "user", f"name={owner}", f"account={account}"])
+        job_id = _submit(
+            c, "pending-metadata", "exit 0", "--hold", f"--account={account}",
+            "--partition=default", "--ntasks=3", "--cpus-per-task=2",
+            "--mem=128", "--time=0:01:30",
+        )
+        submitted = c.scontrol("show", "job", str(job_id))
+        submit_time = re.search(r"SubmitTime=(\S+)", submitted).group(1)
+        c.scancel(job_id)
+        assert _wait_end(c.cli, job_id)["reason"] == "UserCancel"
+
+        # job_id is the int sbatch returned; psql() has no parameter binding.
+        row = c.psql(
+            "SELECT name,user_name,account,partition_name,state,num_nodes,num_tasks,"  # nosec B608
+            "cpus_per_task,memory_mb,start_time IS NULL,reason,usage_recorded,"
+            "time_limit_secs,to_char(submit_time AT TIME ZONE 'UTC',"
+            "'YYYY-MM-DD\"T\"HH24:MI:SS') "
+            f"FROM jobs WHERE job_id={job_id}"
+        ).strip().split("|")
+        assert row == [
+            "pending-metadata", owner, account, "default", "CANCELLED", "1", "3",
+            "2", "128", "t", "UserCancel", "f", "90", submit_time,
+        ], row
+        assert _sacct_field(c.cli, job_id, "Start", 30) == "Unknown"
+        output = c.sacct(["-j", str(job_id)])
+        assert output.splitlines()[0].split()[-1] == "Reason", output
+        assert output.splitlines()[-1].split()[-1] == "UserCancel", output
 
 
 class TestSacctEndReason:
@@ -1956,3 +1993,115 @@ class TestSacctmgrHelpFields:
         out = c.sacctmgr(["show", "--help"])
         assert "Filters (key=value)" in out, f"show help lists no filters: {out}"
         assert "association" in out, f"show help omits association entity: {out}"
+
+
+# ---------------------------------------------------------------------------
+# TRES Billing Weights — rawusage management, weighted sshare, show config
+# ---------------------------------------------------------------------------
+
+
+class TestModifyUsage:
+    """sacctmgr modify user/account set rawusage=N: set, reset, subtract."""
+
+    def _setup_users(self, c):
+        c.sacctmgr(["add", "account", "name=testacct", "description=e2e"])
+        c.sacctmgr(["add", "user", "name=alice", "account=testacct"])
+        c.sacctmgr(["add", "user", "name=bob", "account=testacct"])
+
+    def test_set_and_reset_rawusage(self, accounting_cluster):
+        c = accounting_cluster
+        self._setup_users(c)
+        out = c.sacctmgr(["modify", "user", "name=alice", "account=testacct", "set", "rawusage=50000"])
+        assert "RawUsage set to 50000" in out
+        out = c.sacctmgr(["modify", "user", "name=alice", "account=testacct", "set", "rawusage=0"])
+        assert "RawUsage set to 0" in out
+
+    def test_subtract_rawusage(self, accounting_cluster):
+        c = accounting_cluster
+        self._setup_users(c)
+        c.sacctmgr(["modify", "user", "name=bob", "account=testacct", "set", "rawusage=100000"])
+        out = c.sacctmgr(["modify", "user", "name=bob", "account=testacct", "set", "rawusage=-50000"])
+        assert "RawUsage set to -50000" in out
+
+    def test_account_level_reset(self, accounting_cluster):
+        c = accounting_cluster
+        self._setup_users(c)
+        c.sacctmgr(["modify", "user", "name=alice", "account=testacct", "set", "rawusage=50000"])
+        c.sacctmgr(["modify", "user", "name=bob", "account=testacct", "set", "rawusage=50000"])
+        out = c.sacctmgr(["modify", "account", "name=testacct", "set", "rawusage=0"])
+        assert "RawUsage set to 0" in out
+
+    def test_nonexistent_association_rejected(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.cli_allow_fail(
+            ["spur", "sacctmgr", "modify", "user", "name=ghost", "account=nope", "set", "rawusage=1000"]
+        )
+        assert "not found" in out.lower() or "no association" in out.lower(), (
+            f"expected NOT_FOUND for nonexistent association: {out}"
+        )
+
+    def test_add_with_rawusage_rejected(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "account", "name=rejectacct", "description=e2e"])
+        out = c.cli_allow_fail(
+            ["spur", "sacctmgr", "add", "user", "name=nobody", "account=rejectacct", "rawusage=50000"]
+        )
+        assert "rawusage cannot be set during add" in out.lower() or "modify" in out.lower(), (
+            f"expected rejection for rawusage on add: {out}"
+        )
+
+    def test_user_without_account_rejected(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.cli_allow_fail(
+            ["spur", "sacctmgr", "modify", "user", "name=alice", "set", "rawusage=0"]
+        )
+        assert "account" in out.lower(), (
+            f"expected account= required error: {out}"
+        )
+
+
+class TestSshareWeightedDisplay:
+    """sshare displays weighted RawUsage when billing weights are configured."""
+
+    def test_sshare_shows_user_after_modify(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "account", "name=shareacct", "description=e2e"])
+        c.sacctmgr(["add", "user", "name=alice", "account=shareacct"])
+        c.sacctmgr(["add", "user", "name=bob", "account=shareacct"])
+        c.sacctmgr(["modify", "user", "name=alice", "account=shareacct", "set", "rawusage=10000"])
+        out = c.sshare([])
+        assert "alice" in out, f"sshare output missing alice: {out}"
+        assert "bob" in out, f"sshare output missing bob: {out}"
+        for line in out.splitlines():
+            if "alice" in line:
+                assert "10.000" not in line, (
+                    f"alice should not have max fairshare after rawusage=10000: {line}"
+                )
+                break
+
+    def test_sshare_long_shows_cpu_gpu_columns(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "account", "name=longacct", "description=e2e"])
+        c.sacctmgr(["add", "user", "name=bob", "account=longacct"])
+        c.sacctmgr(["modify", "user", "name=bob", "account=longacct", "set", "rawusage=5000"])
+        out = c.sshare(["-l"])
+        assert "CPURawUsage" in out, f"sshare -l missing CPURawUsage column: {out}"
+        assert "GPURawUsage" in out, f"sshare -l missing GPURawUsage column: {out}"
+
+
+class TestScontrolBillingConfig:
+    """scontrol show config exposes TRESBillingWeights when configured."""
+
+    def test_show_config_has_cluster_name(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.scontrol("show", "config")
+        assert "ClusterName" in out, (
+            f"scontrol show config missing ClusterName: {out}"
+        )
+
+    def test_show_config_omits_billing_weights_when_unset(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.scontrol("show", "config")
+        assert "TRESBillingWeights" not in out, (
+            f"TRESBillingWeights should be absent with default config: {out}"
+        )

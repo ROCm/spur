@@ -5,7 +5,9 @@ pub mod cdi;
 pub mod gres;
 pub mod inject;
 pub mod registry;
+pub mod topology;
 pub mod types;
+pub mod ualink;
 
 pub use cdi::annotations::DeviceMetadata;
 pub use gres::{expand_hostlist, expand_multiple_files, GresCache, GresEntry};

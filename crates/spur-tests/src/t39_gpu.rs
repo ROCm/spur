@@ -50,6 +50,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -67,6 +68,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -88,6 +90,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -105,6 +108,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -126,6 +130,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -142,6 +147,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::PCIe,
+                topology: None,
                 stable_id: 0,
             }],
             ..Default::default()
@@ -162,6 +168,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -179,6 +186,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -246,7 +254,10 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -313,7 +324,10 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -377,7 +391,10 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -400,6 +417,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),

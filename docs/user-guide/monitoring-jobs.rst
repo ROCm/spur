@@ -57,6 +57,10 @@ Common flags:
      - ``-t``
      - Filter by state codes or names (comma list). ``-t all`` shows every
        state.
+   * - ``--jobs``
+     - ``-j``
+     - Show only these job IDs (comma list). A step suffix (``30.0``) matches
+       the base job. A non-numeric ID is an error.
    * - ``--account``
      - ``-A``
      - Filter by account.
@@ -269,8 +273,11 @@ Common reasons include ``Priority`` (waiting its turn), ``Resources`` (waiting
 for nodes to free up), ``Dependency`` (waiting on another job), ``Reservation``
 (waiting for a reservation window), ``Preempted`` (requeue-preempted and held
 until its eligibility window reopens), ``JobArrayTaskLimit`` (held back by the
-array's own ``%N`` concurrency cap, see :ref:`submit-arrays`), and various QOS
-or association limit reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
+array's own ``%N`` concurrency cap, see :ref:`submit-arrays`),
+``PartitionTresLimit`` (held back by a partition's per-node resource cap; the
+column shows a description with the numbers, see
+:doc:`/admin-guide/partition-resource-limits`), and various QOS or association
+limit reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
 
 View Nodes & Partitions — ``sinfo``
 -----------------------------------
@@ -375,7 +382,8 @@ Accounting History — ``sacct``
 -------------------------------
 
 ``spur history`` (Slurm ``sacct``) reports finished and running jobs from the
-accounting service.
+accounting service. With ``private_data = ["jobs"]`` it lists only your own
+jobs, and ``-u`` for someone else prints nothing (see :ref:`private-data`).
 
 .. code-block:: bash
 
@@ -410,7 +418,8 @@ Flags:
        ``DEADLINE``/``DL``, ``RUNNING``/``R``, ``PENDING``/``PD``.
    * - ``--jobs``
      - ``-j``
-     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base job).
+     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base
+       job). A non-numeric ID is an error.
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
@@ -570,7 +579,12 @@ is leader keeps the reason of its previous run, and a run the older controller
 force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
-NNodes ExitCode``.
+NNodes ExitCode Reason``. Scripts that read columns by position should select
+them with ``--format``.
+
+A job cancelled or expired before it starts keeps its name, user, account,
+partition, and requested resources in accounting. Its ``Start`` is ``Unknown``
+and it is charged no usage.
 
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).
@@ -586,7 +600,8 @@ Running-Job Stats — ``sstat``
 -----------------------------
 
 ``spur stat`` (Slurm ``sstat``) reports live resource usage for running jobs.
-``--jobs``/``-j`` is required (comma list).
+``--jobs``/``-j`` is required (comma list). A step suffix (``30.0``) matches
+the base job. A non-numeric ID is an error.
 
 .. code-block:: bash
 
@@ -782,12 +797,62 @@ When a job has been preempted, ``scontrol show job`` includes three additional
 fields:
 
 * ``PreemptedBy=<job_id>`` — the ID of the higher-priority job that triggered
-  the preemption. Only shown when the job has been preempted.
+  the preemption. Only shown once the job has been preempted; during a
+  preemption grace period nothing has been preempted yet, so it is not printed.
 * ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
 * ``PreemptQOS=<name>`` — the QOS of the preempting job, whose ``preempt``
   allow-list authorized the preemption. Set for any job preempted by this
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
+
+While a job is inside its preemption grace period, ``scontrol show job`` instead
+prints a line holding only ``PreemptTime=<timestamp>``, the moment the job was
+signaled to wind down, and ``EndTime`` shows when the grace ends. ``PreemptTime``
+is omitted for a job that is not in a grace.
+
+.. _preemption-grace-user:
+
+How a job learns it is being preempted
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If the QOS your job runs under, or the partition it runs in, has a ``GraceTime``
+(ask your administrator; see :ref:`preemption grace time <qos-preempt-grace>`;
+the QOS value wins if it is set, otherwise the highest value among the
+partitions the job runs in applies), a job selected for preemption in ``cancel`` or
+``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
+as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
+deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).
+The grace is shortened if the job's own time limit arrives first; the deadline
+is fixed when the warning is sent, so lowering the time limit later does not
+shorten it. The warning is sent once: if it is lost (for example the node's agent
+is unreachable at that moment) the job is still preempted at the deadline, only
+without having been warned. Without a ``GraceTime`` there is no warning period and
+the job is preempted immediately.
+
+* **Launch your work with** ``srun``. The warning goes to the job's ``srun``
+  steps, not to the batch script, so a training process started directly from
+  the batch script gets no warning and sees only the final kill. Run it as
+  ``srun python train.py`` and handle SIGTERM there to checkpoint.
+* **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
+  process in the job, waits up to the kill wait (5 seconds by default), then
+  sends SIGKILL. A handler that is already shutting down should ignore a repeat.
+  The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+* **Exiting early is fine.** A job that exits during its grace is recorded as
+  ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
+  mode), and the preempting job starts as soon as the nodes are free.
+* **One node finishing early does not affect the others.** The job stays
+  ``R`` until every node has finished or the deadline. A node whose work has finished is freed for the
+  preempting job, and the other nodes keep running undisturbed, so a rank that
+  exits first does not cut short the ranks that are still writing their
+  checkpoint. If your batch script launches ranks with ``srun``, ranks exiting
+  do not end the job: it ends when the batch script exits (the remaining nodes
+  are then stopped), or at the deadline.
+* **You can still cancel.** ``scancel`` during the grace ends the job as your
+  cancel. ``scontrol suspend`` is refused.
+* **The grace is not withdrawn.** The job is preempted at the deadline even if
+  the job that triggered it is cancelled meanwhile.
+
+Jobs on nodes managed by the Kubernetes operator get no grace and no warning.
 
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -938,7 +1003,12 @@ By default every caller sees every scope and may pass ``users=<name>`` to
 inspect one user. When an administrator sets ``private_data = ["usage"]`` under
 ``[auth]`` (see :ref:`private-data`), an unprivileged caller sees only the QOS
 and accounts they take part in, and only their own ``User=`` lines; a ``users=``
-selector is replaced with their own name. ``Grp*`` totals on the scope line
+selector is replaced with their own name. ``sshare`` omits other users'
+rows and leaves account totals and shares of the total blank. ``sreport``
+utilization fills in only your own usage and fairshare and leaves the other
+cells blank. ``sreport preemptions`` shows only your own rows and the accounts
+you coordinate when either ``"jobs"`` or ``"usage"`` is private. ``sprio`` and
+``sreport job`` sizes follow ``"jobs"`` instead. ``Grp*`` totals on the scope line
 still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
@@ -984,8 +1054,8 @@ Endpoints
      - Planned
      - Route exists but currently returns an empty body.
    * - ``/metrics/scheduler``
-     - Planned
-     - Route exists but currently returns an empty body.
+     - Live
+     - Scheduler cycle statistics and preemption outcomes.
    * - ``/metrics/k8s``
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
@@ -1019,6 +1089,150 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - Memory (bytes) allocated to running/completing jobs.
    * - ``spur_jobs_gpus_alloc``
      - GPUs allocated to running/completing jobs.
+
+Preemption outcomes — ``/metrics/scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a pending job (the requester) preempts running jobs (the victims), Spur
+records whether the launch of the requester used the capacity each victim released.
+Counts describe **victim runs**, not nodes: preempting the same job on two runs
+counts twice. Suspension and idle-fill reclaim without an owner-directed handoff
+are excluded. A grace warning alone does not count; the first released slice
+opens one observation for that victim run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 48 12 40
+
+   * - Metric
+     - Type
+     - Meaning
+   * - ``spur_scheduler_preemptions_used_total``
+     - Counter
+     - Victim runs with matching released capacity in a confirmed requesting launch.
+   * - ``spur_scheduler_preemptions_unused_total{reason,initiator}``
+     - Counter
+     - Victim runs closed without confirmed use by the requesting launch.
+   * - ``spur_scheduler_preemptions_open``
+     - Gauge
+     - Victim runs that released capacity but whose requesting launch outcome is unresolved.
+   * - ``spur_scheduler_preemption_exports_pending``
+     - Gauge
+     - Finished jobs past retention kept in the controller until their counts reach accounting.
+   * - ``spur_scheduler_preemption_export_oldest_seconds``
+     - Gauge
+     - Age of the oldest of those jobs, from its end time.
+
+For example, if a requester preempts A on n1 and B on n2, then launches only
+using B's capacity, used increases by one and unused by one. Partial reports
+and replay do not count a victim run again. A successful launch followed by a
+later application failure remains used. A failed release is a launch failure,
+even if the controller already recorded the job as Running. Native interactive
+allocations count as launched once allocation registration and activation succeed.
+
+``reason`` has four values:
+
+* ``started_elsewhere``: the launch succeeded without matching released capacity.
+* ``launch_failed``: a reserved requesting launch was rejected, held, backed off,
+  lost its nodes, or was not released.
+* ``cancelled``: cancellation ended the request before use.
+* ``ended_other``: another end or a superseding attempt closed the request,
+  including an outcome that could not be confirmed after controller failure.
+
+``initiator`` is ``user``, ``admin``, ``system``, or ``unknown``. Cancellation
+uses the authenticated cancellation provenance. Scheduler placement and launch
+failures use ``system``. Missing provenance stays ``unknown``. The label records
+the observed operation, not an inferred root cause: a launch rejection caused
+by user-supplied input still has a system launch-failure verdict. The
+``ended_other`` / ``unknown`` bucket is uncertainty, not proof of resource loss.
+No username, job ID, or node name is a Prometheus label.
+
+The counts are also available from:
+
+* ``sdiag``: cluster totals, unused counts by cause, and, when finished jobs past
+  retention are waiting for export, how many and the oldest one's age.
+* ``scontrol show job``: ``PreemptionsUsed``, ``PreemptionsUnused``, and
+  ``PreemptionsOpen`` on the requesting job, plus ``UnusedPreemptionCauses`` as
+  comma-separated ``reason/initiator:count`` pairs. Printed only when a count is
+  nonzero.
+* REST job responses: the same counts and causes in ``preemption_usage``.
+* ``sreport preemptions``: lifetime totals per requesting user and account
+  (see below).
+
+A device-backed victim counts as used only when the requester received the same
+node-local devices; using CPU on the same GPU node is not enough. CPU and memory
+have no identity, so they are matched against a capacity budget. Both are
+approximations: they do not prove a preemption was necessary or measure lost
+GPU-hours. One victim using any matching capacity counts once.
+
+If the requesting launch fails before it reserves nodes, the observation stays
+open so a retry can still use the capacity. If the requester gives up a
+reservation before it starts (a backoff, a hold, or a node going down), the
+observation closes as ``launch_failed`` and a later retry does not count as use.
+A launch result that was not recorded before a controller restart closes as
+``ended_other`` / ``unknown`` once the new leader's dispatch grace expires (twice
+the dispatch timeout; never, if that timeout is disabled). This records
+uncertainty, not a launch failure.
+
+Cluster totals and per-job counts survive controller restart and are not
+cleared by ``sdiag --reset``.
+
+Lifetime user/account reporting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``sreport preemptions`` needs PostgreSQL accounting:
+
+.. code-block:: console
+
+   sreport preemptions
+   sreport preemptions --user alice --parsable
+   sreport preemptions --account research --limit 25
+   sreport preemptions --account research --by-cause
+   sreport preemptions --account research --limit 25 --page-token '<token>'
+
+Rows show ``User``, ``Account``, ``Used``, ``Unused``, and ``Open``. Each row is a
+requesting user/account pair; a user's rows across accounts add to that user's
+total. A complete account report requires every page for that account. The CLI
+prints the next-page token on standard error when another page exists. The
+default page contains at most 100 rows; ``--limit`` accepts 1 through 1000.
+``--start`` and ``--end`` are rejected because these are lifetime totals rather
+than event-time reports. Pages are read in user/account order, not from a frozen
+snapshot: counts can change between pages, and a pair added before the current
+position during paging is not shown.
+
+Add ``--by-cause`` to show only nonzero unused counts, with one row per requesting
+user/account, reason, and initiator. These use the same values as the scheduler
+metrics and count victim runs, not nodes. For example:
+
+.. code-block:: text
+
+   $ sreport preemptions --by-cause
+   User                 Account              Reason               Initiator          Unused
+   alice                research             cancelled            user                    2
+   alice                research             launch_failed        system                  1
+
+With ``--parsable --by-cause``, the columns are
+``User|Account|Reason|Initiator|Unused``. For example:
+
+.. code-block:: text
+
+   $ sreport preemptions --parsable --noheader --by-cause --user alice
+   alice|research|cancelled|user|2
+   alice|research|launch_failed|system|1
+
+Cause counts add up to the pair's ``Unused`` total in the default report. Pairs
+with no unused counts have no rows in the cause report. Pagination still counts
+user/account pairs and keeps their causes together, so a page can have no cause
+rows and still print a next-page token; continue until there is no token.
+
+The report applies both ``jobs`` and ``usage`` privacy settings, including
+coordinator visibility (see :ref:`private-data`). A scoped report is not a full
+account or cluster total. Cluster totals in ``sdiag`` and the metrics are
+aggregates with no per-user detail and are not scoped.
+
+Accounting reports lag the live counts, and ``Open`` there is the last exported
+value. :ref:`preemption-outcome-export` describes how counts reach PostgreSQL
+and what happens during an accounting outage.
 
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1200,6 +1414,38 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.
 
+**Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
+to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It
+stays ``COMPLETING`` for up to the time-limit kill wait
+(``timeout_kill_wait_secs``, default 30 seconds), then Spur sends SIGKILL. The
+wait ends early once the job's own process (its batch script) has exited, and
+the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
+exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
+on timeout. While it waits, the job still counts as running for
+``--dependency=singleton`` and for an array's ``%N`` throttle, so a successor
+or the next array task does not start until the job has ended. The SIGTERM is final, so a batch script can use the wait to
+checkpoint and exit. An idle interactive allocation reaped for inactivity
+(:ref:`inactive-limit`) normally ends ``TIMEOUT`` within a moment of the
+SIGTERM, without spending the wait in ``COMPLETING``: its work runs in ``srun``
+steps and its own process exits on SIGTERM (see the note below). ``scancel``,
+``scontrol requeue`` and the final kill of a preempted job use the general kill
+wait (``kill_wait_secs``, default 5 seconds), as does stopping the other nodes
+of a job whose batch script has exited. An ``srun`` step with no supervisor process gets the full wait that applies to it
+when a stop reaches it (see the note below): 5 seconds on ``scancel``, 30 at a
+time limit, where earlier releases gave it 2 seconds.
+
+.. _kill-wait-steps-caveat:
+
+.. note::
+
+   A job does not yet wait for its ``srun`` steps: it ends and frees its nodes
+   once its batch script (or, for an allocation, its placeholder process) exits.
+   On nodes where Spur runs as root, the steps are then stopped with the job
+   without getting the kill wait. On nodes without cgroup enforcement, they can
+   outlive the job and keep running beside a newly placed job. This affects every
+   stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
+   and the final kill of a preempted job. The preemption grace is not affected.
+
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
 .. code-block:: bash
@@ -1209,6 +1455,20 @@ refused. A job that is already finished or unknown does not fail a plain cancel
    scontrol requeue 1024    # return a job to the queue
    scontrol suspend 1024    # SIGSTOP, keep the allocation
    scontrol resume 1024     # SIGCONT
+
+Suspending a job that is in its preemption grace period is refused, because the
+preemption that ends the grace only applies to a running job.
+
+.. _held-job-still-running:
+
+A running job that is held, by ``scontrol requeuehold`` (``JobHeldUser``) or
+on reaching ``max_batch_requeue`` (``JobHoldMaxRequeue``), gives up its nodes
+at once. If the stop sent at that moment does not reach a node, the process
+keeps running there while ``sinfo`` already shows the node's resources as free,
+and a new job sent to the same GPUs is refused. An administrator can find the
+job still holding them in that node's spurd log (``gpu_owners=[...]``). On the
+node's next heartbeat the controller tells it to stop the held job's process,
+so the resources become usable within about 40 seconds.
 
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
