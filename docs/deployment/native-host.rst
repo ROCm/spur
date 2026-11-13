@@ -457,8 +457,8 @@ its heartbeats resume and it reports a clean job list. If it still runs work the
 no longer assigns to it, such as a job that ended or the old run of a job that was
 requeued, for example because it was unreachable at the time, the controller cancels that
 work again and keeps the node ``DOWN`` until it reports clean, so no new job lands beside
-it. A heartbeat that cannot enumerate the node's jobs (a momentarily contended agent lock,
-or a just-restarted agent still adopting its jobs) does not count as clean. After a
+it. A heartbeat that cannot enumerate the node's jobs (a momentarily contended agent lock)
+does not count as clean, and neither does a registration before its first heartbeat. After a
 leadership change, a ``DOWN`` node stays down until its first heartbeat to the new leader
 reports a clean job list.
 
@@ -467,10 +467,12 @@ The hold gives the node time to finish killing and cleaning up: it lasts the lon
 30-second heartbeat interval for the clean report to arrive. That budget is the larger of
 ``scheduler.kill_wait_secs`` and ``scheduler.timeout_kill_wait_secs``, plus
 ``cgroup.cleanup_timeout_secs``, plus the ``hooks.epilog_timeout_secs`` bound, so the hold
-lasts about four minutes at defaults. If that work still has not cleared by then, usually a
-process that will not die, the node is drained rather than returned (it shows as
-``DRAINED``), with reason ``Kill task failed (JobId=...)``, or with ``Agent job list
-unavailable`` when it cannot report its jobs at all. The node takes no new work until an
+lasts about four minutes at defaults. The cap is checked on each health pass, so a hold
+can run up to one ``controller.health_tick_secs`` past it. If that work still has not
+cleared by then, usually a process that will not die, the node is drained rather than
+returned (it shows as ``DRAINED``), with reason ``Kill task failed (JobId=...)`` naming up
+to five jobs and a count of the rest, or with ``Agent job list unavailable`` when it cannot
+report its jobs at all. The node takes no new work until an
 operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
 reclaim cancels keep running in the meantime.
 

@@ -1180,11 +1180,7 @@ message HeartbeatRequest {
   optional K0sNodeStatus k0s_status = 7;
   uint64 core_layout_fingerprint = 8; // fingerprint of the layout spurd holds; 0 = none
   string spec_enforcement_error = 9;  // why the held layout is not enforced; empty = enforced
-  // The agent could not enumerate its running jobs for this heartbeat (a
-  // contended local lock), so `running_jobs` is not a complete set. The
-  // controller then treats the node as not-yet-clean rather than assuming it
-  // holds nothing. Older agents never set it, so their lists read as complete.
-  bool running_jobs_incomplete = 10;
+  bool running_jobs_incomplete = 10;  // running_jobs is partial (contended agent lock); older agents never set it
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
