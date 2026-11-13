@@ -96,9 +96,6 @@ fn parse_clearable_minutes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::PartitionError;
-    use spur_core::partition_limits::PartitionLimitsUpdate;
-    use spur_core::wal::WalOperation;
 
     fn strings(items: &[&str]) -> Option<Vec<String>> {
         Some(items.iter().map(|s| s.to_string()).collect())
@@ -257,8 +254,7 @@ mod tests {
 
     #[test]
     fn each_field_lands_in_the_entry_field_of_the_same_name() {
-        let selector: std::collections::HashMap<String, String> =
-            [("rack".to_string(), "r1".to_string())].into();
+        let selector: HashMap<String, String> = [("rack".to_string(), "r1".to_string())].into();
         let limits = PartitionLimitsUpdate {
             def_mem_per_node: Some(Some(4096)),
             ..Default::default()

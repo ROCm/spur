@@ -29,6 +29,7 @@ src/
   rpc_middleware.rs        Tower layer: RPC path/timing recording
   metrics_proto.rs         Protobuf-to-snapshot converters for OpenMetrics export
   metrics_server.rs        Axum HTTP server exporting /metrics/* endpoints (OpenMetrics 1.0)
+  partition_patch.rs       PartitionPatch: named update_partition input and its WAL-entry conversion
 
   accounting/
     mod.rs                 Bring-up orchestration: connect-with-retry, activate caches/loops
