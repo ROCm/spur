@@ -15,7 +15,7 @@ use spur_core::node::NodeSource;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster::{ClusterManager, MarkDownPolicy, StaleNodes};
 use crate::raft::JobFinalized;
@@ -30,7 +30,7 @@ const FAILED_PROBES_TO_MARK_DOWN: u32 = 2;
 /// a hair under one tick still counts.
 const STRIKE_SPACING_SLACK: Duration = Duration::from_millis(500);
 /// How often the leader repeats its warning about a silent node whose agent
-/// still answers.
+/// still answers, and its error about a tripped silent-node limit.
 const SILENT_NODE_WARN_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
@@ -261,6 +261,8 @@ pub(crate) struct NodeLiveness {
     strikes: StrikeTracker,
     max_stale_fraction: f64,
     term: Option<u64>,
+    /// When a tripped silent-node limit was last logged; `None` while it is not tripped.
+    breaker_logged: Option<Instant>,
 }
 
 impl NodeLiveness {
@@ -269,7 +271,26 @@ impl NodeLiveness {
             strikes: StrikeTracker::new(min_strike_gap),
             max_stale_fraction,
             term: None,
+            breaker_logged: None,
         }
+    }
+
+    /// Whether a tripped pass is due its error: on the trip, then once per
+    /// [`SILENT_NODE_WARN_INTERVAL`] while it stays tripped.
+    fn breaker_log_due(&mut self, now: Instant) -> bool {
+        if self
+            .breaker_logged
+            .is_some_and(|last| now.saturating_duration_since(last) < SILENT_NODE_WARN_INTERVAL)
+        {
+            return false;
+        }
+        self.breaker_logged = Some(now);
+        true
+    }
+
+    /// Whether a pass that did not trip ends a trip, which is then forgotten.
+    fn breaker_recovered(&mut self) -> bool {
+        self.breaker_logged.take().is_some()
     }
 
     /// Called every health tick with the term this controller leads, or `None`.
@@ -280,6 +301,7 @@ impl NodeLiveness {
             return;
         }
         self.strikes.clear();
+        self.breaker_logged = None;
         cluster.clear_not_responding();
         cluster.set_liveness_breaker_tripped(false);
         self.term = leading_term;
@@ -295,56 +317,71 @@ impl NodeLiveness {
         prober: &P,
         still_leading: F,
     ) -> Vec<JobFinalized> {
-        let mark_down = match mark_down {
+        let (mark_down, tripped) = match mark_down {
             MarkDownPolicy::Allowed => {
                 let stale = cluster.stale_nodes(timeout_secs);
-                MarkDownPolicy::Only(self.confirm(cluster, stale, prober).await)
+                let (confirmed, tripped) = self.confirm(cluster, stale, prober).await;
+                (MarkDownPolicy::Only(confirmed), Some(tripped))
             }
-            other => other,
+            other => (other, None),
         };
         if !still_leading() {
             self.strikes.clear();
+            cluster.set_liveness_breaker_tripped(false);
             return Vec::new();
+        }
+        if let Some(tripped) = tripped {
+            cluster.set_liveness_breaker_tripped(tripped);
         }
         cluster.check_node_health(timeout_secs, mark_down)
     }
 
     /// Judges the silent-node limit after probing, by the nodes that did not
-    /// answer. A mass silence can overrun the tick, which only delays recoveries.
+    /// answer; returns the nodes confirmed gone and whether the limit tripped. A
+    /// mass silence can overrun the tick, which only delays recoveries.
     async fn confirm<P: Prober>(
         &mut self,
         cluster: &ClusterManager,
         stale: StaleNodes,
         prober: &P,
-    ) -> HashSet<String> {
+    ) -> (HashSet<String>, bool) {
         let stale_names: HashSet<String> = stale.names.iter().cloned().collect();
         self.strikes.retain(&stale_names);
         if stale_names.is_empty() {
-            cluster.set_liveness_breaker_tripped(false);
-            return HashSet::new();
+            self.log_breaker_recovery();
+            return (HashSet::new(), false);
         }
         let (operator_managed, targets) = split_by_source(cluster, &stale.names);
         let results = probe_all(targets, prober).await;
 
         let suspects = Suspects::count(&results, &operator_managed, &stale);
-        let tripped = breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction);
-        cluster.set_liveness_breaker_tripped(tripped);
-        if tripped {
-            error!(
-                failed_probes = suspects.failed_probes,
-                operator_managed = suspects.operator_managed,
-                recently_silent = suspects.recently_silent,
-                watched = stale.watched,
-                "too many nodes went silent in one health pass; suspecting the control plane and marking none of them Down"
-            );
+        if breaker_tripped(suspects.total(), stale.watched, self.max_stale_fraction) {
+            if self.breaker_log_due(Instant::now()) {
+                error!(
+                    failed_probes = suspects.failed_probes,
+                    operator_managed = suspects.operator_managed,
+                    recently_silent = suspects.recently_silent,
+                    watched = stale.watched,
+                    "too many nodes went silent in one health pass; suspecting the control plane and marking none of them Down"
+                );
+            }
             self.record_answers(results);
             self.strikes.clear_failures();
-            return HashSet::new();
+            return (HashSet::new(), true);
         }
+        self.log_breaker_recovery();
 
         let mut confirmed: HashSet<String> = operator_managed.into_iter().collect();
         confirmed.extend(self.judge_probes(results));
-        confirmed
+        (confirmed, false)
+    }
+
+    fn log_breaker_recovery(&mut self) {
+        if self.breaker_recovered() {
+            info!(
+                "the silent-node limit is no longer exceeded; marking unreachable nodes Down again"
+            );
+        }
     }
 
     /// Records each probe's outcome and returns the nodes now confirmed gone.
@@ -1262,6 +1299,38 @@ mod tests {
         let metrics = cm.node_metrics();
         assert!(!metrics.liveness_breaker_tripped);
         assert_eq!(metrics.not_responding, 3, "answering nodes stay flagged");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_dropped_for_lost_leadership_does_not_set_the_breaker_gauge() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2", "n3", "n4"]).await;
+        silence(&cm, &["n1", "n2", "n3"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || false)
+            .await;
+
+        assert!(!cm.node_metrics().liveness_breaker_tripped);
+    }
+
+    #[test]
+    fn a_tripped_breaker_is_logged_on_the_trip_and_then_once_per_interval() {
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        let t0 = Instant::now();
+
+        assert!(liveness.breaker_log_due(t0));
+        assert!(!liveness.breaker_log_due(t0 + Duration::from_secs(30)));
+        assert!(liveness.breaker_log_due(t0 + SILENT_NODE_WARN_INTERVAL));
+        assert!(liveness.breaker_recovered());
+        assert!(!liveness.breaker_recovered(), "recovery is logged once");
+        assert!(
+            liveness.breaker_log_due(t0 + SILENT_NODE_WARN_INTERVAL + Duration::from_secs(30)),
+            "a new trip is logged at once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
