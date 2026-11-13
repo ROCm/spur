@@ -1173,6 +1173,11 @@ pub struct Job {
     #[serde(skip)]
     pub preferred_nodes: HashSet<String>,
 
+    /// Keep partition and quota scopes separate: credits from alternatives cannot
+    /// jointly prove that one placement has complete occupied-node reuse.
+    #[serde(skip)]
+    pub node_reuse: HashMap<String, Vec<HashSet<String>>>,
+
     /// When the scheduler last evaluated this job for placement. Not persisted:
     /// replicating a per-cycle timestamp would be a Raft write storm.
     #[serde(skip)]
@@ -1244,6 +1249,7 @@ impl Job {
             effective_partition: None,
             original_request: None,
             preferred_nodes: HashSet::new(),
+            node_reuse: HashMap::new(),
             last_sched_eval: None,
         }
     }
@@ -2531,6 +2537,18 @@ mod tests {
         assert!(job.spec.submitted_at.is_none());
         assert!(job.preempt_grace().is_none());
         assert_eq!(job.preemption_usage, Default::default());
+    }
+
+    #[test]
+    fn node_reuse_credits_are_transient_and_old_snapshots_still_load() {
+        let mut job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
+        assert!(job.node_reuse.is_empty());
+        job.node_reuse
+            .insert("default".into(), vec![HashSet::from(["n1".into()])]);
+        let value = serde_json::to_value(&job).unwrap();
+        assert!(value.get("node_reuse").is_none());
+        let restored: Job = serde_json::from_value(value).unwrap();
+        assert!(restored.node_reuse.is_empty());
     }
 
     #[test]
