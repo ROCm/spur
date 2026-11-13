@@ -401,8 +401,8 @@ pub enum WalOperation {
         nodes: Option<String>,
         selector: Option<HashMap<String, String>>,
         state: Option<String>,
-        // These four limits are always serialized, so old entries hold `null` for
-        // "unchanged"; removing one goes through `clear`.
+        // These three limits and `preempt_exempt_time` below are always serialized,
+        // so old entries hold `null` for "unchanged"; removing one goes through `clear`.
         #[serde(default)]
         max_time_minutes: Option<u32>,
         #[serde(default)]

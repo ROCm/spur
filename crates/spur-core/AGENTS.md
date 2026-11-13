@@ -389,20 +389,23 @@ register/update/state-change/remove, partition/reservation CRUD, k0s lifecycle.
    transient per-scheduling-pass data that must not be persisted. They are
    rebuilt each tick.
 
-7. **A field a patch entry can clear must be `Option<Option<T>>` with
+7. **A new field a patch entry can clear must be `Option<Option<T>>` with
    `#[serde(default, deserialize_with = "clear_or_set", skip_serializing_if =
    "Option::is_none")]`**, exactly like `PartitionUpdate::grace_time`: absent
-   is unchanged, `null` clears, a value sets. Never a bare `Option<Option<T>>`:
-   JSON writes `None` and `Some(None)` both as `null`, so the clear is lost on
-   followers and on replay, while the leader (which applies its in-memory copy)
-   looks correct. Never convert an existing always-serialized field to
-   `clear_or_set`: old entries hold `null` for "unchanged" and would replay as a
-   clear. Legacy fields (`max_time_minutes`, `default_time_minutes`,
-   `max_nodes`, `preempt_exempt_time`) stay `Option<T>` and record clears in
-   `PartitionUpdate::clear` (`PartitionClears`); extend that, do not add a
-   second scheme. Every clearable field needs a serde round-trip test of
-   set, clear and unchanged plus frozen wire forms (see the `grace_time` and
-   `clear` tests in `wal.rs`), and an apply test that replays the JSON.
+   is unchanged, `null` clears, a value sets.
+   - Never a bare `Option<Option<T>>`: JSON writes `None` and `Some(None)` both
+     as `null`, so the clear is lost on followers and on replay, while the
+     leader (which applies its in-memory copy) looks correct.
+   - Never convert an existing always-serialized field to `clear_or_set`: old
+     entries hold `null` for "unchanged" and would replay as a clear. Legacy
+     fields (`max_time_minutes`, `default_time_minutes`, `max_nodes`,
+     `preempt_exempt_time`) stay `Option<T>` and record clears in
+     `PartitionUpdate::clear` (`PartitionClears`).
+   - Only to make another existing, always-serialized `PartitionUpdate` field
+     clearable, add a flag to `PartitionClears`; never use it for a new field.
+   - Every clearable field needs a serde round-trip test of set, clear and
+     unchanged plus frozen wire forms (see the `grace_time` and `clear` tests
+     in `wal.rs`), and an apply test that replays the JSON.
 
 ---
 
