@@ -256,6 +256,28 @@ impl StrikeTracker {
     }
 }
 
+/// When a pass began. Suspects are read at `wall`; the apply step adds the time
+/// the probes took, so a node that crossed the timeout meanwhile is flagged
+/// not-responding and not recovered.
+#[derive(Debug, Clone, Copy)]
+struct PassStart {
+    wall: DateTime<Utc>,
+    at: Instant,
+}
+
+impl PassStart {
+    fn now() -> Self {
+        Self {
+            wall: Utc::now(),
+            at: Instant::now(),
+        }
+    }
+
+    fn wall_now(&self) -> DateTime<Utc> {
+        self.wall + chrono::Duration::from_std(self.at.elapsed()).unwrap_or_default()
+    }
+}
+
 /// The health loop's liveness state. Leader-local: see [`Self::observe_term`].
 #[derive(Debug)]
 pub(crate) struct NodeLiveness {
@@ -327,7 +349,7 @@ impl NodeLiveness {
             mark_down,
             prober,
             still_leading,
-            Utc::now(),
+            PassStart::now(),
         )
         .await
     }
@@ -339,11 +361,11 @@ impl NodeLiveness {
         mark_down: MarkDownPolicy,
         prober: &P,
         still_leading: F,
-        now: DateTime<Utc>,
+        start: PassStart,
     ) -> Vec<JobFinalized> {
         let (mark_down, trip) = match mark_down {
             MarkDownPolicy::Allowed => {
-                let stale = cluster.stale_nodes(timeout_secs, self.health_tick, now);
+                let stale = cluster.stale_nodes(timeout_secs, self.health_tick, start.wall);
                 let (confirmed, trip) = self.confirm(cluster, stale, prober).await;
                 (MarkDownPolicy::Only(confirmed), Some(trip))
             }
@@ -359,12 +381,12 @@ impl NodeLiveness {
             self.report_breaker(cluster, trip.as_ref());
         }
         cluster.set_silent_answering_nodes(self.strikes.answering.len());
-        cluster.check_node_health_at(timeout_secs, mark_down, now)
+        cluster.check_node_health_at(timeout_secs, mark_down, start.wall_now())
     }
 
     /// Judges the silent-node limit after probing, by the nodes that did not
-    /// answer; returns the nodes confirmed gone and the trip, if any. A mass
-    /// silence can overrun the tick, which only delays recoveries.
+    /// answer; returns the nodes confirmed gone and the trip, if any. Probing a
+    /// mass silence can overrun the tick, which delays the next pass.
     async fn confirm<P: Prober>(
         &mut self,
         cluster: &ClusterManager,
@@ -1090,7 +1112,10 @@ mod tests {
                     MarkDownPolicy::Allowed,
                     &prober,
                     || true,
-                    c + chrono::Duration::seconds(secs_after_c),
+                    PassStart {
+                        wall: c + chrono::Duration::seconds(secs_after_c),
+                        at: Instant::now(),
+                    },
                 )
                 .await;
             assert_all_up(&cm, &nodes);
@@ -1107,6 +1132,44 @@ mod tests {
             ["e1", "e1", "e2", "e2"],
             "e1 and e2 failed at C+24 and C+39"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_crosses_the_timeout_while_probes_run_is_judged_when_the_pass_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["d1", "late", "down", "h1"]).await;
+        silence(&cm, &["d1"]);
+        silent_for(&cm, &["late", "down"], 80);
+        set_node_state(&cm, "down", NodeState::Down);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(1.0, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        let probe_phase = Duration::from_secs(30);
+
+        liveness
+            .sweep_at(
+                &cm,
+                90,
+                MarkDownPolicy::Allowed,
+                &prober,
+                || true,
+                PassStart {
+                    wall: Utc::now(),
+                    at: Instant::now().checked_sub(probe_phase).unwrap(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            prober.probed(),
+            ["d1"],
+            "late and down were fresh at the start"
+        );
+        assert!(
+            cm.get_node("late").unwrap().not_responding,
+            "late was past the timeout when the pass applied"
+        );
+        assert_eq!(state(&cm, "down"), NodeState::Down, "down was recovered");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
