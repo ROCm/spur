@@ -870,6 +870,27 @@ fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
         .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
 }
 
+/// Sends one signal to each supervisor and returns how many accepted it. A
+/// failed request is logged and skipped so one dead supervisor cannot keep the
+/// others from being signalled.
+async fn signal_supervisors(
+    job_id: u32,
+    descriptors: &[&crate::stepd::StepdDescriptor],
+    signal: i32,
+) -> usize {
+    let mut delivered = 0;
+    for descriptor in descriptors {
+        match crate::stepd::signal_allocation(descriptor, uuid::Uuid::new_v4().to_string(), signal)
+            .await
+        {
+            Ok(()) => delivered += 1,
+            Err(error) => warn!(job_id, step_id = descriptor.step_id, %error,
+                "runtime signal request failed"),
+        }
+    }
+    delivered
+}
+
 /// Same pid/start-ticks check the crash watchdog uses. A pid of 0 means no
 /// pid was ever recorded, which reads as "not yet known" rather than dead.
 fn stepd_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
@@ -11093,6 +11114,9 @@ impl AgentService {
 
     /// Deliver a signal and nothing else: no launch fencing, release wait,
     /// teardown or escalation, so a warning leaves the run alive to react to it.
+    ///
+    /// A batch-only request that reaches nothing is an error, since the caller
+    /// asked for exactly that one target; `Steps` and `Full` stay best-effort.
     async fn deliver_signal(
         &self,
         job_id: u32,
@@ -11100,14 +11124,10 @@ impl AgentService {
         signal: i32,
         target: SignalTarget,
     ) -> Result<(), Status> {
-        let include_batch = match target {
-            SignalTarget::Steps => false,
-            SignalTarget::Full => true,
-            SignalTarget::Batch => {
-                return Err(Status::unimplemented(
-                    "signalling only the batch script is not supported",
-                ))
-            }
+        let (include_steps, include_batch) = match target {
+            SignalTarget::Steps => (true, false),
+            SignalTarget::Full => (true, true),
+            SignalTarget::Batch => (false, true),
             SignalTarget::Unspecified => {
                 return Err(Status::invalid_argument("a signal target is required"))
             }
@@ -11123,41 +11143,68 @@ impl AgentService {
         };
 
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        for descriptor in runtimes
+        let targeted: Vec<_> = runtimes
             .iter()
-            .filter(|descriptor| include_batch || descriptor.step_id != spur_core::step::STEP_BATCH)
-        {
-            if let Err(error) = crate::stepd::signal_allocation(
-                descriptor,
-                uuid::Uuid::new_v4().to_string(),
-                signal,
-            )
-            .await
-            {
-                warn!(job_id, step_id = descriptor.step_id, %error,
-                    "runtime signal request failed");
-            }
+            .filter(|descriptor| {
+                if descriptor.step_id == spur_core::step::STEP_BATCH {
+                    include_batch
+                } else {
+                    include_steps
+                }
+            })
+            .collect();
+        let delivered = signal_supervisors(job_id, &targeted, signal).await;
+        if include_steps {
+            self.signal_active_steps_for_job(job_id, run_attempt, signal)
+                .await;
         }
-        self.signal_active_steps_for_job(job_id, run_attempt, signal)
-            .await;
-
-        // A batch supervisor owns the job's processes, so the agent has no
-        // handle of its own to signal.
-        if !include_batch || owns_job_processes(&runtimes) {
+        if !include_batch {
             return Ok(());
         }
+
+        let batch_only = !include_steps;
+        // A batch supervisor owns the job's processes, so the agent has no
+        // handle of its own to signal.
+        if owns_job_processes(&runtimes) {
+            if batch_only && delivered == 0 {
+                return Err(Status::unavailable(format!(
+                    "job {job_id}'s batch step did not accept the signal"
+                )));
+            }
+            return Ok(());
+        }
+        let signalled = self
+            .signal_unsupervised_job(job_id, run_attempt, signal, sig)
+            .await;
+        if batch_only && !signalled {
+            return Err(Status::failed_precondition(format!(
+                "job {job_id} has no batch step"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Signals the job's own process when the agent, not a supervisor, holds it.
+    /// Returns whether there was such a process.
+    async fn signal_unsupervised_job(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        sig: nix::sys::signal::Signal,
+    ) -> bool {
         let jobs = self.running.lock().await;
         let Some(tracked) = jobs.get(&job_id).filter(|tracked| {
             !tracked.job.is_allocation_only()
                 && (run_attempt == 0 || tracked.run_attempt == run_attempt)
         }) else {
-            return Ok(());
+            return false;
         };
         info!(job_id, signal, "signalling the unsupervised job");
         if let Err(error) = tracked.job.kill_signal(sig) {
             warn!(job_id, signal, %error, "failed to signal the unsupervised job");
         }
-        Ok(())
+        true
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -23580,18 +23627,176 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_job_rejects_the_batch_target_until_it_is_supported() {
+    async fn signal_job_batch_target_reaches_only_the_batch_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
         let svc = test_agent();
-        let err = svc
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 917, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 917, 1, 0).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(917, tracked).await;
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(917, 4, Some(pid)).await;
+
+        svc.signal_job(signal_job_request(
+            917,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&batch, batch_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+        let step_still_running = process_is_running(pid as i32);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            step_still_running,
+            "the batch target must leave an unsupervised step alone"
+        );
+        assert!(
+            !svc.step_cancel_requested(917, 4).await,
+            "a batch signal must not mark a step cancelled"
+        );
+        assert!(svc.running.lock().await.contains_key(&917));
+        assert!(svc
+            .stepds
+            .lock()
+            .await
+            .contains_key(&(917, spur_core::step::STEP_BATCH)));
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_signals_a_legacy_unsupervised_job() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid") as i32;
+        let mut tracked = TrackedJob {
+            job: executor::RunningJob::Managed { child },
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(921, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            921,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+        let status = wait_until_exited(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
+        assert!(
+            svc.running.lock().await.contains_key(&921),
+            "a signal does not tear the job down"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_for_a_run_without_a_batch_step_is_failed_precondition() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 922, 1, 0).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(922, tracked).await;
+
+        let status = svc
             .signal_job(signal_job_request(
-                917,
+                922,
                 1,
                 nix::sys::signal::Signal::SIGTERM,
                 SignalTarget::Batch,
             ))
             .await
-            .expect_err("the batch target is not implemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect_err("an allocation has no batch step to signal");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "job 922 has no batch step");
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_for_a_job_this_node_does_not_hold_is_not_found() {
+        let svc = test_agent();
+
+        let status = svc
+            .signal_job(signal_job_request(
+                923,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("nothing was signalled");
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_drops_a_stale_run_attempt() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 924, 2, spur_core::step::STEP_BATCH).await;
+
+        svc.signal_job(signal_job_request(
+            924,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("a signal for a superseded run is dropped, not an error");
+
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_reports_a_batch_supervisor_that_cannot_be_reached() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 925, 1, spur_core::step::STEP_BATCH).await;
+        finish_recording_stepd(&batch, batch_server).await;
+
+        let status = svc
+            .signal_job(signal_job_request(
+                925,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("nothing received the signal");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]
