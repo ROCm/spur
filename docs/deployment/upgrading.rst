@@ -869,14 +869,13 @@ that job does not stop. A node drained at the cap is admin-locked, with reason
 ``Kill task failed (JobId=...)`` or ``Agent job list unavailable``, and takes no work
 until an operator runs ``scontrol update nodename=<node> state=resume``, so scripts that
 watch ``sinfo -R`` or resume nodes automatically should expect these reasons. Only
-upgraded agents report ``running_jobs_incomplete`` when
-they cannot list their jobs in full, though. An earlier agent sends an empty list
-when its job map is busy, which reads as clean, so its hold can end while an ended
-run is still going. An upgraded agent also stops the old
-run's processes, including its ``srun`` steps, when the job is placed back on
-the same node, which an earlier agent could miss for a run without a cgroup
-(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
-when not running as root).
+upgraded agents report ``running_jobs_incomplete`` when they cannot list their jobs
+in full, though. An earlier agent sends an empty list when its job map is busy,
+which reads as clean, so its hold can end while an ended run is still going. An
+upgraded agent also stops the old run's processes, including its ``srun`` steps,
+when the job is placed back on the same node, which an earlier agent could miss for
+a run without a cgroup (``[cgroup] enabled = false``, or ``spurd`` cannot create
+cgroups, for example when not running as root).
 
 Before accepting a replacement attempt, the agent fences every older attempt
 it can discover in its tracked sessions, persisted session descriptors, and

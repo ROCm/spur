@@ -467,14 +467,15 @@ The hold gives the node time to finish killing and cleaning up: it lasts the lon
 one 30-second heartbeat interval for the clean report to arrive. That budget is the larger of
 ``scheduler.kill_wait_secs`` and ``scheduler.timeout_kill_wait_secs``, plus
 ``cgroup.cleanup_timeout_secs``, plus the ``hooks.epilog_timeout_secs`` bound, so the hold
-lasts about four minutes at defaults. The cap is checked on each health pass, so a hold
-can run up to one ``controller.health_tick_secs`` past it. If that work still has not
-cleared by then, usually a process that will not die, the node is drained rather than
-returned (it shows as ``DRAINED``), with reason ``Kill task failed (JobId=...)`` naming up
-to five jobs and a count of the rest, or with ``Agent job list unavailable`` when it cannot
-report its jobs at all. The node takes no new work until an
-operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
-reclaim cancels keep running in the meantime.
+lasts about four minutes at defaults. The cap is checked when each health pass applies,
+after it probes any silent nodes, so a hold can run past it by up to one
+``controller.health_tick_secs`` plus the time a pass spends probing. If that work still
+has not cleared by then, usually a process that will not die, the node is drained rather
+than returned (it shows as ``DRAINED``), with reason ``Kill task failed (JobId=...)``
+naming up to five jobs and a count of the rest, or with ``Agent job list unavailable``
+when it cannot report its jobs at all. The node takes no new work until an operator
+clears it with ``scontrol update nodename=<node> state=resume`` once it is sound; reclaim
+cancels keep running in the meantime.
 
 While held, the node shows as ``down`` (or ``error``, for a node held in that state) with no
 ``*``, since its heartbeats arrive, and keeps the reason it went down with, usually ``Not
