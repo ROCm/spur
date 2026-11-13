@@ -510,7 +510,7 @@ class TestSrunContainerStepNsenter:
         script = cluster.write_file(
             "nsenter-other-image.sh",
             "#!/bin/bash\n"
-            f"{cluster.bin_dir}/srun --container-image=/nonexistent/other-image.sqsh true\n"
+            f"{cluster.bin_dir}/srun --container-image=/nonexistent/other-image.sqsh true 2>&1\n"
             'echo "SRUN_EXIT=$?"\n',
         )
         sb = cluster.sbatch([
