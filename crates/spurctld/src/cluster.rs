@@ -4452,9 +4452,10 @@ impl ClusterManager {
         self.recovery_holds.read().contains_key(node)
     }
 
-    /// Clear recovery holds on leadership (re)gain: their start times were set
-    /// by another leadership's health passes.
-    pub(crate) fn reset_recovery_holds(&self) {
+    /// Clear node reports and recovery holds on a leadership change: both were
+    /// built from another leadership's heartbeats and health passes.
+    pub(crate) fn reset_node_reports_and_holds(&self) {
+        self.stale_reporting_nodes.write().clear();
         self.recovery_holds.write().clear();
     }
 

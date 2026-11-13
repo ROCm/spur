@@ -320,7 +320,8 @@ impl NodeLiveness {
 
     /// Called every health tick with the term this controller leads, or `None`.
     /// Leader-local state belongs to the term that built it, so a new term or a
-    /// lost leadership discards strikes, not-responding flags, and the gauges.
+    /// lost leadership discards strikes, not-responding flags, the gauges, and
+    /// node reports and recovery holds.
     pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
         if self.term == leading_term {
             return;
@@ -330,7 +331,7 @@ impl NodeLiveness {
         cluster.clear_not_responding();
         cluster.set_liveness_breaker_tripped(false);
         cluster.set_silent_answering_nodes(0);
-        cluster.reset_recovery_holds();
+        cluster.reset_node_reports_and_holds();
         if leading_term.is_some() {
             cluster.hold_down_nodes_until_reported();
         }
@@ -1774,6 +1775,29 @@ mod tests {
         assert!(
             !cm.is_recovery_held("n1"),
             "a hold started under another term must not count toward this one's cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_leadership_forgets_the_node_reports_it_recorded() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2"]).await;
+        set_node_state(&cm, "n2", NodeState::Down);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        cm.record_node_report("n1", Some(crate::cluster::NodeReport::StaleJobs(vec![1])));
+        cm.record_node_report("n2", Some(crate::cluster::NodeReport::StaleJobs(vec![2])));
+
+        liveness.observe_term(&cm, None);
+        assert_eq!(cm.node_report("n1"), None);
+        assert_eq!(cm.node_report("n2"), None);
+
+        liveness.observe_term(&cm, Some(2));
+        assert_eq!(cm.node_report("n1"), None);
+        assert_eq!(
+            cm.node_report("n2"),
+            Some(crate::cluster::NodeReport::Unknown),
+            "a Down node is held until it reports to the new leader"
         );
     }
 
