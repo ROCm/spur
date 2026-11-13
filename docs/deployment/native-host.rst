@@ -415,15 +415,18 @@ agent must answer with the node's own name to count as alive:
 - **Many nodes go silent at once.** Each pass probes every silent node first, then counts
   the suspects: nodes that failed their probe, operator-managed nodes past the timeout
   (they cannot be probed), and nodes not yet past the timeout that have missed a
-  heartbeat (silent for more than 45 seconds). Those last count only in a pass where a
-  probe failed or an operator-managed node is past the timeout, so an outage in which
-  every agent answers does not trip the limit. A node whose agent answered is never a
-  suspect. When the suspects exceed ``controller.max_stale_node_fraction`` (default half)
-  of the watched nodes, rounded down but never below one, the leader assumes the fault is
-  on its side, marks none of them ``DOWN``, logs ``suspecting the control plane`` at
-  error level (on the trip, then about every 10 minutes while it lasts), and sets the
-  ``spur_nodes_liveness_breaker_tripped`` gauge to ``1`` until a pass that does not trip,
-  which logs ``the silent-node limit is no longer exceeded``. Watched nodes are those not ``DOWN``, drained (``drain``), or
+  heartbeat. A node has missed a heartbeat once it has been silent for longer than
+  ``heartbeat_timeout_secs`` minus ``health_tick_secs``, kept between 35 and 45 seconds
+  (45 at the defaults), so it goes past the timeout within about one pass. Those nodes count
+  only in a pass where a probe failed or an operator-managed node is past the timeout, so
+  an outage in which every agent answers does not trip the limit. A node whose agent
+  answered is never a suspect. When the suspects exceed
+  ``controller.max_stale_node_fraction`` (default half) of the watched nodes, rounded down
+  but never below one, the leader assumes the fault is on its side, marks none of them
+  ``DOWN``, logs ``suspecting the control plane`` at error level (on the trip, then about
+  every 10 minutes while it lasts), and sets the ``spur_nodes_liveness_breaker_tripped``
+  gauge to ``1`` until a pass that does not trip, which logs ``the silent-node limit is no
+  longer exceeded``. Watched nodes are those not ``DOWN``, drained (``drain``), or
   suspended; draining (``drng``) and operator-managed nodes are watched. Draining part of the
   cluster to ``drain`` lowers the number of suspects it takes. Silent nodes are still
   probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by

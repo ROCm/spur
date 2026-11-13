@@ -271,12 +271,14 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Largest fraction of watched nodes that may be suspect in one health
        pass: nodes that fail their liveness probe, operator-managed nodes past
        the heartbeat timeout, and, when either of those is present, nodes that
-       have missed a heartbeat. Nodes whose agent answers do not count. Watched nodes exclude ``DOWN``,
-       drained (``drain``), and suspended ones; draining (``drng``) and
-       operator-managed nodes are watched. Above the limit (rounded down, never
-       below one node, so a single silent node never trips it), the leader
-       assumes the fault is on its side, marks none of them Down, operator-managed
-       ones included, and logs an error. Must be greater than ``0`` and at most ``1``; ``1``
+       have missed a heartbeat (silent for ``heartbeat_timeout_secs`` minus
+       ``health_tick_secs``, kept between 35 and 45 seconds). Nodes whose agent
+       answers do not count. Watched nodes exclude ``DOWN``, drained
+       (``drain``), and suspended ones; draining (``drng``) and operator-managed
+       nodes are watched. Above the limit (rounded down, never below one node,
+       so a single silent node never trips it), the leader assumes the fault is
+       on its side, marks none of them Down, operator-managed ones included,
+       and logs an error. Must be greater than ``0`` and at most ``1``; ``1``
        turns the check off. See :ref:`node-liveness`.
    * - ``max_batch_requeue``
      - integer

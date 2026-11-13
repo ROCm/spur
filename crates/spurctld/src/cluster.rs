@@ -5286,17 +5286,27 @@ impl ClusterManager {
         )
     }
 
-    /// Staleness is re-judged here, when the pass applies, so a node confirmed
-    /// gone that has heartbeated since is kept. Returns finalized jobs for cancel RPCs.
-    pub fn check_node_health(
+    #[cfg(test)]
+    pub(crate) fn check_node_health(
         &self,
         timeout_secs: u64,
         mark_down: MarkDownPolicy,
     ) -> Vec<JobFinalized> {
+        self.check_node_health_at(timeout_secs, mark_down, Utc::now())
+    }
+
+    /// Staleness is re-judged here, when the pass applies, so a node confirmed
+    /// gone that has heartbeated since is kept. Returns finalized jobs for cancel RPCs.
+    pub(crate) fn check_node_health_at(
+        &self,
+        timeout_secs: u64,
+        mark_down: MarkDownPolicy,
+        now: DateTime<Utc>,
+    ) -> Vec<JobFinalized> {
         let mut actions = {
             let nodes = self.nodes.read();
             let refs: Vec<&Node> = nodes.values().collect();
-            evaluate_node_health(&refs, Utc::now(), timeout_secs)
+            evaluate_node_health(&refs, now, timeout_secs)
         };
         match &mark_down {
             MarkDownPolicy::Allowed => {}
@@ -5319,7 +5329,7 @@ impl ClusterManager {
         // Outside the grace window, flag silent nodes NOT_RESPONDING so they take
         // no new work while the leader cannot hear them, DOWN or not.
         if !matches!(mark_down, MarkDownPolicy::Suppressed) {
-            self.refresh_not_responding(timeout_secs, Utc::now());
+            self.refresh_not_responding(timeout_secs, now);
         }
         self.apply_health_actions(actions)
     }
@@ -5349,10 +5359,15 @@ impl ClusterManager {
 
     /// The stale nodes a health pass would mark Down, read before anything is
     /// applied so they can be confirmed first.
-    pub(crate) fn stale_nodes(&self, timeout_secs: u64) -> StaleNodes {
+    pub(crate) fn stale_nodes(
+        &self,
+        timeout_secs: u64,
+        health_tick: std::time::Duration,
+        now: DateTime<Utc>,
+    ) -> StaleNodes {
         let nodes = self.nodes.read();
         let refs: Vec<&Node> = nodes.values().collect();
-        stale_nodes_at(&refs, Utc::now(), timeout_secs)
+        stale_nodes_at(&refs, now, timeout_secs, health_tick)
     }
 
     fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
@@ -12056,9 +12071,22 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     recovered.state
 }
 
-/// A heartbeat can run late by its RPC bound and a retry, so only silence past
-/// one interval plus this counts as a missed beat.
-const MISSED_HEARTBEAT_SLACK_SECS: u64 = 15;
+/// Bounds on the silence past one heartbeat interval that counts as a missed
+/// beat. The floor keeps a healthy node's late beat from counting; past the
+/// ceiling a beat is plainly missed, however long the timeout.
+const MISSED_HEARTBEAT_MIN_SLACK_SECS: u64 = 5;
+const MISSED_HEARTBEAT_MAX_SLACK_SECS: u64 = 15;
+
+/// Seconds of silence after which a watched node that is not yet stale counts
+/// as having missed a heartbeat. Such a node goes stale within a tick, so a
+/// staggered mass failure trips the limit before an early node's second strike.
+pub(crate) fn missed_heartbeat_secs(timeout_secs: u64, health_tick: std::time::Duration) -> u64 {
+    let interval = spur_core::config::HEARTBEAT_INTERVAL_SECS;
+    timeout_secs.saturating_sub(health_tick.as_secs()).clamp(
+        interval + MISSED_HEARTBEAT_MIN_SLACK_SECS,
+        interval + MISSED_HEARTBEAT_MAX_SLACK_SECS,
+    )
+}
 
 /// Whether the silent-node limit watches this node: a heartbeat timeout could
 /// still move it to Down (a heartbeat is on record and it is not already Down
@@ -12072,14 +12100,17 @@ fn is_watched(node: &Node) -> bool {
             .is_some()
 }
 
-fn missed_a_heartbeat(node: &Node, now: DateTime<Utc>) -> bool {
-    let limit = chrono::Duration::seconds(
-        (spur_core::config::HEARTBEAT_INTERVAL_SECS + MISSED_HEARTBEAT_SLACK_SECS) as i64,
-    );
+fn missed_a_heartbeat(node: &Node, now: DateTime<Utc>, after_secs: u64) -> bool {
+    let limit = chrono::Duration::seconds(after_secs as i64);
     node.last_heartbeat.is_some_and(|hb| now - hb > limit)
 }
 
-pub(crate) fn stale_nodes_at(nodes: &[&Node], now: DateTime<Utc>, timeout_secs: u64) -> StaleNodes {
+pub(crate) fn stale_nodes_at(
+    nodes: &[&Node],
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+    health_tick: std::time::Duration,
+) -> StaleNodes {
     let names: Vec<String> = evaluate_node_health(nodes, now, timeout_secs)
         .into_iter()
         .filter_map(|action| match action {
@@ -12095,9 +12126,10 @@ pub(crate) fn stale_nodes_at(nodes: &[&Node], now: DateTime<Utc>, timeout_secs: 
         .map(|node| node.name.clone())
         .collect();
     let watched: Vec<&Node> = nodes.iter().copied().filter(|n| is_watched(n)).collect();
+    let missed_after = missed_heartbeat_secs(timeout_secs, health_tick);
     let recently_silent = watched
         .iter()
-        .filter(|node| !is_stale(node) && missed_a_heartbeat(node, now))
+        .filter(|node| !is_stale(node) && missed_a_heartbeat(node, now, missed_after))
         .count();
     StaleNodes {
         names,
@@ -35962,7 +35994,7 @@ state = "UP"
             down.last_heartbeat = None;
         }
 
-        let stale = cm.stale_nodes(90);
+        let stale = cm.stale_nodes(90, std::time::Duration::from_secs(30), Utc::now());
         assert_eq!(stale.names, vec!["stale".to_string()]);
         assert_eq!(
             stale.watched, 2,
@@ -35995,7 +36027,7 @@ state = "UP"
         set_node_state(&cm, "suspended-silent", NodeState::Suspended);
         set_node_state(&cm, "suspended-stale", NodeState::Suspended);
 
-        let stale = cm.stale_nodes(90);
+        let stale = cm.stale_nodes(90, std::time::Duration::from_secs(30), Utc::now());
         let mut stale_names = stale.names.clone();
         stale_names.sort();
         assert_eq!(stale_names, vec!["stale", "suspended-stale"]);
@@ -36005,6 +36037,18 @@ state = "UP"
         );
         assert_eq!(stale.watched, 4);
         assert_eq!(stale.recently_silent, 1);
+    }
+
+    #[test]
+    fn the_missed_heartbeat_threshold_follows_the_timeout_and_tick() {
+        let secs =
+            |timeout, tick| missed_heartbeat_secs(timeout, std::time::Duration::from_secs(tick));
+        assert_eq!(secs(90, 30), 45, "defaults");
+        assert_eq!(secs(45, 15), 35);
+        assert_eq!(secs(55, 15), 40);
+        assert_eq!(secs(60, 30), 35);
+        assert_eq!(secs(35, 60), 35, "a tick longer than the timeout");
+        assert_eq!(secs(300, 30), 45);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
