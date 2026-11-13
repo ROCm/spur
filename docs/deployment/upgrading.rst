@@ -823,12 +823,15 @@ which keeps new work off it, and asks the node's agent directly. See :ref:`node-
   stay running. The leader warns about the node every 10 minutes and the new
   ``spur_nodes_silent_answering`` gauge counts it. ``spur_nodes_not_responding`` counts
   every node the leader is not hearing, ``DOWN`` ones included, so alert on the new gauge.
-- **A mass silence marks no node** ``DOWN``. When the nodes that fail their probe or, in a
-  pass where a probe fails, miss a heartbeat exceed ``controller.max_stale_node_fraction`` (default ``0.5``) of
-  the watched nodes, rounded down but never below one node (so a single silent node never
-  trips it), the leader assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
+- **A mass silence marks no node** ``DOWN``. The suspects in a pass are the nodes that fail
+  their probe, operator-managed nodes past the heartbeat timeout, and, in a pass with
+  either of those, nodes that have missed a heartbeat. When they exceed
+  ``controller.max_stale_node_fraction`` (default ``0.5``) of the watched nodes, rounded
+  down but never below one node (so a single silent node never trips it), the leader
+  assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
   needs ``scontrol update nodename=<nodes> state=down``. Alert on
-  ``spur_nodes_liveness_breaker_tripped``, or set the fraction to ``1`` to turn the check off.
+  ``spur_nodes_liveness_breaker_tripped``, or set the fraction to ``1`` to turn the check
+  off.
 - **Node state strings can carry the flag.** ``sinfo`` ``%t`` and ``%T`` add a trailing
   ``*`` (``idle*``, ``down*``), ``scontrol show node`` adds ``+NOT_RESPONDING`` to
   ``State=``, and ``spur health`` stars the node. A ``DOWN`` node the leader has not heard

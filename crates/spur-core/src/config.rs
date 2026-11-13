@@ -366,9 +366,11 @@ pub struct ControllerConfig {
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
 
-    /// Largest fraction of watched nodes that may fail a liveness probe or miss
-    /// a heartbeat in one health pass before the leader suspects its own
-    /// connectivity and marks none Down (default: 0.5; 1.0 disables the check).
+    /// Largest fraction of watched nodes that may be suspect in one health pass
+    /// before the leader suspects its own connectivity and marks none Down
+    /// (default: 0.5; 1.0 disables the check). Suspects fail a liveness probe or
+    /// are operator-managed past the timeout; nodes that only missed a heartbeat
+    /// count only in a pass with one of those.
     #[serde(default = "default_max_stale_node_fraction")]
     pub max_stale_node_fraction: f64,
 
