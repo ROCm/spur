@@ -190,7 +190,7 @@ impl<'a> NodePlacement<'a> {
     ) -> bool {
         !node.is_k0s_reserved()
             && self.eligible(node, reservations, now)
-            && node.state.is_up()
+            && node.is_up_for_work()
             && node.layout_block_reason().is_none()
     }
 

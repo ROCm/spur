@@ -309,9 +309,19 @@ Flags:
      - Filter by partition.
    * - ``--states``
      - ``-t``
-     - Filter by node state (comma-separated). Accepts the base states and the
-       display-only labels ``resv`` (or ``reserved``), ``maint``, and ``plnd``
-       (or ``planned``). ``all`` disables the filter.
+     - Filter by node state (comma-separated; a node in any listed state
+       matches). Accepts the base states, the display-only labels ``resv`` (or
+       ``reserved``), ``maint``, and ``plnd`` (or ``planned``), and
+       ``no_respond`` (or ``noresp``) for nodes the controller is not hearing
+       from. ``all`` disables the filter.
+   * - ``--dead``
+     - ``-d``
+     - Only nodes the controller is not hearing from. Combines with ``-t`` and
+       ``-r``; a node must match all of them.
+   * - ``--responding``
+     - ``-r``
+     - Only nodes the controller is hearing from. Combines with ``-t`` and
+       ``-d``; a node must match all of them.
    * - ``--nodes``
      - ``-n``
      - Filter by node.
@@ -377,6 +387,28 @@ and ``planned`` are accepted as aliases for ``resv`` and ``plnd``. ``-t resv``
 also matches ``maint`` nodes (a maintenance reservation is still a reservation),
 while ``-t maint`` matches only maintenance nodes. ``-t idle`` returns all idle
 nodes, including those shown as ``resv``, ``maint``, or ``plnd``.
+
+A trailing ``*`` on the state (``idle*``, ``mix*``, ``down*``) marks a node the
+controller is not currently hearing from: its heartbeats have gone stale, so it
+is given no new work until they resume, while its running jobs are untouched.
+Filter on it with ``-t no_respond``, ``--dead`` (``-d``, only non-responding
+nodes), or ``--responding`` (``-r``, only responding nodes). Like the other
+``-t`` states, ``no_respond`` widens the list: ``sinfo -t idle,no_respond``
+shows idle nodes plus every non-responding node, whatever its state. ``-d`` and
+``-r`` narrow it instead: ``sinfo -t idle -d`` shows only idle nodes that are
+not responding, and ``-d -r`` together match nothing.
+``scontrol show node`` shows the same condition as a ``+NOT_RESPONDING`` suffix
+on ``State=``, the REST node object carries a ``not_responding`` boolean, and
+``spur health`` stars the node and counts it as unhealthy.
+
+The flag is the current leader's view of its heartbeats. It is blank for the
+grace window after a leadership change (see :ref:`node-liveness`), so a silent
+node can still take new work in that window. Once it ends, a ``DOWN`` node the
+leader has not heard from shows as ``down*``. A follower never sets it: the REST
+API answers node reads from the controller it reaches, so ``not_responding`` is
+``false`` for every node when that is a follower, and the CLI shows no ``*``
+when a follower serves a read itself because it cannot forward it to the leader.
+Query the leader for this flag.
 
 Accounting History — ``sacct``
 -------------------------------
@@ -1234,6 +1266,8 @@ Accounting reports lag the live counts, and ``Open`` there is the last exported
 value. :ref:`preemption-outcome-export` describes how counts reach PostgreSQL
 and what happens during an accounting outage.
 
+.. _node-metrics:
+
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1252,6 +1286,19 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
      - Total number of nodes.
    * - ``spur_nodes_<state>``
      - Number of nodes in each state.
+   * - ``spur_nodes_not_responding``
+     - Number of nodes the leader is not hearing heartbeats from (the ``*`` in
+       ``sinfo``), in any state, so it overlaps the per-state counts. See
+       :ref:`node-liveness`.
+   * - ``spur_nodes_liveness_breaker_tripped``
+     - ``1`` while the leader's last health pass marked no node ``DOWN``
+       because too many nodes went silent at once, otherwise ``0``. See
+       :ref:`node-liveness`.
+   * - ``spur_nodes_silent_answering``
+     - Number of nodes the leader keeps up because their agent answers its
+       liveness probe though their heartbeats do not reach it. Such a node can
+       hold finished jobs as running, so alert if this stays above ``0``. Set
+       only by the leader. See :ref:`node-liveness`.
    * - ``spur_nodes_cpus`` / ``spur_nodes_cpus_alloc``
      - Total and allocated CPUs across all nodes.
    * - ``spur_nodes_memory_bytes`` / ``spur_nodes_memory_alloc_bytes``

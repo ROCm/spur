@@ -352,7 +352,8 @@ Enable and start it:
    and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
    what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
    well below ``heartbeat_timeout_secs``, since the draining controller answers no
-   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   heartbeats and would flag every node not-responding (see :ref:`node-liveness`), and
+   avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
    grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
    unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
    flush.
@@ -378,6 +379,78 @@ to the current leader.
 
 Each controller writes its Raft snapshot atomically, so ``state_dir`` needs free space for
 about two copies of ``raft/snapshot.json`` (the current file plus the new temporary one).
+
+.. _node-liveness:
+
+Node Liveness
+~~~~~~~~~~~~~
+
+Each agent sends a heartbeat every 30 seconds, and only the Raft leader records them. A
+silent node is not always a dead one: in an HA cluster heartbeats often reach the leader
+through a follower, and a broken forward or an overloaded leader looks the same as a dead
+host. So when a node's heartbeats stop reaching the leader for
+``controller.heartbeat_timeout_secs`` (default 90), it is flagged not-responding (shown as
+a ``*`` suffix in ``sinfo`` and ``+NOT_RESPONDING`` in ``scontrol show node``), which stops
+new work landing on it while its running jobs continue, and the leader asks the node's
+agent directly before marking it down. The probe is a gRPC ``Ping``, which is exempt from
+authentication, so it carries no controller credential and works in every auth mode. The
+agent must answer with the node's own name to count as alive:
+
+- **The agent answers.** The node and its jobs are kept and it is not marked ``DOWN``,
+  though it stays not-responding and takes no new work until its heartbeats resume. This
+  lasts as long as the agent keeps answering, with no automatic drain, and an agent whose
+  heartbeats cannot reach the leader often cannot report job completions either, so its
+  finished jobs can stay running. The leader logs a warning naming the node and how long
+  it has been silent (``silent_for``), saying its heartbeats are not reaching the leader
+  but its agent still answers. The warning repeats about every 10 minutes while the
+  condition lasts, and the leader's ``spur_nodes_silent_answering`` gauge counts such
+  nodes; ``spur_nodes_not_responding`` counts every node the leader is not hearing,
+  ``DOWN`` ones included (see :ref:`node-metrics`). Look for ``heartbeat failed`` in the
+  agent's log to find the broken path, and drain the node if it cannot be fixed soon.
+- **The agent does not answer on two consecutive health passes**
+  (``controller.health_tick_secs``, default 30; the second failed probe counts only if it
+  ran at least one pass after the first, and only if no heartbeat arrived between the two).
+  The node is marked ``DOWN`` with reason ``Not responding``, and its jobs end
+  ``NODE_FAIL``, or are requeued if they were submitted with ``--requeue``.
+- **Many nodes go silent at once.** Each pass probes every silent node first, then counts
+  the suspects: nodes that failed their probe, operator-managed nodes past the timeout
+  (they cannot be probed), and nodes not yet past the timeout that have missed a
+  heartbeat. A node has missed a heartbeat once it has been silent for longer than
+  ``heartbeat_timeout_secs`` minus ``health_tick_secs``, kept between 35 and 45 seconds
+  (45 at the defaults). When that comes to under 45, such a node goes past the timeout
+  within about one pass; at the 45-second cap it can take longer. With
+  ``heartbeat_timeout_secs`` of 35 or less, no node counts this way, because it is past the
+  timeout first. Those nodes count
+  only in a pass where a probe failed or an operator-managed node is past the timeout, so
+  an outage in which every agent answers does not trip the limit. A node whose agent
+  answered is never a suspect. One dead node beside healthy nodes that have only missed a
+  heartbeat can still trip the limit for a pass; a trip discards failed probes, so that node
+  goes ``DOWN`` about a pass later. When the suspects exceed
+  ``controller.max_stale_node_fraction`` (default half) of the watched nodes, rounded down
+  but never below one, the leader assumes the fault is on its side, marks none of them
+  ``DOWN``, logs ``suspecting the control plane`` at error level (on the trip, then about
+  every 10 minutes while it lasts), and sets the ``spur_nodes_liveness_breaker_tripped``
+  gauge to ``1`` until a pass that does not trip, which logs ``the silent-node limit is no
+  longer exceeded``. A leadership change while the limit is tripped resets this log, so
+  that trip gets no such line; the gauge stays accurate. Watched nodes are those not
+  ``DOWN``, drained (``drain``), or suspended; draining (``drng``) and operator-managed
+  nodes are watched. Draining part of the cluster to ``drain`` lowers the number of suspects
+  it takes. Silent nodes are still
+  probed every pass, so once the fault clears a node that is really gone goes ``DOWN`` by
+  the two-probe rule above. To mark nodes down sooner, use
+  ``scontrol update nodename=<node> state=down``.
+
+Nodes managed by the Kubernetes operator are not probed; they are marked ``DOWN`` on the
+heartbeat timeout alone. They count toward the limit above, and while it is tripped they
+are held up like every other node.
+
+The not-responding flag is the current leader's view: each leader builds it from the
+heartbeats it receives, and a controller that loses leadership drops its flags. After a
+leadership change the flag stays blank for a grace window of
+``controller.heartbeat_timeout_secs`` (at least one health pass), while the new leader
+waits to hear from the agents, so a silent node can still take new work in that window;
+nodes are not marked ``DOWN`` in it either. Once it ends, a ``DOWN`` node the leader has
+not heard from shows as ``down*``.
 
 Joining Worker Nodes
 --------------------

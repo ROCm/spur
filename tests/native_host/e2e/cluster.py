@@ -175,6 +175,55 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
             controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
+@contextlib.contextmanager
+def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop one node's outbound traffic to every controller's client port, so its
+    agent cannot heartbeat but controllers can still reach it. Always undone on exit."""
+    node = cluster.nodes[node_index]
+    rule_args = f"-p tcp --dport {port} -j DROP"
+    node.exec(f"sudo iptables -I OUTPUT {rule_args}")
+    try:
+        yield
+    finally:
+        node.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop inbound traffic to one controller's client port from every node, so no
+    heartbeat reaches it while Raft and its calls to agents keep working.
+    Always undone on exit."""
+    controller = cluster.nodes[node_index]
+    sources = ",".join(node.host for node in cluster.nodes)
+    rule_args = f"-p tcp --dport {port} -s {sources} -j DROP"
+    controller.exec(f"sudo iptables -I INPUT {rule_args}")
+    try:
+        yield
+    finally:
+        controller.exec_allow_fail(f"sudo iptables -D INPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def isolate_controller(cluster: "SpurCluster", node_index: int):
+    """Cut one controller off from every node both ways, keeping Raft up, so it can
+    neither hear a heartbeat nor probe an agent. Always undone on exit."""
+    controller = cluster.nodes[node_index]
+    hosts = ",".join(node.host for node in cluster.nodes)
+    rules = [
+        f"INPUT -p tcp --dport {CONTROLLER_PORT} -s {hosts} -j DROP",
+        f"OUTPUT -p tcp --dport {AGENT_PORT} -d {hosts} -j DROP",
+    ]
+    added = []
+    try:
+        for rule in rules:
+            controller.exec(f"sudo iptables -I {rule}")
+            added.append(rule)
+        yield
+    finally:
+        for rule in added:
+            controller.exec_allow_fail(f"sudo iptables -D {rule}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 
@@ -1794,6 +1843,12 @@ tar -C "$R" -czf '{local_tar}' .
     def signal_controller(self, index: int, sig: str):
         """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""
         self._pkill(self.nodes[index], f"{self.bin_dir}/spurctld", sig=sig)
+
+    def signal_agent(self, index: int, sig: str):
+        """Send *sig* (e.g. ``KILL``) to the spurd on nodes[index]."""
+        self._pkill(
+            self.nodes[index], f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root, sig=sig
+        )
 
     def _kill_mint(self):
         for node in self.nodes:

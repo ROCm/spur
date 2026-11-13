@@ -363,7 +363,7 @@ override the exit-code-based decision.
   heartbeat_loop (periodic HeartbeatRequest)
       |
       |--- heartbeat arrives: update last_seen, resources, running jobs
-      |--- heartbeat timeout: state -> DOWN
+      |--- heartbeat timeout: flagged not-responding; DOWN after two failed probes
       |--- heartbeat recovered: state -> IDLE (unless admin-locked)
       |
       v
@@ -383,7 +383,10 @@ status. Resource inventory and node address are not carried in heartbeats
 (they are set at registration).
 
 **Health checker:** runs on the leader at `health_tick_secs` interval.
-Nodes missing heartbeats past `heartbeat_timeout_secs` are marked DOWN.
+Nodes missing heartbeats past `heartbeat_timeout_secs` are flagged
+not-responding (no new work) and probed directly; one whose agent fails two
+probes a health pass apart is marked DOWN, unless so many nodes are silent at
+once that the leader suspects itself (`max_stale_node_fraction`).
 Running jobs on a DOWN node are evicted (cancel sent to agents, steps
 force-completed). A leadership grace period prevents false positives
 immediately after election.

@@ -1282,10 +1282,11 @@ fn cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
 }
 
 /// `State=` value for `scontrol show node`, composited the way real Slurm
-/// does (`IDLE+RESERVED`, `IDLE+MAINTENANCE+RESERVED`, `IDLE+PLANNED`).
+/// does (`IDLE+RESERVED`, `IDLE+MAINTENANCE+RESERVED`, `IDLE+PLANNED`), with a
+/// trailing `+NOT_RESPONDING` when the controller is not hearing the node.
 fn node_state_display(node: &spur_proto::proto::NodeInfo) -> String {
     let base = node_state_name(node.state);
-    match spur_core::node::node_overlay(node) {
+    let mut state = match spur_core::node::node_overlay(node) {
         Some(spur_core::node::NodeOverlay::Reserved { maint: true }) => {
             format!("{base}+MAINTENANCE+RESERVED")
         }
@@ -1294,7 +1295,11 @@ fn node_state_display(node: &spur_proto::proto::NodeInfo) -> String {
         }
         Some(spur_core::node::NodeOverlay::Planned) => format!("{base}+PLANNED"),
         None => base.to_string(),
+    };
+    if node.not_responding {
+        state.push_str("+NOT_RESPONDING");
     }
+    state
 }
 
 /// `PlannedJobId=/PlannedStartTime=` line for `scontrol show node` (`None` if
@@ -3496,6 +3501,27 @@ mod tests {
         let mut node = idle_node();
         node.planned_job_id = 42;
         assert_eq!(node_state_display(&node), "IDLE+PLANNED");
+    }
+
+    #[test]
+    fn node_state_display_not_responding() {
+        let mut node = idle_node();
+        node.not_responding = true;
+        assert_eq!(node_state_display(&node), "IDLE+NOT_RESPONDING");
+
+        // The flag composes with an overlay, matching Slurm's flag suffix.
+        node.active_reservation = "r1".into();
+        assert_eq!(node_state_display(&node), "IDLE+RESERVED+NOT_RESPONDING");
+
+        // And with a base state other than idle (a draining node gone silent).
+        let mut draining = spur_proto::proto::NodeInfo {
+            state: spur_proto::proto::NodeState::NodeDraining as i32,
+            not_responding: true,
+            ..Default::default()
+        };
+        assert_eq!(node_state_display(&draining), "DRAINING+NOT_RESPONDING");
+        draining.not_responding = false;
+        assert_eq!(node_state_display(&draining), "DRAINING");
     }
 
     #[test]
