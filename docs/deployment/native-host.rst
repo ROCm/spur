@@ -476,6 +476,11 @@ report its jobs at all. The node takes no new work until an
 operator clears it with ``scontrol update nodename=<node> state=resume`` once it is sound;
 reclaim cancels keep running in the meantime.
 
+While held, the node shows as ``down`` with no ``*``, since its heartbeats arrive, and keeps the
+reason it went down with, usually ``Not responding``. The leader logs ``holding node
+recovery until it reports a clean job list`` once when the hold starts, with the jobs it
+is waiting on (``StaleJobs``) or ``Unknown`` when the node could not list its jobs.
+
 The hold's clock runs only while the node keeps sending heartbeats and stays held. A node that
 goes silent again, is resumed by an operator, or is removed starts a fresh hold if it later
 returns still reporting such work.
