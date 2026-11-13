@@ -1819,6 +1819,13 @@ enum GateOutcome {
     Cancelled,
 }
 
+/// A supervisor's launch gate on `listener`, for agent tests that need one
+/// holding its job back.
+#[cfg(test)]
+pub(crate) async fn serve_launch_gate(listener: &UnixListener, descriptor: &StepdDescriptor) {
+    let _ = await_start(listener, descriptor).await;
+}
+
 /// Serves the control socket before the job exists, so spurd's handshake
 /// completes without waiting on the launch. Returns once Start arrives, or
 /// once a cancel arrives telling this session to give up before starting.

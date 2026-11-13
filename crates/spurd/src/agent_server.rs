@@ -4932,6 +4932,24 @@ impl AgentService {
         self.allocation.clone()
     }
 
+    /// Whether the job's batch supervisor is up but has not been told to start
+    /// its workload: its gate answers state queries as active with no pid.
+    async fn batch_awaiting_start(&self, job_id: u32) -> bool {
+        let batch = self
+            .stepds
+            .lock()
+            .await
+            .get(&(job_id, spur_core::step::STEP_BATCH))
+            .cloned();
+        let Some(descriptor) = batch else {
+            return false;
+        };
+        matches!(
+            crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await,
+            Ok(snapshot) if snapshot.active && snapshot.job_pid == 0
+        )
+    }
+
     /// The job's own process, asked of its supervisor over the control socket —
     /// live state, so it is not kept in the durable descriptor.
     async fn supervised_state(&self, job_id: u32) -> Option<crate::stepd::StepdSnapshot> {
@@ -11515,10 +11533,18 @@ impl AgentService {
     ///
     /// Backs `exec_in_job` and `interactive_session` (attach), both reachable
     /// only after the controller's `job.state == Running` check — i.e. every
-    /// node has confirmed LaunchJob (confirm_dispatch_on_nodes) — so no retry
-    /// on a miss. Restart mid-job (empty `running`) is the one uncovered case.
+    /// node has confirmed LaunchJob (confirm_dispatch_on_nodes). The controller
+    /// releases the batch workload only after that, so a job still held at its
+    /// launch gate is `Unavailable` (retried by callers) rather than read with
+    /// no process to take its environment and namespaces from. Restart mid-job
+    /// (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let supervised = self.supervised_state(job_id).await;
+        if supervised.is_none() && self.batch_awaiting_start(job_id).await {
+            return Err(Status::unavailable(format!(
+                "job {job_id} has not started on this node yet"
+            )));
+        }
         let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
         // The supervisor creates the cgroup after spurd's launch returns, so it
         // is read live rather than from the descriptor written before the exec.
@@ -25834,6 +25860,43 @@ mod tests {
             .await
             .expect("job_entry should succeed");
         assert_eq!(entry.cgroup_path, Some(cgroup));
+    }
+
+    // The controller marks a job Running before it releases the batch workload,
+    // so an entry read in between must be retried, not built with no process.
+    #[tokio::test]
+    async fn job_entry_is_unavailable_while_the_batch_workload_is_held_at_its_gate() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let job_id = 4343;
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(None))
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            socket_path.clone(),
+            std::path::PathBuf::new(),
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move {
+            crate::stepd::serve_launch_gate(&listener, &gate_descriptor).await
+        });
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        let err = svc
+            .job_entry(job_id)
+            .await
+            .expect_err("a gated workload has no process to enter yet");
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        gate.abort();
     }
 
     #[tokio::test]

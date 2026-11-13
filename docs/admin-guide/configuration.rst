@@ -2115,6 +2115,35 @@ POSIX ``RLIMIT_*`` values ``spurd`` applies to job steps at launch.
    ``memlock = "unlimited"`` lets RDMA and NCCL workloads pin memory out of the box.
    Lower it only when a hard cap is required.
 
+.. _salloc-config:
+
+``[salloc]``
+------------
+
+How ``salloc`` (``spur alloc``) behaves once its allocation is granted. ``salloc``
+reads this from ``spur.conf`` on the host it runs on, so set it on every login
+node.
+
+**Reload: none.** Each ``salloc`` invocation reads the file.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 10 10 56
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``use_interactive_step``
+     - bool
+     - ``false``
+     - Start the shell as an interactive step on the allocation's first node
+       instead of on the submit host, so the work typed at the prompt runs on
+       the allocated hardware and inside the job's cgroup. Slurm
+       ``LaunchParameters=use_interactive_step``. Users override it per
+       invocation with ``--interactive-step`` / ``--no-interactive-step``. See
+       :ref:`salloc-interactive-step`.
+
 ``[mpi]``
 ---------
 

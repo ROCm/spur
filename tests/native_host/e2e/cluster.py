@@ -674,15 +674,19 @@ class SpurCluster:
         *,
         salloc_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
+        all_nodes: bool = False,
     ) -> tuple[int, str]:
         """Run salloc with *shell_body* as the allocation shell (via ``SHELL``).
 
         salloc exports allocation env vars into the shell, then cancels the job
         when the shell exits.  Returns ``(exit_code, combined_output)``.
+        Set *all_nodes* when the shell runs on an allocated node rather than
+        here (``salloc --interactive-step``).
         """
         script_path = self.write_file(
             f"salloc-shell-{time.time_ns()}.sh",
             f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
+            all_nodes=all_nodes,
         )
 
         cmd_parts = self._cli_env_assignments()
