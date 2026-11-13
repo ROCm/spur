@@ -1470,6 +1470,8 @@ impl Job {
             JobState::Timeout
         } else if self.cancel_signaled_at.is_some() {
             JobState::Cancelled
+        } else if self.launch_failure_detail.is_some() {
+            JobState::Failed
         } else {
             derived_state
         };
@@ -1479,6 +1481,9 @@ impl Job {
             JobState::Timeout => PendingReason::TimeLimit,
             // A cancel, user or scheduler, is not a fault to explain.
             JobState::Cancelled => PendingReason::None,
+            JobState::Failed if self.launch_failure_detail.is_some() => {
+                PendingReason::JobLaunchFailure
+            }
             _ if signal != 0 => PendingReason::RaisedSignal,
             _ if exit_code != 0 => PendingReason::NonZeroExitCode,
             _ => PendingReason::None,
@@ -3082,6 +3087,24 @@ mod tests {
         // A script that traps SIGTERM, checkpoints, and exits 0 still ran out of
         // time; the run's outcome is not the handler's exit status.
         let (state, reason) = timed_out_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_names_a_launch_failure_unless_something_stronger_ended_the_run() {
+        let mut job = make_job();
+        job.launch_failure_detail = Some("pivot_root failed".into());
+
+        let (state, reason) = job.completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::JobLaunchFailure);
+
+        let (state, _) = job.completion_verdict(JobState::Failed, 1, 0, true);
+        assert_eq!(state, JobState::OutOfMemory);
+
+        job.time_limit_signaled_at = Some(chrono::Utc::now());
+        let (state, reason) = job.completion_verdict(JobState::Failed, 0, 15, false);
         assert_eq!(state, JobState::Timeout);
         assert_eq!(reason, PendingReason::TimeLimit);
     }

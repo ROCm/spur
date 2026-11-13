@@ -1465,6 +1465,7 @@ async fn run_completion_hooks_and_report(
                 step_id: None,
                 node_token: node_token.to_string(),
                 pty_step_id: None,
+                launch_failure: None,
             },
         )
         .await;
@@ -2450,6 +2451,7 @@ pub(crate) fn monitor_recovered_stepds(
                         step_id: Some(completion.step_id),
                         node_token: reporter.node_token(),
                         pty_step_id: completion.pty_step_id,
+                        launch_failure: None,
                     },
                 )
                 .await
@@ -2769,14 +2771,24 @@ async fn fence_dead_stepd(
         )
         .ok()
         .flatten();
-    let (exit_code, signal) =
-        recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
-    if recorded_exit.is_none() {
-        if let Some(reason) = store.recorded_failure(
+    let launch_failure = if recorded_exit.is_none() {
+        store.recorded_failure(
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
-        ) {
+        )
+    } else {
+        None
+    };
+    // A missing workload exit used to be reported as SIGKILL, so a supervisor
+    // that died before exec looked like the script had been killed.
+    let (exit_code, signal) = match (&recorded_exit, launch_failure.as_deref()) {
+        (Some(exit), _) => *exit,
+        (None, Some(_)) => (1, 0),
+        (None, None) => (0, nix::sys::signal::Signal::SIGKILL as i32),
+    };
+    if recorded_exit.is_none() {
+        if let Some(reason) = &launch_failure {
             warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %reason,
                 "stepd recorded why its launch failed before dying");
         }
@@ -2806,6 +2818,7 @@ async fn fence_dead_stepd(
             step_id: Some(descriptor.step_id),
             node_token: reporter.node_token(),
             pty_step_id: descriptor.pty_step_id,
+            launch_failure,
         },
     )
     .await;
@@ -2966,6 +2979,7 @@ async fn handle_completion_notification(
                     step_id: Some(step_id),
                     node_token: context.reporter.node_token(),
                     pty_step_id: descriptor.pty_step_id,
+                    launch_failure: None,
                 },
             )
             .await;
@@ -3061,19 +3075,30 @@ async fn replay_runtime_completions(
                 .epilog_failed
                 .then(|| drain_for(EPILOG_FAILED_DRAIN_REASON)),
         };
+        let launch_failure = store.recorded_failure(
+            completion.job_id,
+            completion.run_attempt,
+            completion.step_id,
+        );
+        let (exit_code, signal) = if launch_failure.is_some() {
+            (1, 0)
+        } else {
+            (completion.exit_code, completion.signal)
+        };
         if report_runtime_completion(
             store,
             controller_addr,
             CompletionReport {
                 job_id: completion.job_id,
-                exit_code: completion.exit_code,
-                signal: completion.signal,
+                exit_code,
+                signal,
                 run_attempt: completion.run_attempt,
                 reporting_node,
                 drain: drain.as_ref(),
                 step_id: Some(completion.step_id),
                 node_token: node_token.to_string(),
                 pty_step_id: completion.pty_step_id,
+                launch_failure,
             },
         )
         .await
@@ -3192,6 +3217,7 @@ async fn report_orphan_cleanup_completion(
             drain: None,
             node_token: node_token.to_owned(),
             pty_step_id: None,
+            launch_failure: None,
         },
     )
     .await
@@ -6330,6 +6356,8 @@ pub(crate) struct CompletionReport<'a> {
     pub node_token: String,
     /// See [`crate::stepd::StepdDescriptor::pty_step_id`].
     pub pty_step_id: Option<spur_core::step::StepId>,
+    /// The supervisor's reason when it died before the batch script started.
+    pub launch_failure: Option<String>,
 }
 
 pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
@@ -6343,15 +6371,21 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         step_id,
         node_token,
         pty_step_id,
+        launch_failure,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
+    let message = match &launch_failure {
+        Some(reason) => spur_core::end_reason::format_launch_failure_message(reason),
+        None => format!("exit_code={exit_code}"),
+    };
 
     let result = retry_controller_rpc(move |attempt| {
         let node_token = node_token.clone();
+        let message = message.clone();
         async move {
             let channel = spur_client::connect_channel(controller_addr)
                 .await
@@ -6373,7 +6407,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 state,
                 exit_code,
                 signal,
-                message: format!("exit_code={}", exit_code),
+                message,
                 drain_node: drain.is_some(),
                 drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
                 reporting_node: reporting_node.to_string(),

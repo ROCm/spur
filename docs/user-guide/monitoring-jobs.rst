@@ -647,8 +647,11 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
      - A node the job ran on was removed from the cluster; the detail names
        the node and the removal reason.
    * - ``JobLaunchFailure``
-     - NODE_FAIL
-     - The job could not be started on every node; the detail says why.
+     - NODE_FAIL or FAILED
+     - The job could not be started on every node, or the node accepted it and
+       the supervisor died before the batch script started. The detail says
+       why. A script that itself exits or is signalled stays
+       ``NonZeroExitCode`` or ``RaisedSignal``.
 
 ``EndedBy`` is the user who cancelled the job, for ``UserCancel`` and
 ``AdminCancel``; a ``SystemCancel`` has no user and, like every other reason,

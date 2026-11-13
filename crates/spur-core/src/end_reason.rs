@@ -179,6 +179,15 @@ impl Job {
     }
 
     fn failure_reason(&self) -> (EndReason, Option<String>) {
+        // Set only when this run's supervisor died before the batch script
+        // started. An exit code cannot say that: the same 127 is a missing
+        // command inside the script.
+        if self.pending_reason == PendingReason::JobLaunchFailure {
+            return (
+                EndReason::JobLaunchFailure,
+                self.launch_failure_detail.clone(),
+            );
+        }
         if !self.unreported_nodes.is_empty() {
             let nodes = self.unreported_nodes.join(",");
             return (
@@ -202,6 +211,20 @@ impl Job {
         };
         (EndReason::NonZeroExitCode, hint.map(str::to_owned))
     }
+}
+
+/// Prefix on `ReportJobStatusRequest.message` when the node accepted the job
+/// and the supervisor then died before the batch script started. Anything else
+/// in that field (including `exit_code=N`) is not a launch failure.
+pub const LAUNCH_FAILURE_MESSAGE_PREFIX: &str = "launch_failure:";
+
+pub fn format_launch_failure_message(reason: &str) -> String {
+    format!("{LAUNCH_FAILURE_MESSAGE_PREFIX} {reason}")
+}
+
+pub fn launch_failure_detail_from_message(message: &str) -> Option<String> {
+    let detail = message.strip_prefix(LAUNCH_FAILURE_MESSAGE_PREFIX)?.trim();
+    (!detail.is_empty()).then(|| detail.to_string())
 }
 
 /// Human-readable name for a terminating signal, spelled as Slurm prints it in
@@ -511,6 +534,41 @@ mod tests {
         assert_eq!(
             job.end_reason(JobState::Failed).0,
             EndReason::NonZeroExitCode
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_before_the_script_is_not_a_script_exit() {
+        let mut job = failed(0, 9);
+        job.pending_reason = PendingReason::JobLaunchFailure;
+        job.launch_failure_detail = Some("open stdout: permission denied".into());
+        assert_eq!(
+            job.end_reason(JobState::Failed),
+            (
+                EndReason::JobLaunchFailure,
+                Some("open stdout: permission denied".into())
+            )
+        );
+        assert_eq!(
+            launch_failure_detail_from_message(&format_launch_failure_message(
+                "open stdout: permission denied"
+            ))
+            .as_deref(),
+            Some("open stdout: permission denied")
+        );
+        assert_eq!(launch_failure_detail_from_message("exit_code=1"), None);
+        assert_eq!(launch_failure_detail_from_message("launch_failure:"), None);
+    }
+
+    #[test]
+    fn a_script_exit_stays_a_script_exit() {
+        assert_eq!(
+            failed(1, 0).end_reason(JobState::Failed).0,
+            EndReason::NonZeroExitCode
+        );
+        assert_eq!(
+            failed(0, 9).end_reason(JobState::Failed).0,
+            EndReason::RaisedSignal
         );
     }
 

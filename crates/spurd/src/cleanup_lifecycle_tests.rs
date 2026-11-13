@@ -224,6 +224,7 @@ impl SessionFixture {
             drain: None,
             node_token: String::new(),
             pty_step_id: None,
+            launch_failure: None,
         }
     }
 

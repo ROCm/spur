@@ -66,6 +66,7 @@ fn report_victim_node(cm: &ClusterManager, node: &str) {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     });
 }
 
