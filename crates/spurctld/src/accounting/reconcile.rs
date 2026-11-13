@@ -75,14 +75,16 @@ pub fn spawn_txn_purge_loop(
     });
 }
 
-/// Only jobs that have actually started accrue an accounting record
-/// (`notify_job_start` fires from `start_job`), so jobs still pending are
-/// not candidates.
+/// Include finished requesters with preemption usage even when they never
+/// started, so their final counters reach history before controller eviction.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
         .get_jobs(&JobFilter::default())
         .into_iter()
-        .filter(|j| j.start_time.is_some())
+        .filter(|j| {
+            j.start_time.is_some()
+                || (j.state.is_finalized() && j.preemption_usage != Default::default())
+        })
         .collect();
     if candidates.is_empty() {
         return;
@@ -94,7 +96,7 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
         .collect();
 
     let job_ids: Vec<JobId> = candidates.iter().map(|j| j.job_id).collect();
-    let (accounting_states, unknown): (HashMap<JobId, AccountingRowState>, HashSet<JobId>) =
+    let (mut accounting_states, unknown): (HashMap<JobId, AccountingRowState>, HashSet<JobId>) =
         match db::job_accounting_states(pool, &job_ids).await {
             Ok(rows) => (rows, HashSet::new()),
             Err(e) => {
@@ -111,6 +113,13 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
             }
         };
 
+    // A requester cancelled before launch has no start metadata to backfill.
+    for job in candidates.iter().filter(|j| j.start_time.is_none()) {
+        if let Some(row) = accounting_states.get_mut(&job.job_id) {
+            row.needs_start_backfill = false;
+        }
+    }
+
     let mut stale: Vec<JobId> = jobs_needing_resync(&expected, &accounting_states, &unknown);
 
     // Also flag in-flight jobs whose DB row has total_gpus=0 but the
@@ -123,7 +132,9 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
         if let Some(row) = accounting_states.get(&job.job_id) {
             let expected_gpus =
                 spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
-            if expected_gpus > 0 && row.total_gpus == 0 {
+            if (expected_gpus > 0 && row.total_gpus == 0)
+                || (job.state.is_finalized() && row.preemption_usage != job.preemption_usage)
+            {
                 stale.push(job.job_id);
             }
         }
@@ -207,7 +218,8 @@ async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_bac
     // job hasn't reached a finalized state — otherwise it would clobber a
     // correct finalized state. The finalized case is corrected in the same
     // transaction by write_end below.
-    let needs_start = row_missing || needs_start_backfill || !job.state.is_finalized();
+    let needs_start = job.start_time.is_some()
+        && (row_missing || needs_start_backfill || !job.state.is_finalized());
     let is_finalized = job.state.is_finalized();
 
     let attempt = async {
@@ -279,6 +291,7 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
     db::record_job_end(
         conn,
         &db::JobEndRecord {
+            preemption_usage: Some(job.preemption_usage.clone()),
             job_id: job.job_id,
             state: state.display().to_owned(),
             exit_code: job.exit_code.unwrap_or(0),
@@ -292,6 +305,7 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
             reason_detail: reason_detail.unwrap_or_default(),
             ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
             ended_by_uid: ended_by.and_then(|c| c.uid),
+            submission: Some(db::JobSubmission::for_job(job)),
         },
     )
     .await
@@ -305,6 +319,7 @@ mod tests {
 
     fn synced_row(state: &str) -> AccountingRowState {
         AccountingRowState {
+            preemption_usage: Default::default(),
             state: state.to_string(),
             needs_start_backfill: false,
             total_gpus: 0,
@@ -375,6 +390,7 @@ mod tests {
         accounting.insert(
             1,
             AccountingRowState {
+                preemption_usage: Default::default(),
                 state: "COMPLETED".to_string(),
                 needs_start_backfill: true,
                 total_gpus: 0,
@@ -548,6 +564,7 @@ mod tests {
 
     fn bare_end(job_id: JobId, state: &str, end_time: chrono::DateTime<Utc>) -> db::JobEndRecord {
         db::JobEndRecord {
+            preemption_usage: None,
             job_id,
             state: state.to_string(),
             exit_code: 0,
@@ -561,6 +578,7 @@ mod tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            submission: None,
         }
     }
 
@@ -569,6 +587,36 @@ mod tests {
             .bind(job_id as i64)
             .execute(pool)
             .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn preemption_usage_reconciliation_archives_a_requester_that_never_started(
+    ) -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = 9_800_531;
+        delete_job(&pool, job_id).await;
+        let mut job = test_job(job_id, JobState::Cancelled);
+        job.start_time = None;
+        job.preemption_usage.open_one();
+        job.preemption_usage.settle(Some((
+            spur_core::preemption_usage::UnusedReason::Cancelled,
+            spur_core::preemption_usage::PreemptionInitiator::User,
+        )));
+        resync_job(&pool, &job, true, false).await;
+        let history = db::get_job_history(
+            &pool,
+            &db::JobHistoryQuery {
+                job_ids: &[job_id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].start_time, None);
+        assert_eq!(history[0].preemption_usage, job.preemption_usage);
+        delete_job(&pool, job_id).await;
+        Ok(())
     }
 
     // End to end: simulate record_job_start's retries exhausting (only

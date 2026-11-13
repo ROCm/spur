@@ -57,6 +57,15 @@ class TestCompletingTimeoutCancel:
         assert state in ("F", "GONE"), (
             f"expected force-finish to a terminal state, got {state}"
         )
+        # The unreported node is quarantined before its allocation is released.
+        drained = [
+            name for name in cluster.node_names
+            if "job cleanup was not confirmed before completion timeout"
+            in cluster.scontrol_show_node(name)
+        ]
+        assert len(drained) == 1, (
+            f"expected exactly the unreported node drained, got {drained}"
+        )
 
         # The orphaned marker on rank 1's node must be gone: the fix's cancel
         # killed the process and freed the local allocation. Poll briefly to let

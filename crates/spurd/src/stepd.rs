@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::executor::RunningJob;
+use crate::teardown_lease::{self, TeardownLease, TeardownPhase};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepdLaunchSpec {
@@ -155,6 +156,10 @@ impl From<StepdMemlock> for spur_core::config::MemlockLimit {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepdJobResources {
     #[serde(default)]
+    pub fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    #[serde(default)]
+    pub gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
+    #[serde(default)]
     pub cpus: u32,
     #[serde(default)]
     pub memory_mb: u64,
@@ -170,6 +175,10 @@ pub struct StepdJobResources {
     pub nodelist: String,
     #[serde(default)]
     pub mpi: String,
+    /// What a numbered step narrows the job's share to. Its GPUs stay off-limits
+    /// to other steps for as long as a descriptor carrying them is live.
+    #[serde(default)]
+    pub step_limits: crate::step_resources::StepLimits,
 }
 
 impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
@@ -221,6 +230,8 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             has_user_namespace: false,
             has_mount_namespace: false,
             resources: StepdJobResources {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
                 gpu_devices: config.gpu_devices.clone(),
@@ -228,6 +239,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
                 mpi: config.mpi.clone(),
+                step_limits: config.step_limits.clone(),
             },
             pmix: None,
             cred_id: String::new(),
@@ -276,6 +288,7 @@ impl StepdLaunchSpec {
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
+            step_limits: self.resources.step_limits,
         }
     }
 }
@@ -477,7 +490,7 @@ pub async fn reclaim_pty_master(
     })
 }
 
-const OBLIGATION_FILE: &str = "obligations.jsonl";
+pub(crate) const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
 /// Oldest session format this build still adopts. Raise it only when a change
@@ -555,8 +568,8 @@ pub enum AgentNotification {
 pub enum AgentNotificationResponse {
     /// spurd forwarded the completion to the controller; safe to prune.
     Acknowledged,
-    /// spurd released its local tracking but could not reach the
-    /// controller; leave the durable record for the next startup scan.
+    /// Cleanup or controller acknowledgement is still pending; retain the
+    /// durable record so recovery can finish it.
     Deferred,
 }
 
@@ -577,10 +590,31 @@ pub struct StepdSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "obligation", rename_all = "snake_case")]
 pub enum StepdObligation {
-    ExitObserved { exit_code: i32, signal: i32 },
-    EpilogCompleted { failed: bool },
+    ExitObserved {
+        exit_code: i32,
+        signal: i32,
+        /// Recorded by the agent for a supervisor lost before it recorded an
+        /// exit of its own.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        synthesized: bool,
+    },
+    EpilogCompleted {
+        failed: bool,
+        /// Recorded by the agent because the supervisor was lost before its
+        /// teardown finished. `failed` is always set with it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supervisor_lost: bool,
+    },
     CompletionAcknowledged,
     ResourcesReleased,
+}
+
+/// What the ledger says became of a job's teardown after its last exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpilogOutcome {
+    Succeeded,
+    ScriptFailed,
+    SupervisorLost,
 }
 
 pub struct StepdObligationLog {
@@ -601,13 +635,21 @@ impl StepdObligationLog {
         })?;
         entry.push(b'\n');
         let mut options = fs::OpenOptions::new();
-        options.create(true).append(true);
+        options.read(true).create(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&self.path)?;
+        // The supervisor and the agent both append. Holding the lock while
+        // judging the tail keeps one from cutting an entry the other is
+        // writing or has just written.
+        let mut file = nix::fcntl::Flock::lock(
+            options.open(&self.path)?,
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .map_err(|(_, errno)| io::Error::from(errno))?;
+        drop_torn_tail(&mut file)?;
         file.write_all(&entry)?;
         file.sync_data()
     }
@@ -644,6 +686,21 @@ impl StepdObligationLog {
             })
             .collect()
     }
+}
+
+/// Cuts a final line a crash left unfinished, which `read` already skips, so
+/// the next entry cannot fuse with it into a complete but malformed record.
+fn drop_torn_tail(file: &mut fs::File) -> io::Result<()> {
+    let mut contents = Vec::new();
+    io::Read::read_to_end(file, &mut contents)?;
+    let complete = contents
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1);
+    if complete < contents.len() {
+        file.set_len(complete as u64)?;
+    }
+    Ok(())
 }
 
 /// `read_line` with no cap on line length; a peer that never sends `\n` grows
@@ -878,6 +935,8 @@ impl StepdSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepdDescriptor {
+    #[serde(default = "spur_core::config::default_cgroup_cleanup_timeout")]
+    pub cleanup_timeout_secs: u32,
     pub format_version: u32,
     pub job_id: u32,
     pub run_attempt: u32,
@@ -947,6 +1006,28 @@ pub struct StepdDescriptor {
 }
 
 impl StepdDescriptor {
+    /// Records the container the session's job runs in, so a recovered session
+    /// still tells a step naming another image from one naming the job's own.
+    pub fn record_job_container(&mut self, launch_spec: &StepdLaunchSpec) {
+        self.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+        self.container_image = launch_spec
+            .container
+            .as_ref()
+            .map(|c| c.config.image.clone())
+            .unwrap_or_default();
+    }
+
+    pub fn cleanup_cgroup_path(&self) -> PathBuf {
+        if self.cgroup_path.as_os_str().is_empty() {
+            return crate::executor::reapable_cgroup_path(
+                self.job_id,
+                self.run_attempt,
+                self.step_id,
+            );
+        }
+        crate::cgroup_cleanup::owned_cgroup(&self.cgroup_path, self.step_id).to_path_buf()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: u32,
@@ -958,6 +1039,7 @@ impl StepdDescriptor {
         cgroup_path: PathBuf,
     ) -> Self {
         Self {
+            cleanup_timeout_secs: spur_core::config::default_cgroup_cleanup_timeout(),
             format_version: FORMAT_VERSION,
             job_id,
             run_attempt,
@@ -1021,7 +1103,12 @@ pub(crate) fn record_resources_released(descriptor: &StepdDescriptor) -> io::Res
     {
         return prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ());
     }
-    obligations.append(&StepdObligation::ResourcesReleased)?;
+    match obligations.append(&StepdObligation::ResourcesReleased) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !session_dir.try_exists()? => {
+            return Ok(());
+        }
+        result => result?,
+    }
     prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ())
 }
 
@@ -1087,11 +1174,29 @@ enum SweptSession {
     RetainedAnswer { settled_at: SystemTime },
 }
 
+fn session_cleanup_pending(session_dir: &Path) -> io::Result<bool> {
+    let pending = session_dir
+        .parent()
+        .zip(session_dir.file_name())
+        .map(|(root, name)| {
+            root.join("cleanup")
+                .join(format!("{}.json", name.to_string_lossy()))
+        });
+    Ok(pending
+        .as_ref()
+        .map(|path| path.try_exists())
+        .transpose()?
+        .unwrap_or(false))
+}
+
 fn sweep_finalized_session(
     session_dir: &Path,
     obligations: &StepdObligationLog,
     step_id: spur_core::step::StepId,
 ) -> io::Result<SweptSession> {
+    if session_cleanup_pending(session_dir)? {
+        return Ok(SweptSession::Unfinalized);
+    }
     if !finalized_obligations(&obligations.read()?) {
         return Ok(SweptSession::Unfinalized);
     }
@@ -2181,6 +2286,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if !launch_spec.capability.is_empty() {
         descriptor.capability = launch_spec.capability.clone();
     }
+    descriptor.cleanup_timeout_secs = launch_spec.cgroup.cleanup_timeout_secs;
     descriptor.owner = launch_spec.user.clone();
     descriptor.uid = launch_spec.uid;
     descriptor.gid = launch_spec.gid;
@@ -2189,12 +2295,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_user_namespace = launch_spec.has_user_namespace;
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
-    descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
-    descriptor.container_image = launch_spec
-        .container
-        .as_ref()
-        .map(|c| c.config.image.clone())
-        .unwrap_or_default();
+    descriptor.record_job_container(&launch_spec);
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
@@ -2357,9 +2458,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // own — but the agent made one and recorded it, and it still has to go.
     let recorded_cgroup =
         (!descriptor.cgroup_path.as_os_str().is_empty()).then(|| descriptor.cgroup_path.clone());
+    let cleanup_timeout_secs = descriptor.cleanup_timeout_secs;
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
+    let cleanup_store = store.cleanup_store();
+    let cleanup_lease_dir = session_dir.clone();
     let teardown = |cgroup: Option<PathBuf>| async move {
         // TaskEpilog runs as the job user inside the step cgroup before it is
         // reaped; the extern/allocation step runs no task hooks.
@@ -2380,14 +2484,35 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(pmix) = pmix.as_ref() {
             pmix.stop();
         }
+        let mut reap = None;
         if let Some(cgroup) = cgroup.as_ref() {
-            crate::executor::cleanup_cgroup(cgroup);
-            // The agent reaps the job node once its last step releases; this
-            // covers the case where teardown here runs and that never does.
-            // Removing an absent directory is a no-op, so both trying is safe.
-            if spur_core::step::owns_job_lifetime(step_id) {
-                if let Some(job_cgroup) = cgroup.parent() {
-                    crate::executor::cleanup_cgroup(job_cgroup);
+            let owned = crate::cgroup_cleanup::owned_cgroup(cgroup, step_id);
+            let pending = crate::cgroup_cleanup::PendingCleanup::new(
+                job_id,
+                run_attempt,
+                step_id,
+                owned.to_path_buf(),
+                cleanup_timeout_secs,
+            )?;
+            // An already-empty cgroup is finished inside `prepare`.
+            if !cleanup_store.prepare(&pending)? {
+                let remaining = cleanup_store.remaining(&pending)?;
+                reap = Some((owned, pending, remaining));
+            }
+        }
+        let still_to_reap = reap.as_ref().map(|(_, _, remaining)| *remaining);
+        grant_teardown_lease(
+            &cleanup_lease_dir,
+            TeardownPhase::Cleanup,
+            teardown_lease::cleanup_window(still_to_reap),
+            None,
+        );
+        if let Some((owned, pending, remaining)) = reap {
+            match crate::cgroup_cleanup::wait_until_reaped(owned, remaining).await {
+                Ok(true) => cleanup_store.finish(&pending)?,
+                Ok(false) => tracing::warn!(job_id, "cgroup cleanup outlived its grace period"),
+                Err(error) => {
+                    tracing::warn!(job_id, %error, "cgroup cleanup could not be confirmed")
                 }
             }
         }
@@ -2399,9 +2524,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
+        Ok::<(), io::Error>(())
     };
     if let Err(error) = result {
-        teardown(cgroup).await;
+        teardown(cgroup).await?;
         record_launch_failure(&session_dir, &stderr_path, &error);
         return Err(error.into());
     }
@@ -2418,20 +2544,53 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             signal |= spur_core::job::OOM_SIGNAL_FLAG;
         }
     }
-    // Record the exit before teardown: cleanup, the epilog, and SPANK are
-    // unbounded operator code, and a crash in them must not read as "never ran".
-    obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
-    teardown(cgroup).await;
+    // Record the exit before teardown: a supervisor lost from here on drains
+    // its node unless the epilog outcome was recorded too.
+    obligations.append(&StepdObligation::ExitObserved {
+        exit_code,
+        signal,
+        synthesized: false,
+    })?;
+    teardown(cgroup).await?;
     // Per-job-per-node hooks: only the step owning the job's lifetime runs them.
     let owns_job_lifetime = spur_core::step::owns_job_lifetime(step_id);
-    let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
-        Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
-            Err(error) => {
-                tracing::error!(job_id, %error, "runtime epilog hook failed");
-                true
+    let epilog = hooks.epilog.as_deref().filter(|_| owns_job_lifetime);
+    let epilog_timeout = hooks.epilog_timeout();
+    let epilog_window = teardown_lease::epilog_window(epilog.is_some(), epilog_timeout);
+    if epilog.is_some() || (owns_job_lifetime && spank.is_some()) {
+        grant_teardown_lease(&session_dir, TeardownPhase::Epilog, epilog_window, None);
+    }
+    let epilog_failed = match epilog {
+        Some(epilog) => {
+            match spur_core::hooks::run_hook_bounded(
+                epilog,
+                &hook_context,
+                epilog_timeout,
+                |pid, group_token| {
+                    // Restart the deadline at spawn. The timeout clock starts now,
+                    // and the lease granted above has already spent the time it
+                    // took to exec.
+                    let hook = teardown_lease::HookProcess {
+                        pid,
+                        group_token: group_token.to_owned(),
+                    };
+                    grant_teardown_lease(
+                        &session_dir,
+                        TeardownPhase::Epilog,
+                        epilog_window,
+                        Some(hook),
+                    )
+                },
+            )
+            .await
+            {
+                Err(error) => {
+                    tracing::error!(job_id, %error, "runtime epilog hook failed");
+                    true
+                }
+                Ok(_) => false,
             }
-            Ok(_) => false,
-        },
+        }
         None => false,
     };
     if let Some(spank) = spank.as_ref().filter(|_| owns_job_lifetime) {
@@ -2453,7 +2612,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     obligations.append(&StepdObligation::EpilogCompleted {
         failed: epilog_failed,
+        supervisor_lost: false,
     })?;
+    if let Err(error) = teardown_lease::clear(&session_dir) {
+        tracing::warn!(job_id, %error, "cannot clear the finished teardown lease");
+    }
     let notification = AgentNotification::StepdCompleted {
         job_id,
         run_attempt,
@@ -2477,6 +2640,29 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         })?;
     }
     Ok(exit_code)
+}
+
+/// Best-effort: a supervisor that cannot write its lease still tears down, and
+/// the agent's fixed reclaim window applies as it did before leases.
+fn grant_teardown_lease(
+    session_dir: &Path,
+    phase: TeardownPhase,
+    window: std::time::Duration,
+    hook: Option<teardown_lease::HookProcess>,
+) {
+    let mut lease = match TeardownLease::new(phase, window) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(session = %session_dir.display(), %error, "cannot grant a teardown lease");
+            return;
+        }
+    };
+    if let Some(hook) = hook {
+        lease = lease.with_hook(hook);
+    }
+    if let Err(error) = teardown_lease::grant(session_dir, &lease) {
+        tracing::warn!(session = %session_dir.display(), %error, "cannot grant a teardown lease");
+    }
 }
 
 fn load_runtime_spank(plugstack_path: &str) -> Option<spur_spank::SpankHost> {
@@ -2539,6 +2725,81 @@ impl StepdStore {
         &self.root
     }
 
+    pub(crate) fn cleanup_store(&self) -> crate::cgroup_cleanup::CleanupStore {
+        crate::cgroup_cleanup::CleanupStore::new(self.root())
+    }
+
+    fn cleanup_record(
+        &self,
+        descriptor: &StepdDescriptor,
+    ) -> io::Result<crate::cgroup_cleanup::PendingCleanup> {
+        crate::cgroup_cleanup::PendingCleanup::new(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+            descriptor.cleanup_cgroup_path(),
+            descriptor.cleanup_timeout_secs,
+        )
+    }
+
+    pub fn prepare_cleanup(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .prepare(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn cleanup_expired(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .expired(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn cleanup_quarantined(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .quarantine_acknowledged(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn acknowledge_cleanup_quarantine(
+        &self,
+        descriptor: &StepdDescriptor,
+    ) -> io::Result<()> {
+        self.cleanup_store()
+            .acknowledge_quarantine(&self.cleanup_record(descriptor)?)
+    }
+
+    pub fn prepare_orphan_cleanup(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+        timeout_secs: u32,
+    ) -> io::Result<bool> {
+        let record = crate::cgroup_cleanup::PendingCleanup::new(
+            job_id,
+            run_attempt,
+            step_id,
+            crate::executor::reapable_cgroup_path(job_id, run_attempt, step_id),
+            timeout_secs,
+        )?;
+        self.cleanup_store().prepare(&record)
+    }
+
+    pub fn retry_cleanup(&self) -> io::Result<()> {
+        self.cleanup_store().retry()
+    }
+
+    pub fn ensure_cleanup_ready(&self) -> io::Result<()> {
+        if self.cleanup_store().is_pending()? {
+            return Err(io::Error::other("node has unfinished job cgroup cleanup"));
+        }
+        Ok(())
+    }
+
+    pub fn ensure_job_cleanup_ready(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
+        if self.cleanup_store().is_pending_for(job_id, run_attempt)? {
+            return Err(io::Error::other("job has unfinished cgroup cleanup"));
+        }
+        Ok(())
+    }
+
     /// Both the agent's bind and the supervisor's connect must derive the
     /// notification socket here, or every push silently degrades to replay.
     pub fn agent_socket(&self) -> PathBuf {
@@ -2599,6 +2860,7 @@ impl StepdStore {
         .append(&StepdObligation::ExitObserved {
             exit_code: 0,
             signal: nix::sys::signal::Signal::SIGKILL as i32,
+            synthesized: true,
         })?;
         Ok(true)
     }
@@ -2744,6 +3006,7 @@ impl StepdStore {
         };
         Ok(entries
             .flatten()
+            .filter(|entry| entry.file_name() != "cleanup")
             .filter(|entry| match entry.file_type() {
                 Ok(kind) => kind.is_dir(),
                 // Kept so it surfaces as a rejected session and gets fenced,
@@ -2774,6 +3037,41 @@ impl StepdStore {
             stale,
             rejected,
         })
+    }
+
+    pub(crate) fn older_sessions(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Vec<StepdDescriptor>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let mut fields = name.split('.');
+            if fields.next().and_then(|v| v.parse::<u32>().ok()) != Some(job_id)
+                || fields
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_none_or(|v| v >= run_attempt)
+                || fields.next().and_then(|v| v.parse::<u32>().ok()).is_none()
+                || fields.next().is_some()
+            {
+                continue;
+            }
+            if !entry.file_type()?.is_dir() {
+                return Err(io::Error::other("runtime session is not a directory"));
+            }
+            // A damaged old descriptor cannot establish which supervisor must stop.
+            sessions.push(self.load_descriptor(&entry.path())?);
+        }
+        Ok(sessions)
     }
 
     pub fn discover_unacknowledged_completions(&self) -> io::Result<Vec<PendingStepdCompletion>> {
@@ -2811,12 +3109,14 @@ impl StepdStore {
             };
             for obligation in recorded {
                 match obligation {
-                    StepdObligation::ExitObserved { exit_code, signal } => {
+                    StepdObligation::ExitObserved {
+                        exit_code, signal, ..
+                    } => {
                         observed_exit = Some((exit_code, signal));
                         acknowledged = false;
                         epilog_failed = false;
                     }
-                    StepdObligation::EpilogCompleted { failed } => epilog_failed = failed,
+                    StepdObligation::EpilogCompleted { failed, .. } => epilog_failed = failed,
                     StepdObligation::CompletionAcknowledged if observed_exit.is_some() => {
                         acknowledged = true;
                     }
@@ -2885,6 +3185,9 @@ impl StepdStore {
         now: SystemTime,
         retained: &mut Vec<(SystemTime, PathBuf)>,
     ) -> io::Result<bool> {
+        if session_cleanup_pending(session_dir)? {
+            return Ok(false);
+        }
         let descriptor = match self.load_descriptor(session_dir) {
             Ok(descriptor) => descriptor,
             // Nothing can ever finalize a session whose descriptor will not
@@ -2931,17 +3234,21 @@ impl StepdStore {
             completion.run_attempt,
             completion.step_id,
         );
-        obligations.append(&StepdObligation::CompletionAcknowledged)?;
-        prune_finalized_session(
-            &self.session_dir(
-                completion.job_id,
-                completion.run_attempt,
-                completion.step_id,
-            ),
-            &obligations,
+        let session_dir = self.session_dir(
+            completion.job_id,
+            completion.run_attempt,
             completion.step_id,
-        )
-        .map(|_| ())
+        );
+        // The agent may prune a settled session before the supervisor receives its ack.
+        match obligations.append(&StepdObligation::CompletionAcknowledged) {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && !session_dir.try_exists()? =>
+            {
+                return Ok(());
+            }
+            result => result?,
+        }
+        prune_finalized_session(&session_dir, &obligations, completion.step_id).map(|_| ())
     }
 
     /// Whether the exit this session recorded has already reached the
@@ -3007,29 +3314,102 @@ impl StepdStore {
             .iter()
             .rev()
             .find_map(|obligation| match obligation {
-                StepdObligation::ExitObserved { exit_code, signal } => Some((*exit_code, *signal)),
+                StepdObligation::ExitObserved {
+                    exit_code, signal, ..
+                } => Some((*exit_code, *signal)),
                 _ => None,
             }))
     }
 
-    /// Epilog result recorded after the last observed exit. A late-reported
-    /// completion must still drain the node when its epilog failed.
+    /// The epilog outcome recorded after the last exit, or `None` while the
+    /// teardown after that exit has not finished, or no exit was recorded.
+    pub(crate) fn epilog_outcome(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<EpilogOutcome>> {
+        let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
+        Ok(
+            last_teardown_entry(&obligations).and_then(|entry| match entry {
+                StepdObligation::EpilogCompleted {
+                    supervisor_lost: true,
+                    ..
+                } => Some(EpilogOutcome::SupervisorLost),
+                StepdObligation::EpilogCompleted { failed: true, .. } => {
+                    Some(EpilogOutcome::ScriptFailed)
+                }
+                StepdObligation::EpilogCompleted { .. } => Some(EpilogOutcome::Succeeded),
+                _ => None,
+            }),
+        )
+    }
+
+    /// Whether the epilog outcome recorded after the last exit calls for a
+    /// drain. A late-reported completion must still drain the node then.
     pub(crate) fn epilog_failed(
         &self,
         job_id: u32,
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<bool> {
+        let outcome = self.epilog_outcome(job_id, run_attempt, step_id)?;
+        Ok(outcome.is_some_and(|outcome| outcome != EpilogOutcome::Succeeded))
+    }
+
+    /// The supervisor's lease until the ledger records an epilog outcome. It
+    /// counts with no exit recorded: a failed run tears down without one.
+    pub(crate) fn unfinished_teardown_lease(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<TeardownLease>> {
         let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
-        Ok(obligations
-            .iter()
-            .rev()
-            .find_map(|obligation| match obligation {
-                StepdObligation::EpilogCompleted { failed } => Some(*failed),
-                StepdObligation::ExitObserved { .. } => Some(false),
-                _ => None,
+        if matches!(
+            last_teardown_entry(&obligations),
+            Some(StepdObligation::EpilogCompleted { .. })
+        ) {
+            return Ok(None);
+        }
+        teardown_lease::read(&self.session_dir(job_id, run_attempt, step_id))
+    }
+
+    /// Kills the epilog a supervisor lost mid-teardown left running and records
+    /// the loss, so every report drains. `Ok(false)`: nothing to settle, or
+    /// the supervisor is not provably lost.
+    pub fn settle_interrupted_teardown(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        let (job_id, run_attempt, step_id) = (
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        );
+        // Only the step that owns the job's lifetime runs the node epilog.
+        if !spur_core::step::owns_job_lifetime(step_id)
+            || !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale))
+        {
+            return Ok(false);
+        }
+        let obligations = self.obligations(job_id, run_attempt, step_id);
+        if !matches!(
+            last_teardown_entry(&obligations.read()?),
+            Some(StepdObligation::ExitObserved {
+                synthesized: false,
+                ..
             })
-            .unwrap_or(false))
+        ) {
+            return Ok(false);
+        }
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        kill_orphaned_epilog(descriptor, &session_dir);
+        obligations.append(&StepdObligation::EpilogCompleted {
+            failed: true,
+            supervisor_lost: true,
+        })?;
+        if let Err(error) = teardown_lease::clear(&session_dir) {
+            tracing::warn!(job_id, %error, "cannot clear a settled teardown lease");
+        }
+        Ok(true)
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
@@ -3066,6 +3446,34 @@ impl StepdStore {
         }
         Ok(descriptor)
     }
+}
+
+/// What the same supervisor last published for this session. A copy taken at
+/// launch predates its workload pid and cgroup, which it republishes once started.
+pub(crate) fn republished(descriptor: &StepdDescriptor) -> Option<StepdDescriptor> {
+    let session_dir = descriptor.socket_path.parent()?;
+    let store = StepdStore {
+        root: session_dir.parent()?.to_path_buf(),
+    };
+    let published = match store.load_descriptor(session_dir) {
+        Ok(published) => published,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "cannot read the supervisor's published runtime descriptor"
+            );
+            return None;
+        }
+    };
+    let same_supervisor = published.job_id == descriptor.job_id
+        && published.run_attempt == descriptor.run_attempt
+        && published.step_id == descriptor.step_id
+        && published.pid == descriptor.pid
+        && published.process_start_ticks == descriptor.process_start_ticks;
+    same_supervisor.then_some(published)
 }
 
 fn session_conflict(message: String) -> io::Error {
@@ -3183,6 +3591,41 @@ pub(crate) fn with_failed_publication_sync<T>(body: impl FnOnce() -> T) -> T {
     }
     let _restore = Restore(FAIL_PUBLICATION_SYNC.with(|fail| fail.replace(true)));
     body()
+}
+
+/// The newest exit or epilog outcome: together they say where the latest
+/// run's teardown stands.
+fn last_teardown_entry(obligations: &[StepdObligation]) -> Option<&StepdObligation> {
+    obligations.iter().rev().find(|obligation| {
+        matches!(
+            obligation,
+            StepdObligation::ExitObserved { .. } | StepdObligation::EpilogCompleted { .. }
+        )
+    })
+}
+
+/// An unreadable lease only costs the kill: the teardown is still settled, so
+/// the node still drains.
+fn kill_orphaned_epilog(descriptor: &StepdDescriptor, session_dir: &Path) {
+    let (job_id, run_attempt) = (descriptor.job_id, descriptor.run_attempt);
+    let hook = match teardown_lease::read(session_dir) {
+        Ok(lease) => lease.and_then(|lease| lease.hook),
+        Err(error) => {
+            tracing::warn!(job_id, run_attempt, %error,
+                "cannot read a lost supervisor's teardown lease; any epilog it left running is not killed");
+            return;
+        }
+    };
+    if hook
+        .as_ref()
+        .is_some_and(teardown_lease::kill_orphaned_hook)
+    {
+        tracing::warn!(
+            job_id,
+            run_attempt,
+            "killed the epilog a lost supervisor left running"
+        );
+    }
 }
 
 pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
@@ -3469,6 +3912,35 @@ mod tests {
     }
 
     #[test]
+    fn republished_takes_only_the_same_supervisors_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut at_launch = descriptor(9, 1, std::process::id());
+        at_launch.socket_path = store
+            .session_dir(9, 1, spur_core::step::STEP_BATCH)
+            .join("runtime.sock");
+        let mut started = at_launch.clone();
+        started.workload_pid = 4242;
+        store.publish(&started).expect("publish started descriptor");
+
+        assert_eq!(
+            republished(&at_launch).map(|published| published.workload_pid),
+            Some(4242),
+            "the supervisor's own later record names its workload"
+        );
+
+        let mut reused_pid = started.clone();
+        reused_pid.process_start_ticks += 1;
+        store
+            .publish(&reused_pid)
+            .expect("publish another supervisor");
+        assert!(
+            republished(&at_launch).is_none(),
+            "a record from another supervisor must not name this run's workload"
+        );
+    }
+
+    #[test]
     fn claim_session_dir_refuses_a_directory_a_live_supervisor_owns() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = StepdStore::new(temp.path());
@@ -3588,6 +4060,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 3,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
 
@@ -3751,6 +4224,50 @@ mod tests {
         )
         .expect("write descriptor");
         session_dir
+    }
+
+    #[test]
+    fn a_session_records_the_container_its_job_runs_in() {
+        let mut spec = launch_spec();
+        spec.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+        spec.container = Some(crate::executor::ContainerLaunchConfig {
+            config: crate::container::ContainerConfig {
+                image: "docker://job-image".into(),
+                mounts: Vec::new(),
+                workdir: None,
+                name: None,
+                readonly: false,
+                mount_home: false,
+                remap_root: false,
+                gpu_devices: Vec::new(),
+                environment: HashMap::new(),
+                container_env: HashMap::new(),
+                entrypoint: None,
+                uid: 1000,
+                gid: 1000,
+                username: "spur".into(),
+                home_dir: "/home/spur".into(),
+                device_plan: None,
+            },
+            rootfs: PathBuf::from("/tmp/rootfs"),
+        });
+        let mut descriptor = StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+
+        descriptor.record_job_container(&spec);
+
+        assert_eq!(
+            descriptor.container_rootfs_mode,
+            Some(crate::container::RootfsMode::Overlay)
+        );
+        assert_eq!(descriptor.container_image, "docker://job-image");
     }
 
     fn launch_spec() -> StepdLaunchSpec {
@@ -4032,6 +4549,43 @@ mod tests {
         );
     }
 
+    /// The supervisor applies a step's own limits and its descriptor keeps the
+    /// step's GPUs from other steps, so both must cross launch.json intact while
+    /// the job's own share stays what the job holds.
+    #[test]
+    fn a_steps_own_limits_survive_the_launch_spec_beside_its_jobs_share() {
+        let mut config = launch_spec().into_launch_config();
+        config.gpu_devices = vec![3, 5, 7];
+        config.step_limits = crate::step_resources::StepLimits {
+            cpus: Some(2),
+            memory_mb: Some(512),
+            gpus: Some(vec![5]),
+        };
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        assert_eq!(spec.resources.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(spec.resources.step_limits, config.step_limits);
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+        let restored = restored.into_launch_config();
+        assert_eq!(restored.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(restored.step_limits, config.step_limits);
+    }
+
+    #[test]
+    fn job_resources_from_an_older_build_carry_no_step_limits() {
+        let mut resources =
+            serde_json::to_value(StepdJobResources::default()).expect("encode resources");
+        resources
+            .as_object_mut()
+            .expect("resources encode as an object")
+            .remove("step_limits");
+        let restored: StepdJobResources =
+            serde_json::from_value(resources).expect("decode older resources");
+        assert!(restored.step_limits.is_empty());
+    }
+
     // Drives the whole agent -> launch.json -> supervisor boundary: the array
     // identity has to survive it or every task expands to the same filename.
     #[test]
@@ -4100,6 +4654,20 @@ mod tests {
         assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
+    }
+
+    #[test]
+    fn cleanup_timeout_defaults_when_loading_a_frozen_old_descriptor() {
+        let old = r#"{"format_version":1,"job_id":7,"run_attempt":1,"pid":0,"process_start_ticks":0,"socket_path":"/fixture/runtime/7.1.4294967291/runtime.sock","cgroup_path":"/fixture/job_7_1/step_batch"}"#;
+        let restored: StepdDescriptor = serde_json::from_str(old).unwrap();
+        assert_eq!(restored.cleanup_timeout_secs, 60);
+        let configured = StepdDescriptor {
+            cleanup_timeout_secs: 120,
+            ..restored
+        };
+        let saved = serde_json::to_string(&configured).unwrap();
+        let recovered: StepdDescriptor = serde_json::from_str(&saved).unwrap();
+        assert_eq!(recovered.cleanup_timeout_secs, 120);
     }
 
     #[test]
@@ -4384,6 +4952,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 7,
                 signal: 0,
+                synthesized: false,
             })
             .expect("record the real exit");
 
@@ -4527,6 +5096,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
         obligations
@@ -4571,6 +5141,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 1,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
 
@@ -4579,6 +5150,309 @@ mod tests {
             .expect("discover unacknowledged completions");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].job_id, 11);
+    }
+
+    const ORPHANED_EPILOG_TOKEN: &str = "orphaned-epilog";
+
+    fn spawn_orphaned_epilog() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env(
+                spur_core::hooks::HOOK_GROUP_TOKEN_ENV,
+                ORPHANED_EPILOG_TOKEN,
+            )
+            .process_group(0)
+            .spawn()
+            .expect("spawn the epilog stand-in")
+    }
+
+    /// A batch supervisor, gone, that recorded its workload's exit itself and
+    /// then held `lease` (if any) when it was lost.
+    fn lost_mid_teardown(
+        store: &StepdStore,
+        job_id: u32,
+        lease: Option<TeardownLease>,
+    ) -> StepdDescriptor {
+        let descriptor = descriptor(job_id, 1, 999_999);
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(job_id, 1, spur_core::step::STEP_BATCH)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+                synthesized: false,
+            })
+            .expect("append exit observed");
+        if let Some(lease) = lease {
+            teardown_lease::grant(
+                &store.session_dir(job_id, 1, spur_core::step::STEP_BATCH),
+                &lease,
+            )
+            .expect("grant lease");
+        }
+        descriptor
+    }
+
+    fn test_lease(phase: TeardownPhase, hook: Option<&std::process::Child>) -> TeardownLease {
+        let lease = TeardownLease::new(phase, std::time::Duration::from_secs(300))
+            .expect("lease for the test");
+        match hook {
+            Some(hook) => lease.with_hook(teardown_lease::HookProcess {
+                pid: hook.id(),
+                group_token: ORPHANED_EPILOG_TOKEN.into(),
+            }),
+            None => lease,
+        }
+    }
+
+    fn batch_epilog_outcome(store: &StepdStore, job_id: u32) -> Option<EpilogOutcome> {
+        store
+            .epilog_outcome(job_id, 1, spur_core::step::STEP_BATCH)
+            .expect("epilog outcome")
+    }
+
+    #[test]
+    fn an_epilog_orphaned_by_a_lost_supervisor_is_killed_and_recorded_lost() {
+        use std::os::unix::process::ExitStatusExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut orphan = spawn_orphaned_epilog();
+        let lease = test_lease(TeardownPhase::Epilog, Some(&orphan));
+        let lost = lost_mid_teardown(&store, 60, Some(lease));
+
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+
+        assert_eq!(
+            orphan.wait().expect("reap the epilog").signal(),
+            Some(libc::SIGKILL)
+        );
+        assert_eq!(
+            batch_epilog_outcome(&store, 60),
+            Some(EpilogOutcome::SupervisorLost),
+            "every later report of this completion must drain the node"
+        );
+        assert_eq!(
+            teardown_lease::read(&store.session_dir(60, 1, spur_core::step::STEP_BATCH))
+                .expect("read lease"),
+            None
+        );
+        assert!(
+            !store
+                .settle_interrupted_teardown(&lost)
+                .expect("settle again"),
+            "settling is once-only"
+        );
+    }
+
+    #[test]
+    fn a_settled_teardown_drains_through_the_completion_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = lost_mid_teardown(&store, 61, Some(test_lease(TeardownPhase::Epilog, None)));
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+
+        let pending = store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].epilog_failed);
+    }
+
+    #[test]
+    fn a_teardown_torn_mid_append_still_settles_and_replays() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = lost_mid_teardown(&store, 69, None);
+        tear_last_append(
+            &store
+                .session_dir(69, 1, spur_core::step::STEP_BATCH)
+                .join(OBLIGATION_FILE),
+        );
+        let pending = || {
+            store
+                .discover_unacknowledged_completions()
+                .expect("discover unacknowledged completions")
+        };
+        assert_eq!(pending().len(), 1);
+
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+
+        let replayable = pending();
+        assert_eq!(
+            replayable.len(),
+            1,
+            "settling must keep the completion replayable"
+        );
+        assert!(replayable[0].epilog_failed);
+        assert_eq!(
+            batch_epilog_outcome(&store, 69),
+            Some(EpilogOutcome::SupervisorLost)
+        );
+        assert!(!store
+            .settle_interrupted_teardown(&lost)
+            .expect("settle again"));
+    }
+
+    #[test]
+    fn a_teardown_lease_counts_before_any_exit_is_recorded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let descriptor = descriptor(65, 1, 999_999);
+        store.publish(&descriptor).expect("publish descriptor");
+        let session = store.session_dir(65, 1, spur_core::step::STEP_BATCH);
+        let lease = TeardownLease::new(TeardownPhase::Cleanup, std::time::Duration::from_secs(60))
+            .expect("lease");
+        teardown_lease::grant(&session, &lease).expect("grant lease");
+
+        assert_eq!(
+            store
+                .unfinished_teardown_lease(65, 1, spur_core::step::STEP_BATCH)
+                .expect("read lease"),
+            Some(lease)
+        );
+    }
+
+    #[test]
+    fn a_supervisor_lost_during_cgroup_cleanup_is_settled_before_its_epilog_ran() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lease = test_lease(TeardownPhase::Cleanup, None);
+        let lost = lost_mid_teardown(&store, 62, Some(lease));
+
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+        assert_eq!(
+            batch_epilog_outcome(&store, 62),
+            Some(EpilogOutcome::SupervisorLost)
+        );
+    }
+
+    #[test]
+    fn a_supervisor_lost_after_its_exit_is_settled_without_any_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = lost_mid_teardown(&store, 66, None);
+
+        assert!(store.settle_interrupted_teardown(&lost).expect("settle"));
+        assert_eq!(
+            batch_epilog_outcome(&store, 66),
+            Some(EpilogOutcome::SupervisorLost)
+        );
+    }
+
+    #[test]
+    fn an_exit_the_agent_recorded_for_a_lost_supervisor_is_not_settled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = descriptor(67, 1, 999_999);
+        store.publish(&lost).expect("publish descriptor");
+        assert!(store
+            .record_lost_supervisor_exit(&lost)
+            .expect("record lost exit"));
+
+        assert!(!store.settle_interrupted_teardown(&lost).expect("settle"));
+        assert_eq!(batch_epilog_outcome(&store, 67), None);
+    }
+
+    #[test]
+    fn a_step_that_runs_no_node_epilog_is_not_settled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut step = descriptor(68, 1, 999_999);
+        step.step_id = 0;
+        store.publish(&step).expect("publish descriptor");
+        store
+            .obligations(68, 1, 0)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+                synthesized: false,
+            })
+            .expect("append exit observed");
+
+        assert!(!store.settle_interrupted_teardown(&step).expect("settle"));
+        assert_eq!(
+            store.epilog_outcome(68, 1, 0).expect("epilog outcome"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_finished_epilog_is_not_settled_when_its_lease_file_survived() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = lost_mid_teardown(&store, 63, Some(test_lease(TeardownPhase::Epilog, None)));
+        store
+            .obligations(63, 1, spur_core::step::STEP_BATCH)
+            .append(&StepdObligation::EpilogCompleted {
+                failed: false,
+                supervisor_lost: false,
+            })
+            .expect("append epilog result");
+
+        assert!(!store.settle_interrupted_teardown(&lost).expect("settle"));
+        assert_eq!(
+            batch_epilog_outcome(&store, 63),
+            Some(EpilogOutcome::Succeeded)
+        );
+        assert_eq!(
+            store
+                .unfinished_teardown_lease(63, 1, spur_core::step::STEP_BATCH)
+                .expect("read lease"),
+            None,
+            "the agent must not defer a reclaim for a teardown that finished"
+        );
+    }
+
+    #[test]
+    fn a_live_supervisor_is_never_settled_and_its_epilog_is_left_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut epilog = spawn_orphaned_epilog();
+        let lease = test_lease(TeardownPhase::Epilog, Some(&epilog));
+        let mut running = lost_mid_teardown(&store, 64, Some(lease));
+        running.pid = std::process::id();
+        running.process_start_ticks = process_start_ticks(running.pid).expect("own start ticks");
+
+        assert!(!store.settle_interrupted_teardown(&running).expect("settle"));
+        assert!(epilog.try_wait().expect("poll the epilog").is_none());
+        assert!(store
+            .unfinished_teardown_lease(64, 1, spur_core::step::STEP_BATCH)
+            .expect("read lease")
+            .is_some());
+
+        epilog.kill().expect("stop the epilog stand-in");
+        epilog.wait().expect("reap the epilog stand-in");
+    }
+
+    #[test]
+    fn ledger_entries_from_before_the_lost_supervisor_flags_still_parse() {
+        let exit: StepdObligation =
+            serde_json::from_str(r#"{"obligation":"exit_observed","exit_code":1,"signal":0}"#)
+                .expect("parse an old exit");
+        assert_eq!(
+            exit,
+            StepdObligation::ExitObserved {
+                exit_code: 1,
+                signal: 0,
+                synthesized: false,
+            }
+        );
+        let epilog: StepdObligation =
+            serde_json::from_str(r#"{"obligation":"epilog_completed","failed":true}"#)
+                .expect("parse an old epilog result");
+        assert_eq!(
+            epilog,
+            StepdObligation::EpilogCompleted {
+                failed: true,
+                supervisor_lost: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&epilog).expect("serialize"),
+            r#"{"obligation":"epilog_completed","failed":true}"#,
+            "an unset flag stays off the wire, so older readers see the old entry"
+        );
     }
 
     #[test]
@@ -4595,6 +5469,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 7,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
         assert_eq!(
@@ -4647,6 +5522,7 @@ mod tests {
     const USER_STEP_EXIT: StepdObligation = StepdObligation::ExitObserved {
         exit_code: 7,
         signal: 0,
+        synthesized: false,
     };
 
     #[test]
@@ -4723,6 +5599,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
         assert_eq!(store.prune_finalized().expect("prune"), 0);
@@ -4747,6 +5624,7 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit observed");
         assert_eq!(store.prune_finalized().expect("prune"), 0);
@@ -4779,6 +5657,7 @@ mod tests {
             StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: 0,
+                synthesized: false,
             },
             StepdObligation::CompletionAcknowledged,
             StepdObligation::ResourcesReleased,
@@ -5336,6 +6215,7 @@ mod tests {
         log.append(&StepdObligation::ExitObserved {
             exit_code: 3,
             signal: 0,
+            synthesized: false,
         })
         .expect("append exit");
         // Power loss mid-append: a complete entry followed by an unterminated one.
@@ -5348,7 +6228,8 @@ mod tests {
             log.read().expect("torn tail is tolerated"),
             vec![StepdObligation::ExitObserved {
                 exit_code: 3,
-                signal: 0
+                signal: 0,
+                synthesized: false,
             }]
         );
 
@@ -5358,6 +6239,52 @@ mod tests {
             "{\"obligation\":\"bogus\"}\n{\"obligation\":\"resources_released\"}\n",
         )
         .expect("write corrupt log");
+        assert!(log.read().is_err());
+    }
+
+    /// What a crash midway through appending an epilog outcome leaves behind.
+    const TORN_ENTRY: &str = "{\"obligation\":\"epilog_comp";
+
+    fn tear_last_append(log_path: &Path) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(log_path)
+            .and_then(|mut log| log.write_all(TORN_ENTRY.as_bytes()))
+            .expect("tear the log");
+    }
+
+    #[test]
+    fn appending_after_a_torn_tail_keeps_every_complete_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(OBLIGATION_FILE);
+        let log = StepdObligationLog::new(path.clone());
+        let exit = StepdObligation::ExitObserved {
+            exit_code: 3,
+            signal: 0,
+            synthesized: false,
+        };
+        log.append(&exit).expect("append exit");
+        tear_last_append(&path);
+
+        log.append(&StepdObligation::ResourcesReleased)
+            .expect("append after the torn tail");
+
+        assert_eq!(
+            log.read().expect("read log"),
+            vec![exit, StepdObligation::ResourcesReleased]
+        );
+    }
+
+    #[test]
+    fn appending_leaves_a_malformed_complete_entry_failing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(OBLIGATION_FILE);
+        fs::write(&path, "{\"obligation\":\"bogus\"}\n").expect("write corrupt log");
+        let log = StepdObligationLog::new(path);
+
+        log.append(&StepdObligation::ResourcesReleased)
+            .expect("append");
+
         assert!(log.read().is_err());
     }
 
@@ -5373,13 +6300,17 @@ mod tests {
             .append(&StepdObligation::ExitObserved {
                 exit_code: 0,
                 signal: 0,
+                synthesized: false,
             })
             .expect("append exit");
         assert!(!store
             .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
             .expect("epilog state"));
         obligations
-            .append(&StepdObligation::EpilogCompleted { failed: true })
+            .append(&StepdObligation::EpilogCompleted {
+                failed: true,
+                supervisor_lost: false,
+            })
             .expect("append epilog result");
         assert!(store
             .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
@@ -5439,6 +6370,71 @@ mod tests {
         step_id: spur_core::step::StepId,
         pty_step_id: Option<spur_core::step::StepId>,
     ) -> (StepdDescriptor, AgentNotification) {
+        let allocation = start_supervised_allocation(step_id, pty_step_id, |spec, state_dir| {
+            spec.hooks.epilog = Some(
+                state_dir
+                    .join("epilog-that-cannot-spawn")
+                    .display()
+                    .to_string(),
+            );
+        })
+        .await;
+        allocation.shut_down().await;
+        let outcome = allocation.finish().await;
+        (outcome.published, outcome.notice)
+    }
+
+    /// What is left once a supervised allocation has torn down; dropping it
+    /// removes the state directory.
+    struct SupervisedOutcome {
+        _state_dir: tempfile::TempDir,
+        store: StepdStore,
+        session_dir: PathBuf,
+        published: StepdDescriptor,
+        notice: AgentNotification,
+    }
+
+    /// A real allocation supervisor that stays up until the test shuts it down.
+    struct SupervisedAllocation {
+        state_dir: tempfile::TempDir,
+        store: StepdStore,
+        session_dir: PathBuf,
+        published: StepdDescriptor,
+        handle: StepdDescriptor,
+        agent: tokio::task::JoinHandle<AgentNotification>,
+        supervisor: tokio::task::JoinHandle<anyhow::Result<i32>>,
+    }
+
+    const SUPERVISED_JOB_ID: u32 = 987_654;
+    const SUPERVISED_RUN_ATTEMPT: u32 = 1;
+
+    impl SupervisedAllocation {
+        async fn shut_down(&self) {
+            shutdown_allocation(&self.handle, "agent-1".into())
+                .await
+                .expect("shut the allocation down");
+        }
+
+        async fn finish(self) -> SupervisedOutcome {
+            self.supervisor
+                .await
+                .expect("supervisor task")
+                .expect("supervisor exits cleanly");
+            SupervisedOutcome {
+                notice: self.agent.await.expect("agent task"),
+                _state_dir: self.state_dir,
+                store: self.store,
+                session_dir: self.session_dir,
+                published: self.published,
+            }
+        }
+    }
+
+    async fn start_supervised_allocation(
+        step_id: spur_core::step::StepId,
+        pty_step_id: Option<spur_core::step::StepId>,
+        configure: impl FnOnce(&mut StepdLaunchSpec, &Path),
+    ) -> SupervisedAllocation {
         let state_dir = tempfile::tempdir().expect("state dir");
         let store = StepdStore::new(state_dir.path());
         create_private_dir_all(store.root()).expect("create runtime dir");
@@ -5456,22 +6452,16 @@ mod tests {
             serde_json::from_str::<AgentNotification>(&line).expect("decode notice")
         });
 
-        let job_id = 987_654;
-        let run_attempt = 1;
+        let job_id = SUPERVISED_JOB_ID;
+        let run_attempt = SUPERVISED_RUN_ATTEMPT;
         let mut spec = launch_spec();
         spec.job_id = job_id;
         spec.step_id = step_id;
         spec.run_attempt = run_attempt;
         spec.allocation_only = true;
         spec.work_dir = state_dir.path().display().to_string();
-        spec.hooks.epilog = Some(
-            state_dir
-                .path()
-                .join("epilog-that-cannot-spawn")
-                .display()
-                .to_string(),
-        );
         spec.pty_step_id = pty_step_id;
+        configure(&mut spec, state_dir.path());
         let capability = spec.capability.clone();
         let spec_path = state_dir.path().join("launch.json");
         fs::write(&spec_path, serde_json::to_vec(&spec).expect("encode spec"))
@@ -5506,15 +6496,15 @@ mod tests {
             PathBuf::new(),
         );
         descriptor.capability = capability;
-        shutdown_allocation(&descriptor, "agent-1".into())
-            .await
-            .expect("shut the allocation down");
-
-        supervisor
-            .await
-            .expect("supervisor task")
-            .expect("supervisor exits cleanly");
-        (published, agent.await.expect("agent task"))
+        SupervisedAllocation {
+            state_dir,
+            store,
+            session_dir,
+            published,
+            handle: descriptor,
+            agent,
+            supervisor,
+        }
     }
 
     // spurd's provisional descriptor is replaced by the one the supervisor
@@ -5557,6 +6547,108 @@ mod tests {
             !epilog_failed,
             "a terminal placeholder must leave the node epilog to the step owning the job"
         );
+    }
+
+    fn executable_script(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/bash\n{body}\n")).expect("write script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        path.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_hung_epilog_is_killed_at_its_timeout_and_reported_failed() {
+        let allocation =
+            start_supervised_allocation(spur_core::step::STEP_BATCH, None, |spec, dir| {
+                spec.hooks.epilog = Some(executable_script(dir, "hung-epilog", "exec sleep 300"));
+                spec.hooks.epilog_timeout_secs = 1;
+            })
+            .await;
+        allocation.shut_down().await;
+        let outcome = allocation.finish().await;
+
+        let AgentNotification::StepdCompleted { epilog_failed, .. } = outcome.notice;
+        assert!(epilog_failed, "a timed-out epilog counts as a failed one");
+        assert!(outcome
+            .store
+            .epilog_failed(
+                SUPERVISED_JOB_ID,
+                SUPERVISED_RUN_ATTEMPT,
+                spur_core::step::STEP_BATCH
+            )
+            .expect("epilog state"));
+        assert_eq!(
+            teardown_lease::read(&outcome.session_dir).expect("read lease"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_holds_a_lease_naming_its_epilog_while_it_runs() {
+        let allocation =
+            start_supervised_allocation(spur_core::step::STEP_BATCH, None, |spec, dir| {
+                let body = format!(
+                    "touch {}\nwhile [ ! -e {} ]; do sleep 0.05; done",
+                    dir.join("epilog-started").display(),
+                    dir.join("epilog-release").display()
+                );
+                spec.hooks.epilog = Some(executable_script(dir, "gated-epilog", &body));
+            })
+            .await;
+        let release = allocation.state_dir.path().join("epilog-release");
+        allocation.shut_down().await;
+
+        // The leader's identity lands a moment after the epilog starts running.
+        let mut leased = None;
+        for _ in 0..2_000 {
+            leased = allocation
+                .store
+                .unfinished_teardown_lease(
+                    SUPERVISED_JOB_ID,
+                    SUPERVISED_RUN_ATTEMPT,
+                    spur_core::step::STEP_BATCH,
+                )
+                .expect("read lease")
+                .filter(|lease| lease.hook.is_some());
+            if leased.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let lease = leased.expect("the supervisor leases its node while the epilog runs");
+        assert_eq!(lease.phase, TeardownPhase::Epilog);
+        let hook = lease
+            .hook
+            .clone()
+            .expect("the lease names the epilog's leader");
+        assert!(teardown_lease::is_the_hooks_group(&hook).expect("scan for the epilog"));
+        assert_eq!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(hook.pid as i32)))
+                .expect("group of the epilog")
+                .as_raw(),
+            hook.pid as i32,
+            "the epilog must lead a group the agent can kill whole"
+        );
+        assert!(matches!(
+            teardown_lease::reclaim_decision(
+                Some(&lease),
+                teardown_lease::boot_ms().expect("clock")
+            ),
+            teardown_lease::ReclaimDecision::Defer(_)
+        ));
+
+        fs::write(&release, "").expect("release the epilog");
+        let outcome = allocation.finish().await;
+
+        let AgentNotification::StepdCompleted { epilog_failed, .. } = outcome.notice;
+        assert!(!epilog_failed);
+        assert_eq!(
+            teardown_lease::read(&outcome.session_dir).expect("read lease"),
+            None,
+            "a finished teardown must not keep the node leased"
+        );
+        assert!(!teardown_lease::is_the_hooks_group(&hook).expect("scan for the epilog"));
     }
 
     struct ExitedTerminal {

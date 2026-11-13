@@ -51,11 +51,21 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-shear
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-shear@1.14.0
       - name: Check for unused dependencies
         run: cargo shear --locked --deny-warnings
+
+  knowledge-sync:
+    name: Knowledge Base Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check knowledge base sync
+        run: scripts/check-knowledge-sync.sh
 
   fmt:
     runs-on: ubuntu-latest
@@ -103,7 +113,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -244,7 +254,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-llvm-cov
 
@@ -275,7 +285,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -299,6 +309,7 @@ jobs:
           build-args: |
             BUILD_MPI_PLUGIN=1
           outputs: type=docker,dest=/tmp/spur-image.tar
+          no-cache-filters: runtime
           cache-from: type=registry,ref=${{ steps.cacheref.outputs.ref }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max,ignore-error=true', steps.cacheref.outputs.ref) || '' }}
 
@@ -336,6 +347,7 @@ jobs:
           mkdir -p "$root/examples"
           cp -r tests "$root/"
           cp -r scripts "$root/"
+          cp -r proto "$root/"
           cp -r examples/k8s "$root/examples/"
 
       - name: Upload E2E assets
@@ -361,11 +373,14 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/spur-image.tar
 
+      - name: Install Trivy
+        uses: $/.github/actions/install-trivy
+
       - name: Scan image for vulnerabilities and secrets
         id: scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: v0.74.0
+          skip-setup-trivy: true
           image-ref: spur:ci
           scanners: vuln,secret
           format: sarif
@@ -377,7 +392,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image

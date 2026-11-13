@@ -29,8 +29,34 @@ pub fn rpc_stats_to_proto(snap: &RpcStatsSnapshot) -> RpcStats {
     RpcStats { by_operation }
 }
 
+pub fn preemption_usage_to_proto(
+    usage: &spur_core::preemption_usage::PreemptionUsage,
+) -> spur_proto::proto::PreemptionUsage {
+    spur_proto::proto::PreemptionUsage {
+        used: usage.used,
+        unused: usage.unused_total(),
+        open: usage.open,
+        unused_by_cause: usage
+            .unused
+            .iter()
+            .flat_map(|(reason, counts)| {
+                counts.iter().map(move |(initiator, count)| {
+                    spur_proto::proto::UnusedPreemptionCount {
+                        reason: reason.as_str().into(),
+                        initiator: initiator.as_str().into(),
+                        count: *count,
+                    }
+                })
+            })
+            .collect(),
+    }
+}
+
 pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
     SchedStats {
+        preemption_usage: Some(preemption_usage_to_proto(&snap.preemption_usage)),
+        preemption_exports_pending: snap.preemption_exports_pending,
+        preemption_export_oldest_secs: snap.preemption_export_oldest_secs,
         plugin: snap.plugin.clone(),
         cycles: snap.cycles,
         cycle_total_time_us: snap.cycle_total_time_us,
@@ -170,15 +196,19 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: i as u64,
             });
         }
         ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb,
             gpus,
             generic: Default::default(),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -302,6 +332,9 @@ mod tests {
     #[test]
     fn sched_proto_matches_http_gauges() {
         let snap = SchedStatsSnapshot {
+            preemption_usage: Default::default(),
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 10,
             cycle_total_time_us: 5000,

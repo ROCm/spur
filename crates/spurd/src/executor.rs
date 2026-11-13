@@ -21,6 +21,7 @@ use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
 use crate::device_cgroup;
+use crate::step_resources::StepLimits;
 
 /// Typed launch errors so callers can distinguish a broken node from a job that
 /// simply cannot run here.
@@ -113,7 +114,7 @@ pub(crate) fn classify_spool_error(
 use crate::container::ContainerConfig;
 
 /// Cgroup root for slurmd-managed jobs.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
 /// Node-local spool root for spurd's per-job scratch (job script, namespace
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
@@ -193,6 +194,8 @@ pub struct JobLaunchConfig {
     /// Isolating it would make it PID 1 of a namespace, where the kernel drops
     /// unhandled signals and nothing can then tear it down.
     pub allocation_holder: bool,
+    /// What a numbered step narrows the job's limits to; empty for any other launch.
+    pub step_limits: StepLimits,
 }
 
 pub struct LaunchResult {
@@ -622,6 +625,7 @@ async fn spawn_job_process(
         memory_mb,
         cpu_ids,
         device_paths,
+        &cfg.step_limits,
     )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
@@ -1109,6 +1113,22 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     if let Some(quota) = limits.cpu_quota_us {
         files.push(("cpu.max", format!("{} {}", quota, limits.cpu_period_us)));
     }
+    files.extend(memory_limit_files(limits));
+    files.push(("pids.max", limits.pids_max.to_string()));
+    if !limits.cpuset_cpus.is_empty() {
+        let cpuset = limits
+            .cpuset_cpus
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        files.push(("cpuset.cpus", cpuset));
+    }
+    files
+}
+
+fn memory_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = Vec::new();
     if let Some(bytes) = limits.memory_max_bytes {
         files.push(("memory.max", bytes.to_string()));
     }
@@ -1121,17 +1141,55 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     if limits.oom_kill_job {
         files.push(("memory.oom.group", "1".to_string()));
     }
-    files.push(("pids.max", limits.pids_max.to_string()));
-    if !limits.cpuset_cpus.is_empty() {
-        let cpuset = limits
-            .cpuset_cpus
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        files.push(("cpuset.cpus", cpuset));
+    files
+}
+
+/// A step's own control files. Memory is sized exactly as a job's is; the CPU
+/// cap is always a quota, since the step shares its job's cpuset.
+fn step_limit_files(cgroup: &CgroupConfig, step: &StepLimits) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = Vec::new();
+    let Some(sized) = cgroup.limits_for(step.cpus.unwrap_or(1), step.memory_mb.unwrap_or(0), &[])
+    else {
+        return files;
+    };
+    if let Some(cpus) = step.cpus {
+        let quota = u64::from(cpus) * sized.cpu_period_us;
+        files.push(("cpu.max", format!("{quota} {}", sized.cpu_period_us)));
+    }
+    if step.memory_mb.is_some() {
+        files.extend(memory_limit_files(&sized));
     }
     files
+}
+
+/// Narrow a step's leaf to what the step asked for. Each limit was explicitly
+/// requested, so one that cannot be applied refuses the step instead of degrading.
+fn apply_step_limits(
+    step_path: &Path,
+    cgroup: &CgroupConfig,
+    step: &StepLimits,
+    device_paths: &[String],
+) -> anyhow::Result<()> {
+    let applied = (|| -> anyhow::Result<()> {
+        for (name, content) in step_limit_files(cgroup, step) {
+            std::fs::write(step_path.join(name), &content)
+                .with_context(|| format!("write the step's {name}"))?;
+        }
+        // The job's filter stays attached above and the kernel requires both to
+        // allow an open, so this can only take devices away from the step.
+        if step.gpus.is_some() {
+            let paths =
+                device_cgroup::device_paths_for_job(device_paths, &cgroup.extra_device_paths);
+            let rules =
+                device_cgroup::rules_for_device_paths(&paths, device_cgroup::stat_device_node);
+            device_cgroup::install_device_filter(step_path, &rules)?;
+        }
+        Ok(())
+    })();
+    if applied.is_err() {
+        let _ = std::fs::remove_dir(step_path);
+    }
+    applied.context("[cgroup] the step's own limits could not be applied")
 }
 
 /// No injection plan means no devices were allocated, and must stay an empty list:
@@ -1244,6 +1302,7 @@ pub(crate) fn setup_cgroup(
     memory_mb: u64,
     cpu_ids: &[u32],
     device_paths: &[String],
+    step_limits: &StepLimits,
 ) -> anyhow::Result<Option<PathBuf>> {
     let CgroupScope {
         job_id,
@@ -1251,6 +1310,9 @@ pub(crate) fn setup_cgroup(
         step_id,
     } = scope;
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
+        if !step_limits.is_empty() {
+            anyhow::bail!("[cgroup] the step asked for its own limits but cgroups are disabled");
+        }
         debug!(job_id, "cgroup enforcement disabled by config");
         return Ok(None);
     };
@@ -1261,7 +1323,18 @@ pub(crate) fn setup_cgroup(
     // Anything but the job's own workload joins the job's cgroup rather than
     // configuring it: the limits/device filter there describe the job.
     if !spur_core::step::owns_job_lifetime(step_id) {
-        return join_job_cgroup(&cgroup_root, scope, cgroup, &cgroup_path);
+        let joined = join_job_cgroup(&cgroup_root, scope, cgroup, &cgroup_path)?;
+        if step_limits.is_empty() {
+            return Ok(joined);
+        }
+        let step_path = step_cgroup_path_for(&cgroup_root, job_id, run_attempt, step_id);
+        if joined.as_deref() != Some(step_path.as_path()) {
+            anyhow::bail!(
+                "[cgroup] the step asked for its own limits but has no cgroup of its own"
+            );
+        }
+        apply_step_limits(&step_path, cgroup, step_limits, device_paths)?;
+        return Ok(joined);
     }
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
@@ -1293,6 +1366,11 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
+    // io only gives each job an io.stat for disk accounting; no limits depend on
+    // it, so a kernel without it is not a degrade.
+    if let Err(e) = std::fs::write(&subtree, "+io") {
+        debug!(job_id, error = %e, "io controller not delegated; no per-job disk I/O stats");
+    }
     // Claiming reaps whatever is in the directory, which only the step owning the
     // job's lifetime may do — user steps took the join path above.
     if let Err(e) = claim_cgroup_dir(&cgroup_path) {
@@ -1310,8 +1388,8 @@ pub(crate) fn setup_cgroup(
         }
     }
 
-    // Core ids come from a synthesized 0..n range, which can name cores this
-    // cgroup may not hold. Drop those rather than let the whole write fail.
+    // Core ids may name CPUs this cgroup does not hold (offline, or excluded
+    // from the root). Drop those rather than let the whole write fail.
     if !limits.cpuset_cpus.is_empty() {
         match std::fs::read_to_string(cgroup_root.join("cpuset.cpus.effective")) {
             Ok(effective) => {
@@ -2668,8 +2746,7 @@ mod cpuset_tests {
 
     #[test]
     fn drops_cores_the_parent_cgroup_does_not_hold() {
-        // Core ids are synthesized from a count, so a sparse online mask can name
-        // cores that do not exist. Writing one fails ERANGE, leaving it unbounded.
+        // Writing a CPU the parent does not hold fails ERANGE, leaving it unbounded.
         assert_eq!(permitted_cores(&[0, 1, 99], "0-3"), vec![0, 1]);
         assert_eq!(permitted_cores(&[64, 65], "0-63"), Vec::<u32>::new());
     }
@@ -2785,6 +2862,96 @@ mod cgroup_guard_tests {
     fn cleanup_of_a_missing_cgroup_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         cleanup_cgroup(&dir.path().join("job_5"));
+    }
+}
+
+#[cfg(test)]
+mod step_limit_files_tests {
+    use super::{setup_cgroup, step_limit_files, CgroupScope, StepLimits};
+    use spur_core::config::CgroupConfig;
+
+    fn get<'a>(files: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        files
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn a_step_that_asked_for_nothing_writes_nothing() {
+        assert!(step_limit_files(&CgroupConfig::default(), &StepLimits::default()).is_empty());
+    }
+
+    #[test]
+    fn a_cpu_request_is_a_quota_even_when_jobs_get_none() {
+        let step = StepLimits {
+            cpus: Some(3),
+            ..Default::default()
+        };
+        let files = step_limit_files(&CgroupConfig::default(), &step);
+        assert_eq!(files, [("cpu.max", "300000 100000".to_string())]);
+    }
+
+    #[test]
+    fn a_memory_request_is_sized_like_a_jobs_and_kills_only_the_step() {
+        let cfg = CgroupConfig {
+            allowed_ram_percent: 150,
+            ..CgroupConfig::default()
+        };
+        let step = StepLimits {
+            memory_mb: Some(1024),
+            ..Default::default()
+        };
+        let files = step_limit_files(&cfg, &step);
+        let high = (1024u64 * 1024 * 1024).to_string();
+        let max = (1536u64 * 1024 * 1024).to_string();
+        assert_eq!(get(&files, "memory.high"), Some(high.as_str()));
+        assert_eq!(get(&files, "memory.max"), Some(max.as_str()));
+        assert_eq!(get(&files, "memory.oom.group"), Some("1"));
+        assert_eq!(get(&files, "cpu.max"), None, "no CPU request, no CPU cap");
+        assert_eq!(
+            get(&files, "pids.max"),
+            None,
+            "the job's pids.max still applies"
+        );
+        assert_eq!(
+            get(&files, "cpuset.cpus"),
+            None,
+            "the step shares the job's cpuset"
+        );
+    }
+
+    #[test]
+    fn a_gpu_only_request_writes_no_control_files() {
+        let step = StepLimits {
+            gpus: Some(vec![3]),
+            ..Default::default()
+        };
+        assert!(step_limit_files(&CgroupConfig::default(), &step).is_empty());
+    }
+
+    #[test]
+    fn step_limits_are_refused_rather_than_dropped_when_cgroups_are_off() {
+        let disabled = CgroupConfig {
+            enabled: false,
+            ..CgroupConfig::default()
+        };
+        let scope = CgroupScope {
+            job_id: 1,
+            run_attempt: 0,
+            step_id: 0,
+        };
+        let step = StepLimits {
+            memory_mb: Some(64),
+            ..Default::default()
+        };
+        let err = setup_cgroup(scope, &disabled, 1, 0, &[], &[], &step).unwrap_err();
+        assert!(err.to_string().contains("cgroups are disabled"), "{err}");
+        assert_eq!(
+            setup_cgroup(scope, &disabled, 1, 0, &[], &[], &StepLimits::default()).unwrap(),
+            None,
+            "a step without limits of its own still runs unconfined"
+        );
     }
 }
 
@@ -3748,6 +3915,7 @@ mod tests {
         JobLaunchConfig {
             joins_parent_namespaces: false,
             allocation_holder: false,
+            step_limits: Default::default(),
             step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,

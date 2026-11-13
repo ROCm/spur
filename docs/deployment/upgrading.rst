@@ -13,6 +13,37 @@ and the Ansible playbooks that upgrade a running cluster with or without an outa
    binaries on disk — it does **not** restart the daemons. The drain-aware, jobs-preserving
    cluster path is the Ansible ``rolling_upgrade.yml`` playbook (see below).
 
+Preemption accounting compatibility
+-----------------------------------
+
+The preemption-outcome feature adds a ``preemption_usage`` column to accounting
+job history and PostgreSQL checkpoint, aggregate, and cause tables.
+The accounting service creates these automatically; its database role needs the
+same schema-update permissions as for other migrations. Back up the database
+and controller state before upgrading. Counting starts with the upgrade:
+earlier preemptions are not counted.
+
+Upgrade every controller before relying on preemption totals. Older controllers
+can read the new log and snapshot entries but do not update the counts or hold
+finished jobs for export. While an older controller leads, it can evict a
+finished job whose latest counts were never exported; those counts are lost
+from the ``sreport preemptions`` totals for good, and any of its observations
+still open there are closed as ``ended_other`` / ``unknown``.
+
+**Rollback.** An older controller drops the preemption counts from its next
+snapshot: live totals, open observations, and per-job counts reset, and finished
+jobs held for export can be evicted before their counts reach PostgreSQL. The
+PostgreSQL tables and rollups already written stay in place and are ignored by
+the older controller; upgrading again resumes counting from zero in Raft while
+keeping the existing rollups. A job that lives across the rollback and the
+re-upgrade restarts its counts from zero, and its new counts reach the rollups
+only once they exceed what was already exported for it.
+
+Rollups survive job-history cleanup and fairshare resets. Accounting outages
+keep affected finished jobs in the controller, up to 24 hours past
+``terminal_job_retention_secs``, which can increase controller memory and
+snapshot size. See :ref:`preemption-outcome-export`.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 
@@ -29,7 +60,7 @@ Check whether an update is available:
 
 .. code-block:: text
 
-   update available: 0.3.0 → v0.3.1
+   update available: 0.14.0 → v0.15.0
    Run `spur self-update` to install.
 
 Install the update:
@@ -55,7 +86,7 @@ After a successful update the CLI prints:
 
 .. code-block:: text
 
-   Updated spur to v0.3.1
+   Updated spur to v0.15.0
    Note: Restart running daemons (spurctld, spurd, spurauthd) to use the new version.
 
 .. warning::
@@ -120,7 +151,7 @@ Pass ``nightly`` or a pinned ``vX.Y.Z`` to select a specific release, or set
 .. code-block:: bash
 
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- nightly
-   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- v0.3.1
+   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- v0.15.0
 
 Like ``spur self-update``, ``install.sh`` does not manage systemd units or restart
 daemons. Restart ``spurctld`` and ``spurd`` yourself after re-installing.
@@ -138,7 +169,7 @@ unable to parse a log written by a differently-versioned peer:
 
 .. code-block:: bash
 
-   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
 
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
@@ -158,7 +189,7 @@ or when a short blip is acceptable:
 
 .. note::
 
-   Spur 0.3.0 has no online Raft membership change. Adding, removing, or reordering a
+   Spur has no online Raft membership change. Adding, removing, or reordering a
    **controller** fails early unless you also pass ``-e spur_wipe_state=true`` (a Raft
    reinit that wipes state). Compute agents are not Raft members, so they can be added or
    removed freely without a wipe.
@@ -335,7 +366,7 @@ Follow this order for any cluster upgrade:
    ``spurstepd`` to carry running jobs across instead (see :ref:`upgrading-in-place`).
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
    Wiping resets the Raft job-id counter and destroys accounting history.
-5. **HA membership is fixed at init** in Spur 0.3.0. You can roll new binaries onto the
+5. **HA membership is fixed at init.** You can roll new binaries onto the
    existing controller set freely, but changing *which* hosts are controllers requires
    ``deploy.yml -e spur_wipe_state=true``.
 6. **Only roll forward across an accounting schema migration.** The first upgraded
@@ -571,6 +602,12 @@ Without ``private_data``, ``scancel -p``, ``-A``, or ``-n`` also selects other
 users' jobs. Each one the caller does not own is refused and reported on
 ``stderr``.
 
+A cluster that already sets ``"jobs"`` now also hides other users' ``sacct``
+history and ``sreport job`` sizes. A cluster that already sets ``"usage"`` now
+also hides other users' ``sshare`` and ``sreport`` utilization figures. ``sprio``
+stays with ``"jobs"``. Set the categories only where that narrower view is what
+you want, and upgrade ``spur-cli`` together with ``spurctld``.
+
 ``scontrol reconfigure`` applies ``private_data`` on the leader only; restart every
 controller after changing it. During a rolling upgrade, visibility depends on which
 controller serves the request, but it is never wider than the new configuration
@@ -708,6 +745,289 @@ The field is live and applies on ``scontrol reconfigure``. Jobs submitted while
 an older controller ran carry no keepalive mark, so they are reaped only if
 their client pings the upgraded controller. ``scontrol show config`` prints the
 value in effect as ``InactiveLimit``. See :ref:`inactive-limit`.
+
+GPU partition identities (CPX, QPX, DPX)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes the allocation id (``stable_id``) of partitions 1 and up of a
+GPU that runs in a partitioned compute mode. Partition 0 and GPUs in SPX mode keep
+their ids. The id is the GPU allocation key in the Raft log and in the job state of
+``spurd``. Old log entries still deserialize.
+
+The ids change when ``spurd`` regenerates the CDI spec (``spur k8s up``), or at a
+restart on a node that has no ``/etc/cdi/amd.json``. A binary swap alone does not
+change them while that file exists.
+
+.. note::
+
+   ``spurd`` carries a running job's GPU ids across this change, both at a
+   restart and when it rewrites the CDI spec: it saves the last
+   controller-acknowledged inventory to disk and recognizes the old encoding
+   against it, or, on the first restart after upgrade with no saved inventory
+   yet, recognizes the old encoding directly. When the node re-registers, the
+   controller remaps the job's allocation to the new ids. Upgrade the
+   controllers before the agents: an older controller does not remap
+   allocations when a node re-registers, and an upgraded agent then rejects
+   dispatches with
+   ``controller-allocated GPUs are not in this node's gpu inventory``.
+   With the controllers upgraded first, jobs keep running, no
+   dispatch rejection or ``JobHoldMaxRequeue`` hold results, and draining
+   nodes is no longer required for the GPU id change. See
+   :ref:`gpu-partition-mode-change` for the separate, still-destructive case
+   of actually switching a GPU's partition mode.
+
+Bounded controller shutdown (``shutdown_grace_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After ``SIGTERM``, ``spurctld`` now waits at most ``[controller] shutdown_grace_secs``
+(default 10s) for in-flight RPCs to drain, then flushes accounting and exits. Previously it
+waited on every in-flight RPC with no bound, and an ``srun`` step holds its RPC open for the
+step's whole runtime, so restarting a controller while a step ran (for example during
+``rolling_upgrade.yml``) hung until systemd's ``TimeoutStopSec`` killed it, skipping the
+accounting flush.
+
+A step still running when the grace period ends keeps running on its node. A buffered
+``srun`` re-attaches to it if it reconnects to the restarted controller within its retry
+window, and otherwise exits with an error while the step runs on; see
+:ref:`srun-controller-restart`. ``srun --pty`` follows a different path and is not covered.
+Accounting for requests still in flight at that point is best-effort: anything they write
+after the flush is lost.
+
+The default suits most sites. Keep it well below ``heartbeat_timeout_secs``: the controller
+answers no heartbeats while it drains, so a grace within about 35 seconds of that timeout
+lets a full drain mark nodes DOWN and fail their jobs. ``0`` restores the unbounded wait,
+which can run past that timeout too, and which a repeated ``SIGTERM`` or ``SIGINT`` does not
+end; only ``SIGKILL`` does. ``spurctld`` warns at startup in either case. Keep the grace,
+plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step that
+finishes during the drain does not end it, so raising the value mostly lengthens the
+restart. A new value takes effect at the next start.
+
+.. _requeued-run-upgrade-notes:
+
+Stopping a requeued job's run on a recovered node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
+with ``--requeue`` goes back to the queue, but the job's nodes are not told to
+stop when they go Down. From this release, the controller stops that run when a
+node heartbeats again, even while the job is still waiting in the queue. Before,
+a node kept the run and its GPUs until the job ended or ran again, and refused
+every job placed on those GPUs in the meantime.
+
+Stopping the run on heartbeat needs both an upgraded controller and an upgraded
+agent on that node, which reports the run it holds; with either side from an
+earlier release, the old behavior stays. An upgraded agent also stops the old
+run's processes, including its ``srun`` steps, when the job is placed back on
+the same node, which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
+when not running as root).
+
+Before accepting a replacement attempt, the agent fences every older attempt
+it can discover in its tracked sessions, persisted session descriptors, and
+``/sys/fs/cgroup/spur/job_<id>_<attempt>`` directories. This includes attempts
+with reused step IDs after a restart and orphan cgroups without descriptors.
+It kills old workloads and removes their complete cgroup trees, including the
+parent job cgroup. Same or newer attempts and other jobs are left alone.
+Batch launches and allocation registration are refused if an old cgroup cannot
+be removed or an old session descriptor cannot be read; the old reservation is
+not replaced. Step startup is serialized with this cleanup so an old step
+cannot recreate a cgroup during replacement.
+Completed steps keep their recorded exit status when a replacement reclaims
+their retained sessions. An unreadable exit record also refuses replacement.
+
+.. _kill-wait-upgrade-notes:
+
+Kill waits and the time-limit completing state (``kill_wait_secs``, ``timeout_kill_wait_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release makes the wait between SIGTERM and SIGKILL configurable with two
+settings. ``scheduler.kill_wait_secs`` (default ``5``) covers ``scancel``,
+``scontrol requeue``, the final kill of a preemption, idle-fill reclaim,
+reservation end, the stop of a finished batch script's other nodes and the other
+graceful stops. ``scheduler.timeout_kill_wait_secs``
+(default ``30``) covers the stops that end ``TIMEOUT``: the time limit and the
+inactivity limit. Both changes apply to a ``spur.conf`` that is not edited, and
+with the defaults most waits are the ones a job had before.
+``scontrol show config`` prints both values in effect as ``KillWait`` and
+``TimeoutKillWait`` (in seconds, floor applied); against a controller older than
+this release it omits them rather than showing a misleading ``0``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Behavior
+     - Before
+     - After
+     - Effect
+   * - ``scancel`` and the final preemption kill
+     - SIGKILL 5 seconds after SIGTERM
+     - SIGKILL up to ``kill_wait_secs`` (5 seconds) after SIGTERM; a job that
+       exits on SIGTERM is gone as soon as it exits
+     - Unchanged by default. Raise ``kill_wait_secs`` to give such jobs longer.
+   * - A batch job at its time limit
+     - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
+       and was SIGKILLed
+     - Moves to ``COMPLETING`` (``CG``) at once, waits up to
+       ``timeout_kill_wait_secs`` (30 seconds), then ends ``TIMEOUT`` with
+       reason ``TimeLimit``
+     - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
+       reason, timing, and ``--requeue`` behavior are unchanged. The job does
+       not yet wait for its ``srun`` steps: it ends once its batch script exits
+       (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       The kill is now the agent's, so a
+       job on a hung or unreachable agent stays in ``CG`` for up to
+       ``complete_wait_secs`` (300 seconds by default) before it ends ``TIMEOUT``,
+       where the controller used to end it 30 seconds after SIGTERM.
+   * - An idle interactive allocation reaped by ``inactive_limit_secs``
+     - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
+       and was SIGKILLed
+     - Normally ends ``TIMEOUT`` within a moment of the SIGTERM, without
+       spending the wait in ``COMPLETING``, as its work runs in ``srun`` steps
+       that the wait does not yet reach (:ref:`kill wait note
+       <kill-wait-steps-caveat>`). Like the batch row above, it stays ``CG``
+       for up to ``complete_wait_secs`` on a hung or unreachable agent.
+     - The allocation is freed sooner than before. ``--requeue`` does not apply.
+   * - A requeued job (requeue-mode preemption, ``scontrol requeue``)
+     - Held out of the queue for ``2 x interval_secs + 3`` seconds (5 seconds
+       with the default 1 second interval)
+     - Held for the larger of that and ``kill_wait_secs``: still 5 seconds with
+       the defaults
+     - Unchanged by default. Raising ``kill_wait_secs`` raises the hold with it,
+       so the job does not restart into its own old run's kill wait.
+   * - An unsupervised ``srun`` step on cancel or at a time limit
+     - SIGKILL after 2 seconds
+     - SIGKILL after the full kill wait that applies: 5 seconds on cancel, 30
+       at a time limit
+     - A step that handles SIGTERM now has time to shut down cleanly, where a
+       stop reaches it (:ref:`kill wait note <kill-wait-steps-caveat>`).
+
+Keep ``complete_wait_secs`` above the larger of the two waits plus
+``[cgroup] cleanup_timeout_secs`` (60 seconds by default). A node reports only
+after the job is killed and its cgroup cleanup finishes, so a shorter
+``complete_wait_secs`` force-finishes the job while healthy nodes are still
+working, and every node that has not reported is drained. The controller logs a
+warning on startup and on reconfigure. The warning uses the controller's own
+``[cgroup] cleanup_timeout_secs``, so set it there to the largest value any
+node uses. ``kill_wait_secs`` and ``timeout_kill_wait_secs`` both accept
+``0``-``65533``, and a value below 5 acts as 5. See
+:doc:`/admin-guide/configuration` for the fields, including a
+known issue with requeue: a requeued job frees its nodes while the old run is
+still in its kill wait, so keep ``kill_wait_secs`` low if that matters with
+requeue-mode preemption.
+
+**Upgrade the leader last.** Every time limit and every inactivity-limit
+expiry now writes a new Raft log entry, ``JobTimeLimitExpired``. A controller
+that predates it cannot parse the entry and stops replicating until it is
+upgraded, so the order in :ref:`upgrading-leader-last` applies, and a rollback
+after the entry has been written is not supported: roll forward.
+
+**Time-limited jobs during the rolling upgrade.** The controller sends the kill
+wait with each cancel, and an agent that predates it ignores the value and
+waits a fixed 5 seconds. Controllers are upgraded before agents, so a job that
+reaches its time limit on a node that is not yet upgraded gets 5 seconds
+between SIGTERM and SIGKILL instead of the 30 it had before, which can be too
+short for a checkpoint. Upgrade the agents promptly, or drain the nodes still
+on the old build before their jobs' limits arrive. Once a node is upgraded the
+job gets the full ``timeout_kill_wait_secs``.
+
+.. _preempt-grace-upgrade-notes:
+
+Preemption grace time (``GraceTime``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release makes the per-QOS ``GraceTime`` take effect and adds a per-partition
+``GraceTime`` (see :ref:`preemption grace time <qos-preempt-grace>`). A victim's
+grace is its QOS value if set, else the highest value among the partitions it runs
+in, else ``0``. Nothing is set by default, so nothing changes until an administrator sets
+one.
+
+**Upgrade every controller before setting a partition ``GraceTime``.** The
+partition's ``grace_time`` is a new field in the partition entries of the Raft
+log and snapshots, including the entry that
+``scontrol update partition GraceTime=`` writes. A controller that predates it ignores the field, so a
+change applied while a follower is not upgraded is lost on that follower, which
+would lack the grace if it became leader, until it replays from a new snapshot.
+This is already required before setting a QOS ``GraceTime`` (see below).
+
+**Upgrade the leader last.** The first preemption that starts a grace writes a
+new Raft log entry, ``JobPreemptSignaled``. A controller that predates it
+cannot parse the entry and stops replicating until it is upgraded, so the order
+in :ref:`upgrading-leader-last` applies, and a rollback after the entry has been
+written is not supported: roll forward. The entry is written only when a
+``GraceTime`` greater than ``0`` is in use.
+
+**Upgrade controllers and agents before setting ``GraceTime``.** A node whose
+``spurd`` predates this release does not advertise the ``signal-job``
+capability. A victim on such a node gets no grace and is preempted at once, and
+the controller logs a warning naming the node, so setting ``GraceTime`` before
+the agents are upgraded silently does nothing for jobs on those nodes.
+
+**Kubernetes operator nodes get no grace.** Victims on nodes managed by
+``spur-k8s`` are preempted at once whatever the QOS or partition ``GraceTime``.
+
+The ``grace_time`` column is added to the QOS table automatically with
+``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
+ignores it.
+
+Preemption handoff
+~~~~~~~~~~~~~~~~~~
+
+Cancel and requeue preemption now hold the nodes they free for the job that
+triggered the eviction, so other pending jobs no longer take them in the gap
+(see :doc:`../admin-guide/configuration`). No configuration change is needed
+and no new Raft entry type is added: the requeue entry gains an optional
+``handoff`` field that a controller predating it ignores.
+
+During a rolling upgrade a controller that predates this release does not hold
+the nodes, so the protection applies only once the leader runs the new build.
+Victim selection also counts nodes that a draining job has already released,
+which changes ordinary preemption as well.
+
+.. _upgrading-partition-resource-limits:
+
+Partition resource limits
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds per-partition resource caps and memory limits (see
+:doc:`/admin-guide/partition-resource-limits`). Existing ``spur.conf`` files
+behave as before: with no limit set, nothing changes, and
+``enforce_part_limits`` keeps its meaning for wall time.
+
+Jobs already running when you upgrade have no recorded partition. Once a cap
+is set, each one is charged to the highest-``priority_tier`` partition it
+requested, which is the partition it ran in unless it listed several.
+
+.. warning::
+
+   **Upgrade every controller replica before you configure any cap or memory
+   knob**, whether in ``spur.conf``, with ``scontrol``, or through the API.
+   An older replica ignores the new fields, so it diverges from the leader:
+
+   - It schedules without the caps if it becomes leader.
+   - It ignores the adjusted request a ``def_mem_*`` or ``max_mem_*`` knob
+     records when a job starts, so its copy of the job keeps the original
+     CPU and memory request.
+   - It cannot load a Raft snapshot holding a job blocked by a cap, whose
+     ``PartitionTresLimit`` pending reason it does not know, either on
+     restart or when the leader sends one to catch it up.
+
+**Rolling back.** Once a cap has blocked a job, a controller from an earlier
+release cannot load the snapshot. To downgrade:
+
+#. Remove every cap and memory knob (``spur.conf`` plus ``scontrol
+   reconfigure``, or ``scontrol update``).
+#. Wait until no job carries the ``PartitionTresLimit`` reason. A job keeps
+   its last pending reason after it ends, so this includes finished jobs:
+   wait until no pending job shows the reason, then at least
+   ``controller.terminal_job_retention_secs`` (default one hour) more, so
+   finished jobs that had it are evicted.
+#. Wait for a new Raft snapshot: on every controller,
+   ``<state_dir>/raft/snapshot.json`` must be newer than the end of the
+   previous step. A snapshot is taken every 5000 Raft log entries, so on a
+   quiet cluster this can take a while; job submissions and completions
+   move it along.
+#. Downgrade the controllers.
 
 See Also
 --------

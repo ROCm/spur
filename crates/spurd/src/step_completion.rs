@@ -96,17 +96,48 @@ impl StepCompletions {
         step_id: StepId,
         outcome: StepOutcome,
     ) -> bool {
+        self.complete_inner(job_id, run_attempt, step_id, outcome, false)
+            .await
+    }
+
+    /// Fencing supplies an outcome only when no completion has already settled.
+    /// A racing completion must keep the same answer for the memo and its waiter.
+    pub(crate) async fn complete_if_unsettled(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: StepId,
+        outcome: StepOutcome,
+    ) -> bool {
+        self.complete_inner(job_id, run_attempt, step_id, outcome, true)
+            .await
+    }
+
+    async fn complete_inner(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: StepId,
+        outcome: StepOutcome,
+        preserve_settled: bool,
+    ) -> bool {
         let key = (job_id, run_attempt, step_id);
         let now = Instant::now();
         let mut settled = self.settled.lock().await;
-        settled.retain(|entry| entry.key != key);
-        settled.push_back(SettledStep {
-            key,
-            outcome,
-            settled_at: now,
+        let retained = settled
+            .iter()
+            .find(|entry| preserve_settled && entry.key == key)
+            .map(|entry| entry.outcome);
+        let outcome = retained.unwrap_or_else(|| {
+            settled.retain(|entry| entry.key != key);
+            settled.push_back(SettledStep {
+                key,
+                outcome,
+                settled_at: now,
+            });
+            outcome
         });
         evict_settled(&mut settled, now);
-        drop(settled);
 
         let Some(sender) = self.waiters.lock().await.remove(&key) else {
             return false;
@@ -314,6 +345,60 @@ mod tests {
         completions.complete(42, 1, 0, rerun).await;
 
         assert_eq!(completions.settled(42, 1, 0).await, Some(rerun));
+    }
+
+    #[tokio::test]
+    async fn fencing_preserves_a_completion_while_its_waiter_is_being_delivered() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let completions = StepCompletions::new();
+        let mut waiter = completions.register(42, 1, 0).await;
+        let waiters = completions.waiters.lock().await;
+        let mut completion = std::pin::pin!(completions.complete(42, 1, 0, OUTCOME));
+        poll_fn(|cx| {
+            assert!(completion.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let fallback = StepOutcome {
+            exit_code: 0,
+            signal: 9,
+        };
+        let mut fence = std::pin::pin!(completions.complete_if_unsettled(42, 1, 0, fallback));
+        poll_fn(|cx| {
+            assert!(fence.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        drop(waiters);
+        assert_eq!(tokio::join!(completion, fence), (true, false));
+        assert_eq!(
+            waiter.try_recv().expect("recorded outcome delivered"),
+            OUTCOME
+        );
+        assert_eq!(completions.settled(42, 1, 0).await, Some(OUTCOME));
+    }
+
+    #[tokio::test]
+    async fn a_late_completion_replaces_a_fencing_fallback() {
+        let completions = StepCompletions::new();
+        completions
+            .complete_if_unsettled(
+                42,
+                1,
+                0,
+                StepOutcome {
+                    exit_code: 0,
+                    signal: 9,
+                },
+            )
+            .await;
+
+        completions.complete(42, 1, 0, OUTCOME).await;
+
+        assert_eq!(completions.settled(42, 1, 0).await, Some(OUTCOME));
     }
 
     #[tokio::test]

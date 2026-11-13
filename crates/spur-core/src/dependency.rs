@@ -298,7 +298,9 @@ pub fn check_dependencies(
                 let matching = get_jobs_by_name_user(&job.spec.name, &job.spec.user);
                 let has_active = matching.iter().any(|j| {
                     j.job_id != job.job_id
-                        && (j.state == JobState::Running || j.state == JobState::Pending)
+                        && (j.state == JobState::Running
+                            || j.state == JobState::Pending
+                            || j.is_stopping_for_time_limit())
                 });
                 if has_active {
                     return DependencyResult::Waiting;
@@ -937,5 +939,40 @@ mod tests {
         assert_eq!(Dependency::AfterNotOk(10).target_job_id(), Some(10));
         assert_eq!(Dependency::AfterCorr(11).target_job_id(), Some(11));
         assert_eq!(Dependency::Singleton.target_job_id(), None);
+    }
+
+    fn singleton_waits(predecessor: Job) -> bool {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "train".into(),
+                user: "alice".into(),
+                dependency: vec!["singleton".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|_, _| {
+            vec![predecessor.clone()]
+        });
+        result == DependencyResult::Waiting
+    }
+
+    #[test]
+    fn singleton_waits_for_a_predecessor_still_inside_its_time_limit_kill_wait() {
+        let mut predecessor = make_job(2, JobState::Completing);
+        predecessor.time_limit_signaled_at = Some(chrono::Utc::now());
+        assert!(singleton_waits(predecessor));
+    }
+
+    #[test]
+    fn singleton_ignores_a_cancelled_completing_predecessor() {
+        let mut predecessor = make_job(2, JobState::Completing);
+        predecessor.cancel_signaled_at = Some(chrono::Utc::now());
+        assert!(!singleton_waits(predecessor));
+    }
+
+    #[test]
+    fn singleton_waits_for_a_running_predecessor() {
+        assert!(singleton_waits(make_job(2, JobState::Running)));
     }
 }

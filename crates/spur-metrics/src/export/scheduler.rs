@@ -4,9 +4,11 @@
 //! Scheduler metric registration for `/metrics/scheduler`.
 
 use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use spur_core::preemption_usage::{PreemptionInitiator, UnusedReason};
 use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
@@ -16,6 +18,12 @@ use crate::scheduler::SchedStatsSnapshot;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PluginLabel {
     plugin: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct UnusedLabels {
+    reason: &'static str,
+    initiator: &'static str,
 }
 
 fn set_plugin_info(registry: &mut Registry, snap: &SchedStatsSnapshot) {
@@ -35,6 +43,46 @@ fn set_plugin_info(registry: &mut Registry, snap: &SchedStatsSnapshot) {
 /// Register scheduler metrics into `registry` from `snap`.
 pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     set_plugin_info(registry, snap);
+    register_counter(
+        registry,
+        "spur_scheduler_preemptions_used",
+        "Victim runs whose released capacity served the requesting launch; durable lifetime total",
+        snap.preemption_usage.used,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_preemptions_open",
+        "Victim runs with released capacity awaiting a requesting launch outcome",
+        snap.preemption_usage.open,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_preemption_exports_pending",
+        "Finished jobs past retention kept until their preemption counts reach accounting",
+        snap.preemption_exports_pending,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_preemption_export_oldest_seconds",
+        "Age of the oldest of those jobs, from its end time",
+        snap.preemption_export_oldest_secs,
+    );
+    let unused = Family::<UnusedLabels, Counter>::default();
+    for reason in UnusedReason::ALL {
+        for initiator in PreemptionInitiator::ALL {
+            unused
+                .get_or_create(&UnusedLabels {
+                    reason: reason.as_str(),
+                    initiator: initiator.as_str(),
+                })
+                .inc_by(snap.preemption_usage.unused_count(reason, initiator));
+        }
+    }
+    registry.register(
+        "spur_scheduler_preemptions_unused",
+        "Victim runs closed without confirmed use by the requesting launch; durable lifetime total",
+        unused,
+    );
 
     register_gauge(
         registry,
@@ -121,6 +169,9 @@ mod tests {
 
     fn sample_snapshot() -> SchedStatsSnapshot {
         SchedStatsSnapshot {
+            preemption_usage: Default::default(),
+            preemption_exports_pending: 0,
+            preemption_export_oldest_secs: 0,
             plugin: "backfill".into(),
             cycles: 10,
             cycle_total_time_us: 5000,
@@ -173,6 +224,41 @@ mod tests {
             "gauge"
         );
         assert!(body.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn preemption_usage_exports_bounded_counter_labels_and_open_gauge() {
+        let mut snap = sample_snapshot();
+        snap.preemption_usage.open_one();
+        snap.preemption_usage.settle(None);
+        snap.preemption_usage.open_one();
+        snap.preemption_usage
+            .settle(Some((UnusedReason::Cancelled, PreemptionInitiator::User)));
+        snap.preemption_usage.open_one();
+        let body = encode_scheduler_metrics(&snap);
+        assert!(body.contains("spur_scheduler_preemptions_used_total 1"));
+        assert!(body.contains("spur_scheduler_preemptions_open 1"));
+        assert!(body.contains(
+            "spur_scheduler_preemptions_unused_total{reason=\"cancelled\",initiator=\"user\"} 1"
+        ));
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_preemptions_used"),
+            "counter"
+        );
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_preemptions_unused"),
+            "counter"
+        );
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_preemptions_open"),
+            "gauge"
+        );
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.starts_with("spur_scheduler_preemptions_unused_total{"))
+                .count(),
+            16
+        );
     }
 
     #[test]

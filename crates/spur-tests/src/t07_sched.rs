@@ -27,7 +27,10 @@ mod tests {
         let pending = vec![make_job_with_resources("train", 2, 64, 1, Some(60))];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -52,7 +55,10 @@ mod tests {
         ];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -76,7 +82,10 @@ mod tests {
         let pending = vec![make_job_with_resources("big", 4, 128, 1, Some(60))];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -96,7 +105,10 @@ mod tests {
         let pending = vec![make_job_with_resources("cpu_heavy", 1, 64, 1, Some(60))];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -119,7 +131,10 @@ mod tests {
         let pending = vec![make_job_with_resources("job", 2, 32, 1, Some(60))];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -145,7 +160,10 @@ mod tests {
         let pending = vec![make_job_with_resources("job", 1, 32, 1, Some(60))];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -175,7 +193,10 @@ mod tests {
         job.spec.partition = Some("gpu".into());
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -319,7 +340,10 @@ mod tests {
         job.spec.exclusive = true;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -346,7 +370,10 @@ mod tests {
         job.spec.exclusive = true;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -371,7 +398,10 @@ mod tests {
         let job = make_job_with_resources("normal", 1, 1, 1, Some(60));
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -397,7 +427,10 @@ mod tests {
         job.spec.constraint = Some("gpu".into());
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -427,7 +460,10 @@ mod tests {
         job.spec.constraint = Some("gpu".into());
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -492,7 +528,10 @@ mod tests {
         let partitions = vec![make_partition("default", 2)];
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -513,7 +552,10 @@ mod tests {
         let partitions = vec![make_partition("default", 2)];
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -573,7 +615,10 @@ mod tests {
         // A job with no reservation spec should NOT land on node001.
         let job = make_job_with_resources("regular-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -611,7 +656,10 @@ mod tests {
         job.spec.user = "bob".into();
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -633,7 +681,10 @@ mod tests {
         let partitions = vec![make_partition("default", 4)];
         let job = make_job_with_resources("free-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -656,7 +707,10 @@ mod tests {
         job.spec.num_nodes = 0;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -678,7 +732,10 @@ mod tests {
         let job = make_job("simple");
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -704,7 +761,10 @@ mod tests {
         job.spec.constraint = Some("gpu".into());
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -731,7 +791,10 @@ mod tests {
         job.spec.exclusive = true;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -759,7 +822,10 @@ mod tests {
         job.spec.num_tasks = 1;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -789,7 +855,10 @@ mod tests {
         job.spec.num_tasks = 1;
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -839,7 +908,10 @@ mod tests {
         ]);
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -903,7 +975,10 @@ mod tests {
         ]);
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -946,7 +1021,10 @@ mod tests {
         ]);
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -989,7 +1067,10 @@ mod tests {
         ]);
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1041,7 +1122,10 @@ mod tests {
         let pending = vec![make_job("test-immediate")];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1067,7 +1151,10 @@ mod tests {
         let pending = vec![job];
 
         let cluster = ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

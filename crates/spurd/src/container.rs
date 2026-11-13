@@ -1160,6 +1160,9 @@ pub fn container_init(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
     #[test]
     fn the_same_reference_is_the_same_image() {
         assert!(same_image("docker://alpine", "docker://alpine", 1000));
@@ -1188,9 +1191,6 @@ mod tests {
         assert!(same_image(image, link, 1000));
         assert!(!same_image(image, other, 1000));
     }
-
-    use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
     /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
     /// env var). Cargo runs tests in parallel within a binary, so without

@@ -66,14 +66,25 @@ the accounting admin level never applies on a node. They use
 JWT ``admin`` claim or verified UID 0, when deciding who may attach to, exec
 in, or stream a job.
 
-By default every caller sees every job and every ``scontrol show assoc_mgr``
-scope, as a stock ``slurm.conf`` does. ``[auth] private_data`` narrows this,
-matching Slurm's ``PrivateData``: ``"jobs"`` pins a User's job reads to their
-own jobs, and ``"usage"`` pins ``scontrol show assoc_mgr`` to the scopes they
-take part in. Operators and Administrators are exempt. A caller with no verified
-identity is not restricted either, so ``private_data`` is enforceable only under
-``plugin = "spur"`` with ``mode = "required"``. See :ref:`private-data` for the
-full list of affected commands.
+By default every caller sees every job, every user and account, every
+reservation, and every ``scontrol show assoc_mgr`` scope, as a stock
+``slurm.conf`` does. ``[auth] private_data`` narrows this, matching Slurm's
+``PrivateData``: ``"jobs"`` pins a User's job reads, including ``sacct``,
+``sprio``, and ``sreport job`` sizes, to their own jobs, ``"usage"`` pins
+``scontrol show assoc_mgr`` and the usage and fairshare figures in ``sshare``
+and ``sreport`` utilization (the user and account rows of those commands follow
+``"users"`` and ``"accounts"``; see :ref:`private-data`), ``"users"`` pins
+``sacctmgr show user`` to the caller, ``"accounts"`` shows a coordinator only
+the accounts they coordinate, and ``"reservations"`` pins ``scontrol show
+reservation``. A coordinator also sees jobs, usage, and associations in those
+accounts. Operators and Administrators are exempt. A caller with no verified
+identity is not restricted
+either, so ``private_data`` is enforceable only under ``plugin = "spur"`` with
+``mode = "required"``. See :ref:`private-data` for the full list of affected
+commands. ``sreport preemptions`` applies both ``jobs`` and ``usage`` privacy:
+either setting limits a User to their own rows and the accounts they coordinate.
+These lifetime reports retain the requesting association from the first export,
+even if the job's account is subsequently changed.
 
 ``CancelJob`` with no verified identity and an empty ``user`` is treated as the
 in-cluster daemon (the Kubernetes operator) and can cancel any job. A named

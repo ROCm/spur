@@ -124,8 +124,9 @@ flags above apply to a step's ``srun`` and behave as follows:
 - **Step inside a containerized allocation.** When the batch job was submitted
   with ``--container-image`` (``sbatch --container-image ...``), a nested
   ``srun`` step enters that already-running container — it shares the job's
-  image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
-  used by multi-node launchers. Naming the job's own image on the step
+  image, mounts, and GPU devices. Pyxis does not support ``srun`` from inside a
+  containerized ``sbatch`` script; Spur lets the step join the job's container,
+  which is what multi-node launchers rely on. Naming the job's own image on the step
   (``srun --container-image`` with the same image, including one inherited from
   ``SRUN_CONTAINER``) also enters it. Two references are the same image when they
   are identical or resolve to the same squashfs file. A step cannot use a
@@ -140,6 +141,13 @@ flags above apply to a step's ``srun`` and behave as follows:
   cgroup limits and GPU allocation still apply to the step. A step without
   ``--container-image`` in such a batch job keeps running on the node's own
   root filesystem.
+
+.. note::
+
+   Breaking change: ``srun --container-image=B`` inside a script submitted with
+   ``sbatch --container-image=A`` no longer runs the step in ``A`` and exits 0
+   with the flag ignored. It now fails, so scripts that rely on that must drop
+   the step's ``--container-image`` or submit the job without one.
 
 Allocate first, then run steps from inside the allocation shell. By default a
 single step fans out one container per allocated node; ``-N`` or ``-w`` limits
@@ -182,6 +190,26 @@ the image from its containerized ``sbatch`` job:
 A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
 a fresh one, and fails if it names a different image.
+
+Isolating Steps From Each Other
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One allocation can run several unrelated containers side by side on a node, each
+kept apart from the others. Give each step its own image, its own share of the
+allocation (:ref:`see the step resource flags <step-own-share>`):
+
+.. code-block:: bash
+
+   salloc -N1 --gpus-per-node=8 --cpus-per-task=64 --mem=512G
+   # ...inside the allocation shell:
+   srun --container-image=inference.sqsh -c 16 --mem=128G --gpus=2 ./serve.sh &
+   srun --container-image=batch.sqsh -c 8 --mem=32G --gpus=1 ./process.sh &
+   wait
+
+Each such step has its own root filesystem, mount and PID namespaces, ``/tmp``
+and ``/dev/shm``, its own cgroup with the CPU, memory and GPU limits it asked
+for, and only its own GPUs. It still runs as your user and shares the node's
+network namespace with the rest of the allocation.
 
 Exec Into a Running Container Job
 ---------------------------------

@@ -3,11 +3,13 @@
 
 mod auth_keys;
 mod authclient;
+mod boolean;
 mod clap_exit;
 mod env_defaults;
 mod exec;
 mod exit_fmt;
 mod export_env;
+mod fabric_cli;
 mod format_engine;
 mod image;
 mod interactive;
@@ -46,6 +48,7 @@ mod submitline;
 mod timearg;
 mod timefmt;
 mod token;
+mod usage_scope;
 
 use std::path::Path;
 

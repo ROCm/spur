@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CodeQL configuration
+# Reference: https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning#using-a-custom-configuration-file
+#
+# CodeQL configuration for this repository's security scans.
+#
+# This file defines the complete scanner policy;
+# Keep repository-specific suppressions and tuning here.
+
+query-filters:
+  # The rule treats any identifier containing "account" as sensitive, and a
+  # Slurm account name is printed by design throughout the CLI and its tests.
+  # With it off, logging of real secrets (auth tokens, keys) is caught only
+  # in review.
+  - exclude:
+      id: rust/cleartext-logging

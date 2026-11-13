@@ -51,14 +51,16 @@ impl FairshareCache {
         pool: PgPool,
         halflife_days: u32,
         refresh_interval_secs: u64,
+        weights_source: Arc<RwLock<spur_core::config::BillingWeights>>,
     ) {
         let cache = Arc::clone(self);
         let interval = Duration::from_secs(refresh_interval_secs.max(10));
 
         tokio::spawn(async move {
+            let weights = *weights_source.read();
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                crate::accounting::fairshare_factors(&pool, halflife_days),
+                crate::accounting::fairshare_factors(&pool, halflife_days, &weights),
             )
             .await
             {
@@ -76,10 +78,11 @@ impl FairshareCache {
 
             loop {
                 tokio::time::sleep(interval).await;
+                let weights = *weights_source.read();
 
                 match tokio::time::timeout(
                     Duration::from_secs(10),
-                    crate::accounting::fairshare_factors(&pool, halflife_days),
+                    crate::accounting::fairshare_factors(&pool, halflife_days, &weights),
                 )
                 .await
                 {
