@@ -100,7 +100,12 @@ pub async fn all_members_support(raft: &SpurRaft, cap: &str) -> bool {
         match done {
             Ok((_, true)) => {}
             Ok((id, false)) => {
-                debug!(node = me, member = id, cap, "member does not list the capability");
+                debug!(
+                    node = me,
+                    member = id,
+                    cap,
+                    "member does not list the capability"
+                );
                 all = false;
             }
             Err(_) => all = false,
@@ -127,7 +132,9 @@ async fn member_lists(addr: &str, cap: &str) -> bool {
         return false;
     };
     let Ok(resp) = raft_client(channel)
-        .capabilities(spur_proto::raft_proto::RaftRequest { payload: Vec::new() })
+        .capabilities(spur_proto::raft_proto::RaftRequest {
+            payload: Vec::new(),
+        })
         .await
     else {
         return false;

@@ -7600,8 +7600,7 @@ impl ClusterManager {
             return false;
         };
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(crate::raft::all_members_support(&raft, cap))
+            tokio::runtime::Handle::current().block_on(crate::raft::all_members_support(&raft, cap))
         })
     }
 
