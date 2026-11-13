@@ -56,7 +56,7 @@ pub(crate) struct NodeRank {
     new_jobs: u32,
     work: u64,
     /// Nodes the pick empties and the preemptor still needs; at least 1.
-    pub(crate) freed: u32,
+    freed: u32,
     hash: u64,
 }
 
@@ -93,11 +93,10 @@ impl<'a> VictimOrder<'a> {
             .iter()
             .map(|id| self.facts.get(id).unwrap_or(&VictimFacts::UNKNOWN).work())
             .fold(0u64, u64::saturating_add);
-        debug_assert!(freed >= 1, "a pick always frees its own node");
         NodeRank {
             new_jobs: u32::try_from(new_jobs.len()).unwrap_or(u32::MAX),
             work,
-            freed,
+            freed: freed.max(1),
             hash,
         }
     }
