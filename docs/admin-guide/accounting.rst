@@ -1059,9 +1059,9 @@ preempt the job that displaced it. Without that rule a self-listing QOS using
 ``preemptmode=requeue`` would ping-pong indefinitely and neither job would
 finish.
 
-Among the jobs that pass every guard below, the scheduler takes the cheapest set
-of whole nodes that lets the pending job run, as described under *Choosing among
-eligible victims* below. At most one pending job triggers preemption per scheduling
+Among the jobs that pass every guard below, the scheduler builds a set of whole
+nodes that lets the pending job run, as described under *Choosing among eligible
+victims* below. At most one pending job triggers preemption per scheduling
 cycle.
 
 **Guards checked before a victim is selected**
@@ -1097,14 +1097,17 @@ failure moves the scheduler on to the next candidate.
 **Choosing among eligible victims**
 
 The guards decide who *may* be preempted; they do not decide who *is*. Preemption
-only frees whole nodes, so the scheduler looks for the cheapest set of nodes it can
-empty entirely. A node counts only when every job on it is an eligible victim, and
-emptying it evicts every job on it, so a node shared with an ineligible job is never
-chosen. The set is worked out in memory first, and nothing is evicted unless it frees
-enough nodes. When no set is enough, nothing is evicted. If a later eviction fails
-partway, the victims already evicted stay evicted.
+only frees whole nodes, so the scheduler adds nodes it can empty entirely until enough
+are free. A node counts only when it could host the pending job once empty, emptying
+it brings its partition back under ``max_tres_per_node``, and every job on it is an
+eligible victim; emptying it evicts every job on it, so a node shared with an
+ineligible job, or with a suspended or completing one, is never chosen. The set is
+worked out in memory first, and nothing is evicted unless the pending job would then
+start on the freed nodes under the normal placement rules. When no set passes,
+nothing is evicted. If a later eviction fails partway, the victims already evicted
+stay evicted.
 
-Nodes are added to the set one at a time, in this order:
+Nodes are added to the set one at a time, cheapest first, in this order:
 
 1. The highest QOS ``priority`` among the jobs on the node, lowest first, so the
    least important work is spent first.
@@ -1124,7 +1127,7 @@ priority and ``preempt_exempt_time`` are settled first. Idle-fill reclaim (see
 .. code-block:: toml
 
    [scheduler]
-   preempt_victim_order = ["fewest_jobs", "least_work", "hash"]
+   preempt_victim_order = ["least_work", "fewest_jobs", "hash"]
 
 The keys above are the default, so the line is only needed to change the order.
 Keys apply in the order listed: the first that tells two nodes apart decides, and
@@ -1142,13 +1145,15 @@ empties, up to the nodes still needed.
 
    * - Key
      - Goes first
+   * - ``least_work``
+     - The pick that loses the least work per node freed. Work is the current run's
+       elapsed time, less time spent suspended, times the nodes the job holds, summed
+       over the node's new jobs. The run time restarts on a requeue, and a job with
+       no recorded start time counts as no work. Whole nodes are counted, so ten
+       small jobs sharing a node count as ten node-hours per hour.
    * - ``fewest_jobs``
      - The pick that evicts the fewest new jobs per node freed. A job the set
        already holds adds nothing.
-   * - ``least_work``
-     - The pick that loses the least work per node freed. Work is the current run's
-       elapsed time, which restarts on a requeue, times the nodes the job holds,
-       summed over the node's new jobs.
    * - ``hash``
      - The node with the lowest stable 64-bit hash of the preempting job's ID and
        the node name. This removes the bias towards low node names while keeping a
@@ -1157,6 +1162,18 @@ empties, up to the nodes still needed.
 
 None of the keys reads the accounting database or fair-share; they use only what
 the controller holds in memory.
+
+The search is greedy: it never revisits an earlier pick, so the set is not always
+the cheapest one. Under ``[]``, for example, with two nodes needed, a 1-node job on
+``n1`` and a 2-node job on ``n2`` and ``n3``, both jobs are evicted although the
+2-node job alone is enough. A request whose per-node needs differ, such as a GPU
+total spread over several nodes, may find no set that passes the placement check
+even where another set of nodes would have; nothing is evicted then.
+
+``least_work`` comes first in the default because the cost of ``fewest_jobs`` grows
+with the victim's width: with one node needed, it prefers one 64-node job, 64
+node-hours lost, to two 1-node jobs on a single node. List ``fewest_jobs`` first to
+prefer fewer evictions over less lost work.
 
 On upgrade, with no configuration change, the recount and the default keys change
 which victims are chosen and how many jobs are evicted, not only the order among
