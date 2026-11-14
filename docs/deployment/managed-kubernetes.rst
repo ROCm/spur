@@ -121,11 +121,22 @@ in ``spur.conf``, or the first node). For HA, request 3 or 5 control planes:
 
 .. code-block:: bash
 
-   spur k8s up --replicas 3                                    # lowest-named 3 nodes
+   spur k8s up --replicas 3                                    # configured bootstrap, then lowest names
    spur k8s up --control-plane-nodes cp-1,cp-2,cp-3             # explicit set; overrides --replicas
 
-``--control-plane-nodes`` (or a single ``--control-plane-node``) always wins
-over ``--replicas``. The first control-plane node is the etcd bootstrap.
+An explicit ``--control-plane-nodes`` list overrides the configured bootstrap and
+replica count. ``--control-plane-node`` overrides the configured bootstrap while
+``--replicas`` still controls the set's size. Without either node option, a fresh
+cluster uses ``cluster.control_plane_node`` as its bootstrap and fills any remaining
+control-plane slots from the lowest-named nodes. The configured bootstrap must be
+registered and in the selected node scope, or the request is rejected.
+
+The first control-plane node is the etcd bootstrap. Once at least one node has a
+k0s role, repeating bare ``spur k8s up`` preserves the recorded bootstrap and
+control-plane set, even if the config default has changed. Before role assignment,
+repeat the original replica count or explicit set to preserve the HA selection.
+Tear down the cluster with ``spur k8s down --reset`` before selecting a different
+control plane.
 
 .. important::
 

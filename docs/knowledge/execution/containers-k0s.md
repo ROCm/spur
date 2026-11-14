@@ -259,6 +259,11 @@ gets re-assigned and re-joined on the next tick.
 
 ### Role and IP assignment (`provision_assignments`)
 
+`ClusterUp` records the control-plane set before reconciliation. An explicit CLI
+set overrides `cluster.control_plane_node`; otherwise the CLI bootstrap, recorded
+bootstrap, then the configured bootstrap take precedence. The bootstrap must be in
+the selected node scope. A bare re-up preserves an assigned cluster's recorded set.
+
 Each unassigned member node receives:
 
 - **Role:** Controller (from the HA set or bootstrap node), Worker, or

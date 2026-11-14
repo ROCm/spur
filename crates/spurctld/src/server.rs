@@ -4194,7 +4194,13 @@ impl SlurmController for ControllerService {
         let pinned = req
             .control_plane_node
             .clone()
-            .or_else(|| state.control_plane_node.clone());
+            .or_else(|| state.control_plane_node.clone())
+            .or_else(|| {
+                if !req.control_plane_nodes.is_empty() {
+                    return None;
+                }
+                self.cluster.config().cluster.control_plane_node.clone()
+            });
         // A bare re-up of an assigned cluster targets the recorded set, so it stays idempotent
         // regardless of the config default; an explicit list/replica count is resolved and enforced.
         let cp_set = if assigned && !explicit_override {
@@ -13364,6 +13370,114 @@ mod tests {
             svc.cluster.k0s_state().member_nodes,
             vec!["node-a", "node-b"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_uses_configured_bootstrap_unless_the_request_overrides_it() {
+        for (pin, explicit, replicas, expected) in [
+            (None, vec![], None, vec!["node-b"]),
+            (Some("node-c"), vec![], None, vec!["node-c"]),
+            (None, vec!["node-a"], None, vec!["node-a"]),
+            (None, vec![], Some(3), vec!["node-b", "node-a", "node-c"]),
+            (
+                None,
+                vec!["node-c", "node-a", "node-b"],
+                Some(3),
+                vec!["node-c", "node-a", "node-b"],
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = step_test_config();
+            config.cluster.control_plane_node = Some("node-b".into());
+            let svc = test_service_with(&dir, config).await;
+            for name in ["node-a", "node-b", "node-c"] {
+                register_plain_node(&svc, name, 0).await;
+            }
+            let response = svc
+                .cluster_up(Request::new(ClusterUpRequest {
+                    caller: "root".into(),
+                    control_plane_node: pin.map(str::to_string),
+                    control_plane_nodes: explicit.into_iter().map(str::to_string).collect(),
+                    control_plane_replicas: replicas,
+                    ..Default::default()
+                }))
+                .await
+                .expect("control-plane selection accepted")
+                .into_inner();
+            assert!(response.accepted);
+            let state = svc.cluster.k0s_state();
+            assert_eq!(state.controllers(), expected);
+            assert_eq!(state.control_plane_node.as_deref(), Some(expected[0]));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_rejects_an_unusable_configured_bootstrap_without_recording_intent() {
+        for configured in ["missing-node", "node-c"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = step_test_config();
+            config.cluster.control_plane_node = Some(configured.into());
+            let svc = test_service_with(&dir, config).await;
+            for name in ["node-a", "node-b", "node-c"] {
+                register_plain_node(&svc, name, 0).await;
+            }
+            let error = svc
+                .cluster_up(Request::new(ClusterUpRequest {
+                    caller: "root".into(),
+                    nodes: "node-a,node-b".into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("configured bootstrap must belong to the selected nodes");
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains(configured));
+            let state = svc.cluster.k0s_state();
+            assert_eq!(state.phase, spur_core::k0s::K0sPhase::Down);
+            assert!(state.control_plane_node.is_none());
+            assert!(state.controllers().is_empty());
+            assert!(state.member_nodes.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_keeps_recorded_bootstrap_ahead_of_the_config_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.cluster.control_plane_node = Some("node-b".into());
+        let svc = test_service_with(&dir, config).await;
+        for name in ["node-a", "node-b"] {
+            register_plain_node(&svc, name, 0).await;
+        }
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+        for assigned in [false, true] {
+            if assigned {
+                svc.cluster
+                    .assign_node_k0s(
+                        "node-a",
+                        spur_core::k0s::K0sRole::Single,
+                        "10.44.0.1",
+                        "10.42.0.0/24",
+                    )
+                    .unwrap();
+            }
+            svc.cluster_up(Request::new(ClusterUpRequest {
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("bare re-up preserves the bootstrap");
+            let state = svc.cluster.k0s_state();
+            assert_eq!(state.control_plane_node.as_deref(), Some("node-a"));
+            assert_eq!(state.controllers(), vec!["node-a"]);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
