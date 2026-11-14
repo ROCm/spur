@@ -1,0 +1,21 @@
+# Unprivileged half of the KB accuracy check: fork PRs get no secrets here, so
+# this only signals kb-accuracy.yml (workflow_run), which holds KB_API_KEY.
+name: KB Accuracy Trigger
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  trigger:
+    name: KB Accuracy Trigger
+    # labeled: only the kb-check label itself; synchronize/reopened: any PR carrying it.
+    if: >-
+      (github.event.action == 'labeled' && github.event.label.name == 'kb-check') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'kb-check'))
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "kb-check requested"

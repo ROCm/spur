@@ -1,40 +1,125 @@
+# Trusted half: workflow_run runs this file from the default branch with
+# KB_API_KEY, after kb-accuracy-trigger.yml. Forks can edit the trigger, so the
+# kb-check label, base and head SHA are re-verified via the API here. The PR
+# head is fetched as git objects only; never check out or execute it.
 name: KB Accuracy
 
 on:
-  pull_request:
-    branches: [main]
-    types: [labeled]
+  workflow_run: # zizmor: ignore[dangerous-triggers] never runs PR code, see header
+    workflows: ["KB Accuracy Trigger"]
+    types: [completed]
+
+permissions: {}
 
 concurrency:
-  group: kb-accuracy-${{ github.event.pull_request.number }}
+  group: kb-accuracy-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   kb-accuracy:
     name: Knowledge Base Accuracy (LLM)
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, amd-internal]
-    if: contains(github.event.pull_request.labels.*.name, 'kb-check')
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
     steps:
+      # listPullRequestsAssociatedWithCommit misses some fork PRs; look up by head owner:branch.
+      - name: Resolve and verify PR
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { HEAD_SHA, HEAD_OWNER, HEAD_BRANCH } = process.env;
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', head: `${HEAD_OWNER}:${HEAD_BRANCH}`,
+            });
+            const pr = prs.find((p) => p.head.sha === HEAD_SHA && p.base.ref === 'main');
+            if (!pr || !pr.labels.some((l) => l.name === 'kb-check')) {
+              core.notice('No open PR to main at this SHA with the kb-check label; skipping.');
+              core.setOutput('run', 'false');
+              return;
+            }
+            core.setOutput('run', 'true');
+            core.setOutput('number', String(pr.number));
+
+      # Commit status, not checks.create: an API-created check run lands in an
+      # arbitrary existing Actions suite and shows under that workflow's name.
+      - name: Set pending status
+        id: status
+        if: steps.pr.outputs.run == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: process.env.HEAD_SHA, state: 'pending',
+              context: 'KB Accuracy / Knowledge Base Accuracy (LLM)',
+              description: 'Checking the diff against the knowledge base',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            core.setOutput('set', 'true');
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pr.outputs.run == 'true'
         with:
           persist-credentials: false
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Check out trusted checker from base branch
+
+      - name: Fetch PR head (data only)
+        if: steps.pr.outputs.run == 'true'
         env:
-          BASE_REF: ${{ github.base_ref }}
-        run: git checkout "origin/${BASE_REF}" -- scripts/check-kb-accuracy.sh 2>/dev/null || true
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
       - name: Check KB accuracy against diff
+        id: kb
+        if: steps.pr.outputs.run == 'true'
         env:
           KB_API_KEY: ${{ secrets.KB_API_KEY }}
-          KB_BASE_REF: origin/${{ github.base_ref }}
+          KB_BASE_REF: origin/main
+          KB_HEAD_REF: ${{ github.event.workflow_run.head_sha }}
         run: |
-          rc=0; scripts/check-kb-accuracy.sh || rc=$?
-          if [ "$rc" -eq 2 ]; then
-            echo "::notice::KB accuracy check could not run (exit 2) — not a gate"
-            exit 0
-          fi
-          exit "$rc"
+          # Default shell has no pipefail: take the checker's rc, not tee's.
+          set +e
+          scripts/check-kb-accuracy.sh 2>&1 | tee "$RUNNER_TEMP/kb-output.txt"
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # rc: 0 pass, 1 contradictions, 2 could not run (not a gate); anything else = job error.
+      # Statuses have no neutral: rc 2 and job errors report success so they don't gate.
+      - name: Set final status
+        if: always() && steps.status.outputs.set == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RC: ${{ steps.kb.outputs.rc }}
+        with:
+          script: |
+            const fs = require('fs');
+            const file = `${process.env.RUNNER_TEMP}/kb-output.txt`;
+            let text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+            if (text.length > 60000) text = '…(truncated)\n' + text.slice(-60000);
+            const map = {
+              '0': ['success', 'PASS — no contradictions found'],
+              '1': ['failure', 'FAIL — contradicts the knowledge base'],
+              '2': ['success', 'Skipped — could not run (not a gate)'],
+            };
+            const [state, description] = map[process.env.RC] || ['success', 'Skipped — job error (not a gate)'];
+            await core.summary.addHeading(description, 3).addCodeBlock(text || description).write();
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: process.env.HEAD_SHA, state, description,
+              context: 'KB Accuracy / Knowledge Base Accuracy (LLM)',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Fail job on contradictions
+        if: steps.kb.outputs.rc == '1'
+        run: exit 1
