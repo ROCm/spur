@@ -244,6 +244,21 @@ pub fn resolve_image(
     )
 }
 
+/// Whether two image references name the same image: the same reference, or
+/// references that resolve to the same squashfs file for this user. An
+/// unresolvable reference matches only an identical one.
+pub fn same_image(a: &str, b: &str, uid: u32) -> bool {
+    if a == b {
+        return true;
+    }
+    let canonical = |image: &str| {
+        resolve_image(image, None, Some(uid))
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+    };
+    matches!((canonical(a), canonical(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// How the rootfs was set up — determines cleanup strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootfsMode {
@@ -1147,6 +1162,35 @@ pub fn container_init(
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+
+    #[test]
+    fn the_same_reference_is_the_same_image() {
+        assert!(same_image("docker://alpine", "docker://alpine", 1000));
+    }
+
+    #[test]
+    fn different_unresolvable_references_are_different_images() {
+        assert!(!same_image("docker://alpine", "docker://ubuntu", 1000));
+    }
+
+    #[test]
+    fn two_paths_to_one_squashfs_file_are_the_same_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("a.sqsh");
+        std::fs::write(&image, b"x").unwrap();
+        let link = dir.path().join("link.sqsh");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        let other = dir.path().join("b.sqsh");
+        std::fs::write(&other, b"x").unwrap();
+
+        let (image, link, other) = (
+            image.to_str().unwrap(),
+            link.to_str().unwrap(),
+            other.to_str().unwrap(),
+        );
+        assert!(same_image(image, link, 1000));
+        assert!(!same_image(image, other, 1000));
+    }
 
     /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
     /// env var). Cargo runs tests in parallel within a binary, so without

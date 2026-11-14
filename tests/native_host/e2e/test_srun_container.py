@@ -7,17 +7,18 @@ Two dispatch paths exist for a containerized step, and they are tested
 separately because they are reached by genuinely different setups:
 
   Case 2 — NEW container per step (spurd forks a fresh rootfs):
-    Reached by standalone `srun --container-image` and by `salloc
-    --container-image` + `srun`. Neither runs a batch process on the compute
-    node, so the step's tracked job has no live namespaces and spurd builds a
-    new container for the step. Capabilities exercised: container entry, bind
+    Reached by standalone `srun --container-image`, by `salloc` + `srun
+    --container-image`, and by `srun --container-image` inside an `sbatch`
+    script that is not itself containerized. A step that names its own image
+    always gets its own rootfs unless its job runs in a container. Capabilities exercised: container entry, bind
     mounts, workdir, home mount, user identity, DNS, GPU env deny, GPU device
     injection.
 
   Case 1 — ENTER the parent container (nsenter):
-    Reached only by `sbatch --container-image` + a nested `srun`. The batch
-    script runs *inside* a live container, so the nested step enters those
-    namespaces instead of building a new rootfs. Capabilities exercised:
+    Reached only by `sbatch --container-image` + a nested `srun` without an
+    image, or naming the job's own. The batch script runs *inside* a live container, so the
+    nested step enters those namespaces instead of building a new rootfs; a
+    nested `srun --container-image` naming another image is refused. Capabilities exercised:
     container entry, parent bind mounts visible, GPU visibility through nsenter.
 
   Multi-node:
@@ -295,6 +296,33 @@ class TestSrunContainerStepNewRootfs:
             f"salloc + srun --container-image step not in container:\n{step_out}"
         )
 
+    def test_batch_job_step_builds_its_own_container(self, step_container_cluster):
+        """`srun --container-image` inside a plain `sbatch` script runs in the
+        step's image, not on the host, even though a root spurd runs the batch
+        script itself in fresh PID and mount namespaces."""
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        out_path = f"{cluster.remote_dir}/batch-step-image.out"
+        script = cluster.write_file(
+            "batch-step-image.sh",
+            "#!/bin/bash\n"
+            f"{cluster.bin_dir}/srun --container-image='{img}' cat '{MARKER_PATH}'\n"
+            'echo "SRUN_EXIT=$?"\n'
+            f"{cluster.bin_dir}/srun bash -c 'test -f {MARKER_PATH} && echo STEP_FOUND || echo STEP_NOTFOUND'\n",
+        )
+        sb = cluster.sbatch(["-J", "batch-step-image", "-N", "1", "-t", "0:03", "-o", out_path, script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        diag = cluster.debug_job(job_id)
+        assert MARKER_CONTENT in out and "SRUN_EXIT=0" in out, (
+            f"batch-job step did not run in its own image:\n{diag}\noutput:\n{out}"
+        )
+        assert "STEP_NOTFOUND" in out, (
+            f"a step without an image must still run on the host:\n{diag}\noutput:\n{out}"
+        )
+
     def test_cancellation_terminates_container_step(self, step_container_cluster):
         """scancel of a containerized srun step terminates the container (no orphan).
 
@@ -443,6 +471,61 @@ class TestSrunContainerStepNsenter:
         diag = cluster.debug_job(job_id)
         assert MARKER_CONTENT in out, (
             f"nested srun did not enter parent container:\n{diag}\noutput:\n{out}"
+        )
+
+    def test_nested_srun_naming_the_jobs_image_enters_the_container(self, step_container_cluster):
+        """Repeating the job's own image on a nested `srun` (or inheriting it
+        from SRUN_CONTAINER) still joins the job's container."""
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        out_path = f"{cluster.remote_dir}/nsenter-same-image.out"
+        script = cluster.write_file(
+            "nsenter-same-image.sh",
+            "#!/bin/bash\n"
+            f"{cluster.bin_dir}/srun --container-image='{img}' cat '{MARKER_PATH}'\n"
+            'echo "SRUN_EXIT=$?"\n',
+        )
+        sb = cluster.sbatch([
+            "-J", "nsenter-same-image", "-N", "1", "-t", "0:03", "-o", out_path,
+            f"--container-image={img}",
+            *_toolchain_mounts(cluster),
+            script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        diag = cluster.debug_job(job_id)
+        assert MARKER_CONTENT in out and "SRUN_EXIT=0" in out, (
+            f"nested srun with the job's own image did not enter it:\n{diag}\noutput:\n{out}"
+        )
+
+    def test_nested_srun_with_a_different_image_is_refused(self, step_container_cluster):
+        """The job's container is the only rootfs its steps can use, so a nested
+        `srun --container-image` naming another image fails instead of running
+        in the wrong one."""
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        out_path = f"{cluster.remote_dir}/nsenter-other-image.out"
+        script = cluster.write_file(
+            "nsenter-other-image.sh",
+            "#!/bin/bash\n"
+            f"{cluster.bin_dir}/srun --container-image=/nonexistent/other-image.sqsh true 2>&1\n"
+            'echo "SRUN_EXIT=$?"\n',
+        )
+        sb = cluster.sbatch([
+            "-J", "nsenter-other-image", "-N", "1", "-t", "0:03", "-o", out_path,
+            f"--container-image={img}",
+            *_toolchain_mounts(cluster),
+            script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        diag = cluster.debug_job(job_id)
+        assert "differs from" in out and "SRUN_EXIT=0" not in out, (
+            f"nested srun with another image was not refused:\n{diag}\noutput:\n{out}"
         )
 
     def test_nested_srun_inherits_workdir(self, step_container_cluster):

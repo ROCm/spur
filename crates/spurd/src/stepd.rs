@@ -988,6 +988,10 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    /// The image the job runs in, as requested; empty without a job container
+    /// or when the session predates recording it.
+    #[serde(default)]
+    pub container_image: String,
     #[serde(default)]
     pub cred_id: String,
     #[serde(default)]
@@ -1002,6 +1006,17 @@ pub struct StepdDescriptor {
 }
 
 impl StepdDescriptor {
+    /// Records the container the session's job runs in, so a recovered session
+    /// still tells a step naming another image from one naming the job's own.
+    pub fn record_job_container(&mut self, launch_spec: &StepdLaunchSpec) {
+        self.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+        self.container_image = launch_spec
+            .container
+            .as_ref()
+            .map(|c| c.config.image.clone())
+            .unwrap_or_default();
+    }
+
     pub fn cleanup_cgroup_path(&self) -> PathBuf {
         if self.cgroup_path.as_os_str().is_empty() {
             return crate::executor::reapable_cgroup_path(
@@ -1049,6 +1064,7 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            container_image: String::new(),
             cred_id: String::new(),
             cred_kid: String::new(),
             cred_digest: String::new(),
@@ -2279,7 +2295,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_user_namespace = launch_spec.has_user_namespace;
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
-    descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    descriptor.record_job_container(&launch_spec);
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
@@ -4210,6 +4226,50 @@ mod tests {
         session_dir
     }
 
+    #[test]
+    fn a_session_records_the_container_its_job_runs_in() {
+        let mut spec = launch_spec();
+        spec.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+        spec.container = Some(crate::executor::ContainerLaunchConfig {
+            config: crate::container::ContainerConfig {
+                image: "docker://job-image".into(),
+                mounts: Vec::new(),
+                workdir: None,
+                name: None,
+                readonly: false,
+                mount_home: false,
+                remap_root: false,
+                gpu_devices: Vec::new(),
+                environment: HashMap::new(),
+                container_env: HashMap::new(),
+                entrypoint: None,
+                uid: 1000,
+                gid: 1000,
+                username: "spur".into(),
+                home_dir: "/home/spur".into(),
+                device_plan: None,
+            },
+            rootfs: PathBuf::from("/tmp/rootfs"),
+        });
+        let mut descriptor = StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+
+        descriptor.record_job_container(&spec);
+
+        assert_eq!(
+            descriptor.container_rootfs_mode,
+            Some(crate::container::RootfsMode::Overlay)
+        );
+        assert_eq!(descriptor.container_image, "docker://job-image");
+    }
+
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
             joins_parent_namespaces: false,
@@ -4627,6 +4687,7 @@ mod tests {
             "stdout_path",
             "stderr_path",
             "container_rootfs_mode",
+            "container_image",
         ] {
             fields.remove(field);
         }
@@ -4641,6 +4702,7 @@ mod tests {
         assert!(restored.stdout_path.is_empty());
         assert!(restored.stderr_path.is_empty());
         assert_eq!(restored.container_rootfs_mode, None);
+        assert!(restored.container_image.is_empty());
     }
 
     #[test]
