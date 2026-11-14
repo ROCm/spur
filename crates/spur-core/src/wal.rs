@@ -777,6 +777,8 @@ impl WalOperation {
 
 #[cfg(test)]
 mod job_state_change_wal_tests {
+    use super::*;
+
     #[test]
     fn node_inventory_has_stable_wire_form_and_optional_initialization() {
         let op: super::WalOperation =
@@ -791,12 +793,18 @@ mod job_state_change_wal_tests {
         };
         assert!(!initialize);
         assert_eq!(
-            inventory.names.unwrap(),
+            inventory.names.clone().unwrap(),
             ["n1".to_string()].into_iter().collect()
         );
+        let saved = super::WalOperation::NodeInventoryUpdate {
+            inventory,
+            initialize: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&saved).unwrap(),
+            r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]},"initialize":true}}"#
+        );
     }
-
-    use super::*;
 
     /// A reason's variant name is its wire form in the Raft log, and a controller
     /// on an older binary cannot read a name it does not know. Freeze the newest

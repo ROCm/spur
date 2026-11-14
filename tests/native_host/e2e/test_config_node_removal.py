@@ -224,3 +224,18 @@ def test_startup_node_names_never_block_registration_or_delete(unstarted_cluster
         assert set(c.sinfo_nodes()) == {listed}
     finally:
         c.cli_allow_fail(["scancel", str(job_id)])
+
+
+def test_edited_node_names_take_effect_only_through_reconfigure(roster_cluster):
+    c = roster_cluster
+    kept, dropped = c.node_names[0], c.node_names[1]
+    _write_roster(c, [kept])
+    c.restart_controller()
+    c.restart_agent(1)
+    c.wait_agent_serving(1)
+    assert "differs from the saved list" in c.spurctld_log(0)
+    assert set(c.sinfo_nodes()) == set(c.node_names)
+
+    c.scontrol("reconfigure")
+    assert set(c.sinfo_nodes()) == {kept}
+    assert dropped not in c.sinfo_nodes()

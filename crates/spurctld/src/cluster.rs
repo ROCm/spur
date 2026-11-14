@@ -608,7 +608,8 @@ pub struct ClusterManager {
     nodes: RwLock<HashMap<String, Node>>,
     node_inventory: RwLock<Option<NodeInventory>>,
     startup_node_inventory: NodeInventory,
-    node_names_warned: std::sync::atomic::AtomicBool,
+    unlisted_nodes_warned: std::sync::atomic::AtomicBool,
+    node_names_mismatch_warned: std::sync::atomic::AtomicBool,
     reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -1048,7 +1049,8 @@ impl ClusterManager {
             nodes: RwLock::new(HashMap::new()),
             node_inventory: RwLock::new(None),
             startup_node_inventory,
-            node_names_warned: std::sync::atomic::AtomicBool::new(false),
+            unlisted_nodes_warned: std::sync::atomic::AtomicBool::new(false),
+            node_names_mismatch_warned: std::sync::atomic::AtomicBool::new(false),
             reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -4320,34 +4322,37 @@ impl ClusterManager {
         let Some(listed) = &self.startup_node_inventory.names else {
             return;
         };
-        let saved = self
+        let saved_differs = self
             .node_inventory
             .read()
             .as_ref()
-            .map(|i| i.names.is_some());
-        if saved == Some(false) {
-            self.warn_node_names_once(|| {
+            .map(|saved| saved.names.as_ref() != Some(listed));
+        if let Some(differs) = saved_differs {
+            if differs && !swap_flag(&self.node_names_mismatch_warned) {
                 warn!(
-                    "admission.node_names is set but a cleared list is saved; \
+                    "admission.node_names in the file differs from the saved list; \
                      run `scontrol reconfigure` to apply it"
-                )
-            });
-        }
-        if saved.is_some() {
+                );
+            }
             return;
         }
         if has_unlisted_node(listed, &self.nodes.read()) {
-            self.warn_node_names_once(|| {
+            if !swap_flag(&self.unlisted_nodes_warned) {
+                let unlisted = unlisted_node_names(listed, &self.nodes.read());
                 warn!(
-                    nodes = %unlisted_node_names(listed, &self.nodes.read()).join(","),
+                    nodes = %unlisted.join(","),
                     "registered nodes are absent from admission.node_names; \
                      run `scontrol reconfigure` to remove them"
-                )
-            });
+                );
+            }
             return;
         }
-        let _reconfigure = self.reconfigure_lock.lock();
-        if self.node_inventory.read().is_some() || has_unlisted_node(listed, &self.nodes.read()) {
+        // A held lock means a reconfigure or another registration is already saving the list.
+        let Some(_reconfigure) = self.reconfigure_lock.try_lock() else {
+            return;
+        };
+        let saved = self.node_inventory.read().is_some();
+        if saved || has_unlisted_node(listed, &self.nodes.read()) {
             return;
         }
         if let Err(error) = self.propose(WalOperation::NodeInventoryUpdate {
@@ -4358,15 +4363,6 @@ impl ClusterManager {
         }
     }
 
-    fn warn_node_names_once(&self, warn: impl FnOnce()) {
-        if !self
-            .node_names_warned
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            warn();
-        }
-    }
-
     fn committed_inventory_excludes(&self, name: &str) -> bool {
         self.node_inventory
             .read()
@@ -4374,21 +4370,37 @@ impl ClusterManager {
             .is_some_and(|inventory| inventory.excludes(name))
     }
 
+    /// With a saved node_names list, registered nodes are all listed, so an unregistered name
+    /// is either excluded or not yet registered; earlier log entries stay unfenced on replay.
+    fn references_unregistered(&self, nodes: &HashMap<String, Node>, name: &str) -> bool {
+        !nodes.contains_key(name)
+            && self
+                .node_inventory
+                .read()
+                .as_ref()
+                .is_some_and(|inventory| inventory.names.is_some())
+    }
+
     fn k0s_inventory_error<'a>(
         &self,
         nodes: &HashMap<String, Node>,
         references: impl IntoIterator<Item = &'a String>,
     ) -> Option<String> {
-        // Legacy logs can reference nodes before registration; only a saved
-        // node_names list enables the reciprocal fence against its deletions.
-        let inventory = self.node_inventory.read();
-        let inventory = inventory.as_ref()?;
         references
             .into_iter()
-            .find(|name| {
-                !nodes.contains_key(*name) || inventory.excludes(name)
-            })
+            .find(|name| self.references_unregistered(nodes, name))
             .map(|name| format!("Kubernetes membership references node '{name}', which is not registered or not in admission.node_names"))
+    }
+
+    fn reservation_inventory_error(
+        &self,
+        nodes: &HashMap<String, Node>,
+        names: &[String],
+    ) -> Option<String> {
+        names
+            .iter()
+            .find(|name| self.references_unregistered(nodes, name))
+            .map(|name| format!("reservation names node '{name}', which is not registered or not in admission.node_names"))
     }
 
     pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
@@ -9226,14 +9238,13 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
-                // A saved node_names list enables this fence; earlier log entries
-                // must retain their original placement behavior on replay.
+                // Only a saved node_names list fences placement; earlier log entries keep
+                // their original placement behavior on replay.
                 if let Some(name) = node_names
                     .iter()
-                    .find(|name| !nodes.contains_key(*name))
-                    .filter(|_| self.node_inventory.read().is_some())
+                    .find(|name| self.references_unregistered(&nodes, name))
                 {
-                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto a removed node");
+                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto an unregistered node");
                     return ClientResponse::default();
                 }
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
@@ -9253,12 +9264,6 @@ impl ClusterManager {
                 {
                     warn!(job_id = *job_id, node = %node, "refusing a JobStart onto an excluded node");
                     return ClientResponse::default();
-                }
-                if node_names
-                    .iter()
-                    .any(|name| self.committed_inventory_excludes(name))
-                {
-                    return response;
                 }
                 response.job_started = true;
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -10208,12 +10213,8 @@ impl ClusterManager {
                 self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
-                if reservation.nodes.iter().any(|name| {
-                    self.committed_inventory_excludes(name)
-                        || (self.node_inventory.read().is_some() && !nodes.contains_key(name))
-                }) {
-                    response.node_inventory_error =
-                        Some("reservation contains a node absent from admission.node_names".into());
+                if let Some(error) = self.reservation_inventory_error(&nodes, &reservation.nodes) {
+                    response.node_inventory_error = Some(error);
                     return response;
                 }
                 let mut reservations = self.reservations.write();
@@ -10238,12 +10239,8 @@ impl ClusterManager {
                 add_accounts,
                 remove_accounts,
             } => {
-                if add_nodes.iter().any(|name| {
-                    self.committed_inventory_excludes(name)
-                        || (self.node_inventory.read().is_some() && !nodes.contains_key(name))
-                }) {
-                    response.node_inventory_error =
-                        Some("reservation contains a node absent from admission.node_names".into());
+                if let Some(error) = self.reservation_inventory_error(&nodes, add_nodes) {
+                    response.node_inventory_error = Some(error);
                     return response;
                 }
                 let mut reservations = self.reservations.write();
@@ -10478,6 +10475,10 @@ fn inventory_removals(
         }
     }
     Ok(removed)
+}
+
+fn swap_flag(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn has_unlisted_node(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> bool {
@@ -12920,7 +12921,6 @@ fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<J
 #[cfg(test)]
 pub(crate) mod node_test_fixtures {
     use super::ClusterManager;
-    use crate::raft::StateMachineApply;
     use spur_core::wal::WalOperation;
 
     pub(crate) fn register(cluster: &ClusterManager, names: &[&str]) {
@@ -12945,19 +12945,6 @@ pub(crate) mod node_test_fixtures {
                 capabilities: Vec::new(),
             });
         }
-    }
-
-    pub(crate) fn restore_without_node(cluster: &ClusterManager, name: &str) {
-        let mut snapshot: serde_json::Value =
-            serde_json::from_slice(&cluster.snapshot_state().unwrap()).unwrap();
-        snapshot["nodes"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|node| node["name"] != name);
-        cluster
-            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
-            .unwrap();
-        assert!(cluster.get_node(name).is_none());
     }
 }
 
@@ -13925,7 +13912,6 @@ pub(crate) mod tests {
             initialize: false,
         });
         assert!(cm.check_node_inventory("n1").is_ok());
-        assert!(!cm.apply_operation(&placement).job_started);
         let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
         restored
             .restore_from_snapshot(&cm.snapshot_state().unwrap())
@@ -13934,13 +13920,18 @@ pub(crate) mod tests {
             *restored.node_inventory.read(),
             Some(NodeInventory::default())
         );
-        assert!(!restored.apply_operation(&placement).job_started);
-        assert!(
-            !restored
-                .apply_operation(&inventory_registration("n1"))
-                .node_registration_rejected
-        );
+        // A cleared list fences nothing, the same as a list that was never set.
         assert!(restored.apply_operation(&placement).job_started);
+        let reserved: Reservation = serde_json::from_str(r#"{"name":"cleared","start_time":"2099-01-01T00:00:00Z","end_time":"2099-01-02T00:00:00Z","nodes":["n1"],"accounts":[],"users":[]}"#).unwrap();
+        assert!(cm
+            .apply_operation(&WalOperation::ReservationCreate {
+                reservation: reserved
+            })
+            .node_inventory_error
+            .is_none());
+        assert!(cm
+            .k0s_inventory_error(&cm.nodes.read(), &["n1".to_string()])
+            .is_none());
     }
 
     fn inventory_resource_cases() -> [ResourceAllocations; 3] {
@@ -13955,6 +13946,38 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_skips_the_save_while_a_reconfigure_holds_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.admission.node_names = Some(vec!["n[1-2]".into()]);
+        let cm = test_cluster_with_config(&dir, config).await;
+        let reconfiguring = cm.reconfigure_lock.lock();
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        assert_eq!(*cm.node_inventory.read(), None);
+        drop(reconfiguring);
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1", "n2"])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edited_startup_list_never_replaces_the_saved_one() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.admission.node_names = Some(vec!["n1".into()]);
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.apply_operation(&inventory_update(&["n1", "n2"]));
+        try_register_node(&cm, "n2", 4, 8000).unwrap();
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1", "n2"])));
+        assert!(cm
+            .node_names_mismatch_warned
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!cm
+            .unlisted_nodes_warned
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -13972,9 +13995,10 @@ pub(crate) mod tests {
         };
         // The warning is logged after the pre-check passed, before the per-node lock.
         while !cm
-            .node_names_warned
+            .unlisted_nodes_warned
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            assert!(!registering.is_finished(), "registration ended early");
             std::thread::yield_now();
         }
         cm.apply_operation(&WalOperation::NodeRemove {

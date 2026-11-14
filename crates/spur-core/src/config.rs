@@ -3403,6 +3403,9 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::Write;
+
     #[test]
     fn node_inventory_is_opt_in_and_expands_hostlists() {
         let old: super::AdmissionConfig = serde_json::from_str(r#"{"mode":"open"}"#).unwrap();
@@ -3447,9 +3450,6 @@ node_names = ["n[01-02]", "n01", "service-a"]
             );
         }
     }
-
-    use super::*;
-    use std::io::Write;
 
     #[test]
     fn cgroup_cleanup_timeout_preserves_old_configs_and_accepts_overrides() {

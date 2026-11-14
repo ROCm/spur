@@ -2286,8 +2286,10 @@ Controls which nodes may register with the controller.
      - unset
      - Optional list of the nodes allowed in the cluster, expressed as node
        names or Slurm hostlist expressions. Applies in both admission modes.
-       Omitted preserves dynamic registration; an explicit empty list permits no
-       nodes.
+       Unset and never saved means dynamic registration; an explicit empty list
+       permits no nodes. See :ref:`configured-node-list`.
+
+See :doc:`accounting` for managing admission tokens with ``spur token``.
 
 .. _configured-node-list:
 
@@ -2306,60 +2308,58 @@ To manage the inventory through ``spur.conf``, list the allowed nodes:
    mode = "open"  # or "token"; node_names is enforced in either mode
    node_names = ["compute[01-04]", "service-a"]
 
-After editing ``node_names``, run ``scontrol reconfigure``. Registered nodes
-absent from the new list are deleted, including DOWN nodes whose agent or
-container is already gone. ``scontrol reconfigure`` is the only operation that
-deletes nodes this way. The controller rejects the change if any node to be
-deleted still holds job allocations, has allocated resources, belongs to a
-reservation, or belongs to the managed Kubernetes cluster. Drain those nodes,
-wait for their allocations to finish, and remove reservation and Kubernetes
-membership first: ``spur k8s remove-nodes`` removes workers from a cluster
-started with an explicit node list. A cluster started without one spans every
-node, so it blocks every deletion until ``spur k8s down``; node roles clear once
-the teardown finishes, so retry the reconfigure if it still reports membership.
+After editing ``node_names``, run ``scontrol reconfigure``; the file's list takes
+effect only through ``scontrol reconfigure``, never through a restart alone.
+Registered nodes absent from the new list are deleted, including DOWN nodes whose
+agent or container is already gone. The controller rejects the change if any node
+to be deleted still holds job allocations, has allocated resources, belongs to a
+reservation, or belongs to the managed Kubernetes cluster. Drain those nodes, wait
+for their allocations to finish, and remove reservation and Kubernetes membership
+first. ``spur k8s remove-nodes`` removes workers from a cluster scoped with
+``--nodes``, ``--partition``, or ``--selector``; a control-plane node, or a cluster
+started without a scope (which spans every node), needs ``spur k8s down``. Node
+roles clear once the teardown finishes, so retry the reconfigure if it still
+reports membership.
+
+On each deleted host, stop and disable ``spurd``: a still-running agent keeps
+retrying registration and logging the refusal, and a restarted one exits. Remove
+the host's mesh peer as described in :ref:`wireguard-remove-node`.
 
 The list and its deletions commit together, before any partition change in the
 same reconfigure, so a refusal leaves the list, the nodes, and the partitions
-unchanged. A Raft write failure after the list is saved can leave the partition
-changes and the rest of the new configuration unapplied. Rerunning
-``scontrol reconfigure`` after fixing the cause is safe, including after a
-timeout: the controller applies the file's list after any earlier write that may
-still be pending.
+unchanged. If a reconfigure fails or times out after that, some partition changes
+and the rest of the new configuration may be unapplied; fix the cause and rerun
+``scontrol reconfigure``, which is safe to repeat.
 
-Once saved, the list also rejects later registration of an excluded name, so a
+Once saved, the list rejects later registration of an excluded name, so a
 still-running or recreated agent cannot recreate a deleted record. To admit it
-again, restore its name and reconfigure. Adding names does not create node
-records: each permitted agent must register. Reservations, Kubernetes
-membership, and job placement also refuse nodes that are excluded or not yet
-registered. A token is still required when ``mode = "token"``. The list applies
-to all node sources; it does not provide a mixed static/dynamic inventory mode.
-Names match exactly, including case.
+again, restore its name and reconfigure. ``spur node remove`` of a node that is
+still listed does not keep it out: its agent registers again. Adding names does
+not create node records: each permitted agent must register. Reservations,
+Kubernetes membership, and job placement also refuse nodes that are excluded or
+not yet registered. A token is still required when ``mode = "token"``. The list
+applies to all node sources; it does not provide a mixed static/dynamic inventory
+mode. Names match exactly, including case.
 
 ``node_names = []`` deliberately deletes every registered node, subject to the
-same refusals, and rejects every new registration. Removing the field and
-running ``scontrol reconfigure`` saves a cleared list and restores dynamic
-registration without recreating deleted records; adding ``node_names`` back
-later takes effect only through ``scontrol reconfigure``. Names support letters,
-digits, dots, underscores, and hyphens; the list is bounded to 100,000 distinct
-names of at most 255 bytes each. Wildcards and label selectors belong in
-``[[nodes]]`` and ``[[partitions]]``, not here.
+same refusals, and rejects every new registration. Removing the field and running
+``scontrol reconfigure`` saves a cleared list, which behaves like one that was
+never set: dynamic registration resumes, deleted records are not recreated, and
+nothing is refused for being unregistered. Names support letters, digits, dots,
+underscores, and hyphens; the list is bounded to 100,000 distinct names of at most
+255 bytes each. Wildcards and label selectors belong in ``[[nodes]]`` and
+``[[partitions]]``, not here.
 
 Starting or restarting the controllers with ``node_names`` in the file never
-deletes a node. If no list was saved before, a registration saves it once every
+deletes a node. If no list was ever saved, a registration saves it once every
 registered node is in it; run ``scontrol reconfigure`` to save it right away.
-Until then the controller logs the registered nodes missing from the list on the
-next registration, keeps them, and only refuses names that are neither listed
-nor already registered; run ``scontrol reconfigure`` to remove them. Before the
-list is saved, the current leader enforces the list in its own file, so give
-every controller the same file before restarting. Once saved, the list is
-restored from Raft and snapshots and remains authoritative across leader changes
-and controller restarts. A changed file alone does not replace it: distribute
-the updated file to every controller, because the next reconfigure reads the
-leader's copy, and run ``scontrol reconfigure``.
-
-All controllers must run a release that supports ``node_names`` before it is
-enabled. An older controller cannot replay a log that contains the saved list,
-so downgrading after enabling it is not supported.
+Until then the controller logs the registered nodes missing from the list once,
+keeps them, and only refuses names that are neither listed nor already
+registered. Before the list is saved, each controller enforces the list it loaded
+at startup, so give every controller the same file before restarting. Once saved,
+the list is restored from Raft and snapshots and remains authoritative across
+leader changes and controller restarts; a different list in the file is logged
+once and ignored until ``scontrol reconfigure``, which reads the leader's file.
 
 In Slurm, the global static ``NodeName=`` definitions are the authoritative node
 set by default; there is no separate deletion-enabling knob. Slurm 24.11 and
@@ -2368,11 +2368,8 @@ draining and removing their configuration references. Older versions require the
 controller restart procedure. Dynamic Slurm nodes are different: absence from
 static configuration does not delete them. See the `Slurm node-removal FAQ
 <https://slurm.schedmd.com/faq.html#rem_nodes>`_. Spur makes this list explicit
-to preserve existing deployments that discover nodes dynamically. Removing only
-a partition membership is not a global node deletion in either configuration
-model.
-
-See :doc:`accounting` for managing admission tokens with ``spur token``.
+to preserve existing deployments that discover nodes dynamically. Upgrade every
+controller before setting it; see :ref:`upgrading-node-names`.
 
 ``[devices]``
 -------------

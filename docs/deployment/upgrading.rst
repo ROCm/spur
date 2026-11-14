@@ -1075,6 +1075,20 @@ release cannot load the snapshot. To downgrade:
    move it along.
 #. Downgrade the controllers.
 
+.. _upgrading-node-names:
+
+Configured node list (``admission.node_names``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds the optional ``[admission] node_names`` list (see
+:ref:`configured-node-list`). Nothing changes until it is set.
+
+**Upgrade every controller before setting it.** Saving the list writes a new
+Raft log entry, ``NodeInventoryUpdate``. A controller that predates it cannot
+parse the entry and stops replicating until it is upgraded, and it ignores the
+list in a snapshot. A rollback after the list has been saved is not supported:
+roll forward.
+
 See Also
 --------
 

@@ -162,8 +162,10 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    /// Set when an op was refused because of admission.node_names or a removal it blocks.
     #[serde(default)]
     pub node_inventory_error: Option<String>,
+    /// True when a `NodeRegister`/`NodeUpdate` named a node the saved list excludes.
     #[serde(default)]
     pub node_registration_rejected: bool,
 }
