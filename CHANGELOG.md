@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.17.0](https://github.com/ROCm/spur/compare/v0.16.0...v0.17.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurd:** give a batch job's srun --container-image step its own container ([#1172](https://github.com/ROCm/spur/issues/1172))
+* **spurd:** hold a node until its epilog finishes or times out ([#1227](https://github.com/ROCm/spur/issues/1227))
+
+### Features
+
+* **spur-cli:** map scontrol node deletion to native removal ([#1244](https://github.com/ROCm/spur/issues/1244)) ([56d75c7](https://github.com/ROCm/spur/commit/56d75c7e7a012c5f2cef59113e46532fbe1ac48e))
+* **spurctld:** add per-partition resource limits on shared nodes ([#1193](https://github.com/ROCm/spur/issues/1193)) ([a6471fa](https://github.com/ROCm/spur/commit/a6471fa021d023e2362b9669b2378c11b361024e))
+* **spurctld:** track preemption outcomes with accounting reports ([#1226](https://github.com/ROCm/spur/issues/1226)) ([72fd55c](https://github.com/ROCm/spur/commit/72fd55c74777548dc2d7aa93fa0095c965206999))
+* **spurd:** enable the io controller for job cgroups ([#1256](https://github.com/ROCm/spur/issues/1256)) ([d40a237](https://github.com/ROCm/spur/commit/d40a23755fede9a747ae75c0fae65d6672c88980))
+* **steps:** let a step take its own cpu, memory, and gpu share of its allocation ([#1171](https://github.com/ROCm/spur/issues/1171)) ([45cc891](https://github.com/ROCm/spur/commit/45cc89179c7881db0415486cf31e4aedcfa208ac))
+
+
+### Bug Fixes
+
+* **spurctld:** confirm a node is unreachable before marking it down ([#1149](https://github.com/ROCm/spur/issues/1149)) ([f5bdc83](https://github.com/ROCm/spur/commit/f5bdc83ba35bfd9c350d0f6f18cd2c3d86123859))
+* **spurctld:** keep a preemptor's quota claim while its eviction is in flight ([#1190](https://github.com/ROCm/spur/issues/1190)) ([8af8f81](https://github.com/ROCm/spur/commit/8af8f81579ea632c5b064fa9e1dddefe8fd1acd4))
+* **spurd:** give a batch job's srun --container-image step its own container ([#1172](https://github.com/ROCm/spur/issues/1172)) ([47bd33f](https://github.com/ROCm/spur/commit/47bd33f9f05ba87fc3ad6916a349f96ec6a5b694))
+* **spurd:** hold a node until its epilog finishes or times out ([#1227](https://github.com/ROCm/spur/issues/1227)) ([fcdd88e](https://github.com/ROCm/spur/commit/fcdd88ec8c720e50805f15ab7122ae50feedb7b2))
+* **sshare:** keep the caller's own rows when usage is private ([#1230](https://github.com/ROCm/spur/issues/1230)) ([f201994](https://github.com/ROCm/spur/commit/f2019947fdba6a71c98c1b649dea9f27a2988b79))
+
 ## [0.16.0](https://github.com/ROCm/spur/compare/v0.15.0...v0.16.0) (2026-11-07)
 
 
