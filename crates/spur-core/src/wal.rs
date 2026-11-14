@@ -441,6 +441,8 @@ pub enum WalOperation {
         remove_users: Vec<String>,
         add_accounts: Vec<String>,
         remove_accounts: Vec<String>,
+        #[serde(default)]
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
     },
     ReservationDelete {
         name: String,
