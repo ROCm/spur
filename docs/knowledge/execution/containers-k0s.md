@@ -331,8 +331,8 @@ unit. It renders a unit file with these directives:
 | `Delegate` | `yes` | Required for k0s's containerd to manage its own cgroups. |
 | `Restart` | `always` | systemd re-spawns on process crash. |
 | `RestartSec` | `10` | Delay between restarts. |
-| `StartLimitIntervalSec` | `300` | 5 restarts in 5 minutes before systemd stops retrying. |
-| `StartLimitBurst` | `5` | The reconcile loop re-enables the unit on its next tick, adding backoff without permanent lockout. |
+| `StartLimitIntervalSec` | `300` | In `[Unit]`, because systemd ignores it in `[Service]`. 5 starts in 5 minutes before systemd stops retrying. |
+| `StartLimitBurst` | `5` | systemd also refuses the reconcile loop's `systemctl start` until the 5 minutes end. A later tick starts the unit again, adding backoff without permanent lockout. |
 
 The unit is tagged with `"(managed by spurd)"` in its `Description` field.
 This marker is the only way to distinguish a spurd-owned k0s unit from an
