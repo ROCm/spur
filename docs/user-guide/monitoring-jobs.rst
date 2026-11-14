@@ -593,7 +593,14 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
        the node and the removal reason.
    * - ``JobLaunchFailure``
      - NODE_FAIL
-     - The job could not be started on every node; the detail says why.
+     - The job could not be started on every node; the detail says why and
+       lists the nodes that did not confirm the launch.
+
+Dispatch failure details include ``failed nodes:`` followed by up to eight node
+names in sorted order. If more nodes failed, ``(+N more)`` gives the remaining
+count. Confirmed nodes are omitted, even when the controller cancels their work
+because another node failed. These names are available in the job's reason even
+when it never started and has no allocated ``NodeList``.
 
 ``EndedBy`` is the user who cancelled the job, for ``UserCancel`` and
 ``AdminCancel``; a ``SystemCancel`` has no user and, like every other reason,
