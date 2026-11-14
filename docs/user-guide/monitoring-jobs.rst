@@ -478,12 +478,13 @@ Flags:
      - Maximum rows to return. Default ``100``.
 
 Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
-``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,
+``%`` letters. The available fields are ``JobID``, ``JobName``, ``User``,
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
 ``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
 ``Borrowed``, ``Reason``, ``ReasonDetail``, ``EndedBy``, and ``ReqGPUS``. Set a per-field width with
-``Field%N``, e.g. ``JobName%20``.
+``Field%N``, e.g. ``JobName%20``. A name Spur does not provide is an error, and the message
+names that field. ``--format=JobID,NotAField`` prints no table.
 
 ``NodeList`` is the compressed hostlist of the nodes the job was allocated, in
 the same form ``squeue`` and ``scontrol show job`` print (``node[01-04]``). It
