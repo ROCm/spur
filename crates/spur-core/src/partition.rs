@@ -211,6 +211,36 @@ pub enum PreemptType {
     QosPriority,
 }
 
+/// One key of `scheduler.preempt_victim_order`, ranking eligible victims of equal QOS priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VictimOrderKey {
+    /// Fewest jobs evicted per node freed.
+    FewestJobs,
+    /// Least work lost per node freed: the current run's unsuspended time times its nodes.
+    LeastWork,
+    /// Stable hash of the preempting job and the node, so no node name is favoured.
+    Hash,
+}
+
+impl VictimOrderKey {
+    /// The name used in the config file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FewestJobs => "fewest_jobs",
+            Self::LeastWork => "least_work",
+            Self::Hash => "hash",
+        }
+    }
+}
+
+/// The order applied when `scheduler.preempt_victim_order` is not set.
+pub const DEFAULT_VICTIM_ORDER: [VictimOrderKey; 3] = [
+    VictimOrderKey::LeastWork,
+    VictimOrderKey::FewestJobs,
+    VictimOrderKey::Hash,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PreemptMode {
     #[default]

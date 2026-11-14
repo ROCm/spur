@@ -705,6 +705,17 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
        which uses ``idle_fill_exempt_secs`` instead.
+   * - ``preempt_victim_order``
+     - list of strings
+     - ``["least_work", "fewest_jobs", "hash"]``
+     - Live
+     - Order among preemption victims of equal QOS priority, as keys in precedence
+       order: ``"least_work"`` (lose the least work per node freed: run time,
+       less time suspended, times nodes), ``"fewest_jobs"`` (evict the fewest jobs
+       per node freed) and ``"hash"`` (a stable hash of the preempting job and the
+       node). Node name breaks any remaining tie, and ``[]`` ranks by node name alone. The keys only
+       rank jobs that are already eligible. A key may be listed once. Also applies to
+       idle-fill reclaim. See :doc:`accounting`.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``

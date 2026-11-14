@@ -1435,8 +1435,13 @@ impl Job {
 
     /// Compute the run time.
     pub fn run_time(&self) -> Option<chrono::Duration> {
+        self.run_time_at(Utc::now())
+    }
+
+    /// Run time as of `now`, less time spent suspended.
+    pub fn run_time_at(&self, now: DateTime<Utc>) -> Option<chrono::Duration> {
         let start = self.start_time?;
-        let end = self.end_time.unwrap_or_else(Utc::now);
+        let end = self.end_time.unwrap_or(now);
         let mut suspended = self.suspended_secs;
         if let Some(since) = self.suspended_at {
             suspended += (end - since).num_seconds().max(0);
