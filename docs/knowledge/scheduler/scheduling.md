@@ -219,9 +219,15 @@ partition override > global config.
 **Reservation protection** -- a job running inside an active reservation cannot
 be preempted by a job from the same or lower partition tier.
 
-**Victim selection** -- candidates are sorted by ascending QOS priority (cheapest
-first). The scheduler proves that evicting the selected victim set would
-actually place the pending job before committing.
+**Victim selection** (`satisfiable_victim_set`, shared with idle-fill reclaim) --
+only whole nodes are freed, and a node counts only if every job on it is an
+eligible victim. Nodes are picked greedily, never undone: lowest QOS priority on
+the node first, then `scheduler.preempt_victim_order` (default `least_work`,
+`fewest_jobs`, `hash`; `[]` = node name), then node name. `least_work` is run
+time minus suspended time times nodes held; both it and `fewest_jobs` compare
+per node freed, capped at the nodes still needed. A chosen multi-node victim
+frees every node it spans (the recount). Before evicting, a dry-run placement on
+the freed and idle nodes must start the pending job; otherwise nobody is evicted.
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching
