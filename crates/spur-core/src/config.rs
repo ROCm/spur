@@ -1904,7 +1904,7 @@ pub struct AdmissionConfig {
     pub node_names: Option<Vec<String>>,
 }
 
-/// The node_names list once saved through Raft; it outlives controller restarts.
+/// Expanded `admission.node_names`; once saved through Raft it outlives controller restarts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NodeInventory {
     #[serde(default)]

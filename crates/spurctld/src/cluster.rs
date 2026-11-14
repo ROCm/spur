@@ -608,6 +608,7 @@ pub struct ClusterManager {
     nodes: RwLock<HashMap<String, Node>>,
     node_inventory: RwLock<Option<NodeInventory>>,
     startup_node_inventory: NodeInventory,
+    node_names_warned: std::sync::atomic::AtomicBool,
     reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -1047,6 +1048,7 @@ impl ClusterManager {
             nodes: RwLock::new(HashMap::new()),
             node_inventory: RwLock::new(None),
             startup_node_inventory,
+            node_names_warned: std::sync::atomic::AtomicBool::new(false),
             reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -4213,6 +4215,15 @@ impl ClusterManager {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
         };
+        // A node removed after the pre-check must not come back as a fresh record before the list is saved.
+        if matches!(action, RegistrationAction::Register)
+            && self.node_inventory.read().is_none()
+            && self.startup_node_inventory.excludes(&name)
+        {
+            return Err(RegisterNodeError::PermissionDenied(format!(
+                "node {name} is absent from admission.node_names"
+            )));
+        }
 
         match action {
             RegistrationAction::Skip => {
@@ -4303,26 +4314,40 @@ impl ClusterManager {
         self.check_node_inventory(&name)
     }
 
-    /// Saves the startup node list only when that deletes no node; deletion is
-    /// left to `scontrol reconfigure`, so one node can never block another's registration.
+    /// Saves the startup node list only when that deletes no node; deletion is left to
+    /// `scontrol reconfigure`, so a busy node never makes another's registration fail.
     fn initialize_node_inventory(&self) {
         let Some(listed) = &self.startup_node_inventory.names else {
             return;
         };
-        if self.node_inventory.read().is_some() {
+        let saved = self
+            .node_inventory
+            .read()
+            .as_ref()
+            .map(|i| i.names.is_some());
+        if saved == Some(false) {
+            self.warn_node_names_once(|| {
+                warn!(
+                    "admission.node_names is set but a cleared list is saved; \
+                     run `scontrol reconfigure` to apply it"
+                )
+            });
+        }
+        if saved.is_some() {
+            return;
+        }
+        if has_unlisted_node(listed, &self.nodes.read()) {
+            self.warn_node_names_once(|| {
+                warn!(
+                    nodes = %unlisted_node_names(listed, &self.nodes.read()).join(","),
+                    "registered nodes are absent from admission.node_names; \
+                     run `scontrol reconfigure` to remove them"
+                )
+            });
             return;
         }
         let _reconfigure = self.reconfigure_lock.lock();
-        if self.node_inventory.read().is_some() {
-            return;
-        }
-        let unlisted = unlisted_node_names(listed, &self.nodes.read());
-        if !unlisted.is_empty() {
-            warn!(
-                nodes = %unlisted.join(","),
-                "registered nodes are absent from admission.node_names; \
-                 run `scontrol reconfigure` to remove them"
-            );
+        if self.node_inventory.read().is_some() || has_unlisted_node(listed, &self.nodes.read()) {
             return;
         }
         if let Err(error) = self.propose(WalOperation::NodeInventoryUpdate {
@@ -4330,6 +4355,15 @@ impl ClusterManager {
             initialize: true,
         }) {
             warn!(%error, "failed to save admission.node_names; retrying on next registration");
+        }
+    }
+
+    fn warn_node_names_once(&self, warn: impl FnOnce()) {
+        if !self
+            .node_names_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn();
         }
     }
 
@@ -4354,7 +4388,7 @@ impl ClusterManager {
             .find(|name| {
                 !nodes.contains_key(*name) || inventory.excludes(name)
             })
-            .map(|name| format!("Kubernetes membership references node '{name}' absent from the committed node inventory"))
+            .map(|name| format!("Kubernetes membership references node '{name}', which is not registered or not in admission.node_names"))
     }
 
     pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
@@ -9971,7 +10005,7 @@ impl ClusterManager {
                         || inventory
                             .names
                             .as_ref()
-                            .is_some_and(|listed| !unlisted_node_names(listed, &nodes).is_empty()))
+                            .is_some_and(|listed| has_unlisted_node(listed, &nodes)))
                 {
                     return response;
                 }
@@ -10444,6 +10478,10 @@ fn inventory_removals(
         }
     }
     Ok(removed)
+}
+
+fn has_unlisted_node(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> bool {
+    nodes.keys().any(|name| !listed.contains(name))
 }
 
 fn unlisted_node_names(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> Vec<String> {
@@ -13534,6 +13572,7 @@ pub(crate) mod tests {
             let cm = Arc::new(
                 ClusterManager::new_with_config_path(config, dir.path(), Some(path)).unwrap(),
             );
+            // A static because `before_apply` is a plain fn pointer.
             static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             let recorder = Arc::new(RecordingApplier {
                 inner: cm.clone(),
@@ -13803,6 +13842,13 @@ pub(crate) mod tests {
             error.contains("spans every node; run `spur k8s down`"),
             "{error}"
         );
+        cm.nodes.write().get_mut("n1").unwrap().k0s_role = None;
+        cm.k0s.write().member_nodes = vec!["n1".into()];
+        let error = cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap();
+        assert!(error.contains("remove that membership first"), "{error}");
         assert!(cm.get_node("n1").is_some());
     }
 
@@ -13909,6 +13955,39 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         ]
+    }
+
+    #[test]
+    fn removed_unlisted_node_cannot_reregister_before_the_list_is_saved() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.admission.node_names = Some(vec!["n1".into()]);
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        cm.apply_operation(&inventory_registration("old"));
+        let node_lock = cm.node_registration_lock("old");
+        let held = node_lock.lock();
+        let registering = {
+            let cm = cm.clone();
+            std::thread::spawn(move || try_register_node(&cm, "old", 4, 8000))
+        };
+        // The warning is logged after the pre-check passed, before the per-node lock.
+        while !cm
+            .node_names_warned
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::thread::yield_now();
+        }
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "old".into(),
+            reason: None,
+            at: None,
+        });
+        drop(held);
+        assert!(matches!(
+            registering.join().unwrap(),
+            Err(RegisterNodeError::PermissionDenied(_))
+        ));
+        assert!(cm.get_node("old").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
