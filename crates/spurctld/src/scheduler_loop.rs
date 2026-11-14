@@ -2402,7 +2402,18 @@ fn satisfiable_victim_set(
         return None;
     }
     let (victims, emptied) = VictimSearch::new(&evacuable, pool).run(short)?;
-    places_once_emptied(reclaimer, state, &empty, &emptied, &victims).then_some(victims)
+    if places_once_emptied(reclaimer, state, &empty, &emptied, &victims) {
+        return Some(victims);
+    }
+    // Debug, not info: the same refusal repeats every pass until the layout changes.
+    let mut refused: Vec<_> = victims.into_iter().collect();
+    refused.sort_unstable();
+    debug!(
+        job_id = reclaimer.job_id,
+        victims = ?refused,
+        "victim set frees enough nodes but the job would not start on them; evicting nobody"
+    );
+    None
 }
 
 /// What one node must hold for `job`: the per-node minimum, except that a one-node
@@ -6933,6 +6944,33 @@ pub(crate) mod tests {
             assert_eq!(ranked, 3000);
         }
 
+        /// Runs `f` with debug logs captured, returning its result and the log text.
+        fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || CapturedLog(writer.clone()))
+                .finish();
+            let out = tracing::subscriber::with_default(subscriber, f);
+            let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+            (out, text)
+        }
+
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         /// The same greedy choice without the search's shortcuts: every node re-ranked
         /// from scratch after every pick.
         fn full_re_rank(
@@ -7097,8 +7135,16 @@ pub(crate) mod tests {
             };
             let mut wants = reclaimer(2, 1);
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(9, None));
-            let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());
+            let (set, logs) = with_captured_logs(|| {
+                victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now())
+            });
             assert_eq!(set, None);
+            assert!(
+                logs.contains("the job would not start on them")
+                    && logs.contains(&format!("job_id={}", wants.job_id))
+                    && logs.contains("victims=[1, 2]"),
+                "a refused set must say which job and victims: {logs}"
+            );
 
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
             let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());
