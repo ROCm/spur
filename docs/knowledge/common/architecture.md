@@ -172,7 +172,7 @@ Served by spurctld. The primary API surface for clients, agents, and
 operators.
 
 **Job management:** SubmitJob, GetJobs, GetJob, CancelJob, CompleteJob,
-SuspendJob, ResumeJob, UpdateJob, RequeueJob, RunStep, ExecInJob,
+SuspendJob, ResumeJob, SignalJob, UpdateJob, RequeueJob, RunStep, ExecInJob,
 JobKeepalive, GetJobSteps, CreateJobStep, CompleteJobStep, ReportJobStatus.
 
 **Node management:** RegisterAgent, Heartbeat, ReportStepdRecovery,

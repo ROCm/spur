@@ -1816,6 +1816,7 @@ mod tests {
         cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
         cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
         cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
+        signal_job(pb::SignalJobRequest) -> ();
     }
 
     /// A kube client whose every request fails. The deletion path tolerates

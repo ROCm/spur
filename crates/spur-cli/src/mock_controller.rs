@@ -524,6 +524,7 @@ mock_controller_impl! {
         cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
         cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
         cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
+        signal_job(proto::SignalJobRequest) -> ();
     }
 }
 
