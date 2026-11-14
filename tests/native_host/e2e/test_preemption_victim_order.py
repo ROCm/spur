@@ -13,6 +13,7 @@ Requires:
   - Postgres on node 0 (accounting_cluster fixture, skips when Docker is absent)
 """
 
+import json
 import time
 
 import pytest
@@ -75,10 +76,10 @@ def _set_order(c, keys: list[str]) -> None:
     c.scontrol("reconfigure")
 
 
-def _start_victim(c, jobs: list[int], label: str, node: str) -> int:
+def _start_victim(c, jobs: list[int], label: str, node: str, extra=()) -> int:
     script = c.write_file(f"{label}.sh", _SLEEP_SCRIPT)
     out = c.sbatch(["-J", label, "-q", _VICTIM_QOS, "-N1", "-n1", f"--nodelist={node}",
-                    script])
+                    *extra, script])
     job_id = parse_job_id(out)
     assert job_id is not None, f"{label}: submit failed: {out}"
     jobs.append(job_id)
@@ -86,9 +87,9 @@ def _start_victim(c, jobs: list[int], label: str, node: str) -> int:
     return job_id
 
 
-def _start_aggressor(c, jobs: list[int]) -> int:
+def _start_aggressor(c, jobs: list[int], extra=()) -> int:
     script = c.write_file("vo-aggressor.sh", _QUICK_SCRIPT)
-    args = ["-J", "vo-aggressor", "-q", _HUNTER_QOS, "-N1", "--exclusive"]
+    args = ["-J", "vo-aggressor", "-q", _HUNTER_QOS, "-N1", "--exclusive", *extra]
     extra = c.node_names[2:]
     if extra:
         args += ["-x", ",".join(extra)]
@@ -180,3 +181,87 @@ class TestVictimOrder:
         wait_job_state(c, resumed, "R", timeout=_WAIT_RUN)
         aggressor = _start_aggressor(c, jobs)
         _assert_evicted(c, {"resumed": resumed, "steady": steady}, {"resumed"}, aggressor)
+
+
+# A fixed path, so the config written before the agents start can name it.
+_CDI_DIR = "/tmp/spur-e2e-vo-cdi"
+_FAKE_MINOR = 250
+
+
+def _render_minors(node) -> list[int]:
+    out = node.exec_allow_fail("ls /dev/dri 2>/dev/null")
+    return sorted(int(n[len("renderD"):]) for n in out.split() if n.startswith("renderD"))
+
+
+def _gpu_spec(minors: list[int]) -> str:
+    """A static AMD CDI spec, one GPU per render minor. The loader never opens the paths."""
+    devices = [
+        {
+            "name": str(i),
+            "annotations": {
+                "spur.amd.com/render-minor": str(minor),
+                "spur.amd.com/stable-id": str((i + 1) << 16),
+                "spur.amd.com/gpu-type": "mi300x",
+            },
+            "containerEdits": {"deviceNodes": [{"path": f"/dev/dri/renderD{minor}"}]},
+        }
+        for i, minor in enumerate(minors)
+    ]
+    return json.dumps({"cdiVersion": "0.6.0", "kind": "amd.com/gpu", "devices": devices})
+
+
+def _declare_gpus(c, node_index: int, count: int) -> bool:
+    """Declares `count` GPUs on a node, real render minors first; True if all are real."""
+    node = c.nodes[node_index]
+    real = _render_minors(node)
+    minors = (real + list(range(_FAKE_MINOR, _FAKE_MINOR + count)))[:count]
+    node.exec(f"mkdir -p {_CDI_DIR}")
+    node.write_file(f"{_CDI_DIR}/amd.json", _gpu_spec(minors))
+    return len(real) >= count
+
+
+class TestOneNodeGpuTotal:
+    """`-N1 --gpus=2` may only empty a node with two GPUs. A static CDI spec declares 2 and
+    1 GPUs whatever the bed has; least_work alone would pick the 1-GPU node's fresh victim."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self, cluster_config_overrides):
+        return {**cluster_config_overrides,
+                "devices": {"auto_detect": False, "cdi_spec_dirs": [_CDI_DIR]}}
+
+    @pytest.mark.parametrize("big_first", [True, False], ids=["big-is-node0", "big-is-node1"])
+    def test_only_a_node_that_can_host_the_gpu_total_is_emptied(self, vo, big_first):
+        c, jobs = vo
+        big, small = (0, 1) if big_first else (1, 0)
+        try:
+            all_real = _declare_gpus(c, big, 2)
+            _declare_gpus(c, small, 1)
+            c.start_agents()
+            names = c.node_names
+            for index, want in ((big, 2), (small, 1)):
+                deadline = time.time() + 60
+                while c.node_gpu_count(names[index]) != want and time.time() < deadline:
+                    time.sleep(2)
+                got = c.node_gpu_count(names[index])
+                if got != want:
+                    pytest.skip(f"static CDI advertised {got} GPUs on {names[index]}, wanted {want}")
+
+            victims = {"old": _start_victim(c, jobs, "vo-old", names[big], ["--exclusive"])}
+            time.sleep(_AGE_GAP_SECS)
+            victims["fresh"] = _start_victim(c, jobs, "vo-fresh", names[small], ["--exclusive"])
+            aggressor = _start_aggressor(c, jobs, ["--gpus=2"])
+
+            state = wait_job(c, victims["old"], timeout=_WAIT_PREEMPT)
+            assert state in ("CA", "GONE"), f"the 2-GPU node's victim should go, got {state!r}"
+            time.sleep(_GUARD_SECS)
+            assert job_state(c.squeue_all(), victims["fresh"]) == "R", (
+                "the 1-GPU node cannot host the job, so its victim must keep running"
+            )
+            show = c.scontrol("show", "job", str(aggressor))
+            assert f"NodeList={names[small]}" not in show, show
+            if all_real:
+                final = wait_job(c, aggressor, timeout=_WAIT_RUN)
+                assert final == "CD", f"aggressor should run on the freed node, got {final!r}"
+        finally:
+            for node in c.nodes[:2]:
+                node.exec_allow_fail(f"rm -rf {_CDI_DIR}")
