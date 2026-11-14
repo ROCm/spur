@@ -23637,7 +23637,13 @@ mod tests {
         let mut tracked = TrackedJob::allocation_only(None);
         tracked.run_attempt = 1;
         svc.insert_test_job(917, tracked).await;
-        let child = spawn_term_ignoring_process().await;
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
         let pid = child.id().expect("pid");
         svc.register_test_step(917, 4, Some(pid)).await;
 

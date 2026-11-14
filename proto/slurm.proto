@@ -1342,7 +1342,7 @@ message AgentCancelJobRequest {
 enum SignalTarget {
   SIGNAL_TARGET_UNSPECIFIED = 0;
   SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
-  SIGNAL_TARGET_BATCH = 2;   // the batch script only; FAILED_PRECONDITION if the run has no batch step
+  SIGNAL_TARGET_BATCH = 2;   // the batch script only; FAILED_PRECONDITION if the run has no batch step, UNAVAILABLE if its supervisor does not accept the signal; agents predating batch support return UNIMPLEMENTED
   SIGNAL_TARGET_FULL = 3;    // everything in the run
 }
 
