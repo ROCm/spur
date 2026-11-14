@@ -1899,16 +1899,24 @@ pub struct DevicesGresEntry {
 pub struct AdmissionConfig {
     #[serde(default)]
     pub mode: AdmissionMode,
-    /// An explicit roster; absence preserves dynamic node admission.
+    /// The nodes allowed in the cluster; absence preserves dynamic node admission.
     #[serde(default)]
     pub node_names: Option<Vec<String>>,
 }
 
-/// The committed roster remains authoritative across controller restarts.
+/// The node_names list once saved through Raft; it outlives controller restarts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NodeInventory {
     #[serde(default)]
     pub names: Option<BTreeSet<String>>,
+}
+
+impl NodeInventory {
+    pub fn excludes(&self, name: &str) -> bool {
+        self.names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+    }
 }
 
 impl AdmissionConfig {
@@ -1926,7 +1934,7 @@ impl AdmissionConfig {
                 .map_err(|error| invalid(error.to_string()))?;
             if expanded.is_empty() {
                 return Err(invalid(
-                    "empty entries are not node names; use [] for an empty roster".into(),
+                    "empty entries are not node names; use [] to allow no nodes".into(),
                 ));
             }
             for name in expanded {
@@ -1938,7 +1946,7 @@ impl AdmissionConfig {
                 }
                 names.insert(name);
                 if names.len() > 100_000 {
-                    return Err(invalid("roster exceeds 100000 nodes".into()));
+                    return Err(invalid("more than 100000 node names".into()));
                 }
             }
         }

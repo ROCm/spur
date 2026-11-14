@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Authoritative roster changes through spur.conf and scontrol reconfigure."""
+"""admission.node_names changes through spur.conf and scontrol reconfigure."""
 
 import shlex
 
@@ -14,7 +14,7 @@ from cluster import parse_job_id, wait_job_state, wait_node_state, wait_until
 def roster_cluster(unstarted_cluster, request):
     c = unstarted_cluster
     if len(c.nodes) < 2:
-        pytest.skip("node roster tests require two nodes")
+        pytest.skip("node_names tests require two nodes")
     c.start_controller(config_overrides={
         "admission": {"mode": request.param, "node_names": list(c.node_names)},
         "auth": {"plugin": "jwt", "jwt_key": "roster-e2e-test-key"},
@@ -185,3 +185,42 @@ def test_omitted_roster_preserves_nodes_when_policy_is_removed(roster_cluster):
     c._write_config()
     c.scontrol("reconfigure")
     assert set(c.sinfo_nodes()) == set(c.node_names)
+
+
+def test_startup_node_names_never_block_registration_or_delete(unstarted_cluster):
+    c = unstarted_cluster
+    if len(c.nodes) < 2:
+        pytest.skip("node_names tests require two nodes")
+    c.start_controller(config_overrides={"admission": {"mode": "open"}})
+    c.start_agents()
+    c.wait_ready()
+    listed, busy = c.node_names[0], c.node_names[1]
+    release = f"{c.remote_dir}/release-unlisted"
+    script = c.write_file(
+        "unlisted-busy.sh",
+        f"#!/bin/sh\nwhile [ ! -f {shlex.quote(release)} ]; do sleep 0.1; done\n",
+    )
+    output = c.sbatch([
+        "-N", "1", "-w", busy, "-t", "5", "-D", c.remote_dir,
+        "-o", f"{c.remote_dir}/unlisted-busy.out", script,
+    ])
+    job_id = parse_job_id(output)
+    assert job_id is not None, output
+    try:
+        wait_job_state(c, job_id, "R")
+        _write_roster(c, [listed])
+        c.restart_controller()
+        for index in (0, 1):
+            c.restart_agent(index)
+            c.wait_agent_serving(index)
+            assert "admission.node_names" not in c.spurd_log(index)
+        assert set(c.sinfo_nodes()) == set(c.node_names)
+        assert "JobState=RUNNING" in c.scontrol("show", "job", str(job_id))
+
+        _assert_rejected(c, "job allocations", c.node_names)
+        c.nodes[1].exec(f"touch {shlex.quote(release)}")
+        wait_job_state(c, job_id, "CD")
+        c.scontrol("reconfigure")
+        assert set(c.sinfo_nodes()) == {listed}
+    finally:
+        c.cli_allow_fail(["scancel", str(job_id)])

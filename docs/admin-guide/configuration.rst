@@ -111,7 +111,7 @@ and the plugin set also require a daemon restart.
 swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
 Kubernetes they re-read the same Secret). ``[[partitions]]`` and the optional
-``admission.node_names`` roster are exceptions: their changes replicate through
+``admission.node_names`` list are exceptions: their changes replicate through
 the write-ahead log. A follower still re-derives
 node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
 ``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks.
@@ -1932,8 +1932,8 @@ matches, and the first matching entry wins.
 
 .. note::
 
-   ``[[nodes]]`` is not a node roster. A node joins the cluster when ``spurd``
-   registers with the controller, so adding a block here does not create a node,
+   ``[[nodes]]`` does not list the nodes in the cluster. A node joins the cluster
+   when ``spurd`` registers with the controller, so adding a block here does not create a node,
    and removing one does not remove a node — it only clears that node's features,
    weight, and resource caps (reverting to the agent-detected inventory). Remove a
    node with ``spur node remove <node>``, which takes a
@@ -1941,8 +1941,8 @@ matches, and the first matching entry wins.
    stays in the inventory as ``down`` with the reason ``agent shutdown``. It
    returns to service when the agent registers and sends heartbeats again. An
    operator drain is kept through the restart. This differs from Slurm, where
-   ``NodeName=`` lines in ``slurm.conf`` define the roster. For configuration-driven
-   removal in Spur, see :ref:`configured-node-roster`.
+   ``NodeName=`` lines in ``slurm.conf`` define the node set. For configuration-driven
+   removal in Spur, see :ref:`configured-node-list`.
 
 Resuming a node with ``scontrol update NodeName=<node> State=RESUME`` (or
 ``State=IDLE``) clears its administrative hold. The displayed state reflects
@@ -2284,11 +2284,11 @@ Controls which nodes may register with the controller.
    * - ``node_names``
      - string[]
      - unset
-     - Optional authoritative node roster, expressed as node names or Slurm
+     - Optional list of the nodes allowed in the cluster, expressed as node names or Slurm
        hostlist expressions. Applies in both admission modes. Omitted preserves
        dynamic registration; an explicit empty list permits no nodes.
 
-.. _configured-node-roster:
+.. _configured-node-list:
 
 Configuration-driven node removal
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2297,57 +2297,64 @@ By default, registered nodes remain in the inventory until explicitly removed
 with ``spur node remove <node>``. ``[[nodes]]`` entries describe resource limits
 and scheduling policy; deleting one does not delete a registered node.
 
-To manage the inventory through ``spur.conf``, set an explicit roster:
+To manage the inventory through ``spur.conf``, list the allowed nodes:
 
 .. code-block:: toml
 
    [admission]
-   mode = "open"  # or "token"; the roster is enforced in either mode
+   mode = "open"  # or "token"; node_names is enforced in either mode
    node_names = ["compute[01-04]", "service-a"]
 
-After editing the roster, run ``scontrol reconfigure``. Registered nodes absent
-from the new list are deleted, including DOWN nodes whose agent or container is
-already gone. The controller rejects a roster change if any node to be deleted
-still holds job allocations, has allocated resources, belongs to a reservation,
-or belongs to the managed Kubernetes cluster. Drain those nodes, wait for their allocations
-to finish, and remove reservation and Kubernetes membership first. The roster
-and its deletions commit together; a refusal leaves both unchanged. Other
-configuration changes, such as partition updates, are separate operations.
+After editing ``node_names``, run ``scontrol reconfigure``. Registered nodes
+absent from the new list are deleted, including DOWN nodes whose agent or
+container is already gone. ``scontrol reconfigure`` is the only operation that
+deletes nodes this way. The controller rejects the change if any node to be
+deleted still holds job allocations, has allocated resources, belongs to a
+reservation, or belongs to the managed Kubernetes cluster. Drain those nodes,
+wait for their allocations to finish, and remove reservation and Kubernetes
+membership first. A Kubernetes cluster started without an explicit node list
+spans every node, so it blocks every deletion until ``spur k8s down``. The list
+and its deletions commit together, before any partition change in the same
+reconfigure, so a refusal leaves the list, the nodes, and the partitions
+unchanged. A Raft write failure after the list is saved can leave the partition
+changes unapplied. Rerunning ``scontrol reconfigure`` after fixing the cause is safe,
+including after a timeout: the controller applies the file's list after any
+earlier write that may still be pending.
 
-A reconfigure timeout has an unknown outcome: its roster update may still
-commit. Keep the desired roster in the file and retry after the controller
-recovers. Each reconfigure orders that roster after earlier queued updates,
-even when it initially appears unchanged.
-
-The committed roster also rejects later registration of an excluded name, so a
+Once saved, the list also rejects later registration of an excluded name, so a
 still-running or recreated agent cannot recreate a deleted record. To admit it
 again, restore its name and reconfigure. Adding names does not create node
 records: each permitted agent must register. A token is still required when
-``mode = "token"``. The roster applies to all node sources; it does not provide a
-mixed static/dynamic inventory mode.
+``mode = "token"``. The list applies to all node sources; it does not provide a
+mixed static/dynamic inventory mode. Names match exactly, including case.
 
-``node_names = []`` deliberately deletes every removable registered node and
-rejects every new registration. Removing the field and running
+``node_names = []`` deliberately deletes every registered node, subject to the
+same refusals, and rejects every new registration. Removing the field and running
 ``scontrol reconfigure`` restores dynamic registration without recreating deleted
-records. Names support letters, digits, dots, underscores, and hyphens; the roster
-is bounded to 100,000 distinct names of at most 255 bytes each. Wildcards and label selectors belong in the
-existing policy sections, not this roster.
+records. Names support letters, digits, dots, underscores, and hyphens; the list
+is bounded to 100,000 distinct names of at most 255 bytes each. Wildcards and
+label selectors belong in ``[[nodes]]`` and ``[[partitions]]``, not here.
 
-The first permitted registration on a cluster with an explicit roster commits
-that roster before admitting the node, using the same deletion safeguards.
-Once committed, the roster is restored from Raft and snapshots and remains
-authoritative across leader changes and controller restarts. A changed file
-alone does not replace it: distribute the updated file to every controller and
-run ``scontrol reconfigure``. All controllers must support the roster WAL
-operation before enabling this feature.
+Starting or restarting the controllers with ``node_names`` in the file never
+deletes a node. The next registration saves the list once every registered node
+is in it. Until then the controller logs the registered nodes missing from the
+list, keeps them, and only refuses names that are neither listed nor already
+registered; run ``scontrol reconfigure`` to remove them. Before the list is saved,
+each controller enforces its own file. Once saved, the list is
+restored from Raft and snapshots and remains authoritative across leader changes
+and controller restarts. A changed file alone does not replace it: distribute
+the updated file to every controller, because the next reconfigure reads the
+leader's copy, and run ``scontrol reconfigure``. All controllers must run a
+release that supports ``node_names`` before it is enabled; older controllers
+cannot replay the saved list.
 
-In Slurm, the global static ``NodeName=`` definitions are an authoritative roster
+In Slurm, the global static ``NodeName=`` definitions are the authoritative node set
 by default; there is no separate deletion-enabling knob. Slurm 24.11 and later
 support removing static nodes through ``scontrol reconfigure`` after draining
 and removing their configuration references. Older versions require the
 controller restart procedure. Dynamic Slurm nodes are different: absence from
 static configuration does not delete them. See the `Slurm node-removal FAQ
-<https://slurm.schedmd.com/faq.html#rem_nodes>`_. Spur makes roster management
+<https://slurm.schedmd.com/faq.html#rem_nodes>`_. Spur makes this list
 explicit to preserve existing deployments that discover nodes dynamically.
 Removing only a partition membership is not a global node deletion in either
 configuration model.
