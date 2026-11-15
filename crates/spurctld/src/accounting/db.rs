@@ -846,7 +846,7 @@ fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres
     push_coordinated(&mut qb, "user_name", "account", query.coordinated);
 
     qb.push(" ORDER BY submit_time DESC LIMIT ")
-        .push_bind(effective_query_limit(query.limit));
+        .push_bind(history_query_limit(query.limit));
     qb
 }
 
@@ -956,18 +956,29 @@ pub async fn record_txn(
     Ok(())
 }
 
-/// Default and hard cap on rows a single history/audit query returns, bounding
-/// DB load and response size; a larger request is clamped, not rejected.
+/// Rows returned when a caller asks for 0. A larger request is clamped, not rejected.
 const DEFAULT_QUERY_LIMIT: u32 = 1_000;
-const MAX_QUERY_LIMIT: u32 = 10_000;
+/// Audit queries stop here. History may return one more; both share
+/// [`spur_core::accounting::MAX_JOB_HISTORY_ROWS`].
+const MAX_QUERY_LIMIT: u32 = spur_core::accounting::MAX_JOB_HISTORY_ROWS;
 
-fn effective_query_limit(requested: u32) -> i64 {
+fn clamp_query_limit(requested: u32, max: u32) -> i64 {
     let n = if requested == 0 {
         DEFAULT_QUERY_LIMIT
     } else {
-        requested.min(MAX_QUERY_LIMIT)
+        requested.min(max)
     };
     i64::from(n)
+}
+
+fn effective_query_limit(requested: u32) -> i64 {
+    clamp_query_limit(requested, MAX_QUERY_LIMIT)
+}
+
+/// History may ask for one row past the cap so `sacct` can tell a full page
+/// from one the cap cut short. The audit log keeps the tighter cap.
+fn history_query_limit(requested: u32) -> i64 {
+    clamp_query_limit(requested, MAX_QUERY_LIMIT.saturating_add(1))
 }
 
 /// Query the `txn` audit log, newest first.
@@ -1322,6 +1333,20 @@ mod history_query_tests {
         );
         assert!(pred < limit, "{sql}");
         assert!(sql.contains("account = ANY"), "{sql}");
+    }
+
+    #[test]
+    fn history_query_limit_keeps_one_probe_row_past_the_cap() {
+        assert_eq!(history_query_limit(0), i64::from(DEFAULT_QUERY_LIMIT));
+        assert_eq!(history_query_limit(101), 101);
+        assert_eq!(
+            history_query_limit(MAX_QUERY_LIMIT + 1),
+            i64::from(MAX_QUERY_LIMIT + 1)
+        );
+        assert_eq!(
+            history_query_limit(1_000_000),
+            i64::from(MAX_QUERY_LIMIT + 1)
+        );
     }
 }
 

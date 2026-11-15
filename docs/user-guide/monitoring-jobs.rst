@@ -419,7 +419,8 @@ Flags:
    * - ``--jobs``
      - ``-j``
      - Filter by job ID (comma list; step suffixes like ``30.0`` match the base
-       job). A non-numeric ID is an error.
+       job). A non-numeric ID is an error. Without ``--limit``, every requested
+       id is returned, up to 10000.
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
@@ -443,7 +444,10 @@ Flags:
        the last one wins.
    * - ``--limit``
      -
-     - Maximum rows to return. Default ``100``.
+     - Maximum rows to print. Must be at least 1. Default ``100`` when ``-j``
+       is omitted, and the server returns at most 10000 rows. When a page
+       hides further matches, a warning is printed to stderr and the command
+       still exits 0.
 
 Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,

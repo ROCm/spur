@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_core::accounting::MAX_JOB_HISTORY_ROWS;
 use spur_proto::proto::GetJobHistoryRequest;
 
 use crate::exit_fmt::format_exit;
@@ -66,9 +67,10 @@ pub struct SacctArgs {
     #[arg(short = 'P', long, overrides_with = "parsable")]
     pub parsable2: bool,
 
-    /// Max records
-    #[arg(long, default_value = "100")]
-    pub limit: u32,
+    /// Maximum rows to print, at least 1. Without -j the default is 100. With
+    /// -j and no --limit, every requested id is returned, up to the server cap.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: Option<u32>,
 
     /// Controller address (accounting is served on the same port)
     #[arg(
@@ -189,6 +191,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .map(crate::job_id_arg::parse_job_ids)
         .transpose()?
         .unwrap_or_default();
+    let page = history_page(args.limit, job_ids.len());
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -214,17 +217,67 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             start_before,
             states,
             job_ids,
-            limit: args.limit,
+            limit: page.fetch,
         })
         .await
         .context("failed to get job history")?;
 
-    let jobs = response.into_inner().jobs;
+    let (jobs, truncated) = take_visible(response.into_inner().jobs, page.show);
+    if truncated {
+        eprintln!(
+            "sacct: warning: results truncated at {}; more jobs matched",
+            page.show
+        );
+    }
     for line in render(style, &fields, &jobs) {
         println!("{line}");
     }
 
     Ok(())
+}
+
+/// Rows printed for an open query. `-j` without `--limit` prints the whole list.
+const DEFAULT_HISTORY_ROWS: u32 = 100;
+
+#[derive(Debug)]
+struct HistoryPage {
+    show: u32,
+    fetch: u32,
+}
+
+fn history_page(explicit: Option<u32>, job_ids: usize) -> HistoryPage {
+    match explicit {
+        Some(limit) => page_with_probe(limit),
+        None if job_ids > 0 => page_for_job_ids(job_ids),
+        None => page_with_probe(DEFAULT_HISTORY_ROWS),
+    }
+}
+
+fn page_for_job_ids(job_ids: usize) -> HistoryPage {
+    match u32::try_from(job_ids) {
+        Ok(count) if count <= MAX_JOB_HISTORY_ROWS => HistoryPage {
+            show: count,
+            fetch: count,
+        },
+        _ => page_with_probe(MAX_JOB_HISTORY_ROWS),
+    }
+}
+
+fn page_with_probe(limit: u32) -> HistoryPage {
+    let show = limit.min(MAX_JOB_HISTORY_ROWS);
+    HistoryPage {
+        show,
+        fetch: show.saturating_add(1),
+    }
+}
+
+fn take_visible<T>(mut rows: Vec<T>, show: u32) -> (Vec<T>, bool) {
+    let show = show as usize;
+    if rows.len() <= show {
+        return (rows, false);
+    }
+    rows.truncate(show);
+    (rows, true)
 }
 
 fn output_fields(args: &SacctArgs) -> Result<Vec<format_engine::FormatToken>> {
@@ -708,5 +761,59 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("no recognized fields"));
+    }
+
+    #[test]
+    fn job_id_list_is_fetched_in_full_when_limit_is_omitted() {
+        let page = history_page(None, 150);
+        assert_eq!((page.show, page.fetch), (150, 150));
+    }
+
+    #[test]
+    fn an_open_query_fetches_one_past_the_default_page() {
+        let page = history_page(None, 0);
+        assert_eq!((page.show, page.fetch), (100, 101));
+    }
+
+    #[test]
+    fn an_explicit_limit_wins_over_a_longer_job_id_list() {
+        let page = history_page(Some(10), 150);
+        assert_eq!((page.show, page.fetch), (10, 11));
+    }
+
+    #[test]
+    fn a_zero_limit_is_rejected() {
+        let err = SacctArgs::try_parse_from(["sacct", "--limit", "0"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--limit"), "{msg}");
+        assert!(msg.contains('1'), "{msg}");
+    }
+
+    #[test]
+    fn a_job_id_list_past_the_cap_asks_for_one_probe_row() {
+        let page = history_page(None, (MAX_JOB_HISTORY_ROWS as usize) + 5_000);
+        assert_eq!(
+            (page.show, page.fetch),
+            (MAX_JOB_HISTORY_ROWS, MAX_JOB_HISTORY_ROWS + 1)
+        );
+    }
+
+    #[test]
+    fn an_explicit_limit_above_the_cap_keeps_one_probe_row() {
+        let page = history_page(Some(MAX_JOB_HISTORY_ROWS + 10_000), 0);
+        assert_eq!(
+            (page.show, page.fetch),
+            (MAX_JOB_HISTORY_ROWS, MAX_JOB_HISTORY_ROWS + 1)
+        );
+    }
+
+    #[test]
+    fn take_visible_drops_the_probe_row_and_reports_the_cut() {
+        let (rows, truncated) = take_visible(vec!["a", "b", "c"], 2);
+        assert_eq!(rows, ["a", "b"]);
+        assert!(truncated);
+        let (rows, truncated) = take_visible(vec!["a", "b"], 2);
+        assert_eq!(rows, ["a", "b"]);
+        assert!(!truncated);
     }
 }
