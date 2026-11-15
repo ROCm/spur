@@ -27,7 +27,8 @@ pub fn job_to_json(job: &Job) -> serde_json::Value {
         "state_reason": job.state_reason(),
         "submit_time": job.submit_time.timestamp(),
         "start_time": job.start_time.map(|t| t.timestamp()),
-        "end_time": job.end_time.map(|t| t.timestamp()),
+        "end_time": job.reported_end_time().map(|t| t.timestamp()),
+        "preempt_time": job.preempt_grace().map(|p| p.signaled_at.timestamp()),
         "time_limit": job.spec.time_limit.map(|d| d.num_minutes()),
         "node_count": job.spec.num_nodes,
         "tasks": job.spec.num_tasks,
@@ -152,6 +153,50 @@ mod tests {
                 "unused_by_cause": [{"reason": "cancelled", "initiator": "user", "count": 1}],
             })
         );
+    }
+
+    #[test]
+    fn job_to_json_reports_grace_preempt_time_and_end_time() {
+        use chrono::{Duration, TimeZone, Utc};
+        use spur_core::job::{JobSpec, PreemptPending};
+        use spur_core::partition::PreemptMode;
+
+        let mut job = Job::new(7, JobSpec::default());
+        let plain = job_to_json(&job);
+        assert!(plain["preempt_time"].is_null());
+        assert!(plain["end_time"].is_null());
+
+        let signaled_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let deadline = signaled_at + Duration::seconds(60);
+        job.preempt_pending = Some(PreemptPending {
+            preemption_claim: None,
+            signaled_at,
+            deadline,
+            preempted_by: 9,
+            preempt_qos: None,
+            mode: PreemptMode::Cancel,
+            run_attempt: 0,
+            requeue_hold_secs: 0,
+        });
+        let json = job_to_json(&job);
+        assert_eq!(json["preempt_time"], signaled_at.timestamp());
+        assert_eq!(json["end_time"], deadline.timestamp());
+
+        let mut finished = job.clone();
+        let ended = signaled_at + Duration::seconds(10);
+        finished.end_time = Some(ended);
+        finished.preempt_pending = None;
+        let finished = job_to_json(&finished);
+        assert_eq!(finished["end_time"], ended.timestamp());
+        assert!(finished["preempt_time"].is_null());
+
+        job.run_attempt = 1;
+        let next_run = job_to_json(&job);
+        assert!(
+            next_run["preempt_time"].is_null(),
+            "a grace from an earlier run is not reported"
+        );
+        assert!(next_run["end_time"].is_null());
     }
 
     #[test]
