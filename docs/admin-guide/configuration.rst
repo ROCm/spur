@@ -112,13 +112,13 @@ swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
 Kubernetes they re-read the same Secret). ``[[partitions]]`` and the optional
 ``admission.node_names`` list are exceptions: their changes replicate through
-the write-ahead log. A follower still re-derives
-node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
-``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks.
+the write-ahead log. A follower still re-derives node features, weight, and
+resource caps (``cpus`` / ``memory_mb`` / ``reserved_memory_mb``) from its own
+pre-reconfigure ``[[nodes]]`` blocks.
 Allocation-derived node states also reflect each controller's resource caps. In
 particular, a cap you *lower* via ``reconfigure`` is not enforced by a follower that
 has not restarted, so after an immediate failover the new leader may briefly admit
-against the old (higher) cap. Do not rely on reconfigured non-partition state
+against the old (higher) cap. Do not rely on other reconfigured state
 surviving an immediate failover; roll the controllers to converge them.
 
 Resource caps are applied by the controller when it stores a node's inventory, so a
@@ -2308,58 +2308,66 @@ To manage the inventory through ``spur.conf``, list the allowed nodes:
    mode = "open"  # or "token"; node_names is enforced in either mode
    node_names = ["compute[01-04]", "service-a"]
 
-After editing ``node_names``, run ``scontrol reconfigure``; the file's list takes
-effect only through ``scontrol reconfigure``, never through a restart alone.
-Registered nodes absent from the new list are deleted, including DOWN nodes whose
-agent or container is already gone. The controller rejects the change if any node
-to be deleted still holds job allocations, has allocated resources, belongs to a
-reservation, or belongs to the managed Kubernetes cluster. Drain those nodes, wait
-for their allocations to finish, and remove reservation and Kubernetes membership
-first. ``spur k8s remove-nodes`` removes workers from a cluster scoped with
-``--nodes``, ``--partition``, or ``--selector``; a control-plane node, or a cluster
-started without a scope (which spans every node), needs ``spur k8s down``. Node
-roles clear once the teardown finishes, so retry the reconfigure if it still
-reports membership.
+After editing ``node_names``, run ``scontrol reconfigure``. It is the only
+operation that deletes nodes for the list, and once a list is saved it is the only
+way to change or clear it; a restart never deletes a node. Registered nodes absent
+from the new list are deleted, including DOWN nodes whose agent or container is
+already gone. The controller rejects the change if any node to be deleted still
+holds job allocations, has allocated resources, belongs to a reservation, or
+belongs to the managed Kubernetes cluster. Drain those nodes, wait for their
+allocations to finish, and remove reservation and Kubernetes membership first.
+``spur k8s remove-nodes`` removes workers from a cluster brought up with
+``spur k8s up --nodes``, ``--partition``, or ``--selector``. A control-plane node,
+the last members, or a cluster brought up without a scope (which spans every
+node) needs ``spur k8s down``. Node roles clear once the teardown finishes, so
+retry the reconfigure if it reports that the teardown has not finished.
 
-On each deleted host, stop and disable ``spurd``: a still-running agent keeps
-retrying registration and logging the refusal, and a restarted one exits. Remove
-the host's mesh peer as described in :ref:`wireguard-remove-node`.
+On each deleted host, stop and disable ``spurd``. A still-running agent keeps
+retrying registration and logging the refusal, and a restarted one exits, so a
+service manager that restarts it loops. Remove the host's mesh peer as described
+in :ref:`wireguard-remove-node`.
 
 The list and its deletions commit together, before any partition change in the
 same reconfigure, so a refusal leaves the list, the nodes, and the partitions
-unchanged. If a reconfigure fails or times out after that, some partition changes
-and the rest of the new configuration may be unapplied; fix the cause and rerun
-``scontrol reconfigure``, which is safe to repeat.
+unchanged. A reconfigure that fails or times out after submitting the list may
+still save it and delete nodes, and some partition changes and the rest of the new
+configuration may be unapplied. Fix the cause and rerun ``scontrol reconfigure``,
+which is safe to repeat, to reach a known state.
 
 Once saved, the list rejects later registration of an excluded name, so a
 still-running or recreated agent cannot recreate a deleted record. To admit it
 again, restore its name and reconfigure. ``spur node remove`` of a node that is
-still listed does not keep it out: its agent registers again. Adding names does
-not create node records: each permitted agent must register. Reservations,
-Kubernetes membership, and job placement also refuse nodes that are excluded or
-not yet registered. A token is still required when ``mode = "token"``. The list
-applies to all node sources; it does not provide a mixed static/dynamic inventory
-mode. Names match exactly, including case.
+still listed does not keep it out: its agent registers again on its next
+heartbeat. Adding names does not create node records: each permitted agent must
+register. With a saved list, reservations, Kubernetes membership, and job
+placement also refuse nodes that are excluded or not yet registered. A token is
+still required when ``mode = "token"``. The list applies to all node sources; it
+does not provide a mixed static/dynamic inventory mode. Names match exactly,
+including case.
 
 ``node_names = []`` deliberately deletes every registered node, subject to the
 same refusals, and rejects every new registration. Removing the field and running
 ``scontrol reconfigure`` saves a cleared list, which behaves like one that was
-never set: dynamic registration resumes, deleted records are not recreated, and
-nothing is refused for being unregistered. Names support letters, digits, dots,
-underscores, and hyphens; the list is bounded to 100,000 distinct names of at most
-255 bytes each. Wildcards and label selectors belong in ``[[nodes]]`` and
-``[[partitions]]``, not here.
+never set: dynamic registration resumes and nothing is refused for being
+unregistered. Deleted records are not restored, but any agent still running on a
+deleted host registers again on its next heartbeat. Removing the field without
+running ``scontrol reconfigure`` keeps a saved list in force. Names support
+letters, digits, dots, underscores, and hyphens; the list is bounded to 100,000
+distinct names of at most 255 bytes each. Wildcards and label selectors belong in
+``[[nodes]]`` and ``[[partitions]]``, not here.
 
 Starting or restarting the controllers with ``node_names`` in the file never
-deletes a node. If no list was ever saved, a registration saves it once every
-registered node is in it; run ``scontrol reconfigure`` to save it right away.
-Until then the controller logs the registered nodes missing from the list once,
-keeps them, and only refuses names that are neither listed nor already
-registered. Before the list is saved, each controller enforces the list it loaded
-at startup, so give every controller the same file before restarting. Once saved,
-the list is restored from Raft and snapshots and remains authoritative across
-leader changes and controller restarts; a different list in the file is logged
-once and ignored until ``scontrol reconfigure``, which reads the leader's file.
+deletes a node. If no list was ever saved, the leader refuses names that are
+neither listed nor already registered, and a registration saves the list once
+every registered node is in it; run ``scontrol reconfigure`` to save it right
+away. Until then the leader logs the registered nodes missing from the list at
+most once per controller process, on a registration it handles. Before the list is
+saved, the current leader enforces the list it loaded at startup, so a failover can
+change which list applies; give every controller the same file before restarting.
+Once saved, the list is restored from Raft and snapshots and remains authoritative
+across leader changes and controller restarts. A different list loaded at startup
+is logged at most once per controller process and ignored until
+``scontrol reconfigure``, which reads the leader's file.
 
 In Slurm, the global static ``NodeName=`` definitions are the authoritative node
 set by default; there is no separate deletion-enabling knob. Slurm 24.11 and

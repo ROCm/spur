@@ -1899,7 +1899,7 @@ pub struct DevicesGresEntry {
 pub struct AdmissionConfig {
     #[serde(default)]
     pub mode: AdmissionMode,
-    /// The nodes allowed in the cluster; absence preserves dynamic node admission.
+    /// The nodes allowed in the cluster; once saved, only `scontrol reconfigure` changes or clears it.
     #[serde(default)]
     pub node_names: Option<Vec<String>>,
 }

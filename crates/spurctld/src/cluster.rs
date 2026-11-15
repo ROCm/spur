@@ -4330,8 +4330,8 @@ impl ClusterManager {
         if let Some(differs) = saved_differs {
             if differs && !swap_flag(&self.node_names_mismatch_warned) {
                 warn!(
-                    "admission.node_names in the file differs from the saved list; \
-                     run `scontrol reconfigure` to apply it"
+                    "admission.node_names loaded at startup differs from the saved list; \
+                     the saved list applies until `scontrol reconfigure`"
                 );
             }
             return;
@@ -4347,7 +4347,7 @@ impl ClusterManager {
             }
             return;
         }
-        // A held lock means a reconfigure or another registration is already saving the list.
+        // A held lock means a reconfigure is running, and it saves the list itself.
         let Some(_reconfigure) = self.reconfigure_lock.try_lock() else {
             return;
         };
@@ -6992,8 +6992,8 @@ impl ClusterManager {
         let reservations = self.reservations.read();
         let removed =
             inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
-        // Heartbeats can change the local used-view; it must not decide whether
-        // a saved node_names list applies on one replica but is refused on another.
+        // A leader-side guard only: Raft apply rechecks job holds, reservations, and
+        // Kubernetes membership, but not these counters.
         for name in removed {
             let node = &nodes[&name];
             if node.alloc_resources.cpus > 0
@@ -10465,13 +10465,24 @@ fn inventory_removals(
         }
         let k0s_up = k0s.phase != spur_core::k0s::K0sPhase::Down;
         if node.k0s_role.is_some() || (k0s_up && k0s.is_member(name)) {
-            if k0s_up && k0s.member_nodes.is_empty() {
+            use spur_core::k0s::K0sRole;
+            if !k0s_up {
+                anyhow::bail!(
+                    "node '{name}' still has a Kubernetes role; retry once the teardown finishes"
+                );
+            }
+            if k0s.member_nodes.is_empty() {
                 anyhow::bail!(
                     "node '{name}' belongs to the managed Kubernetes cluster, which spans every \
                      node; run `spur k8s down` first"
                 );
             }
-            anyhow::bail!("node '{name}' belongs to the managed Kubernetes cluster; remove that membership first");
+            if matches!(node.k0s_role, Some(K0sRole::Controller | K0sRole::Single)) {
+                anyhow::bail!(
+                    "node '{name}' is a Kubernetes control-plane node; run `spur k8s down` first"
+                );
+            }
+            anyhow::bail!("node '{name}' belongs to the managed Kubernetes cluster; remove that membership first with `spur k8s remove-nodes`");
         }
     }
     Ok(removed)
@@ -13808,7 +13819,10 @@ pub(crate) mod tests {
             .apply_operation(&inventory_update(&[]))
             .node_inventory_error
             .unwrap();
-        assert!(error.contains("remove that membership first"), "{error}");
+        assert!(
+            error.contains("retry once the teardown finishes"),
+            "{error}"
+        );
         assert!(cm.get_node("n1").is_some());
         cm.nodes.write().get_mut("n1").unwrap().k0s_role = None;
         cm.k0s.write().phase = spur_core::k0s::K0sPhase::Provisioning;
@@ -13835,7 +13849,17 @@ pub(crate) mod tests {
             .apply_operation(&inventory_update(&[]))
             .node_inventory_error
             .unwrap();
-        assert!(error.contains("remove that membership first"), "{error}");
+        assert!(error.contains("spur k8s remove-nodes"), "{error}");
+        cm.nodes.write().get_mut("n1").unwrap().k0s_role =
+            Some(spur_core::k0s::K0sRole::Controller);
+        let error = cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap();
+        assert!(
+            error.contains("control-plane node; run `spur k8s down`"),
+            "{error}"
+        );
         assert!(cm.get_node("n1").is_some());
     }
 

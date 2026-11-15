@@ -2600,7 +2600,7 @@ impl SlurmController for ControllerService {
         let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
 
         let req = request.into_inner();
-        // Token first, so an unauthenticated caller cannot probe which names are listed.
+        // Token first, so in token mode an unauthenticated caller cannot probe which names are listed.
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
         self.cluster
             .check_node_inventory(&req.hostname)
