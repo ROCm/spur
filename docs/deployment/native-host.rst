@@ -209,14 +209,32 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   agent from another cluster on the same host could remove the first agent's
   leftover directories.
 
-Directories kept because the activity inventory was uncertain, or the
-controller did not confirm them (per batch of 128 job ids), are logged with a
-count (``retained job spools: <reason>``); directories left when the time runs out
+The same pass handles leftover container root filesystems in the container
+directory (``/var/spool/spur/containers``, or ``$SPUR_CONTAINER_DIR``):
+
+* Only unnamed rootfs directories are considered: ``job_<id>`` for a job and
+  ``step_<id>_<step>`` for a step. Named containers (``--container-name``) are
+  never matched unless they were given one of those names, which normal job
+  completion already treats as unnamed.
+* The same controller confirmation and running-work checks apply; a process
+  whose root directory is the rootfs keeps it.
+* Overlay mounts left behind (``lower``, ``upper``, ``merged``) are detached
+  first. A mount that cannot be detached keeps the directory and logs ``kept
+  container rootfs: a mount beneath it could not be detached``.
+* Deletion runs in the background after ``spurd`` starts serving, so a large
+  image does not delay startup. A job relaunched on the node before its old
+  rootfs is gone waits for the deletion, or keeps the directory if it got there
+  first. Progress is logged as ``deleting orphan container rootfs`` and
+  ``deleted orphan container rootfs``.
+
+Directories kept because the controller did not confirm them or the activity
+inventory was uncertain are logged with a count per batch of 128 job ids
+(``retained job spools: <reason>``); directories left when the time runs out
 log ``retained remaining job spools`` with the reason. Each path is logged at
 debug level. Directories still in use log ``retained locally owned job spool``
 or ``retained job spool: runtime session, cgroup or process still holds it``;
 removals log ``deleted orphan job spool``. The pass ends with ``startup job
-spool cleanup finished deleted=<n> retained=<n> errors=<n>``.
+spool cleanup finished deleted=<n> retained=<n> errors=<n> queued_rootfs=<n>``.
 
 Quick Start: Two-Node Cluster
 -----------------------------

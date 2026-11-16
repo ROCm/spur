@@ -4523,6 +4523,46 @@ async fn run_containerized_step(
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct SpoolOwnership {
+    lifecycle: crate::job_lifecycle::JobLifecycle,
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    stepds: Arc<Mutex<StepdMap>>,
+}
+
+impl SpoolOwnership {
+    pub(crate) async fn guard(
+        &self,
+        job_id: u32,
+    ) -> crate::job_lifecycle::KeyedLifecycleGuard<u32> {
+        self.lifecycle.acquire(job_id).await
+    }
+
+    pub(crate) async fn local_owner(&self, job_id: u32) -> Option<&'static str> {
+        if self.running.lock().await.contains_key(&job_id) {
+            return Some("tracked job");
+        }
+        if self.allocation.lock().await.owner_attempt(job_id).is_some() {
+            return Some("reserved allocation");
+        }
+        if self
+            .active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(id, _)| *id == job_id)
+        {
+            return Some("active step");
+        }
+        if self.stepds.lock().await.keys().any(|(id, _)| *id == job_id) {
+            return Some("retained supervisor");
+        }
+        None
+    }
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     /// In-memory only: starts empty on every spurd start/restart, regardless
@@ -5071,20 +5111,26 @@ impl AgentService {
         BatchWorkload::Gated
     }
 
-    pub async fn cleanup_startup_job_spools(&self) {
-        self.cleanup_startup_job_spools_with_inventory(crate::startup_spool::ActivityPaths {
-            proc_root: "/proc".into(),
-            cgroup_root: executor::CGROUP_ROOT.into(),
-            runtime_root: crate::stepd::StepdStore::new(&self.stepd_state_dir)
-                .root()
-                .to_owned(),
-            cgroups_enabled: self.cgroup.enabled,
-            supervisor_uid: nix::unistd::geteuid().as_raw(),
-            budget: crate::startup_spool::STARTUP_CLEANUP_BUDGET,
-            #[cfg(test)]
-            worker_gate: None,
-        })
-        .await;
+    /// Runs the startup pass; the returned future deletes queued container rootfs dirs and is spawned once serving.
+    pub async fn cleanup_startup_job_spools(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let summary = self
+            .cleanup_startup_job_spools_with_inventory(crate::startup_spool::ActivityPaths {
+                proc_root: "/proc".into(),
+                cgroup_root: executor::CGROUP_ROOT.into(),
+                runtime_root: crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                    .root()
+                    .to_owned(),
+                cgroups_enabled: self.cgroup.enabled,
+                supervisor_uid: nix::unistd::geteuid().as_raw(),
+                budget: crate::startup_spool::STARTUP_CLEANUP_BUDGET,
+                container_root: Some(crate::container::container_dir()),
+                #[cfg(test)]
+                worker_gate: None,
+            })
+            .await;
+        crate::startup_spool::delete_pending_rootfs(self.spool_ownership(), summary.pending_rootfs)
     }
 
     pub(crate) async fn cleanup_startup_job_spools_with_inventory(
@@ -5102,25 +5148,18 @@ impl AgentService {
     }
 
     pub(crate) async fn spool_local_owner(&self, job_id: u32) -> Option<&'static str> {
-        if self.running.lock().await.contains_key(&job_id) {
-            return Some("tracked job");
+        self.spool_ownership().local_owner(job_id).await
+    }
+
+    /// What decides whether a job's on-disk state is still in use, detached for work after serving.
+    pub(crate) fn spool_ownership(&self) -> SpoolOwnership {
+        SpoolOwnership {
+            lifecycle: self.lifecycle.clone(),
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+            active_steps: self.active_steps.clone(),
+            stepds: self.stepds.clone(),
         }
-        if self.allocation.lock().await.owner_attempt(job_id).is_some() {
-            return Some("reserved allocation");
-        }
-        if self
-            .active_steps
-            .lock()
-            .await
-            .keys()
-            .any(|(id, _)| *id == job_id)
-        {
-            return Some("active step");
-        }
-        if self.stepds.lock().await.keys().any(|(id, _)| *id == job_id) {
-            return Some("retained supervisor");
-        }
-        None
     }
 
     /// The job's own process, asked of its supervisor over the control socket —

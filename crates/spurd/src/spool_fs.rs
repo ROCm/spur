@@ -1,7 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use nix::errno::Errno;
 use nix::fcntl::{openat, openat2, AtFlags, OFlag, OpenHow, ResolveFlag};
+use nix::mount::{umount2, MntFlags};
 use nix::sys::stat::{fstatat, Mode};
 use nix::unistd::{unlinkat, UnlinkatFlags};
 use std::collections::HashSet;
@@ -20,6 +22,7 @@ pub(crate) const MAX_SPOOL_DEPTH: usize = 256;
 const READ_CHUNK: usize = 1024;
 const MAX_RESCANS: u8 = 2;
 const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
+const MAX_UNMOUNT_ROUNDS: usize = 4;
 
 /// Opens a root (spool, cgroup or session), following symlinks in its path; nothing beneath it is followed.
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
@@ -146,6 +149,32 @@ pub(crate) fn job_spool_name(job_id: u32) -> OsString {
     OsString::from(format!("job{job_id}"))
 }
 
+/// Mount points and filesystem types from a mountinfo file; a missing file lists none.
+pub(crate) fn read_mounts(path: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+    let info = match std::fs::read_to_string(path) {
+        Ok(info) => info,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(info
+        .lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let point = left.split(' ').nth(4)?;
+            let kind = right.split(' ').next()?;
+            Some((PathBuf::from(unescape_mount_path(point)), kind.to_owned()))
+        })
+        .collect())
+}
+
+fn unescape_mount_path(point: &str) -> String {
+    point
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
 fn verify_root(root: &File) -> io::Result<()> {
     let metadata = root.metadata()?;
     if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
@@ -163,6 +192,46 @@ pub(crate) fn canonical_job_id(name: &OsStr) -> Option<u32> {
     (id > 0 && name == format!("job{id}")).then_some(id)
 }
 
+/// Job id of an unnamed container rootfs: `job_<N>` (a job) or `step_<N>_<M>` (a step).
+pub(crate) fn canonical_rootfs_job_id(name: &OsStr) -> Option<u32> {
+    let name = name.to_str()?;
+    let positive = |s: &str| {
+        s.parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0 && s == n.to_string())
+    };
+    if let Some(job) = name.strip_prefix("job_") {
+        return positive(job);
+    }
+    let (job, step) = name.strip_prefix("step_")?.split_once('_')?;
+    positive(step)?;
+    positive(job)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpoolKind {
+    /// `job<N>` under a spool root: the job script and step output.
+    Spool,
+    /// `job_<N>` or `step_<N>_<M>` under the container root: an unnamed container rootfs.
+    Rootfs,
+}
+
+impl SpoolKind {
+    fn job_id(self, name: &OsStr) -> Option<u32> {
+        match self {
+            Self::Spool => canonical_job_id(name),
+            Self::Rootfs => canonical_rootfs_job_id(name),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Spool => "job spool",
+            Self::Rootfs => "container rootfs",
+        }
+    }
+}
+
 pub(crate) struct SpoolRoot {
     pub(crate) path: PathBuf,
     real_path: PathBuf,
@@ -172,12 +241,30 @@ pub(crate) struct SpoolRoot {
 #[derive(Clone)]
 pub(crate) struct JobSpool {
     pub(crate) job_id: u32,
+    pub(crate) kind: SpoolKind,
+    name: OsString,
     metadata: Metadata,
+    roots: Vec<(u64, u64)>,
 }
 
 impl JobSpool {
-    pub(crate) fn device(&self) -> u64 {
-        self.metadata.dev()
+    /// Inodes a process would hold as its root or cwd while using this entry.
+    pub(crate) fn identities(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        std::iter::once(inode_identity(&self.metadata)).chain(self.roots.iter().copied())
+    }
+}
+
+// An overlay rootfs is entered through `merged`, a separate filesystem from the base.
+fn rootfs_roots(kind: SpoolKind, base: &File) -> io::Result<Vec<(u64, u64)>> {
+    if kind != SpoolKind::Rootfs {
+        return Ok(Vec::new());
+    }
+    match fstatat(base, "merged", AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+            Ok(vec![(stat.st_dev, stat.st_ino)])
+        }
+        Ok(_) | Err(nix::errno::Errno::ENOENT) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -198,19 +285,56 @@ impl SpoolRoot {
         })
     }
 
-    /// The job's path with root symlinks resolved, matching how /proc reports holders.
-    pub(crate) fn job_path(&self, job_id: u32) -> PathBuf {
-        self.real_path.join(job_spool_name(job_id))
+    /// The entry's path with root symlinks resolved, matching how /proc and mountinfo report it.
+    pub(crate) fn entry_path(&self, spool: &JobSpool) -> PathBuf {
+        self.real_path.join(&spool.name)
     }
 
     pub(crate) fn identity(&self) -> io::Result<(u64, u64)> {
         Ok(inode_identity(&self.directory.metadata()?))
     }
 
-    pub(crate) fn candidates(&self) -> io::Result<Vec<JobSpool>> {
+    /// Detaches every mount at or beneath the entry, deepest first; any that remain keep it.
+    pub(crate) fn unmount_beneath(&self, spool: &JobSpool, mountinfo: &Path) -> io::Result<usize> {
+        let base = self.entry_path(spool);
+        let beneath = |mounts: Vec<(PathBuf, String)>| -> Vec<PathBuf> {
+            let mut points: Vec<_> = mounts
+                .into_iter()
+                .map(|(point, _)| point)
+                .filter(|point| point.starts_with(&base))
+                .collect();
+            points.sort_by_key(|point| std::cmp::Reverse(point.as_os_str().len()));
+            points
+        };
+        let mut detached = 0;
+        for _ in 0..MAX_UNMOUNT_ROUNDS {
+            let points = beneath(read_mounts(mountinfo)?);
+            if points.is_empty() {
+                return Ok(detached);
+            }
+            for point in points {
+                match umount2(&point, MntFlags::UMOUNT_NOFOLLOW) {
+                    Ok(()) => detached += 1,
+                    Err(Errno::EINVAL | Errno::ENOENT) => {}
+                    Err(error) => {
+                        tracing::warn!(job_id = spool.job_id, mount = %point.display(), %error,
+                            "could not detach a mount beneath an orphan entry");
+                        return Err(io::Error::other(Kept(
+                            "a mount beneath it could not be detached",
+                        )));
+                    }
+                }
+            }
+        }
+        Err(io::Error::other(Kept(
+            "a mount beneath it could not be detached",
+        )))
+    }
+
+    pub(crate) fn candidates(&self, kind: SpoolKind) -> io::Result<Vec<JobSpool>> {
         let mut candidates = Vec::new();
         for name in directory_names(&self.directory)? {
-            let Some(job_id) = canonical_job_id(&name) else {
+            let Some(job_id) = kind.job_id(&name) else {
                 continue;
             };
             let metadata = match fstatat(
@@ -226,22 +350,25 @@ impl SpoolRoot {
                 libc::S_IFDIR => {}
                 libc::S_IFLNK => {
                     tracing::warn!(job_id, root = %self.path.display(),
-                        "kept job spool: entry is a symlink, not followed");
+                        "kept {}: entry is a symlink, not followed", kind.label());
                     continue;
                 }
                 _ => {
                     tracing::info!(job_id, root = %self.path.display(),
-                        "skipped job spool name that is not a directory");
+                        "skipped {} name that is not a directory", kind.label());
                     continue;
                 }
             }
             match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
                 Ok(directory) => candidates.push(JobSpool {
                     job_id,
+                    kind,
+                    roots: rootfs_roots(kind, &directory)?,
                     metadata: directory.metadata()?,
+                    name,
                 }),
                 Err(error) => tracing::warn!(job_id, root = %self.path.display(), %error,
-                    "skipped unsafe or unreadable job spool"),
+                    "skipped unsafe or unreadable {}", kind.label()),
             }
         }
         Ok(candidates)
@@ -265,9 +392,9 @@ impl SpoolRoot {
         if held.is_empty() {
             return Ok(false);
         }
-        let name = job_spool_name(spool.job_id);
+        let name = &spool.name;
         let directory =
-            match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
+            match open_child(&self.directory, name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
                 Ok(directory) => directory,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
@@ -320,7 +447,7 @@ impl SpoolRoot {
     }
 
     fn delete_job(&self, spool: &JobSpool, deadline: Option<Instant>) -> io::Result<()> {
-        let name = job_spool_name(spool.job_id);
+        let name = spool.name.clone();
         let directory =
             match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
                 Ok(directory) => directory,
@@ -523,7 +650,10 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
     root.delete_job(
         &JobSpool {
             job_id,
+            kind: SpoolKind::Spool,
             metadata: directory.metadata()?,
+            roots: Vec::new(),
+            name,
         },
         Some(Instant::now() + COMPLETION_BUDGET),
     )

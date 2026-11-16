@@ -106,7 +106,7 @@ fn image_dir() -> PathBuf {
 /// 1. `$SPUR_CONTAINER_DIR` environment variable
 /// 2. `/var/spool/spur/containers` if writable
 /// 3. `~/.spur/containers/` as user-local fallback
-fn container_dir() -> PathBuf {
+pub(crate) fn container_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SPUR_CONTAINER_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);

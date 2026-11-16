@@ -320,3 +320,37 @@ def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster):
     assert not spool.exists(), log
     assert (target / "sentinel").read_text() == "outside spool\n"
     assert "JobState=COMPLETED" in cluster.cli("control", "show", "job", job_id)
+
+
+def _make_rootfs(base):
+    (base / "usr/lib").mkdir(parents=True)
+    (base / "usr/lib/site.py").write_text("image\n")
+    (base / "lib").symlink_to("usr/lib")
+    (base / "host").symlink_to("/")
+    return base
+
+
+def test_orphan_container_rootfs_is_unmounted_and_removed_after_serving(local_cluster):
+    cluster = local_cluster
+    containers = cluster.spool / "containers"
+    containers.mkdir()
+    containers.chmod(0o755)
+    extracted = _make_rootfs(containers / "job_501")
+    overlay = containers / "job_502"
+    for layer in ["lower", "upper", "work", "merged"]:
+        (overlay / layer).mkdir(parents=True)
+    upper = "/var/spool/spur/containers/job_502/upper"
+    cluster.call("mount_tmpfs", path=upper)
+    (overlay / "upper/data").write_text("layer\n")
+    named = _make_rootfs(containers / "my-image")
+    never_issued = _make_rootfs(containers / f"job_{NEVER_ISSUED}")
+    log = cluster.start_agent()
+    assert "queued orphan container rootfs for background deletion" in log, log
+    log = cluster.wait_file(cluster.agent["log"], "deleted orphan container rootfs job_id=502")
+    cluster.wait_file(cluster.agent["log"], "deleted orphan container rootfs job_id=501")
+    assert log.index("agent gRPC server listening") < log.index("deleting orphan container rootfs"), log
+    assert not extracted.exists()
+    assert not overlay.exists()
+    assert not cluster.call("mounted", path=upper)
+    assert (named / "usr/lib/site.py").read_text() == "image\n"
+    assert (never_issued / "usr/lib/site.py").read_text() == "image\n"

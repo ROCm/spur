@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::agent_server::AgentService;
+use crate::agent_server::{AgentService, SpoolOwnership};
 use crate::spool_fs::{
     budget_exhausted, directory_names, inode_identity, kept_reason, open_child, open_directory,
-    JobSpool, SpoolRoot,
+    read_mounts, JobSpool, SpoolKind, SpoolRoot,
 };
 use nix::fcntl::OFlag;
 use spur_core::job::JobState;
@@ -30,6 +30,7 @@ pub(crate) struct ActivityPaths {
     pub(crate) cgroups_enabled: bool,
     pub(crate) supervisor_uid: u32,
     pub(crate) budget: Duration,
+    pub(crate) container_root: Option<PathBuf>,
     #[cfg(test)]
     pub(crate) worker_gate: Option<Arc<(tokio::sync::Notify, std::sync::Barrier)>>,
 }
@@ -39,6 +40,7 @@ pub(crate) struct CleanupSummary {
     pub(crate) deleted: usize,
     pub(crate) retained: usize,
     pub(crate) errors: usize,
+    pub(crate) pending_rootfs: Vec<PendingRootfs>,
 }
 
 impl CleanupSummary {
@@ -47,8 +49,16 @@ impl CleanupSummary {
             deleted = self.deleted,
             retained = self.retained,
             errors = self.errors,
+            queued_rootfs = self.pending_rootfs.len(),
             "startup job spool cleanup finished"
         );
+    }
+
+    fn absorb(&mut self, batch: CleanupSummary) {
+        self.deleted += batch.deleted;
+        self.retained += batch.retained;
+        self.errors += batch.errors;
+        self.pending_rootfs.extend(batch.pending_rootfs);
     }
 }
 
@@ -58,11 +68,40 @@ struct Candidate {
     path: PathBuf,
 }
 
+/// An orphan container rootfs the controller confirmed, unmounted and left for background deletion.
+pub(crate) struct PendingRootfs(Candidate);
+
+impl std::fmt::Debug for PendingRootfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRootfs")
+            .field("job_id", &self.0.spool.job_id)
+            .field("path", &self.0.path)
+            .finish()
+    }
+}
+
+impl PendingRootfs {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.0.path
+    }
+}
+
 pub(crate) async fn run(
     service: &AgentService,
-    roots: Vec<PathBuf>,
+    spool_roots: Vec<PathBuf>,
     paths: ActivityPaths,
 ) -> CleanupSummary {
+    let roots = spool_roots
+        .into_iter()
+        .map(|root| (root, SpoolKind::Spool))
+        .chain(
+            paths
+                .container_root
+                .clone()
+                .map(|root| (root, SpoolKind::Rootfs)),
+        )
+        .collect();
     let mut summary = CleanupSummary::default();
     let deadline = Instant::now() + paths.budget;
     if !paths.cgroups_enabled {
@@ -220,11 +259,7 @@ pub(crate) async fn run(
             break;
         };
         match worker {
-            Ok(batch_summary) => {
-                summary.deleted += batch_summary.deleted;
-                summary.retained += batch_summary.retained;
-                summary.errors += batch_summary.errors;
-            }
+            Ok(batch_summary) => summary.absorb(batch_summary),
             Err(error) => {
                 summary.retained += in_flight;
                 summary.errors += 1;
@@ -277,10 +312,10 @@ pub(crate) fn controller_confirmed(response: &GetJobsResponse, batch: &[u32]) ->
         .collect()
 }
 
-fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
+fn discover(paths: Vec<(PathBuf, SpoolKind)>) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let mut roots = HashSet::new();
-    for path in paths {
+    for (path, kind) in paths {
         let root = match SpoolRoot::open(path.clone()) {
             Ok(root) => Arc::new(root),
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -291,7 +326,7 @@ fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
         };
         let spools = match root.identity() {
             Ok(identity) if !roots.insert(identity) => continue,
-            Ok(_) => root.candidates(),
+            Ok(_) => root.candidates(kind),
             Err(error) => Err(error),
         };
         let spools = match spools {
@@ -302,7 +337,7 @@ fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
             }
         };
         candidates.extend(spools.into_iter().map(|spool| Candidate {
-            path: root.job_path(spool.job_id),
+            path: root.entry_path(&spool),
             root: root.clone(),
             spool,
         }));
@@ -319,41 +354,95 @@ fn clean_inactive(
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
         let path = &candidate.path;
+        let kind = candidate.spool.kind.label();
         let held = if inventory.protected.contains(&job_id) {
             Ok(true)
         } else {
-            candidate
-                .root
-                .holds_any(&candidate.spool, &inventory.held, Some(deadline))
+            match candidate.spool.kind {
+                SpoolKind::Spool => {
+                    candidate
+                        .root
+                        .holds_any(&candidate.spool, &inventory.held, Some(deadline))
+                }
+                // A rootfs is held through its root inode; walking a full image tree is too slow.
+                SpoolKind::Rootfs => Ok(candidate
+                    .spool
+                    .identities()
+                    .any(|identity| inventory.held.contains(&identity))),
+            }
         };
         let result = match held {
             Ok(true) => {
-                info!(job_id, path = %path.display(), "retained job spool: runtime session, cgroup or process still holds it");
+                info!(job_id, path = %path.display(), "retained {kind}: runtime session, cgroup or process still holds it");
                 summary.retained += 1;
                 continue;
             }
             Ok(false) if Instant::now() >= deadline => Err(budget_exhausted()),
+            Ok(false) if candidate.spool.kind == SpoolKind::Rootfs => {
+                match candidate
+                    .root
+                    .unmount_beneath(&candidate.spool, &paths.proc_root.join("self/mountinfo"))
+                {
+                    Ok(detached) => {
+                        info!(job_id, path = %path.display(), detached, "queued orphan container rootfs for background deletion");
+                        summary.pending_rootfs.push(PendingRootfs(candidate));
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             Ok(false) => candidate.root.delete(&candidate.spool, Some(deadline)),
             Err(error) => Err(error),
         };
         match result {
             Ok(()) => {
                 summary.deleted += 1;
-                info!(job_id, path = %path.display(), "deleted orphan job spool");
+                info!(job_id, path = %path.display(), "deleted orphan {kind}");
             }
             Err(error) => match kept_reason(&error) {
                 Some(reason) => {
                     summary.retained += 1;
-                    warn!(job_id, path = %path.display(), "kept job spool: {reason}");
+                    warn!(job_id, path = %path.display(), "kept {kind}: {reason}");
                 }
                 None => {
                     summary.errors += 1;
-                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan job spool; will reconsider on next startup");
+                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan {kind}; will reconsider on next startup");
                 }
             },
         }
     }
     summary
+}
+
+/// Deletes confirmed orphan container rootfs dirs after the agent serves; each holds its job's lifecycle lock.
+pub(crate) async fn delete_pending_rootfs(owners: SpoolOwnership, pending: Vec<PendingRootfs>) {
+    for PendingRootfs(candidate) in pending {
+        let job_id = candidate.spool.job_id;
+        let guard = owners.guard(job_id).await;
+        if let Some(reason) = owners.local_owner(job_id).await {
+            info!(job_id, path = %candidate.path.display(), reason, "kept container rootfs: the job is active again");
+            continue;
+        }
+        info!(job_id, path = %candidate.path.display(), "deleting orphan container rootfs");
+        let path = candidate.path.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            candidate.root.delete(&candidate.spool, None)
+        })
+        .await;
+        match deleted {
+            Ok(Ok(())) => info!(job_id, path = %path.display(), "deleted orphan container rootfs"),
+            Ok(Err(error)) => match kept_reason(&error) {
+                Some(reason) => {
+                    warn!(job_id, path = %path.display(), "kept container rootfs: {reason}")
+                }
+                None => {
+                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup")
+                }
+            },
+            Err(error) => warn!(job_id, %error, "container rootfs deletion task failed"),
+        }
+    }
 }
 
 struct Inventory {
@@ -478,7 +567,10 @@ fn inspect_processes(
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     let holders = HolderFilter {
-        devices: candidates.iter().map(|c| c.spool.device()).collect(),
+        devices: candidates
+            .iter()
+            .flat_map(|c| c.spool.identities().map(|(device, _)| device))
+            .collect(),
         remote: RemoteMounts::read(&paths.proc_root.join("self/mountinfo"))?,
     };
     for entry in fs::read_dir(&paths.proc_root)? {
@@ -550,19 +642,9 @@ struct RemoteMounts {
 
 impl RemoteMounts {
     fn read(path: &Path) -> io::Result<Self> {
-        let info = match fs::read_to_string(path) {
-            Ok(info) => info,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
-        };
-        let mounts = info
-            .lines()
-            .filter_map(|line| {
-                let (left, right) = line.split_once(" - ")?;
-                let point = left.split(' ').nth(4)?;
-                let kind = right.split(' ').next()?;
-                Some((PathBuf::from(unescape_mount_path(point)), is_remote(kind)))
-            })
+        let mounts = read_mounts(path)?
+            .into_iter()
+            .map(|(point, kind)| (point, is_remote(&kind)))
             .collect();
         Ok(Self { mounts })
     }
@@ -592,14 +674,6 @@ fn is_remote(kind: &str) -> bool {
                 | "beegfs"
                 | "afs"
         )
-}
-
-fn unescape_mount_path(point: &str) -> String {
-    point
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
 }
 
 /// Real and effective uid from `/proc/<pid>/status`; unlike the directory owner, a process cannot fake these.
@@ -691,11 +765,13 @@ fn inspect_process(
             None => debug!(process = %path.display(), "ignored unparsable job marker"),
         }
     }
-    let cwd = path.join("cwd");
-    match fs::read_link(&cwd) {
-        Ok(target) => protect_holder(&cwd, &target, candidates, holders, inventory)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && args.is_empty() => {}
-        Err(error) => return Err(error),
+    for link in ["cwd", "root"] {
+        let link = path.join(link);
+        match fs::read_link(&link) {
+            Ok(target) => protect_holder(&link, &target, candidates, holders, inventory)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && args.is_empty() => {}
+            Err(error) => return Err(error),
+        }
     }
     for fd in fs::read_dir(path.join("fd"))? {
         let fd = fd?.path();

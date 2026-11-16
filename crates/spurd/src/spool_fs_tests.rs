@@ -120,11 +120,11 @@ fn exercise_cleanup_safety() {
     symlink(&root, &root_link).unwrap();
 
     let spool_root = SpoolRoot::open(root_link.clone()).unwrap();
+    let candidates = spool_root.candidates(SpoolKind::Spool).unwrap();
     assert_eq!(
-        spool_root.job_path(1),
+        spool_root.entry_path(&candidates[0]),
         std::fs::canonicalize(&root).unwrap().join("job1")
     );
-    let candidates = spool_root.candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].job_id, 1);
     let error = cleanup_job_spool_under(&root_link, 2).unwrap_err();
@@ -175,7 +175,11 @@ fn cleanup_stops_at_its_deadline_and_keeps_the_spool() {
     std::fs::create_dir(root.join("job1")).unwrap();
     std::fs::write(root.join("job1/output"), "retained").unwrap();
     let spool_root = SpoolRoot::open(root.clone()).unwrap();
-    let spool = spool_root.candidates().unwrap().pop().unwrap();
+    let spool = spool_root
+        .candidates(SpoolKind::Spool)
+        .unwrap()
+        .pop()
+        .unwrap();
     let error = spool_root.delete(&spool, Some(Instant::now())).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(kept_reason(&error), Some("cleanup time budget exhausted"));
@@ -286,7 +290,11 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
     std::fs::create_dir(root.join("job1")).unwrap();
     std::fs::write(root.join("job1/output"), "original").unwrap();
     let spool_root = SpoolRoot::open(root.clone()).unwrap();
-    let spool = spool_root.candidates().unwrap().pop().unwrap();
+    let spool = spool_root
+        .candidates(SpoolKind::Spool)
+        .unwrap()
+        .pop()
+        .unwrap();
     std::fs::rename(root.join("job1"), root.join("retained-job")).unwrap();
     std::fs::create_dir(root.join("job1")).unwrap();
     std::fs::write(root.join("job1/output"), "replacement").unwrap();
@@ -300,7 +308,11 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
         "original"
     );
 
-    let spool = spool_root.candidates().unwrap().pop().unwrap();
+    let spool = spool_root
+        .candidates(SpoolKind::Spool)
+        .unwrap()
+        .pop()
+        .unwrap();
     let retained = directory.path().join("retained-root");
     std::fs::rename(&root, &retained).unwrap();
     std::fs::create_dir(&root).unwrap();
@@ -412,7 +424,7 @@ fn traversal_fd_exhaustion_retains_the_spool() {
     }
     let fixture = DeepSpool::new(128);
     let root = SpoolRoot::open(fixture.root.clone()).unwrap();
-    let spool = root.candidates().unwrap().pop().unwrap();
+    let spool = root.candidates(SpoolKind::Spool).unwrap().pop().unwrap();
     set_fd_limit(32);
     assert_eq!(
         root.delete(&spool, None).unwrap_err().raw_os_error(),
@@ -492,7 +504,7 @@ fn fallback_rejects_same_filesystem_bind_mounts() {
     }
     deny_openat2(libc::ENOSYS);
     let spool_root = SpoolRoot::open(root.clone()).unwrap();
-    let candidates = spool_root.candidates().unwrap();
+    let candidates = spool_root.candidates(SpoolKind::Spool).unwrap();
     assert_eq!(
         candidates
             .iter()
@@ -513,4 +525,32 @@ fn fallback_rejects_same_filesystem_bind_mounts() {
         std::fs::read_to_string(target.join("sentinel")).unwrap(),
         "untouched"
     );
+}
+
+#[test]
+fn rootfs_names_are_parsed_strictly() {
+    for (name, id) in [("job_7", 7), ("step_7_2", 7), ("job_4294967295", u32::MAX)] {
+        assert_eq!(
+            canonical_rootfs_job_id(OsStr::new(name)),
+            Some(id),
+            "{name}"
+        );
+    }
+    for name in [
+        "job_",
+        "job_0",
+        "job_07",
+        "job7",
+        "step_7",
+        "step_7_",
+        "step_7_0",
+        "step_07_1",
+        "step_7_2_3",
+        "job_7_1",
+        "my-image",
+        "job_-1",
+        "job_4294967296",
+    ] {
+        assert_eq!(canonical_rootfs_job_id(OsStr::new(name)), None, "{name}");
+    }
 }

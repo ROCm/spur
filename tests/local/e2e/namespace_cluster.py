@@ -282,6 +282,12 @@ max_time = "00:05:00"
             return None
         if operation == "wait_process":
             return self.processes[request["name"]].wait(timeout=30)
+        if operation == "mount_tmpfs":
+            subprocess.run(["mount", "-t", "tmpfs", "tmpfs", request["path"]], check=True)
+            return None
+        if operation == "mounted":
+            mounts = Path("/proc/self/mountinfo").read_text().splitlines()
+            return any(line.split(" ")[4] == request["path"] for line in mounts)
         if operation == "make_deep_tree":
             descriptor = os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY)
             try:

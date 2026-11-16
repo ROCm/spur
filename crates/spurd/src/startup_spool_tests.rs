@@ -2,9 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::startup_spool::{ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET};
+use crate::startup_spool::{
+    delete_pending_rootfs, ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET,
+};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
+
+/// Waits until the pass's worker is parked; fails rather than hangs if the pass ends first.
+async fn worker_reached(
+    gate: &(tokio::sync::Notify, std::sync::Barrier),
+    cleanup: &mut tokio::task::JoinHandle<CleanupSummary>,
+) {
+    tokio::select! {
+        _ = gate.0.notified() => {}
+        result = cleanup => panic!("the pass ended before its worker started: {result:?}"),
+    }
+}
 
 /// Waits until the pass's worker is parked; fails rather than hangs if the pass ends first.
 async fn worker_reached(
@@ -83,9 +96,15 @@ impl SpoolFixture {
             &root,
             &directory.path().join("proc"),
             &directory.path().join("cgroup/spur"),
+            &directory.path().join("containers"),
         ] {
             fs::create_dir_all(path).unwrap();
         }
+        fs::set_permissions(
+            directory.path().join("containers"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(
             directory.path().join("cgroup/cgroup.controllers"),
             "cpu memory",
@@ -115,8 +134,31 @@ impl SpoolFixture {
             cgroups_enabled: self.agent.cgroup.enabled,
             supervisor_uid: nix::unistd::geteuid().as_raw(),
             budget: STARTUP_CLEANUP_BUDGET,
+            container_root: Some(self.containers()),
             worker_gate: None,
         }
+    }
+
+    fn containers(&self) -> PathBuf {
+        self.directory.path().join("containers")
+    }
+
+    /// A small extracted image: nested dirs, a file, and links that must not be followed.
+    fn rootfs(&self, name: &str) -> PathBuf {
+        let base = self.containers().join(name);
+        fs::create_dir_all(base.join("usr/lib/python3")).unwrap();
+        fs::create_dir_all(base.join("root")).unwrap();
+        fs::write(base.join("usr/lib/python3/site.py"), "image").unwrap();
+        symlink("/", base.join("usr/host-root")).unwrap();
+        symlink("usr/lib", base.join("lib")).unwrap();
+        base
+    }
+
+    async fn run_and_drain(&self) -> CleanupSummary {
+        let mut summary = self.run().await;
+        let pending = std::mem::take(&mut summary.pending_rootfs);
+        delete_pending_rootfs(self.agent.spool_ownership(), pending).await;
+        summary
     }
 
     async fn run(&self) -> CleanupSummary {
@@ -154,6 +196,7 @@ impl SpoolFixture {
         )
         .unwrap();
         symlink(self.directory.path(), path.join("cwd")).unwrap();
+        symlink("/", path.join("root")).unwrap();
         if let Some(command) = command.first() {
             symlink(command, path.join("exe")).unwrap();
         }
@@ -886,4 +929,132 @@ async fn startup_spool_keeps_bind_mounts_and_their_targets_untouched() {
     for mountpoint in [fixture.root.join("job1"), nested] {
         nix::mount::umount(&mountpoint).unwrap();
     }
+}
+
+#[tokio::test]
+async fn startup_removes_confirmed_orphan_container_rootfs_in_the_background() {
+    use spur_proto::proto::JobState;
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[(4, JobState::JobRunning as i32)]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let job = fixture.rootfs("job_1");
+    let step = fixture.rootfs("step_2_3");
+    let running = fixture.rootfs("job_4");
+    let named = fixture.rootfs("my-image");
+    let noncanonical = fixture.rootfs("job_01");
+    let summary = fixture.run().await;
+    let mut queued: Vec<_> = summary
+        .pending_rootfs
+        .iter()
+        .map(|p| p.path().to_owned())
+        .collect();
+    queued.sort();
+    assert_eq!(
+        queued,
+        [
+            fs::canonicalize(&job).unwrap(),
+            fs::canonicalize(&step).unwrap()
+        ]
+    );
+    assert!(
+        job.join("usr/lib/python3/site.py").is_file(),
+        "deletion waits for the background task"
+    );
+    let queries = controller.state.spool_queries.lock().unwrap().clone();
+    assert_eq!(queries[0].job_ids, [1, 2, 4]);
+    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    assert!(!job.exists());
+    assert!(!step.exists());
+    assert!(running.is_dir());
+    assert!(named.is_dir());
+    assert!(noncanonical.is_dir());
+}
+
+#[tokio::test]
+async fn container_processes_keep_their_rootfs_through_their_root() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let used = fixture.rootfs("job_1");
+    let idle = fixture.rootfs("job_2");
+    let process = fixture.process(100, &["python3"], b"");
+    fs::remove_file(process.join("root")).unwrap();
+    symlink(&used, process.join("root")).unwrap();
+    let summary = fixture.run_and_drain().await;
+    assert_eq!(summary.retained, 1);
+    assert!(used.is_dir());
+    assert!(!idle.exists());
+}
+
+#[tokio::test]
+async fn background_rootfs_deletion_rechecks_ownership_and_identity() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let relaunched = fixture.rootfs("job_1");
+    let replaced = fixture.rootfs("job_2");
+    let summary = fixture.run().await;
+    assert_eq!(summary.pending_rootfs.len(), 2);
+    fixture
+        .agent
+        .running
+        .lock()
+        .await
+        .insert(1, TrackedJob::allocation_only(None));
+    let saved = fixture.directory.path().join("saved-rootfs");
+    fs::rename(&replaced, &saved).unwrap();
+    fs::create_dir(&replaced).unwrap();
+    fs::write(replaced.join("new-generation"), "fresh").unwrap();
+    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    assert!(relaunched.join("usr/lib/python3/site.py").is_file());
+    assert!(replaced.join("new-generation").is_file());
+    assert!(saved.join("usr/lib/python3/site.py").is_file());
+}
+
+#[tokio::test]
+#[ignore = "requires unshare with user and mount namespaces"]
+async fn orphan_rootfs_mounts_are_detached_before_deletion_and_busy_ones_kept() {
+    const CHILD: &str = "SPUR_ROOTFS_MOUNT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--propagation", "private"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "agent_server::cleanup_lifecycle_tests::startup_spool_tests::orphan_rootfs_mounts_are_detached_before_deletion_and_busy_ones_kept", "--ignored"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    symlink("/proc/self", fixture.paths().proc_root.join("self")).unwrap();
+    let mut layers = Vec::new();
+    for name in ["job_1", "job_2"] {
+        let base = fixture.containers().join(name);
+        for layer in ["lower", "upper", "merged"] {
+            fs::create_dir_all(base.join(layer)).unwrap();
+            nix::mount::mount(
+                Some("tmpfs"),
+                &base.join(layer),
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .unwrap();
+            fs::write(base.join(layer).join("data"), layer).unwrap();
+        }
+        layers.push(base);
+    }
+    let _busy = fs::File::open(layers[1].join("upper/data")).unwrap();
+    let summary = fixture.run().await;
+    assert_eq!(summary.pending_rootfs.len(), 1);
+    assert_eq!(summary.retained, 1);
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    assert!(!mounts.contains(layers[0].to_str().unwrap()));
+    assert!(mounts.contains(layers[1].join("upper").to_str().unwrap()));
+    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    assert!(!layers[0].exists());
+    assert!(layers[1].join("upper/data").is_file());
 }
