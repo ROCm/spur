@@ -260,9 +260,11 @@ The agent gates controller-only RPCs (job launch, cancel) on
 
 ### PrivateData and job-control RPCs
 
-Under `private_data = ["jobs"]`, `SuspendJob`, `ResumeJob`, `SignalJob` and
-`CancelJob` answer NOT_FOUND ("job N not found") for a job the caller may not
-see, identical to a nonexistent id. The visibility check runs before any
+Under `private_data = ["jobs"]`, every per-job RPC (`SuspendJob`, `ResumeJob`,
+`SignalJob`, `CancelJob`, `UpdateJob`, `RequeueJob`, `CompleteJob`,
+`JobKeepalive`, `CreateJobStep`, `CompleteJobStep`, `RunStep`, `ExecInJob`)
+answers NOT_FOUND ("job N not found") for a job the caller may not see,
+identical to a nonexistent id. The visibility check runs before any
 argument validation, state check or ownership check, so no answer confirms that
 a hidden job exists, or what state or owner it has.
 

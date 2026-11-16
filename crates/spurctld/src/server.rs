@@ -1174,9 +1174,26 @@ impl ControllerService {
         job_id: spur_core::job::JobId,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Result<spur_core::job::Job, Status> {
-        self.cluster
-            .get_job(job_id)
-            .filter(|job| self.caller_may_see_job(&job.spec.user, identity))
+        self.visible_or_not_found(self.cluster.get_job(job_id), job_id, identity)
+    }
+
+    /// [`Self::job_visible_to`] for an RPC that also accepts an array parent id, which has no
+    /// stored job: the parent is as visible as its tasks, which share an owner.
+    fn job_or_array_visible_to(
+        &self,
+        job_id: spur_core::job::JobId,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<spur_core::job::Job, Status> {
+        self.visible_or_not_found(self.cluster.get_job_for_display(job_id), job_id, identity)
+    }
+
+    fn visible_or_not_found(
+        &self,
+        job: Option<spur_core::job::Job>,
+        job_id: spur_core::job::JobId,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<spur_core::job::Job, Status> {
+        job.filter(|job| self.caller_may_see_job(&job.spec.user, identity))
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))
     }
 
@@ -1880,6 +1897,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        self.job_visible_to(req.job_id, __identity.as_ref())?;
         let completion = self
             .cluster
             .finish_srun_job_for(
@@ -1942,10 +1960,7 @@ impl SlurmController for ControllerService {
                 "keepalive requires a user".to_string(),
             ));
         }
-        let job = self
-            .cluster
-            .get_job(req.job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
+        let job = self.job_visible_to(req.job_id, __identity.as_ref())?;
         spur_core::auth::check_job_caller(
             &req.user,
             None,
@@ -2074,10 +2089,7 @@ impl SlurmController for ControllerService {
         // same way. `is_internal` is a verified admin only — derived from the
         // verified identity, never the wire `user` string; an unauthenticated
         // non-owner is still denied, ownership checked against the claimed user.
-        let job = self
-            .cluster
-            .get_job(req.job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
+        let job = self.job_visible_to(req.job_id, __identity.as_ref())?;
         spur_core::auth::check_job_owner(
             &req.user,
             self.caller_is_operator(__identity.as_ref()),
@@ -2150,6 +2162,7 @@ impl SlurmController for ControllerService {
             )
             .asserted_actor(&req.user),
         );
+        self.job_or_array_visible_to(req.job_id, __identity.as_ref())?;
         let outcome = self
             .cluster
             .requeue_job_by(
@@ -3197,10 +3210,7 @@ impl SlurmController for ControllerService {
         Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
 
         spur_core::auth::check_job_caller(
             &req.user,
@@ -3305,10 +3315,7 @@ impl SlurmController for ControllerService {
         Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
 
         spur_core::auth::check_job_caller(
             &req.user,
@@ -3773,10 +3780,7 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
 
         spur_core::auth::check_job_caller(
             &req.user,
@@ -3853,10 +3857,7 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
 
         // A step executes arbitrary commands on the job's allocated nodes, so the
         // caller must own the target job — same gate as create_job_step / exec_in_job.
@@ -11343,7 +11344,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // Unknown job -> FailedPrecondition (non-auth cluster error).
+        // Unknown job -> NotFound, the same answer a hidden job gets.
         let err = svc
             .requeue_job(Request::new(RequeueJobRequest {
                 job_id: 999_999,
@@ -11352,7 +11353,8 @@ mod tests {
             }))
             .await
             .expect_err("unknown job must error");
-        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.code(), Code::NotFound);
+        assert_eq!(err.message(), "job 999999 not found");
 
         // Wrong user -> PermissionDenied (auth precedes the state checks).
         let err = svc
@@ -13655,6 +13657,454 @@ mod tests {
             signal_target_or_default(-1).unwrap_err().code(),
             Code::InvalidArgument
         );
+    }
+
+    /// The per-job RPCs beyond suspend/resume/cancel that also answer for a hidden job.
+    #[derive(Clone, Copy, Debug)]
+    enum PerJobRpc {
+        CompleteJob,
+        JobKeepalive,
+        UpdateJob,
+        RequeueJob,
+        CreateJobStep,
+        CompleteJobStep,
+        ExecInJob,
+        RunStep,
+    }
+
+    const PER_JOB_RPCS: [PerJobRpc; 8] = [
+        PerJobRpc::CompleteJob,
+        PerJobRpc::JobKeepalive,
+        PerJobRpc::UpdateJob,
+        PerJobRpc::RequeueJob,
+        PerJobRpc::CreateJobStep,
+        PerJobRpc::CompleteJobStep,
+        PerJobRpc::ExecInJob,
+        PerJobRpc::RunStep,
+    ];
+
+    async fn call_per_job_rpc(
+        svc: &ControllerService,
+        rpc: PerJobRpc,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let user = who.user.clone();
+        match rpc {
+            PerJobRpc::CompleteJob => svc
+                .complete_job(as_caller(
+                    CompleteJobRequest {
+                        job_id,
+                        exit_code: 0,
+                        user,
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::JobKeepalive => svc
+                .job_keepalive(as_caller(JobKeepaliveRequest { job_id, user }, who))
+                .await
+                .map(|_| ()),
+            PerJobRpc::UpdateJob => svc
+                .update_job(as_caller(
+                    UpdateJobRequest {
+                        job_id,
+                        comment: Some("edited".into()),
+                        user,
+                        ..Default::default()
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::RequeueJob => svc
+                .requeue_job(as_caller(
+                    RequeueJobRequest {
+                        job_id,
+                        user,
+                        hold: false,
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::CreateJobStep => svc
+                .create_job_step(as_caller(
+                    CreateJobStepRequest {
+                        job_id,
+                        command: vec!["bash".into()],
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                        user,
+                        ..Default::default()
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::CompleteJobStep => svc
+                .complete_job_step(as_caller(
+                    CompleteJobStepRequest {
+                        job_id,
+                        step_id: 1,
+                        exit_code: 0,
+                        user,
+                        ..Default::default()
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::ExecInJob => svc
+                .exec_in_job(as_caller(
+                    ExecInJobRequest {
+                        job_id,
+                        command: vec!["id".into()],
+                        user,
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+            PerJobRpc::RunStep => svc
+                .run_step(as_caller(
+                    RunStepRequest {
+                        job_id,
+                        command: vec!["id".into()],
+                        step_id: 1,
+                        user,
+                        ..Default::default()
+                    },
+                    who,
+                ))
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    /// Everything a per-job RPC could change about alice's jobs, in a comparable form.
+    fn job_records(svc: &ControllerService, jobs: &AliceJobs) -> Vec<serde_json::Value> {
+        [jobs.pending, jobs.running, jobs.suspended, jobs.terminal]
+            .into_iter()
+            .map(|id| {
+                let mut steps = svc.cluster.get_steps(id);
+                steps.sort_by_key(|s| s.step_id);
+                serde_json::json!({
+                    "job": svc.cluster.get_job(id),
+                    "steps": steps,
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_per_job_rpc_answers_hidden_jobs_as_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        interactive_step_on(&svc, jobs.running, "alice").await;
+        let bob = viewer("bob", false);
+        let before = job_records(&svc, &jobs);
+
+        let cases = [
+            ("a nonexistent job", jobs.missing),
+            ("a pending job", jobs.pending),
+            ("a running job", jobs.running),
+            ("a suspended job", jobs.suspended),
+            ("a terminal job", jobs.terminal),
+        ];
+        for rpc in PER_JOB_RPCS {
+            for (what, id) in cases {
+                assert_not_found(
+                    call_per_job_rpc(&svc, rpc, id, &bob).await,
+                    id,
+                    &format!("{rpc:?} on {what}"),
+                );
+            }
+        }
+
+        assert_eq!(job_records(&svc, &jobs), before);
+    }
+
+    /// Every outcome of `rpc` as `who` against a fresh job in each state, as comparable text.
+    async fn per_job_rpc_outcomes(
+        svc: &ControllerService,
+        rpc: PerJobRpc,
+        who: &spur_core::auth::Identity,
+    ) -> Vec<String> {
+        let jobs = alice_jobs_in_every_state(svc).await;
+        let mut outcomes = Vec::new();
+        for id in [
+            jobs.missing,
+            jobs.pending,
+            jobs.running,
+            jobs.suspended,
+            jobs.terminal,
+        ] {
+            let outcome = match call_per_job_rpc(svc, rpc, id, who).await {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("{:?}: {}", e.code(), e.message()),
+            };
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// Owners and operators must hear exactly what they heard before `private_data` existed,
+    /// so each RPC's answers with `jobs` private are compared against a cluster without it.
+    async fn assert_private_jobs_change_nothing_for(who: &spur_core::auth::Identity) {
+        let open_dir = tempfile::TempDir::new().unwrap();
+        let open = test_service(&open_dir).await;
+        let private_dir = tempfile::TempDir::new().unwrap();
+        let private = test_service_with(&private_dir, jobs_private_config()).await;
+        for svc in [&open, &private] {
+            svc.cluster
+                .association_cache()
+                .insert_admin_level("dave", "Operator");
+        }
+
+        for rpc in PER_JOB_RPCS {
+            let want = per_job_rpc_outcomes(&open, rpc, who).await;
+            let got = per_job_rpc_outcomes(&private, rpc, who).await;
+            assert_eq!(got, want, "{rpc:?} as {}", who.user);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_job_rpcs_keep_their_answers_for_the_owner_under_private_jobs() {
+        assert_private_jobs_change_nothing_for(&viewer("alice", false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_job_rpcs_keep_their_answers_for_an_operator_under_private_jobs() {
+        assert_private_jobs_change_nothing_for(&viewer("dave", false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_job_rpcs_keep_owner_and_state_answers_for_others_without_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        for rpc in [
+            PerJobRpc::JobKeepalive,
+            PerJobRpc::UpdateJob,
+            PerJobRpc::RequeueJob,
+            PerJobRpc::CreateJobStep,
+            PerJobRpc::CompleteJobStep,
+            PerJobRpc::ExecInJob,
+            PerJobRpc::RunStep,
+        ] {
+            let err = call_per_job_rpc(&svc, rpc, jobs.running, &bob)
+                .await
+                .expect_err("another user's job is not theirs to touch");
+            assert_eq!(err.code(), Code::PermissionDenied, "{rpc:?}: {err}");
+            assert!(err.message().contains("alice"), "{rpc:?}: {err}");
+        }
+
+        let err = call_per_job_rpc(&svc, PerJobRpc::CompleteJob, jobs.running, &bob)
+            .await
+            .expect_err("not an srun allocation");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        for rpc in PER_JOB_RPCS {
+            assert_not_found(
+                call_per_job_rpc(&svc, rpc, jobs.missing, &bob).await,
+                jobs.missing,
+                &format!("{rpc:?} on a nonexistent job"),
+            );
+        }
+    }
+
+    /// srun and salloc clients act as the job's owner with their own credential, so each step
+    /// of their lifecycle must still pass the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_srun_lifecycle_still_works_for_the_owner_under_private_jobs() {
+        use spur_core::resource::ResourceAllocations;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let alice = viewer("alice", false);
+
+        let job_id = running_interactive_job_owned_by(&svc, "alice").await;
+        let step = svc
+            .create_job_step(as_caller(
+                CreateJobStepRequest {
+                    job_id,
+                    command: vec!["bash".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+                &alice,
+            ))
+            .await
+            .expect("the owner creates a step")
+            .into_inner();
+
+        let err = svc
+            .run_step(as_caller(
+                RunStepRequest {
+                    job_id,
+                    command: vec!["id".into()],
+                    step_id: step.step_id + 1,
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+                &alice,
+            ))
+            .await
+            .expect_err("no such step");
+        assert_eq!(
+            err.message(),
+            format!("step {} not found for job {job_id}", step.step_id + 1)
+        );
+
+        svc.complete_job_step(as_caller(
+            CompleteJobStepRequest {
+                job_id,
+                step_id: step.step_id,
+                exit_code: 3,
+                user: "alice".into(),
+                ..Default::default()
+            },
+            &alice,
+        ))
+        .await
+        .expect("the owner completes their step");
+        let recorded = svc.cluster.get_step(job_id, step.step_id).unwrap();
+        assert_eq!(recorded.exit_code, Some(3));
+
+        call_per_job_rpc(&svc, PerJobRpc::JobKeepalive, job_id, &alice)
+            .await
+            .expect("the owner's keepalive");
+        assert!(svc.cluster.keepalive_last_seen(job_id).is_some());
+
+        let srun = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                srun_job: true,
+                ..owned_job("alice", "/tmp")
+            })
+            .unwrap()
+            .job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: HashMap<_, _> = [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job_impl(srun, vec!["n1".into()], res, per_node, true, false)
+            .unwrap();
+        await_job_state(&svc, srun, JobState::Running).await;
+        call_per_job_rpc(&svc, PerJobRpc::CompleteJob, srun, &alice)
+            .await
+            .expect("the owner finishes their srun allocation");
+        await_job_state(&svc, srun, JobState::Completed).await;
+
+        let bob = viewer("bob", false);
+        let other = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                srun_job: true,
+                ..owned_job("alice", "/tmp")
+            })
+            .unwrap()
+            .job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: HashMap<_, _> = [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job_impl(other, vec!["n1".into()], res, per_node, true, false)
+            .unwrap();
+        await_job_state(&svc, other, JobState::Running).await;
+        assert_not_found(
+            call_per_job_rpc(&svc, PerJobRpc::CompleteJob, other, &bob).await,
+            other,
+            "another tenant finishing an srun allocation",
+        );
+        assert_eq!(svc.cluster.get_job(other).unwrap().state, JobState::Running);
+    }
+
+    /// An unauthenticated caller (`auth.mode = permissive` without a credential) is not pinned
+    /// to a user, so the gate leaves its owner-name check to the handler as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unauthenticated_caller_still_reaches_per_job_rpcs_under_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let job_id = running_interactive_job_owned_by(&svc, "alice").await;
+
+        svc.job_keepalive(Request::new(JobKeepaliveRequest {
+            job_id,
+            user: "alice".into(),
+        }))
+        .await
+        .expect("the named owner, unauthenticated");
+        assert!(svc.cluster.keepalive_last_seen(job_id).is_some());
+
+        let err = svc
+            .job_keepalive(Request::new(JobKeepaliveRequest {
+                job_id,
+                user: "mallory".into(),
+            }))
+            .await
+            .expect_err("a different name is still not the owner");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_fans_out_over_an_array_parent_only_for_its_owner() {
+        use spur_core::resource::ResourceAllocations;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        running_job_owned_by(&svc, "alice").await;
+        let parent = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                array_spec: Some("0-1".into()),
+                ..owned_job("alice", "/tmp")
+            })
+            .unwrap()
+            .job_id;
+        let tasks: Vec<u32> = (0..svc.cluster.peek_next_job_id())
+            .filter(|id| {
+                svc.cluster
+                    .get_job(*id)
+                    .is_some_and(|j| j.spec.array_job_id == Some(parent))
+            })
+            .collect();
+        assert_eq!(tasks.len(), 2);
+        for task in &tasks {
+            let res = ResourceAllocations::with_scalar(1, 1000);
+            let per_node: HashMap<_, _> = [("n1".to_string(), res.clone())].into_iter().collect();
+            svc.cluster
+                .start_job(*task, vec!["n1".into()], res, per_node)
+                .unwrap();
+            await_job_state(&svc, *task, JobState::Running).await;
+        }
+
+        assert_not_found(
+            call_per_job_rpc(&svc, PerJobRpc::RequeueJob, parent, &viewer("bob", false)).await,
+            parent,
+            "another tenant requeuing an array",
+        );
+        for task in &tasks {
+            assert_eq!(svc.cluster.get_job(*task).unwrap().state, JobState::Running);
+        }
+
+        let resp = svc
+            .requeue_job(as_caller(
+                RequeueJobRequest {
+                    job_id: parent,
+                    user: "alice".into(),
+                    hold: false,
+                },
+                &viewer("alice", false),
+            ))
+            .await
+            .expect("the owner requeues their array")
+            .into_inner();
+        assert_eq!(resp.requeued, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
