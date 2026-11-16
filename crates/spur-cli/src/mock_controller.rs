@@ -62,6 +62,7 @@ pub(crate) struct StepCapture {
     cancel_job_calls: Arc<AtomicU32>,
     cancel_job_requests: Arc<Mutex<Vec<proto::CancelJobRequest>>>,
     signal_job_requests: Arc<Mutex<Vec<proto::SignalJobRequest>>>,
+    get_jobs_requests: Arc<Mutex<Vec<proto::GetJobsRequest>>>,
     signal_job_error: Arc<Mutex<Option<tonic::Status>>>,
     /// `(job_id, exit_code, user)` for every `CompleteJob` the mock received.
     complete_job_calls: Arc<Mutex<Vec<(u32, i32, String)>>>,
@@ -213,6 +214,11 @@ impl StepCapture {
     /// Every `CancelJob` the mock received, in call order.
     pub(crate) fn cancel_job_requests(&self) -> Vec<proto::CancelJobRequest> {
         self.cancel_job_requests.lock().unwrap().clone()
+    }
+
+    /// Every `GetJobs` the mock received, in call order.
+    pub(crate) fn get_jobs_requests(&self) -> Vec<proto::GetJobsRequest> {
+        self.get_jobs_requests.lock().unwrap().clone()
     }
 
     /// Every `SignalJob` the mock received, in call order.
@@ -445,8 +451,13 @@ mock_controller_impl! {
 
         async fn get_jobs(
             &self,
-            _request: tonic::Request<proto::GetJobsRequest>,
+            request: tonic::Request<proto::GetJobsRequest>,
         ) -> Result<tonic::Response<proto::GetJobsResponse>, tonic::Status> {
+            self.capture
+                .get_jobs_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
             Ok(tonic::Response::new(proto::GetJobsResponse::default()))
         }
 

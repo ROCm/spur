@@ -642,17 +642,19 @@ running, as Slurm does. Earlier releases ended the job on any signal: ``scancel 
 another signal) to stop jobs now leaves them running. The signal goes to the
 job's ``srun`` steps by default, to the batch script's shell with ``-b``, and to
 the steps, the batch script and its children with ``-f``/``--full``. A job
-with no steps gets nothing from a plain ``-s``. Nodes managed by the Kubernetes
+with no steps gets nothing from a plain ``-s``, and ``scancel`` still exits ``0``. Nodes managed by the Kubernetes
 operator cannot be signalled and answer with an error. See
 :ref:`scancel signals <scancel-signals>`, including the limit on ``-b`` for jobs in
 a PID namespace.
 
 The new ``scancel`` calls the controller's ``SignalJob`` RPC, so upgrade
 ``spurctld`` before ``spur-cli``: a new ``scancel`` against an older controller
-refuses a signal with an error and does not cancel the job. An older ``scancel``
-against this controller sends the signal through ``CancelJob``, which the
-controller now delivers without cancelling, so the behavior is the same. Delivering
+refuses a signal with an error and does not cancel the job. An older ``scancel
+-s`` against this controller still delivers the signal to the job's steps without
+cancelling it; its ``-b`` has no effect, and in filter mode each pending job is
+reported as an error. Upgrade the CLI for ``-b`` and ``--full``. Delivering
 ``-b`` needs the ``spurd`` on the job's nodes upgraded too.
+
 Job preemption policy (``preempt_type``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

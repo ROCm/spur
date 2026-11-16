@@ -1483,7 +1483,8 @@ signal:
      - Signal goes to
    * - ``-s SIG``
      - The job's ``srun`` steps, not the batch script. A job with no steps gets
-       nothing from a plain ``-s SIG``.
+       nothing from a plain ``-s SIG``, and ``scancel`` still reports success
+       (exit ``0``). In particular, ``-s TERM`` no longer ends a batch job.
    * - ``-s SIG -b``, ``--batch``
      - The batch script's shell process only, not its children and not any step.
    * - ``-s SIG -f``, ``--full``
@@ -1494,11 +1495,13 @@ signal:
      - The job is cancelled. ``-b`` and ``-f`` only choose a signal's target and
        have no effect here.
 
-With a filter such as ``-u`` or ``-n``, a signal goes to your running jobs; pass
+With a filter such as ``-u`` or ``-n``, a signal goes to the matching running jobs
+(``-p``, ``-A`` and ``-R`` without ``-u`` match every user's jobs); pass
 ``--state`` to select others. If a job cannot be signalled, ``scancel`` says why
 on ``stderr`` and exits ``1``: the job is not running, has no batch script
 (``-b``) or its batch script has already exited, or no node could be reached.
-Signalling another user's job is refused. Nodes managed by the Kubernetes
+Signalling another user's job is refused (operators and administrators may).
+Nodes managed by the Kubernetes
 operator cannot be signalled, and ``scancel`` reports that rather than cancelling
 the job.
 
@@ -1516,8 +1519,12 @@ the job.
 
       #!/bin/bash
       trap 'save_checkpoint' USR1
-      srun ./train &
-      wait
+      srun ./train & pid=$!
+      while ! wait "$pid" && kill -0 "$pid" 2>/dev/null; do :; done
+
+   The loop is needed because ``wait`` returns as soon as a trapped signal
+   arrives; without it the script would run off its end and exit, which as PID 1
+   ends the job.
 
    Alternatively use ``--full``, which also reaches the processes the script
    started.

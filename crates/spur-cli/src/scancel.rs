@@ -19,11 +19,11 @@ enum Action {
     Signal { signal: i32, target: SignalTarget },
 }
 
-/// Cancel pending or running jobs.
+/// Cancel or signal pending or running jobs.
 #[derive(Parser, Debug)]
-#[command(name = "scancel", about = "Cancel jobs")]
+#[command(name = "scancel", about = "Cancel or signal jobs")]
 pub struct ScancelArgs {
-    /// Job IDs to cancel
+    /// Job IDs to cancel or signal
     pub job_ids: Vec<u32>,
 
     /// Cancel all jobs for this user
@@ -962,5 +962,38 @@ mod tests {
 
         assert_eq!(capture.cancel_job_requests().len(), 1);
         assert!(capture.signal_job_requests().is_empty());
+    }
+
+    async fn run_scancel(addr: std::net::SocketAddr, args: &[&str]) {
+        let mut argv = vec![
+            "scancel".to_string(),
+            "--controller".to_string(),
+            format!("http://{addr}"),
+        ];
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        main_with_args(argv).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filter_mode_signal_selects_running_jobs_unless_state_overrides() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+
+        run_scancel(addr, &["-u", "alice", "-s", "USR1"]).await;
+        run_scancel(addr, &["-u", "alice", "-s", "USR1", "-t", "PD"]).await;
+        run_scancel(addr, &["-u", "alice"]).await;
+
+        let states: Vec<_> = capture
+            .get_jobs_requests()
+            .into_iter()
+            .map(|request| request.states)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                vec![JobState::JobRunning as i32],
+                vec![JobState::JobPending as i32],
+                cancellable_states(),
+            ]
+        );
     }
 }
