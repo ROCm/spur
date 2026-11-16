@@ -13,6 +13,8 @@ prost-types = { workspace = true }
 # Transitive HTTP/2 layer; declared only to pin a minimum version (see root
 # Cargo.toml). spur-proto owns the gRPC wire surface, so the floor lives here.
 h2 = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

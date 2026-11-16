@@ -3649,9 +3649,11 @@ dependencies = [
  "h2",
  "prost",
  "prost-types",
+ "sha2 0.11.1",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]

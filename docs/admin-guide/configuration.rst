@@ -2143,6 +2143,21 @@ WireGuard mesh networking and the agent port.
        so changing it needs a restart rather than ``scontrol reconfigure``. See
        :doc:`accounting`.
 
+.. note::
+
+   **Diagnosing a message that failed to decode.** If a controller cannot decode
+   a request, it logs a warning naming the message type, its length, its SHA-256,
+   and the underlying decode error. For an invalid-UTF-8 field such as a corrupted
+   job script it adds a *candidate* location — the field path, the byte offset of
+   the first non-UTF-8 byte, and a short hex window — flagged as a heuristic,
+   because a non-UTF-8 byte can fall in a legitimate binary field rather than at
+   the real fault. The surrounding bytes may belong to another caller, so they
+   stay in the log and never go back to the client; the client's error carries the
+   message type, the decode error, the length, and the candidate offset — never
+   the bytes. That same warning records the method, the peer, and whether the
+   request was ``forwarded``, so it alone tells a corrupted direct request from a
+   corrupted forwarded one (the ``audit_rpcs`` log does not carry that flag).
+
 ``[rlimits]``
 -------------
 

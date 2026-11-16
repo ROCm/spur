@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .protoc_arg("--experimental_allow_proto3_optional")
         .build_server(true)
         .build_client(true)
+        // Every service decodes through DiagnosticCodec: identical wire format,
+        // but a decode failure reports where the bytes went bad.
+        .codec_path("crate::codec::DiagnosticCodec")
         .compile_protos(&protos, &["../../proto"])?;
     Ok(())
 }
