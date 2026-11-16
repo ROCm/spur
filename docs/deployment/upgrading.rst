@@ -862,11 +862,25 @@ every job placed on those GPUs in the meantime.
 
 Stopping the run on heartbeat needs both an upgraded controller and an upgraded
 agent on that node, which reports the run it holds; with either side from an
-earlier release, the old behavior stays. An upgraded agent also stops the old
-run's processes, including its ``srun`` steps, when the job is placed back on
-the same node, which an earlier agent could miss for a run without a cgroup
-(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
-when not running as root).
+earlier release, the old behavior stays. The recovery hold that keeps a returning
+node ``DOWN`` until it reports a clean job list applies to earlier agents too: one
+that still reports a job the controller ended is held, and drained at the cap if
+that job does not stop. A node drained at the cap is admin-locked, with reason
+``Kill task failed (JobId=...)`` or ``Agent job list unavailable``, and takes no work
+until an operator runs ``scontrol update nodename=<node> state=resume``, so scripts that
+watch ``sinfo -R`` or resume nodes automatically should expect these reasons. Only
+upgraded agents report ``running_jobs_incomplete`` when they cannot list their jobs
+in full, though. An earlier agent sends an empty list when its job map is busy,
+which reads as clean, so its hold can end while an ended run is still going. A job
+entry with run attempt ``0`` (an agent too old to report the run sends ``0`` for every
+job) is judged like any other: it holds the node if the controller ended the job or
+placed it on other nodes. The exception is a job back in the queue: its entry is
+neither stopped (a cancel without an attempt could hit the job's next launch) nor held
+for, so it reads as clean. An upgraded agent also stops the old run's
+processes, including its ``srun`` steps, when the job is placed back on the same node,
+which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example when not
+running as root).
 
 Before accepting a replacement attempt, the agent fences every older attempt
 it can discover in its tracked sessions, persisted session descriptors, and

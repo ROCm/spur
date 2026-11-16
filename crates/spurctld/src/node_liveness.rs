@@ -319,8 +319,8 @@ impl NodeLiveness {
     }
 
     /// Called every health tick with the term this controller leads, or `None`.
-    /// Leader-local state belongs to the term that built it, so a new term or a
-    /// lost leadership discards strikes, not-responding flags, and the gauges.
+    /// Leader-local state belongs to the term that built it, so a new term or a lost
+    /// leadership discards strikes, not-responding flags, gauges, reports, and holds.
     pub(crate) fn observe_term(&mut self, cluster: &ClusterManager, leading_term: Option<u64>) {
         if self.term == leading_term {
             return;
@@ -330,6 +330,10 @@ impl NodeLiveness {
         cluster.clear_not_responding();
         cluster.set_liveness_breaker_tripped(false);
         cluster.set_silent_answering_nodes(0);
+        cluster.reset_node_reports_and_holds();
+        if leading_term.is_some() {
+            cluster.hold_down_nodes_until_reported();
+        }
         self.term = leading_term;
     }
 
@@ -381,7 +385,12 @@ impl NodeLiveness {
             self.report_breaker(cluster, trip.as_ref());
         }
         cluster.set_silent_answering_nodes(self.strikes.answering.len());
-        cluster.check_node_health_at(timeout_secs, mark_down, start.wall_now())
+        cluster.check_node_health_at(
+            timeout_secs,
+            mark_down,
+            start.wall_now(),
+            std::time::Instant::now(),
+        )
     }
 
     /// Judges the silent-node limit after probing, by the nodes that did not
@@ -1712,6 +1721,82 @@ mod tests {
             state(&cm, "n1"),
             NodeState::Idle,
             "the strike from the lost term must not count"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_node_recovers_only_after_reporting_to_a_new_leader() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        // A replicated snapshot taken mid-hold carries a fresh stamp for a Down node.
+        set_node_state(&cm, "n1", NodeState::Down);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        liveness.observe_term(&cm, Some(1));
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        assert_eq!(state(&cm, "n1"), NodeState::Down);
+
+        cm.record_node_report("n1", None);
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        wait_for("recovered after a clean report", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_term_restarts_recovery_holds_from_the_last_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_node_state(&cm, "n1", NodeState::Down);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        cm.record_node_report("n1", Some(crate::cluster::NodeReport::StaleJobs(vec![1])));
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+
+        liveness.observe_term(&cm, Some(1));
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
+            .await;
+        assert!(cm.is_recovery_held("n1"));
+        liveness.observe_term(&cm, Some(1));
+        assert!(cm.is_recovery_held("n1"), "the same term keeps its holds");
+
+        liveness.observe_term(&cm, Some(2));
+        assert!(
+            !cm.is_recovery_held("n1"),
+            "a hold started under another term must not count toward this one's cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_leadership_forgets_the_node_reports_it_recorded() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_of(&dir, &["n1", "n2"]).await;
+        set_node_state(&cm, "n2", NodeState::Down);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        liveness.observe_term(&cm, Some(1));
+        cm.record_node_report("n1", Some(crate::cluster::NodeReport::StaleJobs(vec![1])));
+        cm.record_node_report("n2", Some(crate::cluster::NodeReport::StaleJobs(vec![2])));
+
+        liveness.observe_term(&cm, None);
+        assert_eq!(cm.node_report("n1"), None);
+        assert_eq!(cm.node_report("n2"), None);
+
+        liveness.observe_term(&cm, Some(2));
+        assert_eq!(cm.node_report("n1"), None);
+        assert_eq!(
+            cm.node_report("n2"),
+            Some(crate::cluster::NodeReport::Unknown),
+            "a Down node is held until it reports to the new leader"
         );
     }
 
