@@ -68,6 +68,7 @@ impl HeartbeatManager {
                             k0s_status: None,         // virtual agents run no k0s unit
                             core_layout_fingerprint: 0,
                             spec_enforcement_error: String::new(),
+                            agent_instance: String::new(), // no spurd process to keep out
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -123,6 +124,7 @@ mod tests {
             join_token: String::new(),
             topology: None,
             capabilities: vec![],
+            agent_instance: String::new(),
         }
     }
 

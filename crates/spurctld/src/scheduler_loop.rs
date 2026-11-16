@@ -7209,6 +7209,7 @@ pub(crate) mod tests {
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
                 capabilities: Vec::new(),
+                agent_instance: String::new(),
             });
             let n = name.to_string();
             wait_for(

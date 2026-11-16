@@ -41,6 +41,7 @@ fn register_gpu_node(cm: &ClusterManager) {
         labels: Default::default(),
         source: spur_core::node::NodeSource::NativeHost,
         capabilities: Vec::new(),
+        agent_instance: String::new(),
     });
 }
 

@@ -155,13 +155,24 @@ pub enum SubmitError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterNodeError {
     PermissionDenied(String),
+    Deleted(String),
     Internal(String),
+}
+
+pub(crate) fn deleted_agent_error(name: &str) -> RegisterNodeError {
+    RegisterNodeError::Deleted(format!(
+        "node {name} was deleted; restart its spurd to add it back"
+    ))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 impl std::fmt::Display for RegisterNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PermissionDenied(m) | Self::Internal(m) => f.write_str(m),
+            Self::PermissionDenied(m) | Self::Deleted(m) | Self::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -618,6 +629,9 @@ pub struct ClusterManager {
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
     /// partitions with the same name from re-appearing on restart.
     deleted_partition_names: RwLock<HashSet<String>>,
+    /// Deleted node name -> the spurd process it was deleted under. That process
+    /// stays out; a restarted spurd (new instance) registers it again.
+    deleted_nodes: RwLock<HashMap<String, String>>,
     /// Partition names seeded from config before WAL replay. A replayed
     /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
     /// once overridden the name is removed, so later duplicates stay
@@ -1065,6 +1079,7 @@ impl ClusterManager {
             reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
+            deleted_nodes: RwLock::new(HashMap::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
@@ -4187,6 +4202,12 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Whether `agent_instance` is the spurd process `name` was deleted under.
+    pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
+        !agent_instance.is_empty()
+            && self.deleted_nodes.read().get(name).map(String::as_str) == Some(agent_instance)
+    }
+
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.
     fn node_registration_lock(&self, name: &str) -> Arc<parking_lot::Mutex<()>> {
         self.node_registration_locks
@@ -4196,11 +4217,45 @@ impl ClusterManager {
             .clone()
     }
 
-    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
-    /// node (see `sync_node_labels`); first registration never needs it.
+    /// Register an agent that reports no process instance, as older agents do.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
+        name: String,
+        hostname: String,
+        resources: ResourceSet,
+        address: String,
+        port: u16,
+        wg_pubkey: String,
+        version: String,
+        source: NodeSource,
+        labels: HashMap<String, String>,
+        capabilities: Vec<String>,
+        caller_privileged: bool,
+    ) -> Result<(), RegisterNodeError> {
+        self.register_agent_node(
+            String::new(),
+            name,
+            hostname,
+            resources,
+            address,
+            port,
+            wg_pubkey,
+            version,
+            source,
+            labels,
+            capabilities,
+            caller_privileged,
+        )
+    }
+
+    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
+    /// node (see `sync_node_labels`); first registration never needs it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_agent_node(
+        &self,
+        agent_instance: String,
         name: String,
         hostname: String,
         resources: ResourceSet,
@@ -4226,6 +4281,10 @@ impl ClusterManager {
         let node_lock = self.node_registration_lock(&name);
         let _registration = node_lock.lock();
 
+        if self.is_deleted_agent(&name, &agent_instance) {
+            return Err(deleted_agent_error(&name));
+        }
+
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -4250,7 +4309,8 @@ impl ClusterManager {
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
                             && existing.version.as_deref() != Some(version.as_str()))
-                        || existing.capabilities != capabilities;
+                        || existing.capabilities != capabilities
+                        || existing.agent_instance.as_deref().unwrap_or_default() != agent_instance;
                     if needs_update {
                         let response = self
                             .propose(WalOperation::NodeUpdate {
@@ -4266,6 +4326,7 @@ impl ClusterManager {
                                 version,
                                 source: source.clone(),
                                 capabilities,
+                                agent_instance,
                             })
                             .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         reject_excluded_registration(&response, &name)?;
@@ -4290,6 +4351,7 @@ impl ClusterManager {
                         version,
                         source: source.clone(),
                         capabilities,
+                        agent_instance,
                     })
                     .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 reject_excluded_registration(&response, &name)?;
@@ -4313,10 +4375,16 @@ impl ClusterManager {
                         labels,
                         source: source.clone(),
                         capabilities,
+                        agent_instance,
                     })
                     .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 reject_excluded_registration(&response, &name)?;
-                if let Some(node) = self.nodes.write().get_mut(&name) {
+                {
+                    let mut nodes = self.nodes.write();
+                    // Absent only when the apply refused a deleted spurd's registration.
+                    let Some(node) = nodes.get_mut(&name) else {
+                        return Err(deleted_agent_error(&name));
+                    };
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
                 }
@@ -9864,15 +9932,22 @@ impl ClusterManager {
                 labels,
                 source,
                 capabilities,
+                agent_instance,
             } => {
                 if self.committed_inventory_excludes(name) {
                     response.node_registration_rejected = true;
                     return response;
                 }
+                if self.is_deleted_agent(name, agent_instance) {
+                    warn!(node = %name, "ignoring registration from the spurd this node was deleted under");
+                    return response;
+                }
+                self.deleted_nodes.write().remove(name);
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
                 let mut node = Node::new(name.clone(), resources);
+                node.agent_instance = non_empty(agent_instance);
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -9932,12 +10007,14 @@ impl ClusterManager {
                 version,
                 source,
                 capabilities,
+                agent_instance,
             } => {
                 if self.committed_inventory_excludes(name) {
                     response.node_registration_rejected = true;
                     return response;
                 }
                 if let Some(node) = nodes.get_mut(name) {
+                    node.agent_instance = non_empty(agent_instance);
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
                     resources.backfill_stable_ids();
@@ -10099,6 +10176,11 @@ impl ClusterManager {
                     // A node can be force-removed while still k0s-assigned (no prior `k8s down`).
                     if let Some(role) = node.k0s_role {
                         self.k0s_role_counts.dec(role);
+                    }
+                    if let Some(instance) = &node.agent_instance {
+                        self.deleted_nodes
+                            .write()
+                            .insert(name.clone(), instance.clone());
                     }
                 }
                 nodes.remove(name);
@@ -10654,6 +10736,8 @@ struct ClusterSnapshot {
     /// partitions with the same name from re-seeding on restart.
     #[serde(default)]
     deleted_partition_names: HashSet<String>,
+    #[serde(default)]
+    deleted_nodes: HashMap<String, String>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     #[serde(default)]
@@ -10817,6 +10901,7 @@ impl StateMachineApply for ClusterManager {
             reservations: self.reservations.read().clone(),
             partitions: Some(self.partitions.read().clone()),
             deleted_partition_names: self.deleted_partition_names.read().clone(),
+            deleted_nodes: self.deleted_nodes.read().clone(),
             steps,
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
@@ -10863,6 +10948,7 @@ impl StateMachineApply for ClusterManager {
 
         // Restore tombstone set first — used below to filter the config baseline.
         *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
+        *self.deleted_nodes.write() = snap.deleted_nodes;
 
         // `snap.partitions` is the leader's authoritative set, installed
         // wholesale. Only a pre-partition snapshot (`None`) falls back to the
@@ -16678,6 +16764,7 @@ state = "UP"
                 version: String::new(),
                 labels: HashMap::new(),
                 capabilities: Vec::new(),
+                agent_instance: String::new(),
                 source: spur_core::node::NodeSource::NativeHost,
             },
             WalOperation::JobSubmit {
@@ -16706,6 +16793,7 @@ state = "UP"
                 wg_pubkey: String::new(),
                 version: String::new(),
                 capabilities: Vec::new(),
+                agent_instance: String::new(),
                 source: spur_core::node::NodeSource::NativeHost,
             },
         ]
@@ -17650,6 +17738,7 @@ state = "UP"
             labels: HashMap::new(),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -40772,6 +40861,7 @@ state = "UP"
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         assert_eq!(
@@ -40816,6 +40906,7 @@ state = "UP"
             labels: HashMap::new(),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -40868,6 +40959,7 @@ state = "UP"
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -40920,6 +41012,7 @@ state = "UP"
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -40968,6 +41061,7 @@ state = "UP"
             reservations: Vec::new(),
             partitions: None,
             deleted_partition_names: HashSet::new(),
+            deleted_nodes: HashMap::new(),
             steps: Vec::new(),
             license_pool: HashMap::new(),
             tokens: Vec::new(),
@@ -41283,6 +41377,219 @@ state = "UP"
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
     }
 
+    fn register_agent(
+        cm: &ClusterManager,
+        name: &str,
+        instance: &str,
+    ) -> Result<(), RegisterNodeError> {
+        cm.register_agent_node(
+            instance.into(),
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn agent_register_op(name: &str, instance: &str) -> WalOperation {
+        WalOperation::NodeRegister {
+            name: name.into(),
+            hostname: name.into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
+            agent_instance: instance.into(),
+        }
+    }
+
+    fn remove_op(name: &str) -> WalOperation {
+        WalOperation::NodeRemove {
+            name: name.into(),
+            reason: None,
+            at: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_node_stays_out_until_its_spurd_restarts() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_agent(&cm, "n1", "first").unwrap();
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        let err = register_agent(&cm, "n1", "first").expect_err("the deleted spurd stays out");
+        assert!(matches!(err, RegisterNodeError::Deleted(_)), "{err}");
+        assert!(cm.get_node("n1").is_none());
+
+        register_agent(&cm, "n1", "second").expect("a restarted spurd is admitted");
+        let node = cm.get_node("n1").expect("n1 is back");
+        assert_eq!(node.agent_instance.as_deref(), Some("second"));
+        assert!(
+            !cm.is_deleted_agent("n1", "first"),
+            "readmission clears the delete record"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_node_without_an_agent_instance_does_not_keep_it_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        try_register_node(&cm, "n1", 4, 8000).expect("an older agent re-registers as before");
+        assert!(cm.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_reregistration_records_the_new_agent_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_agent(&cm, "n1", "first").unwrap();
+        register_agent(&cm, "n1", "second").unwrap();
+        assert_eq!(
+            cm.get_node("n1").unwrap().agent_instance.as_deref(),
+            Some("second")
+        );
+
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+        assert!(cm.is_deleted_agent("n1", "second"));
+        assert!(!cm.is_deleted_agent("n1", "first"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_ignores_a_registration_from_the_deleted_spurd() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1"));
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        assert!(cm.get_node("n1").is_none());
+
+        cm.apply_operation(&agent_register_op("n1", "second"));
+        assert!(cm.get_node("n1").is_some());
+        assert!(!cm.is_deleted_agent("n1", "first"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_delete_of_a_busy_node_also_keeps_its_spurd_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        cm.remove_node("n1", true, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+        assert!(matches!(
+            register_agent(&cm, "n1", "first"),
+            Err(RegisterNodeError::Deleted(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_agent_taking_over_the_node_clears_its_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        assert_eq!(cm.get_node("n1").unwrap().agent_instance, None);
+
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+        assert!(!cm.is_deleted_agent("n1", "first"));
+        register_agent(&cm, "n1", "first").expect("nothing was recorded against it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replayed_node_update_carries_the_instance_into_the_delete_record() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
+            agent_instance: "second".into(),
+        });
+        cm.apply_operation(&remove_op("n1"));
+
+        assert!(cm.is_deleted_agent("n1", "second"));
+        assert!(!cm.is_deleted_agent("n1", "first"));
+        assert!(
+            !cm.is_deleted_agent("n1", ""),
+            "an empty instance never matches"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_record_survives_snapshot_restore() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1"));
+        let bytes = cm.snapshot_state().unwrap();
+
+        let other_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&other_dir).await;
+        restored.apply_operation(&agent_register_op("n2", "other"));
+        restored.apply_operation(&remove_op("n2"));
+        restored.restore_from_snapshot(&bytes).unwrap();
+        assert!(restored.is_deleted_agent("n1", "first"));
+        assert!(
+            !restored.is_deleted_agent("n2", "other"),
+            "restore replaces the delete records"
+        );
+
+        // Frozen snapshot from before delete records existed.
+        restored
+            .restore_from_snapshot(
+                br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{}}"#,
+            )
+            .expect("an older snapshot still restores");
+        assert!(!restored.is_deleted_agent("n1", "first"));
+    }
+
     /// A stopping agent must not delete its node: the record carries the
     /// `wg_pubkey` that keeps the node in the WireGuard membership, and
     /// without it every other node prunes the peer and the node cannot
@@ -41410,6 +41717,7 @@ state = "UP"
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 

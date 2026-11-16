@@ -3,9 +3,13 @@
 
 """scontrol node deletion dispatches through the existing native removal RPC."""
 
+import time
+
 import pytest
 
-from cluster import job_state, parse_job_id, wait_job_state, wait_node_gone, wait_node_state
+from cluster import (
+    job_state, parse_job_id, wait_job_state, wait_node_gone, wait_node_state, wait_until,
+)
 
 
 @pytest.fixture
@@ -80,6 +84,62 @@ def test_delete_continues_after_unknown_node(departed_cluster):
     assert f"Node {name} removed from cluster" in out, out
     assert "failed on 1 of 2 node(s)" in out, out
     assert set(cluster.sinfo_nodes()) == before - {name}
+
+
+def _wait_told_deleted(cluster, index):
+    wait_until(
+        lambda: "this node was deleted" in cluster.spurd_log(index),
+        timeout_s=90, interval_s=2, desc="running agent told it was deleted",
+    )
+    assert "re-registering" not in cluster.spurd_log(index)
+
+
+def test_deleted_node_stays_out_until_its_agent_restarts(cluster):
+    index = len(cluster.nodes) - 1
+    name = cluster.node_names[index]
+    others = [n for n in cluster.node_names if n != name]
+
+    out = cluster.scontrol("delete", f"NodeName={name}")
+
+    assert f"Node {name} removed from cluster" in out, out
+    wait_node_gone(cluster, name)
+    _wait_told_deleted(cluster, index)
+    assert name not in cluster.sinfo_nodes()
+
+    if cluster.ha_controller_count == 1:
+        cluster.restart_controller(expected_nodes=others)
+        # One full heartbeat interval: the record must survive the restart.
+        time.sleep(35)
+        assert name not in cluster.sinfo_nodes()
+
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
+
+
+def test_forced_delete_of_busy_node_keeps_its_agent_out(cluster):
+    index = len(cluster.nodes) - 1
+    name = cluster.node_names[index]
+    out = cluster.sbatch([
+        "-N", "1", "-w", name, "-t", "10", "--wrap", "sleep 600",
+        "-o", f"{cluster.remote_dir}/delete-forced.out",
+    ])
+    job_id = parse_job_id(out)
+    assert job_id is not None, out
+    try:
+        wait_job_state(cluster, job_id, "R")
+        cluster.cli(["spur", "node", "remove", name, "--force"])
+        wait_node_gone(cluster, name)
+        wait_until(
+            lambda: job_state(cluster.squeue_all(), job_id) != "R",
+            timeout_s=60, interval_s=2, desc="job evicted from the removed node",
+        )
+        _wait_told_deleted(cluster, index)
+        assert name not in cluster.sinfo_nodes()
+    finally:
+        cluster.cli_allow_fail(["scancel", str(job_id)])
+
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
 
 
 @pytest.mark.parametrize("key,separator", [("NodeName", "="), ("node", " ")])

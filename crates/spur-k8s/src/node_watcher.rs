@@ -135,6 +135,7 @@ pub async fn run(
                         join_token: String::new(),
                         topology: None,
                         capabilities: vec![],
+                        agent_instance: String::new(),
                     };
 
                     let reg = req.clone();

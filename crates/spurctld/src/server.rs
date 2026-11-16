@@ -2626,7 +2626,8 @@ impl SlurmController for ControllerService {
         let cluster = self.cluster.clone();
         let hostname = req.hostname.clone();
         tokio::task::spawn_blocking(move || {
-            cluster.register_node(
+            cluster.register_agent_node(
+                req.agent_instance,
                 // NodeName and NodeHostname are the same until agents can supply both.
                 req.hostname.clone(),
                 req.hostname,
@@ -2823,6 +2824,14 @@ impl SlurmController for ControllerService {
                 &req.spec_enforcement_error,
             );
             Ok(Response::new(HeartbeatResponse { reregister }))
+        } else if self
+            .cluster
+            .is_deleted_agent(&req.hostname, &req.agent_instance)
+        {
+            // Not NotFound: that would send the agent straight back to re-register.
+            Err(register_node_rpc_status(
+                crate::cluster::deleted_agent_error(&req.hostname),
+            ))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -6106,6 +6115,7 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
 fn register_node_rpc_status(err: crate::cluster::RegisterNodeError) -> Status {
     match err {
         crate::cluster::RegisterNodeError::PermissionDenied(m) => Status::permission_denied(m),
+        crate::cluster::RegisterNodeError::Deleted(m) => Status::failed_precondition(m),
         crate::cluster::RegisterNodeError::Internal(m) => Status::internal(m),
     }
 }
@@ -9207,6 +9217,107 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("node {name} never became visible");
+    }
+
+    fn agent_registration(instance: &str) -> Request<RegisterAgentRequest> {
+        Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: 6818,
+            agent_instance: instance.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn heartbeat_code(svc: &ControllerService, instance: &str) -> Code {
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            agent_instance: instance.into(),
+            ..Default::default()
+        }))
+        .await
+        .map_or_else(|status| status.code(), |_| Code::Ok)
+    }
+
+    // NotFound would send the deleted spurd straight back to re-register.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_node_answers_its_running_spurd_without_a_reregister_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        svc.register_agent(agent_registration("first"))
+            .await
+            .expect("first registration");
+        await_registered_node(&svc, "n1").await;
+        svc.cluster
+            .remove_node("n1", false, None)
+            .expect("delete n1");
+
+        assert_eq!(
+            heartbeat_code(&svc, "first").await,
+            Code::FailedPrecondition
+        );
+        assert_eq!(heartbeat_code(&svc, "second").await, Code::NotFound);
+        assert_eq!(heartbeat_code(&svc, "").await, Code::NotFound);
+        let refused = svc
+            .register_agent(agent_registration("first"))
+            .await
+            .expect_err("the deleted spurd stays out");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert!(svc.cluster.get_node("n1").is_none());
+
+        svc.register_agent(agent_registration("second"))
+            .await
+            .expect("a restarted spurd is admitted");
+        assert_eq!(heartbeat_code(&svc, "second").await, Code::Ok);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_node_answer_still_requires_the_node_credential() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        svc.cluster
+            .register_agent_node(
+                "first".into(),
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .expect("register n1");
+        svc.cluster
+            .remove_node("n1", false, None)
+            .expect("delete n1");
+        let heartbeat = |node_token: String| HeartbeatRequest {
+            hostname: "n1".into(),
+            node_token,
+            agent_instance: "first".into(),
+            ..Default::default()
+        };
+
+        let anonymous = svc
+            .heartbeat(Request::new(heartbeat(String::new())))
+            .await
+            .expect_err("no credential");
+        assert_eq!(anonymous.code(), Code::Unauthenticated);
+
+        let token = spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes())
+            .expect("node token");
+        let deleted = svc
+            .heartbeat(Request::new(heartbeat(token)))
+            .await
+            .expect_err("n1 was deleted");
+        assert_eq!(deleted.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

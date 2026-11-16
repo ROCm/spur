@@ -1153,6 +1153,7 @@ message RegisterAgentRequest {
   // Optional agent features (e.g. "signal-job"), so the controller can avoid
   // calling RPCs an older agent does not implement.
   repeated string capabilities = 10;
+  string agent_instance = 11;  // random per spurd process; empty from older agents
 }
 
 message RegisterAgentResponse {
@@ -1181,6 +1182,7 @@ message HeartbeatRequest {
   uint64 core_layout_fingerprint = 8; // fingerprint of the layout spurd holds; 0 = none
   string spec_enforcement_error = 9;  // why the held layout is not enforced; empty = enforced
   bool running_jobs_incomplete = 10;  // running_jobs is partial (contended agent lock); older agents never set it
+  string agent_instance = 11;         // same value the agent registered with; empty from older agents
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.

@@ -339,6 +339,8 @@ pub enum WalOperation {
         source: NodeSource,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default)]
+        agent_instance: String,
     },
     NodeUpdate {
         name: String,
@@ -353,6 +355,8 @@ pub enum WalOperation {
         source: NodeSource,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default)]
+        agent_instance: String,
     },
     NodeStateChange {
         name: String,
@@ -1854,7 +1858,14 @@ mod deregistration_wal_tests {
         let op: WalOperation = serde_json::from_str(NODE_REGISTER)
             .expect("frozen NodeRegister must deserialize; a new field needs #[serde(default)]");
         match op {
-            WalOperation::NodeRegister { capabilities, .. } => assert!(capabilities.is_empty()),
+            WalOperation::NodeRegister {
+                capabilities,
+                agent_instance,
+                ..
+            } => {
+                assert!(capabilities.is_empty());
+                assert!(agent_instance.is_empty());
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -1865,7 +1876,14 @@ mod deregistration_wal_tests {
         let op: WalOperation = serde_json::from_str(NODE_UPDATE)
             .expect("frozen NodeUpdate must deserialize; a new field needs #[serde(default)]");
         match op {
-            WalOperation::NodeUpdate { capabilities, .. } => assert!(capabilities.is_empty()),
+            WalOperation::NodeUpdate {
+                capabilities,
+                agent_instance,
+                ..
+            } => {
+                assert!(capabilities.is_empty());
+                assert!(agent_instance.is_empty());
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -1883,6 +1901,7 @@ mod deregistration_wal_tests {
             labels: HashMap::new(),
             source: NodeSource::NativeHost,
             capabilities: vec![crate::node::CAP_SIGNAL_JOB.to_string()],
+            agent_instance: String::new(),
         };
         let json = serde_json::to_string(&op).expect("serialize");
         let back: WalOperation = serde_json::from_str(&json).expect("deserialize");

@@ -1533,11 +1533,21 @@ For a removal reason or to evict active jobs, use
 option. Node removal requires Administrator when the caller has a verified
 identity; see :ref:`privileged-operations`.
 
-Removal does not stop the agent or change ``spur.conf``. An agent that
-registers again can recreate the node record. Slurm restricts this command
-to dynamic nodes without running jobs or reservation membership; Spur uses
-its native registered-node removal rules and does not currently guard
-reservation membership.
+Removal does not stop the agent or change ``spur.conf``. A ``spurd`` that
+keeps running after its node is removed stays out: its heartbeats are refused,
+and it logs ``this node was deleted; restart spurd to add it back`` once
+instead of registering again. Restarting ``spurd`` (or the host) adds the
+node back, as a restarted ``slurmd`` does for a deleted Slurm dynamic node.
+Each ``spurd`` process identifies itself with a random instance ID, so the
+controller can tell a restart from the process that was running when the node
+was removed; the removal is replicated and survives a controller restart or
+failover. Agents older than this release send no instance ID, so their nodes
+still register again on the next heartbeat; during a rolling upgrade, any node
+can, until every controller runs this release.
+
+Slurm restricts this command to dynamic nodes without running jobs or
+reservation membership; Spur uses its native registered-node removal rules and
+does not currently guard reservation membership.
 
 .. note::
 
