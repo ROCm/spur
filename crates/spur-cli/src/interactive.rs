@@ -246,6 +246,9 @@ pub fn install_ctrl_c_cancel(
     tokio::spawn(async move {
         let mut client = client;
         if tokio::signal::ctrl_c().await.is_ok() {
+            // process::exit skips RawModeGuard's drop, so a SIGINT that lands
+            // during a PTY session would otherwise leave the terminal raw.
+            let _ = crossterm::terminal::disable_raw_mode();
             eprintln!("\n{tool}: cancelling job {job_id}...");
             let cancel_user = resolve_job_owner_for_cancel(&mut client, job_id, &submit_user).await;
             let _ = client

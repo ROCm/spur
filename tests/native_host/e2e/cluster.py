@@ -723,15 +723,36 @@ class SpurCluster:
         *,
         salloc_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
+        all_nodes: bool = False,
+        tty: bool = False,
     ) -> tuple[int, str]:
         """Run salloc with *shell_body* as the allocation shell (via ``SHELL``).
 
         salloc exports allocation env vars into the shell, then cancels the job
         when the shell exits.  Returns ``(exit_code, combined_output)``.
+        Set *all_nodes* when the shell runs on an allocated node rather than
+        here (``salloc --interactive-step``), and *tty* to give salloc a
+        terminal for stdin instead of the harness's non-TTY SSH channel.
         """
+        cmd = self.salloc_command(shell_body, salloc_args=salloc_args,
+                                  extra_env=extra_env, all_nodes=all_nodes)
+        if tty:
+            cmd = f"script -qec {shlex.quote(cmd)} /dev/null"
+        return self.nodes[0].exec_with_exit(cmd)
+
+    def salloc_command(
+        self,
+        shell_body: str,
+        *,
+        salloc_args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
+        all_nodes: bool = False,
+    ) -> str:
+        """The command line :meth:`salloc_run` runs, for tests that drive it."""
         script_path = self.write_file(
             f"salloc-shell-{time.time_ns()}.sh",
             f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
+            all_nodes=all_nodes,
         )
 
         cmd_parts = self._cli_env_assignments()
@@ -741,7 +762,7 @@ class SpurCluster:
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
         cmd_parts.append("salloc")
         cmd_parts.extend(shlex.quote(a) for a in (salloc_args or ["-N", "1", "-t", "0:05"]))
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
+        return " ".join(cmd_parts)
 
     def squeue(self, args: list[str]) -> str:
         return self.cli(["squeue"] + args)
