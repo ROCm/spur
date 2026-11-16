@@ -126,9 +126,9 @@ pub fn job_spool_root() -> &'static Path {
     Path::new(SPOOL_ROOT)
 }
 
-/// Whoever can write the spool root can swap a job's folder between spurd
-/// writing a file there and something executing it, so it must be root's alone.
-pub fn spool_root_is_trusted(owner_uid: u32, mode: u32) -> bool {
+/// Whoever else can write a directory root reads and then acts on can swap an entry
+/// between root writing it and using it, so such a directory must be root's alone.
+pub fn is_root_trusted_dir(owner_uid: u32, mode: u32) -> bool {
     owner_uid == 0 && mode & 0o022 == 0
 }
 
@@ -1893,7 +1893,8 @@ fn append_as_user_child(
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
-            libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
+            // A FIFO with no reader fails (ENXIO) rather than stalling the cleanup.
+            libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1934,7 +1935,12 @@ fn write_all_raw(fd: RawFd, mut buf: &[u8]) -> bool {
 /// in-process half of [`append_as_user`]. Never creates the stream.
 fn append_in_process(path: &str, line: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    match std::fs::OpenOptions::new().append(true).open(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(mut file) => file.write_all(line),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -3292,14 +3298,12 @@ mod tests {
         );
     }
 
-    // Whoever can write the spool root can swap a job's folder between spurd
-    // writing a file there and something executing it.
     #[test]
-    fn only_a_root_owned_spool_root_closed_to_others_is_trusted() {
-        assert!(spool_root_is_trusted(0, 0o40755));
-        assert!(!spool_root_is_trusted(1000, 0o40755), "its owner");
-        assert!(!spool_root_is_trusted(0, 0o40775), "a group member");
-        assert!(!spool_root_is_trusted(0, 0o40757), "anyone");
+    fn only_a_root_owned_dir_closed_to_others_is_trusted() {
+        assert!(is_root_trusted_dir(0, 0o40755));
+        assert!(!is_root_trusted_dir(1000, 0o40755), "its owner");
+        assert!(!is_root_trusted_dir(0, 0o40775), "a group member");
+        assert!(!is_root_trusted_dir(0, 0o40757), "anyone");
     }
 
     #[test]
@@ -3969,6 +3973,18 @@ mod tests {
             !stream.exists(),
             "a stream the launch never opened must not be created here"
         );
+    }
+
+    // Without O_NONBLOCK both halves hang on the open, so this also guards that flag.
+    #[test]
+    fn a_failure_report_to_a_fifo_with_no_reader_gives_up_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("job.err");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+
+        assert_ne!(append_as_user_child(None, &path, b"spurstepd: boom\n"), 0);
+        assert!(append_as_user(0, 0, fifo.to_str().unwrap(), b"spurstepd: boom\n").is_err());
     }
 
     #[test]

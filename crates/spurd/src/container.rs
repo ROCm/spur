@@ -559,8 +559,8 @@ struct PseudoFsDirs {
     run: crate::scratch::ScratchDir,
 }
 
-/// The image is the user's, so a linked one of these refuses the container
-/// rather than letting root create or mount through the link.
+/// A pseudo-filesystem must sit at its own path, and /dev is reopened by name once
+/// mounted, so a link at one of these refuses the container instead of being followed.
 fn prepare_pseudo_fs_dirs(rootfs: &Path) -> anyhow::Result<PseudoFsDirs> {
     let root = crate::scratch::ScratchDir::open(rootfs)
         .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
@@ -574,8 +574,6 @@ fn prepare_pseudo_fs_dirs(rootfs: &Path) -> anyhow::Result<PseudoFsDirs> {
         prepare("dev", 0o755)?,
         prepare("run", 0o755)?,
     );
-    prepare("tmp", 0o1777)?;
-    prepare("etc", 0o755)?;
     Ok(PseudoFsDirs {
         root,
         proc,
@@ -834,13 +832,14 @@ nameserver 8.8.8.8\n";
 
 /// Write a fresh container's entry script into its rootfs's `/tmp`, still
 /// reachable after pivot_root. The rootfs comes from a user's image, or a named
-/// container shared across jobs, so nothing in it may be followed.
+/// container shared across jobs, so its links resolve inside it, never on the node.
 pub(crate) fn write_entry_script(
     rootfs: &Path,
     name: &str,
     content: &str,
 ) -> std::io::Result<PathBuf> {
-    let tmp = crate::scratch::open_dir_beneath(rootfs, Path::new("tmp"), 0o1777)?;
+    let root = crate::scratch::ScratchDir::open(rootfs)?;
+    let tmp = crate::scratch::open_dir_in_root(&root, Path::new("tmp"), 0o1777)?;
     crate::scratch::write_scratch(
         &tmp,
         name,
@@ -852,7 +851,8 @@ pub(crate) fn write_entry_script(
 
 /// The image is the user's, so a link at resolv.conf is replaced, not written through.
 fn write_resolv_conf(rootfs: &Path, content: &str) -> std::io::Result<()> {
-    let etc = crate::scratch::open_dir_beneath(rootfs, Path::new("etc"), 0o755)?;
+    let root = crate::scratch::ScratchDir::open(rootfs)?;
+    let etc = crate::scratch::open_dir_in_root(&root, Path::new("etc"), 0o755)?;
     crate::scratch::write_scratch(
         &etc,
         "resolv.conf",
@@ -942,7 +942,8 @@ pub fn setup_shadow(rootfs: &Path, config: &ContainerConfig) -> anyhow::Result<(
             bail!("container {field} {value:?} cannot appear in /etc/passwd");
         }
     }
-    let etc = crate::scratch::open_dir_beneath(rootfs, Path::new("etc"), 0o755)
+    let etc = crate::scratch::ScratchDir::open(rootfs)
+        .and_then(|root| crate::scratch::open_dir_in_root(&root, Path::new("etc"), 0o755))
         .context("open the container's /etc")?;
     let user = &config.username;
     add_account_line(
@@ -1339,25 +1340,36 @@ mod tests {
         assert_eq!(mode, 0o755);
     }
 
-    // An image is user-supplied, so an absolute link inside it resolves against
-    // the host when root writes before pivot_root.
     #[test]
-    fn an_entry_script_never_follows_a_symlinked_tmp() {
+    fn an_entry_script_behind_a_linked_tmp_stays_inside_the_image() {
         let rootfs = tempfile::tempdir().unwrap();
-        let host = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(host.path(), rootfs.path().join("tmp")).unwrap();
+        // Not a tempdir: one under /tmp would resolve back through this very link.
+        let elsewhere = Path::new("/spur-test-not-on-this-node");
+        std::os::unix::fs::symlink(elsewhere, rootfs.path().join("tmp")).unwrap();
 
-        let error = write_entry_script(rootfs.path(), "spur_job_7.sh", "x")
-            .expect_err("a linked /tmp must not be followed");
+        write_entry_script(rootfs.path(), "spur_job_7.sh", "x").expect("write entry script");
 
         assert!(
-            matches!(
-                error.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::ENOTDIR)
-            ),
-            "{error}"
+            !elsewhere.exists(),
+            "the link must resolve inside the image"
         );
-        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+        let inside = rootfs.path().join(elsewhere.strip_prefix("/").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(inside.join("spur_job_7.sh")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn an_image_whose_tmp_links_to_var_tmp_still_gets_its_entry_script() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("var/tmp")).unwrap();
+        std::os::unix::fs::symlink("var/tmp", rootfs.path().join("tmp")).unwrap();
+
+        write_entry_script(rootfs.path(), "spur_job_7.sh", "x").expect("write entry script");
+
+        let staged = rootfs.path().join("var/tmp/spur_job_7.sh");
+        assert_eq!(std::fs::read_to_string(staged).unwrap(), "x");
     }
 
     // A named container's /tmp outlives the job that wrote to it, so anyone
@@ -1817,14 +1829,18 @@ mod tests {
     #[test]
     fn a_mount_target_behind_an_image_link_stays_inside_the_image() {
         let rootfs = tempfile::tempdir().unwrap();
-        let host = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(host.path(), rootfs.path().join("mnt")).unwrap();
+        // Not a tempdir: on a runner whose TMPDIR is under /mnt it would loop back here.
+        let elsewhere = Path::new("/spur-test-not-on-this-node");
+        std::os::unix::fs::symlink(elsewhere, rootfs.path().join("mnt")).unwrap();
 
         create_mount_target(rootfs.path(), "/mnt/data", source.path()).unwrap();
 
-        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
-        let inside = rootfs.path().join(host.path().strip_prefix("/").unwrap());
+        assert!(
+            !elsewhere.exists(),
+            "the link must resolve inside the image"
+        );
+        let inside = rootfs.path().join(elsewhere.strip_prefix("/").unwrap());
         assert!(inside.join("data").is_dir());
     }
 
@@ -1896,7 +1912,7 @@ mod tests {
     fn pseudo_filesystem_dirs_are_created_when_the_image_lacks_them() {
         let rootfs = tempfile::tempdir().unwrap();
         prepare_pseudo_fs_dirs(rootfs.path()).unwrap();
-        for dir in ["dev", "proc", "sys", "tmp", "etc", "run"] {
+        for dir in ["dev", "proc", "sys", "run"] {
             assert!(rootfs.path().join(dir).is_dir(), "{dir}");
         }
     }
@@ -1982,6 +1998,27 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&host_passwd).unwrap(),
             "root:x:0:0:root:/root:/bin/bash\n"
+        );
+    }
+
+    #[test]
+    fn account_lines_behind_a_linked_etc_stay_inside_the_image() {
+        let root_line = "root:x:0:0:root:/root:/bin/bash\n";
+        let rootfs = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("passwd"), root_line).unwrap();
+        let inside = rootfs.path().join(host.path().strip_prefix("/").unwrap());
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("passwd"), root_line).unwrap();
+        std::os::unix::fs::symlink(host.path(), rootfs.path().join("etc")).unwrap();
+
+        setup_shadow(rootfs.path(), &shadow_config("alice", "/home/alice")).unwrap();
+
+        let passwd = std::fs::read_to_string(inside.join("passwd")).unwrap();
+        assert!(passwd.contains("alice:x:1000:1000"), "{passwd}");
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("passwd")).unwrap(),
+            root_line
         );
     }
 

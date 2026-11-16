@@ -2185,7 +2185,8 @@ fn apply_multi_rank_pmix(
         spec.script = wrapper;
         return Ok(());
     }
-    write_pmix_wrapper(spec, &pmix.wrapper_path, &wrapper).map_err(|error| {
+    let spool_roots = crate::executor::default_job_spool_candidates();
+    write_pmix_wrapper(&spool_roots, spec, &pmix.wrapper_path, &wrapper).map_err(|error| {
         anyhow::anyhow!(
             "failed to write the PMIx rank wrapper at {}: {error}",
             pmix.wrapper_path
@@ -2196,12 +2197,14 @@ fn apply_multi_rank_pmix(
 /// The path arrives in launch.json, so it is honoured only inside the job's own
 /// spool folder, where a planted name cannot redirect the write.
 fn write_pmix_wrapper(
+    spool_roots: &[PathBuf],
     spec: &StepdLaunchSpec,
     wrapper_path: &str,
     wrapper: &str,
 ) -> anyhow::Result<()> {
-    let dir = crate::executor::create_job_spool_dir(spec.job_id, spec.uid, spec.gid)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let dir =
+        crate::executor::create_job_spool_dir_under(spool_roots, spec.job_id, spec.uid, spec.gid)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
     let path = Path::new(wrapper_path);
     let name = path
         .file_name()
@@ -4379,13 +4382,16 @@ mod tests {
 
     #[test]
     fn a_pmix_wrapper_in_the_job_spool_is_written() {
-        let mut spec = launch_spec();
-        spec.job_id = 987_654_330;
-        let spool = crate::executor::create_job_spool_dir(spec.job_id, spec.uid, spec.gid)
-            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+        let spec = launch_spec();
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let spool =
+            crate::executor::create_job_spool_dir_under(&roots, spec.job_id, spec.uid, spec.gid)
+                .unwrap_or_else(|e| panic!("create spool dir: {e}"));
         let wrapper_path = spool.join("wrapper_0_3.sh");
 
         write_pmix_wrapper(
+            &roots,
             &spec,
             &wrapper_path.to_string_lossy(),
             "#!/bin/bash\nexec true\n",
@@ -4396,26 +4402,29 @@ mod tests {
             std::fs::read_to_string(&wrapper_path).unwrap(),
             "#!/bin/bash\nexec true\n"
         );
-        crate::executor::cleanup_job_spool(spec.job_id);
     }
 
     // The path arrives in launch.json, so it is honoured only where a planted
     // name cannot redirect the write.
     #[test]
     fn a_pmix_wrapper_outside_the_job_spool_is_refused() {
-        let mut spec = launch_spec();
-        spec.job_id = 987_654_331;
+        let spec = launch_spec();
+        let root = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let wrapper_path = elsewhere.path().join("wrapper_0_3.sh");
 
-        let written = write_pmix_wrapper(&spec, &wrapper_path.to_string_lossy(), "x");
+        let written = write_pmix_wrapper(
+            &[root.path().to_path_buf()],
+            &spec,
+            &wrapper_path.to_string_lossy(),
+            "x",
+        );
 
         assert!(
             written.is_err(),
             "a path outside the job spool must be refused"
         );
         assert!(!wrapper_path.exists());
-        crate::executor::cleanup_job_spool(spec.job_id);
     }
 
     fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {

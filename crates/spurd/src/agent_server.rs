@@ -4096,13 +4096,8 @@ async fn awaited_step_response(
 }
 
 async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> String {
-    use tokio::io::AsyncReadExt;
     for path in crate::executor::step_output_path_candidates(job_id, step_id, stderr) {
-        let Ok(mut file) = crate::scratch::open_spool_file(&path).await else {
-            continue;
-        };
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).await.is_ok() {
+        if let Ok(bytes) = crate::scratch::read_spool_file(&path).await {
             return String::from_utf8_lossy(&bytes).into_owned();
         }
     }
@@ -9324,24 +9319,18 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back, which is what bounds it in memory. Read
-        // through open_spool_file so a link or FIFO planted at the name (a legacy
-        // folder may be the job's) is refused rather than followed or blocked on.
+        // reading the spool files back, which is what bounds it in memory.
         let read_back = |path: String| async move {
-            use tokio::io::AsyncReadExt;
-            let read = async {
-                let mut file = crate::scratch::open_spool_file(std::path::Path::new(&path)).await?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).await?;
-                Ok::<String, std::io::Error>(String::from_utf8_lossy(&bytes).into_owned())
-            };
-            read.await.unwrap_or_else(|e| {
-                // Don't fail the step over a read-back error, but log it so a
-                // missing response body can be correlated with a filesystem
-                // fault rather than looking like the step produced no output.
-                warn!(path = %path, error = %e, "failed to read back step output");
-                String::new()
-            })
+            match crate::scratch::read_spool_file(std::path::Path::new(&path)).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => {
+                    // Don't fail the step over a read-back error, but log it so a
+                    // missing response body can be correlated with a filesystem
+                    // fault rather than looking like the step produced no output.
+                    warn!(path = %path, error = %e, "failed to read back step output");
+                    String::new()
+                }
+            }
         };
         let stdout = read_back(stdout_path).await;
         Ok(Response::new(RunCommandResponse {

@@ -48,16 +48,21 @@ impl ScratchDir {
 
     /// Open `name` beneath this directory, creating it if absent, never through a symlink.
     pub(crate) fn subdir(&self, name: &OsStr, mode: u32) -> io::Result<Self> {
-        match mkdirat(&self.fd, name, Mode::from_bits_truncate(mode)) {
-            Ok(()) | Err(Errno::EEXIST) => {}
+        let created = match mkdirat(&self.fd, name, Mode::from_bits_truncate(mode)) {
+            Ok(()) => true,
+            Err(Errno::EEXIST) => false,
             Err(errno) => return Err(errno.into()),
-        }
+        };
         let fd = openat(
             &self.fd,
             name,
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
+        // mkdirat honours the umask, so a fresh /tmp would come out 1755, not 1777.
+        if created {
+            fchmod(&fd, Mode::from_bits_truncate(mode))?;
+        }
         Ok(Self {
             fd,
             path: self.path.join(name),
@@ -185,6 +190,29 @@ pub(crate) fn open_mount_point(
     path: &Path,
     kind: MountPoint,
 ) -> io::Result<OwnedFd> {
+    resolve_in_root(root, path, kind, 0o755)
+}
+
+/// A directory root writes into, resolved as [`open_mount_point`] resolves one and
+/// given `mode` if it has to be created.
+pub(crate) fn open_dir_in_root(
+    root: &ScratchDir,
+    path: &Path,
+    mode: u32,
+) -> io::Result<ScratchDir> {
+    let fd = resolve_in_root(root, path, MountPoint::Dir, mode)?;
+    Ok(ScratchDir {
+        fd,
+        path: root.path.join(path.strip_prefix("/").unwrap_or(path)),
+    })
+}
+
+fn resolve_in_root(
+    root: &ScratchDir,
+    path: &Path,
+    kind: MountPoint,
+    mode: u32,
+) -> io::Result<OwnedFd> {
     let mut walked: Vec<ScratchDir> = Vec::new();
     let mut pending = steps(path);
     let mut links = 0;
@@ -213,7 +241,7 @@ pub(crate) fn open_mount_point(
                 return open_file_mount_point(dir, &name);
             }
             Ok(_) | Err(Errno::ENOENT) => {
-                let subdir = dir.subdir(&name, 0o755)?;
+                let subdir = dir.subdir(&name, if last { mode } else { 0o755 })?;
                 if last {
                     return Ok(subdir.fd);
                 }
@@ -273,21 +301,6 @@ pub(crate) fn unlink_scratch(dir: &ScratchDir, name: &str) -> io::Result<()> {
     }
 }
 
-/// Open `relative` beneath `root`, creating missing components and refusing any symlink.
-pub(crate) fn open_dir_beneath(root: &Path, relative: &Path, mode: u32) -> io::Result<ScratchDir> {
-    let mut dir = ScratchDir::open(root)?;
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a plain relative path", relative.display()),
-            ));
-        };
-        dir = dir.subdir(name, mode)?;
-    }
-    Ok(dir)
-}
-
 /// Whether a root daemon may take over an existing job spool folder: its own,
 /// or one an older agent handed to the job. An unprivileged daemon can neither
 /// chown a folder nor be escalated through one, so it takes whatever it opened.
@@ -311,6 +324,14 @@ pub(crate) async fn open_spool_file(path: &Path) -> io::Result<tokio::fs::File> 
         ));
     }
     Ok(file)
+}
+
+/// Read a whole spool file, opened with [`open_spool_file`]'s checks.
+pub(crate) async fn read_spool_file(path: &Path) -> io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    open_spool_file(path).await?.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 fn create_exclusive(dir: &ScratchDir, name: impl AsRef<OsStr>, mode: u32) -> io::Result<File> {
@@ -644,43 +665,43 @@ mod tests {
     }
 
     #[test]
-    fn a_path_beneath_a_root_is_created_component_by_component() {
-        let root = tempfile::tempdir().unwrap();
-        let staged =
-            open_dir_beneath(root.path(), Path::new("var/spool/spur/job1"), 0o755).unwrap();
-        assert_eq!(staged.path(), root.path().join("var/spool/spur/job1"));
-        assert!(staged.path().is_dir());
+    fn a_created_subdirectory_gets_exactly_its_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        scratch(&temp).subdir(OsStr::new("tmp"), 0o1777).unwrap();
+        let mode = std::fs::metadata(temp.path().join("tmp"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o1777, "the umask must not trim it");
     }
 
-    // A container image is user-supplied, and an absolute link inside it would
-    // resolve against the host when root walks the unpacked tree.
+    // An image's own directory is the user's choice, so only a created one is chmod'ed.
     #[test]
-    fn an_absolute_symlink_inside_the_root_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let host = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(host.path(), root.path().join("var")).unwrap();
+    fn an_existing_subdirectory_keeps_its_own_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("tmp");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = open_dir_beneath(root.path(), Path::new("var/spool/spur/job1"), 0o755)
-            .err()
-            .expect("the walk must stay inside the root");
+        scratch(&temp).subdir(OsStr::new("tmp"), 0o1777).unwrap();
 
-        assert!(
-            matches!(
-                error.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::ENOTDIR)
-            ),
-            "{error}"
-        );
-        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+        let mode = std::fs::metadata(&existing).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700);
     }
 
     #[test]
-    fn a_parent_component_beneath_a_root_is_rejected() {
+    fn a_dir_opened_in_root_gets_its_mode_and_its_parents_the_default() {
         let root = tempfile::tempdir().unwrap();
-        let error = open_dir_beneath(root.path(), Path::new("../escape"), 0o755)
-            .err()
-            .expect("`..` must not be walked");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let dir = open_dir_in_root(&scratch(&root), Path::new("/var/tmp"), 0o1777).unwrap();
+
+        assert_eq!(dir.path(), root.path().join("var/tmp"));
+        let mode = |p: &str| {
+            let meta = std::fs::metadata(root.path().join(p)).unwrap();
+            meta.permissions().mode() & 0o7777
+        };
+        assert_eq!(mode("var/tmp"), 0o1777);
+        assert_eq!(mode("var"), 0o755);
     }
 
     #[test]

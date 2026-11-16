@@ -97,11 +97,11 @@ never lets anything in your image lead that work onto the node itself:
   inside the image. With ``/lib -> usr/lib`` in the image, a mount on
   ``/lib/modules`` lands on the image's ``/usr/lib/modules``; an absolute link
   such as ``/data -> /scratch`` leads to the image's own ``/scratch``, never the
-  node's.
-- The container refuses to start when the image's ``/dev``, ``/proc``,
-  ``/sys``, ``/tmp``, ``/etc`` or ``/run`` is a link, or when ``/etc/passwd``
-  or ``/etc/group`` is a link or anything but a regular file, such as a FIFO or
-  a device node.
+  node's. ``/tmp`` and ``/etc``, where Spur writes the job's entry script and its
+  account and DNS files, are resolved the same way, so ``/tmp -> var/tmp`` works.
+- The container refuses to start when the image's ``/dev``, ``/proc``, ``/sys``
+  or ``/run`` is a link, or when ``/etc/passwd`` or ``/etc/group`` is a link or
+  anything but a regular file, such as a FIFO or a device node.
 - A user name or home directory containing ``:`` or a control character such
   as a newline is refused, since it would corrupt the container's
   ``/etc/passwd``.

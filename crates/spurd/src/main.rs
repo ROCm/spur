@@ -138,7 +138,7 @@ fn warn_if_untrusted(path: &std::path::Path, what: &str) {
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
     };
-    if spurd::executor::spool_root_is_trusted(metadata.uid(), metadata.mode()) {
+    if spurd::executor::is_root_trusted_dir(metadata.uid(), metadata.mode()) {
         return;
     }
     warn!(
