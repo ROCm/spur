@@ -1432,7 +1432,7 @@ R='{rootfs}'
 mkdir -p "$R/bin" "$R/usr/bin" "$R/lib" "$R/lib64" \
   "$R/etc" "$R/dev" "$R/proc" "$R/sys" "$R/tmp" \
   "$R/run" "$R/home" "$R/mnt"
-for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent pwd grep awk; do
+for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent pwd grep awk sed seq; do
   src=$(which "$b" 2>/dev/null) || continue
   [ -f "$src" ] && cp "$src" "$R/usr/bin/"
 done

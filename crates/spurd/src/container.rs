@@ -1985,6 +1985,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_fifo_at_the_images_passwd_stops_the_container_without_blocking() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        let passwd = etc.join("passwd");
+        nix::unistd::mkfifo(&passwd, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
+
+        assert!(setup_shadow(rootfs.path(), &shadow_config("alice", "/home/alice")).is_err());
+    }
+
     // These become whole lines of passwd and group, so a line break in them
     // would let the job write accounts of its own choosing.
     #[test]

@@ -836,7 +836,7 @@ async fn spawn_job_process(
                 );
             }
             let (job, pty_master) =
-                launch_container_job(cfg, ctn, &env, job_io, &cgroup_path).await?;
+                launch_container_job(cfg, ctn, &spool_dir, &env, job_io, &cgroup_path).await?;
             return Ok(LaunchResult {
                 job,
                 stdout_path: stdout_resolved,
@@ -2050,13 +2050,13 @@ pub(crate) fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
     Ok(())
 }
 
-/// Receive file descriptors sent via SCM_RIGHTS. Returns an empty vec if the
-/// peer closed without sending (e.g. the helper failed before passing fds).
-pub(crate) fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
+/// Receive up to `N` file descriptors sent via SCM_RIGHTS; a message carrying more
+/// fails with ENOBUFS. Empty if the peer closed without sending any.
+pub(crate) fn recv_fds<const N: usize>(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
     let mut buf = [0u8; 8];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-    let mut cmsg = nix::cmsg_space!([RawFd; 2]);
+    let mut cmsg = nix::cmsg_space!([RawFd; N]);
     let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
     let mut fds = Vec::new();
     for cmsg in msg.cmsgs()? {
@@ -2182,7 +2182,25 @@ fn open_job_io(
     }
 
     // Resolve credentials before the fork; see resolve_user_creds.
-    let creds = resolve_user_creds(uid, gid);
+    open_job_io_in_helper(
+        resolve_user_creds(uid, gid),
+        use_append,
+        stdin_path,
+        stdout_path,
+        stderr_path,
+    )
+}
+
+/// [`open_job_io`]'s forked half. `None` creds open as the caller, so a non-root
+/// test can drive the same fd passing a root agent relies on.
+fn open_job_io_in_helper(
+    creds: Option<crate::privdrop::PrivDrop>,
+    use_append: bool,
+    stdin_path: Option<&str>,
+    stdout_path: &str,
+    stderr_path: &str,
+) -> anyhow::Result<JobStdio> {
+    let shared = stderr_path == stdout_path;
 
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
     let (parent_sock, child_sock) = socketpair(
@@ -2262,7 +2280,8 @@ fn open_job_io(
                 other => bail!("stdio helper failed to open job stdio (status: {other:?})"),
             }
             let expected = 2 + usize::from(stdin_path.is_some());
-            let fds = recv_fds(parent_sock.as_raw_fd()).context("receive stdio fds from helper")?;
+            let fds =
+                recv_fds::<3>(parent_sock.as_raw_fd()).context("receive stdio fds from helper")?;
             if fds.len() != expected {
                 bail!(
                     "stdio helper returned {} fds, expected {expected}",
@@ -2491,6 +2510,17 @@ pub(crate) fn write_spool_scratch(
     })
 }
 
+/// The job's spool folder, read-only at its host path inside the job's container,
+/// where steps that build or enter it find the scripts spurd generates later.
+pub(crate) fn job_spool_mount(dir: &ScratchDir) -> crate::container::BindMount {
+    let path = dir.path().display().to_string();
+    crate::container::BindMount {
+        source: path.clone(),
+        target: path,
+        readonly: true,
+    }
+}
+
 /// Whether a launch wraps the job in fresh namespaces. A PMIx rank needs the
 /// host's, a step entering a parent's brings its own, and a holder must stay
 /// signalable.
@@ -2566,6 +2596,7 @@ pub(crate) fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern
 async fn launch_container_job(
     cfg: &JobLaunchConfig,
     ctn: &ContainerLaunchConfig,
+    spool_dir: &ScratchDir,
     env: &HashMap<String, String>,
     job_io: JobIo,
     cgroup_path: &CgroupGuard,
@@ -2594,7 +2625,8 @@ async fn launch_container_job(
     let raw_io = job_io.raw();
 
     // Snapshot everything the child needs (must not reference async state after fork)
-    let config = &ctn.config;
+    let mut config = ctn.config.clone();
+    config.mounts.push(job_spool_mount(spool_dir));
     let rootfs = ctn.rootfs.clone();
     // The image's own config.Env is the base environment, as with docker run;
     // the job environment layers on top of it.
@@ -2649,7 +2681,7 @@ async fn launch_container_job(
             apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
-            let hook_env = match crate::container::container_init(config, &rootfs) {
+            let hook_env = match crate::container::container_init(&config, &rootfs) {
                 Ok(env) => env,
                 Err(e) => {
                     let msg = format!("E:{:#}", e);
@@ -3848,6 +3880,37 @@ mod tests {
     }
 
     #[test]
+    fn the_stdio_helper_hands_back_stdin_stdout_and_stderr_in_order() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let stdin = dir.path().join("in.txt");
+        std::fs::write(&stdin, b"job input\n").unwrap();
+        let out = dir.path().join("j.out");
+        let err = dir.path().join("j.err");
+
+        let mut io = open_job_io_in_helper(
+            None,
+            false,
+            Some(stdin.to_str().unwrap()),
+            out.to_str().unwrap(),
+            err.to_str().unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("open stdio through the helper: {e:#}"));
+
+        let mut read = String::new();
+        io.stdin
+            .as_mut()
+            .expect("stdin requested")
+            .read_to_string(&mut read)
+            .unwrap();
+        assert_eq!(read, "job input\n");
+        io.stdout.write_all(b"o").unwrap();
+        io.stderr.write_all(b"e").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "o");
+        assert_eq!(std::fs::read_to_string(&err).unwrap(), "e");
+    }
+
+    #[test]
     fn open_job_output_shared_path_shares_offset() {
         // `srun -o file` with no `-e` makes stderr follow stdout (same path).
         // stderr must share stdout's fd (dup) so the two streams advance one
@@ -4179,6 +4242,25 @@ mod tests {
     }
 
     #[test]
+    fn a_jobs_container_sees_its_spool_folder_read_only_at_the_host_path() {
+        let root = tempfile::tempdir().expect("spool root");
+        let dir = ScratchDir::open(root.path()).unwrap();
+
+        let mount = job_spool_mount(&dir);
+
+        let folder = root.path().display().to_string();
+        assert_eq!(mount.source, folder);
+        assert_eq!(
+            mount.target, folder,
+            "generated wrappers name their scripts by host path"
+        );
+        assert!(
+            mount.readonly,
+            "the job must not write its spool through it"
+        );
+    }
+
+    #[test]
     fn a_spool_write_keeps_the_errno_downcastable() {
         // Classification walks the chain for a real io::Error, so an errno
         // flattened into text would quietly stop broken nodes draining.
@@ -4256,7 +4338,7 @@ mod tests {
         .unwrap();
 
         send_fds(a.as_raw_fd(), &[file.as_raw_fd()]).unwrap();
-        let received = recv_fds(b.as_raw_fd()).unwrap();
+        let received = recv_fds::<1>(b.as_raw_fd()).unwrap();
         assert_eq!(received.len(), 1);
 
         // The received fd refers to the same open file description: writes made
@@ -4288,7 +4370,7 @@ mod tests {
         let iov = [std::io::IoSlice::new(b"F")];
         sendmsg::<()>(a.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).unwrap();
 
-        let received = recv_fds(b.as_raw_fd()).unwrap();
+        let received = recv_fds::<1>(b.as_raw_fd()).unwrap();
         assert!(received.is_empty());
     }
 

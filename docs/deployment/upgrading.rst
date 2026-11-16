@@ -550,7 +550,9 @@ replaces an existing file rather than rewriting it in place.
 * ``srun`` steps that ``spurd`` wraps in generated scripts (several tasks per node,
   ``--label``, ``--mpi=pmix``) keep those scripts in the spool folder, not in a
   ``.spur_step_<id>`` folder in the work dir. Such steps now also run when root cannot
-  write the work dir, for example on an NFS export with ``root_squash``.
+  write the work dir, for example on an NFS export with ``root_squash``. A job's
+  containers, its batch job's and any a step builds, see the spool folder mounted
+  read-only at the same path, which is how a step inside one reaches its scripts.
 * A root ``spurd`` no longer falls back to ``$TMPDIR/spur`` when it cannot create the
   spool folder. The failure drains the node, like any other fault in the spool tree.
 

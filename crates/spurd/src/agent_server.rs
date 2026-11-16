@@ -3932,7 +3932,6 @@ fn stage_fresh_container_step(
     ctx: FreshContainerContext,
     job_id: u32,
     step_script: &str,
-    step_scripts: Option<&StepScriptCleanup>,
 ) -> Result<
     (
         executor::ContainerLaunchConfig,
@@ -3940,7 +3939,6 @@ fn stage_fresh_container_step(
     ),
     Status,
 > {
-    let (uid, gid) = (ctx.uid, ctx.gid);
     let mut container_env = c.env.clone();
     maybe_deny_gpu_env(&mut container_env, &ctx.gpu_devices);
     let (launch, rootfs_mode) = build_container_launch(
@@ -3969,29 +3967,13 @@ fn stage_fresh_container_step(
             rootfs_base: ctx.rootfs_base,
         },
     )?;
-    stage_fresh_step_files(&launch.rootfs, job_id, step_script, step_scripts, uid, gid)?;
+    crate::container::write_entry_script(
+        &launch.rootfs,
+        &format!("spur_job_{job_id}.sh"),
+        step_script,
+    )
+    .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
     Ok((launch, rootfs_mode))
-}
-
-/// Stage what a fresh container's step runs inside its rootfs: the entry script
-/// `executor::launch_job`'s container path execs, and any generated step scripts
-/// at their host paths, which pivot_root otherwise hides.
-fn stage_fresh_step_files(
-    rootfs: &std::path::Path,
-    job_id: u32,
-    step_script: &str,
-    step_scripts: Option<&StepScriptCleanup>,
-    uid: u32,
-    gid: u32,
-) -> Result<(), Status> {
-    crate::container::write_entry_script(rootfs, &format!("spur_job_{job_id}.sh"), step_script)
-        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
-    if let Some(scripts) = step_scripts {
-        scripts.stage_in_rootfs(rootfs, uid, gid).map_err(|e| {
-            Status::internal(format!("failed to stage step scripts in container: {e}"))
-        })?;
-    }
-    Ok(())
 }
 
 /// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
@@ -6031,30 +6013,6 @@ mod child_containment_tests {
 struct StepScriptCleanup {
     dir: crate::scratch::ScratchDir,
     names: Vec<String>,
-}
-
-impl StepScriptCleanup {
-    /// Copy the scripts to the same paths inside a container's rootfs, which a
-    /// fresh container needs because pivot_root hides the host's copies.
-    fn stage_in_rootfs(&self, rootfs: &std::path::Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-        let relative = self
-            .dir
-            .path()
-            .strip_prefix("/")
-            .map_err(|_| anyhow::anyhow!("step script path must be absolute"))?;
-        let staged = crate::scratch::open_dir_beneath(rootfs, relative, 0o755).map_err(|e| {
-            anyhow::anyhow!(
-                "stage step scripts under {}: {e}",
-                rootfs.join(relative).display()
-            )
-        })?;
-        let owner = crate::executor::job_scratch_owner(uid, gid);
-        for name in &self.names {
-            let content = crate::scratch::read_scratch(&self.dir, name)?;
-            crate::scratch::write_scratch(&staged, name, &content, owner, 0o700)?;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for StepScriptCleanup {
@@ -8979,7 +8937,6 @@ impl SlurmAgent for AgentService {
                         },
                         job_id,
                         &step_script,
-                        _step_script_guard.as_ref(),
                     )?;
                     supervised_rootfs_mode = Some(rootfs_mode);
                     Some(launch)
@@ -9251,11 +9208,9 @@ impl SlurmAgent for AgentService {
             // Multi-task and labeled commands use agent-generated wrappers. A
             // fresh container cannot see their host paths after pivot_root.
             if let Some(ref scripts) = _step_script_guard {
-                scripts
-                    .stage_in_rootfs(&rootfs, step_uid, step_gid)
-                    .map_err(|e| {
-                        Status::internal(format!("failed to stage step scripts in container: {e}"))
-                    })?;
+                container_cfg
+                    .mounts
+                    .push(crate::executor::job_spool_mount(&scripts.dir));
             }
 
             // Write the step command as a script inside the rootfs so it's
@@ -10045,7 +10000,6 @@ impl SlurmAgent for AgentService {
                                 },
                                 init.job_id,
                                 &script,
-                                None,
                             )?;
                             container_rootfs_mode = Some(rootfs_mode);
                             fresh_container_env = Some(env);
@@ -19066,129 +19020,6 @@ mod tests {
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout.trim(), "0 1 test-node n1,n2,test-node 3");
-    }
-
-    #[test]
-    fn step_scripts_are_staged_at_their_container_paths() {
-        let spool = tempfile::TempDir::new().unwrap();
-        let rootfs = tempfile::TempDir::new().unwrap();
-        let dir = crate::scratch::ScratchDir::open(spool.path()).unwrap();
-        let command = "#!/bin/bash\necho staged\n".to_string();
-        let wrapper = format!("#!/bin/bash\nbash {}\n", dir.join("cmd_0.sh").display());
-        let scripts = [("cmd_0.sh", &command), ("wrapper_0.sh", &wrapper)];
-        for (name, content) in scripts {
-            crate::scratch::write_scratch(
-                &dir,
-                name,
-                content.as_bytes(),
-                crate::scratch::ScratchOwner::Daemon,
-                0o700,
-            )
-            .unwrap();
-        }
-        let cleanup = StepScriptCleanup {
-            dir,
-            names: scripts.iter().map(|(name, _)| name.to_string()).collect(),
-        };
-
-        cleanup.stage_in_rootfs(rootfs.path(), 0, 0).unwrap();
-
-        let staged = rootfs.path().join(spool.path().strip_prefix("/").unwrap());
-        for (name, content) in scripts {
-            assert_eq!(
-                &std::fs::read_to_string(staged.join(name)).unwrap(),
-                content
-            );
-        }
-    }
-
-    #[test]
-    fn a_fresh_container_step_is_staged_without_following_links_in_its_image() {
-        let rootfs = tempfile::TempDir::new().unwrap();
-        let host = tempfile::TempDir::new().unwrap();
-        std::os::unix::fs::symlink(host.path(), rootfs.path().join("tmp")).unwrap();
-
-        let staged = stage_fresh_step_files(rootfs.path(), 7, "#!/bin/bash\ntrue\n", None, 0, 0);
-
-        assert!(
-            staged.is_err(),
-            "a linked /tmp in the image must not be followed"
-        );
-        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
-    }
-
-    // pivot_root hides the host's copies, so a fresh container's wrapper must be
-    // staged where its entry script will look for it.
-    #[test]
-    fn a_fresh_container_step_gets_its_generated_scripts_beside_its_entry_script() {
-        let rootfs = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
-        let spool = tempfile::TempDir::new().unwrap();
-        let dir = crate::scratch::ScratchDir::open(spool.path()).unwrap();
-        crate::scratch::write_scratch(
-            &dir,
-            "wrapper_0_1.sh",
-            b"#!/bin/bash\necho wrapped\n",
-            crate::scratch::ScratchOwner::Daemon,
-            0o700,
-        )
-        .unwrap();
-        let entry = format!(
-            "#!/bin/bash\nexec bash {}\n",
-            dir.join("wrapper_0_1.sh").display()
-        );
-        let scripts = StepScriptCleanup {
-            dir,
-            names: vec!["wrapper_0_1.sh".into()],
-        };
-
-        stage_fresh_step_files(rootfs.path(), 7, &entry, Some(&scripts), 0, 0)
-            .expect("stage the step");
-
-        assert_eq!(
-            std::fs::read_to_string(rootfs.path().join("tmp/spur_job_7.sh")).unwrap(),
-            entry
-        );
-        let staged = rootfs
-            .path()
-            .join(spool.path().strip_prefix("/").unwrap())
-            .join("wrapper_0_1.sh");
-        assert_eq!(
-            std::fs::read_to_string(staged).unwrap(),
-            "#!/bin/bash\necho wrapped\n"
-        );
-    }
-
-    // A container image is user-supplied, and an absolute link inside it would
-    // resolve against the host when root walks the unpacked tree.
-    #[test]
-    fn step_script_staging_refuses_a_symlink_inside_the_image() {
-        let spool = tempfile::TempDir::new().unwrap();
-        let rootfs = tempfile::TempDir::new().unwrap();
-        let host = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            spool.path().join("cmd_0_1.sh"),
-            "#!/bin/bash\necho staged\n",
-        )
-        .unwrap();
-        let first = spool
-            .path()
-            .strip_prefix("/")
-            .unwrap()
-            .components()
-            .next()
-            .unwrap();
-        std::os::unix::fs::symlink(host.path(), rootfs.path().join(first)).unwrap();
-        let scripts = StepScriptCleanup {
-            dir: crate::scratch::ScratchDir::open(spool.path()).unwrap(),
-            names: vec!["cmd_0_1.sh".into()],
-        };
-
-        assert!(
-            scripts.stage_in_rootfs(rootfs.path(), 0, 0).is_err(),
-            "a link in the image must not lead staging out of the rootfs"
-        );
-        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
     }
 
     // The job picks its own work dir, so a step folder planted there must never

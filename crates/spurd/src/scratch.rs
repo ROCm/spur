@@ -157,13 +157,21 @@ pub(crate) fn open_scratch_output(
     Ok(file)
 }
 
+/// Read `name` without trusting what holds it, as `open_spool_file` does: a link is
+/// refused, a FIFO cannot stall the open, and only a regular file is read.
 pub(crate) fn read_scratch(dir: &ScratchDir, name: &str) -> io::Result<Vec<u8>> {
     let fd = openat(
         &dir.fd,
         name,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
+    if fstat(&fd)?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", dir.join(name).display()),
+        ));
+    }
     let mut content = Vec::new();
     File::from(fd).read_to_end(&mut content)?;
     Ok(content)
@@ -686,6 +694,18 @@ mod tests {
         let error = read_scratch(&scratch(&temp), "cmd_0_1.sh")
             .expect_err("a planted link must not be read through");
         assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
+    }
+
+    // Without O_NONBLOCK this would hang on the open, so it also guards that flag.
+    #[test]
+    fn a_fifo_at_a_scratch_name_is_refused_without_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let planted = temp.path().join("passwd");
+        nix::unistd::mkfifo(&planted, Mode::from_bits_truncate(0o600)).unwrap();
+
+        let error =
+            read_scratch(&scratch(&temp), "passwd").expect_err("a FIFO is not a file to read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 
     #[test]

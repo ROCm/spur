@@ -100,7 +100,8 @@ never lets anything in your image lead that work onto the node itself:
   node's.
 - The container refuses to start when the image's ``/dev``, ``/proc``,
   ``/sys``, ``/tmp``, ``/etc`` or ``/run`` is a link, or when ``/etc/passwd``
-  or ``/etc/group`` is one.
+  or ``/etc/group`` is a link or anything but a regular file, such as a FIFO or
+  a device node.
 - A user name or home directory containing ``:`` or a control character such
   as a newline is refused, since it would corrupt the container's
   ``/etc/passwd``.
@@ -169,6 +170,11 @@ flags above apply to a step's ``srun`` and behave as follows:
    ``sbatch --container-image=A`` no longer runs the step in ``A`` and exits 0
    with the flag ignored. It now fails, so scripts that rely on that must drop
    the step's ``--container-image`` or submit the job without one.
+
+Every container Spur starts for a job, the batch job's and each fresh step's, has
+the job's spool folder ``/var/spool/spur/job<id>`` mounted read-only at the same
+path. Spur keeps the wrappers it generates for steps with several tasks per node,
+``--label`` or ``--mpi=pmix`` there, so those steps run in either kind of container.
 
 Allocate first, then run steps from inside the allocation shell. By default a
 single step fans out one container per allocated node; ``-N`` or ``-w`` limits
