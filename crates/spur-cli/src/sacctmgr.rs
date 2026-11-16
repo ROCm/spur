@@ -74,7 +74,8 @@ const SACCTMGR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// entity's fields in that one page.
 const ADD_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres,
+            defaultqos, qos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
@@ -89,7 +90,8 @@ Fields (key=value), by entity:
 /// immediately-preemptable).
 const MODIFY_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres,
+            defaultqos, qos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
@@ -277,6 +279,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "maxjobs",
     "grptres",
     "rawusage",
+    "defaultqos",
     "qos",
 ];
 
@@ -533,6 +536,15 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .unwrap_or(spur_core::accounting::INFINITE);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
             let qos = p.get("qos").cloned();
+            let default_qos = p.get("defaultqos").cloned();
+            if let (Some(dq), Some(list)) = (default_qos.as_deref(), qos.as_deref()) {
+                if !dq.is_empty()
+                    && !list.is_empty()
+                    && !list.split(',').map(str::trim).any(|q| q == dq)
+                {
+                    bail!("defaultqos={dq} must be included in qos={list}");
+                }
+            }
 
             let mut client = connect(addr).await?;
             client
@@ -544,6 +556,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     fairshare_weight: Some(fairshare),
                     max_running_jobs: Some(max_jobs),
                     grp_tres: Some(grp_tres),
+                    default_qos: default_qos.clone(),
                     allowed_qos: qos.clone(),
                 })
                 .await
@@ -557,6 +570,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 if parent.is_empty() { "root" } else { &parent },
                 fairshare
             );
+            if let Some(q) = default_qos.as_deref().filter(|q| !q.is_empty()) {
+                println!("  DefQOS     = {q}");
+            }
             if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
                 println!("  QOS        = {q}");
             }
@@ -816,6 +832,13 @@ fn build_modify_account_request(
         .or_else(|| p.get("account"))
         .ok_or_else(|| anyhow::anyhow!("name= required"))?
         .clone();
+    let default_qos = p.get("defaultqos").cloned();
+    let allowed_qos = p.get("qos").cloned();
+    if let (Some(dq), Some(list)) = (default_qos.as_deref(), allowed_qos.as_deref()) {
+        if !dq.is_empty() && !list.is_empty() && !list.split(',').map(str::trim).any(|q| q == dq) {
+            bail!("defaultqos={dq} must be included in qos={list}");
+        }
+    }
     Ok(CreateAccountRequest {
         name,
         description: p.get("description").cloned(),
@@ -829,7 +852,8 @@ fn build_modify_account_request(
             .map(|(k, v)| parse_limit(k, v))
             .transpose()?,
         grp_tres: p.get("grptres").cloned(),
-        allowed_qos: p.get("qos").cloned(),
+        default_qos,
+        allowed_qos,
     })
 }
 
@@ -1578,7 +1602,7 @@ fn fmt_txn_ts(ts: &prost_types::Timestamp) -> String {
 
 const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
 
-const ACCOUNT_ALL_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G %-10J %-40Q";
+const ACCOUNT_ALL_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G %-10J %-15d %-40Q";
 
 fn account_header(spec: char) -> &'static str {
     match spec {
@@ -1590,6 +1614,7 @@ fn account_header(spec: char) -> &'static str {
         'G' => "GrpTRES",
         'J' => "MaxJobs",
         'C' => "Coords",
+        'd' => "DefQOS",
         'Q' => "QOS",
         _ => "?",
     }
@@ -1605,6 +1630,7 @@ fn account_field_spec(name: &str) -> Option<char> {
         "grptres" => Some('G'),
         "maxjobs" | "maxrunningjobs" => Some('J'),
         "coords" | "coordinators" | "coord" => Some('C'),
+        "defaultqos" | "defqos" => Some('d'),
         "qos" => Some('Q'),
         _ => None,
     }
@@ -1621,7 +1647,7 @@ fn account_format_fields(
         ACCOUNT_ALL_FORMAT,
         &account_field_spec,
         &account_header,
-        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords, QOS",
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords, DefQOS, QOS",
     )
 }
 
@@ -1902,6 +1928,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char, coords: &str) -> String {
         'G' => a.grp_tres.clone(),
         'J' => blank_if_unset(a.max_running_jobs),
         'C' => coords.to_string(),
+        'd' => a.default_qos.clone(),
         'Q' => a.allowed_qos.clone(),
         _ => "?".into(),
     }
@@ -2840,6 +2867,7 @@ mod tests {
         assert_eq!(req.parent_account, None);
         assert_eq!(req.max_running_jobs, None);
         assert_eq!(req.grp_tres, None);
+        assert_eq!(req.default_qos, None);
         assert_eq!(req.allowed_qos, None);
     }
 
@@ -2863,6 +2891,52 @@ mod tests {
         let p = parse_params(&["name=amd-collectives".into(), "qos=".into()]);
         let req = build_modify_account_request(&p).unwrap();
         assert_eq!(req.allowed_qos.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_modify_account_request_accepts_defaultqos() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "defaultqos=normal".into(),
+            "qos=normal,burst".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.default_qos, Some("normal".into()));
+        assert_eq!(req.allowed_qos, Some("normal,burst".into()));
+    }
+
+    #[test]
+    fn build_modify_account_request_rejects_defaultqos_not_in_allowlist() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "defaultqos=highprio".into(),
+            "qos=normal,burst".into(),
+        ]);
+        let err = build_modify_account_request(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("must be included in qos"),
+            "expected validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_modify_account_request_allows_clearing_allowlist_with_default() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "defaultqos=normal".into(),
+            "qos=".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.default_qos, Some("normal".into()));
+        assert_eq!(req.allowed_qos, Some(String::new()));
+    }
+
+    #[test]
+    fn build_modify_account_request_defaultqos_alone_is_valid() {
+        let p = parse_params(&["name=physics".into(), "defaultqos=normal".into()]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.default_qos, Some("normal".into()));
+        assert_eq!(req.allowed_qos, None);
     }
 
     #[test]
@@ -3489,6 +3563,7 @@ mod tests {
             fairshare_weight: 5.0,
             max_running_jobs: 10,
             grp_tres: "node=4,cpu=256".into(),
+            default_qos: String::new(),
             allowed_qos: String::new(),
         }
     }

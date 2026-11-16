@@ -160,6 +160,38 @@ async fn normalize_qos_list(pool: &PgPool, list: &str) -> Result<String, Status>
     Ok(names.join(","))
 }
 
+/// Validate restated default/allowed QOS against the live DB (not QosCache,
+/// which may lag a just-created QOS) and return the normalized allow-list.
+/// `None` fields are left to the stored value; an explicit empty clears.
+async fn validate_qos_fields(
+    pool: &PgPool,
+    default_qos: Option<&str>,
+    allowed_qos: Option<&str>,
+) -> Result<Option<String>, Status> {
+    if let Some(dq) = default_qos.filter(|d| !d.is_empty()) {
+        let exists = db::qos_exists(pool, dq)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !exists {
+            return Err(Status::not_found(format!("QOS '{dq}' does not exist")));
+        }
+    }
+    let allowed_normalized = match allowed_qos {
+        None => None,
+        Some(list) => Some(normalize_qos_list(pool, list).await?),
+    };
+    // Cross-checked only when both are restated; a preserved side can't be
+    // validated without a read.
+    if let (Some(dq), Some(list)) = (default_qos, allowed_normalized.as_deref()) {
+        if !dq.is_empty() && !list.is_empty() && !list.split(',').any(|q| q == dq) {
+            return Err(Status::invalid_argument(format!(
+                "default QOS '{dq}' must be included in qos={list}"
+            )));
+        }
+    }
+    Ok(allowed_normalized)
+}
+
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
 /// keep, empty -> clear (SQL NULL), otherwise -> set.
 fn nullable_str(field: &Option<String>) -> Option<Option<&str>> {
@@ -912,10 +944,9 @@ impl SlurmAccounting for AccountingService {
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
         }
-        let allowed_qos_normalized = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
-        };
+        let allowed_qos_normalized =
+            validate_qos_fields(pool, req.default_qos.as_deref(), req.allowed_qos.as_deref())
+                .await?;
         let update = db::AccountUpdate {
             description: req.description.as_deref(),
             organization: req.organization.as_deref(),
@@ -923,6 +954,7 @@ impl SlurmAccounting for AccountingService {
             fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
+            default_qos: nullable_str(&req.default_qos),
             allowed_qos: nullable_str(&allowed_qos_normalized),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
@@ -936,6 +968,7 @@ impl SlurmAccounting for AccountingService {
             ("fairshare_weight", req.fairshare_weight.map(Into::into)),
             ("max_running_jobs", req.max_running_jobs.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
+            ("default_qos", req.default_qos.map(Into::into)),
             ("allowed_qos", allowed_qos_normalized.map(Into::into)),
         ]);
         write_txn_in_band(
@@ -1042,6 +1075,7 @@ impl SlurmAccounting for AccountingService {
                 fairshare_weight: r.fairshare_weight as f64,
                 max_running_jobs: limit_to_wire(r.max_running_jobs),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                default_qos: r.default_qos.unwrap_or_default(),
                 allowed_qos: r.allowed_qos.unwrap_or_default(),
             })
             .collect();
@@ -1060,39 +1094,9 @@ impl SlurmAccounting for AccountingService {
             .as_deref()
             .map(normalize_admin_level)
             .transpose()?;
-        // QOS references are validated against the live DB, not QosCache: a QOS
-        // created just now may not have reached the cache's next refresh yet,
-        // the same lag job submission already accepts for QosCache reads. Each
-        // check runs only for a field the request actually restated.
-        if let Some(dq) = req.default_qos.as_deref() {
-            if !dq.is_empty() {
-                let exists = db::qos_exists(pool, dq)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                if !exists {
-                    return Err(Status::not_found(format!("QOS '{dq}' does not exist")));
-                }
-            }
-        }
-        // Normalize + validate an explicitly restated allow-list. `None` leaves
-        // the stored allow-list untouched; an explicit empty clears it.
-        let allowed_qos_normalized: Option<String> = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
-        };
-        // Cross-check the default is in the allow-list only when both are
-        // restated here; a preserved (unset) side can't be validated without a
-        // read and is left to the stored value.
-        if let (Some(dq), Some(list)) = (
-            req.default_qos.as_deref(),
-            allowed_qos_normalized.as_deref(),
-        ) {
-            if !dq.is_empty() && !list.is_empty() && !list.split(',').any(|q| q == dq) {
-                return Err(Status::invalid_argument(format!(
-                    "default QOS '{dq}' must be included in qos={list}"
-                )));
-            }
-        }
+        let allowed_qos_normalized =
+            validate_qos_fields(pool, req.default_qos.as_deref(), req.allowed_qos.as_deref())
+                .await?;
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
         }

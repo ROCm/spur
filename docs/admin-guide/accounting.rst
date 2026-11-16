@@ -249,12 +249,38 @@ Account keys
        account who has no ``qos=`` of their own inherits this list, both for
        ``sacctmgr show user`` and for job admission. Set ``qos=`` empty to clear
        it.
+   * - ``defaultqos``
+     - unset
+     - QOS applied to jobs of users in the account who have no ``defaultqos=`` of
+       their own. Set ``defaultqos=`` empty to clear it.
 
 .. note::
 
    ``modify`` sends only the fields you name; every field you omit is preserved
    (re-read from the stored record, not reset). To lift a numeric limit, set it
    to ``-1``; to clear a text field, set it empty (e.g. ``grptres=``).
+
+Account-level QOS
+~~~~~~~~~~~~~~~~~
+
+Set ``defaultqos=`` and ``qos=`` once on an account instead of on every user.
+Each QOS named must exist, and if both are given the default must be in the
+allow-list.
+
+.. code-block:: bash
+
+   sacctmgr modify account name=ml set defaultqos=normal qos=normal,highprio
+
+A job submitted without ``--qos`` resolves its QOS in this order, skipping any
+QOS that has since been deleted:
+
+#. The user association's ``defaultqos``.
+#. The account's ``defaultqos``.
+#. The cluster fallback (``accounting.default_qos``).
+
+The account default is not inherited by a user whose allow-list (their own
+``qos=``, or the account's when they have none) excludes it, so an account
+default never grants a user a QOS their association does not permit.
 
 Managing users
 --------------

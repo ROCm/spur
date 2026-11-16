@@ -21,7 +21,29 @@ struct Snapshot {
     allowed_qos: HashMap<(String, String), HashSet<String>>,
     admin_level: HashMap<String, String>,
     coordinators: HashSet<(String, String)>,
+    account_default_qos: HashMap<String, String>,
     loaded: bool,
+}
+
+impl Snapshot {
+    /// Default QOS candidates in resolution order: association default, then
+    /// account default. The account default is skipped when the member's
+    /// nonempty allow-list (own, or inherited from the account) excludes it,
+    /// so inheritance can't widen the association's scope.
+    fn default_qos_candidates(&self, user: &str, account: &str) -> Vec<String> {
+        let key = (user.to_owned(), account.to_owned());
+        let mut out: Vec<String> = self.default_qos.get(&key).cloned().into_iter().collect();
+        if let Some(acct_default) = self.account_default_qos.get(account) {
+            let permitted = self
+                .allowed_qos
+                .get(&key)
+                .is_none_or(|a| a.is_empty() || a.contains(acct_default));
+            if permitted && !out.contains(acct_default) {
+                out.push(acct_default.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,16 +104,7 @@ pub(crate) fn with_sub_accounts(
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
-            snapshot: RwLock::new(Snapshot {
-                default_qos: HashMap::new(),
-                default_account: HashMap::new(),
-                memberships: HashSet::new(),
-                limits: HashMap::new(),
-                allowed_qos: HashMap::new(),
-                admin_level: HashMap::new(),
-                coordinators: HashSet::new(),
-                loaded: false,
-            }),
+            snapshot: RwLock::new(Snapshot::default()),
             kick: Notify::new(),
         }
     }
@@ -193,8 +206,15 @@ impl AssociationCache {
     /// validate one against the other's stale snapshot (see `resolve()`).
     /// Permissive while the cache hasn't loaded — at startup before the
     /// first fetch completes, or while the accounting DB stays
-    /// unreachable/erroring.
-    pub fn check_qos_authorized(&self, user: &str, account: &str, qos: &str) -> Result<(), String> {
+    /// unreachable/erroring. The entitled default is the first candidate
+    /// `qos_exists` accepts, matching what submit assigns.
+    pub fn check_qos_authorized(
+        &self,
+        user: &str,
+        account: &str,
+        qos: &str,
+        qos_exists: impl Fn(&str) -> bool,
+    ) -> Result<(), String> {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {
             return Ok(());
@@ -207,8 +227,11 @@ impl AssociationCache {
         }
         let empty = HashSet::new();
         let allowed = snapshot.allowed_qos.get(&key).unwrap_or(&empty);
-        let default = snapshot.default_qos.get(&key);
-        if qos_permitted(allowed, default.map(String::as_str), qos) {
+        let default = snapshot
+            .default_qos_candidates(user, account)
+            .into_iter()
+            .find(|d| qos_exists(d));
+        if qos_permitted(allowed, default.as_deref(), qos) {
             Ok(())
         } else {
             Err(format!(
@@ -218,14 +241,15 @@ impl AssociationCache {
     }
 
     /// The effective account (given, or the user's default), that
-    /// association's default QOS, and its allow-list (empty if unscoped),
+    /// association's default QOS candidates in resolution order (see
+    /// `default_qos_candidates`), and its allow-list (empty if unscoped),
     /// resolved under a single read lock so a concurrent refresh can't
     /// yield a torn old/new combination.
     pub fn resolve(
         &self,
         user: &str,
         account: Option<&str>,
-    ) -> (Option<String>, Option<String>, HashSet<String>) {
+    ) -> (Option<String>, Vec<String>, HashSet<String>) {
         let snapshot = self.snapshot.read();
         let effective_account = account
             .filter(|a| !a.is_empty())
@@ -237,16 +261,18 @@ impl AssociationCache {
                         .memberships
                         .contains(&(user.to_owned(), acct.clone()))
             });
-        let default_qos = effective_account.as_ref().and_then(|acct| {
-            snapshot
-                .default_qos
-                .get(&(user.to_owned(), acct.clone()))
-                .cloned()
-        });
+        let default_qos = effective_account
+            .as_deref()
+            .map(|acct| snapshot.default_qos_candidates(user, acct))
+            .unwrap_or_default();
         let allowed_qos = effective_account
             .as_ref()
-            .and_then(|acct| snapshot.allowed_qos.get(&(user.to_owned(), acct.clone())))
-            .cloned()
+            .and_then(|acct| {
+                snapshot
+                    .allowed_qos
+                    .get(&(user.to_owned(), acct.clone()))
+                    .cloned()
+            })
             .unwrap_or_default();
         (effective_account, default_qos, allowed_qos)
     }
@@ -342,6 +368,14 @@ impl AssociationCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn insert_account_default_qos(&self, account: &str, qos: &str) {
+        let mut snap = self.snapshot.write();
+        snap.account_default_qos
+            .insert(account.to_owned(), qos.to_owned());
+        snap.loaded = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_default_account(&self, user: &str, account: &str) {
         let mut snap = self.snapshot.write();
         snap.memberships
@@ -390,6 +424,7 @@ impl AssociationCache {
                     allowed_qos,
                     admin_level,
                     coordinators,
+                    acct_default_qos,
                 ))) => {
                     info!(
                         default_qos = qos.len(),
@@ -399,6 +434,7 @@ impl AssociationCache {
                         allowed_qos = allowed_qos.len(),
                         admin_level = admin_level.len(),
                         coordinators = coordinators.len(),
+                        account_default_qos = acct_default_qos.len(),
                         "association cache initialized"
                     );
                     cache.replace(Snapshot {
@@ -409,6 +445,7 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        account_default_qos: acct_default_qos,
                         loaded: true,
                     });
                 }
@@ -440,6 +477,7 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        acct_default_qos,
                     ))) => cache.replace(Snapshot {
                         default_qos: qos,
                         default_account: accounts,
@@ -448,6 +486,7 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        account_default_qos: acct_default_qos,
                         loaded: true,
                     }),
                     Ok(Err(e)) => {
@@ -469,7 +508,7 @@ mod tests {
         let cache = AssociationCache::new();
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (Some("research".into()), None, HashSet::new())
+            (Some("research".into()), vec![], HashSet::new())
         );
     }
 
@@ -520,7 +559,7 @@ mod tests {
     #[test]
     fn resolve_unknown_user_with_no_account_given_resolves_nothing() {
         let cache = AssociationCache::new();
-        assert_eq!(cache.resolve("alice", None), (None, None, HashSet::new()));
+        assert_eq!(cache.resolve("alice", None), (None, vec![], HashSet::new()));
     }
 
     #[test]
@@ -531,13 +570,13 @@ mod tests {
             cache.resolve("alice", Some("research")),
             (
                 Some("research".into()),
-                Some("highprio".into()),
+                vec!["highprio".to_string()],
                 HashSet::new()
             )
         );
         assert_eq!(
             cache.resolve("alice", Some("other")),
-            (None, None, HashSet::new())
+            (None, vec![], HashSet::new())
         );
     }
 
@@ -566,15 +605,15 @@ mod tests {
         });
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (None, None, HashSet::new())
+            (None, vec![], HashSet::new())
         );
         assert_eq!(
             cache.resolve("bob", Some("eng")),
-            (Some("eng".into()), Some("new".into()), HashSet::new())
+            (Some("eng".into()), vec!["new".to_string()], HashSet::new())
         );
         assert_eq!(
             cache.resolve("bob", None),
-            (Some("eng".into()), Some("new".into()), HashSet::new())
+            (Some("eng".into()), vec!["new".to_string()], HashSet::new())
         );
     }
 
@@ -585,7 +624,7 @@ mod tests {
         cache.insert_default_qos("alice", "other", "highprio");
         let (account, qos, _) = cache.resolve("alice", Some("other"));
         assert_eq!(account.as_deref(), Some("other"));
-        assert_eq!(qos.as_deref(), Some("highprio"));
+        assert_eq!(qos, vec!["highprio".to_string()]);
     }
 
     #[test]
@@ -595,7 +634,7 @@ mod tests {
         cache.insert_default_qos("alice", "research", "highprio");
         let (account, qos, _) = cache.resolve("alice", None);
         assert_eq!(account.as_deref(), Some("research"));
-        assert_eq!(qos.as_deref(), Some("highprio"));
+        assert_eq!(qos, vec!["highprio".to_string()]);
     }
 
     #[test]
@@ -616,7 +655,7 @@ mod tests {
             account, None,
             "old default_account must not survive the swap"
         );
-        assert_eq!(qos, None);
+        assert!(qos.is_empty());
     }
 
     #[test]
@@ -647,7 +686,7 @@ mod tests {
     fn check_qos_authorized_unloaded_cache_is_permissive() {
         let cache = AssociationCache::new();
         assert!(cache
-            .check_qos_authorized("alice", "research", "anything")
+            .check_qos_authorized("alice", "research", "anything", |_| true)
             .is_ok());
     }
 
@@ -656,10 +695,10 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "highprio");
         assert!(cache
-            .check_qos_authorized("alice", "research", "highprio")
+            .check_qos_authorized("alice", "research", "highprio", |_| true)
             .is_ok());
         assert!(cache
-            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .check_qos_authorized("alice", "research", "other-teams-qos", |_| true)
             .is_err());
     }
 
@@ -668,7 +707,7 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_association("alice", "research");
         assert!(cache
-            .check_qos_authorized("alice", "research", "anything")
+            .check_qos_authorized("alice", "research", "anything", |_| true)
             .is_ok());
     }
 
@@ -679,7 +718,7 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_default_qos("bob", "eng", "highprio");
         let err = cache
-            .check_qos_authorized("alice", "research", "anything")
+            .check_qos_authorized("alice", "research", "anything", |_| true)
             .unwrap_err();
         assert!(err.contains("not associated with account 'research'"));
     }
@@ -688,10 +727,14 @@ mod tests {
     fn check_qos_authorized_allows_any_member_of_the_allow_list() {
         let cache = AssociationCache::new();
         cache.insert_allowed_qos("alice", "research", &["a", "b", "c"]);
-        assert!(cache.check_qos_authorized("alice", "research", "a").is_ok());
-        assert!(cache.check_qos_authorized("alice", "research", "c").is_ok());
         assert!(cache
-            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .check_qos_authorized("alice", "research", "a", |_| true)
+            .is_ok());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "c", |_| true)
+            .is_ok());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "other-teams-qos", |_| true)
             .is_err());
     }
 
@@ -702,11 +745,42 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "highprio");
         assert!(cache
-            .check_qos_authorized("alice", "research", "highprio")
+            .check_qos_authorized("alice", "research", "highprio", |_| true)
             .is_ok());
         assert!(cache
-            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .check_qos_authorized("alice", "research", "other-teams-qos", |_| true)
             .is_err());
+    }
+
+    #[test]
+    fn account_default_inherited_only_within_user_allow_list() {
+        let cache = AssociationCache::new();
+        cache.insert_allowed_qos("alice", "research", &["normal"]);
+        cache.insert_account_default_qos("research", "highprio");
+        assert!(cache.resolve("alice", Some("research")).1.is_empty());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "highprio", |_| true)
+            .is_err());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "normal", |_| true)
+            .is_ok());
+    }
+
+    #[test]
+    fn association_default_keeps_entitlement_over_account_default() {
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("alice", "research", "normal");
+        cache.insert_account_default_qos("research", "batch");
+        assert_eq!(
+            cache.resolve("alice", Some("research")).1,
+            vec!["normal".to_string(), "batch".to_string()]
+        );
+        assert!(cache
+            .check_qos_authorized("alice", "research", "batch", |_| true)
+            .is_err());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "batch", |q| q != "normal")
+            .is_ok());
     }
 
     #[test]
