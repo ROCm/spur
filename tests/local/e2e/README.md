@@ -33,7 +33,8 @@ limits may safely retain the deep spool.
 A separate single-threaded launcher denies `openat2` with `ENOSYS` using seccomp
 before executing the agent. The completion regression runs a real job and checks
 that its spool is removed without following a nested symlink. The filter applies
-only to that agent and its children. This case skips if native x86_64/aarch64 or
+only to that agent and its children. Completion also removes stale output in a
+writable fallback root that startup cannot trust. This case skips if native x86_64/aarch64 or
 seccomp filtering is unavailable.
 
 Startup tests check terminal/absent spool removal, nonterminal retention,

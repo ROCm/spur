@@ -252,7 +252,8 @@ def test_deep_spool_cannot_abort_daemon_startup(local_cluster):
         cluster.call("remove_deep_tree", path=str(orphan))
 
 
-def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster):
+@pytest.mark.parametrize("fallback_mode", [0o755, 0o777])
+def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster, fallback_mode):
     cluster = local_cluster
     fault = cluster.call("openat2_fault_available")
     if not fault["available"]:
@@ -274,6 +275,12 @@ def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster):
     target.mkdir()
     (target / "sentinel").write_text("outside spool\n")
     (spool / "nested-link").symlink_to(target, target_is_directory=True)
+    fallback_root = cluster.root / "tmp/spur"
+    fallback_root.chmod(fallback_mode)
+    fallback = fallback_root / f"job{job_id}"
+    fallback.mkdir()
+    (fallback / "step0.out").write_text("output from an earlier agent\n")
+    (fallback / "nested-link").symlink_to(target, target_is_directory=True)
     channel = os.open(release, os.O_WRONLY | os.O_NONBLOCK)
     try:
         os.write(channel, b"release\n")
@@ -283,5 +290,6 @@ def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster):
     cluster.call("wait_pid_exit", pid=supervisor_pid)
     log = cluster.wait_file(cluster.agent["log"], "reported completion to controller")
     assert not spool.exists(), log
+    assert not fallback.exists(), log
     assert (target / "sentinel").read_text() == "outside spool\n"
     assert "JobState=COMPLETED" in cluster.cli("control", "show", "job", job_id)

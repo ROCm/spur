@@ -145,6 +145,30 @@ fn cleanup_unlinks_symlinks_without_following_them() {
 }
 
 #[test]
+fn completion_cleans_writable_roots_that_startup_cannot_trust() {
+    let (_directory, root) = fixture();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::create_dir(root.join("job1")).unwrap();
+    std::fs::write(root.join("job1/step0.out"), "stale output").unwrap();
+    assert!(SpoolRoot::open(root.clone()).is_err());
+    cleanup_job_spool_under(&root, 1).unwrap();
+    assert!(!root.join("job1").exists());
+}
+
+#[test]
+#[ignore = "requires root to create a spool root owned by another UID"]
+fn completion_cleans_foreign_roots_that_startup_cannot_trust() {
+    assert_eq!(nix::unistd::geteuid().as_raw(), 0);
+    let (_directory, root) = fixture();
+    std::fs::create_dir(root.join("job1")).unwrap();
+    std::fs::write(root.join("job1/step0.out"), "stale output").unwrap();
+    nix::unistd::chown(&root, Some(nix::unistd::Uid::from_raw(1)), None).unwrap();
+    assert!(SpoolRoot::open(root.clone()).is_err());
+    cleanup_job_spool_under(&root, 1).unwrap();
+    assert!(!root.join("job1").exists());
+}
+
+#[test]
 fn cleanup_without_openat2() {
     const CHILD: &str = "SPUR_SPOOL_FS_COMPAT_ERRNO";
     let Some(errno) = std::env::var_os(CHILD) else {

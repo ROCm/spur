@@ -401,6 +401,8 @@ This pass finishes before the agent starts its RPC server and background runtime
 pruning. Heartbeats continue throughout startup. The configured controller state
 directory does not add a spool root, and no periodic spool scan is installed.
 Only daemon-owned roots without group or world write permission are scanned.
+These discovery restrictions do not apply to a supervisor's normal completion
+cleanup of its known job folder, which also cleans user-owned fallback roots.
 
 The agent queries the controller in sorted batches of 128 job IDs without other
 filters and with `GetJobsRequest.require_authoritative` enabled. These strict

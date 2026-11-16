@@ -157,8 +157,13 @@ pub(crate) struct JobSpool {
 
 impl SpoolRoot {
     pub(crate) fn open(path: PathBuf) -> io::Result<Self> {
+        let root = Self::open_for_owned_job(path)?;
+        verify_root(&root.directory)?;
+        Ok(root)
+    }
+
+    fn open_for_owned_job(path: PathBuf) -> io::Result<Self> {
         let directory = open_directory(&path)?;
-        verify_root(&directory)?;
         Ok(Self { path, directory })
     }
 
@@ -197,6 +202,10 @@ impl SpoolRoot {
     pub(crate) fn delete(&self, spool: &JobSpool) -> io::Result<()> {
         verify_root(&self.directory)?;
         let current = Self::open(self.path.clone())?;
+        self.delete_with_current_root(spool, &current)
+    }
+
+    fn delete_with_current_root(&self, spool: &JobSpool, current: &Self) -> io::Result<()> {
         if current.identity()? != self.identity()? {
             return Err(io::Error::other("spool root changed since discovery"));
         }
@@ -360,7 +369,9 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
             "job id must be positive",
         ));
     }
-    let root = match SpoolRoot::open(root.to_owned()) {
+    // Completion owns this job's lifetime even in a user-owned fallback root;
+    // startup discovery must additionally establish trust in the entire root.
+    let root = match SpoolRoot::open_for_owned_job(root.to_owned()) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
@@ -371,10 +382,14 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    root.delete(&JobSpool {
-        job_id,
-        metadata: directory.metadata()?,
-    })
+    let current = SpoolRoot::open_for_owned_job(root.path.clone())?;
+    root.delete_with_current_root(
+        &JobSpool {
+            job_id,
+            metadata: directory.metadata()?,
+        },
+        &current,
+    )
 }
 
 #[cfg(test)]
