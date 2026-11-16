@@ -3514,7 +3514,13 @@ impl SlurmController for ControllerService {
         tokio::task::spawn_blocking(move || cluster.reconfigure())
             .await
             .map_err(|error| Status::internal(format!("reconfigure task failed: {error}")))?
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                if e.is::<crate::cluster::NodeInventoryRefused>() {
+                    Status::failed_precondition(e.to_string())
+                } else {
+                    Status::internal(e.to_string())
+                }
+            })?;
 
         Ok(Response::new(()))
     }
@@ -9068,6 +9074,72 @@ mod tests {
         assert!(svc.cluster.get_node("n1").is_some());
         assert!(svc.cluster.get_node("n2").is_none());
         assert!(svc.cluster.check_node_inventory("n2").is_err());
+        assert_eq!(
+            svc.cluster.config().admission.node_names,
+            Some(vec!["n1".into()])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_reports_node_names_refusals_as_failed_preconditions() {
+        use crate::raft::StateMachineApply;
+        use spur_core::config::SlurmConfig;
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spur.conf");
+        let config_text =
+            |names: &str| format!("cluster_name = 'test'\n[admission]\nnode_names = [{names}]\n");
+        std::fs::write(&path, config_text("'n1'")).unwrap();
+        let config = SlurmConfig::load_from_file(&path).unwrap();
+        let svc = test_service_with_config_path(&dir, config, Some(path.clone())).await;
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                svc.cluster.as_ref(),
+                op,
+            )
+        };
+        apply(&WalOperation::JobSubmit {
+            job_id: 42,
+            spec: Box::new(spur_core::job::JobSpec::default()),
+        });
+        assert!(
+            apply(&WalOperation::job_start(
+                42,
+                vec!["n1".into()],
+                ResourceAllocations::with_scalar(1, 100),
+                [("n1".into(), ResourceAllocations::with_scalar(1, 100))]
+                    .into_iter()
+                    .collect(),
+            ))
+            .job_started
+        );
+
+        std::fs::write(&path, config_text("")).unwrap();
+        let refused = svc.reconfigure(admin_request(())).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert!(refused.message().contains("job allocations"));
+
+        std::fs::write(&path, config_text("'node*'")).unwrap();
+        let invalid = svc.reconfigure(admin_request(())).await.unwrap_err();
+        assert_ne!(invalid.code(), tonic::Code::Ok);
+        assert!(
+            invalid.message().contains("admission.node_names"),
+            "{invalid:?}"
+        );
+        assert!(svc.cluster.get_node("n1").is_some());
         assert_eq!(
             svc.cluster.config().admission.node_names,
             Some(vec!["n1".into()])

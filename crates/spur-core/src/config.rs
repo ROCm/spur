@@ -1929,9 +1929,15 @@ impl AdmissionConfig {
             value,
         };
         let mut names = BTreeSet::new();
+        let mut expanded_total = 0usize;
         for pattern in patterns {
             let expanded = crate::hostlist::expand_bounded(pattern, 100_000, 255)
                 .map_err(|error| invalid(error.to_string()))?;
+            // Repeated wide patterns stay under the distinct-name cap but would still cost time.
+            expanded_total += expanded.len();
+            if expanded_total > 1_000_000 {
+                return Err(invalid("more than 1000000 expanded node names".into()));
+            }
             if expanded.is_empty() {
                 return Err(invalid(
                     "empty entries are not node names; use [] to allow no nodes".into(),
@@ -3442,6 +3448,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             r#"["node*"]"#,
             r#"["n[1-100001]"]"#,
             r#"["a[1-60000]", "b[1-60000]"]"#,
+            format!("[{}]", ["'n[1-90000]'"; 12].join(",")).as_str(),
         ] {
             let input = format!("cluster_name = 'test'\n[admission]\nnode_names = {names}");
             // Only the controller expands the list, so other readers of a shared file still load it.

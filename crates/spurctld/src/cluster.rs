@@ -608,7 +608,7 @@ pub struct ClusterManager {
     nodes: RwLock<HashMap<String, Node>>,
     node_inventory: RwLock<Option<NodeInventory>>,
     startup_node_inventory: NodeInventory,
-    unlisted_nodes_warned: std::sync::atomic::AtomicBool,
+    node_names_unsaved_warned: std::sync::atomic::AtomicBool,
     node_names_mismatch_warned: std::sync::atomic::AtomicBool,
     reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
@@ -1049,7 +1049,7 @@ impl ClusterManager {
             nodes: RwLock::new(HashMap::new()),
             node_inventory: RwLock::new(None),
             startup_node_inventory,
-            unlisted_nodes_warned: std::sync::atomic::AtomicBool::new(false),
+            node_names_unsaved_warned: std::sync::atomic::AtomicBool::new(false),
             node_names_mismatch_warned: std::sync::atomic::AtomicBool::new(false),
             reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
@@ -4201,7 +4201,7 @@ impl ClusterManager {
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
         self.check_node_inventory(&name)?;
-        self.initialize_node_inventory();
+        self.warn_node_names_not_applied();
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
@@ -4222,9 +4222,7 @@ impl ClusterManager {
             && self.node_inventory.read().is_none()
             && self.startup_node_inventory.excludes(&name)
         {
-            return Err(RegisterNodeError::PermissionDenied(format!(
-                "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
-            )));
+            return Err(excluded_by_node_names(&name));
         }
 
         match action {
@@ -4316,50 +4314,31 @@ impl ClusterManager {
         self.check_node_inventory(&name)
     }
 
-    /// Saves the startup node list only when that deletes no node; deletion is left to
-    /// `scontrol reconfigure`, so a busy node never makes another's registration fail.
-    fn initialize_node_inventory(&self) {
+    /// Only `scontrol reconfigure` saves node_names, so a rolling upgrade never writes
+    /// the new log entry on its own; until then this leader filters by its startup list.
+    fn warn_node_names_not_applied(&self) {
         let Some(listed) = &self.startup_node_inventory.names else {
             return;
         };
-        let saved_differs = self
+        let matches_saved = self
             .node_inventory
             .read()
             .as_ref()
-            .map(|saved| saved.names.as_ref() != Some(listed));
-        if let Some(differs) = saved_differs {
-            if differs && !swap_flag(&self.node_names_mismatch_warned) {
-                warn!(
-                    "admission.node_names loaded at startup differs from the saved list; \
-                     the saved list applies until `scontrol reconfigure`"
-                );
-            }
-            return;
-        }
-        if has_unlisted_node(listed, &self.nodes.read()) {
-            if !swap_flag(&self.unlisted_nodes_warned) {
-                let unlisted = unlisted_node_names(listed, &self.nodes.read());
-                warn!(
-                    nodes = %unlisted.join(","),
-                    "registered nodes are absent from admission.node_names; \
-                     run `scontrol reconfigure` to remove them"
-                );
-            }
-            return;
-        }
-        // Another registration or a reconfigure holds the lock; a later registration retries.
-        let Some(_reconfigure) = self.reconfigure_lock.try_lock() else {
-            return;
+            .map(|saved| saved.names.as_ref() == Some(listed));
+        let (flag, message) = match matches_saved {
+            Some(true) => return,
+            Some(false) => (
+                &self.node_names_mismatch_warned,
+                "admission.node_names loaded at startup differs from the saved list; \
+                 the saved list applies until `scontrol reconfigure`",
+            ),
+            None => (
+                &self.node_names_unsaved_warned,
+                "admission.node_names is not saved yet; run `scontrol reconfigure` to apply it",
+            ),
         };
-        let saved = self.node_inventory.read().is_some();
-        if saved || has_unlisted_node(listed, &self.nodes.read()) {
-            return;
-        }
-        if let Err(error) = self.propose(WalOperation::NodeInventoryUpdate {
-            inventory: self.startup_node_inventory.clone(),
-            initialize: true,
-        }) {
-            warn!(%error, "failed to save admission.node_names; retrying on next registration");
+        if !swap_flag(flag) {
+            warn!("{message}");
         }
     }
 
@@ -4412,9 +4391,7 @@ impl ClusterManager {
             None => !registered && self.startup_node_inventory.excludes(name),
         };
         if excluded {
-            return Err(RegisterNodeError::PermissionDenied(format!(
-                "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
-            )));
+            return Err(excluded_by_node_names(name));
         }
         Ok(())
     }
@@ -6819,7 +6796,8 @@ impl ClusterManager {
             );
         }
         let inventory = new_config.admission.node_inventory()?;
-        self.validate_node_inventory(&inventory)?;
+        self.validate_node_inventory(&inventory)
+            .map_err(|error| NodeInventoryRefused(error.to_string()))?;
         let mut reconcile_inventory = inventory.names.is_some()
             || self.startup_node_inventory.names.is_some()
             || self.node_inventory.read().is_some();
@@ -6837,7 +6815,7 @@ impl ClusterManager {
                 initialize: false,
             })?;
             if let Some(error) = response.node_inventory_error {
-                anyhow::bail!("reconfigure: {error}");
+                return Err(NodeInventoryRefused(error).into());
             }
             // The saved list now matches this leader's file, so a startup-list mismatch is stale.
             swap_flag(&self.node_names_mismatch_warned);
@@ -7002,7 +6980,10 @@ impl ClusterManager {
                 || node.alloc_resources.memory_mb > 0
                 || node.alloc_resources.has_devices()
             {
-                anyhow::bail!("node '{name}' still has allocated resources");
+                anyhow::bail!(
+                    "node '{name}' still has allocated resources; wait for them to be released, \
+                     or remove it with `spur node remove`"
+                );
             }
         }
         Ok(())
@@ -10417,14 +10398,30 @@ pub struct LayoutDelivery {
     pub error: String,
 }
 
+fn excluded_by_node_names(name: &str) -> RegisterNodeError {
+    RegisterNodeError::PermissionDenied(format!(
+        "node {name} is not allowed by admission.node_names"
+    ))
+}
+
+/// A user-fixable refusal of a node_names change, reported as a failed precondition.
+#[derive(Debug)]
+pub(crate) struct NodeInventoryRefused(pub(crate) String);
+
+impl std::fmt::Display for NodeInventoryRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reconfigure: {}", self.0)
+    }
+}
+
+impl std::error::Error for NodeInventoryRefused {}
+
 fn reject_excluded_registration(
     response: &ClientResponse,
     name: &str,
 ) -> Result<(), RegisterNodeError> {
     if response.node_registration_rejected {
-        return Err(RegisterNodeError::PermissionDenied(format!(
-            "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
-        )));
+        return Err(excluded_by_node_names(name));
     }
     Ok(())
 }
@@ -13402,6 +13399,8 @@ pub(crate) mod tests {
         let (cm, path) = test_cluster_with_conf_file(&dir, base).await;
         try_register_node(&cm, "n1", 4, 8000).unwrap();
         try_register_node(&cm, "n2", 4, 8000).unwrap();
+        assert_eq!(*cm.node_inventory.read(), None);
+        cm.reconfigure().unwrap();
         assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1", "n2"])));
         std::fs::write(
             &path,
@@ -13697,6 +13696,7 @@ pub(crate) mod tests {
         )
         .await;
         try_register_node(&cm, "n1", 4, 8000).unwrap();
+        cm.reconfigure().unwrap();
         let mut job = Job::new(42, JobSpec::default());
         job.allocated_nodes = vec!["n1".into()];
         cm.jobs.write().insert(42, job);
@@ -13777,7 +13777,7 @@ pub(crate) mod tests {
             .contains("job allocations"));
         assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
         assert_eq!(cm.get_job(42).unwrap().allocated_nodes, vec!["n1"]);
-        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+        assert_eq!(*cm.node_inventory.read(), None);
         assert_eq!(cm.config().admission.node_names, Some(vec!["n1".into()]));
         assert_eq!(
             cm.get_partitions()[0].max_time_minutes,
@@ -13997,20 +13997,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn registration_skips_the_save_while_a_reconfigure_holds_the_lock() {
-        let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.admission.node_names = Some(vec!["n[1-2]".into()]);
-        let cm = test_cluster_with_config(&dir, config).await;
-        let reconfiguring = cm.reconfigure_lock.lock();
-        try_register_node(&cm, "n1", 4, 8000).unwrap();
-        assert_eq!(*cm.node_inventory.read(), None);
-        drop(reconfiguring);
-        try_register_node(&cm, "n2", 4, 8000).unwrap();
-        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1", "n2"])));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_edited_startup_list_never_replaces_the_saved_one() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -14024,8 +14010,48 @@ pub(crate) mod tests {
             .node_names_mismatch_warned
             .load(std::sync::atomic::Ordering::Relaxed));
         assert!(!cm
-            .unlisted_nodes_warned
+            .node_names_unsaved_warned
             .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn placement_onto_an_unregistered_node_is_refused_with_a_saved_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.apply_operation(&inventory_update(&["n1", "n2"]));
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+        assert!(cm
+            .reserve_placement(
+                id,
+                vec!["n2".into()],
+                res.clone(),
+                per_node_for(&["n2"], res.clone()),
+                false,
+                false,
+            )
+            .is_err());
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.allocated_nodes.is_empty());
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn controller_refuses_to_start_with_an_invalid_node_list() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.admission.node_names = Some(vec!["node*".into()]);
+        assert!(ClusterManager::new(config, dir.path()).is_err());
     }
 
     #[test]
@@ -14043,7 +14069,7 @@ pub(crate) mod tests {
         };
         // The warning is logged after the pre-check passed, before the per-node lock.
         while !cm
-            .unlisted_nodes_warned
+            .node_names_unsaved_warned
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             assert!(!registering.is_finished(), "registration ended early");
@@ -14063,7 +14089,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn registration_never_saves_a_node_list_that_deletes_a_node() {
+    async fn registration_never_saves_the_node_list() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.admission.node_names = Some(vec!["n1".into()]);
@@ -14101,7 +14127,7 @@ pub(crate) mod tests {
                 .filter(|op| matches!(op, WalOperation::NodeInventoryUpdate { .. }))
                 .count()
         };
-        assert_eq!(saves(), 0, "registration must not propose a deleting save");
+        assert_eq!(saves(), 0, "only scontrol reconfigure saves the list");
         assert!(cm
             .apply_operation(&WalOperation::NodeInventoryUpdate {
                 inventory: inventory(&["n1"]),
@@ -14115,8 +14141,15 @@ pub(crate) mod tests {
         cm.nodes.write().get_mut("old").unwrap().alloc_resources = Default::default();
         cm.remove_node("old", false, None).unwrap();
         try_register_node(&cm, "n1", 4, 8000).unwrap();
-        assert_eq!(saves(), 1);
-        assert_eq!(*cm.node_inventory.read(), Some(inventory(&["n1"])));
+        assert_eq!(
+            saves(),
+            0,
+            "a list that deletes nothing is not saved either"
+        );
+        assert_eq!(*cm.node_inventory.read(), None);
+        assert!(cm
+            .node_names_unsaved_warned
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
