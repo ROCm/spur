@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+# The fixture controller starts issuing at 1000: lower ids read as issued then purged.
+NEVER_ISSUED = 900001
+
 
 def _submit_held(cluster):
     return int(cluster.cli("submit", "--parsable", "--hold", "--export", "NONE", "--wrap", "true").strip())
@@ -44,13 +47,15 @@ def test_startup_removes_terminal_and_absent_spools_but_keeps_pending(local_clus
     assert f"JobState={terminal_state}" in cluster.cli("control", "show", "job", terminal)
     pending = _submit_held(cluster)
     stale = cluster.make_spool(terminal)
-    absent = cluster.make_spool(900001)
+    absent = cluster.make_spool(501)
     held = cluster.make_spool(pending)
+    never_issued = cluster.make_spool(NEVER_ISSUED)
     log = cluster.start_agent()
     assert not stale.exists(), log
     assert not absent.exists(), log
     assert (held / "sentinel").read_text() == f"job {pending}\n"
-    assert "deleted=2" in log and "retained=1" in log, log
+    assert (never_issued / "sentinel").read_text() == f"job {NEVER_ISSUED}\n", log
+    assert "deleted=2" in log and "retained=2" in log, log
     assert len(cluster.call("queries")) == 1
 
 
@@ -59,9 +64,9 @@ def test_startup_deletion_does_not_follow_symlinks_or_noncanonical_names(local_c
     target = cluster.root / "symlink-target"
     target.mkdir()
     (target / "sentinel").write_text("outside spool\n")
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
     (orphan / "nested-link").symlink_to(target, target_is_directory=True)
-    linked_job = cluster.spool / "job900002"
+    linked_job = cluster.spool / "job502"
     linked_job.symlink_to(target, target_is_directory=True)
     names = ["job0", "job01", "job-1", "job4294967296", "jobs", "containers"]
     for name in names:
@@ -76,10 +81,10 @@ def test_startup_deletion_does_not_follow_symlinks_or_noncanonical_names(local_c
 @pytest.mark.parametrize("mode", ["unavailable", "legacy"])
 def test_failed_or_legacy_query_retains_spools_until_next_startup(local_cluster, mode):
     cluster = local_cluster
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
     cluster.call("proxy_mode", mode=mode)
     log = cluster.start_agent()
-    assert (orphan / "sentinel").read_text() == "job 900001\n", log
+    assert (orphan / "sentinel").read_text() == "job 501\n", log
     assert len(cluster.call("queries")) == 1
     cluster.call("proxy_mode", mode="pass")
     cluster.cli("info")
@@ -92,13 +97,13 @@ def test_failed_or_legacy_query_retains_spools_until_next_startup(local_cluster,
 def test_legacy_terminal_response_cannot_delete_a_pending_job_spool(local_cluster):
     cluster = local_cluster
     pending = _submit_held(cluster)
-    assert pending == 1, "frozen legacy response describes job 1"
+    assert pending == 1000, "frozen legacy response describes job 1000"
     held = cluster.make_spool(pending)
-    absent = cluster.make_spool(900001)
+    absent = cluster.make_spool(501)
     cluster.call("proxy_mode", mode="legacy-terminal")
     log = cluster.start_agent()
-    assert (held / "sentinel").read_text() == "job 1\n", log
-    assert (absent / "sentinel").read_text() == "job 900001\n", log
+    assert (held / "sentinel").read_text() == "job 1000\n", log
+    assert (absent / "sentinel").read_text() == "job 501\n", log
     assert "JobState=PENDING" in cluster.cli("control", "show", "job", pending)
     assert len(cluster.call("queries")) == 1
     cluster.call("proxy_mode", mode="pass")
@@ -110,7 +115,7 @@ def test_legacy_terminal_response_cannot_delete_a_pending_job_spool(local_cluste
 
 def test_deletion_error_is_retried_only_after_restart(local_cluster):
     cluster = local_cluster
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
     cluster.call("proxy_mode", mode="blocked")
     cluster.start_agent(wait=False)
     cluster.call("wait_query", count=1)
@@ -127,37 +132,64 @@ def test_deletion_error_is_retried_only_after_restart(local_cluster):
     assert len(cluster.call("queries")) == 2
 
 
-@pytest.mark.parametrize("fault", ["disabled-cgroups", "writable-root", "symlink-root", "unknown-runtime"])
+@pytest.mark.parametrize("fault", ["disabled-cgroups", "writable-root", "writable-symlink-root", "unknown-runtime"])
 def test_uncertain_or_unsafe_startup_inventory_retains_spools(local_cluster, fault):
     cluster = local_cluster
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
     if fault == "disabled-cgroups":
         cluster.cgroups(False)
     elif fault == "writable-root":
         cluster.spool.chmod(0o777)
-    elif fault == "symlink-root":
+    elif fault == "writable-symlink-root":
         saved = cluster.root / "saved-spool"
         cluster.spool.rename(saved)
+        saved.chmod(0o777)
         cluster.spool.symlink_to(saved, target_is_directory=True)
     else:
         (cluster.root / "agent/runtime/unidentified").mkdir(parents=True)
         (cluster.root / "agent/runtime").chmod(0o700)
     log = cluster.start_agent()
-    assert (orphan / "sentinel").read_text() == "job 900001\n", log
+    assert (orphan / "sentinel").read_text() == "job 501\n", log
     assert "deleted=0" in log, log
     expected_queries = 1 if fault == "unknown-runtime" else 0
     assert len(cluster.call("queries")) == expected_queries
 
 
-@pytest.mark.parametrize("holder", ["environment", "cwd", "hardlink-fd"])
+def test_symlinked_spool_root_is_followed_but_nothing_beneath_it(local_cluster):
+    cluster = local_cluster
+    saved = cluster.root / "saved-spool"
+    cluster.spool.rename(saved)
+    cluster.spool.symlink_to(saved, target_is_directory=True)
+    orphan = cluster.make_spool(501)
+    held = cluster.make_spool(502)
+    target = cluster.root / "symlink-target"
+    target.mkdir()
+    (target / "sentinel").write_text("outside spool\n")
+    (cluster.spool / "job503").symlink_to(target, target_is_directory=True)
+    process = cluster.call("start_holder", name="holder", environment={},
+                           script=f"import os, signal; os.chdir({str(held)!r}); "
+                                  "print('READY', flush=True); signal.pause()")
+    cluster.wait_file(process["log"], "READY")
+    log = cluster.start_agent()
+    assert not orphan.exists(), log
+    assert held.exists(), log
+    assert (cluster.spool / "job503").is_symlink()
+    assert (target / "sentinel").read_text() == "outside spool\n"
+    assert "kept job spool: entry is a symlink, not followed" in log, log
+    cluster.call("stop", name="holder")
+
+
+@pytest.mark.parametrize("holder", ["environment", "cwd", "fd", "hardlink-fd"])
 def test_real_process_owners_protect_only_their_spool_until_restart(local_cluster, holder):
     cluster = local_cluster
-    held = cluster.make_spool(900001)
-    absent = cluster.make_spool(900002)
-    environment = {"SLURM_JOB_ID": "900001"} if holder == "environment" else {}
+    held = cluster.make_spool(501)
+    absent = cluster.make_spool(502)
+    environment = {"SLURM_JOB_ID": "501"} if holder == "environment" else {}
     setup = ""
     if holder == "cwd":
         setup = f"import os; os.chdir({str(held)!r}); "
+    elif holder == "fd":
+        setup = f"output = open({str(held / 'sentinel')!r}); "
     elif holder == "hardlink-fd":
         alias = cluster.root / "output-alias"
         os.link(held / "sentinel", alias)
@@ -178,7 +210,7 @@ def test_real_process_owners_protect_only_their_spool_until_restart(local_cluste
 def test_spools_created_after_startup_wait_for_the_next_daemon_start(local_cluster):
     cluster = local_cluster
     cluster.start_agent()
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
     cluster.call("wait_heartbeat", count=2)
     assert orphan.exists()
     log = Path(cluster.agent["log"]).read_text()
@@ -215,7 +247,7 @@ def test_running_batch_and_step_keep_spool_and_output_across_restart(local_clust
     assert any(0 <= descriptor["step_id"] < 100 for descriptor in descriptors), descriptors
     pids = [descriptor["pid"] for descriptor in descriptors]
     assert all(cluster.call("pid_exists", pid=pid) for pid in pids)
-    unrelated = cluster.make_spool(900001)
+    unrelated = cluster.make_spool(501)
     cluster.cgroups(True)
     log = cluster.restart_agent()
     assert spool.is_dir(), log
@@ -239,15 +271,16 @@ def test_running_batch_and_step_keep_spool_and_output_across_restart(local_clust
     assert step_output.read_text().splitlines() == ["STEP_START", "STEP_DONE"]
 
 
-def test_deep_spool_cannot_abort_daemon_startup(local_cluster):
+def test_deep_spool_is_kept_without_aborting_daemon_startup(local_cluster):
     cluster = local_cluster
-    limits = cluster.call("deep_tree_limits")
-    if not limits["available"]:
-        pytest.skip(f"deep-spool regression requires RLIMIT_NOFILE hard >= 65536, got {limits['hard']}")
-    orphan = cluster.make_spool(900001)
+    orphan = cluster.make_spool(501)
+    shallow = cluster.make_spool(502)
     cluster.call("make_deep_tree", path=str(orphan), depth=6000)
     try:
-        cluster.start_agent()
+        log = cluster.start_agent()
+        assert orphan.exists(), log
+        assert not shallow.exists(), log
+        assert "kept job spool: deeper than the traversal limit" in log, log
     finally:
         cluster.call("remove_deep_tree", path=str(orphan))
 

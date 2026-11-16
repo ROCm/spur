@@ -21,14 +21,15 @@ forwards real controller calls and provides explicit query failures and barriers
 File waits use inotify events instead of assumed startup delays. A stopped
 namespace kills all its remaining supervisors and workloads.
 
-The suite is included in the default pytest test paths. The CI deployment jobs
-still select the native-host and Kubernetes suites explicitly; they do not run
-these local tests.
+The suite is included in the default pytest test paths, but it is local-only:
+no CI workflow runs it. The CI deployment jobs select the native-host and
+Kubernetes suites explicitly.
 
-The deep-spool regression uses a 2 MiB Rust worker stack and an explicit
-65536 soft/hard file-descriptor limit. It skips if the inherited hard limit
-cannot accommodate that setting. Startup must finish without a crash; traversal
-limits may safely retain the deep spool.
+The fixture controller issues job ids from 1000, so lower ids model spools of
+jobs the controller has issued and since purged.
+
+The deep-spool regression builds a tree deeper than the agent's traversal limit
+and checks that startup keeps it, logs why, and still cleans other spools.
 
 A separate single-threaded launcher denies `openat2` with `ENOSYS` using seccomp
 before executing the agent. The completion regression runs a real job and checks

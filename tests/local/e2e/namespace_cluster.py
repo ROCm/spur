@@ -53,8 +53,8 @@ class ControllerProxy(grpc.GenericRpcHandler):
                 elif mode == "legacy":
                     return b""
                 elif mode == "legacy-terminal":
-                    # A stale legacy controller claims job 1 is terminal with full visibility.
-                    return b"\x0a\x04\x08\x01\x38\x05\x10\x01"
+                    # A stale legacy controller claims job 1000 is terminal with full visibility.
+                    return b"\x0a\x05\x08\xe8\x07\x38\x05\x10\x01"
             try:
                 return self.channel.unary_unary(method)(request, timeout=10)
             except grpc.RpcError as error:
@@ -125,6 +125,7 @@ class NamespaceCluster:
 listen_addr = "{self.controller_address}"
 raft_listen_addr = "127.0.0.1:{raft_port}"
 state_dir = {json.dumps(str(self.root / "controller"))}
+first_job_id = 1000
 heartbeat_timeout_secs = 90
 [scheduler]
 interval_secs = 1
@@ -261,7 +262,12 @@ max_time = "00:05:00"
                     raise RuntimeError("agent did not issue the expected heartbeat")
             return self.proxy.heartbeats
         if operation == "pid_exists":
-            return Path(f"/proc/{request['pid']}").exists()
+            # The driver is PID 1 here and reaps late, so a dead child lingers as a zombie.
+            try:
+                stat = Path(f"/proc/{request['pid']}/stat").read_text()
+            except FileNotFoundError:
+                return False
+            return stat.rsplit(")", 1)[1].split()[0] != "Z"
         if operation == "wait_pid_exit":
             try:
                 descriptor = os.pidfd_open(request["pid"])
@@ -287,12 +293,6 @@ max_time = "00:05:00"
             finally:
                 os.close(descriptor)
             return None
-        if operation == "deep_tree_limits":
-            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            if hard != resource.RLIM_INFINITY and hard < 65536:
-                return {"available": False, "hard": hard}
-            resource.setrlimit(resource.RLIMIT_NOFILE, (65536, 65536))
-            return {"available": True}
         if operation == "remove_deep_tree":
             path = Path(request["path"])
             if not path.exists():
