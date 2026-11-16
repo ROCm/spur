@@ -398,42 +398,63 @@ After initial completion replay, runtime pruning, supervisor adoption and
 stale-session settlement, `spurd` makes one pass over direct `job<id>`
 directories under `/var/spool/spur` and the temporary-directory `spur` fallback.
 This pass finishes before the agent starts its RPC server and background runtime
-pruning. Heartbeats continue throughout startup. The configured controller state
-directory does not add a spool root, and no periodic spool scan is installed.
-Only daemon-owned roots without group or world write permission are scanned.
-These discovery restrictions do not apply to a supervisor's normal completion
-cleanup of its known job folder, which also cleans user-owned fallback roots.
+pruning, and is bounded by a 60-second budget; anything not decided by then is
+retained and logged. Heartbeats continue throughout startup. The roots are fixed
+and not configurable; the configured controller state directory does not add a
+spool root, and no periodic spool scan is installed (restarting `spurd` is the
+only trigger).
+
+Symlinks in a root's path are followed, as for normal completion cleanup; nothing
+beneath the root is followed. A `job<id>` entry that is itself a symlink, or a
+spool containing a mount point, is kept and logged so an admin can clean it by
+hand. Startup only scans roots whose resolved directory is owned by the daemon
+and not group- or world-writable. Normal completion cleanup of a known job
+folder skips that ownership check, so it also cleans user-owned fallback roots.
 
 The agent queries the controller in sorted batches of 128 job IDs without other
 filters and with `GetJobsRequest.require_authoritative` enabled. These strict
 reads forward to the leader and require a bounded quorum confirmation and apply
-catch-up; ordinary job queries retain their existing local fallback. Both
-terminal jobs and missing jobs are eligible for cleanup only when
-`GetJobsResponse.authoritative` confirms fresh controller state. Missing jobs
-also require `GetJobsResponse.unrestricted_visibility`, which confirms caller
-visibility independently of freshness; request filters still apply. Upgrade
+catch-up; ordinary job queries retain their existing local fallback. Terminal
+jobs are eligible for cleanup only when `GetJobsResponse.authoritative` confirms
+fresh controller state. Missing jobs also require
+`GetJobsResponse.unrestricted_visibility` and an id below
+`GetJobsResponse.next_job_id`, so a freshly bootstrapped or wiped controller,
+which has issued none of the node's ids, cannot mark them deletable. Upgrade
 controllers before agents to enable automatic spool cleanup. Older controllers
 default the authority flag to false, so every candidate remains protected.
+
+With `[auth] private_data` including `jobs`, the node's identity sees only its
+own jobs unless it is an operator or administrator, so other users' spools are
+retained and a log line says why.
 
 Local ownership takes precedence: tracked jobs, reserved allocations, active
 steps, supervisors and every retained runtime session protect the entire job
 spool across attempts and sibling steps. Completed sessions still waiting for
 completion or output replay are retained. Asynchronous supervisor recovery
 reports keep their existing retry behavior; startup cleanup does not wait for
-them. Read-only cgroup population checks and process inventories also protect
-surviving workloads and processes holding spool files or working directories,
-including supervisors whose runtime records disappeared.
+them. Read-only cgroup population checks and a process inventory also protect
+surviving workloads:
+
+- a `spurstepd` supervisor, recognised by name only when its real and effective
+  uid are the daemon's, protects the job in its arguments, even if its runtime
+  record disappeared; such a process without a job id retains every candidate;
+- a valid `SPUR_JOB_ID`, `SPUR_JOBID`, `SLURM_JOB_ID` or `SLURM_JOBID` in a
+  process environment protects that job; values that name no job are ignored;
+- a working directory or open file inside a spool protects it, matched by path
+  and by inode (for holders on the spool's filesystem), so hardlinks and bind
+  mounts are recognised.
 
 Unsafe or unreadable roots, uncertain activity information, unknown job states,
 non-authoritative responses and restricted missing-job responses cause folders
 to be retained with a log message. A failed controller query stops further
 batches and startup continues.
 
-Automatic deletion is skipped when cgroups are disabled. Traversal uses
-`openat2` where available and otherwise combines `openat` with no-follow opens
-and descriptor mount IDs; folders remain protected if safe path or mount
-information is unavailable. Deletion follows neither symlinks nor mount points
-and shares the per-job launch/teardown lock.
+Automatic deletion is skipped when cgroups are disabled. Traversal streams
+directory entries, keeps one directory open per level and stops at 256 levels
+(the spool is kept); it uses `openat2` where available and otherwise combines
+`openat` with no-follow opens and descriptor mount IDs. Deletion follows
+neither symlinks nor mount points and shares the per-job launch/teardown lock.
+One spool that cannot be walked or deleted does not hold back the others.
 
 Logs record deletions, retention reasons, errors and the final count. A failed
 or partial deletion is reconsidered on the next startup without a persistent
