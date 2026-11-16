@@ -488,7 +488,8 @@ This is separate from the ten-minute retention of a finished step's recorded
 result.
 
 One case is not covered: a step given its own ``--container-image``. It ends
-when the agent stops, and leaves its unpacked rootfs behind. A standalone
+when the agent stops, and its unpacked rootfs stays on the node until the agent
+next starts after the job has ended. A standalone
 ``srun --pty`` that allocates its own job loses the job as well: ``srun``
 cancels the job it created as soon as its connection drops. Take an allocation
 first and run ``srun --pty`` inside it, so a restart costs you the terminal

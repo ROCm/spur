@@ -8,15 +8,8 @@ use crate::startup_spool::{
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
-/// Waits until the pass's worker is parked; fails rather than hangs if the pass ends first.
-async fn worker_reached(
-    gate: &(tokio::sync::Notify, std::sync::Barrier),
-    cleanup: &mut tokio::task::JoinHandle<CleanupSummary>,
-) {
-    tokio::select! {
-        _ = gate.0.notified() => {}
-        result = cleanup => panic!("the pass ended before its worker started: {result:?}"),
-    }
+fn no_stop() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
 }
 
 /// Waits until the pass's worker is parked; fails rather than hangs if the pass ends first.
@@ -157,7 +150,7 @@ impl SpoolFixture {
     async fn run_and_drain(&self) -> CleanupSummary {
         let mut summary = self.run().await;
         let pending = std::mem::take(&mut summary.pending_rootfs);
-        delete_pending_rootfs(self.agent.spool_ownership(), pending).await;
+        delete_pending_rootfs(self.agent.spool_ownership(), pending, no_stop()).await;
         summary
     }
 
@@ -962,7 +955,12 @@ async fn startup_removes_confirmed_orphan_container_rootfs_in_the_background() {
     );
     let queries = controller.state.spool_queries.lock().unwrap().clone();
     assert_eq!(queries[0].job_ids, [1, 2, 4]);
-    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    delete_pending_rootfs(
+        fixture.agent.spool_ownership(),
+        summary.pending_rootfs,
+        no_stop(),
+    )
+    .await;
     assert!(!job.exists());
     assert!(!step.exists());
     assert!(running.is_dir());
@@ -975,15 +973,72 @@ async fn container_processes_keep_their_rootfs_through_their_root() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = SpoolFixture::new(&controller, &[]);
+    let extracted = fixture.rootfs("job_1");
+    let overlay = fixture.containers().join("job_2");
+    fs::create_dir_all(overlay.join("merged/usr")).unwrap();
+    let idle = fixture.rootfs("job_3");
+    // A pivoted process reports its root as "/"; only the inode ties it to the rootfs.
+    for (pid, root) in [(100, extracted.clone()), (101, overlay.join("merged"))] {
+        let alias = fixture.directory.path().join(format!("pivoted-root-{pid}"));
+        symlink(&root, &alias).unwrap();
+        let process = fixture.process(pid, &["python3"], b"");
+        fs::remove_file(process.join("root")).unwrap();
+        symlink(&alias, process.join("root")).unwrap();
+    }
+    let summary = fixture.run_and_drain().await;
+    assert_eq!(summary.retained, 2);
+    assert!(extracted.is_dir());
+    assert!(overlay.join("merged/usr").is_dir());
+    assert!(!idle.exists());
+}
+
+#[tokio::test]
+async fn processes_in_another_mount_namespace_are_stat_ed_despite_remote_host_paths() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
     let used = fixture.rootfs("job_1");
-    let idle = fixture.rootfs("job_2");
+    let proc_root = fixture.paths().proc_root;
+    fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+    symlink("mnt:[1]", proc_root.join("self/ns/mnt")).unwrap();
+    let alias = fixture.directory.path().join("remote/pivoted-root");
+    fs::create_dir(fixture.directory.path().join("remote")).unwrap();
+    symlink(&used, &alias).unwrap();
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        format!(
+            "36 25 0:50 / {} rw - nfs4 server:/export rw\n",
+            fixture.directory.path().join("remote").display()
+        ),
+    )
+    .unwrap();
     let process = fixture.process(100, &["python3"], b"");
+    fs::create_dir(process.join("ns")).unwrap();
+    symlink("mnt:[2]", process.join("ns/mnt")).unwrap();
     fs::remove_file(process.join("root")).unwrap();
-    symlink(&used, process.join("root")).unwrap();
+    symlink(&alias, process.join("root")).unwrap();
     let summary = fixture.run_and_drain().await;
     assert_eq!(summary.retained, 1);
     assert!(used.is_dir());
-    assert!(!idle.exists());
+}
+
+#[tokio::test]
+async fn background_rootfs_deletion_stops_for_shutdown() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let rootfs = fixture.rootfs("job_1");
+    let summary = fixture.run().await;
+    assert_eq!(summary.pending_rootfs.len(), 1);
+    let stop = no_stop();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    delete_pending_rootfs(
+        fixture.agent.spool_ownership(),
+        summary.pending_rootfs,
+        stop,
+    )
+    .await;
+    assert!(rootfs.join("usr/lib/python3/site.py").is_file());
 }
 
 #[tokio::test]
@@ -1005,7 +1060,12 @@ async fn background_rootfs_deletion_rechecks_ownership_and_identity() {
     fs::rename(&replaced, &saved).unwrap();
     fs::create_dir(&replaced).unwrap();
     fs::write(replaced.join("new-generation"), "fresh").unwrap();
-    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    delete_pending_rootfs(
+        fixture.agent.spool_ownership(),
+        summary.pending_rootfs,
+        no_stop(),
+    )
+    .await;
     assert!(relaunched.join("usr/lib/python3/site.py").is_file());
     assert!(replaced.join("new-generation").is_file());
     assert!(saved.join("usr/lib/python3/site.py").is_file());
@@ -1013,13 +1073,13 @@ async fn background_rootfs_deletion_rechecks_ownership_and_identity() {
 
 #[tokio::test]
 #[ignore = "requires unshare with user and mount namespaces"]
-async fn orphan_rootfs_mounts_are_detached_before_deletion_and_busy_ones_kept() {
+async fn orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stays() {
     const CHILD: &str = "SPUR_ROOTFS_MOUNT_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--mount", "--propagation", "private"])
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "agent_server::cleanup_lifecycle_tests::startup_spool_tests::orphan_rootfs_mounts_are_detached_before_deletion_and_busy_ones_kept", "--ignored"])
+            .args(["--exact", "agent_server::cleanup_lifecycle_tests::startup_spool_tests::orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stays", "--ignored"])
             .env(CHILD, "1")
             .status()
             .unwrap();
@@ -1054,7 +1114,12 @@ async fn orphan_rootfs_mounts_are_detached_before_deletion_and_busy_ones_kept() 
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(!mounts.contains(layers[0].to_str().unwrap()));
     assert!(mounts.contains(layers[1].join("upper").to_str().unwrap()));
-    delete_pending_rootfs(fixture.agent.spool_ownership(), summary.pending_rootfs).await;
+    delete_pending_rootfs(
+        fixture.agent.spool_ownership(),
+        summary.pending_rootfs,
+        no_stop(),
+    )
+    .await;
     assert!(!layers[0].exists());
     assert!(layers[1].join("upper/data").is_file());
 }

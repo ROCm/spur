@@ -4523,6 +4523,20 @@ async fn run_containerized_step(
     }
 }
 
+/// Background deletion of orphan container rootfs dirs, started after the agent serves.
+pub struct RootfsCleanup {
+    task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RootfsCleanup {
+    /// Starts the deletions; setting the returned flag stops them between entries for shutdown.
+    pub fn spawn(self) -> Arc<std::sync::atomic::AtomicBool> {
+        tokio::spawn(self.task);
+        self.stop
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SpoolOwnership {
     lifecycle: crate::job_lifecycle::JobLifecycle,
@@ -5111,10 +5125,8 @@ impl AgentService {
         BatchWorkload::Gated
     }
 
-    /// Runs the startup pass; the returned future deletes queued container rootfs dirs and is spawned once serving.
-    pub async fn cleanup_startup_job_spools(
-        &self,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+    /// Runs the startup pass; container rootfs dirs it queued are deleted by [`RootfsCleanup::spawn`].
+    pub async fn cleanup_startup_job_spools(&self) -> RootfsCleanup {
         let summary = self
             .cleanup_startup_job_spools_with_inventory(crate::startup_spool::ActivityPaths {
                 proc_root: "/proc".into(),
@@ -5130,7 +5142,15 @@ impl AgentService {
                 worker_gate: None,
             })
             .await;
-        crate::startup_spool::delete_pending_rootfs(self.spool_ownership(), summary.pending_rootfs)
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        RootfsCleanup {
+            task: Box::pin(crate::startup_spool::delete_pending_rootfs(
+                self.spool_ownership(),
+                summary.pending_rootfs,
+                stop.clone(),
+            )),
+            stop,
+        }
     }
 
     pub(crate) async fn cleanup_startup_job_spools_with_inventory(

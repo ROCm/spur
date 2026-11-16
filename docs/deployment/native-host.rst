@@ -210,22 +210,29 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   leftover directories.
 
 The same pass handles leftover container root filesystems in the container
-directory (``/var/spool/spur/containers``, or ``$SPUR_CONTAINER_DIR``):
+directory: ``$SPUR_CONTAINER_DIR`` if set for ``spurd``, else
+``/var/spool/spur/containers`` if writable, else ``$HOME/.spur/containers``.
+The spool-root rule applies to it too: it must be owned by the ``spurd`` user
+and not writable by group or others.
 
 * Only unnamed rootfs directories are considered: ``job_<id>`` for a job and
-  ``step_<id>_<step>`` for a step. Named containers (``--container-name``) are
-  never matched unless they were given one of those names, which normal job
-  completion already treats as unnamed.
-* The same controller confirmation and running-work checks apply; a process
-  whose root directory is the rootfs keeps it.
-* Overlay mounts left behind (``lower``, ``upper``, ``merged``) are detached
-  first. A mount that cannot be detached keeps the directory and logs ``kept
-  container rootfs: a mount beneath it could not be detached``.
-* Deletion runs in the background after ``spurd`` starts serving, so a large
-  image does not delay startup. A job relaunched on the node before its old
-  rootfs is gone waits for the deletion, or keeps the directory if it got there
-  first. Progress is logged as ``deleting orphan container rootfs`` and
-  ``deleted orphan container rootfs``.
+  ``step_<id>_<step>`` for a step. A named container (``--container-name``)
+  whose name is exactly one of those forms is treated as that job's rootfs;
+  other names are never touched.
+* The controller confirmation and the job checks above (tracked work,
+  supervisor, populated cgroup, job id in a process environment) apply. A
+  process whose root or working directory is the rootfs also keeps it.
+* Mounts left behind in overlay mode (``lower``, ``upper``, ``merged``) are
+  unmounted first. If one stays mounted the directory is kept and ``kept
+  container rootfs: a mount beneath it could not be unmounted`` is logged; the
+  next start tries again.
+* Deletion runs in the background after ``spurd`` starts serving, one directory
+  at a time, with no time limit, so a large image does not delay startup. A job
+  relaunched on the node with the same id waits for that deletion, or keeps the
+  directory if it got there first. Stopping ``spurd`` halts the deletion; the
+  next start finishes it. Progress is logged as ``deleting orphan container
+  rootfs`` and ``deleted orphan container rootfs``, ending with ``background
+  container rootfs cleanup finished``.
 
 Directories kept because the controller did not confirm them or the activity
 inventory was uncertain are logged with a count per batch of 128 job ids

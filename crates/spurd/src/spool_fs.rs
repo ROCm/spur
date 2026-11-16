@@ -14,6 +14,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -43,7 +45,51 @@ impl std::fmt::Display for Kept {
 
 impl std::error::Error for Kept {}
 
+const UNMOUNT_FAILED: &str = "a mount beneath it could not be unmounted";
 const TOO_DEEP: &str = "deeper than the traversal limit";
+
+/// When a walk must stop: a time budget, an agent shutdown, or neither.
+#[derive(Clone, Default)]
+pub(crate) struct Bound {
+    deadline: Option<Instant>,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+impl Bound {
+    pub(crate) fn until(deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            stop: None,
+        }
+    }
+
+    pub(crate) fn until_stopped(stop: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: None,
+            stop: Some(stop),
+        }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(budget_exhausted());
+        }
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                Kept("stopped for agent shutdown"),
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn budget_exhausted() -> io::Error {
     io::Error::new(
@@ -195,20 +241,16 @@ pub(crate) fn canonical_job_id(name: &OsStr) -> Option<u32> {
 /// Job id of an unnamed container rootfs: `job_<N>` (a job) or `step_<N>_<M>` (a step).
 pub(crate) fn canonical_rootfs_job_id(name: &OsStr) -> Option<u32> {
     let name = name.to_str()?;
-    let positive = |s: &str| {
-        s.parse::<u32>()
-            .ok()
-            .filter(|n| *n > 0 && s == n.to_string())
-    };
+    let canonical = |s: &str| s.parse::<u32>().ok().filter(|n| s == n.to_string());
     if let Some(job) = name.strip_prefix("job_") {
-        return positive(job);
+        return canonical(job).filter(|id| *id > 0);
     }
     let (job, step) = name.strip_prefix("step_")?.split_once('_')?;
-    positive(step)?;
-    positive(job)
+    canonical(step)?;
+    canonical(job).filter(|id| *id > 0)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SpoolKind {
     /// `job<N>` under a spool root: the job script and step output.
     Spool,
@@ -294,7 +336,7 @@ impl SpoolRoot {
         Ok(inode_identity(&self.directory.metadata()?))
     }
 
-    /// Detaches every mount at or beneath the entry, deepest first; any that remain keep it.
+    /// Unmounts every mount at or beneath the entry, deepest first; any that remain keep it.
     pub(crate) fn unmount_beneath(&self, spool: &JobSpool, mountinfo: &Path) -> io::Result<usize> {
         let base = self.entry_path(spool);
         let beneath = |mounts: Vec<(PathBuf, String)>| -> Vec<PathBuf> {
@@ -318,17 +360,19 @@ impl SpoolRoot {
                     Err(Errno::EINVAL | Errno::ENOENT) => {}
                     Err(error) => {
                         tracing::warn!(job_id = spool.job_id, mount = %point.display(), %error,
-                            "could not detach a mount beneath an orphan entry");
-                        return Err(io::Error::other(Kept(
-                            "a mount beneath it could not be detached",
-                        )));
+                            "could not unmount a mount beneath an orphan entry");
+                        return Err(io::Error::other(Kept(UNMOUNT_FAILED)));
                     }
                 }
             }
         }
-        Err(io::Error::other(Kept(
-            "a mount beneath it could not be detached",
-        )))
+        let remaining = beneath(read_mounts(mountinfo)?);
+        if remaining.is_empty() {
+            return Ok(detached);
+        }
+        tracing::warn!(job_id = spool.job_id, mounts = ?remaining,
+            "mounts beneath an orphan entry would not unmount");
+        Err(io::Error::other(Kept(UNMOUNT_FAILED)))
     }
 
     pub(crate) fn candidates(&self, kind: SpoolKind) -> io::Result<Vec<JobSpool>> {
@@ -359,12 +403,14 @@ impl SpoolRoot {
                     continue;
                 }
             }
-            match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
-                Ok(directory) => candidates.push(JobSpool {
+            let opened = open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+                .and_then(|directory| Ok((rootfs_roots(kind, &directory)?, directory.metadata()?)));
+            match opened {
+                Ok((roots, metadata)) => candidates.push(JobSpool {
                     job_id,
                     kind,
-                    roots: rootfs_roots(kind, &directory)?,
-                    metadata: directory.metadata()?,
+                    roots,
+                    metadata,
                     name,
                 }),
                 Err(error) => tracing::warn!(job_id, root = %self.path.display(), %error,
@@ -374,12 +420,12 @@ impl SpoolRoot {
         Ok(candidates)
     }
 
-    pub(crate) fn delete(&self, spool: &JobSpool, deadline: Option<Instant>) -> io::Result<()> {
+    pub(crate) fn delete(&self, spool: &JobSpool, bound: &Bound) -> io::Result<()> {
         verify_root(&self.directory)?;
         if Self::open(self.path.clone())?.identity()? != self.identity()? {
             return Err(io::Error::other("spool root changed since discovery"));
         }
-        self.delete_job(spool, deadline)
+        self.delete_job(spool, bound)
     }
 
     /// Whether any entry in the job's spool is one of `held`, the inodes live processes keep open.
@@ -387,7 +433,7 @@ impl SpoolRoot {
         &self,
         spool: &JobSpool,
         held: &HashSet<(u64, u64)>,
-        deadline: Option<Instant>,
+        bound: &Bound,
     ) -> io::Result<bool> {
         if held.is_empty() {
             return Ok(false);
@@ -407,9 +453,7 @@ impl SpoolRoot {
         }
         let mut stack = vec![ReadFrame::new(directory)?];
         while !stack.is_empty() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(budget_exhausted());
-            }
+            bound.check()?;
             let depth = stack.len();
             let Some(frame) = stack.last_mut() else {
                 break;
@@ -446,7 +490,7 @@ impl SpoolRoot {
         Ok(false)
     }
 
-    fn delete_job(&self, spool: &JobSpool, deadline: Option<Instant>) -> io::Result<()> {
+    fn delete_job(&self, spool: &JobSpool, bound: &Bound) -> io::Result<()> {
         let name = spool.name.clone();
         let directory =
             match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
@@ -458,7 +502,7 @@ impl SpoolRoot {
         if !same_identity(&directory.metadata()?, &spool.metadata) {
             return Err(io::Error::other("job spool changed since discovery"));
         }
-        remove_contents(&directory, deadline)?;
+        remove_contents(&directory, bound)?;
         require_identity(&self.directory, &name, &spool.metadata)?;
         absent_is_success(
             unlinkat(&self.directory, name.as_os_str(), UnlinkatFlags::RemoveDir)
@@ -500,12 +544,10 @@ fn require_identity(parent: &File, name: &OsStr, expected: &Metadata) -> io::Res
     Ok(())
 }
 
-fn remove_contents(directory: &File, deadline: Option<Instant>) -> io::Result<()> {
+fn remove_contents(directory: &File, bound: &Bound) -> io::Result<()> {
     let mut stack = vec![TraversalFrame::new(directory.try_clone()?, None)];
     while !stack.is_empty() {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(budget_exhausted());
-        }
+        bound.check()?;
         let depth = stack.len();
         let Some(frame) = stack.last_mut() else {
             break;
@@ -655,7 +697,7 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
             roots: Vec::new(),
             name,
         },
-        Some(Instant::now() + COMPLETION_BUDGET),
+        &Bound::until(Instant::now() + COMPLETION_BUDGET),
     )
 }
 

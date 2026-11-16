@@ -180,7 +180,9 @@ fn cleanup_stops_at_its_deadline_and_keeps_the_spool() {
         .unwrap()
         .pop()
         .unwrap();
-    let error = spool_root.delete(&spool, Some(Instant::now())).unwrap_err();
+    let error = spool_root
+        .delete(&spool, &Bound::until(Instant::now()))
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(kept_reason(&error), Some("cleanup time budget exhausted"));
     assert!(root.join("job1/output").is_file());
@@ -298,7 +300,7 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
     std::fs::rename(root.join("job1"), root.join("retained-job")).unwrap();
     std::fs::create_dir(root.join("job1")).unwrap();
     std::fs::write(root.join("job1/output"), "replacement").unwrap();
-    assert!(spool_root.delete(&spool, None).is_err());
+    assert!(spool_root.delete(&spool, &Bound::default()).is_err());
     assert_eq!(
         std::fs::read_to_string(root.join("job1/output")).unwrap(),
         "replacement"
@@ -317,7 +319,7 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
     std::fs::rename(&root, &retained).unwrap();
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(spool_root.delete(&spool, None).is_err());
+    assert!(spool_root.delete(&spool, &Bound::default()).is_err());
     assert_eq!(
         std::fs::read_to_string(retained.join("job1/output")).unwrap(),
         "replacement"
@@ -427,7 +429,9 @@ fn traversal_fd_exhaustion_retains_the_spool() {
     let spool = root.candidates(SpoolKind::Spool).unwrap().pop().unwrap();
     set_fd_limit(32);
     assert_eq!(
-        root.delete(&spool, None).unwrap_err().raw_os_error(),
+        root.delete(&spool, &Bound::default())
+            .unwrap_err()
+            .raw_os_error(),
         Some(libc::EMFILE)
     );
     assert!(fixture.root.join("job1").is_dir());
@@ -529,7 +533,12 @@ fn fallback_rejects_same_filesystem_bind_mounts() {
 
 #[test]
 fn rootfs_names_are_parsed_strictly() {
-    for (name, id) in [("job_7", 7), ("step_7_2", 7), ("job_4294967295", u32::MAX)] {
+    for (name, id) in [
+        ("job_7", 7),
+        ("step_7_2", 7),
+        ("step_7_0", 7),
+        ("job_4294967295", u32::MAX),
+    ] {
         assert_eq!(
             canonical_rootfs_job_id(OsStr::new(name)),
             Some(id),
@@ -543,7 +552,8 @@ fn rootfs_names_are_parsed_strictly() {
         "job7",
         "step_7",
         "step_7_",
-        "step_7_0",
+        "step_7_00",
+        "step_0_1",
         "step_07_1",
         "step_7_2_3",
         "job_7_1",
@@ -553,4 +563,23 @@ fn rootfs_names_are_parsed_strictly() {
     ] {
         assert_eq!(canonical_rootfs_job_id(OsStr::new(name)), None, "{name}");
     }
+}
+
+#[test]
+fn a_stop_request_halts_deletion_and_keeps_the_rest() {
+    let (_directory, root) = fixture();
+    std::fs::create_dir(root.join("job1")).unwrap();
+    std::fs::write(root.join("job1/output"), "retained").unwrap();
+    let spool_root = SpoolRoot::open(root.clone()).unwrap();
+    let spool = spool_root
+        .candidates(SpoolKind::Spool)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(true));
+    let error = spool_root
+        .delete(&spool, &Bound::until_stopped(stop))
+        .unwrap_err();
+    assert_eq!(kept_reason(&error), Some("stopped for agent shutdown"));
+    assert!(root.join("job1/output").is_file());
 }

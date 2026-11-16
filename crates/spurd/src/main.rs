@@ -876,7 +876,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
     let server_task = tokio::spawn(server_future);
-    tokio::spawn(rootfs_cleanup);
+    let rootfs_cleanup_stop = rootfs_cleanup.spawn();
 
     if !recovered_stepds.is_empty() {
         for descriptor in recovered_stepds {
@@ -1012,6 +1012,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_task => { result??; }
         _ = sigterm.recv() => {
+            rootfs_cleanup_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if !stepds_handle.lock().await.is_empty() {
                 info!("received SIGTERM with held stepds; preserving controller registration");
                 return Ok(());

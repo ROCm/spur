@@ -341,16 +341,20 @@ def test_orphan_container_rootfs_is_unmounted_and_removed_after_serving(local_cl
         (overlay / layer).mkdir(parents=True)
     upper = "/var/spool/spur/containers/job_502/upper"
     cluster.call("mount_tmpfs", path=upper)
-    (overlay / "upper/data").write_text("layer\n")
+    first_step = _make_rootfs(containers / "step_501_0")
+    decoy = _make_rootfs(containers / "job_0501")
     named = _make_rootfs(containers / "my-image")
     never_issued = _make_rootfs(containers / f"job_{NEVER_ISSUED}")
     log = cluster.start_agent()
     assert "queued orphan container rootfs for background deletion" in log, log
     log = cluster.wait_file(cluster.agent["log"], "deleted orphan container rootfs job_id=502")
-    cluster.wait_file(cluster.agent["log"], "deleted orphan container rootfs job_id=501")
+    log = cluster.wait_file(cluster.agent["log"], "background container rootfs cleanup finished")
+    assert "deleted=3 kept=0 failed=0" in log, log
     assert log.index("agent gRPC server listening") < log.index("deleting orphan container rootfs"), log
     assert not extracted.exists()
+    assert not first_step.exists()
     assert not overlay.exists()
+    assert decoy.is_dir()
     assert not cluster.call("mounted", path=upper)
     assert (named / "usr/lib/site.py").read_text() == "image\n"
     assert (never_issued / "usr/lib/site.py").read_text() == "image\n"

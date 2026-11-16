@@ -4,7 +4,7 @@
 use crate::agent_server::{AgentService, SpoolOwnership};
 use crate::spool_fs::{
     budget_exhausted, directory_names, inode_identity, kept_reason, open_child, open_directory,
-    read_mounts, JobSpool, SpoolKind, SpoolRoot,
+    read_mounts, Bound, JobSpool, SpoolKind, SpoolRoot,
 };
 use nix::fcntl::OFlag;
 use spur_core::job::JobState;
@@ -16,6 +16,7 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -210,7 +211,7 @@ pub(crate) async fn run(
             let job_candidates = candidates.remove(&job_id).unwrap_or_default();
             if !confirmed.contains(&job_id) {
                 for candidate in &job_candidates {
-                    debug!(job_id, path = %candidate.path.display(), "retained job spool: controller has not confirmed terminality or absence");
+                    debug!(job_id, path = %candidate.path.display(), "retained {}: controller has not confirmed terminality or absence", candidate.spool.kind.label());
                 }
                 unconfirmed += job_candidates.len();
                 continue;
@@ -218,7 +219,7 @@ pub(crate) async fn run(
             let guard = service.spool_lifecycle_guard(job_id).await;
             if let Some(reason) = service.spool_local_owner(job_id).await {
                 for candidate in &job_candidates {
-                    info!(job_id, path = %candidate.path.display(), reason, "retained locally owned job spool");
+                    info!(job_id, path = %candidate.path.display(), reason, "retained locally owned {}", candidate.spool.kind.label());
                 }
                 summary.retained += job_candidates.len();
                 continue;
@@ -229,7 +230,7 @@ pub(crate) async fn run(
         if unconfirmed > 0 {
             info!(
                 count = unconfirmed,
-                "retained job spools: controller has not confirmed terminality or absence"
+                "retained directories: controller has not confirmed terminality or absence"
             );
             summary.retained += unconfirmed;
         }
@@ -278,10 +279,10 @@ fn retain_remaining(
 ) {
     let count = candidates.values().map(Vec::len).sum::<usize>();
     for candidate in candidates.values().flatten() {
-        debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), reason, "retained job spool");
+        debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), reason, "retained {}", candidate.spool.kind.label());
     }
     if count > 0 {
-        warn!(count, reason, "retained remaining job spools");
+        warn!(count, reason, "retained remaining directories");
     }
     summary.retained += count;
 }
@@ -325,7 +326,7 @@ fn discover(paths: Vec<(PathBuf, SpoolKind)>) -> Vec<Candidate> {
             }
         };
         let spools = match root.identity() {
-            Ok(identity) if !roots.insert(identity) => continue,
+            Ok(identity) if !roots.insert((identity, kind)) => continue,
             Ok(_) => root.candidates(kind),
             Err(error) => Err(error),
         };
@@ -351,6 +352,18 @@ fn clean_inactive(
     deadline: Instant,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
+    let inventory = match activity_inventory(&candidates, paths, deadline) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            for candidate in &candidates {
+                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained {}: activity inventory uncertain", candidate.spool.kind.label());
+            }
+            warn!(count = candidates.len(), %error, "retained directories: activity inventory uncertain");
+            summary.retained += candidates.len();
+            return summary;
+        }
+    };
+    let bound = Bound::until(deadline);
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
         let path = &candidate.path;
@@ -362,7 +375,7 @@ fn clean_inactive(
                 SpoolKind::Spool => {
                     candidate
                         .root
-                        .holds_any(&candidate.spool, &inventory.held, Some(deadline))
+                        .holds_any(&candidate.spool, &inventory.held, &bound)
                 }
                 // A rootfs is held through its root inode; walking a full image tree is too slow.
                 SpoolKind::Rootfs => Ok(candidate
@@ -391,7 +404,7 @@ fn clean_inactive(
                     Err(error) => Err(error),
                 }
             }
-            Ok(false) => candidate.root.delete(&candidate.spool, Some(deadline)),
+            Ok(false) => candidate.root.delete(&candidate.spool, &bound),
             Err(error) => Err(error),
         };
         match result {
@@ -415,34 +428,57 @@ fn clean_inactive(
 }
 
 /// Deletes confirmed orphan container rootfs dirs after the agent serves; each holds its job's lifecycle lock.
-pub(crate) async fn delete_pending_rootfs(owners: SpoolOwnership, pending: Vec<PendingRootfs>) {
+pub(crate) async fn delete_pending_rootfs(
+    owners: SpoolOwnership,
+    pending: Vec<PendingRootfs>,
+    stop: Arc<AtomicBool>,
+) {
+    let (mut deleted, mut kept, mut failed) = (0, 0, 0);
     for PendingRootfs(candidate) in pending {
+        if stop.load(Ordering::Relaxed) {
+            kept += 1;
+            continue;
+        }
         let job_id = candidate.spool.job_id;
         let guard = owners.guard(job_id).await;
         if let Some(reason) = owners.local_owner(job_id).await {
             info!(job_id, path = %candidate.path.display(), reason, "kept container rootfs: the job is active again");
+            kept += 1;
             continue;
         }
         info!(job_id, path = %candidate.path.display(), "deleting orphan container rootfs");
         let path = candidate.path.clone();
-        let deleted = tokio::task::spawn_blocking(move || {
+        let bound = Bound::until_stopped(stop.clone());
+        let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            candidate.root.delete(&candidate.spool, None)
+            candidate.root.delete(&candidate.spool, &bound)
         })
         .await;
-        match deleted {
-            Ok(Ok(())) => info!(job_id, path = %path.display(), "deleted orphan container rootfs"),
+        match result {
+            Ok(Ok(())) => {
+                deleted += 1;
+                info!(job_id, path = %path.display(), "deleted orphan container rootfs");
+            }
             Ok(Err(error)) => match kept_reason(&error) {
                 Some(reason) => {
-                    warn!(job_id, path = %path.display(), "kept container rootfs: {reason}")
+                    kept += 1;
+                    warn!(job_id, path = %path.display(), "kept container rootfs: {reason}");
                 }
                 None => {
-                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup")
+                    failed += 1;
+                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup");
                 }
             },
-            Err(error) => warn!(job_id, %error, "container rootfs deletion task failed"),
+            Err(error) => {
+                failed += 1;
+                warn!(job_id, %error, "container rootfs deletion task failed");
+            }
         }
     }
+    info!(
+        deleted,
+        kept, failed, "background container rootfs cleanup finished"
+    );
 }
 
 struct Inventory {
@@ -566,6 +602,7 @@ fn inspect_processes(
     deadline: Instant,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
+    let own_namespace = mount_namespace(&paths.proc_root.join("self"));
     let holders = HolderFilter {
         devices: candidates
             .iter()
@@ -592,7 +629,15 @@ fn inspect_processes(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let result = inspect_process(&path, paths.supervisor_uid, candidates, &holders, inventory);
+        let foreign = own_namespace.is_some() && mount_namespace(&path) != own_namespace;
+        let result = inspect_process(
+            &path,
+            paths.supervisor_uid,
+            candidates,
+            &holders,
+            foreign,
+            inventory,
+        );
         match fs::read(path.join("stat")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -656,6 +701,10 @@ impl RemoteMounts {
             .max_by_key(|(point, _)| point.as_os_str().len())
             .is_some_and(|(_, remote)| *remote)
     }
+}
+
+fn mount_namespace(process: &Path) -> Option<PathBuf> {
+    fs::read_link(process.join("ns/mnt")).ok()
 }
 
 fn is_remote(kind: &str) -> bool {
@@ -729,6 +778,7 @@ fn inspect_process(
     supervisor_uid: u32,
     candidates: &[Candidate],
     holders: &HolderFilter,
+    foreign: bool,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     let cmdline = fs::read(path.join("cmdline"))?;
@@ -768,7 +818,7 @@ fn inspect_process(
     for link in ["cwd", "root"] {
         let link = path.join(link);
         match fs::read_link(&link) {
-            Ok(target) => protect_holder(&link, &target, candidates, holders, inventory)?,
+            Ok(target) => protect_holder(&link, &target, candidates, holders, foreign, inventory)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound && args.is_empty() => {}
             Err(error) => return Err(error),
         }
@@ -776,7 +826,7 @@ fn inspect_process(
     for fd in fs::read_dir(path.join("fd"))? {
         let fd = fd?.path();
         match fs::read_link(&fd) {
-            Ok(target) => protect_holder(&fd, &target, candidates, holders, inventory)?,
+            Ok(target) => protect_holder(&fd, &target, candidates, holders, foreign, inventory)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -790,10 +840,12 @@ fn protect_holder(
     target: &Path,
     candidates: &[Candidate],
     holders: &HolderFilter,
+    foreign: bool,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     protect_target(target, candidates, &mut inventory.protected);
-    if !target.is_absolute() || holders.remote.contains(target) {
+    // Another mount namespace reports paths from its own root, so the host mount table says nothing.
+    if !target.is_absolute() || (!foreign && holders.remote.contains(target)) {
         return Ok(());
     }
     match fs::metadata(holder) {
