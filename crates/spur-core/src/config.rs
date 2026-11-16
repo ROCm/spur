@@ -127,6 +127,19 @@ pub struct SlurmConfig {
     /// direction of `[controller] agent_*`.
     #[serde(default)]
     pub spurd: SpurdConfig,
+
+    /// `salloc` behavior, read by the CLI from the submit host's `spur.conf`.
+    #[serde(default)]
+    pub salloc: SallocConfig,
+}
+
+/// Client-side `salloc` settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SallocConfig {
+    /// Start the allocation's shell as an interactive step on its first node
+    /// instead of on the submit host (Slurm `LaunchParameters=use_interactive_step`).
+    #[serde(default)]
+    pub use_interactive_step: bool,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -357,7 +370,8 @@ pub struct ControllerConfig {
 
     /// Seconds without a heartbeat before the leader checks on a node. A node
     /// whose agent still answers is kept; one that fails two checks a health
-    /// pass apart is marked Down. Defaults to 90 when absent.
+    /// pass apart is marked Down. Defaults to 90 when absent. Also the
+    /// shortest recovery hold before a node still reporting ended jobs is drained.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
@@ -5020,6 +5034,18 @@ max_batch_requeue = 7
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_batch_requeue, 7);
+    }
+
+    #[test]
+    fn salloc_interactive_step_defaults_off_and_parses_when_set() {
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").expect("parse");
+        assert!(!unset.salloc.use_interactive_step);
+
+        let set = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[salloc]\nuse_interactive_step = true\n",
+        )
+        .expect("parse");
+        assert!(set.salloc.use_interactive_step);
     }
 
     #[test]

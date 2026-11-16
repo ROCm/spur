@@ -510,5 +510,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         mpi: Default::default(),
         health: Default::default(),
         spurd: Default::default(),
+        salloc: Default::default(),
     }
 }

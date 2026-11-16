@@ -254,8 +254,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        with ``--requeue`` goes back to the queue, and is held there after
        ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
        stopped when they heartbeat again, or when the job is relaunched there
-       (see :ref:`requeued-run-upgrade-notes` for older agents). See
-       :ref:`node-liveness`.
+       (see :ref:`requeued-run-upgrade-notes` for older agents). Also bounds how
+       long a returning node's recovery is held while it still reports runs the
+       controller ended or requeued, after which it is drained for an operator:
+       the hold lasts this long, or the node's kill, cleanup, and epilog budget
+       plus one heartbeat interval if that is longer. See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``
@@ -2142,6 +2145,37 @@ POSIX ``RLIMIT_*`` values ``spurd`` applies to job steps at launch.
 
    ``memlock = "unlimited"`` lets RDMA and NCCL workloads pin memory out of the box.
    Lower it only when a hard cap is required.
+
+.. _salloc-config:
+
+``[salloc]``
+------------
+
+How ``salloc`` (``spur alloc``) behaves once its allocation is granted. ``salloc``
+reads this from ``spur.conf`` on the host it runs on, so set it on every login
+node.
+
+**Reload: none.** Each ``salloc`` invocation reads the file.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 10 10 56
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``use_interactive_step``
+     - bool
+     - ``false``
+     - Start the shell as an interactive step on the allocation's first node
+       instead of on the submit host, so the work typed at the prompt runs on
+       the allocated hardware and inside the job's cgroup. Slurm
+       ``LaunchParameters=use_interactive_step``. Applies only when
+       ``salloc``'s stdin is a terminal, so scripted ``salloc`` runs keep a
+       local shell. Users override it per invocation with
+       ``--interactive-step`` / ``--no-interactive-step``. See
+       :ref:`salloc-interactive-step`.
 
 ``[mpi]``
 ---------
