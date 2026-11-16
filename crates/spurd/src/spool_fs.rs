@@ -45,6 +45,7 @@ impl std::fmt::Display for Kept {
 
 impl std::error::Error for Kept {}
 
+const CHANGED: &str = "changed since discovery";
 const UNMOUNT_FAILED: &str = "a mount beneath it could not be unmounted";
 const TOO_DEEP: &str = "deeper than the traversal limit";
 
@@ -195,22 +196,35 @@ pub(crate) fn job_spool_name(job_id: u32) -> OsString {
     OsString::from(format!("job{job_id}"))
 }
 
-/// Mount points and filesystem types from a mountinfo file; a missing file lists none.
-pub(crate) fn read_mounts(path: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+/// One line of a mountinfo file.
+pub(crate) struct Mount {
+    pub(crate) id: u64,
+    pub(crate) device: String,
+    pub(crate) root: PathBuf,
+    pub(crate) point: PathBuf,
+    pub(crate) kind: String,
+}
+
+/// Mounts listed in a mountinfo file; a missing file lists none.
+pub(crate) fn read_mounts(path: &Path) -> io::Result<Vec<Mount>> {
     let info = match std::fs::read_to_string(path) {
         Ok(info) => info,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    Ok(info
-        .lines()
-        .filter_map(|line| {
-            let (left, right) = line.split_once(" - ")?;
-            let point = left.split(' ').nth(4)?;
-            let kind = right.split(' ').next()?;
-            Some((PathBuf::from(unescape_mount_path(point)), kind.to_owned()))
-        })
-        .collect())
+    Ok(info.lines().filter_map(parse_mount_line).collect())
+}
+
+fn parse_mount_line(line: &str) -> Option<Mount> {
+    let (left, right) = line.split_once(" - ")?;
+    let fields: Vec<_> = left.split(' ').collect();
+    Some(Mount {
+        id: fields.first()?.parse().ok()?,
+        device: (*fields.get(2)?).to_owned(),
+        root: PathBuf::from(unescape_mount_path(fields.get(3)?)),
+        point: PathBuf::from(unescape_mount_path(fields.get(4)?)),
+        kind: right.split(' ').next()?.to_owned(),
+    })
 }
 
 fn unescape_mount_path(point: &str) -> String {
@@ -280,6 +294,13 @@ pub(crate) struct SpoolRoot {
     directory: File,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Unmounted {
+    pub(crate) count: usize,
+    /// Whether a mount sat on the entry itself, so the directory underneath is a new identity.
+    pub(crate) base: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct JobSpool {
     pub(crate) job_id: u32,
@@ -337,18 +358,22 @@ impl SpoolRoot {
     }
 
     /// Unmounts every mount at or beneath the entry, deepest first; any that remain keep it.
-    pub(crate) fn unmount_beneath(&self, spool: &JobSpool, mountinfo: &Path) -> io::Result<usize> {
+    pub(crate) fn unmount_beneath(
+        &self,
+        spool: &JobSpool,
+        mountinfo: &Path,
+    ) -> io::Result<Unmounted> {
         let base = self.entry_path(spool);
-        let beneath = |mounts: Vec<(PathBuf, String)>| -> Vec<PathBuf> {
+        let beneath = |mounts: Vec<Mount>| -> Vec<PathBuf> {
             let mut points: Vec<_> = mounts
                 .into_iter()
-                .map(|(point, _)| point)
+                .map(|mount| mount.point)
                 .filter(|point| point.starts_with(&base))
                 .collect();
             points.sort_by_key(|point| std::cmp::Reverse(point.as_os_str().len()));
             points
         };
-        let mut detached = 0;
+        let mut detached = Unmounted::default();
         for _ in 0..MAX_UNMOUNT_ROUNDS {
             let points = beneath(read_mounts(mountinfo)?);
             if points.is_empty() {
@@ -356,7 +381,10 @@ impl SpoolRoot {
             }
             for point in points {
                 match umount2(&point, MntFlags::UMOUNT_NOFOLLOW) {
-                    Ok(()) => detached += 1,
+                    Ok(()) => {
+                        detached.count += 1;
+                        detached.base |= point == base;
+                    }
                     Err(Errno::EINVAL | Errno::ENOENT) => {}
                     Err(error) => {
                         tracing::warn!(job_id = spool.job_id, mount = %point.display(), %error,
@@ -440,24 +468,32 @@ impl SpoolRoot {
         }
     }
 
-    /// The entry as it is now, e.g. the directory underneath once a mount on it is gone.
-    pub(crate) fn reopen(&self, spool: &JobSpool) -> io::Result<JobSpool> {
+    /// The entry after unmounting; only a mount removed from the entry itself may change its identity.
+    pub(crate) fn reopen(&self, spool: &JobSpool, unmounted: Unmounted) -> io::Result<JobSpool> {
         let directory = open_child(
             &self.directory,
             &spool.name,
             OFlag::O_RDONLY | OFlag::O_DIRECTORY,
         )?;
+        let metadata = directory.metadata()?;
+        if !unmounted.base && !same_identity(&metadata, &spool.metadata) {
+            return Err(io::Error::other(Kept(CHANGED)));
+        }
         Ok(JobSpool {
             roots: rootfs_roots(spool.kind, &directory)?,
-            metadata: directory.metadata()?,
+            metadata,
             ..spool.clone()
         })
+    }
+
+    pub(crate) fn device(&self) -> io::Result<u64> {
+        Ok(self.directory.metadata()?.dev())
     }
 
     pub(crate) fn delete(&self, spool: &JobSpool, bound: &Bound) -> io::Result<()> {
         verify_root(&self.directory)?;
         if Self::open(self.path.clone())?.identity()? != self.identity()? {
-            return Err(io::Error::other("spool root changed since discovery"));
+            return Err(io::Error::other(Kept(CHANGED)));
         }
         self.delete_job(spool, bound)
     }
@@ -480,7 +516,7 @@ impl SpoolRoot {
                 Err(error) => return Err(error),
             };
         if !same_identity(&directory.metadata()?, &spool.metadata) {
-            return Err(io::Error::other("job spool changed since discovery"));
+            return Err(io::Error::other(Kept(CHANGED)));
         }
         if held.contains(&inode_identity(&spool.metadata)) {
             return Ok(true);
@@ -534,7 +570,7 @@ impl SpoolRoot {
             };
         require_identity(&self.directory, &name, &spool.metadata)?;
         if !same_identity(&directory.metadata()?, &spool.metadata) {
-            return Err(io::Error::other("job spool changed since discovery"));
+            return Err(io::Error::other(Kept(CHANGED)));
         }
         remove_contents(&directory, bound)?;
         require_identity(&self.directory, &name, &spool.metadata)?;

@@ -47,7 +47,8 @@ directory. Used when running without root or for named (persistent) containers.
 
 Named containers reuse an existing rootfs directory across jobs. Unnamed
 containers are cleaned up after the job exits (unmount for overlay, `rm -rf`
-for extracted).
+for extracted); leftovers from a crash are removed by spurd's startup orphan
+pass (see the job execution notes).
 
 ## 2. Image import and pulling (OCI registry support)
 

@@ -205,34 +205,42 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   kept. Give root the Operator role (for example through ``operator_groups``)
   to let cleanup proceed; ``allow_uid_zero_administrator = true`` also works but
   makes root on every node a cluster Administrator.
-* Run one ``spurd`` per host. The spool and cgroup roots are fixed, so a second
-  agent from another cluster on the same host could remove the first agent's
-  leftover directories.
+* Run one ``spurd`` per host. The spool, container and cgroup roots are fixed,
+  so a second agent from another cluster on the same host could remove the
+  first agent's leftover directories.
 
 The same pass handles leftover container root filesystems in the container
 directory: ``$SPUR_CONTAINER_DIR`` if set for ``spurd``, else
-``/var/spool/spur/containers`` if writable, else ``$HOME/.spur/containers``.
-The spool-root rule applies to it too: it must be owned by the ``spurd`` user
-and not writable by group or others.
+``/var/spool/spur/containers`` (created if missing) if writable, else
+``$HOME/.spur/containers``. The spool-root rule applies to it too: it must be
+owned by the ``spurd`` user and not writable by group or others.
 
 * Only unnamed rootfs directories are considered: ``job_<id>`` for a job and
   ``step_<id>_<step>`` for a step. A named container (``--container-name``)
   whose name is exactly one of those forms is treated as that job's rootfs;
   other names are never touched.
-* The controller confirmation and the job checks above (tracked work,
-  supervisor, populated cgroup, job id in a process environment) apply. A
-  process whose root or working directory is the rootfs also keeps it.
-* Mounts left behind in overlay mode (``lower``, ``upper``, ``merged``), or a
-  mount on the rootfs directory itself, are unmounted first. If one stays mounted the directory is kept and ``kept
-  container rootfs: a mount beneath it could not be unmounted`` is logged; the
-  next start tries again.
+* The controller confirmation and the job checks above apply. As with spools,
+  a process whose working directory, root or open file is inside the rootfs
+  keeps it; a process in another mount namespace (such as the container
+  itself) is checked against its own mount table, and a bind mount of any part
+  of the rootfs, in any namespace, keeps it.
+* Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
+  ``merged``, or a mount on the directory itself) is unmounted first, without a
+  lazy detach. If one stays mounted the directory is kept and ``kept container
+  rootfs: a mount beneath it could not be unmounted`` is logged; the next start
+  tries again.
 * Deletion runs in the background after ``spurd`` starts serving, one directory
   at a time, with no time limit, so a large image does not delay startup. A job
-  relaunched on the node with the same id waits for that deletion, or keeps the
-  directory if it got there first. Stopping ``spurd`` halts the deletion; the
-  next start finishes it. Progress is logged as ``deleting orphan container
-  rootfs`` and ``deleted orphan container rootfs``, ending with ``background
-  container rootfs cleanup finished``.
+  relaunched on the node with the same id waits, without a time limit, for
+  that deletion, or keeps the directory if it got there first. Stopping
+  ``spurd`` halts the deletion and the next start finishes it.
+
+Container rootfs decisions are logged as ``retained container rootfs:
+<reason>``, ``queued orphan container rootfs for background deletion``,
+``deleting orphan container rootfs``, ``deleted orphan container rootfs`` or
+``kept container rootfs: <reason>``; a finished background run logs
+``background container rootfs cleanup finished deleted=<n> kept=<n>
+failed=<n>``.
 
 Directories kept because the controller did not confirm them or the activity
 inventory was uncertain are logged with a count per batch of 128 job ids

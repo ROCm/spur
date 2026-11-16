@@ -993,33 +993,113 @@ async fn container_processes_keep_their_rootfs_through_their_root() {
 }
 
 #[tokio::test]
-async fn processes_in_another_mount_namespace_are_stat_ed_despite_remote_host_paths() {
+async fn processes_in_another_mount_namespace_are_judged_by_their_own_mounts() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = SpoolFixture::new(&controller, &[]);
-    let used = fixture.rootfs("job_1");
+    let local = fixture.rootfs("job_1");
+    let remote = fixture.rootfs("job_2");
     let proc_root = fixture.paths().proc_root;
+    let alias_dir = fixture.directory.path().join("aliases");
+    fs::create_dir(&alias_dir).unwrap();
     fs::create_dir_all(proc_root.join("self/ns")).unwrap();
     symlink("mnt:[1]", proc_root.join("self/ns/mnt")).unwrap();
-    let alias = fixture.directory.path().join("remote/pivoted-root");
-    fs::create_dir(fixture.directory.path().join("remote")).unwrap();
-    symlink(&used, &alias).unwrap();
-    fs::write(
-        proc_root.join("self/mountinfo"),
+    let nfs_line = |point: &std::path::Path| {
         format!(
             "36 25 0:50 / {} rw - nfs4 server:/export rw\n",
-            fixture.directory.path().join("remote").display()
+            point.display()
+        )
+    };
+    fs::write(proc_root.join("self/mountinfo"), nfs_line(&alias_dir)).unwrap();
+    // Each process sees the alias dir differently: local ext4 for one, NFS for the other.
+    for (pid, rootfs, own_mounts) in [
+        (
+            100,
+            &local,
+            format!(
+                "40 1 8:1 / {} rw - ext4 /dev/sda1 rw\n",
+                alias_dir.display()
+            ),
         ),
+        (101, &remote, nfs_line(&alias_dir)),
+    ] {
+        let alias = alias_dir.join(format!("root-{pid}"));
+        symlink(rootfs, &alias).unwrap();
+        let process = fixture.process(pid, &["python3"], b"");
+        fs::create_dir(process.join("ns")).unwrap();
+        symlink(format!("mnt:[{pid}]"), process.join("ns/mnt")).unwrap();
+        fs::write(process.join("mountinfo"), own_mounts).unwrap();
+        fs::remove_file(process.join("root")).unwrap();
+        symlink(&alias, process.join("root")).unwrap();
+    }
+    let summary = fixture.run_and_drain().await;
+    assert_eq!(summary.retained, 1);
+    assert!(
+        local.is_dir(),
+        "a local root is stat-ed even when the host calls the path remote"
+    );
+    assert!(
+        !remote.exists(),
+        "a root on the process's own network mount is never stat-ed"
+    );
+}
+
+#[tokio::test]
+async fn a_rootfs_subtree_bound_in_any_namespace_keeps_the_rootfs() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let bound = fixture.rootfs("job_1");
+    let free = fixture.rootfs("job_2");
+    let proc_root = fixture.paths().proc_root;
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
     )
     .unwrap();
     let process = fixture.process(100, &["python3"], b"");
+    fs::write(
+        process.join("mountinfo"),
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /data rw - ext4 /dev/sda1 rw\n",
+            fs::canonicalize(&bound).unwrap().join("usr").display()
+        ),
+    )
+    .unwrap();
     fs::create_dir(process.join("ns")).unwrap();
     symlink("mnt:[2]", process.join("ns/mnt")).unwrap();
-    fs::remove_file(process.join("root")).unwrap();
-    symlink(&alias, process.join("root")).unwrap();
     let summary = fixture.run_and_drain().await;
     assert_eq!(summary.retained, 1);
-    assert!(used.is_dir());
+    assert!(bound.join("usr/lib/python3/site.py").is_file());
+    assert!(!free.exists());
+}
+
+#[tokio::test]
+async fn a_rootfs_replaced_during_the_controller_query_is_kept() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = Arc::new(SpoolFixture::new(&controller, &[]));
+    let rootfs = fixture.rootfs("job_1");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *controller.state.spool_query_barrier.lock().unwrap() =
+        Some((entered.clone(), release.clone()));
+    let cleanup = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.run_and_drain().await }
+    });
+    entered.notified().await;
+    let saved = fixture.directory.path().join("saved");
+    fs::rename(&rootfs, &saved).unwrap();
+    fs::create_dir(&rootfs).unwrap();
+    fs::write(rootfs.join("replacement"), "new").unwrap();
+    release.notify_one();
+    let summary = cleanup.await.unwrap();
+    assert!(summary.pending_rootfs.is_empty());
+    assert_eq!(summary.retained, 1);
+    assert!(rootfs.join("replacement").is_file());
+    assert!(saved.join("usr/lib/python3/site.py").is_file());
 }
 
 #[tokio::test]

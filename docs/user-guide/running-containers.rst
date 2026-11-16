@@ -58,6 +58,9 @@ runs inside the container.
      - Working directory inside the container.
    * - ``--container-name <name>``
      - Persist the container across jobs. Required for ``spur image export``.
+       Avoid names of the form ``job_<id>`` or ``step_<id>_<step>``: those
+       are reserved for unnamed containers and are removed once job ``<id>``
+       has ended.
    * - ``--container-readonly``
      - Not yet implemented — rejected at submission. (A read-only container
        root is not enforced yet; the flag is refused rather than silently

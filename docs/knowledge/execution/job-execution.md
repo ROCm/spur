@@ -473,13 +473,18 @@ Unnamed container rootfs dirs (`job_<id>`, `step_<id>_<step>`, step ids from
 0) under `container::container_dir()` are candidates too, keyed by the same job
 id and gated the same way; `/proc/<pid>/root` joins the inventory, and a rootfs
 counts as held when its base or overlay `merged` root inode is held (no full
-walk). Links of a process in another mount namespace are stat-ed even when the
-host mount table calls the path remote, since they resolve from that process's
-own root. Mounts at or beneath the base (from `/proc/self/mountinfo`) are
-unmounted deepest-first without `MNT_DETACH`, for up to four rounds; any that
-remain keep it. Confirmed rootfs dirs are deleted after the agent serves, one
-at a time, each under its job's lifecycle lock with a fresh local-ownership
-and identity check, no time budget, and a stop flag set on SIGTERM.
+walk). A process in another mount namespace has its links classified against
+its own `/proc/<pid>/mountinfo` (fds by `fdinfo` `mnt_id`), so network and FUSE
+files are never stat-ed and a pivoted container's root is. A mount in the host
+or any scanned namespace whose source is the rootfs or a subtree of it (same
+device, `root` field under the rootfs path) keeps it. Mounts at or beneath the
+base are unmounted deepest-first without `MNT_DETACH`, for up to four rounds;
+any that remain keep it. The entry is then reopened: its identity may change
+only when a mount on the entry itself was removed, and the uncovered directory
+is checked against held inodes. Confirmed rootfs dirs are deleted after the
+agent serves, one at a time, each under its job's lifecycle lock with a fresh
+local-ownership and identity check, no time budget, and a stop flag set when
+the agent exits by any path.
 
 This pass does not roll back failed launches or run epilogs. Deleting a spool does not establish epilog
 completion or change node-drain policy.

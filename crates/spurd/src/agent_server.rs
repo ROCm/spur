@@ -4530,10 +4530,24 @@ pub struct RootfsCleanup {
 }
 
 impl RootfsCleanup {
-    /// Starts the deletions; setting the returned flag stops them between entries for shutdown.
-    pub fn spawn(self) -> Arc<std::sync::atomic::AtomicBool> {
-        tokio::spawn(self.task);
-        self.stop
+    /// Starts the deletions; dropping the returned handle stops them between entries.
+    pub fn spawn(self) -> RootfsCleanupHandle {
+        RootfsCleanupHandle {
+            _task: tokio::spawn(self.task),
+            stop: self.stop,
+        }
+    }
+}
+
+/// Keeps the background deletion bounded by the agent's lifetime, however `main` exits.
+pub struct RootfsCleanupHandle {
+    _task: tokio::task::JoinHandle<()>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for RootfsCleanupHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

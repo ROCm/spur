@@ -4,7 +4,7 @@
 use crate::agent_server::{AgentService, SpoolOwnership};
 use crate::spool_fs::{
     budget_exhausted, directory_names, inode_identity, kept_reason, open_child, open_directory,
-    read_mounts, Bound, JobSpool, SpoolKind, SpoolRoot,
+    read_mounts, Bound, JobSpool, Mount, SpoolKind, SpoolRoot,
 };
 use nix::fcntl::OFlag;
 use spur_core::job::JobState;
@@ -396,9 +396,21 @@ fn clean_inactive(
                 let unmounted = candidate
                     .root
                     .unmount_beneath(&candidate.spool, &mountinfo)
-                    .and_then(|detached| Ok((detached, candidate.root.reopen(&candidate.spool)?)));
+                    .and_then(|unmounted| {
+                        Ok((
+                            unmounted,
+                            candidate.root.reopen(&candidate.spool, unmounted)?,
+                        ))
+                    });
                 match unmounted {
-                    Ok((detached, spool)) => {
+                    // The directory a mount hid was never inventoried under its own identity.
+                    Ok((_, spool)) if spool.identities().any(|id| inventory.held.contains(&id)) => {
+                        info!(job_id, path = %path.display(), "retained {kind}: a process holds the directory under its mount");
+                        summary.retained += 1;
+                        continue;
+                    }
+                    Ok((unmounted, spool)) => {
+                        let detached = unmounted.count;
                         info!(job_id, path = %path.display(), detached, "queued orphan container rootfs for background deletion");
                         summary
                             .pending_rootfs
@@ -607,13 +619,15 @@ fn inspect_processes(
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     let own_namespace = mount_namespace(&paths.proc_root.join("self"));
-    let holders = HolderFilter {
-        devices: candidates
-            .iter()
-            .flat_map(|c| c.spool.identities().map(|(device, _)| device))
-            .collect(),
-        remote: RemoteMounts::read(&paths.proc_root.join("self/mountinfo"))?,
-    };
+    let mut devices: HashSet<u64> = candidates
+        .iter()
+        .flat_map(|c| c.spool.identities().map(|(device, _)| device))
+        .collect();
+    for candidate in candidates {
+        devices.insert(candidate.root.device()?);
+    }
+    let host = MountTable::read(&paths.proc_root.join("self/mountinfo"))?;
+    let mut namespaces = HashMap::<PathBuf, MountTable>::new();
     for entry in fs::read_dir(&paths.proc_root)? {
         if Instant::now() >= deadline {
             return Err(budget_exhausted());
@@ -633,15 +647,26 @@ fn inspect_processes(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let foreign = own_namespace.is_some() && mount_namespace(&path) != own_namespace;
-        let result = inspect_process(
-            &path,
-            paths.supervisor_uid,
-            candidates,
-            &holders,
-            foreign,
-            inventory,
-        );
+        // A process in another mount namespace is judged by its own mount table when it can be read.
+        let mounts = match mount_namespace(&path) {
+            Some(namespace) if Some(&namespace) != own_namespace.as_ref() => {
+                match namespaces.entry(namespace) {
+                    std::collections::hash_map::Entry::Occupied(entry) => Some(&*entry.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        match MountTable::read(&path.join("mountinfo")) {
+                            Ok(table) if !table.mounts.is_empty() => Some(&*entry.insert(table)),
+                            _ => None,
+                        }
+                    }
+                }
+            }
+            _ => None,
+        };
+        let holders = HolderFilter {
+            devices: &devices,
+            mounts: mounts.unwrap_or(&host),
+        };
+        let result = inspect_process(&path, paths.supervisor_uid, candidates, &holders, inventory);
         match fs::read(path.join("stat")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -655,7 +680,39 @@ fn inspect_processes(
             Ok(_) => result?,
         }
     }
+    protect_bound_rootfs(candidates, &host, &namespaces, &mut inventory.protected);
     Ok(())
+}
+
+// A bind of a rootfs subtree, in any namespace, can be in use without any path or inode the scan sees.
+fn protect_bound_rootfs(
+    candidates: &[Candidate],
+    host: &MountTable,
+    namespaces: &HashMap<PathBuf, MountTable>,
+    protected: &mut HashSet<u32>,
+) {
+    for candidate in candidates {
+        if candidate.spool.kind != SpoolKind::Rootfs {
+            continue;
+        }
+        // Located through the parent: mounts on or under the rootfs are its own and get unmounted.
+        let (Some(parent), Some(name)) = (candidate.path.parent(), candidate.path.file_name())
+        else {
+            continue;
+        };
+        let Some((device, inside)) = host.locate(parent) else {
+            continue;
+        };
+        let inside = inside.join(name);
+        let bound = std::iter::once(host)
+            .chain(namespaces.values())
+            .flat_map(|table| &table.mounts)
+            .filter(|mount| !mount.point.starts_with(&candidate.path))
+            .any(|mount| mount.device == device && mount.root.starts_with(&inside));
+        if bound {
+            protected.insert(candidate.spool.job_id);
+        }
+    }
 }
 
 fn stat_field(stat: &[u8], index: usize) -> io::Result<&[u8]> {
@@ -678,33 +735,58 @@ fn process_state(stat: &[u8]) -> io::Result<&[u8]> {
     stat_field(stat, 0)
 }
 
-struct HolderFilter {
-    devices: HashSet<u64>,
-    remote: RemoteMounts,
+struct HolderFilter<'a> {
+    devices: &'a HashSet<u64>,
+    mounts: &'a MountTable,
 }
 
-/// Network and FUSE mounts, whose stat can block indefinitely; spools never live on them.
-#[derive(Default)]
-struct RemoteMounts {
-    mounts: Vec<(PathBuf, bool)>,
+/// A mount namespace's mounts, used to avoid stat-ing network and FUSE files, which can block indefinitely.
+struct MountTable {
+    mounts: Vec<Mount>,
 }
 
-impl RemoteMounts {
+impl MountTable {
     fn read(path: &Path) -> io::Result<Self> {
-        let mounts = read_mounts(path)?
-            .into_iter()
-            .map(|(point, kind)| (point, is_remote(&kind)))
-            .collect();
-        Ok(Self { mounts })
+        Ok(Self {
+            mounts: read_mounts(path)?,
+        })
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    fn containing(&self, path: &Path) -> Option<&Mount> {
         self.mounts
             .iter()
-            .filter(|(point, _)| path.starts_with(point))
-            .max_by_key(|(point, _)| point.as_os_str().len())
-            .is_some_and(|(_, remote)| *remote)
+            .filter(|mount| path.starts_with(&mount.point))
+            .max_by_key(|mount| mount.point.as_os_str().len())
     }
+
+    fn is_remote(&self, path: &Path) -> bool {
+        self.containing(path)
+            .is_some_and(|mount| is_remote(&mount.kind))
+    }
+
+    fn is_remote_id(&self, id: u64) -> Option<bool> {
+        self.mounts
+            .iter()
+            .find(|mount| mount.id == id)
+            .map(|mount| is_remote(&mount.kind))
+    }
+
+    /// The filesystem holding `path` and the path within that filesystem.
+    fn locate(&self, path: &Path) -> Option<(String, PathBuf)> {
+        let mount = self.containing(path)?;
+        let rest = path.strip_prefix(&mount.point).ok()?;
+        Some((mount.device.clone(), mount.root.join(rest)))
+    }
+}
+
+fn fd_mount_id(fdinfo: &Path) -> Option<u64> {
+    fs::read_to_string(fdinfo)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn mount_namespace(process: &Path) -> Option<PathBuf> {
@@ -782,7 +864,6 @@ fn inspect_process(
     supervisor_uid: u32,
     candidates: &[Candidate],
     holders: &HolderFilter,
-    foreign: bool,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     let cmdline = fs::read(path.join("cmdline"))?;
@@ -822,15 +903,17 @@ fn inspect_process(
     for link in ["cwd", "root"] {
         let link = path.join(link);
         match fs::read_link(&link) {
-            Ok(target) => protect_holder(&link, &target, candidates, holders, foreign, inventory)?,
+            Ok(target) => protect_holder(&link, &target, None, candidates, holders, inventory)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound && args.is_empty() => {}
             Err(error) => return Err(error),
         }
     }
     for fd in fs::read_dir(path.join("fd"))? {
-        let fd = fd?.path();
+        let fd = fd?;
+        let mount = fd_mount_id(&path.join("fdinfo").join(fd.file_name()));
+        let fd = fd.path();
         match fs::read_link(&fd) {
-            Ok(target) => protect_holder(&fd, &target, candidates, holders, foreign, inventory)?,
+            Ok(target) => protect_holder(&fd, &target, mount, candidates, holders, inventory)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -842,14 +925,16 @@ fn inspect_process(
 fn protect_holder(
     holder: &Path,
     target: &Path,
+    mount: Option<u64>,
     candidates: &[Candidate],
     holders: &HolderFilter,
-    foreign: bool,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     protect_target(target, candidates, &mut inventory.protected);
-    // Another mount namespace reports paths from its own root, so the host mount table says nothing.
-    if !target.is_absolute() || (!foreign && holders.remote.contains(target)) {
+    let remote = mount
+        .and_then(|id| holders.mounts.is_remote_id(id))
+        .unwrap_or_else(|| holders.mounts.is_remote(target));
+    if !target.is_absolute() || remote {
         return Ok(());
     }
     match fs::metadata(holder) {
