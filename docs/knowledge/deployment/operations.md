@@ -123,7 +123,7 @@ All configuration is TOML at `/etc/spur/spur.conf`, parsed by
 | `[rest_api]` | Slurm-compat REST API on port 6820, off by default. |
 | `[hooks]` | Prolog/epilog/task hooks, job_submit shell/lua scripts. All paths must be absolute. |
 | `[devices]` | CDI, GRES discovery configuration. |
-| `[admission]` | Node admission mode (`open`/`token`). |
+| `[admission]` | Node admission mode (`open`/`token`), optional `node_names` list of allowed nodes (saved by `scontrol reconfigure`). |
 | `[rlimits]` | Per-step RLIMIT_MEMLOCK (`unlimited`/`inherit`/bytes). |
 | `[cgroup]` | cgroup-v2 enforcement: enabled, required, constrain_cores/ram/swap/devices, cleanup timeout, OOM group, device filter extra paths. |
 | `[mpi]` | PMIx plugin directory, tmpdir, min version, modex timeouts. |
@@ -332,7 +332,9 @@ tunnels for Raft elections.
 
 Deregister from the cluster **first** (`spur node remove <node>`), then drop
 the mesh peer (`spur net remove-peer`).  In HA, remove the peer on every
-controller.
+controller.  With `[admission] node_names`, drop the name from the list and run
+`scontrol reconfigure` instead; it deletes the node and keeps it from
+registering again.
 
 ---
 
@@ -549,6 +551,11 @@ scontrol reconfigure
 config until restarted.  Some fields are live (partitions, scheduler parameters,
 `private_data`); others require a daemon restart (metrics bind, tick interval,
 max jobs per cycle).  `spurd` reads `[cgroup]` only at startup.
+
+`admission.node_names` is saved through Raft only by `scontrol reconfigure`, and
+only when the list differs from the saved one; a removed field equals a cleared
+list.  A restart never saves it or deletes nodes.  Its Raft entry is new, so
+set the field only after every controller is upgraded.
 
 ### Snapshot recovery
 
