@@ -31,6 +31,7 @@ src/
   backfill.rs     -- BackfillScheduler: the main scheduling algorithm (~850 lines + ~2600 lines of tests)
   timeline.rs     -- NodeTimeline: per-node resource interval tracking with sweep-line queries
   cons_tres.rs    -- NodeAllocation: per-node consumable TRES (core/GPU/memory) allocation ledger
+  immediate.rs    -- bounded compact requests and cycle budgets for immediate placement trials
 ```
 
 ## Scheduling algorithm
@@ -270,6 +271,15 @@ exclusions and per-GPU reserved CPUs; the caller re-applies both.
 | `CapacityChange` | `cons_tres` | Result of applying a fresh inventory |
 
 ## Testing
+
+`BackfillScheduler::place_now` shares partition resolution and allocation helpers
+with backfill, while rejecting future starts and skipping convergence. Inputs are
+prepared through `immediate::PlacementRequest`; its bounded `PlacementScope`
+reuses name/partition/feature matching, including preferred-node fallback.
+Nonlinear charges use that scope; full-domain scan/copy/seeding work stays charged.
+Controller victim selection owns
+the projected allocations and shares `SearchBudget` across reclaim/preemption.
+Trial timelines are reused and memory-only allocations must be seeded.
 
 The crate is heavily unit-tested (each module has `#[cfg(test)] mod tests`).
 `backfill.rs` alone has ~2600 lines of tests covering:

@@ -3,6 +3,7 @@
 
 pub mod backfill;
 pub mod cons_tres;
+pub mod immediate;
 pub mod node_match;
 pub mod partition_cap;
 pub mod priority;

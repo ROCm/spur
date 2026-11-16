@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::job::JobSpec;
-use crate::step::{distribute_tasks, TaskDistribution};
 
 /// A GPU resource request. The meaning of `count` depends on which `JobSpec`
 /// field holds it (total, per-node, or per-task).
@@ -155,19 +154,14 @@ pub fn tasks_per_node_counts(spec: &JobSpec, num_nodes: u32) -> Vec<u32> {
     if let Some(tpn) = spec.tasks_per_node {
         return vec![tpn; num_nodes as usize];
     }
-    let dist = spec
-        .distribution
-        .as_deref()
-        .map(|d| d.parse::<TaskDistribution>().unwrap_or_default())
-        .unwrap_or_default();
-    let mapping = distribute_tasks(spec.num_tasks, num_nodes, dist);
-    let mut counts = vec![0u32; num_nodes as usize];
-    for node in mapping {
-        if let Some(slot) = counts.get_mut(node as usize) {
-            *slot += 1;
-        }
+    if num_nodes == 0 {
+        return Vec::new();
     }
-    counts
+    let per_node = spec.num_tasks / num_nodes;
+    let remainder = spec.num_tasks % num_nodes;
+    (0..num_nodes)
+        .map(|node| per_node + u32::from(node < remainder))
+        .collect()
 }
 
 /// Parse the per-node GPU count carried in `gres` (e.g. "gpu:mi300x:4"),
@@ -538,5 +532,50 @@ mod tests {
         };
         assert_eq!(GpuRequest::from_proto(Some(proto)), None);
         assert_eq!(GpuRequest::from_proto(None), None);
+    }
+
+    #[test]
+    fn task_counts_match_launch_mapping_for_every_distribution() {
+        use crate::step::{distribute_tasks, TaskDistribution};
+        for distribution in [
+            TaskDistribution::Block,
+            TaskDistribution::Cyclic,
+            TaskDistribution::Plane,
+            TaskDistribution::Arbitrary,
+        ] {
+            for nodes in 0..=8 {
+                for tasks in 0..=33 {
+                    let spec = JobSpec {
+                        num_tasks: tasks,
+                        distribution: Some(format!("{distribution:?}").to_lowercase()),
+                        ..Default::default()
+                    };
+                    let mut expected = vec![0u32; nodes as usize];
+                    for node in distribute_tasks(tasks, nodes, distribution) {
+                        if let Some(count) = expected.get_mut(node as usize) {
+                            *count += 1;
+                        }
+                    }
+                    assert_eq!(tasks_per_node_counts(&spec, nodes), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_task_count_requires_only_per_node_storage() {
+        let spec = JobSpec {
+            num_tasks: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            tasks_per_node_counts(&spec, 2),
+            vec![2_147_483_648, 2_147_483_647]
+        );
+        let spec = JobSpec {
+            tasks_per_node: Some(7),
+            ..spec
+        };
+        assert_eq!(tasks_per_node_counts(&spec, 2), vec![7, 7]);
     }
 }

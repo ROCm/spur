@@ -44,6 +44,7 @@ pub struct BackfillScheduler {
     last_outcome: HashMap<JobId, Unplaced>,
     /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
     report_unplaced: bool,
+    immediate: bool,
     /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
     released_handoffs: Vec<(String, JobId)>,
     /// Jobs the last pass did not start now while a partition cap was exceeded.
@@ -222,12 +223,93 @@ impl<'a> HandoffGate<'a> {
 }
 
 impl BackfillScheduler {
+    /// Checks only the current window, sharing allocation and partition resolution.
+    pub fn place_now(
+        &mut self,
+        request: &crate::immediate::PlacementRequest,
+        cluster: &ClusterState<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        let request = crate::immediate::PlacementRequest::new(request.job(), cluster, budget)?;
+        let flags = (self.immediate, self.report_unplaced);
+        self.immediate = true;
+        self.report_unplaced = false;
+        let result = self.place_now_prepared(&request, cluster, now, budget);
+        (self.immediate, self.report_unplaced) = flags;
+        result
+    }
+
+    fn place_now_prepared(
+        &mut self,
+        request: &crate::immediate::PlacementRequest,
+        cluster: &ClusterState<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        budget.trial(request.trial_work)?;
+        self.init_timelines(cluster.nodes);
+        let until = now + UNLIMITED_JOB_DURATION;
+        for (index, node) in cluster.nodes.iter().enumerate() {
+            if !node.alloc_resources.is_empty() {
+                self.timelines[index].reserve(now, until, node.alloc_resources.clone());
+            }
+        }
+        self.seed_partition_usage(cluster, now);
+        let Some(job) = job_in_eligible_partitions(&request.job, cluster.partitions) else {
+            return Some(None);
+        };
+        let typed_gpu = job_typed_gpu(&job);
+        let candidates = candidate_partitions(&job, cluster.partitions);
+        let handoffs = HandoffGate::new(cluster.preemption_handoffs);
+        let per_partition = candidates
+            .iter()
+            .any(|p| is_capped(p) || p.has_memory_policy() || p.max_mem_per_node.is_some());
+        let resolved = if per_partition {
+            self.resolve_partition(
+                &job,
+                cluster,
+                &handoffs,
+                now,
+                &candidates,
+                typed_gpu.as_deref(),
+            )
+        } else {
+            self.plan_placement(&job, cluster, &handoffs, now, None)
+                .map(|plan| {
+                    let partition = attributed_partition(&candidates, cluster.nodes, &plan.nodes);
+                    (plan, partition)
+                })
+        };
+        Some(
+            resolved
+                .ok()
+                .filter(|(plan, _)| plan.start <= now)
+                .map(|(plan, partition)| Assignment {
+                    job_id: job.job_id,
+                    nodes: plan
+                        .nodes
+                        .into_iter()
+                        .map(|i| cluster.nodes[i].name.clone())
+                        .collect(),
+                    per_node_alloc: plan.per_node_alloc,
+                    memory_adjustment: planned_adjustment(
+                        &job,
+                        partition.as_deref(),
+                        cluster.partitions,
+                    ),
+                    partition,
+                }),
+        )
+    }
+
     pub fn new(max_jobs: usize) -> Self {
         Self {
             timelines: Vec::new(),
             max_jobs,
             last_outcome: HashMap::new(),
             report_unplaced: true,
+            immediate: false,
             released_handoffs: Vec::new(),
             cap_blocks: HashMap::new(),
         }
@@ -377,6 +459,15 @@ impl BackfillScheduler {
 
     /// Initialize or reset timelines from current cluster state.
     fn init_timelines(&mut self, nodes: &[Node]) {
+        if self.timelines.len() == nodes.len() {
+            for (timeline, node) in self.timelines.iter_mut().zip(nodes) {
+                timeline.node_name.clone_from(&node.name);
+                timeline.total.clone_from(&node.total_resources);
+                timeline.pools = node.cpu_pools();
+                timeline.intervals.clear();
+            }
+            return;
+        }
         self.timelines = nodes
             .iter()
             .map(|n| {
@@ -421,6 +512,15 @@ impl BackfillScheduler {
         floor: chrono::DateTime<Utc>,
     ) -> chrono::DateTime<Utc> {
         let max_check = floor + chrono::Duration::days(365);
+        if self.immediate {
+            let allocated = self.timelines[ni].accumulated_at(floor);
+            let fits = self.timelines[ni]
+                .total
+                .can_satisfy_with_allocated(&allocated, request)
+                && cap.is_none_or(|cap| self.timelines[ni].cap_admits(cap, floor, duration))
+                && Self::reservation_blocker(res_check, floor, duration).is_none();
+            return if fits { floor } else { max_check };
+        }
         let mut candidate = floor;
         loop {
             if candidate > max_check {
@@ -713,6 +813,7 @@ impl BackfillScheduler {
                 let mut floor = now;
                 loop {
                     let mut trial = Self {
+                        immediate: false,
                         timelines: self.timelines.clone(),
                         max_jobs: 1,
                         last_outcome: HashMap::new(),
@@ -999,7 +1100,7 @@ impl BackfillScheduler {
                     .get(&node.name)
                     .copied()
                     .unwrap_or(now + Duration::hours(24));
-                if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
+                if !node.alloc_resources.is_empty() {
                     self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
                 }
                 // Older-layout jobs on these GPUs' reserved CPUs end by
@@ -1007,12 +1108,14 @@ impl BackfillScheduler {
                 if let Some(blocked) = node.layout_blocked_alloc() {
                     self.timelines[i].reserve(now, free_at, blocked);
                 }
-                debug!(
-                    node = %node.name,
-                    alloc_cpus = node.alloc_resources.cpus,
-                    alloc_gpus = node.alloc_resources.total_device_count("gpu"),
-                    "node allocation state"
-                );
+                if self.report_unplaced {
+                    debug!(
+                        node = %node.name,
+                        alloc_cpus = node.alloc_resources.cpus,
+                        alloc_gpus = node.alloc_resources.total_device_count("gpu"),
+                        "node allocation state"
+                    );
+                }
             }
             self.seed_partition_usage(cluster, now);
         }
@@ -1246,12 +1349,14 @@ impl BackfillScheduler {
                     start: now,
                     end,
                 }]) {
-                    debug!(
+                    if self.report_unplaced {
+                        debug!(
                         job_id = job.job_id,
                         nodes = ?node_names,
                         partition = ?partition,
                         "scheduling job"
-                    );
+                        );
+                    }
                 } else {
                     handoffs.owner_refused(job.job_id, now);
                     note(UnplacedKind::RefusedAtStart, plan.nodes.len(), None);
@@ -1461,6 +1566,7 @@ impl BackfillScheduler {
                 partition_cap_ok(partition, &node.name, &used, &charge).err()
             })
             .collect();
+
         (!overshoots.is_empty()).then(|| PartitionCapBlock {
             partition: partition.name.clone(),
             overshoots,
@@ -1591,16 +1697,22 @@ impl BackfillScheduler {
                     duration,
                     floor,
                 );
-                debug!(
-                    job_id = job.job_id,
-                    node = %cluster.nodes[ni].name,
-                    earliest_start = %start,
-                    is_now = (start <= now),
-                    "earliest start for node"
-                );
+                if self.report_unplaced {
+                    debug!(
+                        job_id = job.job_id,
+                        node = %cluster.nodes[ni].name,
+                        earliest_start = %start,
+                        is_now = (start <= now),
+                        "earliest start for node"
+                    );
+                }
                 (ni, start)
             })
             .collect();
+
+        if self.immediate {
+            node_starts.retain(|(_, start)| *start <= now);
+        }
 
         // Free GPUs per candidate, evaluated at each node's own
         // earliest_start (not `now`, which can be stale by then).
@@ -1748,6 +1860,9 @@ impl BackfillScheduler {
             ) {
                 per_node_alloc = allocations;
                 break;
+            }
+            if self.immediate {
+                return Err((UnplacedKind::NoCapacityAtStart, assigned_nodes.len()));
             }
 
             // Per-node timing floors can fit before the full GPU total or

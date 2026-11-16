@@ -1032,6 +1032,19 @@ The table assumes the allow-list, rank, node-overlap, reservation, and exempt-ti
 guards have all passed; any of those failing skips the victim regardless of the
 action configured.
 
+Victim selection also checks that releasing the selected allocations would place
+the complete pending request now. Protected co-residents retain their allocations;
+their presence does not shield eligible jobs sharing the node. CPU, memory, GPU
+identity, exclusivity, node-list requirements, reservations, and partition resource
+limits all participate in that check. Only a sufficient set of eligible jobs is
+evicted, and unnecessary victims are removed from that set.
+
+The search is bounded and deterministic, rather than an exhaustive search for a
+globally smallest victim set. Reaching an internal resource or work limit defers
+the pending request without evicting any jobs. Heterogeneous job groups and
+requests requiring GPU property or fabric binding currently defer this victim
+search as well.
+
 A QOS's ``preemptmode`` always outranks its partitions': unset defers to the
 partition action, but any explicit value — including ``off`` — wins outright.
 ``preemptmode=off`` on a QOS is therefore a real protection: it keeps that

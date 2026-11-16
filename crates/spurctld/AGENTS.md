@@ -15,6 +15,7 @@ src/
   raft_server.rs           Dedicated gRPC server for Raft-internal RPCs (AppendEntries, Vote, InstallSnapshot)
   scheduler_loop.rs        Leader-gated scheduling loop: BackfillScheduler, time-limit/completing/inactive enforcers
   victim_order.rs          In-memory victim costs, per-node-freed rank keys, stable preemptor/node hash
+  scheduler_loop/preemption.rs  Coherent compact allocation snapshots and bounded resource-aware victim sets
   cluster_k8s.rs           k0s cluster reconcile loop: role assignment, WireGuard mesh, join-token lifecycle
   hooks.rs                 Sandboxed Lua job_submit hooks (mlua, text-only, memory/instruction-capped)
   auth_middleware.rs        Tower layer: single auth verification point for all gRPC+accounting RPCs

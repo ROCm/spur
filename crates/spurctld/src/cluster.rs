@@ -8398,6 +8398,16 @@ impl ClusterManager {
         }
     }
 
+    pub(crate) fn with_allocation_records<T>(
+        &self,
+        read: impl FnOnce(&HashMap<JobId, Job>, &HashMap<String, Node>) -> T,
+    ) -> T {
+        // Placement apply holds jobs before nodes; readers need the same coherent pair.
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        read(&jobs, &nodes)
+    }
+
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
@@ -26759,6 +26769,7 @@ state = "UP"
 
         let mut high = basic_spec("high");
         high.qos = Some("high".into());
+        high.exclusive = true;
         submit_and_wait(&cm, high);
 
         let pending = cm.pending_jobs();
@@ -26830,6 +26841,7 @@ state = "UP"
 
         let mut hunter = basic_spec("hunter");
         hunter.qos = Some(hunter_qos.into());
+        hunter.exclusive = true;
         hunter.nodelist = Some(node.into());
         let hunter_id = submit_and_wait(cm, hunter);
         (victim_id, hunter_id)
@@ -27487,6 +27499,7 @@ state = "UP"
         let blocker = run_with_qos(&cm, "blocker", "low", "n2", 2);
         let mut hunter = basic_spec("hunter");
         hunter.qos = Some("high".into());
+        hunter.exclusive = true;
         hunter.nodelist = Some("n1,n2".into());
         hunter.num_nodes = 2;
         hunter.num_tasks = 2;
@@ -27684,6 +27697,7 @@ state = "UP"
         cm.jobs.write().get_mut(&victim).unwrap().spec.qos = Some("low".into());
         let mut owner = basic_spec("owner");
         owner.qos = Some("high".into());
+        owner.exclusive = true;
         owner.nodelist = Some("n1".into());
         owner.time_limit = Some(chrono::Duration::minutes(1));
         let owner = submit_and_wait(&cm, owner);
@@ -28427,6 +28441,7 @@ state = "UP"
 
         let mut primus = basic_spec("primus");
         primus.qos = Some("primus".into());
+        primus.exclusive = true;
         submit_and_wait(&cm, primus);
 
         let pending = cm.pending_jobs();
@@ -28478,6 +28493,7 @@ state = "UP"
         let mut primus = basic_spec("primus");
         primus.priority = Some(1000);
         primus.qos = Some("primus".into());
+        primus.exclusive = true;
         submit_and_wait(&cm, primus);
 
         let pending = cm.pending_jobs();
@@ -28596,6 +28612,7 @@ state = "UP"
 
         let mut high = basic_spec("high");
         high.qos = Some("high".into());
+        high.exclusive = true;
         submit_and_wait(&cm, high);
 
         let pending = cm.pending_jobs();
@@ -28856,6 +28873,7 @@ state = "UP"
         let mut unplaceable = basic_spec("unplaceable");
         unplaceable.priority = Some(10_000);
         unplaceable.qos = Some("high".into());
+        unplaceable.exclusive = true;
         unplaceable.gres = vec!["1".into()];
         let unplaceable_id = submit_and_wait(&cm, unplaceable);
         let unplaceable_job = cm.get_job(unplaceable_id).unwrap();
@@ -28882,6 +28900,7 @@ state = "UP"
         let mut placeable = basic_spec("placeable");
         placeable.priority = Some(10_000);
         placeable.qos = Some("high".into());
+        placeable.exclusive = true;
         let placeable_id = submit_and_wait(&cm, placeable);
         let placeable_job = cm.get_job(placeable_id).unwrap();
         crate::scheduler_loop::try_preempt(
@@ -28926,6 +28945,7 @@ state = "UP"
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
         high.qos = Some("high".into());
+        high.exclusive = true;
         high.num_nodes = 2;
         high.num_tasks = 2;
         let high_id = submit_and_wait(&cm, high);
