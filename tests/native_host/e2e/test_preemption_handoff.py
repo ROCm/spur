@@ -233,7 +233,7 @@ def _capped_preemptor(c):
     return victim, preemptor, sibling
 
 
-def test_preemptor_keeps_its_qos_node_cap_while_its_victim_drains(handoff_cluster):
+def test_preemptor_keeps_its_qos_room_while_its_victim_drains(handoff_cluster):
     c = handoff_cluster
     victim, preemptor, sibling = _capped_preemptor(c)
     _gate(c, victim, [0], False)
