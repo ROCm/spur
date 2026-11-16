@@ -4235,9 +4235,13 @@ pub fn spawn_cancel_runs_on_node(node: &Node, runs: &[(spur_core::job::JobId, u3
         warn!(node = %node.name, "no comm address — cannot cancel jobs on removed node");
         return;
     };
+    spawn_cancel_runs_at(&agent_addr, runs, signal);
+}
+
+pub fn spawn_cancel_runs_at(agent_addr: &str, runs: &[(spur_core::job::JobId, u32)], signal: i32) {
     for &(job_id, run_attempt) in runs {
         tokio::spawn(cancel_one_agent(
-            agent_addr.clone(),
+            agent_addr.to_string(),
             job_id,
             run_attempt,
             signal,

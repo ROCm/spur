@@ -159,6 +159,14 @@ pub enum RegisterNodeError {
     Internal(String),
 }
 
+/// The spurd a removed node is kept out from, and where to reach it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeletedAgent {
+    pub agent_instance: String,
+    #[serde(default)]
+    pub comm_url: Option<String>,
+}
+
 pub(crate) fn deleted_agent_error(name: &str) -> RegisterNodeError {
     RegisterNodeError::Deleted(format!(
         "node {name} was deleted; restart its spurd to add it back"
@@ -631,7 +639,9 @@ pub struct ClusterManager {
     deleted_partition_names: RwLock<HashSet<String>>,
     /// Deleted node name -> the spurd process it was deleted under. That process
     /// stays out; a restarted spurd (new instance) registers it again.
-    deleted_nodes: RwLock<HashMap<String, String>>,
+    deleted_nodes: RwLock<HashMap<String, DeletedAgent>>,
+    /// Removed nodes whose refused heartbeat this process already logged. Leader-local.
+    deleted_heartbeats_logged: parking_lot::Mutex<HashSet<String>>,
     /// Partition names seeded from config before WAL replay. A replayed
     /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
     /// once overridden the name is removed, so later duplicates stay
@@ -1080,6 +1090,7 @@ impl ClusterManager {
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
             deleted_nodes: RwLock::new(HashMap::new()),
+            deleted_heartbeats_logged: parking_lot::Mutex::new(HashSet::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
@@ -4204,19 +4215,36 @@ impl ClusterManager {
 
     /// Whether a registered node's spurd reports an instance its record lacks,
     /// as when it registered through a controller that predates the field.
-    pub(crate) fn agent_instance_changed(&self, name: &str, agent_instance: &str) -> bool {
+    pub(crate) fn agent_instance_unrecorded(&self, name: &str, agent_instance: &str) -> bool {
         !agent_instance.is_empty()
             && self
                 .nodes
                 .read()
                 .get(name)
-                .is_some_and(|node| node.agent_instance.as_deref() != Some(agent_instance))
+                .is_some_and(|node| node.agent_instance.is_none())
     }
 
-    /// Whether `agent_instance` is the spurd process `name` was deleted under.
+    /// The delete record if `agent_instance` is the spurd process `name` was deleted under.
+    pub(crate) fn deleted_agent(&self, name: &str, agent_instance: &str) -> Option<DeletedAgent> {
+        if agent_instance.is_empty() {
+            return None;
+        }
+        self.deleted_nodes
+            .read()
+            .get(name)
+            .filter(|deleted| deleted.agent_instance == agent_instance)
+            .cloned()
+    }
+
+    /// True the first time this process refuses `name`'s heartbeat since it was removed.
+    pub(crate) fn first_refused_heartbeat(&self, name: &str) -> bool {
+        self.deleted_heartbeats_logged
+            .lock()
+            .insert(name.to_string())
+    }
+
     pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
-        !agent_instance.is_empty()
-            && self.deleted_nodes.read().get(name).map(String::as_str) == Some(agent_instance)
+        self.deleted_agent(name, agent_instance).is_some()
     }
 
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.
@@ -4311,7 +4339,6 @@ impl ClusterManager {
         match action {
             RegistrationAction::Skip => {
                 debug!(node = %name, "node unchanged, skipping");
-                self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(existing) = self.get_node(&name) {
                     let needs_update = existing.address.as_deref() != Some(address.as_str())
                         || existing.hostname != hostname
@@ -4349,6 +4376,8 @@ impl ClusterManager {
                         }
                     }
                 }
+                // After the update, so a refused relabel cannot keep the new instance unrecorded.
+                self.sync_node_labels(&name, labels, caller_privileged)?;
             }
             RegistrationAction::Update => {
                 let response = self
@@ -9967,6 +9996,7 @@ impl ClusterManager {
                     return response;
                 }
                 self.deleted_nodes.write().remove(name);
+                self.deleted_heartbeats_logged.lock().remove(name);
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
@@ -10202,9 +10232,11 @@ impl ClusterManager {
                         self.k0s_role_counts.dec(role);
                     }
                     if let Some(instance) = &node.agent_instance {
-                        self.deleted_nodes
-                            .write()
-                            .insert(name.clone(), instance.clone());
+                        let deleted = DeletedAgent {
+                            agent_instance: instance.clone(),
+                            comm_url: crate::scheduler_loop::node_comm_http_url(node),
+                        };
+                        self.deleted_nodes.write().insert(name.clone(), deleted);
                     }
                 }
                 nodes.remove(name);
@@ -10761,7 +10793,7 @@ struct ClusterSnapshot {
     #[serde(default)]
     deleted_partition_names: HashSet<String>,
     #[serde(default)]
-    deleted_nodes: HashMap<String, String>,
+    deleted_nodes: HashMap<String, DeletedAgent>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     #[serde(default)]
@@ -41597,6 +41629,43 @@ state = "UP"
 
         assert!(cm.get_node("n1").is_some());
         assert!(!cm.is_deleted_agent("n1", "first"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_relabel_still_records_the_new_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+
+        let err = cm
+            .register_agent_node(
+                "second".into(),
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::from([("rack".to_string(), "r1".to_string())]),
+                Vec::new(),
+                false,
+            )
+            .expect_err("an unprivileged relabel is refused");
+
+        assert!(
+            matches!(err, RegisterNodeError::PermissionDenied(_)),
+            "{err}"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().agent_instance.as_deref(),
+            Some("second")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

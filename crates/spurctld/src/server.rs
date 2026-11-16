@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
@@ -2827,13 +2827,24 @@ impl SlurmController for ControllerService {
                 &req.spec_enforcement_error,
             ) || self
                 .cluster
-                .agent_instance_changed(&req.hostname, &req.agent_instance);
+                .agent_instance_unrecorded(&req.hostname, &req.agent_instance);
             Ok(Response::new(HeartbeatResponse { reregister }))
-        } else if self
+        } else if let Some(deleted) = self
             .cluster
-            .is_deleted_agent(&req.hostname, &req.agent_instance)
+            .deleted_agent(&req.hostname, &req.agent_instance)
         {
-            debug!(node = %req.hostname, "refusing heartbeat from the spurd this node was deleted under");
+            if self.cluster.first_refused_heartbeat(&req.hostname) {
+                info!(node = %req.hostname, "refusing heartbeats from the spurd this node was removed under");
+            }
+            // Nothing runs on a removed node legitimately; repeating each beat retries a lost kill.
+            if let Some(url) = &deleted.comm_url {
+                let runs: Vec<_> = req
+                    .running_jobs
+                    .iter()
+                    .map(|run| (run.job_id, run.run_attempt))
+                    .collect();
+                crate::scheduler_loop::spawn_cancel_runs_at(url, &runs, 9);
+            }
             // Not NotFound: that would send the agent straight back to re-register.
             Err(register_node_rpc_status(
                 crate::cluster::deleted_agent_error(&req.hostname),
@@ -9281,7 +9292,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service(&dir).await;
         let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
-        let (n2, _) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
         let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
 
@@ -9294,9 +9305,50 @@ mod tests {
         .expect("forced removal");
 
         wait_for_cancel(&n1_cancelled, job_id).await;
-        let cancel = n1_cancelled.lock().unwrap()[0];
-        assert_eq!(cancel.run_attempt, run_attempt);
+        wait_for_cancel(&n2_cancelled, job_id).await;
+        assert_eq!(n1_cancelled.lock().unwrap().len(), 1);
+        assert_eq!(n1_cancelled.lock().unwrap()[0].run_attempt, run_attempt);
+        assert_eq!(n2_cancelled.lock().unwrap()[0].run_attempt, run_attempt);
         assert!(svc.cluster.get_node("n1").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_spurd_heartbeat_kills_the_runs_it_still_reports() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (agent, cancelled) = spawn_cancel_recording_agent().await;
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: agent.port().into(),
+            agent_instance: "first".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("register n1");
+        await_registered_node(&svc, "n1").await;
+        svc.cluster
+            .remove_node("n1", false, None)
+            .expect("delete n1");
+
+        let refused = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                agent_instance: "first".into(),
+                running_jobs: vec![spur_proto::proto::RunningJobStatus {
+                    job_id: 42,
+                    run_attempt: 3,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .await
+            .expect_err("n1 was deleted");
+
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        wait_for_cancel(&cancelled, 42).await;
+        let cancel = cancelled.lock().unwrap()[0];
+        assert_eq!((cancel.run_attempt, cancel.signal), (3, 9));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9328,6 +9380,10 @@ mod tests {
             .expect("register again");
         assert!(!reregister("first").await);
         assert!(!reregister("").await, "an older agent is never asked");
+        assert!(
+            !reregister("second").await,
+            "a second spurd under the same name must not trade places on every beat"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

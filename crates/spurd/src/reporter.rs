@@ -629,10 +629,16 @@ impl NodeReporter {
         load: u32,
         free_mem: u64,
     ) {
+        let deleted = matches!(
+            &result,
+            Err(crate::controller_auth::ConnectAuthError::Status(status)) if is_deleted_node(status)
+        );
+        if !deleted {
+            self.deleted_logged.store(false, Ordering::Relaxed);
+        }
         match result {
             Ok(resp) => {
                 debug!(load, free_mem, "heartbeat sent");
-                self.deleted_logged.store(false, Ordering::Relaxed);
                 // The controller asks for re-registration when the layout it
                 // expects differs from what this node reported enforcing, so
                 // a changed spec policy is redelivered without a restart.
@@ -654,9 +660,7 @@ impl NodeReporter {
                     warn!(error = %e, "re-registration after heartbeat rejection failed");
                 }
             }
-            Err(crate::controller_auth::ConnectAuthError::Status(status))
-                if is_deleted_node(&status) =>
-            {
+            Err(crate::controller_auth::ConnectAuthError::Status(status)) if deleted => {
                 if !self.deleted_logged.swap(true, Ordering::Relaxed) {
                     warn!("{}", status.message());
                 }
@@ -756,18 +760,10 @@ fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
 }
 
-/// The controller deleted this node while this process kept running; heartbeat
-/// and registration return FailedPrecondition for nothing else.
+/// The controller deleted this node while this process kept running; the
+/// heartbeat returns FailedPrecondition for nothing else.
 fn is_deleted_node(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
-}
-
-/// Whether a failed `register` was refused because this node was deleted.
-pub fn registration_refused_as_deleted(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<crate::controller_auth::ConnectAuthError>(),
-        Some(crate::controller_auth::ConnectAuthError::Status(status)) if is_deleted_node(status)
-    )
 }
 
 /// Whether a connect/RPC failure means the dialed endpoint is unreachable or wedged,
@@ -3103,7 +3099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_heartbeat_accepted_again_rearms_the_deleted_warning() {
+    async fn any_other_heartbeat_outcome_rearms_the_deleted_warning() {
         let reporter = test_reporter(rset(8, 0, vec![]));
         let deleted = || {
             Err(crate::controller_auth::ConnectAuthError::Status(
@@ -3117,23 +3113,13 @@ mod tests {
             .handle_heartbeat_result(Ok(Default::default()), 0, 0)
             .await;
         assert!(!reporter.deleted_logged.load(Ordering::Relaxed));
-    }
 
-    #[tokio::test]
-    async fn only_a_deleted_refusal_lets_startup_continue_unregistered() {
-        let (deleted, _) = controller_answering(tonic::Code::FailedPrecondition).await;
-        let (other, _) = controller_answering(tonic::Code::PermissionDenied).await;
-
-        let refused = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{deleted}"))
-            .register()
-            .await
-            .expect_err("refused");
-        assert!(registration_refused_as_deleted(&refused));
-        let refused = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{other}"))
-            .register()
-            .await
-            .expect_err("refused");
-        assert!(!registration_refused_as_deleted(&refused));
+        reporter.handle_heartbeat_result(deleted(), 0, 0).await;
+        let unavailable = Err(crate::controller_auth::ConnectAuthError::Status(
+            tonic::Status::unavailable("controller restarting"),
+        ));
+        reporter.handle_heartbeat_result(unavailable, 0, 0).await;
+        assert!(!reporter.deleted_logged.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

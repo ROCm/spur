@@ -1537,7 +1537,8 @@ Removal does not stop the agent or change ``spur.conf``. A ``spurd`` that
 keeps running after its node is removed stays out: its heartbeats are refused,
 and it logs ``node <name> was deleted; restart its spurd to add it back`` once
 instead of registering again. A forced removal also stops the node's evicted
-jobs on that ``spurd``. Restarting ``spurd`` (or rebooting the host) adds the
+jobs on that ``spurd``, and any job it still reports is stopped again on each
+refused heartbeat. Restarting ``spurd`` (or rebooting the host) adds the
 node back, as a restarted ``slurmd`` re-creates a deleted Slurm dynamic node.
 To keep a host out for good, also stop and disable ``spurd`` on it, for
 example with ``systemctl disable --now spurd``.
@@ -1547,10 +1548,11 @@ a restart from the process that was running when the node was removed. The
 record of which ``spurd`` to keep out is replicated and survives a controller
 restart or failover. Nodes registered by agents older than this release, or by
 the Kubernetes operator, send no instance ID and register again on their next
-heartbeat as before. During a rolling upgrade, an agent that registered
-through an older controller is asked to register again once its heartbeat
-reaches an upgraded leader; until then, removing its node does not keep it
-out.
+heartbeat as before. During a rolling upgrade, a removal sticks only once
+both the leader and the controller the agent talks to run this release;
+removals made earlier may not stick. An agent that registered through an
+older controller is asked to register again once its heartbeat reaches an
+upgraded leader.
 
 Slurm restricts this command to dynamic nodes without running jobs or
 reservation membership; Spur uses its native registered-node removal rules and

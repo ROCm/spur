@@ -125,8 +125,10 @@ def test_deleted_node_stays_out_across_a_controller_restart(cluster):
     _wait_told_deleted(cluster, index)
 
     cluster.restart_controller(expected_nodes=[n for n in cluster.node_names if n != name])
-    # One full spurd heartbeat interval, so the restarted controller has answered one.
-    time.sleep(35)
+    wait_until(
+        lambda: "refusing heartbeats from the spurd" in cluster.spurctld_log(0),
+        timeout_s=90, interval_s=2, desc="restarted controller refuses the agent",
+    )
     assert name not in cluster.sinfo_nodes()
     assert REREGISTERED not in cluster.spurd_log(index)
 
@@ -134,6 +136,7 @@ def test_deleted_node_stays_out_across_a_controller_restart(cluster):
     wait_node_state(cluster, name, ["idle"])
 
 
+# Also true before keep-out; guards that a started spurd is still let back in.
 def test_deleted_departed_node_returns_when_its_agent_starts(departed_cluster):
     cluster = departed_cluster
     index, name = _delete_last_node(cluster)
@@ -155,12 +158,15 @@ def test_forced_delete_stops_the_job_and_keeps_the_agent_out(cluster):
     assert job_id is not None, out
     try:
         wait_job_state(cluster, job_id, "R")
+        running = f"pgrep -f '[s]leep {seconds}' || true"
+        wait_until(
+            lambda: cluster.nodes[index].exec_allow_fail(running).strip(),
+            timeout_s=60, interval_s=2, desc="job process started",
+        )
         cluster.cli(["spur", "node", "remove", name, "--force"])
         wait_node_gone(cluster, name)
         wait_until(
-            lambda: not cluster.nodes[index].exec_allow_fail(
-                f"pgrep -f '[s]leep {seconds}' || true"
-            ).strip(),
+            lambda: not cluster.nodes[index].exec_allow_fail(running).strip(),
             timeout_s=60, interval_s=2, desc="job processes on the removed node stopped",
         )
         _wait_told_deleted(cluster, index)
