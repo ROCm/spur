@@ -15,7 +15,8 @@ use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
-    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
+    batch_script_uses_step_launch, build_step_task_plan, runs_batch_companion_hold,
+    step_needs_pmix_prepare,
 };
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
@@ -1205,9 +1206,10 @@ impl ControllerService {
         }
         let recipients = signal_recipients(&job, target);
         if recipients.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "job {job_id} has no running processes to signal"
-            )));
+            return Err(Status::failed_precondition(match target {
+                SignalTarget::Batch => format!("job {job_id}'s batch script has already exited"),
+                _ => format!("job {job_id} has no running processes to signal"),
+            }));
         }
         let results = crate::scheduler_loop::signal_job_on_nodes(
             &self.cluster,
@@ -1215,7 +1217,6 @@ impl ControllerService {
             job.run_attempt,
             &recipients,
             signal,
-            target,
         )
         .await;
         crate::scheduler_loop::signal_verdict(job_id, target, &results)
@@ -4948,17 +4949,37 @@ fn signal_annotation(
     .asserted_actor(user)
 }
 
-/// The nodes a signal for `target` is sent to. The batch script runs only on
-/// the first allocated node, and only while that node has not reported.
-fn signal_recipients(job: &spur_core::job::Job, target: SignalTarget) -> Vec<String> {
-    if target != SignalTarget::Batch {
-        return job.held_nodes();
+/// The target to send the node at `node_index` of the allocation, or `None` when it has no
+/// batch script for a `Batch` signal. A companion node's batch step is a hold script that
+/// exits on an untrapped signal and would end that node's slice of the allocation, so it only
+/// ever gets the steps.
+fn node_signal_target(
+    job: &spur_core::job::Job,
+    node_index: usize,
+    target: SignalTarget,
+) -> Option<SignalTarget> {
+    let script = job.spec.script.as_deref().unwrap_or_default();
+    let task_fanout = job.spec.srun_job && !job.srun_step_dispatch;
+    let holds_allocation = runs_batch_companion_hold(script, node_index == 0, task_fanout);
+    match (target, holds_allocation) {
+        (SignalTarget::Batch, true) => None,
+        (SignalTarget::Full, true) => Some(SignalTarget::Steps),
+        (SignalTarget::Unspecified, _) => Some(SignalTarget::Steps),
+        (target, _) => Some(target),
     }
+}
+
+/// The nodes still held by `job` and what to send each for `target`. Nodes that already
+/// reported have nothing left to signal.
+fn signal_recipients(
+    job: &spur_core::job::Job,
+    target: SignalTarget,
+) -> Vec<(String, SignalTarget)> {
     job.allocated_nodes
-        .first()
-        .filter(|node| job.is_held_on(node))
-        .cloned()
-        .into_iter()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| job.is_held_on(node))
+        .filter_map(|(index, node)| Some((node.clone(), node_signal_target(job, index, target)?)))
         .collect()
 }
 
@@ -13074,9 +13095,16 @@ mod tests {
 
     /// A two-node job of alice's whose agents record the signals they are sent.
     async fn signalling_two_node_job(svc: &ControllerService) -> (u32, SignalLog, SignalLog) {
+        signalling_two_node_job_running(svc, "srun ./train\n").await
+    }
+
+    async fn signalling_two_node_job_running(
+        svc: &ControllerService,
+        script: &str,
+    ) -> (u32, SignalLog, SignalLog) {
         let (n1, n1_signals) = spawn_signal_recording_agent(None).await;
         let (n2, n2_signals) = spawn_signal_recording_agent(None).await;
-        let job_id = running_two_node_job(svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let job_id = running_two_node_job(svc, script, n1.port(), n2.port()).await;
         grant_signal_capability(svc, n1, n2).await;
         (job_id, n1_signals, n2_signals)
     }
@@ -13118,12 +13146,21 @@ mod tests {
 
         let full = SignalTarget::Full as i32;
         let steps = SignalTarget::Steps as i32;
-        let expected = vec![
-            (job_id, run_attempt, 10, full),
-            (job_id, run_attempt, 12, steps),
-        ];
-        assert_eq!(signals_seen(&n1), expected);
-        assert_eq!(signals_seen(&n2), expected);
+        assert_eq!(
+            signals_seen(&n1),
+            [
+                (job_id, run_attempt, 10, full),
+                (job_id, run_attempt, 12, steps)
+            ]
+        );
+        assert_eq!(
+            signals_seen(&n2),
+            [
+                (job_id, run_attempt, 10, steps),
+                (job_id, run_attempt, 12, steps)
+            ],
+            "the companion's batch step only holds the allocation, so Full is demoted to Steps"
+        );
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().state,
             JobState::Running
@@ -13148,19 +13185,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_reaches_every_copy_of_a_fanned_out_script() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job_running(&svc, "./train\n").await;
+        let alice = viewer("alice", false);
+
+        signal_as(&svc, job_id, &alice, 10, SignalTarget::Full)
+            .await
+            .unwrap();
+        signal_as(&svc, job_id, &alice, 12, SignalTarget::Batch)
+            .await
+            .unwrap();
+
+        let run_attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        let expected = [
+            (job_id, run_attempt, 10, SignalTarget::Full as i32),
+            (job_id, run_attempt, 12, SignalTarget::Batch as i32),
+        ];
+        assert_eq!(signals_seen(&n1), expected);
+        assert_eq!(signals_seen(&n2), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signal_job_for_the_batch_target_skips_a_batch_node_that_already_reported() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let (job_id, n1, n2) = signalling_two_node_job(&svc).await;
+        // In a grace the job outlives its primary, which otherwise ends it.
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
         report_node_finished(&svc, job_id, "n1").await;
         let alice = viewer("alice", false);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "the run-state check must not be what refuses the signal"
+        );
 
         let err = signal_as(&svc, job_id, &alice, 10, SignalTarget::Batch)
             .await
             .unwrap_err();
 
         assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("job {job_id}'s batch script has already exited")
+        );
         assert!(signals_seen(&n1).is_empty() && signals_seen(&n2).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_skips_fanned_out_copies_that_already_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job_running(&svc, "./train\n").await;
+        // In a grace the job outlives a node's exit, which otherwise ends it.
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+        report_node_finished(&svc, job_id, "n2").await;
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "n1 still runs its copy"
+        );
+
+        signal_as(
+            &svc,
+            job_id,
+            &viewer("alice", false),
+            10,
+            SignalTarget::Batch,
+        )
+        .await
+        .unwrap();
+
+        assert!(signals_seen(&n2).is_empty(), "n2's copy already exited");
+        assert_eq!(signals_seen(&n1).len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13538,6 +13637,66 @@ mod tests {
             direct.details,
             serde_json::json!({"signal": 10, "target": "batch"})
         );
+    }
+
+    fn job_for_targets(
+        script: Option<&str>,
+        srun_job: bool,
+        step_dispatch: bool,
+    ) -> spur_core::job::Job {
+        let spec = spur_core::job::JobSpec {
+            script: script.map(Into::into),
+            srun_job,
+            ..Default::default()
+        };
+        let mut job = spur_core::job::Job::new(1, spec);
+        job.srun_step_dispatch = step_dispatch;
+        job
+    }
+
+    #[test]
+    fn a_companion_node_is_only_ever_sent_the_steps() {
+        use SignalTarget::{Batch, Full, Steps, Unspecified};
+        let srun_based = job_for_targets(Some("srun ./train\n"), false, false);
+        let plain_script = job_for_targets(Some("./train\n"), false, false);
+        let fanned_out_srun = job_for_targets(Some("srun ./train\n"), true, false);
+
+        // (job, node index, requested, expected)
+        let cases = [
+            (&srun_based, 0, Steps, Some(Steps)),
+            (&srun_based, 0, Batch, Some(Batch)),
+            (&srun_based, 0, Full, Some(Full)),
+            (&srun_based, 1, Steps, Some(Steps)),
+            (&srun_based, 1, Batch, None),
+            (&srun_based, 1, Full, Some(Steps)),
+            (&plain_script, 0, Batch, Some(Batch)),
+            (&plain_script, 1, Steps, Some(Steps)),
+            (&plain_script, 1, Batch, Some(Batch)),
+            (&plain_script, 1, Full, Some(Full)),
+            (&fanned_out_srun, 1, Batch, Some(Batch)),
+            (&fanned_out_srun, 1, Full, Some(Full)),
+            (&srun_based, 1, Unspecified, Some(Steps)),
+        ];
+        for (job, index, requested, expected) in cases {
+            assert_eq!(
+                node_signal_target(job, index, requested),
+                expected,
+                "node {index}, {requested:?}, script {:?}, srun_job {}",
+                job.spec.script,
+                job.spec.srun_job
+            );
+        }
+    }
+
+    #[test]
+    fn an_srun_allocation_without_a_batch_script_gets_every_target_on_every_node() {
+        let allocation = job_for_targets(None, true, true);
+        for index in 0..2 {
+            assert_eq!(
+                node_signal_target(&allocation, index, SignalTarget::Batch),
+                Some(SignalTarget::Batch)
+            );
+        }
     }
 
     #[test]

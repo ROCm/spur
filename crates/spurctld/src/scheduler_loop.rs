@@ -4541,7 +4541,7 @@ fn signal_outcome<T>(result: Result<T, tonic::Status>) -> SignalOutcome {
         Code::FailedPrecondition => SignalOutcome::Precondition(status.message().to_string()),
         Code::Unimplemented => SignalOutcome::AgentTooOld,
         Code::InvalidArgument => SignalOutcome::Rejected(status.message().to_string()),
-        _ => SignalOutcome::Failed(status.to_string()),
+        code => SignalOutcome::Failed(format!("{code:?}: {}", status.message())),
     }
 }
 
@@ -4625,28 +4625,28 @@ async fn signal_one_agent(
     }
 }
 
-/// Deliver one `signal` to every node in `node_names` and report what each did
-/// with it, in `node_names` order. Nodes run concurrently, each bounded by
-/// `CANCEL_RPC_TIMEOUT`. Kubernetes-operator nodes and agents without
+/// Deliver one `signal` to every `(node, target)` in `recipients` and report what
+/// each node did with it, in `recipients` order. Nodes run concurrently, each
+/// bounded by `CANCEL_RPC_TIMEOUT`. Kubernetes-operator nodes and agents without
 /// `CAP_SIGNAL_JOB` are not called.
 pub(crate) async fn signal_job_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
-    node_names: &[String],
+    recipients: &[(String, SignalTarget)],
     signal: i32,
-    target: SignalTarget,
 ) -> Vec<(String, NodeSignal)> {
     let mut set = tokio::task::JoinSet::new();
-    for (index, name) in node_names.iter().enumerate() {
+    for (index, (name, target)) in recipients.iter().enumerate() {
         let node = cluster.get_node(name);
         let name = name.clone();
+        let target = *target;
         set.spawn(async move {
             let result = signal_node(node, job_id, run_attempt, signal, target).await;
             (index, name, result)
         });
     }
-    let mut results = Vec::with_capacity(node_names.len());
+    let mut results = Vec::with_capacity(recipients.len());
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(result) => results.push(result),
@@ -4658,7 +4658,7 @@ pub(crate) async fn signal_job_on_nodes(
         .into_iter()
         .map(|(_, name, result)| {
             if result != NodeSignal::Sent(SignalOutcome::Delivered) {
-                warn!(job_id, signal, ?target, node = %name, ?result, "signal not delivered");
+                warn!(job_id, signal, node = %name, ?result, "signal not delivered");
             }
             (name, result)
         })
@@ -8036,9 +8036,10 @@ pub(crate) mod tests {
                 },
                 vec![SIGNAL_JOB_CAPABILITY.into()],
             );
-            let nodes = ["k8s", "ghost", "new", "old"].map(String::from);
+            let recipients =
+                ["k8s", "ghost", "new", "old"].map(|name| (name.to_string(), SignalTarget::Full));
 
-            let results = signal_job_on_nodes(&cm, 7, 3, &nodes, 10, SignalTarget::Full).await;
+            let results = signal_job_on_nodes(&cm, 7, 3, &recipients, 10).await;
 
             assert_eq!(
                 results,

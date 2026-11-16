@@ -35,7 +35,8 @@ use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
     batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
     build_mpi_mpirun_wrapper, build_multi_task_pmix_wrapper, build_multi_task_wrapper,
-    build_step_task_plan, slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
+    build_step_task_plan, runs_batch_companion_hold, slurm_tasks_per_node_str,
+    use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -6765,7 +6766,7 @@ impl SlurmAgent for AgentService {
         let work_dir = spec.work_dir.clone();
 
         let allocation_holder =
-            batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout;
+            runs_batch_companion_hold(&spec.script, task_offset == 0, req.task_fanout);
         let script = if allocation_holder {
             batch_companion_hold_script().to_string()
         } else {

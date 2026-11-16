@@ -196,6 +196,13 @@ pub fn batch_companion_hold_script() -> &'static str {
     "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile true; do sleep 60 & wait $!; done\n"
 }
 
+/// Whether a node runs `batch_companion_hold_script` as its batch step rather than a copy of
+/// the user's script: a script that launches its own steps runs once, on the primary, unless
+/// `task_fanout` dispatches the literal command to every node.
+pub fn runs_batch_companion_hold(script: &str, is_primary: bool, task_fanout: bool) -> bool {
+    !is_primary && !task_fanout && batch_script_uses_step_launch(script)
+}
+
 /// Per-node task launch parameters derived from a step's task distribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeStepTasks {
@@ -1044,6 +1051,19 @@ mod tests {
 
         let commented = "#!/bin/bash\n# srun should not match\n/tmp/hello_mpi\n";
         assert!(use_multi_task_launch(2, false, MPI_PMIX, commented));
+    }
+
+    #[test]
+    fn only_non_primary_nodes_of_a_step_launching_script_hold_the_allocation() {
+        use super::runs_batch_companion_hold;
+        let srun = "srun ./train\n";
+        assert!(!runs_batch_companion_hold(srun, true, false));
+        assert!(runs_batch_companion_hold(srun, false, false));
+        assert!(
+            !runs_batch_companion_hold(srun, false, true),
+            "fan-out runs every node"
+        );
+        assert!(!runs_batch_companion_hold("./train\n", false, false));
     }
 
     #[test]
