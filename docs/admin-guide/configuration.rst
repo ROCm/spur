@@ -2286,8 +2286,9 @@ Controls which nodes may register with the controller.
      - unset
      - Optional list of the nodes allowed in the cluster, expressed as node
        names or Slurm hostlist expressions. Applies in both admission modes.
-       Unset and never saved means dynamic registration; an explicit empty list
-       permits no nodes. See :ref:`configured-node-list`.
+       Unset (and no list saved) means no name filter: any node that passes
+       the admission mode registers. An explicit empty list permits no nodes.
+       See :ref:`configured-node-list`.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
@@ -2296,8 +2297,9 @@ See :doc:`accounting` for managing admission tokens with ``spur token``.
 Configuration-driven node removal
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-By default, registered nodes remain in the inventory until explicitly removed
-with ``spur node remove <node>``. ``[[nodes]]`` entries describe resource limits
+By default ``node_names`` is unset, so registration is not filtered by name:
+any node that passes the admission mode registers, and registered nodes remain
+in the inventory until explicitly removed with ``spur node remove <node>``. ``[[nodes]]`` entries describe resource limits
 and scheduling policy; deleting one does not delete a registered node.
 
 To manage the inventory through ``spur.conf``, list the allowed nodes:

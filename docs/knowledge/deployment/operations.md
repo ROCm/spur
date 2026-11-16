@@ -123,7 +123,7 @@ All configuration is TOML at `/etc/spur/spur.conf`, parsed by
 | `[rest_api]` | Slurm-compat REST API on port 6820, off by default. |
 | `[hooks]` | Prolog/epilog/task hooks, job_submit shell/lua scripts. All paths must be absolute. |
 | `[devices]` | CDI, GRES discovery configuration. |
-| `[admission]` | Node admission mode (`open`/`token`), optional `node_names` list of allowed nodes (saved by `scontrol reconfigure`). |
+| `[admission]` | Node admission mode (`open`/`token`), optional `node_names` list of allowed nodes (saved by `scontrol reconfigure`); unset means any node that passes the mode registers, with no name filter. |
 | `[rlimits]` | Per-step RLIMIT_MEMLOCK (`unlimited`/`inherit`/bytes). |
 | `[cgroup]` | cgroup-v2 enforcement: enabled, required, constrain_cores/ram/swap/devices, cleanup timeout, OOM group, device filter extra paths. |
 | `[mpi]` | PMIx plugin directory, tmpdir, min version, modex timeouts. |
