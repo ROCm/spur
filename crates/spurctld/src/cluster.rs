@@ -4223,7 +4223,7 @@ impl ClusterManager {
             && self.startup_node_inventory.excludes(&name)
         {
             return Err(RegisterNodeError::PermissionDenied(format!(
-                "node {name} is absent from admission.node_names"
+                "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
             )));
         }
 
@@ -4347,7 +4347,7 @@ impl ClusterManager {
             }
             return;
         }
-        // A held lock means a reconfigure is running, and it saves the list itself.
+        // Another registration or a reconfigure holds the lock; a later registration retries.
         let Some(_reconfigure) = self.reconfigure_lock.try_lock() else {
             return;
         };
@@ -4413,7 +4413,7 @@ impl ClusterManager {
         };
         if excluded {
             return Err(RegisterNodeError::PermissionDenied(format!(
-                "node {name} is absent from admission.node_names"
+                "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
             )));
         }
         Ok(())
@@ -6839,6 +6839,8 @@ impl ClusterManager {
             if let Some(error) = response.node_inventory_error {
                 anyhow::bail!("reconfigure: {error}");
             }
+            // The saved list now matches this leader's file, so a startup-list mismatch is stale.
+            swap_flag(&self.node_names_mismatch_warned);
         }
         let conf_partitions = new_config.build_partitions();
 
@@ -10030,6 +10032,7 @@ impl ClusterManager {
                 };
                 for name in removed {
                     nodes.remove(&name);
+                    info!(node = %name, "node removed: absent from admission.node_names");
                     self.k8s_metrics
                         .remove_node(&self.config().cluster_name, &name);
                 }
@@ -10420,7 +10423,7 @@ fn reject_excluded_registration(
 ) -> Result<(), RegisterNodeError> {
     if response.node_registration_rejected {
         return Err(RegisterNodeError::PermissionDenied(format!(
-            "node {name} is absent from admission.node_names"
+            "node {name} is not allowed by admission.node_names; list changes take effect through `scontrol reconfigure`"
         )));
     }
     Ok(())
@@ -10437,6 +10440,9 @@ fn inventory_removals(
         return Ok(Vec::new());
     };
     let removed = unlisted_node_names(names, nodes);
+    if removed.is_empty() {
+        return Ok(removed);
+    }
     let held: HashSet<_> = jobs
         .values()
         .filter(|job| !job.state.is_finalized())
@@ -10482,7 +10488,15 @@ fn inventory_removals(
                     "node '{name}' is a Kubernetes control-plane node; run `spur k8s down` first"
                 );
             }
-            anyhow::bail!("node '{name}' belongs to the managed Kubernetes cluster; remove that membership first with `spur k8s remove-nodes`");
+            if k0s.phase == spur_core::k0s::K0sPhase::Degraded {
+                anyhow::bail!(
+                    "node '{name}' belongs to the degraded Kubernetes cluster; run `spur k8s down` first"
+                );
+            }
+            anyhow::bail!(
+                "node '{name}' belongs to the managed Kubernetes cluster; remove that membership \
+                 first with `spur k8s remove-nodes`"
+            );
         }
     }
     Ok(removed)
@@ -13850,6 +13864,16 @@ pub(crate) mod tests {
             .node_inventory_error
             .unwrap();
         assert!(error.contains("spur k8s remove-nodes"), "{error}");
+        cm.k0s.write().phase = spur_core::k0s::K0sPhase::Degraded;
+        let error = cm
+            .apply_operation(&inventory_update(&[]))
+            .node_inventory_error
+            .unwrap();
+        assert!(
+            error.contains("degraded Kubernetes cluster; run `spur k8s down`"),
+            "{error}"
+        );
+        cm.k0s.write().phase = spur_core::k0s::K0sPhase::Provisioning;
         cm.nodes.write().get_mut("n1").unwrap().k0s_role =
             Some(spur_core::k0s::K0sRole::Controller);
         let error = cm

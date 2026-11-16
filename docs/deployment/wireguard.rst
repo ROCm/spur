@@ -145,8 +145,8 @@ Removing a node from the mesh
    every ~30s, so if the node is still registered it will simply re-push the peer
    you just removed. Run ``spur node remove <node>``, or drop it from
    ``admission.node_names`` and run ``scontrol reconfigure`` (see
-   :ref:`configured-node-list`), first, so the reconcile no longer includes it,
-   then remove the peer.
+   :ref:`configured-node-list`; remove its Kubernetes membership first), so the
+   reconcile no longer includes it, then remove the peer.
 
 When a node leaves, drop its peer entry so it does not linger as a "ghost" peer
 (and, on the node itself, tear the interface down so it does not rejoin on

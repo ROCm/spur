@@ -2317,10 +2317,12 @@ holds job allocations, has allocated resources, belongs to a reservation, or
 belongs to the managed Kubernetes cluster. Drain those nodes, wait for their
 allocations to finish, and remove reservation and Kubernetes membership first.
 ``spur k8s remove-nodes`` removes workers from a cluster brought up with
-``spur k8s up --nodes``, ``--partition``, or ``--selector``. A control-plane node,
-the last members, or a cluster brought up without a scope (which spans every
-node) needs ``spur k8s down``. Node roles clear once the teardown finishes, so
-retry the reconfigure if it reports that the teardown has not finished.
+``spur k8s up --nodes``, ``--partition``, or ``--selector`` while it is up. A
+control-plane node, the last members, a degraded cluster, or a cluster brought up
+without a scope (which spans every node) needs ``spur k8s down``. Node roles clear
+once the teardown finishes, so retry the reconfigure if it reports that the
+teardown has not finished. If an external block file names a deleted node, remove
+it from that file in the same change, or later reconfigures fail.
 
 On each deleted host, stop and disable ``spurd``. A still-running agent keeps
 retrying registration and logging the refusal, and a restarted one exits, so a
@@ -2341,15 +2343,18 @@ still listed does not keep it out: its agent registers again on its next
 heartbeat. Adding names does not create node records: each permitted agent must
 register. With a saved list, reservations, Kubernetes membership, and job
 placement also refuse nodes that are excluded or not yet registered. A token is
-still required when ``mode = "token"``. The list applies to all node sources; it
-does not provide a mixed static/dynamic inventory mode. Names match exactly,
-including case.
+still required when ``mode = "token"``. The list applies to all node sources;
+there is no mode that mixes listed and unlisted nodes. Names match exactly,
+including case. ``spurctld`` refuses to start, and ``scontrol reconfigure`` fails,
+if the list is invalid; other programs that read the same file ignore it.
 
 ``node_names = []`` deliberately deletes every registered node, subject to the
 same refusals, and rejects every new registration. Removing the field and running
-``scontrol reconfigure`` saves a cleared list, which behaves like one that was
-never set: dynamic registration resumes and nothing is refused for being
-unregistered. Deleted records are not restored, but any agent still running on a
+``scontrol reconfigure`` saves a cleared list: dynamic registration resumes and
+nothing is refused for being unregistered. Unlike a list that was never set, a
+cleared list stays in force after a restart even if the file sets ``node_names``
+again; only ``scontrol reconfigure`` applies the new list. Deleted records are
+not restored, but any agent still running on a
 deleted host registers again on its next heartbeat. Removing the field without
 running ``scontrol reconfigure`` keeps a saved list in force. Names support
 letters, digits, dots, underscores, and hyphens; the list is bounded to 100,000
@@ -2369,15 +2374,16 @@ across leader changes and controller restarts. A different list loaded at startu
 is logged at most once per controller process and ignored until
 ``scontrol reconfigure``, which reads the leader's file.
 
-In Slurm, the global static ``NodeName=`` definitions are the authoritative node
-set by default; there is no separate deletion-enabling knob. Slurm 24.11 and
-later support removing static nodes through ``scontrol reconfigure`` after
-draining and removing their configuration references. Older versions require the
-controller restart procedure. Dynamic Slurm nodes are different: absence from
-static configuration does not delete them. See the `Slurm node-removal FAQ
-<https://slurm.schedmd.com/faq.html#rem_nodes>`_. Spur makes this list explicit
-to preserve existing deployments that discover nodes dynamically. Upgrade every
-controller before setting it; see :ref:`upgrading-node-names`.
+In Slurm, the ``NodeName=`` lines in ``slurm.conf`` define the node set; there is
+no separate deletion-enabling knob. In Slurm 24.11 and later, a node is removed by
+draining it, removing it from ``slurm.conf`` on every host, and running
+``scontrol reconfigure``; older versions need a controller restart. See the
+`Slurm node-removal FAQ <https://slurm.schedmd.com/faq.html#rem_nodes>`_. Slurm
+`dynamic nodes <https://slurm.schedmd.com/dynamic_nodes.html>`_ are not defined
+in ``slurm.conf`` and are removed only with ``scontrol delete nodename``. Spur
+makes this list explicit to preserve existing deployments that discover nodes
+dynamically. Upgrade every controller before setting it; see
+:ref:`upgrading-node-names`.
 
 ``[devices]``
 -------------

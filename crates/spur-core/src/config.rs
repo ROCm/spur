@@ -2559,7 +2559,6 @@ impl SlurmConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        self.admission.node_inventory()?;
         if let Some(external) = self
             .topology
             .as_ref()
@@ -3442,13 +3441,24 @@ node_names = ["n[01-02]", "n01", "service-a"]
             r#"[""]"#,
             r#"["node*"]"#,
             r#"["n[1-100001]"]"#,
+            r#"["a[1-60000]", "b[1-60000]"]"#,
         ] {
             let input = format!("cluster_name = 'test'\n[admission]\nnode_names = {names}");
-            assert!(
-                super::SlurmConfig::load_from_str(&input).is_err(),
-                "{names}"
-            );
+            // Only the controller expands the list, so other readers of a shared file still load it.
+            let config = super::SlurmConfig::load_from_str(&input).unwrap();
+            assert!(config.admission.node_inventory().is_err(), "{names}");
         }
+        let error = super::SlurmConfig::load_from_str(
+            "cluster_name = 'test'\n[admission]\nnode_names = ['a[1-60000]', 'b[1-60000]']",
+        )
+        .unwrap()
+        .admission
+        .node_inventory()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("more than 100000 node names"),
+            "{error}"
+        );
     }
 
     #[test]

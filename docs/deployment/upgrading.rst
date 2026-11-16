@@ -1082,8 +1082,9 @@ Configured node list (``admission.node_names``)
 
 This release adds the optional ``[admission] node_names`` list (see
 :ref:`configured-node-list`). No new Raft log entries are written until it is
-set. Every ``scontrol reconfigure`` now first waits for earlier Raft writes to
-apply, so on a heavily loaded controller it can fail with a timeout; rerun it.
+set. On a cluster that has never set it, ``scontrol reconfigure`` now first
+waits for earlier Raft writes to apply, so on a heavily loaded controller it can
+fail with a timeout; rerun it.
 
 **Upgrade every controller before setting it.** Saving the list writes a new
 Raft log entry, ``NodeInventoryUpdate``. A controller that predates it cannot
@@ -1093,7 +1094,8 @@ cannot commit and every later write stalls. The list is saved without any
 ``scontrol reconfigure`` when an upgraded leader whose file sets ``node_names``
 handles an agent registration, so do not add ``node_names`` in the same rollout
 as the new binaries: upgrade every controller first, then set it. A rollback
-after the list has been saved is not supported: roll forward.
+after the list has been saved, or cleared, is not supported because older
+controllers cannot replay that log entry: roll forward.
 
 See Also
 --------
