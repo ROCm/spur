@@ -418,14 +418,15 @@ catch-up; ordinary job queries retain their existing local fallback. Terminal
 jobs are eligible for cleanup only when `GetJobsResponse.authoritative` confirms
 fresh controller state. Missing jobs also require
 `GetJobsResponse.unrestricted_visibility` and an id below
-`GetJobsResponse.next_job_id`, so a freshly bootstrapped or wiped controller,
-which has issued none of the node's ids, cannot mark them deletable. Upgrade
+`GetJobsResponse.next_job_id`, the controller's issue high-water mark. A
+freshly bootstrapped or wiped controller cannot confirm ids it has not reached
+yet; ids below a raised `first_job_id` count as issued and purged. Upgrade
 controllers before agents to enable automatic spool cleanup. Older controllers
 default the authority flag to false, so every candidate remains protected.
 
-With `[auth] private_data` including `jobs`, the node's identity sees only its
-own jobs unless it is an operator or administrator, so other users' spools are
-retained and a log line says why.
+With `[auth] plugin = "spur"` and `private_data` including `jobs`, spurd's root
+identity sees only root's jobs unless it is an Operator or Administrator, so
+other users' spools are retained and a log line says why.
 
 Local ownership takes precedence: tracked jobs, reserved allocations, active
 steps, supervisors and every retained runtime session protect the entire job
@@ -439,10 +440,12 @@ surviving workloads:
   uid are the daemon's, protects the job in its arguments, even if its runtime
   record disappeared; such a process without a job id retains every candidate;
 - a valid `SPUR_JOB_ID`, `SPUR_JOBID`, `SLURM_JOB_ID` or `SLURM_JOBID` in a
-  process environment protects that job; values that name no job are ignored;
+  process environment protects that job id; unparsable values are ignored;
 - a working directory or open file inside a spool protects it, matched by path
   and by inode (for holders on the spool's filesystem), so hardlinks and bind
-  mounts are recognised.
+  mounts are recognised; targets on network or FUSE mounts are never stat-ed.
+  A process that is exiting mid-scan is skipped. Reading other processes needs
+  `CAP_SYS_PTRACE`.
 
 Unsafe or unreadable roots, uncertain activity information, unknown job states,
 non-authoritative responses and restricted missing-job responses cause folders
@@ -450,9 +453,12 @@ to be retained with a log message. A failed controller query stops further
 batches and startup continues.
 
 Automatic deletion is skipped when cgroups are disabled. Traversal streams
-directory entries, keeps one directory open per level and stops at 256 levels
-(the spool is kept); it uses `openat2` where available and otherwise combines
-`openat` with no-follow opens and descriptor mount IDs. Deletion follows
+directory entries and stops at 256 levels (the inode check holds two
+descriptors per level, deletion one); deletion is depth-first, so a deeper tree
+may be partly removed before it is kept. A directory that keeps refilling is
+kept. Completion cleanup has its own 60-second budget. Traversal uses `openat2`
+where available and otherwise combines `openat` with no-follow opens and
+descriptor mount IDs. Deletion follows
 neither symlinks nor mount points and shares the per-job launch/teardown lock.
 One spool that cannot be walked or deleted does not hold back the others.
 

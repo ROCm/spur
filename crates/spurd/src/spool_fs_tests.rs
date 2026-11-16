@@ -158,6 +158,18 @@ fn cleanup_streams_directories_larger_than_one_read() {
 }
 
 #[test]
+fn traversal_refuses_a_name_it_already_handed_out() {
+    let (_directory, root) = fixture();
+    std::fs::create_dir(root.join("job1")).unwrap();
+    std::fs::write(root.join("job1/output"), "retained").unwrap();
+    let directory = open_directory(&root.join("job1")).unwrap();
+    let mut frame = TraversalFrame::new(directory, None);
+    assert_eq!(frame.next_name().unwrap(), Some(OsString::from("output")));
+    let error = frame.next_name().unwrap_err();
+    assert_eq!(kept_reason(&error), Some("kept changing during cleanup"));
+}
+
+#[test]
 fn cleanup_stops_at_its_deadline_and_keeps_the_spool() {
     let (_directory, root) = fixture();
     std::fs::create_dir(root.join("job1")).unwrap();
@@ -413,10 +425,7 @@ fn traversal_fd_exhaustion_retains_the_spool() {
 fn cleanup_keeps_spools_deeper_than_the_traversal_limit() {
     let fixture = DeepSpool::new(MAX_SPOOL_DEPTH + 8);
     let error = cleanup_job_spool_under(&fixture.root, 1).unwrap_err();
-    assert_eq!(
-        kept_reason(&error),
-        Some("deeper than the traversal limit, not walked")
-    );
+    assert_eq!(kept_reason(&error), Some("deeper than the traversal limit"));
     assert!(fixture.root.join("job1").is_dir());
 
     let fixture = DeepSpool::new(MAX_SPOOL_DEPTH - 2);

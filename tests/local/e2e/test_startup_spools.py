@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -55,7 +56,7 @@ def test_startup_removes_terminal_and_absent_spools_but_keeps_pending(local_clus
     assert not absent.exists(), log
     assert (held / "sentinel").read_text() == f"job {pending}\n"
     assert (never_issued / "sentinel").read_text() == f"job {NEVER_ISSUED}\n", log
-    assert "deleted=2" in log and "retained=2" in log, log
+    assert re.search(r"deleted=2\b.*retained=2\b", log), log
     assert len(cluster.call("queries")) == 1
 
 
@@ -169,14 +170,16 @@ def test_symlinked_spool_root_is_followed_but_nothing_beneath_it(local_cluster):
     process = cluster.call("start_holder", name="holder", environment={},
                            script=f"import os, signal; os.chdir({str(held)!r}); "
                                   "print('READY', flush=True); signal.pause()")
-    cluster.wait_file(process["log"], "READY")
-    log = cluster.start_agent()
-    assert not orphan.exists(), log
-    assert held.exists(), log
-    assert (cluster.spool / "job503").is_symlink()
-    assert (target / "sentinel").read_text() == "outside spool\n"
-    assert "kept job spool: entry is a symlink, not followed" in log, log
-    cluster.call("stop", name="holder")
+    try:
+        cluster.wait_file(process["log"], "READY")
+        log = cluster.start_agent()
+        assert not orphan.exists(), log
+        assert held.exists(), log
+        assert (cluster.spool / "job503").is_symlink()
+        assert (target / "sentinel").read_text() == "outside spool\n"
+        assert "kept job spool: entry is a symlink, not followed" in log, log
+    finally:
+        cluster.call("stop", name="holder")
 
 
 @pytest.mark.parametrize("holder", ["environment", "cwd", "fd", "hardlink-fd"])

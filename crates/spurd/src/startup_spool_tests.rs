@@ -516,8 +516,58 @@ async fn startup_spool_retains_everything_once_its_budget_is_spent() {
         .cleanup_startup_job_spools_with_inventory(paths)
         .await;
     assert_eq!(summary.deleted, 0);
-    assert_eq!(summary.retained, 2);
     assert!(fixture.exists(1));
+    assert!(fixture.exists(2));
+}
+
+#[tokio::test]
+async fn startup_spool_skips_processes_that_exit_mid_inventory() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1]);
+    let exiting = fixture.process(100, &["workload"], b"");
+    fs::remove_file(exiting.join("cwd")).unwrap();
+    let stat = fs::read_to_string(exiting.join("stat")).unwrap();
+    fs::write(exiting.join("stat"), stat.replacen(") S ", ") Z ", 1)).unwrap();
+    assert_eq!(fixture.run().await.deleted, 1);
+
+    let fixture = SpoolFixture::new(&controller, &[1]);
+    let running = fixture.process(100, &["workload"], b"");
+    fs::remove_file(running.join("cwd")).unwrap();
+    assert_eq!(
+        fixture.run().await.deleted,
+        0,
+        "a live process with no cwd is uncertain"
+    );
+}
+
+#[tokio::test]
+async fn startup_spool_does_not_stat_holders_on_remote_mounts() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1, 2]);
+    let remote = fixture.directory.path().join("remote");
+    fs::create_dir(&remote).unwrap();
+    fs::create_dir(fixture.paths().proc_root.join("self")).unwrap();
+    fs::write(
+        fixture.paths().proc_root.join("self/mountinfo"),
+        format!(
+            "36 25 0:50 / {} rw - nfs4 server:/export rw\n",
+            remote.display()
+        ),
+    )
+    .unwrap();
+    let holder = fixture.process(100, &["output-reader"], b"");
+    for (id, directory) in [(1, &remote), (2, &fixture.directory.path().to_path_buf())] {
+        let alias = directory.join(format!("alias{id}"));
+        fs::hard_link(fixture.root.join(format!("job{id}/output")), &alias).unwrap();
+        symlink(&alias, holder.join(format!("fd/{id}"))).unwrap();
+    }
+    assert_eq!(fixture.run().await.deleted, 1);
+    assert!(
+        !fixture.exists(1),
+        "a holder path on a remote mount is never stat-ed"
+    );
     assert!(fixture.exists(2));
 }
 

@@ -137,35 +137,6 @@ The two daemons are configured with command-line flags. The most common are belo
    ``srun --mpi=pmix`` step each host their PMIx server inside their own
    supervisor.
 
-Orphan job spool cleanup
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-Each job keeps its script and step output in ``/var/spool/spur/job<id>`` (or
-``$TMPDIR/spur/job<id>`` when the first is not writable), removed when the job
-finishes. Directories left behind by a crash or a lost job are removed once,
-each time ``spurd`` starts, before it accepts work:
-
-* A directory is removed only after the leader controller confirms the job has
-  finished or no longer exists. Any doubt keeps it, so a node never loses the
-  output of a job that may still need it.
-* Running work keeps its directory: jobs and steps tracked by the agent or a
-  surviving supervisor, a populated job cgroup, or any process with a
-  ``SLURM_JOB_ID``/``SPUR_JOB_ID`` for the job, or with its working directory or
-  an open file inside it.
-* The pass is skipped when ``[cgroup] enabled = false``, and it gives up after
-  60 seconds, keeping whatever it has not decided. The next start continues.
-* Symlinks in the spool path (for example ``/var/spool`` on another disk) are
-  followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
-  mount point, or a tree deeper than 256 levels is kept and logged with
-  ``kept job spool`` for manual removal.
-* With ``[auth] private_data`` including ``jobs``, the node sees only its own
-  jobs, so other users' directories are kept. Set
-  ``allow_uid_zero_administrator = true`` or add ``root`` to
-  ``cluster_admins`` to let the node see every job.
-
-Every decision is logged; the pass ends with ``startup job spool cleanup
-finished deleted=<n> retained=<n> errors=<n>``.
-
    Before the controller will *fence* a supervisor belonging to a superseded
    run, the reporting node has to prove its identity, and that takes **two**
    settings together: ``[auth] jwt_key`` (or ``jwt_key_file``) **and**
@@ -191,6 +162,52 @@ finished deleted=<n> retained=<n> errors=<n>``.
    falls back to defaults for those sections, which is fine when none of them are
    in use. ``[devices]`` inventory is also re-discovered periodically after
    startup; see :doc:`../admin-guide/configuration`.
+
+Orphan job spool cleanup
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each job keeps its script and step output in ``/var/spool/spur/job<id>``, or in
+``/tmp/spur/job<id>`` (``$TMPDIR/spur`` if set) when the first cannot be
+created. The directory is removed when the job finishes. Directories left
+behind by a crash or a lost job are removed once, each time ``spurd`` starts,
+before it accepts work:
+
+* A directory is removed only after the leader controller confirms the job has
+  finished, or confirms it no longer exists and its id is below the next id the
+  controller will issue. Any doubt keeps it.
+* Running work keeps its directory: jobs and steps tracked by the agent, a
+  surviving ``spurstepd`` for the job, a populated job cgroup, any process with
+  ``SPUR_JOB_ID``, ``SPUR_JOBID``, ``SLURM_JOB_ID`` or ``SLURM_JOBID`` set to
+  the job's id, or any process with its working directory or an open file
+  inside it.
+* A spool root is scanned only if it is owned by the ``spurd`` user and not
+  writable by group or others; otherwise ``skipped unsafe or unreadable spool
+  root`` is logged and it is left alone.
+* The pass is skipped when ``[cgroup] enabled = false`` (it needs cgroup v2),
+  and it stops after 60 seconds, keeping whatever it has not decided. The next
+  start continues. Heartbeats run during the pass, so a launch sent to the node
+  in that window is refused and placed elsewhere.
+* ``spurd`` reads every process's environment, working directory and open
+  files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
+  fail and nothing is removed; each retained directory logs ``activity
+  inventory uncertain``.
+* Symlinks in the spool path (for example ``/var/spool`` on another disk) are
+  followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
+  mount point, or a tree deeper than 256 levels is logged with ``kept job
+  spool: <reason>`` for manual removal; a deep tree may be partly removed.
+* With ``[auth] plugin = "spur"`` and ``private_data`` including ``jobs``,
+  ``spurd`` calls the controller as ``root``, which sees only root's own jobs
+  unless it is an Operator or Administrator. Other users' directories are then
+  kept. Give root the Operator role (for example through ``operator_groups``)
+  to let cleanup proceed; ``allow_uid_zero_administrator = true`` also works but
+  makes root on every node a cluster Administrator.
+* Run one ``spurd`` per host. The spool and cgroup roots are fixed, so a second
+  agent from another cluster on the same host could remove the first agent's
+  leftover directories.
+
+Routine decisions are logged as ``retained job spool: <reason>`` or ``deleted
+orphan job spool``; the pass ends with ``startup job spool cleanup finished
+deleted=<n> retained=<n> errors=<n>``.
 
 Quick Start: Two-Node Cluster
 -----------------------------

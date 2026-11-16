@@ -53,7 +53,7 @@ class ControllerProxy(grpc.GenericRpcHandler):
                 elif mode == "legacy":
                     return b""
                 elif mode == "legacy-terminal":
-                    # A stale legacy controller claims job 1000 is terminal with full visibility.
+                    # A non-authoritative response claiming job 1000 is terminal with full visibility.
                     return b"\x0a\x05\x08\xe8\x07\x38\x05\x10\x01"
             try:
                 return self.channel.unary_unary(method)(request, timeout=10)

@@ -13,12 +13,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Bounds descriptors held by one walk; a deeper user tree is kept, not deleted.
 pub(crate) const MAX_SPOOL_DEPTH: usize = 256;
 const READ_CHUNK: usize = 1024;
 const MAX_RESCANS: u8 = 2;
+const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
 
 /// Opens a spool root, following symlinks in its path; nothing beneath it is followed.
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
@@ -39,7 +40,7 @@ impl std::fmt::Display for Kept {
 
 impl std::error::Error for Kept {}
 
-const TOO_DEEP: &str = "deeper than the traversal limit, not walked";
+const TOO_DEEP: &str = "deeper than the traversal limit";
 
 pub(crate) fn budget_exhausted() -> io::Error {
     io::Error::new(
@@ -212,11 +213,15 @@ impl SpoolRoot {
             let Some(job_id) = canonical_job_id(&name) else {
                 continue;
             };
-            let metadata = fstatat(
+            let metadata = match fstatat(
                 &self.directory,
                 name.as_os_str(),
                 AtFlags::AT_SYMLINK_NOFOLLOW,
-            )?;
+            ) {
+                Ok(metadata) => metadata,
+                Err(nix::errno::Errno::ENOENT) => continue,
+                Err(error) => return Err(error.into()),
+            };
             match metadata.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {}
                 libc::S_IFLNK => {
@@ -436,6 +441,7 @@ struct TraversalFrame {
     directory: File,
     entry: Option<(OsString, Metadata)>,
     pending: std::vec::IntoIter<OsString>,
+    previous: HashSet<OsString>,
     reached_end: bool,
     rescans: u8,
 }
@@ -446,6 +452,7 @@ impl TraversalFrame {
             directory,
             entry,
             pending: Vec::new().into_iter(),
+            previous: HashSet::new(),
             reached_end: false,
             rescans: 0,
         }
@@ -460,10 +467,15 @@ impl TraversalFrame {
         if names.is_empty() {
             return Ok(None);
         }
+        // Every name returned before was unlinked, so seeing one again means no progress.
+        if names.iter().any(|name| self.previous.contains(name)) {
+            return Err(io::Error::other(Kept("kept changing during cleanup")));
+        }
+        self.previous = names.iter().cloned().collect();
         if self.reached_end {
             self.rescans += 1;
             if self.rescans > MAX_RESCANS {
-                return Err(io::Error::other("job spool kept changing during cleanup"));
+                return Err(io::Error::other(Kept("kept changing during cleanup")));
             }
         }
         self.reached_end = names.len() < READ_CHUNK;
@@ -513,7 +525,7 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
             job_id,
             metadata: directory.metadata()?,
         },
-        None,
+        Some(Instant::now() + COMPLETION_BUDGET),
     )
 }
 

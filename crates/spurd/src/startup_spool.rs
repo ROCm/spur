@@ -69,11 +69,17 @@ pub(crate) async fn run(
         summary.log();
         return summary;
     }
-    let candidates = match tokio::task::spawn_blocking(move || discover(roots)).await {
-        Ok(candidates) => candidates,
-        Err(error) => {
+    let discovery = tokio::task::spawn_blocking(move || discover(roots));
+    let candidates = match tokio::time::timeout_at(deadline.into(), discovery).await {
+        Ok(Ok(candidates)) => candidates,
+        Ok(Err(error)) => {
             warn!(%error, "startup spool discovery failed");
             summary.errors += 1;
+            summary.log();
+            return summary;
+        }
+        Err(_) => {
+            warn!("startup spool discovery exceeded its time budget; startup will continue");
             summary.log();
             return summary;
         }
@@ -137,7 +143,7 @@ pub(crate) async fn run(
         let mut eligible = Vec::new();
         for &job_id in batch {
             let job_candidates = candidates.remove(&job_id).unwrap_or_default();
-            // Absence only counts for ids the controller has issued; a wiped controller issues none.
+            // Ids at or above the controller's issue high-water mark are not confirmed absent.
             let absent_confirmed =
                 response.unrestricted_visibility && job_id < response.next_job_id;
             let controller_allows =
@@ -163,6 +169,7 @@ pub(crate) async fn run(
         if eligible.is_empty() {
             continue;
         }
+        let in_flight = eligible.len();
         let paths = paths.clone();
         // Keep guards in the worker so cancellation cannot release launch exclusion
         // while blocking filesystem operations still run.
@@ -177,6 +184,7 @@ pub(crate) async fn run(
         });
         // A worker stuck in the kernel keeps its guards; its own deadline checks stop late deletions.
         let Ok(worker) = tokio::time::timeout_at(deadline.into(), worker).await else {
+            summary.retained += in_flight;
             retain_remaining(&candidates, "cleanup time budget exhausted", &mut summary);
             warn!("startup spool cleanup worker exceeded its time budget; startup will continue");
             break;
@@ -188,6 +196,7 @@ pub(crate) async fn run(
                 summary.errors += batch_summary.errors;
             }
             Err(error) => {
+                summary.retained += in_flight;
                 summary.errors += 1;
                 warn!(%error, "startup spool cleanup worker failed");
             }
@@ -248,7 +257,7 @@ fn clean_inactive(
     deadline: Instant,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
-    let inventory = activity_inventory(&candidates, paths);
+    let inventory = activity_inventory(&candidates, paths, deadline);
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
         let path = &candidate.path;
@@ -302,7 +311,11 @@ struct Inventory {
     held: HashSet<(u64, u64)>,
 }
 
-fn activity_inventory(candidates: &[Candidate], paths: &ActivityPaths) -> io::Result<Inventory> {
+fn activity_inventory(
+    candidates: &[Candidate],
+    paths: &ActivityPaths,
+    deadline: Instant,
+) -> io::Result<Inventory> {
     let mut inventory = Inventory {
         protected: retained_sessions(&paths.runtime_root)?,
         held: HashSet::new(),
@@ -310,7 +323,7 @@ fn activity_inventory(candidates: &[Candidate], paths: &ActivityPaths) -> io::Re
     inventory
         .protected
         .extend(populated_jobs(&paths.cgroup_root)?);
-    inspect_processes(paths, candidates, &mut inventory)?;
+    inspect_processes(paths, candidates, deadline, &mut inventory)?;
     Ok(inventory)
 }
 
@@ -331,7 +344,11 @@ fn retained_sessions(root: &Path) -> io::Result<HashSet<u32>> {
         if name == "cleanup" {
             continue;
         }
-        let entry = open_child(&directory, &name, OFlag::O_PATH)?;
+        let entry = match open_child(&directory, &name, OFlag::O_PATH) {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let metadata = entry.metadata()?;
         if !metadata.is_dir() && !metadata.is_symlink() {
             continue;
@@ -354,6 +371,7 @@ fn populated_jobs(root: &Path) -> io::Result<HashSet<u32>> {
         .parent()
         .ok_or_else(|| io::Error::other("cgroup root has no parent"))?;
     let parent = open_directory(parent)?;
+    // Population is read from cgroup v2 `cgroup.events`; without v2 nothing proves a job idle.
     open_child(&parent, OsStr::new("cgroup.controllers"), OFlag::O_RDONLY)?;
     let mut protected = HashSet::new();
     let Some(directory) = optional_directory(root)? else {
@@ -374,9 +392,15 @@ fn populated_jobs(root: &Path) -> io::Result<HashSet<u32>> {
         else {
             return Err(io::Error::other("unidentified job cgroup"));
         };
-        let job = open_child(&directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
-        if cgroup_populated(&job)? {
-            protected.insert(id);
+        let populated = open_child(&directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+            .and_then(|job| cgroup_populated(&job));
+        match populated {
+            Ok(true) => {
+                protected.insert(id);
+            }
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(protected)
@@ -400,10 +424,17 @@ fn cgroup_populated(directory: &File) -> io::Result<bool> {
 fn inspect_processes(
     paths: &ActivityPaths,
     candidates: &[Candidate],
+    deadline: Instant,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
-    let devices: HashSet<u64> = candidates.iter().map(|c| c.spool.device()).collect();
+    let holders = HolderFilter {
+        devices: candidates.iter().map(|c| c.spool.device()).collect(),
+        remote: RemoteMounts::read(&paths.proc_root.join("self/mountinfo"))?,
+    };
     for entry in fs::read_dir(&paths.proc_root)? {
+        if Instant::now() >= deadline {
+            return Err(budget_exhausted());
+        }
         let entry = entry?;
         if entry
             .file_name()
@@ -419,7 +450,7 @@ fn inspect_processes(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let result = inspect_process(&path, paths.supervisor_uid, candidates, &devices, inventory);
+        let result = inspect_process(&path, paths.supervisor_uid, candidates, &holders, inventory);
         match fs::read(path.join("stat")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -428,13 +459,15 @@ fn inspect_processes(
                     "process identity changed during spool inventory",
                 ));
             }
+            // An exiting process loses its files piecemeal; it no longer holds anything.
+            Ok(after) if result.is_err() && matches!(process_state(&after)?, b"Z" | b"X") => {}
             Ok(_) => result?,
         }
     }
     Ok(())
 }
 
-fn process_identity(stat: &[u8]) -> io::Result<&[u8]> {
+fn stat_field(stat: &[u8], index: usize) -> io::Result<&[u8]> {
     let end = stat
         .iter()
         .rposition(|b| *b == b')')
@@ -442,8 +475,81 @@ fn process_identity(stat: &[u8]) -> io::Result<&[u8]> {
     stat[end + 1..]
         .split(|b| b.is_ascii_whitespace())
         .filter(|s| !s.is_empty())
-        .nth(19)
-        .ok_or_else(|| io::Error::other("missing process start time"))
+        .nth(index)
+        .ok_or_else(|| io::Error::other("truncated process stat"))
+}
+
+fn process_identity(stat: &[u8]) -> io::Result<&[u8]> {
+    stat_field(stat, 19)
+}
+
+fn process_state(stat: &[u8]) -> io::Result<&[u8]> {
+    stat_field(stat, 0)
+}
+
+struct HolderFilter {
+    devices: HashSet<u64>,
+    remote: RemoteMounts,
+}
+
+/// Network and FUSE mounts, whose stat can block indefinitely; spools never live on them.
+#[derive(Default)]
+struct RemoteMounts {
+    mounts: Vec<(PathBuf, bool)>,
+}
+
+impl RemoteMounts {
+    fn read(path: &Path) -> io::Result<Self> {
+        let info = match fs::read_to_string(path) {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let mounts = info
+            .lines()
+            .filter_map(|line| {
+                let (left, right) = line.split_once(" - ")?;
+                let point = left.split(' ').nth(4)?;
+                let kind = right.split(' ').next()?;
+                Some((PathBuf::from(unescape_mount_path(point)), is_remote(kind)))
+            })
+            .collect();
+        Ok(Self { mounts })
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.mounts
+            .iter()
+            .filter(|(point, _)| path.starts_with(point))
+            .max_by_key(|(point, _)| point.as_os_str().len())
+            .is_some_and(|(_, remote)| *remote)
+    }
+}
+
+fn is_remote(kind: &str) -> bool {
+    kind.starts_with("fuse")
+        || kind.starts_with("nfs")
+        || matches!(
+            kind,
+            "cifs"
+                | "smb3"
+                | "smbfs"
+                | "9p"
+                | "ceph"
+                | "glusterfs"
+                | "lustre"
+                | "gpfs"
+                | "beegfs"
+                | "afs"
+        )
+}
+
+fn unescape_mount_path(point: &str) -> String {
+    point
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 /// Real and effective uid from `/proc/<pid>/status`; unlike the directory owner, a process cannot fake these.
@@ -498,7 +604,7 @@ fn inspect_process(
     path: &Path,
     supervisor_uid: u32,
     candidates: &[Candidate],
-    devices: &HashSet<u64>,
+    holders: &HolderFilter,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     let cmdline = fs::read(path.join("cmdline"))?;
@@ -542,14 +648,14 @@ fn inspect_process(
     }
     let cwd = path.join("cwd");
     match fs::read_link(&cwd) {
-        Ok(target) => protect_holder(&cwd, &target, candidates, devices, inventory)?,
+        Ok(target) => protect_holder(&cwd, &target, candidates, holders, inventory)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound && args.is_empty() => {}
         Err(error) => return Err(error),
     }
     for fd in fs::read_dir(path.join("fd"))? {
         let fd = fd?.path();
         match fs::read_link(&fd) {
-            Ok(target) => protect_holder(&fd, &target, candidates, devices, inventory)?,
+            Ok(target) => protect_holder(&fd, &target, candidates, holders, inventory)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -562,15 +668,15 @@ fn protect_holder(
     holder: &Path,
     target: &Path,
     candidates: &[Candidate],
-    devices: &HashSet<u64>,
+    holders: &HolderFilter,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
     protect_target(target, candidates, &mut inventory.protected);
-    if !target.is_absolute() {
+    if !target.is_absolute() || holders.remote.contains(target) {
         return Ok(());
     }
     match fs::metadata(holder) {
-        Ok(metadata) if devices.contains(&metadata.dev()) => {
+        Ok(metadata) if holders.devices.contains(&metadata.dev()) => {
             inventory.held.insert(inode_identity(&metadata));
         }
         Ok(_) => {}
