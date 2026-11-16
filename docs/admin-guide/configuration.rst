@@ -2328,7 +2328,7 @@ once the teardown finishes, so retry the reconfigure if it reports that the
 teardown has not finished. In the same change, remove a deleted node from any
 partition ``nodes`` list and external block file that names it, and cancel
 pending jobs that request it by name; such jobs otherwise stay pending, and a
-block file that still names it makes later reconfigures fail.
+block file that still names it makes every later ``scontrol reconfigure`` fail.
 
 On each deleted host, stop and disable ``spurd``. A still-running agent keeps
 retrying registration and logging the refusal, and a restarted one exits, so a
