@@ -3174,13 +3174,7 @@ impl SlurmController for ControllerService {
         }
 
         // Same visibility as get_job: identified Users cannot probe another tenant's steps.
-        let job = self
-            .cluster
-            .get_job_for_display(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        if !self.caller_may_see_job(&job.spec.user, identity.as_ref()) {
-            return Err(Status::not_found(format!("job {job_id} not found")));
-        }
+        self.job_or_array_visible_to(job_id, identity.as_ref())?;
 
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
@@ -12958,6 +12952,29 @@ mod tests {
             .await
             .map(|_| ());
         assert_not_found(result, jobs.running, "an unknown target to a hidden job");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_steps_answers_hidden_jobs_as_not_found_and_serves_the_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let steps_as = |id: u32, who: &spur_core::auth::Identity| {
+            svc.get_job_steps(as_caller(GetJobStepsRequest { job_id: id }, who))
+        };
+
+        let bob = viewer("bob", false);
+        for id in [jobs.missing, jobs.pending, jobs.running, jobs.terminal] {
+            let err = steps_as(id, &bob).await.unwrap_err();
+            assert_eq!(err.code(), Code::NotFound, "job {id}");
+            assert_eq!(err.message(), format!("job {id} not found"));
+        }
+
+        for who in [viewer("alice", false), viewer("ops", true)] {
+            steps_as(jobs.running, &who)
+                .await
+                .unwrap_or_else(|e| panic!("{} must see the steps: {e}", who.user));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
