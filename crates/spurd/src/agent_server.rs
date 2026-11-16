@@ -2323,6 +2323,19 @@ const WORKLOAD_DEATH_POLLS: u32 = 20;
 const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const WORKLOAD_PID_POLLS: u32 = 40;
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+/// The controller marks a job Running before StartJob releases its batch
+/// workload, and gives that release up to 5s; an entry into the job waits as long.
+const BATCH_RELEASE_POLLS: u32 = 100;
+const BATCH_RELEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What the job's batch supervisor says about its workload.
+enum BatchWorkload {
+    Live(crate::stepd::StepdSnapshot),
+    /// Still held at the launch gate after every poll.
+    Gated,
+    /// No batch supervisor, an unreadable one, or a workload that has exited.
+    Unknown,
+}
 
 /// A supervisor that dies before pushing completion leaves no other record, so
 /// its tracked pid and start ticks are re-checked on this interval.
@@ -4746,9 +4759,10 @@ impl AgentService {
         self.allocation.clone()
     }
 
-    /// Whether the job's batch supervisor is up but has not been told to start
-    /// its workload: its gate answers state queries as active with no pid.
-    async fn batch_awaiting_start(&self, job_id: u32) -> bool {
+    /// The job's batch workload, waiting up to `polls` times while its gate holds
+    /// it. Each answer stands alone: a gate reports active with no pid until it
+    /// is released, and the supervisor only answers again once the workload runs.
+    async fn batch_workload(&self, job_id: u32, polls: u32) -> BatchWorkload {
         let batch = self
             .stepds
             .lock()
@@ -4756,12 +4770,20 @@ impl AgentService {
             .get(&(job_id, spur_core::step::STEP_BATCH))
             .cloned();
         let Some(descriptor) = batch else {
-            return false;
+            return BatchWorkload::Unknown;
         };
-        matches!(
-            crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await,
-            Ok(snapshot) if snapshot.active && snapshot.job_pid == 0
-        )
+        for _ in 0..polls {
+            match crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await {
+                Ok(snapshot) if is_live_workload(&snapshot) => {
+                    return BatchWorkload::Live(snapshot)
+                }
+                Ok(snapshot) if snapshot.active => {
+                    tokio::time::sleep(BATCH_RELEASE_POLL_INTERVAL).await
+                }
+                _ => return BatchWorkload::Unknown,
+            }
+        }
+        BatchWorkload::Gated
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -11248,17 +11270,28 @@ impl AgentService {
     /// Backs `exec_in_job` and `interactive_session` (attach), both reachable
     /// only after the controller's `job.state == Running` check — i.e. every
     /// node has confirmed LaunchJob (confirm_dispatch_on_nodes). The controller
-    /// releases the batch workload only after that, so a job still held at its
-    /// launch gate is `Unavailable` (retried by callers) rather than read with
-    /// no process to take its environment and namespaces from. Restart mid-job
-    /// (empty `running`) is the one uncovered case.
+    /// releases the batch workload only after that, so an entry waits for the
+    /// release rather than being read with no process to take the job's
+    /// environment and namespaces from, and is `Unavailable` if the release
+    /// never comes. Restart mid-job (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
-        let supervised = self.supervised_state(job_id).await;
-        if supervised.is_none() && self.batch_awaiting_start(job_id).await {
-            return Err(Status::unavailable(format!(
-                "job {job_id} has not started on this node yet"
-            )));
-        }
+        self.job_entry_polling(job_id, BATCH_RELEASE_POLLS).await
+    }
+
+    async fn job_entry_polling(
+        &self,
+        job_id: u32,
+        release_polls: u32,
+    ) -> Result<crate::job_entry::JobEntry, Status> {
+        let supervised = match self.batch_workload(job_id, release_polls).await {
+            BatchWorkload::Live(snapshot) => Some(snapshot),
+            BatchWorkload::Gated => {
+                return Err(Status::unavailable(format!(
+                    "job {job_id} was not released on this node"
+                )))
+            }
+            BatchWorkload::Unknown => self.supervised_state(job_id).await,
+        };
         let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
         // The supervisor creates the cgroup after spurd's launch returns, so it
         // is read live rather than from the descriptor written before the exec.
@@ -24972,15 +25005,16 @@ mod tests {
         assert_eq!(entry.cgroup_path, Some(cgroup));
     }
 
-    // The controller marks a job Running before it releases the batch workload,
-    // so an entry read in between must be retried, not built with no process.
-    #[tokio::test]
-    async fn job_entry_is_unavailable_while_the_batch_workload_is_held_at_its_gate() {
-        let svc = test_agent_service(test_reporter()).with_supervised_launch();
-        let job_id = 4343;
+    /// A supervised batch job whose supervisor is still holding its workload at
+    /// the launch gate, as it is between the controller marking the job Running
+    /// and StartJob reaching this node.
+    async fn gated_batch_job(
+        svc: &AgentService,
+        job_id: u32,
+        dir: &tempfile::TempDir,
+    ) -> (crate::stepd::StepdDescriptor, tokio::net::UnixListener) {
         svc.insert_test_job(job_id, TrackedJob::allocation_only(None))
             .await;
-        let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("runtime.sock");
         let descriptor = crate::stepd::StepdDescriptor::new(
             job_id,
@@ -24992,19 +25026,74 @@ mod tests {
             std::path::PathBuf::new(),
         );
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
-        let gate_descriptor = descriptor.clone();
-        let gate = tokio::spawn(async move {
-            crate::stepd::serve_launch_gate(&listener, &gate_descriptor).await
-        });
         svc.stepds
             .lock()
             .await
-            .insert(stepd_key(&descriptor), descriptor);
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        (descriptor, listener)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_entry_waits_for_the_gated_batch_workload_and_enters_it() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = gated_batch_job(&svc, 4343, &dir).await;
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            executor::RunningJob::Managed { child },
+            4343,
+            1,
+            spur_core::step::STEP_BATCH,
+        ));
+        let supervisor_descriptor = descriptor.clone();
+        let supervisor = tokio::spawn(async move {
+            crate::stepd::serve_launch_gate(&listener, &supervisor_descriptor).await;
+            let _ = crate::stepd::run_supervisor(listener, supervisor_descriptor, session).await;
+        });
+        let probe = crate::stepd::query_state(&descriptor, "probe".into())
+            .await
+            .expect("the gate answers before release");
+        assert_eq!(probe.job_pid, 0, "the workload must still be gated here");
+
+        let svc = std::sync::Arc::new(svc);
+        let entering = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.job_entry(4343).await })
+        };
+        tokio::time::sleep(BATCH_RELEASE_POLL_INTERVAL * 3).await;
+        crate::stepd::start_job(&descriptor, "release".into())
+            .await
+            .expect("release the workload");
+
+        let entry = entering
+            .await
+            .expect("join")
+            .expect("an entry made while gated must wait for the release");
+        assert_eq!(entry.pid, pid as i32);
+        supervisor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_entry_is_unavailable_when_the_batch_workload_is_never_released() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = gated_batch_job(&svc, 4344, &dir).await;
+        let gate =
+            tokio::spawn(
+                async move { crate::stepd::serve_launch_gate(&listener, &descriptor).await },
+            );
 
         let err = svc
-            .job_entry(job_id)
+            .job_entry_polling(4344, 2)
             .await
-            .expect_err("a gated workload has no process to enter yet");
+            .expect_err("a workload that is never released has no process to enter");
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         gate.abort();
     }
