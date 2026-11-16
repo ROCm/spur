@@ -67,6 +67,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - The ``FAIRSHARE`` column is a placeholder and does not yet reflect usage.
    * - ``sacctmgr`` ``-p``/``-P``
      - Delimited output covers ``show account``, ``show qos``, and ``show txn``; for ``show user``, ``show association``, and ``show tres`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
+   * - ``scancel -s``, ``-b``, ``-f``
+     - A signal other than ``KILL`` is delivered without cancelling the job, as in Slurm: ``-s`` signals the job's ``srun`` steps, ``-b`` the batch script's shell only, and ``-f``/``--full`` the steps, the batch script and its children. Earlier Spur releases ended the job on any ``scancel -s``. Nodes managed by the Kubernetes operator cannot be signalled. Where jobs run in a PID namespace (the default for root ``spurd``), a signal sent with ``-b`` only has an effect if the batch script traps it. See :ref:`scancel signals <scancel-signals>`.
    * - ``scancel`` arrays
      - Array-element syntax (``123_4``) is not yet supported client-side; cancel by plain job id.
    * - ``scontrol show``

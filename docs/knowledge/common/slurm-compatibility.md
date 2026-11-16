@@ -97,6 +97,12 @@ instead of printing unparseable output.
 **scancel arrays.** Array-element syntax (`123_4`) is not yet supported
 client-side; cancel by plain job ID.
 
+**scancel signals.** `-s SIG` (other than KILL/9) calls `SignalJob` and leaves
+the job running: `Steps` target by default, `Batch` with `-b` (the batch shell
+process only), `Full` with `-f` (`-f` wins over `-b`). No signal or `-s KILL`
+cancels. Kubernetes-operator nodes cannot be signalled. In a PID namespace the
+batch shell is PID 1, so `-b` only has an effect if the script traps the signal.
+
 **sacct --jobs** filters are applied server-side: `GetJobHistoryRequest.job_ids`
 is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
 

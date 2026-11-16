@@ -483,7 +483,9 @@ metrics).
 
 ### Job execution
 - Jobs are forked as their own process-group leaders. Signals go to the
-  negative PID (the whole group), not just the tracked process.
+  negative PID (the whole group), not just the tracked process. The one
+  exception is the `SignalJob` batch target, which signals only the batch
+  shell's PID.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a

@@ -1448,13 +1448,14 @@ Controlling Jobs
    scancel 1024 1025
    spur cancel -u alice -p gpu --state PENDING
    scancel --reservation maint
-   scancel --signal SIGTERM 2048
+   scancel --signal USR1 2048           # signal the job's srun steps; the job keeps running
+   scancel --signal USR1 --batch 2048   # signal the batch script's shell only
+   scancel --signal USR1 --full 2048    # signal the steps, the batch script and its children
 
 Filter flags include ``--user``/``-u``, ``--partition``/``-p``, ``--state``/``-t``
 (only ``PD`` or ``R``), ``--name``/``-n``, ``--account``/``-A``,
-``--reservation``/``-R`` (drain a reservation's jobs, mirroring ``squeue -R``), and
-``--signal``/``-s`` (``KILL``/9, ``TERM``/15, ``INT``/2, and others). You must
-supply job IDs or at least one of ``--user``, ``--name``, ``--partition``,
+and ``--reservation``/``-R`` (drain a reservation's jobs, mirroring ``squeue -R``).
+You must supply job IDs or at least one of ``--user``, ``--name``, ``--partition``,
 ``--account``, or ``--reservation``; ``--state`` alone only narrows a selection.
 Without ``--user``, a filter matches every user's jobs you can see, as in Slurm,
 and each one you do not own is refused — so ``--reservation`` (or ``--account``,
@@ -1465,6 +1466,61 @@ jobs already in a terminal state are silently skipped. ``scancel`` exits ``1`` a
 refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.
+
+.. _scancel-signals:
+
+**Signal jobs without ending them.** ``--signal``/``-s`` takes a signal name
+(``USR1`` or ``SIGUSR1``, in any case) or a number from 1 to 64. Any signal
+other than ``KILL`` (9) is delivered and the job keeps running; plain ``scancel``
+and ``-s KILL`` are what end a job. Three flags choose which processes get the
+signal:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Flags
+     - Signal goes to
+   * - ``-s SIG``
+     - The job's ``srun`` steps, not the batch script. A job with no steps gets
+       nothing from a plain ``-s SIG``.
+   * - ``-s SIG -b``, ``--batch``
+     - The batch script's shell process only, not its children and not any step.
+   * - ``-s SIG -f``, ``--full``
+     - The steps, the batch script and its children.
+   * - ``-s SIG -b -f``
+     - Same as ``-f``; ``-b`` is ignored, as in Slurm.
+   * - no ``-s``, or ``-s KILL``
+     - The job is cancelled. ``-b`` and ``-f`` only choose a signal's target and
+       have no effect here.
+
+With a filter such as ``-u`` or ``-n``, a signal goes to your running jobs; pass
+``--state`` to select others. If a job cannot be signalled, ``scancel`` says why
+on ``stderr`` and exits ``1``: the job is not running, has no batch script
+(``-b``) or its batch script has already exited, or no node could be reached.
+Signalling another user's job is refused. Nodes managed by the Kubernetes
+operator cannot be signalled, and ``scancel`` reports that rather than cancelling
+the job.
+
+.. note::
+
+   On nodes where jobs run in a PID namespace (``spurd`` running as root, the
+   default), the batch script's shell is PID 1 of its namespace, and the kernel
+   discards any signal PID 1 has no handler for, other than ``SIGKILL`` and
+   ``SIGSTOP``. So ``scancel -b -s TERM`` (or ``USR1`` and so on) only has an
+   effect if the script traps that signal, and otherwise does nothing while
+   ``scancel`` still reports success. To react to a signal, ``trap`` it in the
+   batch script, which is the usual checkpoint pattern:
+
+   .. code-block:: bash
+
+      #!/bin/bash
+      trap 'save_checkpoint' USR1
+      srun ./train &
+      wait
+
+   Alternatively use ``--full``, which also reaches the processes the script
+   started.
 
 **Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
 to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It

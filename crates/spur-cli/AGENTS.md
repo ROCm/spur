@@ -50,7 +50,7 @@ src/
   salloc.rs            salloc -- interactive resource allocation
   sattach.rs           sattach -- attach to a running job's I/O
   sbatch.rs            sbatch -- batch job submission
-  scancel.rs           scancel -- cancel jobs
+  scancel.rs           scancel -- cancel or signal jobs
   scontrol.rs          scontrol -- admin control (show/update/create/delete)
   scrontab.rs          scrontab -- recurring cron-style jobs
   sdiag.rs             sdiag -- scheduler diagnostics
@@ -83,7 +83,7 @@ tests/
 | `srun`      | `spur run`               | Run a parallel/interactive job           |
 | `salloc`    | `spur alloc`             | Allocate resources interactively         |
 | `squeue`    | `spur queue` / `jobs`    | View the job queue                       |
-| `scancel`   | `spur cancel` / `kill`   | Cancel jobs                              |
+| `scancel`   | `spur cancel` / `kill`   | Cancel or signal jobs                    |
 | `sinfo`     | `spur nodes` / `info`    | View node/partition information          |
 | `sacct`     | `spur history` / `acct`  | Job accounting history                   |
 | `sacctmgr`  | `spur accounts`/`acctmgr`| Manage accounts, users, QOS              |
@@ -163,6 +163,19 @@ patterns are expanded client-side via `spur_core::hostlist`.
 
 Full CRUD for accounts, users, QOS, and associations. Supports parsable
 output (`-p`/`-P`). Commands: `add`, `modify`, `delete`, `show`, `list`.
+
+### Job cancel and signal (scancel)
+
+`parse_action` maps `-s`/`-b`/`-f` to one `Action`. No `-s`, or `-s KILL`/9,
+is `Cancel` (`CancelJob`, signal 0; `-b`/`-f` are ignored). Any other signal
+(name, `SIG`-prefixed, number 1-64, any case) is `SignalJob` with target
+`Steps` by default, `Batch` with `-b`, `Full` with `-f` (`-f` wins over `-b`).
+A signal never falls back to `CancelJob`: a controller that predates
+`SignalJob` answers `Unimplemented`, reported as an error with exit 1. Filter
+mode without `--state` selects only RUNNING jobs for a signal. A signal to a
+gone job fails (exit 1); a cancel of one does not (`counts_as_failure`).
+`SignalJob` carries a 30 s request timeout, since the controller waits on each
+node's agent.
 
 ### Admin (scontrol)
 

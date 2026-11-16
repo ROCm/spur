@@ -631,6 +631,28 @@ This release makes ``scancel`` exit ``1`` when the controller refuses a cancel o
 printed to ``stderr``. Scripts that call ``scancel`` and branch on its exit code now see the
 failure. A job that is already finished or unknown still does not fail a plain cancel (or
 ``-s KILL``), and ``--quiet``/``-Q`` hides the report but not the exit status.
+
+scancel signals no longer end the job
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release makes ``scancel --signal`` deliver the signal and leave the job
+running, as Slurm does. Earlier releases ended the job on any signal: ``scancel -s TERM
+<job>``, ``-s INT`` and the like cancelled it. **To end a job, use plain**
+``scancel`` **or** ``scancel -s KILL``; a script that relied on ``-s TERM`` (or
+another signal) to stop jobs now leaves them running. The signal goes to the
+job's ``srun`` steps by default, to the batch script's shell with ``-b``, and to
+the steps, the batch script and its children with ``-f``/``--full``. A job
+with no steps gets nothing from a plain ``-s``. Nodes managed by the Kubernetes
+operator cannot be signalled and answer with an error. See
+:ref:`scancel signals <scancel-signals>`, including the limit on ``-b`` for jobs in
+a PID namespace.
+
+The new ``scancel`` calls the controller's ``SignalJob`` RPC, so upgrade
+``spurctld`` before ``spur-cli``: a new ``scancel`` against an older controller
+refuses a signal with an error and does not cancel the job. An older ``scancel``
+against this controller sends the signal through ``CancelJob``, which the
+controller now delivers without cancelling, so the behavior is the same. Delivering
+``-b`` needs the ``spurd`` on the job's nodes upgraded too.
 Job preemption policy (``preempt_type``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
