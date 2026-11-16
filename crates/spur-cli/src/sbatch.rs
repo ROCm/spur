@@ -823,6 +823,10 @@ pub(crate) fn build_sbatch_job_spec(
              writable despite the flag. Omit it rather than rely on a read-only rootfs."
         );
     }
+    crate::authclient::refuse_ungranted_socket_mounts(
+        &args.container_mounts,
+        args.container_auth_socket,
+    )?;
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
     {

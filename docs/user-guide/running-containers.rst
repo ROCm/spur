@@ -145,7 +145,9 @@ flags above apply to a step's ``srun`` and behave as follows:
   with ``--container-image`` (``sbatch --container-image ...``), a nested
   ``srun`` step enters that already-running container — it shares the job's
   image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
-  used by multi-node launchers.
+  used by multi-node launchers. A nested ``srun`` there can authenticate only
+  if the ``sbatch`` (or ``salloc``) was submitted with
+  ``--container-auth-socket``.
 
 - **Step with its own image.** A standalone ``srun --container-image`` (or an
   ``salloc`` allocation followed by ``srun --container-image``) creates a fresh

@@ -271,6 +271,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     resolve_srun_env(&matches, &mut args)?;
+    crate::authclient::refuse_ungranted_socket_mounts(
+        &args.container_mounts,
+        args.container_auth_socket,
+    )?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     validate_step_constraints(

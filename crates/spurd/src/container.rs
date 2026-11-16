@@ -185,6 +185,11 @@ pub fn maybe_bind_auth_socket(
         return Ok(());
     };
     if !path.exists() {
+        warn!(
+            socket = %path.display(),
+            "--container-auth-socket was granted but the mint socket does not exist on this node; \
+             not mounting it (is spurauthd running?)"
+        );
         return Ok(());
     }
     let displayed = path.display().to_string();
@@ -1282,6 +1287,24 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert!(mounts[0].source.ends_with("auth.sock"));
         assert_eq!(mounts[0].source, mounts[0].target);
+    }
+
+    #[test]
+    fn a_granted_container_on_a_node_without_the_socket_gets_no_mount() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("auth.sock");
+        let prev = std::env::var_os(spur_core::native_mint::AUTH_SOCKET_ENV);
+        std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, &missing);
+        let mut cfg = test_config(1000);
+        let out = maybe_bind_auth_socket(&mut cfg, "cluster", false, true);
+        match prev {
+            Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
+            None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
+        }
+        out.unwrap();
+        assert!(cfg.mounts.is_empty());
+        assert!(cfg.withheld_socket.is_none());
     }
 
     #[test]

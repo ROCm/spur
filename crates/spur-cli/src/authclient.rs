@@ -94,11 +94,37 @@ fn mint_failure_message(error: &MintError) -> String {
     match error {
         MintError::Unavailable { path } => format!(
             "credential mint not available in this container ({path}): the node's auth socket \
-             is mounted only when the job was submitted with --container-auth-socket; outside a \
-             container, start spurauthd or set SPUR_AUTH_SOCKET"
+             is mounted only when the job was submitted with --container-auth-socket, and if it \
+             was, check that spurauthd is running on the node; outside a container, start \
+             spurauthd or set SPUR_AUTH_SOCKET"
         ),
         other => other.to_string(),
     }
+}
+
+/// Refuse at submission a `--container-mounts` source that would bind the node's
+/// mint socket into a container that was not granted it. The check is lexical and
+/// uses this host's socket path, so the agent keeps its own check against the
+/// resolved paths on the compute node as a backstop.
+pub fn refuse_ungranted_socket_mounts(mounts: &[String], granted: bool) -> anyhow::Result<()> {
+    if granted || mounts.is_empty() {
+        return Ok(());
+    }
+    let cluster = native_cluster_name().unwrap_or_default();
+    let Ok(socket) = resolve_socket_path(&cluster) else {
+        return Ok(());
+    };
+    for m in mounts {
+        let source = m.split(':').next().unwrap_or_default();
+        if spur_core::native_mint::mount_source_exposes_socket(source, &socket) {
+            anyhow::bail!(
+                "--container-mounts entry '{m}' would expose the credential socket {}, which \
+                 --container-auth-socket makes available; drop the mount or pass the flag",
+                socket.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read the caller's JWT: `$SPUR_AUTH_TOKEN`, else `~/.spur/token`.
@@ -398,6 +424,51 @@ mod tests {
             let name = User::from_uid(Uid::from_raw(uid)).unwrap().unwrap().name;
             assert_eq!(cred.user, name);
         }
+    }
+
+    /// One test because `$SPUR_AUTH_SOCKET` is process-global.
+    #[test]
+    fn ungranted_mounts_of_the_socket_are_refused_at_submission() {
+        let prev = std::env::var_os("SPUR_AUTH_SOCKET");
+        unsafe { std::env::set_var("SPUR_AUTH_SOCKET", "/run/spur/c1/auth.sock") };
+        let mounts = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let refused = refuse_ungranted_socket_mounts(&mounts(&["/run/spur:/run/spur"]), false);
+        let socket_ro =
+            refuse_ungranted_socket_mounts(&mounts(&["/run/spur/c1/auth.sock:/s:ro"]), false);
+        let granted = refuse_ungranted_socket_mounts(&mounts(&["/run/spur:/run/spur"]), true);
+        let unrelated = refuse_ungranted_socket_mounts(&mounts(&["/data:/data"]), false);
+        let sbatch = crate::sbatch::build_sbatch_job_spec(
+            <crate::sbatch::SbatchArgs as clap::Parser>::parse_from([
+                "sbatch",
+                "--container-image=img.sqsh",
+                "--container-mounts=/run/spur:/run/spur",
+                "--wrap=true",
+            ]),
+            None,
+            "sbatch",
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SPUR_AUTH_SOCKET", v),
+                None => std::env::remove_var("SPUR_AUTH_SOCKET"),
+            }
+        }
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("--container-auth-socket"));
+        assert!(socket_ro.is_err());
+        assert!(granted.is_ok(), "the flag allows the mount");
+        assert!(unrelated.is_ok());
+        assert!(sbatch.is_err(), "sbatch refuses it before submitting");
+    }
+
+    #[test]
+    fn mint_failure_message_covers_a_granted_job_without_spurauthd() {
+        let msg = mint_failure_message(&MintError::Unavailable {
+            path: "/run/spur/c1/auth.sock".into(),
+        });
+        assert!(msg.contains("--container-auth-socket") && msg.contains("spurauthd is running"));
     }
 
     /// Both env cases live in one test: `$SPUR_CONF` / `$SPUR_CLUSTER_NAME` are process-global.
