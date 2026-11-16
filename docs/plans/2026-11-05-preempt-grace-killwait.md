@@ -141,10 +141,10 @@ deadline if every controller is down at that moment.
 
 - `SignalJob` (`AgentSignalJobRequest { job_id, run_attempt, signal, target }`) delivers one signal and
   nothing else: no escalation, timer, reservation release or cgroup reaping, and it never marks steps
-  cancelled. `SignalTarget`: `STEPS` (every step except the batch script), `BATCH` (the batch step's
-  supervisor only, or an unsupervised job's own process; `FAILED_PRECONDITION` when the run has no
-  batch step, `UNAVAILABLE` when the batch supervisor does not accept it), `FULL`; unspecified is
-  rejected. Handler: `signal_job` in `spurd/src/agent_server.rs`. The controller sends SIGCONT then
+  cancelled. `SignalTarget`: `STEPS` (every step except the batch script), `BATCH` (the
+  batch script's shell process only, not its children or any step, as `scancel --batch`;
+  `FAILED_PRECONDITION` when the run has no batch step, `UNAVAILABLE` when the shell cannot be
+  signalled), `FULL`; unspecified is rejected. Handler: `signal_job` in `spurd/src/agent_server.rs`. The controller sends SIGCONT then
   SIGTERM as two calls per node.
 - `CancelJob` stays "terminate" and gains `kill_wait_secs` (0 = the old agent default, 5 seconds).
 - Capability: agents advertise `"signal-job"` (`spur_core::node::CAP_SIGNAL_JOB`) in

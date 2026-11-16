@@ -486,6 +486,16 @@ impl RunningJob {
         }
     }
 
+    /// The job process's pid while it can still be signalled: not yet reaped,
+    /// so the pid cannot have been handed to anything else.
+    pub fn live_pid(&self) -> Option<u32> {
+        match self {
+            RunningJob::Managed { child, .. } => child.id(),
+            RunningJob::Forked { pid, reaped, .. } if !*reaped => Some(*pid as u32),
+            RunningJob::Forked { .. } | RunningJob::AllocationOnly => None,
+        }
+    }
+
     pub fn is_allocation_only(&self) -> bool {
         matches!(self, RunningJob::AllocationOnly)
     }
