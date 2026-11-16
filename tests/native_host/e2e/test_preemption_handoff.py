@@ -95,6 +95,8 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400, controll
             if targets:
                 args.append(f"preempt={targets}")
             c.cli(["spur", "sacctmgr"] + args)
+        c.cli(["spur", "sacctmgr", "add", "qos", "name=capped", "priority=10000",
+               "preemptmode=off", "preempt=victim-a", "grptres=node=1"])
         # The controller's accounting caches refresh every ten seconds in this fixture.
         time.sleep(15)
         yield c
@@ -213,6 +215,44 @@ def test_abandoned_handoff_reuses_freed_node(handoff_cluster, action):
     wait_job_state(c, flexible, "R", timeout=60)
     show = _state(c, flexible, "RUNNING")
     assert f"NodeList={c.node_names[1]}" in show, show
+
+
+def _capped_preemptor(c):
+    n1, n2, _ = c.node_names
+    victim = _submit(c, "capped-victim", "victim-a", n1)
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    preemptor = _submit(c, "capped-preemptor", "capped", n1)
+    _wait_epilog(c, victim, [0])
+    assert f"PreemptedBy={preemptor}" in _state(c, victim, "COMPLETING")
+    # Submitted only once the eviction is under way: the pass that evicts can still
+    # admit another job under the same cap.
+    sibling = _submit(c, "capped-sibling", "capped", n2)
+    _assert_pending_for_passes(c, [preemptor, sibling])
+    assert "QOSGrpNodeLimit" in _state(c, sibling, "PENDING")
+    return victim, preemptor, sibling
+
+
+def test_preemptor_keeps_its_qos_node_cap_while_its_victim_drains(handoff_cluster):
+    c = handoff_cluster
+    victim, preemptor, sibling = _capped_preemptor(c)
+    _gate(c, victim, [0], False)
+    wait_job_state(c, preemptor, "R", timeout=60)
+    assert f"NodeList={c.node_names[0]}" in _state(c, preemptor, "RUNNING")
+    assert "QOSGrpNodeLimit" in _state(c, sibling, "PENDING")
+
+
+@pytest.mark.parametrize("action", ["cancel", "hold"])
+def test_sibling_gets_the_qos_room_a_draining_preemptor_gives_up(handoff_cluster, action):
+    c = handoff_cluster
+    victim, preemptor, sibling = _capped_preemptor(c)
+    if action == "cancel":
+        c.cli(["scancel", str(preemptor)])
+    else:
+        c.scontrol("hold", str(preemptor))
+    wait_job_state(c, sibling, "R", timeout=60)
+    assert f"NodeList={c.node_names[1]}" in _state(c, sibling, "RUNNING")
+    _state(c, victim, "COMPLETING")
 
 
 def test_requeued_victim_node_goes_to_preemptor_over_higher_priority_bystander(handoff_cluster):
