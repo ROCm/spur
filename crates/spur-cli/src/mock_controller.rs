@@ -9,7 +9,8 @@
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
 //! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`,
-//! `JobKeepalive`, `ValidateBlockFile`); every other RPC reports `unimplemented`
+//! `JobKeepalive`, `ValidateBlockFile`, `RequeueJob`, `ClusterAddNodes`,
+//! `ClusterRemoveNodes`); every other RPC reports `unimplemented`
 //! so an unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::{HashMap, HashSet};
@@ -27,6 +28,8 @@ pub(crate) const MOCK_STEP_ID: u32 = 4242;
 
 /// Exit code the mock reports from `RunStep`.
 pub(crate) const MOCK_EXIT_CODE: i32 = 7;
+
+type RpcAuthorization = (&'static str, Option<String>);
 
 /// What the mock controller actually received, shared with the test body.
 #[derive(Clone, Default)]
@@ -72,6 +75,11 @@ pub(crate) struct StepCapture {
     /// `JobKeepalive` calls still to reject as unauthenticated.
     keepalive_failures: Arc<AtomicU32>,
     block_validation_content: Arc<Mutex<Vec<String>>>,
+    /// `(rpc, authorization header)` for the RPCs a test needs to prove carry the
+    /// caller's credential; `None` when the request arrived without one.
+    authorization: Arc<Mutex<Vec<RpcAuthorization>>>,
+    requeue_requests: Arc<Mutex<Vec<proto::RequeueJobRequest>>>,
+    requeue_response: Arc<Mutex<Option<Result<proto::RequeueJobResponse, tonic::Code>>>>,
 }
 
 impl StepCapture {
@@ -220,6 +228,37 @@ impl StepCapture {
     pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
         *self.create_step_node_addr.lock().unwrap() = addr.into();
     }
+
+    /// The `authorization` header of every `rpc` call, in call order.
+    pub(crate) fn authorization_of(&self, rpc: &str) -> Vec<Option<String>> {
+        self.authorization
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == rpc)
+            .map(|(_, header)| header.clone())
+            .collect()
+    }
+
+    fn record_authorization(&self, rpc: &'static str, metadata: &tonic::metadata::MetadataMap) {
+        let header = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.authorization.lock().unwrap().push((rpc, header));
+    }
+
+    pub(crate) fn requeue_requests(&self) -> Vec<proto::RequeueJobRequest> {
+        self.requeue_requests.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_requeue_response(&self, response: proto::RequeueJobResponse) {
+        *self.requeue_response.lock().unwrap() = Some(Ok(response));
+    }
+
+    pub(crate) fn set_requeue_error(&self, code: tonic::Code) {
+        *self.requeue_response.lock().unwrap() = Some(Err(code));
+    }
 }
 
 struct MockController {
@@ -361,6 +400,53 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
+        async fn requeue_job(
+            &self,
+            request: tonic::Request<proto::RequeueJobRequest>,
+        ) -> Result<tonic::Response<proto::RequeueJobResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("requeue_job", request.metadata());
+            self.capture
+                .requeue_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            match self.capture.requeue_response.lock().unwrap().clone() {
+                Some(Err(code)) => Err(tonic::Status::new(code, "mock requeue_job failure")),
+                Some(Ok(response)) => Ok(tonic::Response::new(response)),
+                None => Ok(tonic::Response::new(proto::RequeueJobResponse {
+                    requeued: 1,
+                    skipped: Vec::new(),
+                })),
+            }
+        }
+
+        async fn cluster_add_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterAddNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterAddNodesResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("cluster_add_nodes", request.metadata());
+            Ok(tonic::Response::new(proto::ClusterAddNodesResponse {
+                accepted: true,
+                message: "mock accepted".into(),
+                nodes: Vec::new(),
+            }))
+        }
+
+        async fn cluster_remove_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterRemoveNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterRemoveNodesResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("cluster_remove_nodes", request.metadata());
+            Ok(tonic::Response::new(proto::ClusterRemoveNodesResponse {
+                accepted: true,
+                message: "mock accepted".into(),
+                nodes: Vec::new(),
+            }))
+        }
+
         async fn run_step(
             &self,
             request: tonic::Request<proto::RunStepRequest>,
@@ -491,7 +577,6 @@ mock_controller_impl! {
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
-        requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
@@ -522,8 +607,6 @@ mock_controller_impl! {
         cluster_down(proto::ClusterDownRequest) -> proto::ClusterDownResponse;
         cluster_status(proto::ClusterStatusRequest) -> proto::ClusterStatusResponse;
         cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
-        cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
-        cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
     }
 }
 
@@ -568,6 +651,71 @@ pub(crate) fn lazy_client(
         channel,
         &format!("http://{addr}"),
     ))
+}
+
+/// What a fixture child process wrote and how it ended.
+pub(crate) struct FixtureRun {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) success: bool,
+}
+
+impl FixtureRun {
+    /// Value of the single `key: value` line a fixture printed with [`fixture_report`].
+    pub(crate) fn reported(&self, key: &str) -> &str {
+        let prefix = format!("FIXTURE {key}: ");
+        self.stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("fixture reported no {key}:\n{}", self.stdout))
+    }
+
+    /// Stdout with libtest's own framing and the fixture's report lines removed.
+    pub(crate) fn command_stdout(&self) -> String {
+        self.stdout
+            .lines()
+            .filter(|line| {
+                !line.starts_with("FIXTURE ")
+                    && !line.starts_with("running ")
+                    && !line.starts_with("test ")
+                    && !line.is_empty()
+            })
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+}
+
+/// Print one `key: value` line for [`FixtureRun::reported`].
+pub(crate) fn fixture_report(key: &str, value: impl std::fmt::Display) {
+    println!("FIXTURE {key}: {value}");
+}
+
+/// Re-run an `#[ignore]`d fixture test in a child process whose credential
+/// environment is fully controlled. `SPUR_AUTH_TOKEN` and `SPUR_AUTH_PLUGIN` are
+/// process-global, so setting them in the test process would race every other
+/// test; the child also gets an empty `$HOME` and no spur config, so neither the
+/// runner's `~/.spur/token` nor `/etc/spur/spur.conf` can change the outcome.
+pub(crate) fn run_fixture(fixture: &str, scenario: &str, token: Option<&str>) -> FixtureRun {
+    let home = tempfile::TempDir::new().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", fixture, "--ignored", "--nocapture"])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
+        .env("HOME", home.path())
+        .env("SPUR_CONF", home.path().join("no-such-spur.conf"))
+        .env("SPUR_AUTH_PLUGIN", "jwt")
+        .env("SPUR_TEST_SCENARIO", scenario)
+        .current_dir(home.path());
+    if let Some(token) = token {
+        command.env("SPUR_AUTH_TOKEN", token);
+    }
+    let output = command.output().unwrap();
+    FixtureRun {
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+        success: output.status.success(),
+    }
 }
 
 /// Reserve a localhost port and release it, so connecting to it is refused

@@ -1319,7 +1319,7 @@ fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String
 }
 
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -2787,6 +2787,142 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::mock_controller::{run_fixture, FixtureRun};
+
+    fn run_requeue(scenario: &str, token: Option<&str>) -> FixtureRun {
+        let run = run_fixture("scontrol::tests::requeue_fixture", scenario, token);
+        assert!(
+            run.success,
+            "fixture failed:\n{}\n{}",
+            run.stdout, run.stderr
+        );
+        run
+    }
+
+    #[test]
+    fn requeue_presents_the_callers_credential() {
+        let run = run_requeue("single", Some("fixture-token"));
+        assert_eq!(
+            run.reported("authorization"),
+            r#"[Some("Bearer fixture-token")]"#
+        );
+        assert_eq!(run.reported("requests"), "1");
+        assert_eq!(run.reported("job_id"), "7");
+        assert_eq!(run.reported("user_is_caller"), "true");
+    }
+
+    #[test]
+    fn requeue_sends_no_credential_when_the_caller_has_none() {
+        let run = run_requeue("single", None);
+        assert_eq!(run.reported("authorization"), "[None]");
+        assert_eq!(run.reported("requests"), "1");
+    }
+
+    #[test]
+    fn requeuehold_presents_the_callers_credential_and_asks_for_a_hold() {
+        let run = run_requeue("hold", Some("fixture-token"));
+        assert_eq!(
+            run.reported("authorization"),
+            r#"[Some("Bearer fixture-token")]"#
+        );
+        assert_eq!(run.reported("hold"), "true");
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.command_stdout(), "job 7 requeued and held\n");
+    }
+
+    #[test]
+    fn requeue_of_a_single_job_prints_one_line() {
+        let run = run_requeue("single", Some("fixture-token"));
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.reported("hold"), "false");
+        assert_eq!(run.command_stdout(), "job 7 requeued\n");
+        assert!(!run.stderr.contains("skipped"), "{}", run.stderr);
+    }
+
+    #[test]
+    fn requeue_of_an_array_reports_the_count_and_each_skipped_task() {
+        let run = run_requeue("array", Some("fixture-token"));
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.command_stdout(), "requeued 3 task(s)\n");
+        assert!(
+            run.stderr
+                .contains("scontrol: skipped job 9: not eligible\n"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    #[test]
+    fn requeue_of_a_missing_job_fails_with_the_requeue_context() {
+        let run = run_requeue("not_found", Some("fixture-token"));
+        assert_eq!(
+            run.reported("result"),
+            "err requeue failed: code: 'Some requested entity was not found', \
+             message: \"mock requeue_job failure\""
+        );
+        assert_eq!(run.command_stdout(), "");
+    }
+
+    #[test]
+    fn requeue_denied_by_the_controller_fails_with_the_requeue_context() {
+        let run = run_requeue("denied", Some("fixture-token"));
+        assert_eq!(
+            run.reported("result"),
+            "err requeue failed: code: 'The caller does not have permission to execute the \
+             specified operation', message: \"mock requeue_job failure\""
+        );
+        assert_eq!(run.command_stdout(), "");
+    }
+
+    /// Child-process body for the `requeue_*` tests above; see `run_fixture`.
+    #[tokio::test]
+    #[ignore = "child-process fixture driven by the requeue_* tests"]
+    async fn requeue_fixture() {
+        use crate::mock_controller::fixture_report;
+
+        let scenario = std::env::var("SPUR_TEST_SCENARIO").unwrap();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut subcommand = "requeue";
+        match scenario.as_str() {
+            "single" => {}
+            "hold" => subcommand = "requeuehold",
+            "array" => capture.set_requeue_response(spur_proto::proto::RequeueJobResponse {
+                requeued: 3,
+                skipped: vec!["job 9: not eligible".into()],
+            }),
+            "not_found" => capture.set_requeue_error(tonic::Code::NotFound),
+            "denied" => capture.set_requeue_error(tonic::Code::PermissionDenied),
+            other => panic!("unknown scenario {other}"),
+        }
+
+        let result = super::main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            subcommand.into(),
+            "7".into(),
+        ])
+        .await;
+
+        match &result {
+            Ok(()) => fixture_report("result", "ok"),
+            Err(e) => fixture_report("result", format!("err {e:#}")),
+        }
+        fixture_report(
+            "authorization",
+            format!("{:?}", capture.authorization_of("requeue_job")),
+        );
+        let requests = capture.requeue_requests();
+        fixture_report("requests", requests.len());
+        let first = requests.first().cloned().unwrap_or_default();
+        fixture_report("job_id", first.job_id);
+        fixture_report("hold", first.hold);
+        fixture_report(
+            "user_is_caller",
+            first.user == crate::interactive::current_user().unwrap(),
+        );
+    }
+
     #[test]
     fn job_detail_omits_zero_preemption_counts_and_prints_nonzero_causes() {
         let mut job = spur_proto::proto::JobInfo::default();

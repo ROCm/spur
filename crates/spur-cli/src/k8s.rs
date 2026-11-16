@@ -253,7 +253,7 @@ async fn cmd_add_nodes(
     selector: Vec<(String, String)>,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_add_nodes(ClusterAddNodesRequest {
             nodes: nodes.unwrap_or_default(),
@@ -280,7 +280,7 @@ async fn cmd_remove_nodes(
     drain_timeout: Option<u32>,
     force: bool,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_remove_nodes(ClusterRemoveNodesRequest {
             nodes,
@@ -370,6 +370,77 @@ async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock_controller::{fixture_report, run_fixture};
+
+    #[test]
+    fn add_nodes_presents_the_callers_credential() {
+        let run = run_fixture(
+            "k8s::tests::node_change_fixture",
+            "add",
+            Some("fixture-token"),
+        );
+        assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+        assert_eq!(
+            run.reported("authorization"),
+            r#"[Some("Bearer fixture-token")]"#
+        );
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(
+            run.command_stdout(),
+            "k0s add-nodes requested: mock accepted\n"
+        );
+    }
+
+    #[test]
+    fn remove_nodes_presents_the_callers_credential() {
+        let run = run_fixture(
+            "k8s::tests::node_change_fixture",
+            "remove",
+            Some("fixture-token"),
+        );
+        assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+        assert_eq!(
+            run.reported("authorization"),
+            r#"[Some("Bearer fixture-token")]"#
+        );
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(
+            run.command_stdout(),
+            "k0s remove-nodes requested: mock accepted\n"
+        );
+    }
+
+    /// Child-process body for the node-change tests above; see `run_fixture`.
+    #[tokio::test]
+    #[ignore = "child-process fixture driven by the add/remove_nodes tests"]
+    async fn node_change_fixture() {
+        let scenario = std::env::var("SPUR_TEST_SCENARIO").unwrap();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let (rpc, subcommand) = match scenario.as_str() {
+            "add" => ("cluster_add_nodes", "add-nodes"),
+            "remove" => ("cluster_remove_nodes", "remove-nodes"),
+            other => panic!("unknown scenario {other}"),
+        };
+
+        let result = main_with_args(vec![
+            "k8s".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            subcommand.into(),
+            "--nodes".into(),
+            "gpu1".into(),
+        ])
+        .await;
+
+        match &result {
+            Ok(()) => fixture_report("result", "ok"),
+            Err(e) => fixture_report("result", format!("err {e:#}")),
+        }
+        fixture_report(
+            "authorization",
+            format!("{:?}", capture.authorization_of(rpc)),
+        );
+    }
 
     #[test]
     fn parses_up_with_control_plane() {
