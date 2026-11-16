@@ -766,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
+    agent_service.cleanup_startup_job_spools().await;
     // Shared with spurctld's state_dir unless --state-dir is set, so spurd owns
     // only the runtime/ subdir here; the parent must still be root-owned (see
     // log_root_trusted_dirs), or whoever owns it can swap in their own runtime/.

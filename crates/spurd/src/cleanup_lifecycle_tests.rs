@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct ControllerState {
     accept: AtomicBool,
     reports: std::sync::Mutex<Vec<ReportJobStatusRequest>>,
+    spool_response: std::sync::Mutex<spur_proto::proto::GetJobsResponse>,
+    spool_queries: std::sync::Mutex<Vec<spur_proto::proto::GetJobsRequest>>,
+    spool_fail_at: std::sync::atomic::AtomicUsize,
+    spool_query_barrier:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct CleanupController(Arc<ControllerState>);
@@ -20,6 +25,26 @@ macro_rules! cleanup_controller_impl {
     ($($method:ident($req:ty) -> $resp:ty;)*) => {
         #[tonic::async_trait]
         impl spur_proto::proto::slurm_controller_server::SlurmController for CleanupController {
+            async fn get_jobs(
+                &self,
+                request: Request<spur_proto::proto::GetJobsRequest>,
+            ) -> Result<Response<spur_proto::proto::GetJobsResponse>, Status> {
+                let count = {
+                    let mut queries = self.0.spool_queries.lock().expect("queries");
+                    queries.push(request.into_inner());
+                    queries.len()
+                };
+                let barrier = self.0.spool_query_barrier.lock().expect("query barrier").clone();
+                if let Some((entered, release)) = barrier {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                if self.0.spool_fail_at.load(Ordering::SeqCst) == count {
+                    return Err(Status::permission_denied("spool query refused by fixture"));
+                }
+                Ok(Response::new(self.0.spool_response.lock().expect("response").clone()))
+            }
+
             async fn report_job_status(
                 &self,
                 request: Request<ReportJobStatusRequest>,
@@ -52,7 +77,6 @@ macro_rules! cleanup_controller_impl {
 
 cleanup_controller_impl! {
         submit_job(spur_proto::proto::SubmitJobRequest) -> spur_proto::proto::SubmitJobResponse;
-        get_jobs(spur_proto::proto::GetJobsRequest) -> spur_proto::proto::GetJobsResponse;
         get_job(spur_proto::proto::GetJobRequest) -> spur_proto::proto::JobInfo;
         cancel_job(spur_proto::proto::CancelJobRequest) -> ();
         complete_job(spur_proto::proto::CompleteJobRequest) -> ();
@@ -103,6 +127,9 @@ cleanup_controller_impl! {
         validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
 
 }
+
+#[path = "startup_spool_tests.rs"]
+mod startup_spool_tests;
 
 struct ControllerFixture {
     address: String,
@@ -238,34 +265,7 @@ impl SessionFixture {
     }
 
     fn agent(&self, controller: &ControllerFixture) -> AgentService {
-        let reporter = Arc::new(NodeReporter::new(
-            "cleanup-node".into(),
-            controller.address.clone(),
-            ResourceSet {
-                cpus: 4,
-                memory_mb: 8192,
-                ..Default::default()
-            },
-            spur_net::NodeAddress {
-                ip: "127.0.0.1".into(),
-                hostname: "cleanup-node".into(),
-                port: 6818,
-                source: spur_net::AddressSource::Static,
-            },
-            HashMap::new(),
-            String::new(),
-            String::new(),
-            self.directory.path().join("wireguard"),
-            new_running_jobs(),
-            crate::reporter::ReporterTimeouts::default(),
-        ));
-        AgentService::new(
-            reporter,
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        )
-        .with_runtime_state_dir(self.directory.path())
+        agent_for_directory(controller, self.directory.path())
     }
 
     async fn track_allocation(&self, agent: &AgentService) {
@@ -1038,4 +1038,38 @@ async fn expired_orphan_cleanup_completes_only_after_quarantine_and_does_not_rep
             .unwrap();
         assert_eq!(controller.reports().len(), 2);
     }
+}
+
+fn agent_for_directory(
+    controller: &ControllerFixture,
+    directory: &std::path::Path,
+) -> AgentService {
+    let reporter = Arc::new(NodeReporter::new(
+        "cleanup-node".into(),
+        controller.address.clone(),
+        ResourceSet {
+            cpus: 4,
+            memory_mb: 8192,
+            ..Default::default()
+        },
+        spur_net::NodeAddress {
+            ip: "127.0.0.1".into(),
+            hostname: "cleanup-node".into(),
+            port: 6818,
+            source: spur_net::AddressSource::Static,
+        },
+        HashMap::new(),
+        String::new(),
+        String::new(),
+        directory.join("wireguard"),
+        new_running_jobs(),
+        crate::reporter::ReporterTimeouts::default(),
+    ));
+    AgentService::new(
+        reporter,
+        HooksConfig::default(),
+        Arc::new(Mutex::new(DeviceRegistry::new())),
+        spur_core::config::MemlockLimit::Unlimited,
+    )
+    .with_runtime_state_dir(directory)
 }

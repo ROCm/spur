@@ -2485,7 +2485,9 @@ fn spool_dir_error(
 /// location isn't recorded.
 pub fn cleanup_job_spool(job_id: JobId) {
     for base in default_job_spool_candidates() {
-        let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+        if let Err(error) = crate::spool_fs::cleanup_job_spool_under(&base, job_id) {
+            warn!(job_id, root = %base.display(), %error, "failed to clean job spool");
+        }
     }
 }
 
@@ -2591,7 +2593,25 @@ pub(crate) fn stage_user_script(
     uid: u32,
     gid: u32,
 ) -> Result<PathBuf, LaunchError> {
-    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
+    stage_user_script_under(
+        &default_job_spool_candidates(),
+        job_id,
+        step_id,
+        script,
+        uid,
+        gid,
+    )
+}
+
+fn stage_user_script_under(
+    candidates: &[PathBuf],
+    job_id: JobId,
+    step_id: spur_core::step::StepId,
+    script: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<PathBuf, LaunchError> {
+    let spool_dir = create_job_spool_dir_under(candidates, job_id, uid, gid)?;
     write_spool_scratch(
         &spool_dir,
         &user_script_name(step_id),
@@ -4292,16 +4312,26 @@ mod tests {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         let job_id: JobId = 987_654_322;
-        let path = stage_user_script(job_id, spur_core::step::STEP_BATCH, "echo hi\n", uid, gid)
-            .unwrap_or_else(|e| panic!("stage user script: {e}"));
-        let spool = create_job_spool_dir(job_id, uid, gid)
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let roots = vec![root.path().to_owned()];
+        let path = stage_user_script_under(
+            &roots,
+            job_id,
+            spur_core::step::STEP_BATCH,
+            "echo hi\n",
+            uid,
+            gid,
+        )
+        .unwrap_or_else(|e| panic!("stage user script: {e}"));
+        let spool = create_job_spool_dir_under(&roots, job_id, uid, gid)
             .unwrap_or_else(|e| panic!("create spool dir: {e}"));
 
         assert_eq!(path.parent(), Some(spool.path()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo hi\n");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
-        cleanup_job_spool(job_id);
+        crate::spool_fs::cleanup_job_spool_under(root.path(), job_id).unwrap();
         assert!(!path.exists());
     }
 
@@ -4403,14 +4433,16 @@ mod tests {
 
     #[test]
     fn job_spool_dir_round_trips_create_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        // A job id unlikely to collide with a real job on the test host; as a
-        // non-root runner this resolves to the temp-dir fallback.
         let job_id: JobId = 987_654_321;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let roots = vec![root.path().to_owned()];
         // LaunchError has no Debug impl on purpose (it must not be convertible
         // back into an anyhow::Error), so report it through Display.
-        let dir = create_job_spool_dir(job_id, uid, gid)
+        let dir = create_job_spool_dir_under(&roots, job_id, uid, gid)
             .unwrap_or_else(|e| panic!("create spool dir: {e}"));
         assert!(dir.path().is_dir());
         write_spool_scratch(
@@ -4421,7 +4453,7 @@ mod tests {
             "write job script",
         )
         .unwrap_or_else(|e| panic!("write job script: {e}"));
-        cleanup_job_spool(job_id);
+        crate::spool_fs::cleanup_job_spool_under(root.path(), job_id).unwrap();
         assert!(!dir.path().exists());
     }
 

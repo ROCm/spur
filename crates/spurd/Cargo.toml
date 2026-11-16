@@ -34,7 +34,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["dir"] }
 libloading = { workspace = true }
 libc = "0.2"
 hostname = { workspace = true }

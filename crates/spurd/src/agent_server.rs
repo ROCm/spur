@@ -5058,6 +5058,56 @@ impl AgentService {
         BatchWorkload::Gated
     }
 
+    pub async fn cleanup_startup_job_spools(&self) {
+        self.cleanup_startup_job_spools_with_inventory(crate::startup_spool::ActivityPaths {
+            proc_root: "/proc".into(),
+            cgroup_root: executor::CGROUP_ROOT.into(),
+            runtime_root: crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                .root()
+                .to_owned(),
+            cgroups_enabled: self.cgroup.enabled,
+            #[cfg(test)]
+            worker_barriers: None,
+        })
+        .await;
+    }
+
+    pub(crate) async fn cleanup_startup_job_spools_with_inventory(
+        &self,
+        paths: crate::startup_spool::ActivityPaths,
+    ) -> crate::startup_spool::CleanupSummary {
+        crate::startup_spool::run(self, self.job_spool_roots.clone(), paths).await
+    }
+
+    pub(crate) async fn spool_lifecycle_guard(
+        &self,
+        job_id: u32,
+    ) -> crate::job_lifecycle::KeyedLifecycleGuard<u32> {
+        self.lifecycle.acquire(job_id).await
+    }
+
+    pub(crate) async fn spool_local_owner(&self, job_id: u32) -> Option<&'static str> {
+        if self.running.lock().await.contains_key(&job_id) {
+            return Some("tracked job");
+        }
+        if self.allocation.lock().await.owner_attempt(job_id).is_some() {
+            return Some("reserved allocation");
+        }
+        if self
+            .active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(id, _)| *id == job_id)
+        {
+            return Some("active step");
+        }
+        if self.stepds.lock().await.keys().any(|(id, _)| *id == job_id) {
+            return Some("retained supervisor");
+        }
+        None
+    }
+
     /// The job's own process, asked of its supervisor over the control socket —
     /// live state, so it is not kept in the durable descriptor.
     async fn supervised_state(&self, job_id: u32) -> Option<crate::stepd::StepdSnapshot> {

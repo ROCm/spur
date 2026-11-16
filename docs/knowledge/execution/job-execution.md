@@ -378,7 +378,7 @@ fd, and a restarted agent reclaims it via `CUSTODY_RECLAIM_ANY`.
 
 ## 10. Recovery after agent restart
 
-On startup, the agent scans `<state_dir>/` for session directories:
+On startup, the agent scans `<state_dir>/runtime/` for session directories:
 
 1. Loads each `descriptor.json` to find live supervisors.
 2. Validates liveness via `pid + process_start_ticks` (from
@@ -391,6 +391,55 @@ On startup, the agent scans `<state_dir>/` for session directories:
 
 The supervisor is unaffected by the restart -- it runs in its own session
 (via `setsid`), and the agent reconnects to its Unix socket.
+
+### Orphan job spools
+
+After initial completion replay, runtime pruning, supervisor adoption and
+stale-session settlement, `spurd` makes one pass over direct `job<id>`
+directories under `/var/spool/spur` and the temporary-directory `spur` fallback.
+This pass finishes before the agent starts its RPC server and background runtime
+pruning. Heartbeats continue throughout startup. The configured controller state
+directory does not add a spool root, and no periodic spool scan is installed.
+Only daemon-owned roots without group or world write permission are scanned.
+
+The agent queries the controller in sorted batches of 128 job IDs without other
+filters and with `GetJobsRequest.require_authoritative` enabled. These strict
+reads forward to the leader and require a bounded quorum confirmation and apply
+catch-up; ordinary job queries retain their existing local fallback. Both
+terminal jobs and missing jobs are eligible for cleanup only when
+`GetJobsResponse.authoritative` confirms fresh controller state. Missing jobs
+also require `GetJobsResponse.unrestricted_visibility`, which confirms caller
+visibility independently of freshness; request filters still apply. Upgrade
+controllers before agents to enable automatic spool cleanup. Older controllers
+default the authority flag to false, so every candidate remains protected.
+
+Local ownership takes precedence: tracked jobs, reserved allocations, active
+steps, supervisors and every retained runtime session protect the entire job
+spool across attempts and sibling steps. Completed sessions still waiting for
+completion or output replay are retained. Asynchronous supervisor recovery
+reports keep their existing retry behavior; startup cleanup does not wait for
+them. Read-only cgroup population checks and process inventories also protect
+surviving workloads and processes holding spool files or working directories,
+including supervisors whose runtime records disappeared.
+
+Unsafe or unreadable roots, uncertain activity information, unknown job states,
+non-authoritative responses and restricted missing-job responses cause folders
+to be retained with a log message. A failed controller query stops further
+batches and startup continues.
+
+Automatic deletion is skipped when cgroups are disabled. Traversal uses
+`openat2` where available and otherwise combines `openat` with no-follow opens
+and descriptor mount IDs; folders remain protected if safe path or mount
+information is unavailable. Deletion follows neither symlinks nor mount points
+and shares the per-job launch/teardown lock.
+
+Logs record deletions, retention reasons, errors and the final count. A failed
+or partial deletion is reconsidered on the next startup without a persistent
+retry queue.
+
+This pass covers job spools. It does not clean container root filesystems, roll
+back failed launches or run epilogs. Deleting a spool does not establish epilog
+completion or change node-drain policy.
 
 ## 11. Common pitfalls
 
