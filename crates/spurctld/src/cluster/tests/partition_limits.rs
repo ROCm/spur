@@ -397,6 +397,7 @@ fn a_claim_covers_the_most_of_each_resource_among_admitted_requests() {
             charge: 1,
             admits_without_credit: true,
         },
+        partition_qos: PartitionQosAdmitted::default(),
         qos_charge,
     };
     let outcomes = [

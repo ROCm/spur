@@ -241,9 +241,77 @@ async fn an_undefined_partition_qos_holds_jobs_when_accounting_is_on() {
     let mut job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
 
     assert_eq!(
-        view.admit(&mut job, &PassReservations::default()),
+        view.admit(
+            &mut job,
+            &ReuseView::uncapped(&HashMap::new()),
+            &PassReservations::default()
+        )
+        .map(|_| ()),
         Err(PendingReason::InvalidQOS)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_packing_onto_a_node_the_partition_qos_holds_fits_its_group_node_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = one_node_group_cap(&dir).await;
+
+    let packed = submit_and_wait(&cm, gpu_job("bob", "acct-b", "qb"));
+
+    let job = schedulable(&cm, packed).expect("fits on the node the QOS already holds");
+    assert!(job.preferred_nodes.contains("n1"));
+}
+
+async fn one_node_group_cap(dir: &TempDir) -> Arc<ClusterManager> {
+    let cm = capped_cluster(dir, 4).await;
+    let mut one_node = TresRecord::new();
+    one_node.set(TresType::Node, 1);
+    cm.qos_cache().insert(Qos {
+        name: "usercap".into(),
+        limits: QosLimits {
+            grp_tres: Some(one_node),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
+    cm
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_too_big_for_the_held_node_is_held_at_the_group_node_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = one_node_group_cap(&dir).await;
+
+    let wide = submit_and_wait(
+        &cm,
+        JobSpec {
+            cpus_per_task: 8,
+            ..gpu_job("bob", "acct-b", "qb")
+        },
+    );
+
+    assert!(schedulable(&cm, wide).is_none());
+    assert_eq!(
+        cm.get_job(wide).unwrap().pending_reason,
+        PendingReason::QosGrpNodeLimit
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_jobs_in_one_pass_do_not_both_claim_the_held_node() {
+    let dir = TempDir::new().unwrap();
+    let cm = one_node_group_cap(&dir).await;
+
+    let first = submit_and_wait(&cm, gpu_job("bob", "acct-b", "qb"));
+    let second = submit_and_wait(&cm, gpu_job("carol", "acct-b", "qb"));
+
+    let kept = cm
+        .pending_jobs_and_tag_reasons()
+        .into_iter()
+        .filter(|j| j.job_id == first || j.job_id == second)
+        .count();
+    assert_eq!(kept, 1);
 }
 
 #[test]
@@ -281,7 +349,12 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
     );
 
     assert_eq!(
-        view.admit(&mut job, &PassReservations::default()),
+        view.admit(
+            &mut job,
+            &ReuseView::uncapped(&HashMap::new()),
+            &PassReservations::default()
+        )
+        .map(|_| ()),
         Err(PendingReason::QosMaxNodePerUserLimit)
     );
     assert_eq!(
@@ -342,12 +415,19 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
     let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions)
         .into_iter()
         .map(|mut probe| {
-            assert_eq!(view.admit(&mut probe, &PassReservations::default()), Ok(()));
+            assert!(view
+                .admit(
+                    &mut probe,
+                    &ReuseView::uncapped(&HashMap::new()),
+                    &PassReservations::default()
+                )
+                .is_ok());
             let admitted = QuotaVerdict::Admitted {
                 account: AccountAdmitted {
                     charge: 1,
                     admits_without_credit: true,
                 },
+                partition_qos: PartitionQosAdmitted::default(),
                 qos_charge: 1,
             };
             (probe, admitted)

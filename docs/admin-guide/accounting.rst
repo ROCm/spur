@@ -652,6 +652,9 @@ How it behaves:
   ``MaxTRESPU``, ``MaxJobsPU``, ``MaxTRESPJ``, ``GrpTRES`` and ``MaxWall``.
   Submit-count limits (``MaxSubmitJobsPU``, ``MaxSubmitJobsPA``, ``GrpSubmit``)
   and ``GrpWall`` on a partition QOS are not enforced.
+- ``GrpTRES=node=N`` counts distinct nodes, as for a job QOS: a job that packs
+  onto a node the partition QOS already holds needs no new node (see
+  :ref:`grptres-node-packing`).
 - A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
   partitions whose QOS still admits it, and waits only when none does. Until it is
   placed, it counts against every candidate partition's QOS for the rest of that

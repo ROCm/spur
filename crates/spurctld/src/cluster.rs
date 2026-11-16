@@ -6380,7 +6380,12 @@ impl ClusterManager {
                     claim.narrow(job);
                     if !unclaimed.contains(&job.job_id) {
                         reserved.reserve(job, &claim.tres, claim.qos_charge, claim.account_charge);
-                        reserved.reserve_partition_qos(job, &claim.tres, &partition_qos);
+                        reserved.reserve_partition_qos(
+                            job,
+                            &claim.tres,
+                            &partition_qos,
+                            &claim.partition_qos_charges,
+                        );
                         claimed_any = true;
                     }
                     return GateOutcome::Keep;
@@ -6421,7 +6426,12 @@ impl ClusterManager {
                     // is deliberately 0 — that is the one aggregate a borrowed job
                     // is outside of (D1).
                     reserved.reserve(&lent, &job_tres(probe), 0, job.spec.num_nodes as u64);
-                    reserved.reserve_partition_qos(&lent, &job_tres(probe), &partition_qos);
+                    reserved.reserve_partition_qos(
+                        &lent,
+                        &job_tres(probe),
+                        &partition_qos,
+                        &HashMap::new(),
+                    );
                     *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
                         job.spec.num_nodes as u64;
                     idle_fill_candidates.push(lent);
@@ -11802,12 +11812,14 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
 enum QuotaVerdict {
     Admitted {
         account: AccountAdmitted,
+        partition_qos: PartitionQosAdmitted,
         qos_charge: u64,
     },
     AccountBlocked(spur_core::job::PendingReason),
     PartitionQosBlocked(spur_core::job::PendingReason),
     QosBlocked {
         account: AccountAdmitted,
+        partition_qos: PartitionQosAdmitted,
         blocked: QosBlocked,
     },
 }
@@ -11824,12 +11836,14 @@ impl QuotaVerdict {
     }
 
     /// Over its QOS group node cap and nothing else, with no packing credit
-    /// needed from the account, so it may borrow idle capacity.
+    /// needed from the account or a partition QOS, so it may borrow idle capacity.
     fn only_grp_node_blocked(&self) -> bool {
         matches!(
             self,
-            Self::QosBlocked { account, blocked }
-                if blocked.grp_node_sole_blocker && account.admits_without_credit
+            Self::QosBlocked { account, partition_qos, blocked }
+                if blocked.grp_node_sole_blocker
+                    && account.admits_without_credit
+                    && partition_qos.admits_without_credit
         )
     }
 }
@@ -11838,8 +11852,38 @@ impl QuotaVerdict {
 #[derive(Default)]
 struct PartitionQosUsage {
     grp: TresRecord,
+    /// Nodes the QOS's jobs hold, which a job can pack onto without a new group node.
+    occupied: HashSet<String>,
     user_tres: HashMap<String, TresRecord>,
     user_jobs: HashMap<String, u32>,
+}
+
+/// A successful partition-QOS admission.
+#[derive(Clone)]
+struct PartitionQosAdmitted {
+    /// Group node count charged per partition QOS, less than the raw request
+    /// when the job packs onto nodes that QOS already holds.
+    charges: HashMap<String, u64>,
+    /// Whether every partition QOS would admit the job with no packing credit.
+    /// Only idle-fill reads this, as it does for the account.
+    admits_without_credit: bool,
+}
+
+impl Default for PartitionQosAdmitted {
+    fn default() -> Self {
+        Self {
+            charges: HashMap::new(),
+            admits_without_credit: true,
+        }
+    }
+}
+
+/// One partition QOS's admission of a job.
+struct PartitionQosCharge {
+    qos: String,
+    charge: u64,
+    reusable: HashSet<String>,
+    admits_without_credit: bool,
 }
 
 /// A pass's view of partition QOSes. Usage is counted over every job charged to a
@@ -11893,7 +11937,9 @@ impl PartitionQosView {
 
         let mut usage: HashMap<String, PartitionQosUsage> = HashMap::new();
         for (qos, acc) in grp {
-            usage.entry(qos.to_string()).or_default().grp = acc.tres();
+            let entry = usage.entry(qos.to_string()).or_default();
+            entry.occupied = acc.nodes().map(str::to_string).collect();
+            entry.grp = acc.tres();
         }
         for ((qos, user), acc) in per_user {
             usage
@@ -11933,48 +11979,64 @@ impl PartitionQosView {
         requested
     }
 
-    /// Narrows `job` to the requested partitions whose QOS admits it; `Err` with the
-    /// first refusal when none does.
+    /// Narrows `job` to the requested partitions whose QOS admits it, and extends its
+    /// `preferred_nodes` with the nodes credited toward a group node cap; `Err` with
+    /// the first refusal when none admits it.
     fn admit(
         &self,
         job: &mut Job,
+        reuse: &ReuseView<'_>,
         reserved: &PassReservations,
-    ) -> Result<(), spur_core::job::PendingReason> {
+    ) -> Result<PartitionQosAdmitted, spur_core::job::PendingReason> {
+        let mut admission = PartitionQosAdmitted::default();
         if self.by_partition.is_empty() {
-            return Ok(());
+            return Ok(admission);
         }
         let requested = self.candidate_names(job);
         let mut admitted = Vec::new();
+        let mut reusable = HashSet::new();
         let mut refusal = None;
         for name in &requested {
-            match self.refusal(job, name, reserved) {
-                None => admitted.push(name.clone()),
-                Some(reason) => {
+            match self.check(job, name, reuse, reserved) {
+                Ok(charge) => {
+                    admitted.push(name.clone());
+                    let Some(charge) = charge else { continue };
+                    let entry = admission.charges.entry(charge.qos).or_insert(0);
+                    *entry = (*entry).max(charge.charge);
+                    admission.admits_without_credit &= charge.admits_without_credit;
+                    reusable.extend(charge.reusable);
+                }
+                Err(reason) => {
                     refusal.get_or_insert(reason);
                 }
             }
         }
-        let Some(reason) = refusal else {
-            return Ok(());
-        };
-        if admitted.is_empty() {
-            return Err(reason);
+        if let Some(reason) = refusal {
+            if admitted.is_empty() {
+                return Err(reason);
+            }
+            job.spec.partition = Some(admitted.join(","));
         }
-        job.spec.partition = Some(admitted.join(","));
-        Ok(())
+        job.preferred_nodes.extend(reusable);
+        Ok(admission)
     }
 
-    fn refusal(
+    /// `Ok(None)` when `partition` carries no QOS to charge.
+    fn check(
         &self,
         job: &Job,
         partition: &str,
+        reuse: &ReuseView<'_>,
         reserved: &PassReservations,
-    ) -> Option<spur_core::job::PendingReason> {
-        let (name, qos) = self.by_partition.get(partition)?;
+    ) -> Result<Option<PartitionQosCharge>, spur_core::job::PendingReason> {
+        let Some((name, qos)) = self.by_partition.get(partition) else {
+            return Ok(None);
+        };
         let Some(qos) = qos else {
-            return self
-                .unknown_blocks
-                .then_some(spur_core::job::PendingReason::InvalidQOS);
+            if self.unknown_blocks {
+                return Err(spur_core::job::PendingReason::InvalidQOS);
+            }
+            return Ok(None);
         };
         let user = &job.spec.user;
         let usage = self.usage.get(name);
@@ -12002,11 +12064,34 @@ impl PartitionQosView {
         // Submit counts are not tracked per partition, so MaxSubmitJobsPU is not applied here.
         let mut enforced = qos.clone();
         enforced.limits.max_submit_jobs_per_user = None;
-        match spur_core::qos::check_qos_limits(job, &enforced, user_jobs, 0, &user_tres, &grp, None)
-        {
-            QosCheckResult::Allowed => None,
-            QosCheckResult::Blocked(reason) => Some(reason),
+
+        let already_claimed = reserved.partition_qos_claimed_nodes.get(name);
+        let occupied: HashSet<String> = usage
+            .map(|u| &u.occupied)
+            .into_iter()
+            .flatten()
+            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+            .cloned()
+            .collect();
+        let (charge, reusable) =
+            grp_node_credit(job, enforced.limits.grp_tres.as_ref(), &occupied, reuse);
+        let check = |charge| {
+            check_qos_limits_with_grp_node_charge(
+                job, &enforced, user_jobs, 0, &user_tres, &grp, None, charge,
+            )
+        };
+        if let QosCheckResult::Blocked(reason) = check(charge) {
+            return Err(reason);
         }
+        Ok(Some(PartitionQosCharge {
+            qos: name.clone(),
+            charge,
+            reusable,
+            admits_without_credit: matches!(
+                check(job.spec.num_nodes as u64),
+                QosCheckResult::Allowed
+            ),
+        }))
     }
 
     /// The distinct partition QOSes `job` is charged against if it runs.
@@ -12036,15 +12121,21 @@ fn quota_gate(
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
-    if let Err(reason) = partition_qos.admit(job, reserved) {
-        return QuotaVerdict::PartitionQosBlocked(reason);
-    }
+    let partition_qos = match partition_qos.admit(job, reuse, reserved) {
+        Ok(admitted) => admitted,
+        Err(reason) => return QuotaVerdict::PartitionQosBlocked(reason),
+    };
     match qos_block_with(job, qos, ledger, reuse, reserved, consumed_wall_minutes) {
         Ok(qos_charge) => QuotaVerdict::Admitted {
             account,
+            partition_qos,
             qos_charge,
         },
-        Err(blocked) => QuotaVerdict::QosBlocked { account, blocked },
+        Err(blocked) => QuotaVerdict::QosBlocked {
+            account,
+            partition_qos,
+            blocked,
+        },
     }
 }
 
@@ -12055,6 +12146,8 @@ struct QuotaClaim {
     tres: TresRecord,
     qos_charge: u64,
     account_charge: u64,
+    /// Group node charge per partition QOS.
+    partition_qos_charges: HashMap<String, u64>,
     partitions: Vec<String>,
     preferred_nodes: HashSet<String>,
 }
@@ -12066,25 +12159,39 @@ impl QuotaClaim {
         for (probe, verdict) in outcomes {
             let QuotaVerdict::Admitted {
                 account,
+                partition_qos,
                 qos_charge,
             } = verdict
             else {
                 continue;
             };
-            claim
-                .get_or_insert_with(Self::default)
-                .add(probe, *qos_charge, account.charge);
+            claim.get_or_insert_with(Self::default).add(
+                probe,
+                *qos_charge,
+                account.charge,
+                partition_qos,
+            );
         }
         claim
     }
 
-    fn add(&mut self, probe: &Job, qos_charge: u64, account_charge: u64) {
+    fn add(
+        &mut self,
+        probe: &Job,
+        qos_charge: u64,
+        account_charge: u64,
+        partition_qos: &PartitionQosAdmitted,
+    ) {
         let tres = job_tres(probe);
         for kind in tres.types() {
             self.tres.set(kind, self.tres.get(kind).max(tres.get(kind)));
         }
         self.qos_charge = self.qos_charge.max(qos_charge);
         self.account_charge = self.account_charge.max(account_charge);
+        for (qos, charge) in &partition_qos.charges {
+            let entry = self.partition_qos_charges.entry(qos.clone()).or_insert(0);
+            *entry = (*entry).max(*charge);
+        }
         self.partitions
             .extend(requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string));
         self.preferred_nodes
@@ -12641,17 +12748,38 @@ struct PassReservations {
     partition_qos_grp: HashMap<String, TresRecord>,
     partition_qos_user_tres: HashMap<(String, String), TresRecord>,
     partition_qos_user_count: HashMap<(String, String), u32>,
+    partition_qos_claimed_nodes: HashMap<String, HashSet<String>>,
 }
 
 impl PassReservations {
     /// Charge `job` against every partition QOS it could run under; a multi-partition
-    /// job is charged to each, since placement has not picked one yet.
-    fn reserve_partition_qos(&mut self, job: &Job, tres: &TresRecord, view: &PartitionQosView) {
+    /// job is charged to each, since placement has not picked one yet. `node_charges`
+    /// holds the group node count admission charged each QOS; one not in it is
+    /// charged the raw request. Its credited nodes are spoken for, as in [`Self::reserve`].
+    fn reserve_partition_qos(
+        &mut self,
+        job: &Job,
+        tres: &TresRecord,
+        view: &PartitionQosView,
+        node_charges: &HashMap<String, u64>,
+    ) {
         for qos in view.qos_names(job) {
+            let mut grp_tres = tres.clone();
+            grp_tres.set(
+                TresType::Node,
+                node_charges
+                    .get(&qos)
+                    .copied()
+                    .unwrap_or(job.spec.num_nodes as u64),
+            );
             self.partition_qos_grp
                 .entry(qos.clone())
                 .or_default()
-                .add(tres);
+                .add(&grp_tres);
+            self.partition_qos_claimed_nodes
+                .entry(qos.clone())
+                .or_default()
+                .extend(job.preferred_nodes.iter().cloned());
             let key = (job.spec.user.clone(), qos);
             self.partition_qos_user_tres
                 .entry(key.clone())
