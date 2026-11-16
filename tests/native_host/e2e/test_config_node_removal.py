@@ -11,13 +11,13 @@ from cluster import parse_job_id, wait_job_state, wait_node_state, wait_until
 
 
 @pytest.fixture(params=["open", "token"])
-def roster_cluster(unstarted_cluster, request):
+def node_names_cluster(unstarted_cluster, request):
     c = unstarted_cluster
     if len(c.nodes) < 2:
         pytest.skip("node_names tests require two nodes")
     c.start_controller(config_overrides={
         "admission": {"mode": request.param, "node_names": list(c.node_names)},
-        "auth": {"plugin": "jwt", "jwt_key": "roster-e2e-test-key"},
+        "auth": {"plugin": "jwt", "jwt_key": "node-names-e2e-test-key"},
     })
     token = None
     if request.param == "token":
@@ -28,7 +28,7 @@ def roster_cluster(unstarted_cluster, request):
     return c
 
 
-def _write_roster(c, names):
+def _write_node_names(c, names):
     admission = c.config_overrides["admission"]
     if names is None:
         admission.pop("node_names", None)
@@ -51,20 +51,20 @@ def _assert_rejected(c, reason, names):
 
 
 @pytest.mark.parametrize("suspended", [False, True], ids=["running", "suspended"])
-def test_reconfigure_preserves_busy_job_and_idle_node_then_retries(roster_cluster, suspended):
-    c = roster_cluster
+def test_reconfigure_preserves_busy_job_and_idle_node_then_retries(node_names_cluster, suspended):
+    c = node_names_cluster
     busy = c.node_names[0]
     release = f"{c.remote_dir}/release-job"
     survived = f"{c.remote_dir}/job-survived"
     script = c.write_file(
-        "roster-busy.sh",
+        "names-busy.sh",
         "#!/bin/sh\n"
         f"while [ ! -f {shlex.quote(release)} ]; do sleep 0.1; done\n"
         f"echo survived > {shlex.quote(survived)}\n",
     )
     output = c.sbatch([
         "-N", "1", "-w", busy, "-t", "5", "-D", c.remote_dir,
-        "-o", f"{c.remote_dir}/roster-busy.out", script,
+        "-o", f"{c.remote_dir}/names-busy.out", script,
     ])
     job_id = parse_job_id(output)
     assert job_id is not None, output
@@ -78,7 +78,7 @@ def test_reconfigure_preserves_busy_job_and_idle_node_then_retries(roster_cluste
         node_keys = ["CPUAlloc", "CPUTot"]
         node_before = _fields(c.scontrol("show", "node", busy), node_keys)
 
-        _write_roster(c, [])
+        _write_node_names(c, [])
         _assert_rejected(c, "job allocations", c.node_names)
 
         assert _fields(c.scontrol("show", "job", str(job_id)), job_keys) == job_before
@@ -98,9 +98,9 @@ def test_reconfigure_preserves_busy_job_and_idle_node_then_retries(roster_cluste
         c.cli_allow_fail(["scancel", str(job_id)])
 
 
-def test_reconfigure_preserves_reservation_and_idle_node_then_retries(roster_cluster):
-    c = roster_cluster
-    reservation = "roster-maintenance"
+def test_reconfigure_preserves_reservation_and_idle_node_then_retries(node_names_cluster):
+    c = node_names_cluster
+    reservation = "names-maintenance"
     c.cli_as_user(
         "root", [
             "scontrol", "create-reservation", f"--name={reservation}",
@@ -110,7 +110,7 @@ def test_reconfigure_preserves_reservation_and_idle_node_then_retries(roster_clu
     )
     keys = ["ReservationName", "Nodes", "StartTime", "EndTime", "Users"]
     before = _fields(c.scontrol("show", "reservation", reservation), keys)
-    _write_roster(c, [])
+    _write_node_names(c, [])
 
     _assert_rejected(c, "reservation", c.node_names)
 
@@ -122,8 +122,8 @@ def test_reconfigure_preserves_reservation_and_idle_node_then_retries(roster_clu
     assert c.sinfo_nodes() == {}
 
 
-def test_departed_node_stays_excluded_after_restart_until_readmitted(roster_cluster):
-    c = roster_cluster
+def test_departed_node_stays_excluded_after_restart_until_readmitted(node_names_cluster):
+    c = node_names_cluster
     removed = c.node_names[1]
     retained = [name for name in c.node_names if name != removed]
     c.signal_agent(1, "TERM")
@@ -131,12 +131,12 @@ def test_departed_node_stays_excluded_after_restart_until_readmitted(roster_clus
     c.nodes[1].exec(
         f"rm -rf {shlex.quote(c.state_dir)} && mkdir -p {shlex.quote(c.state_dir)}"
     )
-    _write_roster(c, retained)
+    _write_node_names(c, retained)
     c.scontrol("reconfigure")
     assert set(c.sinfo_nodes()) == set(retained)
 
-    # A stale startup file must not override the roster committed through Raft.
-    _write_roster(c, c.node_names)
+    # A stale startup file must not override the list saved in Raft.
+    _write_node_names(c, c.node_names)
     c.restart_controller(expected_nodes=retained)
     assert set(c.sinfo_nodes()) == set(retained)
     c.restart_agent(1)
@@ -152,12 +152,12 @@ def test_departed_node_stays_excluded_after_restart_until_readmitted(roster_clus
     assert set(c.sinfo_nodes()) == set(c.node_names)
 
 
-def test_empty_roster_and_clearing_it_restore_dynamic_admission(roster_cluster):
-    c = roster_cluster
+def test_empty_list_and_clearing_it_restore_dynamic_admission(node_names_cluster):
+    c = node_names_cluster
     c.stop_agents()
     for name in c.node_names:
         wait_node_state(c, name, ["down"])
-    _write_roster(c, [])
+    _write_node_names(c, [])
     c.scontrol("reconfigure")
     assert c.sinfo_nodes() == {}
     c.restart_controller(expected_nodes=[])
@@ -165,11 +165,11 @@ def test_empty_roster_and_clearing_it_restore_dynamic_admission(roster_cluster):
     c.restart_agent(1)
     wait_until(
         lambda: "admission.node_names" in c.spurd_log(1),
-        timeout_s=30, interval_s=1, desc="empty roster rejects registration",
+        timeout_s=30, interval_s=1, desc="empty list rejects registration",
     )
     assert c.sinfo_nodes() == {}
 
-    _write_roster(c, None)
+    _write_node_names(c, None)
     c.scontrol("reconfigure")
     c.restart_agent(0)
     c.restart_agent(1)
@@ -177,9 +177,9 @@ def test_empty_roster_and_clearing_it_restore_dynamic_admission(roster_cluster):
         wait_node_state(c, name, ["idle"])
 
 
-def test_omitted_roster_preserves_nodes_when_policy_is_removed(roster_cluster):
-    c = roster_cluster
-    _write_roster(c, None)
+def test_omitted_list_preserves_nodes_when_policy_is_removed(node_names_cluster):
+    c = node_names_cluster
+    _write_node_names(c, None)
     c.scontrol("reconfigure")
     c.config_overrides["nodes"] = []
     c._write_config()
@@ -208,7 +208,7 @@ def test_startup_node_names_never_block_registration_or_delete(unstarted_cluster
     assert job_id is not None, output
     try:
         wait_job_state(c, job_id, "R")
-        _write_roster(c, [listed])
+        _write_node_names(c, [listed])
         c.restart_controller()
         for index in (0, 1):
             c.restart_agent(index)
@@ -226,11 +226,11 @@ def test_startup_node_names_never_block_registration_or_delete(unstarted_cluster
         c.cli_allow_fail(["scancel", str(job_id)])
 
 
-def test_edited_node_names_take_effect_only_through_reconfigure(roster_cluster):
-    c = roster_cluster
+def test_edited_node_names_take_effect_only_through_reconfigure(node_names_cluster):
+    c = node_names_cluster
     kept, dropped = c.node_names[0], c.node_names[1]
     c.scontrol("reconfigure")
-    _write_roster(c, [kept])
+    _write_node_names(c, [kept])
     c.restart_controller()
     c.restart_agent(1)
     c.wait_agent_serving(1)

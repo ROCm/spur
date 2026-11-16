@@ -2347,14 +2347,16 @@ still-running or recreated agent cannot recreate a deleted record. To admit it
 again, restore its name and reconfigure. ``spur node remove`` of a node that is
 still listed does not keep it out: its agent registers again on its next
 heartbeat. Adding names does not create node records: each permitted agent must
-register. With a saved list, reservations, Kubernetes membership, and job
-placement also refuse nodes that are excluded or not yet registered. A token is
+register. While a saved list is in force (not a cleared one), reservations,
+Kubernetes membership, and job placement also refuse nodes that are excluded or
+not yet registered. A token is
 still required when ``mode = "token"``. The list applies to all node sources;
 there is no mode that mixes listed and unlisted nodes. Names match exactly,
 including case. ``spurctld`` refuses to start, and ``scontrol reconfigure``
 fails, if the list is invalid; other programs that read the same file ignore it.
-Run ``scontrol reconfigure`` on the edited file before a rolling restart, so a
-typo is caught while the controllers are still running.
+Before a rolling restart, run ``scontrol reconfigure`` on the edited file so a
+typo is caught while the controllers are still running; a valid list is then
+saved and applied, deleting unlisted nodes as described above.
 
 ``node_names = []`` deliberately deletes every registered node, subject to the
 same refusals, and rejects every new registration. Removing the field and running
@@ -2363,19 +2365,23 @@ nothing is refused for being unregistered. Deleted records are not restored, but
 any agent still running on a deleted host registers again on its next heartbeat.
 Removing the field without running ``scontrol reconfigure`` keeps a saved list in
 force. Names support letters, digits, dots, underscores, and hyphens; the list is
-bounded to 100,000 distinct names of at most 255 bytes each. Wildcards and label
-selectors belong in ``[[nodes]]`` and ``[[partitions]]``, not here.
+bounded to 100,000 distinct names of at most 255 bytes each, and to 1,000,000
+names counted before duplicates are removed. Wildcards and label selectors belong
+in ``[[nodes]]`` and ``[[partitions]]``, not here.
 
 Before the first ``scontrol reconfigure`` saves a list, the current leader refuses
-names that are neither in the list it loaded at startup nor already registered,
-and logs that the list is not saved yet, once per controller process, on a
-registration it handles. Registered
-nodes missing from it are kept, and job placement, reservations, and Kubernetes
-membership are not checked against it. A failover can change which list applies,
-so give every controller the same file. Once any list has been saved or cleared,
-it is restored from Raft and snapshots and remains authoritative across leader
-changes and controller restarts; a different list in the file is logged the same
-way and ignored until ``scontrol reconfigure``, which reads the leader's file.
+names that are neither in the list it loaded at startup nor already registered.
+On the first registration it accepts, it logs once per controller process that
+the list is not saved yet. Registered nodes missing from the list are kept, and
+job placement, reservations, and Kubernetes membership are not checked against
+it. A failover can change which list applies, so give every controller the same
+file. Once any list has been saved or cleared, it is restored from Raft and
+snapshots and remains authoritative across leader changes and controller
+restarts. A different list in the file is logged the same way and ignored until
+``scontrol reconfigure``, which reads the leader's file; a file without
+``node_names`` logs nothing. A refused agent logs ``is not allowed by
+admission.node_names`` when it starts; a running agent only logs that its
+re-registration failed.
 
 In Slurm, the ``NodeName=`` lines in ``slurm.conf`` define the node set; there is
 no separate deletion-enabling knob. In Slurm 24.11 and later, a node is removed by

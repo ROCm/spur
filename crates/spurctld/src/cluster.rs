@@ -6795,9 +6795,12 @@ impl ClusterManager {
                 restart_only.join(", ")
             );
         }
-        let inventory = new_config.admission.node_inventory()?;
+        let inventory = new_config
+            .admission
+            .node_inventory()
+            .map_err(|error| NodeInventoryError::Invalid(error.to_string()))?;
         self.validate_node_inventory(&inventory)
-            .map_err(|error| NodeInventoryRefused(error.to_string()))?;
+            .map_err(|error| NodeInventoryError::Refused(error.to_string()))?;
         let mut reconcile_inventory = inventory.names.is_some()
             || self.startup_node_inventory.names.is_some()
             || self.node_inventory.read().is_some();
@@ -6810,12 +6813,9 @@ impl ClusterManager {
         // A timed-out earlier write can still apply; order even an unchanged list after it.
         // Saved before partitions so an apply-time refusal leaves nothing half-applied.
         if reconcile_inventory {
-            let response = self.propose(WalOperation::NodeInventoryUpdate {
-                inventory,
-                initialize: false,
-            })?;
+            let response = self.propose(WalOperation::NodeInventoryUpdate { inventory })?;
             if let Some(error) = response.node_inventory_error {
-                return Err(NodeInventoryRefused(error).into());
+                return Err(NodeInventoryError::Refused(error).into());
             }
             // The saved list now matches this leader's file, so a startup-list mismatch is stale.
             swap_flag(&self.node_names_mismatch_warned);
@@ -6942,8 +6942,8 @@ impl ClusterManager {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 tokio::time::timeout(self.propose_timeout, async {
-                    // OpenRaft publishes metrics after processing this FIFO callback,
-                    // including earlier uncommitted writes that a read index can miss.
+                    // OpenRaft 0.9 publishes metrics on every core-loop pass, so after this FIFO
+                    // callback they cover earlier uncommitted writes a read index can miss.
                     let mut metrics = raft.metrics();
                     let mut metrics = raft
                         .with_raft_state(move |_| {
@@ -9984,19 +9984,7 @@ impl ClusterManager {
                     "node removed from cluster"
                 );
             }
-            WalOperation::NodeInventoryUpdate {
-                inventory,
-                initialize,
-            } => {
-                if *initialize
-                    && (self.node_inventory.read().is_some()
-                        || inventory
-                            .names
-                            .as_ref()
-                            .is_some_and(|listed| has_unlisted_node(listed, &nodes)))
-                {
-                    return response;
-                }
+            WalOperation::NodeInventoryUpdate { inventory } => {
                 let reservations = self.reservations.read();
                 let removed = match inventory_removals(
                     inventory,
@@ -10404,17 +10392,21 @@ fn excluded_by_node_names(name: &str) -> RegisterNodeError {
     ))
 }
 
-/// A user-fixable refusal of a node_names change, reported as a failed precondition.
+/// A user-fixable node_names failure in reconfigure: an invalid list or a refused removal.
 #[derive(Debug)]
-pub(crate) struct NodeInventoryRefused(pub(crate) String);
+pub(crate) enum NodeInventoryError {
+    Invalid(String),
+    Refused(String),
+}
 
-impl std::fmt::Display for NodeInventoryRefused {
+impl std::fmt::Display for NodeInventoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reconfigure: {}", self.0)
+        let (Self::Invalid(message) | Self::Refused(message)) = self;
+        write!(f, "reconfigure: {message}")
     }
 }
 
-impl std::error::Error for NodeInventoryRefused {}
+impl std::error::Error for NodeInventoryError {}
 
 fn reject_excluded_registration(
     response: &ClientResponse,
@@ -10501,10 +10493,6 @@ fn inventory_removals(
 
 fn swap_flag(flag: &std::sync::atomic::AtomicBool) -> bool {
     flag.swap(true, std::sync::atomic::Ordering::Relaxed)
-}
-
-fn has_unlisted_node(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> bool {
-    nodes.keys().any(|name| !listed.contains(name))
 }
 
 fn unlisted_node_names(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> Vec<String> {
@@ -13370,7 +13358,6 @@ pub(crate) mod tests {
     fn inventory_update(names: &[&str]) -> WalOperation {
         WalOperation::NodeInventoryUpdate {
             inventory: inventory(names),
-            initialize: false,
         }
     }
 
@@ -13425,7 +13412,7 @@ pub(crate) mod tests {
         cm.reconfigure().unwrap();
         assert!(
             cm.get_node("n2").is_none(),
-            "roster must not invent a live agent"
+            "a listed name must not invent a live agent"
         );
         try_register_node(&cm, "n2", 4, 8000).unwrap();
         std::fs::write(
@@ -13441,12 +13428,12 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconfigure_node_inventory_can_clear_uninitialized_startup_roster() {
-        for roster in ["[]", "['n1']"] {
+    async fn reconfigure_node_inventory_can_clear_an_unsaved_startup_list() {
+        for names_toml in ["[]", "['n1']"] {
             let dir = TempDir::new().unwrap();
             let (cm, path) = test_cluster_with_conf_file(
                 &dir,
-                &format!("cluster_name = 'test'\n[admission]\nnode_names = {roster}\n"),
+                &format!("cluster_name = 'test'\n[admission]\nnode_names = {names_toml}\n"),
             )
             .await;
             let startup_config = cm.config().as_ref().clone();
@@ -13563,11 +13550,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconfigure_node_inventory_orders_same_roster_after_prior_update() {
+    async fn reconfigure_node_inventory_orders_same_list_after_prior_update() {
         for explicit in [false, true] {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("spur.conf");
-            let roster = if explicit {
+            let names_toml = if explicit {
                 "[admission]\nnode_names = ['n1', 'n2']\n"
             } else {
                 ""
@@ -13575,7 +13562,7 @@ pub(crate) mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "cluster_name = 'test'\n{roster}\n[[partitions]]\nname = 'default'\nnodes = 'n[1-2]'\ndefault = true\n"
+                    "cluster_name = 'test'\n{names_toml}\n[[partitions]]\nname = 'default'\nnodes = 'n[1-2]'\ndefault = true\n"
                 ),
             )
             .unwrap();
@@ -13589,13 +13576,8 @@ pub(crate) mod tests {
                 inner: cm.clone(),
                 ops: parking_lot::Mutex::new(Vec::new()),
                 before_apply: |cluster, op| {
-                    if matches!(
-                        op,
-                        WalOperation::NodeInventoryUpdate {
-                            initialize: false,
-                            ..
-                        }
-                    ) && ARMED.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    if matches!(op, WalOperation::NodeInventoryUpdate { .. })
+                        && ARMED.swap(false, std::sync::atomic::Ordering::SeqCst)
                     {
                         // A prior timed-out write may apply after the retry's comparison but before its own write.
                         assert!(cluster
@@ -13622,7 +13604,6 @@ pub(crate) mod tests {
             if !explicit {
                 cm.propose(WalOperation::NodeInventoryUpdate {
                     inventory: NodeInventory::default(),
-                    initialize: false,
                 })
                 .unwrap();
             }
@@ -13650,19 +13631,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn node_inventory_legacy_clear_still_initializes_dynamic_state() {
+    fn node_inventory_clear_saves_a_cleared_list() {
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
-        let clear = serde_json::from_str(
-            r#"{"NodeInventoryUpdate":{"inventory":{"names":null},"initialize":false}}"#,
-        )
-        .unwrap();
+        let clear = serde_json::from_str(r#"{"NodeInventoryUpdate":{"inventory":{"names":null}}}"#)
+            .unwrap();
         assert!(cm.apply_operation(&clear).node_inventory_error.is_none());
         assert_eq!(*cm.node_inventory.read(), Some(NodeInventory::default()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reconfigure_node_inventory_waits_for_timed_out_initial_roster() {
+    async fn reconfigure_node_inventory_waits_for_a_timed_out_earlier_write() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("spur.conf");
         std::fs::write(&path, "cluster_name = 'test'\n").unwrap();
@@ -13733,13 +13712,7 @@ pub(crate) mod tests {
             inner: cm.clone(),
             ops: parking_lot::Mutex::new(Vec::new()),
             before_apply: |cluster, op| {
-                if matches!(
-                    op,
-                    WalOperation::NodeInventoryUpdate {
-                        initialize: false,
-                        ..
-                    }
-                ) {
+                if matches!(op, WalOperation::NodeInventoryUpdate { .. }) {
                     let response = cluster.apply_operation(&WalOperation::job_start(
                         42,
                         vec!["n1".into()],
@@ -13947,17 +13920,7 @@ pub(crate) mod tests {
         assert!(cm.get_reservations()[0].nodes.is_empty());
         assert!(cm.get_nodes().is_empty());
         cm.apply_operation(&WalOperation::NodeInventoryUpdate {
-            inventory: inventory(&["n1"]),
-            initialize: true,
-        });
-        assert_eq!(
-            *cm.node_inventory.read(),
-            Some(inventory(&[])),
-            "late bootstrap cannot overwrite reconfigure"
-        );
-        cm.apply_operation(&WalOperation::NodeInventoryUpdate {
             inventory: NodeInventory::default(),
-            initialize: false,
         });
         assert!(cm.check_node_inventory("n1").is_ok());
         let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
@@ -14067,12 +14030,12 @@ pub(crate) mod tests {
             let cm = cm.clone();
             std::thread::spawn(move || try_register_node(&cm, "old", 4, 8000))
         };
-        // The warning is logged after the pre-check passed, before the per-node lock.
-        while !cm
-            .node_names_unsaved_warned
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            assert!(!registering.is_finished(), "registration ended early");
+        // The registration takes its own handle to the per-node lock once its pre-check passed.
+        while Arc::strong_count(&node_lock) < 3 {
+            assert!(
+                !registering.is_finished(),
+                "registration ended before the per-node lock"
+            );
             std::thread::yield_now();
         }
         cm.apply_operation(&WalOperation::NodeRemove {
@@ -14128,13 +14091,6 @@ pub(crate) mod tests {
                 .count()
         };
         assert_eq!(saves(), 0, "only scontrol reconfigure saves the list");
-        assert!(cm
-            .apply_operation(&WalOperation::NodeInventoryUpdate {
-                inventory: inventory(&["n1"]),
-                initialize: true,
-            })
-            .node_inventory_error
-            .is_none());
         assert_eq!(*cm.node_inventory.read(), None);
         assert!(cm.get_node("old").is_some());
 

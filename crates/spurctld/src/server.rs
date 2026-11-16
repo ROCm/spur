@@ -3514,13 +3514,17 @@ impl SlurmController for ControllerService {
         tokio::task::spawn_blocking(move || cluster.reconfigure())
             .await
             .map_err(|error| Status::internal(format!("reconfigure task failed: {error}")))?
-            .map_err(|e| {
-                if e.is::<crate::cluster::NodeInventoryRefused>() {
-                    Status::failed_precondition(e.to_string())
-                } else {
-                    Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(
+                |e| match e.downcast_ref::<crate::cluster::NodeInventoryError>() {
+                    Some(crate::cluster::NodeInventoryError::Invalid(_)) => {
+                        Status::invalid_argument(e.to_string())
+                    }
+                    Some(crate::cluster::NodeInventoryError::Refused(_)) => {
+                        Status::failed_precondition(e.to_string())
+                    }
+                    None => Status::internal(e.to_string()),
+                },
+            )?;
 
         Ok(Response::new(()))
     }
@@ -8994,7 +8998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_roster_registrations_keep_current_thread_runtime_responsive() {
+    async fn concurrent_node_names_registrations_run_off_the_runtime_thread() {
         use spur_core::config::AdmissionMode;
 
         for mode in [AdmissionMode::Open, AdmissionMode::Token] {
@@ -9033,7 +9037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_roster_reconfigures_keep_current_thread_runtime_responsive() {
+    async fn concurrent_node_names_reconfigures_run_off_the_runtime_thread() {
         use spur_core::config::SlurmConfig;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -9134,7 +9138,7 @@ mod tests {
 
         std::fs::write(&path, config_text("'node*'")).unwrap();
         let invalid = svc.reconfigure(admin_request(())).await.unwrap_err();
-        assert_ne!(invalid.code(), tonic::Code::Ok);
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument, "{invalid:?}");
         assert!(
             invalid.message().contains("admission.node_names"),
             "{invalid:?}"

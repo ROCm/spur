@@ -386,8 +386,6 @@ pub enum WalOperation {
 
     NodeInventoryUpdate {
         inventory: crate::config::NodeInventory,
-        #[serde(default)]
-        initialize: bool,
     },
 
     // Admission token operations
@@ -780,30 +778,17 @@ mod job_state_change_wal_tests {
     use super::*;
 
     #[test]
-    fn node_inventory_has_stable_wire_form_and_optional_initialization() {
-        let op: super::WalOperation =
-            serde_json::from_str(r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]}}}"#)
-                .unwrap();
-        let super::WalOperation::NodeInventoryUpdate {
-            inventory,
-            initialize,
-        } = op
-        else {
+    fn node_inventory_has_a_stable_wire_form() {
+        const FROZEN: &str = r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]}}}"#;
+        let op: super::WalOperation = serde_json::from_str(FROZEN).unwrap();
+        let super::WalOperation::NodeInventoryUpdate { inventory } = &op else {
             panic!("inventory operation");
         };
-        assert!(!initialize);
         assert_eq!(
             inventory.names.clone().unwrap(),
             ["n1".to_string()].into_iter().collect()
         );
-        let saved = super::WalOperation::NodeInventoryUpdate {
-            inventory,
-            initialize: true,
-        };
-        assert_eq!(
-            serde_json::to_string(&saved).unwrap(),
-            r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]},"initialize":true}}"#
-        );
+        assert_eq!(serde_json::to_string(&op).unwrap(), FROZEN);
     }
 
     /// A reason's variant name is its wire form in the Raft log, and a controller

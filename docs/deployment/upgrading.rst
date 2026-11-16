@@ -1081,21 +1081,22 @@ Configured node list (``admission.node_names``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 This release adds the optional ``[admission] node_names`` list (see
-:ref:`configured-node-list`). No new Raft log entries are written until it is
-set. When neither the file nor Raft has a list, ``scontrol reconfigure`` now
+:ref:`configured-node-list`). Only ``scontrol reconfigure`` writes its new Raft
+log entry, ``NodeInventoryUpdate``, and only when the edited file, the file the
+controller started with, or Raft has a list. Otherwise ``scontrol reconfigure``
 first waits for earlier Raft writes to apply, so on a heavily loaded controller it
 can fail with a timeout; rerun it.
 
-**Upgrade every controller before applying it.** Only ``scontrol reconfigure``
-saves the list, as a new Raft log entry, ``NodeInventoryUpdate``. A controller
-that predates it cannot parse the entry and stops replicating until it is
-upgraded, and it ignores the list in a snapshot. If the controllers that predate
-it are a majority, the entry cannot commit and every later write stalls, so run
-``scontrol reconfigure`` with ``node_names`` only after every controller is
-upgraded. A file that already sets ``node_names`` during the rollout is safe: no
-entry is written until that reconfigure. A rollback
-after the list has been saved, or cleared, is not supported because older
-controllers cannot replay that log entry: roll forward.
+**Upgrade every controller before running scontrol reconfigure with a list.** A
+controller that predates ``NodeInventoryUpdate`` cannot parse it and stops
+replicating until it is upgraded, and it ignores the list in a snapshot. If the
+controllers that predate it are a majority, the entry cannot commit and every
+later write stalls. Once a controller has started with ``node_names`` in its
+file, every ``scontrol reconfigure`` it handles writes the entry, even one made
+only for a partition change or after the field was removed, so do not run any
+``scontrol reconfigure`` until every controller is upgraded. Restarts and agent
+registrations never write it. A rollback after the entry has been written is not
+supported because older controllers cannot replay it: roll forward.
 
 See Also
 --------
