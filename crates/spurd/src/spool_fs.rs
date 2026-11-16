@@ -403,7 +403,8 @@ impl SpoolRoot {
                     continue;
                 }
             }
-            let opened = open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+            let opened = self
+                .open_entry(kind, &name)
                 .and_then(|directory| Ok((rootfs_roots(kind, &directory)?, directory.metadata()?)));
             match opened {
                 Ok((roots, metadata)) => candidates.push(JobSpool {
@@ -418,6 +419,39 @@ impl SpoolRoot {
             }
         }
         Ok(candidates)
+    }
+
+    // A rootfs base may itself be a mount point; it is unmounted before anything is deleted.
+    fn open_entry(&self, kind: SpoolKind, name: &OsStr) -> io::Result<File> {
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY;
+        match open_child(&self.directory, name, flags) {
+            Err(error)
+                if kind == SpoolKind::Rootfs && error.raw_os_error() == Some(libc::EXDEV) =>
+            {
+                Ok(openat(
+                    &self.directory,
+                    name,
+                    flags | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    Mode::empty(),
+                )?
+                .into())
+            }
+            result => result,
+        }
+    }
+
+    /// The entry as it is now, e.g. the directory underneath once a mount on it is gone.
+    pub(crate) fn reopen(&self, spool: &JobSpool) -> io::Result<JobSpool> {
+        let directory = open_child(
+            &self.directory,
+            &spool.name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+        )?;
+        Ok(JobSpool {
+            roots: rootfs_roots(spool.kind, &directory)?,
+            metadata: directory.metadata()?,
+            ..spool.clone()
+        })
     }
 
     pub(crate) fn delete(&self, spool: &JobSpool, bound: &Bound) -> io::Result<()> {

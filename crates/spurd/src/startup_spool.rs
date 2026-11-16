@@ -392,13 +392,17 @@ fn clean_inactive(
             }
             Ok(false) if Instant::now() >= deadline => Err(budget_exhausted()),
             Ok(false) if candidate.spool.kind == SpoolKind::Rootfs => {
-                match candidate
+                let mountinfo = paths.proc_root.join("self/mountinfo");
+                let unmounted = candidate
                     .root
-                    .unmount_beneath(&candidate.spool, &paths.proc_root.join("self/mountinfo"))
-                {
-                    Ok(detached) => {
+                    .unmount_beneath(&candidate.spool, &mountinfo)
+                    .and_then(|detached| Ok((detached, candidate.root.reopen(&candidate.spool)?)));
+                match unmounted {
+                    Ok((detached, spool)) => {
                         info!(job_id, path = %path.display(), detached, "queued orphan container rootfs for background deletion");
-                        summary.pending_rootfs.push(PendingRootfs(candidate));
+                        summary
+                            .pending_rootfs
+                            .push(PendingRootfs(Candidate { spool, ..candidate }));
                         continue;
                     }
                     Err(error) => Err(error),

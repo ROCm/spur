@@ -1107,9 +1107,20 @@ async fn orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stay
         }
         layers.push(base);
     }
+    let mounted_base = fixture.containers().join("job_3");
+    fs::create_dir_all(mounted_base.join("underneath")).unwrap();
+    nix::mount::mount(
+        Some("tmpfs"),
+        &mounted_base,
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .unwrap();
+    fs::write(mounted_base.join("on-the-mount"), "layer").unwrap();
     let _busy = fs::File::open(layers[1].join("upper/data")).unwrap();
     let summary = fixture.run().await;
-    assert_eq!(summary.pending_rootfs.len(), 1);
+    assert_eq!(summary.pending_rootfs.len(), 2);
     assert_eq!(summary.retained, 1);
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(!mounts.contains(layers[0].to_str().unwrap()));
@@ -1121,5 +1132,9 @@ async fn orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stay
     )
     .await;
     assert!(!layers[0].exists());
+    assert!(
+        !mounted_base.exists(),
+        "a base that was itself a mount point is removed too"
+    );
     assert!(layers[1].join("upper/data").is_file());
 }

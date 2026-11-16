@@ -222,8 +222,8 @@ and not writable by group or others.
 * The controller confirmation and the job checks above (tracked work,
   supervisor, populated cgroup, job id in a process environment) apply. A
   process whose root or working directory is the rootfs also keeps it.
-* Mounts left behind in overlay mode (``lower``, ``upper``, ``merged``) are
-  unmounted first. If one stays mounted the directory is kept and ``kept
+* Mounts left behind in overlay mode (``lower``, ``upper``, ``merged``), or a
+  mount on the rootfs directory itself, are unmounted first. If one stays mounted the directory is kept and ``kept
   container rootfs: a mount beneath it could not be unmounted`` is logged; the
   next start tries again.
 * Deletion runs in the background after ``spurd`` starts serving, one directory
