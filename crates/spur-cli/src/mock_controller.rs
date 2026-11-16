@@ -653,36 +653,67 @@ pub(crate) fn lazy_client(
     ))
 }
 
+const FIXTURE_BEGIN: &str = "FIXTURE-BEGIN";
+const FIXTURE_END: &str = "FIXTURE-END";
+
 /// What a fixture child process wrote and how it ended.
 pub(crate) struct FixtureRun {
-    pub(crate) stdout: String,
+    /// Only the lines between the fixture's begin and end markers.
+    body: String,
     pub(crate) stderr: String,
     pub(crate) success: bool,
 }
 
 impl FixtureRun {
-    /// Value of the single `key: value` line a fixture printed with [`fixture_report`].
-    pub(crate) fn reported(&self, key: &str) -> &str {
-        let prefix = format!("FIXTURE {key}: ");
-        self.stdout
+    fn new(stdout: &str, stderr: String, success: bool) -> Self {
+        let body = stdout
             .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("fixture reported no {key}:\n{}", self.stdout))
+            .skip_while(|line| *line != FIXTURE_BEGIN)
+            .skip(1)
+            .take_while(|line| *line != FIXTURE_END)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        Self {
+            body,
+            stderr,
+            success,
+        }
     }
 
-    /// Stdout with libtest's own framing and the fixture's report lines removed.
-    pub(crate) fn command_stdout(&self) -> String {
-        self.stdout
+    pub(crate) fn assert_success(&self) {
+        assert!(
+            self.success,
+            "fixture failed:\n{}\n{}",
+            self.body, self.stderr
+        );
+    }
+
+    /// Value of the `key: value` line a fixture printed with [`fixture_report`].
+    pub(crate) fn reported(&self, key: &str) -> &str {
+        let prefix = format!("FIXTURE {key}: ");
+        self.body
             .lines()
-            .filter(|line| {
-                !line.starts_with("FIXTURE ")
-                    && !line.starts_with("running ")
-                    && !line.starts_with("test ")
-                    && !line.is_empty()
-            })
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("fixture reported no {key}:\n{}", self.body))
+    }
+
+    /// What the command under test printed: the fixture body minus its report lines.
+    pub(crate) fn command_stdout(&self) -> String {
+        self.body
+            .lines()
+            .filter(|line| !line.starts_with("FIXTURE "))
             .map(|line| format!("{line}\n"))
             .collect()
     }
+}
+
+/// Open a fixture's output and return the scenario [`run_fixture`] passed in.
+///
+/// The leading newline matters: libtest prints `test <name> ... ` without one on a
+/// single-CPU runner, which would otherwise prefix the first line.
+pub(crate) fn fixture_start() -> String {
+    println!("\n{FIXTURE_BEGIN}");
+    std::env::var("SPUR_TEST_SCENARIO").expect("fixture must be started through run_fixture")
 }
 
 /// Print one `key: value` line for [`FixtureRun::reported`].
@@ -690,11 +721,14 @@ pub(crate) fn fixture_report(key: &str, value: impl std::fmt::Display) {
     println!("FIXTURE {key}: {value}");
 }
 
-/// Re-run an `#[ignore]`d fixture test in a child process whose credential
-/// environment is fully controlled. `SPUR_AUTH_TOKEN` and `SPUR_AUTH_PLUGIN` are
-/// process-global, so setting them in the test process would race every other
-/// test; the child also gets an empty `$HOME` and no spur config, so neither the
-/// runner's `~/.spur/token` nor `/etc/spur/spur.conf` can change the outcome.
+/// Close a fixture's output; everything after this line is libtest's own.
+pub(crate) fn fixture_end() {
+    println!("{FIXTURE_END}");
+}
+
+/// Re-run an `#[ignore]`d fixture in a child process with a controlled credential environment:
+/// the process-global auth variables would race other tests, and an empty `$HOME` and no spur
+/// config keep the runner's `~/.spur/token` and `/etc/spur/spur.conf` out of the result.
 pub(crate) fn run_fixture(fixture: &str, scenario: &str, token: Option<&str>) -> FixtureRun {
     let home = tempfile::TempDir::new().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -711,11 +745,11 @@ pub(crate) fn run_fixture(fixture: &str, scenario: &str, token: Option<&str>) ->
         command.env("SPUR_AUTH_TOKEN", token);
     }
     let output = command.output().unwrap();
-    FixtureRun {
-        stdout: String::from_utf8(output.stdout).unwrap(),
-        stderr: String::from_utf8(output.stderr).unwrap(),
-        success: output.status.success(),
-    }
+    FixtureRun::new(
+        &String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.success(),
+    )
 }
 
 /// Reserve a localhost port and release it, so connecting to it is refused

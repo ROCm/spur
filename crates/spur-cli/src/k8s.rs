@@ -370,7 +370,7 @@ async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_controller::{fixture_report, run_fixture};
+    use crate::mock_controller::{fixture_end, fixture_report, fixture_start, run_fixture};
 
     #[test]
     fn add_nodes_presents_the_callers_credential() {
@@ -379,7 +379,7 @@ mod tests {
             "add",
             Some("fixture-token"),
         );
-        assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+        run.assert_success();
         assert_eq!(
             run.reported("authorization"),
             r#"[Some("Bearer fixture-token")]"#
@@ -398,7 +398,7 @@ mod tests {
             "remove",
             Some("fixture-token"),
         );
-        assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+        run.assert_success();
         assert_eq!(
             run.reported("authorization"),
             r#"[Some("Bearer fixture-token")]"#
@@ -414,7 +414,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "child-process fixture driven by the add/remove_nodes tests"]
     async fn node_change_fixture() {
-        let scenario = std::env::var("SPUR_TEST_SCENARIO").unwrap();
+        let scenario = fixture_start();
         let (addr, capture) = crate::mock_controller::spawn().await;
         let (rpc, subcommand) = match scenario.as_str() {
             "add" => ("cluster_add_nodes", "add-nodes"),
@@ -440,6 +440,7 @@ mod tests {
             "authorization",
             format!("{:?}", capture.authorization_of(rpc)),
         );
+        fixture_end();
     }
 
     #[test]

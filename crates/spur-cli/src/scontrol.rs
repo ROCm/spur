@@ -2791,16 +2791,12 @@ mod tests {
 
     fn run_requeue(scenario: &str, token: Option<&str>) -> FixtureRun {
         let run = run_fixture("scontrol::tests::requeue_fixture", scenario, token);
-        assert!(
-            run.success,
-            "fixture failed:\n{}\n{}",
-            run.stdout, run.stderr
-        );
+        run.assert_success();
         run
     }
 
     #[test]
-    fn requeue_presents_the_callers_credential() {
+    fn requeue_presents_the_callers_credential_and_prints_one_line() {
         let run = run_requeue("single", Some("fixture-token"));
         assert_eq!(
             run.reported("authorization"),
@@ -2808,7 +2804,11 @@ mod tests {
         );
         assert_eq!(run.reported("requests"), "1");
         assert_eq!(run.reported("job_id"), "7");
+        assert_eq!(run.reported("hold"), "false");
         assert_eq!(run.reported("user_is_caller"), "true");
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.command_stdout(), "job 7 requeued\n");
+        assert!(!run.stderr.contains("skipped"), "{}", run.stderr);
     }
 
     #[test]
@@ -2828,15 +2828,6 @@ mod tests {
         assert_eq!(run.reported("hold"), "true");
         assert_eq!(run.reported("result"), "ok");
         assert_eq!(run.command_stdout(), "job 7 requeued and held\n");
-    }
-
-    #[test]
-    fn requeue_of_a_single_job_prints_one_line() {
-        let run = run_requeue("single", Some("fixture-token"));
-        assert_eq!(run.reported("result"), "ok");
-        assert_eq!(run.reported("hold"), "false");
-        assert_eq!(run.command_stdout(), "job 7 requeued\n");
-        assert!(!run.stderr.contains("skipped"), "{}", run.stderr);
     }
 
     #[test]
@@ -2878,9 +2869,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "child-process fixture driven by the requeue_* tests"]
     async fn requeue_fixture() {
-        use crate::mock_controller::fixture_report;
+        use crate::mock_controller::{fixture_end, fixture_report, fixture_start};
 
-        let scenario = std::env::var("SPUR_TEST_SCENARIO").unwrap();
+        let scenario = fixture_start();
         let (addr, capture) = crate::mock_controller::spawn().await;
         let mut subcommand = "requeue";
         match scenario.as_str() {
@@ -2921,6 +2912,7 @@ mod tests {
             "user_is_caller",
             first.user == crate::interactive::current_user().unwrap(),
         );
+        fixture_end();
     }
 
     #[test]
