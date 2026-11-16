@@ -2136,8 +2136,10 @@ node.
      - Start the shell as an interactive step on the allocation's first node
        instead of on the submit host, so the work typed at the prompt runs on
        the allocated hardware and inside the job's cgroup. Slurm
-       ``LaunchParameters=use_interactive_step``. Users override it per
-       invocation with ``--interactive-step`` / ``--no-interactive-step``. See
+       ``LaunchParameters=use_interactive_step``. Applies only when
+       ``salloc``'s stdin is a terminal, so scripted ``salloc`` runs keep a
+       local shell. Users override it per invocation with
+       ``--interactive-step`` / ``--no-interactive-step``. See
        :ref:`salloc-interactive-step`.
 
 ``[mpi]``

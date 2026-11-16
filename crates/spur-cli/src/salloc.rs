@@ -8,6 +8,7 @@ use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobInfo, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 /// Allocate resources for an interactive job.
 #[derive(Parser, Debug)]
@@ -134,6 +135,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         crate::spur_config::load_spur_config()
             .salloc
             .use_interactive_step,
+        std::io::stdin().is_terminal(),
     );
     let submission = Submission {
         work_dir: std::env::current_dir()
@@ -165,7 +167,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let job_id = response.job_id;
     eprintln!("salloc: Pending job allocation {}...", job_id);
 
-    let ctrl_c_cancel = crate::interactive::install_ctrl_c_cancel(
+    crate::interactive::install_ctrl_c_cancel(
         client.clone(),
         job_id,
         submit_user.clone(),
@@ -248,10 +250,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     );
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    // The cancel handler stays armed in both modes: a raw-mode session sends a
+    // typed Ctrl-C to the remote shell as a byte, so only a SIGINT outside one
+    // (session setup, reconnects, no controlling terminal) cancels the allocation.
     let exit_code = if interactive_step {
-        // The session's raw-mode terminal forwards Ctrl-C to the remote shell;
-        // it must not also cancel the allocation from here.
-        ctrl_c_cancel.abort();
         run_shell_on_node(&mut client, job_id, &owner, &shell).await
     } else {
         run_local_shell(&shell, allocation_shell_env(job_id, &job_info)).await?
@@ -273,15 +275,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 }
 
 /// A `--interactive-step`/`--no-interactive-step` flag beats the site's
-/// `[salloc] use_interactive_step`.
-fn use_interactive_step(args: &SallocArgs, configured: bool) -> bool {
+/// `[salloc] use_interactive_step`, which applies only to a terminal: a PTY
+/// step never sees the end of piped input, so a scripted salloc stays local.
+fn use_interactive_step(args: &SallocArgs, configured: bool, stdin_is_tty: bool) -> bool {
     if args.interactive_step {
         return true;
     }
     if args.no_interactive_step {
         return false;
     }
-    configured
+    configured && stdin_is_tty
 }
 
 /// Run the shell as an interactive step on the allocation's first node, the
@@ -536,28 +539,25 @@ mod tests {
 
     #[test]
     fn interactive_step_flags_override_the_configured_default() {
+        let interactive = "--interactive-step";
+        let local = "--no-interactive-step";
+        // (cli, configured, stdin_is_tty, expected)
         let cases = [
-            (vec!["salloc"], false, false),
-            (vec!["salloc"], true, true),
-            (vec!["salloc", "--interactive-step"], false, true),
-            (vec!["salloc", "--no-interactive-step"], true, false),
-            (
-                vec!["salloc", "--no-interactive-step", "--interactive-step"],
-                false,
-                true,
-            ),
-            (
-                vec!["salloc", "--interactive-step", "--no-interactive-step"],
-                true,
-                false,
-            ),
+            (vec!["salloc"], false, true, false),
+            (vec!["salloc"], true, true, true),
+            (vec!["salloc"], true, false, false),
+            (vec!["salloc", interactive], false, true, true),
+            (vec!["salloc", interactive], false, false, true),
+            (vec!["salloc", local], true, true, false),
+            (vec!["salloc", local, interactive], false, true, true),
+            (vec!["salloc", interactive, local], true, true, false),
         ];
-        for (cli, configured, expected) in cases {
+        for (cli, configured, stdin_is_tty, expected) in cases {
             let args = SallocArgs::try_parse_from(&cli).expect("parse failed");
             assert_eq!(
-                use_interactive_step(&args, configured),
+                use_interactive_step(&args, configured, stdin_is_tty),
                 expected,
-                "{cli:?} with configured={configured}"
+                "{cli:?} with configured={configured} stdin_is_tty={stdin_is_tty}"
             );
         }
     }

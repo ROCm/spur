@@ -184,24 +184,37 @@ Shell on the Allocated Node
 
 With ``--interactive-step``, or when the site sets ``[salloc]
 use_interactive_step = true`` (see :ref:`salloc-config`), ``salloc`` starts your
-``$SHELL`` as an interactive step on the allocation's first node rather than
-locally. This is Slurm's ``LaunchParameters=use_interactive_step``.
-``--no-interactive-step`` keeps the shell local when the site default is on.
+``$SHELL`` as an interactive step on the allocation's first node (node 0, where
+``SLURM_NODEID=0``) rather than locally. This is Slurm's
+``LaunchParameters=use_interactive_step``. ``--no-interactive-step`` keeps the
+shell local when the site default is on.
 
 .. code-block:: bash
 
    salloc -N2 --interactive-step
-   hostname                  # the first allocated node
+   hostname                  # the allocation's node 0
    srun -N2 hostname         # a step across the whole allocation
+
+Node 0 is the node the scheduler placed first, which is not always the first
+name in the sorted ``NodeList`` that ``squeue`` shows.
 
 The shell runs inside the job's cgroup, with your submission directory,
 environment, and the allocation's ``SPUR_*`` / ``SLURM_*`` variables. It does
 not hold any of the allocation's resources, so ``srun`` steps started from it
 can use all of them. Once the shell is up, Ctrl-C goes to it like any other
-keystroke instead of cancelling the allocation; while the allocation is still
-pending, Ctrl-C cancels it as usual. Exiting the shell releases the allocation, and ``salloc``
-exits with the shell's exit code. If the job ends first (time limit,
-``scancel``), the node ends the shell and ``salloc`` exits.
+keystroke. Until then (while the allocation is pending or the session is being
+opened or reopened), Ctrl-C cancels the allocation as usual. Exiting the shell
+releases the allocation, and ``salloc`` exits with the shell's exit code. If the
+job ends first (time limit, ``scancel``), the node ends the shell and ``salloc``
+exits.
+
+The site default applies only when ``salloc``'s stdin is a terminal. A scripted
+``salloc`` (``salloc <<EOF``, ``cmds | salloc``) keeps its shell local, because
+a shell on the node never sees the end of piped input and would wait forever.
+``--interactive-step`` still forces the node shell; piped input must then end
+with an explicit ``exit``. The terminal you run ``salloc`` from still switches to
+raw mode for the session, so a typed Ctrl-C does not interrupt it; send SIGINT
+to ``salloc`` (``kill -INT``) to cancel the allocation instead.
 
 Limitations:
 
