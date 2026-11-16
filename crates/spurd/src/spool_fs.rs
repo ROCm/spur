@@ -4,53 +4,58 @@
 use nix::fcntl::{openat, openat2, AtFlags, OFlag, OpenHow, ResolveFlag};
 use nix::sys::stat::{fstatat, Mode};
 use nix::unistd::{unlinkat, UnlinkatFlags};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::time::Instant;
 
+// Bounds descriptors held by one walk; a deeper user tree is kept, not deleted.
+pub(crate) const MAX_SPOOL_DEPTH: usize = 256;
+const READ_CHUNK: usize = 1024;
+const MAX_RESCANS: u8 = 2;
+
+/// Opens a spool root, following symlinks in its path; nothing beneath it is followed.
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
-    if path.as_os_str().is_empty() {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[derive(Debug)]
+struct Kept(&'static str);
+
+impl std::fmt::Display for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
     }
-    let anchor = File::open(if path.is_absolute() { "/" } else { "." })?;
-    let result = openat2(
-        &anchor,
-        path,
-        OpenHow::new()
-            .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
-    );
-    match result {
-        Ok(directory) => Ok(directory.into()),
-        Err(error) if unsupported_openat2(error) => {
-            let mut directory = anchor;
-            for component in path.components() {
-                let name = match component {
-                    Component::RootDir | Component::CurDir => continue,
-                    Component::Normal(name) => name,
-                    Component::ParentDir => OsStr::new(".."),
-                    Component::Prefix(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "invalid spool root",
-                        ));
-                    }
-                };
-                directory = openat(
-                    &directory,
-                    name,
-                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                )?
-                .into();
-            }
-            Ok(directory)
-        }
-        Err(error) => Err(error.into()),
+}
+
+impl std::error::Error for Kept {}
+
+const TOO_DEEP: &str = "deeper than the traversal limit, not walked";
+
+pub(crate) fn budget_exhausted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        Kept("cleanup time budget exhausted"),
+    )
+}
+
+/// Why a job spool was kept rather than deleted, for the rare cases an admin must clean by hand.
+pub(crate) fn kept_reason(error: &io::Error) -> Option<&'static str> {
+    match error.raw_os_error() {
+        Some(libc::EXDEV) => Some("contains a mount point, not crossed"),
+        _ => error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Kept>())
+            .map(|kept| kept.0),
     }
 }
 
@@ -75,6 +80,10 @@ pub(crate) fn open_child(parent: &File, name: &OsStr, flags: OFlag) -> io::Resul
     match result {
         Ok(entry) => Ok(entry.into()),
         Err(error) if unsupported_openat2(error) => {
+            static FALLBACK: Once = Once::new();
+            FALLBACK.call_once(
+                || tracing::debug!(%error, "openat2 unavailable; using openat with mount checks"),
+            );
             let entry: File = openat(
                 parent,
                 name,
@@ -108,7 +117,11 @@ fn mount_id(file: &File) -> io::Result<u64> {
 }
 
 pub(crate) fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
-    // A dup shares the directory offset; each inventory needs its own cursor.
+    read_names(directory, usize::MAX)
+}
+
+fn read_names(directory: &File, limit: usize) -> io::Result<Vec<OsString>> {
+    // A dup shares the directory offset; each read needs its own cursor.
     let cursor = open_child(
         directory,
         OsStr::new("."),
@@ -124,7 +137,12 @@ pub(crate) fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
             )),
             Err(error) => Some(Err(error.into())),
         })
+        .take(limit)
         .collect()
+}
+
+pub(crate) fn job_spool_name(job_id: u32) -> OsString {
+    OsString::from(format!("job{job_id}"))
 }
 
 fn verify_root(root: &File) -> io::Result<()> {
@@ -146,6 +164,7 @@ pub(crate) fn canonical_job_id(name: &OsStr) -> Option<u32> {
 
 pub(crate) struct SpoolRoot {
     pub(crate) path: PathBuf,
+    real_path: PathBuf,
     directory: File,
 }
 
@@ -153,6 +172,12 @@ pub(crate) struct SpoolRoot {
 pub(crate) struct JobSpool {
     pub(crate) job_id: u32,
     metadata: Metadata,
+}
+
+impl JobSpool {
+    pub(crate) fn device(&self) -> u64 {
+        self.metadata.dev()
+    }
 }
 
 impl SpoolRoot {
@@ -164,12 +189,21 @@ impl SpoolRoot {
 
     fn open_for_owned_job(path: PathBuf) -> io::Result<Self> {
         let directory = open_directory(&path)?;
-        Ok(Self { path, directory })
+        let real_path = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
+        Ok(Self {
+            path,
+            real_path,
+            directory,
+        })
+    }
+
+    /// The job's path with root symlinks resolved, matching how /proc reports holders.
+    pub(crate) fn job_path(&self, job_id: u32) -> PathBuf {
+        self.real_path.join(job_spool_name(job_id))
     }
 
     pub(crate) fn identity(&self) -> io::Result<(u64, u64)> {
-        let metadata = self.directory.metadata()?;
-        Ok((metadata.dev(), metadata.ino()))
+        Ok(inode_identity(&self.directory.metadata()?))
     }
 
     pub(crate) fn candidates(&self) -> io::Result<Vec<JobSpool>> {
@@ -183,9 +217,18 @@ impl SpoolRoot {
                 name.as_os_str(),
                 AtFlags::AT_SYMLINK_NOFOLLOW,
             )?;
-            if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
-                tracing::info!(job_id, root = %self.path.display(), "skipped job spool name that is not a direct directory");
-                continue;
+            match metadata.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {}
+                libc::S_IFLNK => {
+                    tracing::warn!(job_id, root = %self.path.display(),
+                        "kept job spool: entry is a symlink, not followed");
+                    continue;
+                }
+                _ => {
+                    tracing::info!(job_id, root = %self.path.display(),
+                        "skipped job spool name that is not a directory");
+                    continue;
+                }
             }
             match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
                 Ok(directory) => candidates.push(JobSpool {
@@ -199,17 +242,80 @@ impl SpoolRoot {
         Ok(candidates)
     }
 
-    pub(crate) fn delete(&self, spool: &JobSpool) -> io::Result<()> {
+    pub(crate) fn delete(&self, spool: &JobSpool, deadline: Option<Instant>) -> io::Result<()> {
         verify_root(&self.directory)?;
-        let current = Self::open(self.path.clone())?;
-        self.delete_with_current_root(spool, &current)
-    }
-
-    fn delete_with_current_root(&self, spool: &JobSpool, current: &Self) -> io::Result<()> {
-        if current.identity()? != self.identity()? {
+        if Self::open(self.path.clone())?.identity()? != self.identity()? {
             return Err(io::Error::other("spool root changed since discovery"));
         }
-        let name = OsString::from(format!("job{}", spool.job_id));
+        self.delete_job(spool, deadline)
+    }
+
+    /// Whether any entry in the job's spool is one of `held`, the inodes live processes keep open.
+    pub(crate) fn holds_any(
+        &self,
+        spool: &JobSpool,
+        held: &HashSet<(u64, u64)>,
+        deadline: Option<Instant>,
+    ) -> io::Result<bool> {
+        if held.is_empty() {
+            return Ok(false);
+        }
+        let name = job_spool_name(spool.job_id);
+        let directory =
+            match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+        if !same_identity(&directory.metadata()?, &spool.metadata) {
+            return Err(io::Error::other("job spool changed since discovery"));
+        }
+        if held.contains(&inode_identity(&spool.metadata)) {
+            return Ok(true);
+        }
+        let mut stack = vec![ReadFrame::new(directory)?];
+        while !stack.is_empty() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(budget_exhausted());
+            }
+            let depth = stack.len();
+            let Some(frame) = stack.last_mut() else {
+                break;
+            };
+            let Some(entry) = frame.entries.next() else {
+                stack.pop();
+                continue;
+            };
+            let entry = entry?;
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." {
+                continue;
+            }
+            let metadata = match open_child(&frame.directory, name, OFlag::O_PATH) {
+                Ok(entry) => entry.metadata()?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if held.contains(&inode_identity(&metadata)) {
+                return Ok(true);
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            if depth >= MAX_SPOOL_DEPTH {
+                return Err(io::Error::other(Kept(TOO_DEEP)));
+            }
+            let child = open_child(&frame.directory, name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
+            if !same_identity(&child.metadata()?, &metadata) {
+                return Err(io::Error::other("spool directory changed during inventory"));
+            }
+            stack.push(ReadFrame::new(child)?);
+        }
+        Ok(false)
+    }
+
+    fn delete_job(&self, spool: &JobSpool, deadline: Option<Instant>) -> io::Result<()> {
+        let name = job_spool_name(spool.job_id);
         let directory =
             match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
                 Ok(directory) => directory,
@@ -220,56 +326,34 @@ impl SpoolRoot {
         if !same_identity(&directory.metadata()?, &spool.metadata) {
             return Err(io::Error::other("job spool changed since discovery"));
         }
-        remove_contents(&directory)?;
+        remove_contents(&directory, deadline)?;
         require_identity(&self.directory, &name, &spool.metadata)?;
         absent_is_success(
             unlinkat(&self.directory, name.as_os_str(), UnlinkatFlags::RemoveDir)
                 .map_err(Into::into),
         )
     }
+}
 
-    pub(crate) fn held_identities(&self, spool: &JobSpool) -> io::Result<Vec<(u64, u64)>> {
-        let name = OsString::from(format!("job{}", spool.job_id));
-        let directory =
-            match open_child(&self.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
-                Ok(directory) => directory,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-            };
-        if !same_identity(&directory.metadata()?, &spool.metadata) {
-            return Err(io::Error::other("job spool changed since discovery"));
-        }
-        let mut identities = Vec::new();
-        collect_identities(&directory, &mut identities)?;
-        Ok(identities)
+struct ReadFrame {
+    directory: File,
+    entries: nix::dir::OwningIter,
+}
+
+impl ReadFrame {
+    fn new(directory: File) -> io::Result<Self> {
+        let cursor = open_child(
+            &directory,
+            OsStr::new("."),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+        )?;
+        let entries = nix::dir::Dir::from_fd(cursor.into())?.into_iter();
+        Ok(Self { directory, entries })
     }
 }
 
-fn collect_identities(directory: &File, identities: &mut Vec<(u64, u64)>) -> io::Result<()> {
-    let metadata = directory.metadata()?;
-    identities.push((metadata.dev(), metadata.ino()));
-    let mut stack = vec![TraversalFrame::new(directory.try_clone()?, None)?];
-    while let Some(frame) = stack.last_mut() {
-        let Some(name) = frame.names.next() else {
-            stack.pop();
-            continue;
-        };
-        let entry = open_child(&frame.directory, &name, OFlag::O_PATH)?;
-        let metadata = entry.metadata()?;
-        identities.push((metadata.dev(), metadata.ino()));
-        if metadata.is_dir() {
-            let child = open_child(
-                &frame.directory,
-                &name,
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
-            )?;
-            if !same_identity(&child.metadata()?, &metadata) {
-                return Err(io::Error::other("spool directory changed during inventory"));
-            }
-            stack.push(TraversalFrame::new(child, None)?);
-        }
-    }
-    Ok(())
+pub(crate) fn inode_identity(metadata: &Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 fn same_identity(left: &Metadata, right: &Metadata) -> bool {
@@ -284,10 +368,17 @@ fn require_identity(parent: &File, name: &OsStr, expected: &Metadata) -> io::Res
     Ok(())
 }
 
-fn remove_contents(directory: &File) -> io::Result<()> {
-    let mut stack = vec![TraversalFrame::new(directory.try_clone()?, None)?];
-    while let Some(frame) = stack.last_mut() {
-        let Some(name) = frame.names.next() else {
+fn remove_contents(directory: &File, deadline: Option<Instant>) -> io::Result<()> {
+    let mut stack = vec![TraversalFrame::new(directory.try_clone()?, None)];
+    while !stack.is_empty() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(budget_exhausted());
+        }
+        let depth = stack.len();
+        let Some(frame) = stack.last_mut() else {
+            break;
+        };
+        let Some(name) = frame.next_name()? else {
             let completed = stack
                 .pop()
                 .ok_or_else(|| io::Error::other("missing spool traversal frame"))?;
@@ -314,6 +405,9 @@ fn remove_contents(directory: &File) -> io::Result<()> {
         };
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
+            if depth >= MAX_SPOOL_DEPTH {
+                return Err(io::Error::other(Kept(TOO_DEEP)));
+            }
             let child = open_child(
                 &frame.directory,
                 &name,
@@ -322,7 +416,7 @@ fn remove_contents(directory: &File) -> io::Result<()> {
             if !same_identity(&child.metadata()?, &metadata) {
                 return Err(io::Error::other("spool directory changed during cleanup"));
             }
-            stack.push(TraversalFrame::new(child, Some((name, metadata)))?);
+            stack.push(TraversalFrame::new(child, Some((name, metadata))));
             continue;
         }
         require_identity(&frame.directory, &name, &metadata)?;
@@ -340,18 +434,41 @@ fn remove_contents(directory: &File) -> io::Result<()> {
 
 struct TraversalFrame {
     directory: File,
-    names: std::vec::IntoIter<OsString>,
     entry: Option<(OsString, Metadata)>,
+    pending: std::vec::IntoIter<OsString>,
+    reached_end: bool,
+    rescans: u8,
 }
 
 impl TraversalFrame {
-    fn new(directory: File, entry: Option<(OsString, Metadata)>) -> io::Result<Self> {
-        let names = directory_names(&directory)?.into_iter();
-        Ok(Self {
+    fn new(directory: File, entry: Option<(OsString, Metadata)>) -> Self {
+        Self {
             directory,
-            names,
             entry,
-        })
+            pending: Vec::new().into_iter(),
+            reached_end: false,
+            rescans: 0,
+        }
+    }
+
+    // Each refill reads from the start: every name already returned has been unlinked.
+    fn next_name(&mut self) -> io::Result<Option<OsString>> {
+        if let Some(name) = self.pending.next() {
+            return Ok(Some(name));
+        }
+        let names = read_names(&self.directory, READ_CHUNK)?;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        if self.reached_end {
+            self.rescans += 1;
+            if self.rescans > MAX_RESCANS {
+                return Err(io::Error::other("job spool kept changing during cleanup"));
+            }
+        }
+        self.reached_end = names.len() < READ_CHUNK;
+        self.pending = names.into_iter();
+        Ok(self.pending.next())
     }
 }
 
@@ -369,26 +486,34 @@ pub(crate) fn cleanup_job_spool_under(root: &Path, job_id: u32) -> io::Result<()
             "job id must be positive",
         ));
     }
-    // Completion owns this job's lifetime even in a user-owned fallback root;
-    // startup discovery must additionally establish trust in the entire root.
+    // Completion owns this job's lifetime, so it skips startup's root ownership check.
     let root = match SpoolRoot::open_for_owned_job(root.to_owned()) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let name = OsString::from(format!("job{job_id}"));
+    let name = job_spool_name(job_id);
     let directory = match open_child(&root.directory, &name, OFlag::O_RDONLY | OFlag::O_DIRECTORY) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+        Err(error) => {
+            let metadata = fstatat(
+                &root.directory,
+                name.as_os_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            );
+            if metadata.is_ok_and(|metadata| metadata.st_mode & libc::S_IFMT == libc::S_IFLNK) {
+                return Err(io::Error::other(Kept("entry is a symlink, not followed")));
+            }
+            return Err(error);
+        }
     };
-    let current = SpoolRoot::open_for_owned_job(root.path.clone())?;
-    root.delete_with_current_root(
+    root.delete_job(
         &JobSpool {
             job_id,
             metadata: directory.metadata()?,
         },
-        &current,
+        None,
     )
 }
 

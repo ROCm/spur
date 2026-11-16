@@ -29,6 +29,7 @@ mod compatibility_tests {
         ] {
             let response = super::GetJobsResponse::decode(wire).expect("legacy job response");
             assert!(!response.authoritative);
+            assert_eq!(response.next_job_id, 0);
         }
     }
 
@@ -65,6 +66,7 @@ mod compatibility_tests {
         assert_eq!(response.jobs[0].state, super::JobState::JobCancelled as i32);
         assert!(response.unrestricted_visibility);
         response.authoritative = true;
+        response.next_job_id = 7;
         let legacy_response = LegacyGetJobsResponse::decode(response.encode_to_vec().as_slice())
             .expect("old client reads new response");
         assert_eq!(

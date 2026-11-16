@@ -119,18 +119,20 @@ fn exercise_cleanup_safety() {
     let root_link = directory.path().join("spool-link");
     symlink(&root, &root_link).unwrap();
 
-    assert!(cleanup_job_spool_under(&root_link, 1).is_err());
-    assert!(open_directory(&root_link.join("job1")).is_err());
-    assert!(root.join("job1/nested/output").is_file());
-    let spool_root = SpoolRoot::open(root.clone()).unwrap();
+    let spool_root = SpoolRoot::open(root_link.clone()).unwrap();
+    assert_eq!(
+        spool_root.job_path(1),
+        std::fs::canonicalize(&root).unwrap().join("job1")
+    );
     let candidates = spool_root.candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].job_id, 1);
-    assert!(!spool_root
-        .held_identities(&candidates[0])
-        .unwrap()
-        .is_empty());
-    cleanup_job_spool_under(&root, 1).unwrap();
+    let error = cleanup_job_spool_under(&root_link, 2).unwrap_err();
+    assert_eq!(
+        kept_reason(&error),
+        Some("entry is a symlink, not followed")
+    );
+    cleanup_job_spool_under(&root_link, 1).unwrap();
     assert!(!root.join("job1").exists());
     assert!(root.join("job2").is_symlink());
     assert_eq!(
@@ -142,6 +144,30 @@ fn exercise_cleanup_safety() {
 #[test]
 fn cleanup_unlinks_symlinks_without_following_them() {
     exercise_cleanup_safety();
+}
+
+#[test]
+fn cleanup_streams_directories_larger_than_one_read() {
+    let (_directory, root) = fixture();
+    std::fs::create_dir_all(root.join("job1/wide")).unwrap();
+    for i in 0..(READ_CHUNK * 2 + 7) {
+        std::fs::write(root.join(format!("job1/wide/f{i}")), "x").unwrap();
+    }
+    cleanup_job_spool_under(&root, 1).unwrap();
+    assert!(!root.join("job1").exists());
+}
+
+#[test]
+fn cleanup_stops_at_its_deadline_and_keeps_the_spool() {
+    let (_directory, root) = fixture();
+    std::fs::create_dir(root.join("job1")).unwrap();
+    std::fs::write(root.join("job1/output"), "retained").unwrap();
+    let spool_root = SpoolRoot::open(root.clone()).unwrap();
+    let spool = spool_root.candidates().unwrap().pop().unwrap();
+    let error = spool_root.delete(&spool, Some(Instant::now())).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(kept_reason(&error), Some("cleanup time budget exhausted"));
+    assert!(root.join("job1/output").is_file());
 }
 
 #[test]
@@ -252,7 +278,7 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
     std::fs::rename(root.join("job1"), root.join("retained-job")).unwrap();
     std::fs::create_dir(root.join("job1")).unwrap();
     std::fs::write(root.join("job1/output"), "replacement").unwrap();
-    assert!(spool_root.delete(&spool).is_err());
+    assert!(spool_root.delete(&spool, None).is_err());
     assert_eq!(
         std::fs::read_to_string(root.join("job1/output")).unwrap(),
         "replacement"
@@ -267,7 +293,7 @@ fn cleanup_rejects_replaced_roots_and_jobs() {
     std::fs::rename(&root, &retained).unwrap();
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(spool_root.delete(&spool).is_err());
+    assert!(spool_root.delete(&spool, None).is_err());
     assert_eq!(
         std::fs::read_to_string(retained.join("job1/output")).unwrap(),
         "replacement"
@@ -287,17 +313,15 @@ fn raw_directory(parent: &File, name: &str) -> nix::Result<File> {
 struct DeepSpool {
     _directory: tempfile::TempDir,
     root: PathBuf,
-    leaf_identity: (u64, u64),
 }
 
 impl DeepSpool {
     fn new(depth: usize) -> Self {
         let (directory, root) = fixture();
         std::fs::create_dir(root.join("job1")).unwrap();
-        let mut fixture = Self {
+        let fixture = Self {
             _directory: directory,
             root,
-            leaf_identity: (0, 0),
         };
         let mut current = File::open(fixture.root.join("job1")).unwrap();
         for _ in 0..depth {
@@ -313,8 +337,6 @@ impl DeepSpool {
         .unwrap()
         .into();
         leaf.write_all(b"retained until cleanup").unwrap();
-        let metadata = leaf.metadata().unwrap();
-        fixture.leaf_identity = (metadata.dev(), metadata.ino());
         fixture
     }
 }
@@ -381,52 +403,25 @@ fn traversal_fd_exhaustion_retains_the_spool() {
     let spool = root.candidates().unwrap().pop().unwrap();
     set_fd_limit(32);
     assert_eq!(
-        root.held_identities(&spool).unwrap_err().raw_os_error(),
-        Some(libc::EMFILE)
-    );
-    assert_eq!(
-        root.delete(&spool).unwrap_err().raw_os_error(),
+        root.delete(&spool, None).unwrap_err().raw_os_error(),
         Some(libc::EMFILE)
     );
     assert!(fixture.root.join("job1").is_dir());
 }
 
 #[test]
-#[ignore = "requires an RLIMIT_NOFILE hard limit of at least 65536"]
-fn inventory_and_cleanup_handle_six_thousand_levels() {
-    const CHILD: &str = "SPUR_SPOOL_FS_DEEP_CHILD";
-    let Some(mode) = std::env::var_os(CHILD) else {
-        for mode in ["inventory", "delete"] {
-            isolate(
-                "inventory_and_cleanup_handle_six_thousand_levels",
-                CHILD,
-                mode,
-                true,
-            );
-        }
-        return;
-    };
-    set_fd_limit(65536);
-    std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
-        .spawn(move || {
-            let fixture = DeepSpool::new(6000);
-            let root = SpoolRoot::open(fixture.root.clone()).unwrap();
-            let spool = root.candidates().unwrap().pop().unwrap();
-            if mode == "inventory" {
-                assert!(root
-                    .held_identities(&spool)
-                    .unwrap()
-                    .contains(&fixture.leaf_identity));
-            } else {
-                assert_eq!(mode, "delete");
-                cleanup_job_spool_under(&fixture.root, 1).unwrap();
-                assert!(!fixture.root.join("job1").exists());
-            }
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+fn cleanup_keeps_spools_deeper_than_the_traversal_limit() {
+    let fixture = DeepSpool::new(MAX_SPOOL_DEPTH + 8);
+    let error = cleanup_job_spool_under(&fixture.root, 1).unwrap_err();
+    assert_eq!(
+        kept_reason(&error),
+        Some("deeper than the traversal limit, not walked")
+    );
+    assert!(fixture.root.join("job1").is_dir());
+
+    let fixture = DeepSpool::new(MAX_SPOOL_DEPTH - 2);
+    cleanup_job_spool_under(&fixture.root, 1).unwrap();
+    assert!(!fixture.root.join("job1").exists());
 }
 
 struct MountedPaths(Vec<PathBuf>);
@@ -496,20 +491,12 @@ fn fallback_rejects_same_filesystem_bind_mounts() {
             .collect::<std::collections::BTreeSet<_>>(),
         [2, 3].into_iter().collect()
     );
-    let nested = candidates.iter().find(|spool| spool.job_id == 2).unwrap();
-    assert_eq!(
-        spool_root
-            .held_identities(nested)
-            .unwrap_err()
-            .raw_os_error(),
-        Some(libc::EXDEV)
-    );
     for id in [1, 2] {
+        let error = cleanup_job_spool_under(&root, id).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         assert_eq!(
-            cleanup_job_spool_under(&root, id)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EXDEV)
+            kept_reason(&error),
+            Some("contains a mount point, not crossed")
         );
     }
     cleanup_job_spool_under(&root, 3).unwrap();

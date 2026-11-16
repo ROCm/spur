@@ -2485,8 +2485,12 @@ fn spool_dir_error(
 /// location isn't recorded.
 pub fn cleanup_job_spool(job_id: JobId) {
     for base in default_job_spool_candidates() {
-        if let Err(error) = crate::spool_fs::cleanup_job_spool_under(&base, job_id) {
-            warn!(job_id, root = %base.display(), %error, "failed to clean job spool");
+        let Err(error) = crate::spool_fs::cleanup_job_spool_under(&base, job_id) else {
+            continue;
+        };
+        match crate::spool_fs::kept_reason(&error) {
+            Some(reason) => warn!(job_id, root = %base.display(), "kept job spool: {reason}"),
+            None => warn!(job_id, root = %base.display(), %error, "failed to clean job spool"),
         }
     }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::startup_spool::{ActivityPaths, CleanupSummary};
+use crate::startup_spool::{ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -50,6 +50,8 @@ impl SpoolFixture {
             cgroup_root: self.directory.path().join("cgroup/spur"),
             runtime_root: self.directory.path().join("runtime"),
             cgroups_enabled: self.agent.cgroup.enabled,
+            supervisor_uid: nix::unistd::geteuid().as_raw(),
+            budget: STARTUP_CLEANUP_BUDGET,
             worker_barriers: None,
         }
     }
@@ -82,6 +84,12 @@ impl SpoolFixture {
         )
         .unwrap();
         fs::write(path.join("environ"), environment).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        fs::write(
+            path.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
         symlink(self.directory.path(), path.join("cwd")).unwrap();
         if let Some(command) = command.first() {
             symlink(command, path.join("exe")).unwrap();
@@ -102,6 +110,7 @@ fn spool_response(controller: &ControllerFixture, unrestricted: bool, jobs: &[(u
             .collect(),
         unrestricted_visibility: unrestricted,
         authoritative: true,
+        next_job_id: u32::MAX,
     };
 }
 
@@ -351,10 +360,40 @@ async fn startup_spool_finds_recordless_supervisors_workloads_and_output_holders
 }
 
 #[tokio::test]
+async fn startup_spool_ignores_job_markers_that_name_no_job() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1, 2]);
+    fixture.process(100, &["workload"], b"SPUR_JOB_ID=bad\0SLURM_JOB_ID=\0");
+    fixture.process(101, &["workload"], b"SLURM_JOB_ID=2\0");
+    let summary = fixture.run().await;
+    assert_eq!(summary.deleted, 1);
+    assert!(!fixture.exists(1));
+    assert!(fixture.exists(2));
+}
+
+#[tokio::test]
+async fn startup_spool_trusts_supervisor_names_only_from_the_daemon_uid() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1]);
+    let other = nix::unistd::geteuid().as_raw().wrapping_add(1);
+    for (pid, status) in [
+        (100, format!("Uid:\t{other}\t{other}\t{other}\t{other}\n")),
+        (101, format!("Uid:\t{other}\t0\t0\t0\n")),
+    ] {
+        let process = fixture.process(pid, &["spurstepd", "--help"], b"");
+        fs::write(process.join("status"), status).unwrap();
+    }
+    assert_eq!(fixture.run().await.deleted, 1);
+    assert!(!fixture.exists(1));
+}
+
+#[tokio::test]
 async fn startup_spool_preserves_uncertain_activity_inventories() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
-    for fault in ["proc", "supervisor", "environment", "cgroup", "runtime"] {
+    for fault in ["proc", "supervisor", "cgroup", "runtime"] {
         let fixture = SpoolFixture::new(&controller, &[1]);
         match fault {
             "proc" => {
@@ -363,9 +402,6 @@ async fn startup_spool_preserves_uncertain_activity_inventories() {
             }
             "supervisor" => {
                 fixture.process(100, &["spurstepd"], b"");
-            }
-            "environment" => {
-                fixture.process(100, &["workload"], b"SPUR_JOB_ID=bad\0");
             }
             "cgroup" => {
                 let group = fixture.paths().cgroup_root.join("job_1_1");
@@ -397,22 +433,92 @@ async fn startup_spool_skips_unsafe_roots_and_disabled_cgroups() {
 }
 
 #[tokio::test]
-async fn startup_spool_does_not_follow_root_or_job_symlinks() {
+async fn startup_spool_follows_root_symlinks_but_nothing_beneath_the_root() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
-    let mut fixture = SpoolFixture::new(&controller, &[1]);
+    let mut fixture = SpoolFixture::new(&controller, &[1, 3, 4]);
     let target = fixture.directory.path().join("target");
     fs::create_dir(&target).unwrap();
     fs::write(target.join("sentinel"), "safe").unwrap();
     symlink(&target, fixture.root.join("job2")).unwrap();
     symlink(&target, fixture.root.join("job1/link")).unwrap();
-    assert_eq!(fixture.run().await.deleted, 1);
-    assert_eq!(fs::read_to_string(target.join("sentinel")).unwrap(), "safe");
-    assert!(fixture.root.join("job2").is_symlink());
     let alias = fixture.directory.path().join("root-link");
     symlink(&fixture.root, &alias).unwrap();
-    fixture.agent.job_spool_roots = vec![alias];
+    fixture.agent.job_spool_roots = vec![alias.clone()];
+    let holder = fixture.process(100, &["output-reader"], b"");
+    symlink(fixture.root.join("job4/output"), holder.join("fd/1")).unwrap();
+    let summary = fixture.run().await;
+    assert_eq!(summary.deleted, 2);
+    assert!(!fixture.exists(1));
+    assert!(!fixture.exists(3));
+    assert!(
+        fixture.exists(4),
+        "holders are matched against the resolved root"
+    );
+    assert_eq!(fs::read_to_string(target.join("sentinel")).unwrap(), "safe");
+    assert!(fixture.root.join("job2").is_symlink());
+
+    let writable = fixture.directory.path().join("writable");
+    fs::create_dir_all(writable.join("job5")).unwrap();
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+    let planted = fixture.directory.path().join("planted-link");
+    symlink(&writable, &planted).unwrap();
+    fixture.agent.job_spool_roots = vec![planted];
     assert_eq!(fixture.run().await.deleted, 0);
+    assert!(writable.join("job5").is_dir());
+}
+
+#[tokio::test]
+async fn startup_spool_treats_only_issued_ids_as_confirmed_absent() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    controller.state.spool_response.lock().unwrap().next_job_id = 3;
+    let fixture = SpoolFixture::new(&controller, &[1, 2, 3, 4]);
+    let summary = fixture.run().await;
+    assert_eq!(summary.deleted, 2);
+    assert!(!fixture.exists(1));
+    assert!(!fixture.exists(2));
+    assert!(fixture.exists(3));
+    assert!(fixture.exists(4));
+    controller.state.spool_response.lock().unwrap().next_job_id = 0;
+    assert_eq!(fixture.run().await.deleted, 0);
+}
+
+#[tokio::test]
+async fn startup_spool_requires_every_duplicate_record_to_be_terminal() {
+    use spur_proto::proto::JobState;
+    let controller = ControllerFixture::new(true);
+    spool_response(
+        &controller,
+        true,
+        &[
+            (1, JobState::JobCompleted as i32),
+            (1, JobState::JobPending as i32),
+            (2, JobState::JobCompleted as i32),
+            (2, JobState::JobFailed as i32),
+        ],
+    );
+    let fixture = SpoolFixture::new(&controller, &[1, 2]);
+    assert_eq!(fixture.run().await.deleted, 1);
+    assert!(fixture.exists(1));
+    assert!(!fixture.exists(2));
+}
+
+#[tokio::test]
+async fn startup_spool_retains_everything_once_its_budget_is_spent() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1, 2]);
+    let mut paths = fixture.paths();
+    paths.budget = std::time::Duration::ZERO;
+    let summary = fixture
+        .agent
+        .cleanup_startup_job_spools_with_inventory(paths)
+        .await;
+    assert_eq!(summary.deleted, 0);
+    assert_eq!(summary.retained, 2);
+    assert!(fixture.exists(1));
+    assert!(fixture.exists(2));
 }
 
 #[tokio::test]
@@ -588,9 +694,13 @@ async fn startup_spool_keeps_bind_mounts_and_their_targets_untouched() {
         .unwrap();
     }
     let summary = fixture.run().await;
-    assert_eq!(summary.deleted, 0);
+    assert_eq!(summary.deleted, 1);
     assert!(fixture.exists(1));
     assert!(fixture.exists(2));
+    assert!(
+        !fixture.exists(3),
+        "a mount in one spool must not hold back the others"
+    );
     assert_eq!(
         fs::read_to_string(target.join("sentinel")).unwrap(),
         "untouched"

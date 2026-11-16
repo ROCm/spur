@@ -33,7 +33,8 @@ use crate::step_claims;
 use spur_core::native_peer::FORWARDED_HEADER;
 const LEADER_HEADER: &str = "x-spur-leader";
 const STEPD_RECOVERY_COHORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-const AUTHORITATIVE_JOB_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// Below spurd's default controller RPC timeout so the forwarding error reaches it.
+const AUTHORITATIVE_JOB_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Where a request should run: locally on the leader, or forwarded to it.
 enum Route {
@@ -1818,12 +1819,19 @@ impl SlurmController for ControllerService {
         // `squeue -u other`.
         let scope = job_read_scope(&self.cluster, __identity.as_ref());
         let unrestricted_visibility = matches!(scope, spur_core::rbac::ReadScope::All);
+        // Read before the job scan so every id below it was issued before the scan began.
+        let next_job_id = if authoritative {
+            self.cluster.peek_next_job_id()
+        } else {
+            0
+        };
         let requested_user = (!req.user.is_empty()).then_some(req.user.as_str());
         let Some(scoped_user) = scope.job_user_filter(requested_user) else {
             return Ok(Response::new(GetJobsResponse {
                 jobs: Vec::new(),
                 unrestricted_visibility,
                 authoritative,
+                next_job_id,
             }));
         };
 
@@ -1882,6 +1890,7 @@ impl SlurmController for ControllerService {
             jobs: proto_jobs,
             unrestricted_visibility,
             authoritative,
+            next_job_id,
         }))
     }
 
@@ -7776,6 +7785,7 @@ mod tests {
                 .expect("fresh leader read")
                 .into_inner();
             assert!(response.authoritative);
+            assert_eq!(response.next_job_id, job_id + 1);
             assert_eq!(response.unrestricted_visibility, unrestricted);
             assert_eq!(response.jobs.len(), usize::from(visible));
             if visible {
@@ -7792,6 +7802,7 @@ mod tests {
             .expect("ordinary leader read")
             .into_inner();
         assert!(!response.authoritative);
+        assert_eq!(response.next_job_id, 0);
         service.raft.raft.shutdown().await.expect("stop leader");
         let status = service
             .get_jobs(Request::new(GetJobsRequest {

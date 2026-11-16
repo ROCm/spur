@@ -5066,6 +5066,8 @@ impl AgentService {
                 .root()
                 .to_owned(),
             cgroups_enabled: self.cgroup.enabled,
+            supervisor_uid: nix::unistd::geteuid().as_raw(),
+            budget: crate::startup_spool::STARTUP_CLEANUP_BUDGET,
             #[cfg(test)]
             worker_barriers: None,
         })
