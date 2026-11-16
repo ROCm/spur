@@ -660,21 +660,30 @@ const FIXTURE_END: &str = "FIXTURE-END";
 pub(crate) struct FixtureRun {
     /// Only the lines between the fixture's begin and end markers.
     body: String,
+    stdout: String,
+    began: bool,
     pub(crate) stderr: String,
     pub(crate) success: bool,
 }
 
 impl FixtureRun {
-    fn new(stdout: &str, stderr: String, success: bool) -> Self {
-        let body = stdout
+    fn new(stdout: String, stderr: String, success: bool) -> Self {
+        let began = stdout.lines().any(|line| line == FIXTURE_BEGIN);
+        let mut lines: Vec<&str> = stdout
             .lines()
             .skip_while(|line| *line != FIXTURE_BEGIN)
             .skip(1)
             .take_while(|line| *line != FIXTURE_END)
-            .map(|line| format!("{line}\n"))
             .collect();
+        // The newline `fixture_end` prints ahead of its marker leaves one empty line.
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        let body = lines.iter().map(|line| format!("{line}\n")).collect();
         Self {
             body,
+            stdout,
+            began,
             stderr,
             success,
         }
@@ -685,6 +694,11 @@ impl FixtureRun {
             self.success,
             "fixture failed:\n{}\n{}",
             self.body, self.stderr
+        );
+        assert!(
+            self.began,
+            "fixture never ran (misspelled fixture name?):\n{}\n{}",
+            self.stdout, self.stderr
         );
     }
 
@@ -721,9 +735,10 @@ pub(crate) fn fixture_report(key: &str, value: impl std::fmt::Display) {
     println!("FIXTURE {key}: {value}");
 }
 
-/// Close a fixture's output; everything after this line is libtest's own.
+/// Close a fixture's output; everything after this line is libtest's own. The leading newline
+/// keeps command output that lacks a trailing one from gluing onto the marker.
 pub(crate) fn fixture_end() {
-    println!("{FIXTURE_END}");
+    println!("\n{FIXTURE_END}");
 }
 
 /// Re-run an `#[ignore]`d fixture in a child process with a controlled credential environment:
@@ -746,7 +761,7 @@ pub(crate) fn run_fixture(fixture: &str, scenario: &str, token: Option<&str>) ->
     }
     let output = command.output().unwrap();
     FixtureRun::new(
-        &String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stdout).unwrap(),
         String::from_utf8(output.stderr).unwrap(),
         output.status.success(),
     )
@@ -764,6 +779,22 @@ pub(crate) async fn unreachable_addr() -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_body_is_only_what_sits_between_the_markers() {
+        let stdout = "running 1 test\ntest t ... \nFIXTURE-BEGIN\nfirst\n\nlast\n\
+                      FIXTURE result: ok\n\nFIXTURE-END\nok\n";
+        let run = FixtureRun::new(stdout.into(), String::new(), true);
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.command_stdout(), "first\n\nlast\n");
+        run.assert_success();
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture never ran")]
+    fn a_misspelled_fixture_name_fails_with_a_clear_message() {
+        run_fixture("mock_controller::tests::no_such_fixture", "x", None).assert_success();
+    }
 
     /// RPCs the mock does not implement must surface as `Unimplemented` rather
     /// than a default-valued success, so a test that drifts onto an unmocked
