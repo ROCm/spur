@@ -66,6 +66,7 @@ The core state machine. Thread-safe via `parking_lot::RwLock`. Both the schedule
 | `reservations` | `RwLock<Vec<Reservation>>` | Active reservations |
 | `steps` | `RwLock<HashMap<(JobId, u32), JobStep>>` | Job steps |
 | `tokens` | `RwLock<HashMap<String, AdmissionToken>>` | Node admission tokens |
+| `node_inventory` | `RwLock<Option<NodeInventory>>` | Saved `admission.node_names` list; `None` until the first save |
 | `k0s` | `RwLock<K0sClusterState>` | Managed k0s cluster state |
 | `raft` | `RwLock<Option<SpurRaft>>` | Raft handle, set after startup |
 | `accounting` | `RwLock<Option<AccountingNotifier>>` | Async accounting writer |
@@ -134,11 +135,11 @@ Raft runs even in single-node mode (self-elects instantly, same pattern as Apach
 
 ### WalOperation
 
-Durable cluster mutations are proposed as `WalOperation` enum variants. 41 variants:
+Durable cluster mutations are proposed as `WalOperation` enum variants. 42 variants:
 
 **Job lifecycle:** `JobSubmit`, `JobStart`, `JobComplete`, `JobNodeComplete`, `JobCancelSignaled`, `JobPreemptCancel`, `JobPreemptRequeue`, `JobSuspend`, `JobResume`, `JobUserRequeue`, `JobDispatchBackoff`, `JobTimeLimitSignaled`, `JobTimeLimitExpired`, `JobPreemptSignaled`, `JobStateChange`, `JobPriorityChange`, `JobStepCreate`, `JobStepComplete`, `JobEvict`, `JobLaunchFailureDetail`, `JobExcludeUpdate`, `EvictTerminalJobs`
 
-**Node management:** `NodeRegister`, `NodeUpdate`, `NodeStateChange`, `NodeLabelsUpdate`, `NodeRemove`, `NodeK0sAssign`, `NodeK0sClear`, `NodeK0sSetError`
+**Node management:** `NodeRegister`, `NodeUpdate`, `NodeStateChange`, `NodeLabelsUpdate`, `NodeRemove`, `NodeInventoryUpdate`, `NodeK0sAssign`, `NodeK0sClear`, `NodeK0sSetError`
 
 **Partitions:** `PartitionCreate`, `PartitionUpdate`, `PartitionDelete`
 
@@ -382,6 +383,8 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 ## Common Pitfalls
 
 **Config reload vs restart:** `scontrol reconfigure` re-reads `spur.conf` and atomically swaps `ClusterManager.config`. But several values are captured once at startup and are restart-only: the gRPC listen address, the Raft peer list, the scheduler tick interval, `max_jobs_per_cycle`, the JWT signing key, and the database pool.
+
+**`admission.node_names` is saved only by `scontrol reconfigure`:** `reconfigure()` waits for earlier Raft writes, then proposes `NodeInventoryUpdate` only when the file's list differs from the saved one (an unset field equals a cleared list), so older controllers never see the op unless an admin sets the list. The apply deletes unlisted nodes atomically and refuses busy, reserved, or Kubernetes-member nodes; restarts and registrations never save it. Tests live in `cluster/tests/node_inventory.rs`.
 
 **WAL size limit:** A single `WalOperation::JobSubmit` becomes one Raft log entry retained in every snapshot. `MAX_JOB_SPEC_SIZE` (4 MiB serialized) caps it. The check measures serialized size without allocating.
 
