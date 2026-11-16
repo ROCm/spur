@@ -401,7 +401,7 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 
 **Dispatch cooldown:** After a resources-unavailable reject, a node is held out of dispatch for a cooldown period (`node_dispatch_cooldowns`). Leader-local, never persisted.
 
-**Recent stops:** `cancel_one_agent` records each successful `CancelJob` by (job, run attempt, node) in `RecentStops`, and heartbeat reclaim skips a run that got one within `cancel_reclaim_grace(kill_wait)`. Only reclaim consults it; other cancels are never suppressed. Leader-local, never persisted: a new leader may re-send once, which the node absorbs (a repeated stop sends no further SIGTERM).
+**Recent stops:** `cancel_one_agent` records each successful `CancelJob` by (job, run attempt, node) in `RecentStops`, and heartbeat reclaim skips a run that got one within `cancel_reclaim_grace(kill_wait)`. The node health report still counts that run (`unreleased_stale_runs`), so the node stays held until it is gone; only the re-send is spaced out. Only reclaim consults it; other cancels are never suppressed. Leader-local, never persisted: a new leader may re-send once, which the node absorbs (a repeated stop sends no further SIGTERM).
 
 **Node registration serialization:** Per-node mutex (`node_registration_locks`) ensures concurrent (re-)registrations for the same node serialize, preventing a stale label diff from being applied over a fresh one.
 

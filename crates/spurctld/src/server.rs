@@ -9899,6 +9899,16 @@ mod tests {
         svc.heartbeat(beat(&[])).await.expect("heartbeat");
         assert!(!svc.cluster.reports_stale_jobs("n1"));
 
+        // A run that was just sent a stop is not re-sent one, but the node still
+        // holds it until it is gone.
+        svc.cluster
+            .recent_stops()
+            .record(30, 0, "n1", Utc::now(), chrono::Duration::seconds(600));
+        svc.heartbeat(beat(&[30])).await.expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+        svc.heartbeat(beat(&[])).await.expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
+
         // An incomplete list (the agent's running-job map was locked) is not a
         // clean report, even when empty, so it must not release a hold.
         svc.heartbeat(Request::new(HeartbeatRequest {
