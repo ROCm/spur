@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
@@ -2366,14 +2366,17 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.reason)
         };
-        if self.cluster.get_node(&req.name).is_none() {
+        let Some(node) = self.cluster.get_node(&req.name) else {
             return Err(Status::not_found(format!("node {} not found", req.name)));
-        }
+        };
+        let runs = self.cluster.runs_on_node(&req.name);
         let evicted = self
             .cluster
             .remove_node(&req.name, req.force, reason)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
         self.spawn_cancel_for_evicted(&evicted);
+        // The fan-out above resolves addresses from the node table, which no longer has this node.
+        crate::scheduler_loop::spawn_cancel_runs_on_node(&node, &runs, 9);
         self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(spur_proto::proto::DeregisterNodeResponse {
             evicted_jobs_count: evicted.len() as u32,
@@ -2822,12 +2825,15 @@ impl SlurmController for ControllerService {
                 &req.hostname,
                 req.core_layout_fingerprint,
                 &req.spec_enforcement_error,
-            );
+            ) || self
+                .cluster
+                .agent_instance_changed(&req.hostname, &req.agent_instance);
             Ok(Response::new(HeartbeatResponse { reregister }))
         } else if self
             .cluster
             .is_deleted_agent(&req.hostname, &req.agent_instance)
         {
+            debug!(node = %req.hostname, "refusing heartbeat from the spurd this node was deleted under");
             // Not NotFound: that would send the agent straight back to re-register.
             Err(register_node_rpc_status(
                 crate::cluster::deleted_agent_error(&req.hostname),
@@ -9239,7 +9245,6 @@ mod tests {
         .map_or_else(|status| status.code(), |_| Code::Ok)
     }
 
-    // NotFound would send the deleted spurd straight back to re-register.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deleted_node_answers_its_running_spurd_without_a_reregister_hint() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -9269,6 +9274,60 @@ mod tests {
             .await
             .expect("a restarted spurd is admitted");
         assert_eq!(heartbeat_code(&svc, "second").await, Code::Ok);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_removal_cancels_the_run_on_the_removed_node() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+
+        svc.deregister_node(Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: true,
+            reason: String::new(),
+        }))
+        .await
+        .expect("forced removal");
+
+        wait_for_cancel(&n1_cancelled, job_id).await;
+        let cancel = n1_cancelled.lock().unwrap()[0];
+        assert_eq!(cancel.run_attempt, run_attempt);
+        assert!(svc.cluster.get_node("n1").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_asks_an_unrecorded_instance_to_register_again() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        svc.register_agent(agent_registration(""))
+            .await
+            .expect("registered without an instance, as through an older controller");
+        await_registered_node(&svc, "n1").await;
+        let reregister = |instance: &'static str| {
+            let svc = &svc;
+            async move {
+                svc.heartbeat(Request::new(HeartbeatRequest {
+                    hostname: "n1".into(),
+                    agent_instance: instance.into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("heartbeat")
+                .into_inner()
+                .reregister
+            }
+        };
+
+        assert!(reregister("first").await);
+        svc.register_agent(agent_registration("first"))
+            .await
+            .expect("register again");
+        assert!(!reregister("first").await);
+        assert!(!reregister("").await, "an older agent is never asked");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

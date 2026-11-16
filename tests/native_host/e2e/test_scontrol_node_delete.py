@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""scontrol node deletion dispatches through the existing native removal RPC."""
+"""scontrol node deletion uses the native removal RPC and keeps the node out
+until its spurd restarts."""
 
 import time
 
@@ -86,41 +87,68 @@ def test_delete_continues_after_unknown_node(departed_cluster):
     assert set(cluster.sinfo_nodes()) == before - {name}
 
 
+DELETED = "was deleted; restart its spurd to add it back"
+REREGISTERED = "controller does not recognize this node"
+
+
 def _wait_told_deleted(cluster, index):
     wait_until(
-        lambda: "this node was deleted" in cluster.spurd_log(index),
+        lambda: DELETED in cluster.spurd_log(index),
         timeout_s=90, interval_s=2, desc="running agent told it was deleted",
     )
-    assert "re-registering" not in cluster.spurd_log(index)
+    assert REREGISTERED not in cluster.spurd_log(index)
+
+
+def _delete_last_node(cluster):
+    index = len(cluster.nodes) - 1
+    name = cluster.node_names[index]
+    out = cluster.scontrol("delete", f"NodeName={name}")
+    assert f"Node {name} removed from cluster" in out, out
+    wait_node_gone(cluster, name)
+    return index, name
 
 
 def test_deleted_node_stays_out_until_its_agent_restarts(cluster):
-    index = len(cluster.nodes) - 1
-    name = cluster.node_names[index]
-    others = [n for n in cluster.node_names if n != name]
+    index, name = _delete_last_node(cluster)
 
-    out = cluster.scontrol("delete", f"NodeName={name}")
-
-    assert f"Node {name} removed from cluster" in out, out
-    wait_node_gone(cluster, name)
     _wait_told_deleted(cluster, index)
     assert name not in cluster.sinfo_nodes()
-
-    if cluster.ha_controller_count == 1:
-        cluster.restart_controller(expected_nodes=others)
-        # One full heartbeat interval: the record must survive the restart.
-        time.sleep(35)
-        assert name not in cluster.sinfo_nodes()
 
     cluster.restart_agent(index)
     wait_node_state(cluster, name, ["idle"])
 
 
-def test_forced_delete_of_busy_node_keeps_its_agent_out(cluster):
+def test_deleted_node_stays_out_across_a_controller_restart(cluster):
+    if cluster.ha_controller_count > 1:
+        pytest.skip("restart_controller() supports one controller")
+    index, name = _delete_last_node(cluster)
+    _wait_told_deleted(cluster, index)
+
+    cluster.restart_controller(expected_nodes=[n for n in cluster.node_names if n != name])
+    # One full spurd heartbeat interval, so the restarted controller has answered one.
+    time.sleep(35)
+    assert name not in cluster.sinfo_nodes()
+    assert REREGISTERED not in cluster.spurd_log(index)
+
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
+
+
+def test_deleted_departed_node_returns_when_its_agent_starts(departed_cluster):
+    cluster = departed_cluster
+    index, name = _delete_last_node(cluster)
+
+    cluster.restart_agent(index)
+
+    wait_node_state(cluster, name, ["idle"])
+
+
+def test_forced_delete_stops_the_job_and_keeps_the_agent_out(cluster):
     index = len(cluster.nodes) - 1
     name = cluster.node_names[index]
+    seconds = 600000 + int(time.time()) % 100000
     out = cluster.sbatch([
-        "-N", "1", "-w", name, "-t", "10", "--wrap", "sleep 600",
+        "-N", "1", "-w", name, "-t", "10", "--wrap", f"sleep {seconds}",
         "-o", f"{cluster.remote_dir}/delete-forced.out",
     ])
     job_id = parse_job_id(out)
@@ -130,8 +158,10 @@ def test_forced_delete_of_busy_node_keeps_its_agent_out(cluster):
         cluster.cli(["spur", "node", "remove", name, "--force"])
         wait_node_gone(cluster, name)
         wait_until(
-            lambda: job_state(cluster.squeue_all(), job_id) != "R",
-            timeout_s=60, interval_s=2, desc="job evicted from the removed node",
+            lambda: not cluster.nodes[index].exec_allow_fail(
+                f"pgrep -f '[s]leep {seconds}' || true"
+            ).strip(),
+            timeout_s=60, interval_s=2, desc="job processes on the removed node stopped",
         )
         _wait_told_deleted(cluster, index)
         assert name not in cluster.sinfo_nodes()

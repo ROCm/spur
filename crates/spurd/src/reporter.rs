@@ -632,6 +632,7 @@ impl NodeReporter {
         match result {
             Ok(resp) => {
                 debug!(load, free_mem, "heartbeat sent");
+                self.deleted_logged.store(false, Ordering::Relaxed);
                 // The controller asks for re-registration when the layout it
                 // expects differs from what this node reported enforcing, so
                 // a changed spec policy is redelivered without a restart.
@@ -657,7 +658,7 @@ impl NodeReporter {
                 if is_deleted_node(&status) =>
             {
                 if !self.deleted_logged.swap(true, Ordering::Relaxed) {
-                    warn!(error = %status, "this node was deleted; restart spurd to add it back");
+                    warn!("{}", status.message());
                 }
             }
             Err(e) => warn!(error = %e, "heartbeat failed"),
@@ -755,10 +756,18 @@ fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
 }
 
-/// The controller deleted this node while this process kept running, so
-/// re-registering would be refused; only a restarted spurd is let back in.
+/// The controller deleted this node while this process kept running; heartbeat
+/// and registration return FailedPrecondition for nothing else.
 fn is_deleted_node(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
+}
+
+/// Whether a failed `register` was refused because this node was deleted.
+pub fn registration_refused_as_deleted(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::controller_auth::ConnectAuthError>(),
+        Some(crate::controller_auth::ConnectAuthError::Status(status)) if is_deleted_node(status)
+    )
 }
 
 /// Whether a connect/RPC failure means the dialed endpoint is unreachable or wedged,
@@ -3091,6 +3100,40 @@ mod tests {
             1,
             "an unknown node re-registers"
         );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_accepted_again_rearms_the_deleted_warning() {
+        let reporter = test_reporter(rset(8, 0, vec![]));
+        let deleted = || {
+            Err(crate::controller_auth::ConnectAuthError::Status(
+                tonic::Status::failed_precondition("node n1 was deleted"),
+            ))
+        };
+
+        reporter.handle_heartbeat_result(deleted(), 0, 0).await;
+        assert!(reporter.deleted_logged.load(Ordering::Relaxed));
+        reporter
+            .handle_heartbeat_result(Ok(Default::default()), 0, 0)
+            .await;
+        assert!(!reporter.deleted_logged.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn only_a_deleted_refusal_lets_startup_continue_unregistered() {
+        let (deleted, _) = controller_answering(tonic::Code::FailedPrecondition).await;
+        let (other, _) = controller_answering(tonic::Code::PermissionDenied).await;
+
+        let refused = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{deleted}"))
+            .register()
+            .await
+            .expect_err("refused");
+        assert!(registration_refused_as_deleted(&refused));
+        let refused = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{other}"))
+            .register()
+            .await
+            .expect_err("refused");
+        assert!(!registration_refused_as_deleted(&refused));
     }
 
     #[tokio::test]

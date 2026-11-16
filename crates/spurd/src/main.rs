@@ -658,8 +658,13 @@ async fn main() -> anyhow::Result<()> {
         .with_fences(startup.fences),
     );
 
-    // Register with controller
-    reporter.register().await?;
+    // Exiting would let a service manager restart spurd under a new instance and undo the delete.
+    if let Err(e) = reporter.register().await {
+        if !spurd::reporter::registration_refused_as_deleted(&e) {
+            return Err(e);
+        }
+        warn!(error = %e, "staying up without registering");
+    }
 
     // Start the heartbeat loop right after registration, before the
     // completion-replay step below: replaying unacknowledged completions

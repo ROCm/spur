@@ -4229,6 +4229,23 @@ pub async fn send_cancel_to_nodes(
     }
 }
 
+/// Cancel `runs` at `node`'s address, for a node already gone from the node table.
+pub fn spawn_cancel_runs_on_node(node: &Node, runs: &[(spur_core::job::JobId, u32)], signal: i32) {
+    let Some(agent_addr) = node_comm_http_url(node) else {
+        warn!(node = %node.name, "no comm address — cannot cancel jobs on removed node");
+        return;
+    };
+    for &(job_id, run_attempt) in runs {
+        tokio::spawn(cancel_one_agent(
+            agent_addr.clone(),
+            job_id,
+            run_attempt,
+            signal,
+            0,
+        ));
+    }
+}
+
 /// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has a
 /// window. The job is read at send time, so a run since marked timed out gets
 /// the timeout wait.

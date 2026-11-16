@@ -4202,6 +4202,17 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Whether a registered node's spurd reports an instance its record lacks,
+    /// as when it registered through a controller that predates the field.
+    pub(crate) fn agent_instance_changed(&self, name: &str, agent_instance: &str) -> bool {
+        !agent_instance.is_empty()
+            && self
+                .nodes
+                .read()
+                .get(name)
+                .is_some_and(|node| node.agent_instance.as_deref() != Some(agent_instance))
+    }
+
     /// Whether `agent_instance` is the spurd process `name` was deleted under.
     pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
         !agent_instance.is_empty()
@@ -4375,15 +4386,19 @@ impl ClusterManager {
                         labels,
                         source: source.clone(),
                         capabilities,
-                        agent_instance,
+                        agent_instance: agent_instance.clone(),
                     })
                     .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 reject_excluded_registration(&response, &name)?;
                 {
                     let mut nodes = self.nodes.write();
-                    // Absent only when the apply refused a deleted spurd's registration.
+                    // Absent if the apply refused it or a delete landed since.
                     let Some(node) = nodes.get_mut(&name) else {
-                        return Err(deleted_agent_error(&name));
+                        drop(nodes);
+                        if self.is_deleted_agent(&name, &agent_instance) {
+                            return Err(deleted_agent_error(&name));
+                        }
+                        return Ok(());
                     };
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
@@ -5810,13 +5825,22 @@ impl ClusterManager {
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
-        let jobs = self.jobs.read();
-        jobs.values().any(|j| {
-            matches!(
-                j.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.is_held_on(name)
-        })
+        !self.runs_on_node(name).is_empty()
+    }
+
+    /// `(job_id, run_attempt)` of each run that may have processes on `name`.
+    pub fn runs_on_node(&self, name: &str) -> Vec<(JobId, u32)> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.is_held_on(name)
+            })
+            .map(|j| (j.job_id, j.run_attempt))
+            .collect()
     }
 
     /// Mark a node Down because its agent is stopping (reboot, service restart).
@@ -41560,6 +41584,19 @@ state = "UP"
             !cm.is_deleted_agent("n1", ""),
             "an empty instance never matches"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_later_registration_of_the_name_clears_the_delete_record() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1"));
+
+        cm.apply_operation(&agent_register_op("n1", ""));
+
+        assert!(cm.get_node("n1").is_some());
+        assert!(!cm.is_deleted_agent("n1", "first"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

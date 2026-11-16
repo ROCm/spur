@@ -417,7 +417,7 @@ pub struct Node {
     /// Optional RPCs the node's agent advertised at registration (e.g. `CAP_SIGNAL_JOB`).
     #[serde(default)]
     pub capabilities: Vec<String>,
-    /// The registered spurd process; `None` for agents that predate it.
+    /// The registered spurd process; `None` for older agents and spur-k8s nodes.
     #[serde(default)]
     pub agent_instance: Option<String>,
 }

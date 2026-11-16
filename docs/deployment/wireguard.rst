@@ -160,7 +160,9 @@ reboot):
    # 2. On the controller — drop the departed node's peer (idempotent):
    sudo spur net remove-peer --key <departed-node-pubkey> --interface spur0
 
-   # 3. On the departed node — stop and de-persist the interface:
+   # 3. On the departed node — stop spurd so a reboot does not add it back,
+   #    then stop and de-persist the interface:
+   sudo systemctl disable --now spurd
    sudo systemctl disable --now wg-quick@spur0
    sudo rm -f /etc/wireguard/spur0.conf
 

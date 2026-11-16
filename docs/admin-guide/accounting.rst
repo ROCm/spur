@@ -1535,15 +1535,22 @@ identity; see :ref:`privileged-operations`.
 
 Removal does not stop the agent or change ``spur.conf``. A ``spurd`` that
 keeps running after its node is removed stays out: its heartbeats are refused,
-and it logs ``this node was deleted; restart spurd to add it back`` once
-instead of registering again. Restarting ``spurd`` (or the host) adds the
-node back, as a restarted ``slurmd`` does for a deleted Slurm dynamic node.
-Each ``spurd`` process identifies itself with a random instance ID, so the
-controller can tell a restart from the process that was running when the node
-was removed; the removal is replicated and survives a controller restart or
-failover. Agents older than this release send no instance ID, so their nodes
-still register again on the next heartbeat; during a rolling upgrade, any node
-can, until every controller runs this release.
+and it logs ``node <name> was deleted; restart its spurd to add it back`` once
+instead of registering again. A forced removal also stops the node's evicted
+jobs on that ``spurd``. Restarting ``spurd`` (or rebooting the host) adds the
+node back, as a restarted ``slurmd`` re-creates a deleted Slurm dynamic node.
+To keep a host out for good, also stop and disable ``spurd`` on it, for
+example with ``systemctl disable --now spurd``.
+
+Each ``spurd`` process sends a random instance ID, so the controller can tell
+a restart from the process that was running when the node was removed. The
+record of which ``spurd`` to keep out is replicated and survives a controller
+restart or failover. Nodes registered by agents older than this release, or by
+the Kubernetes operator, send no instance ID and register again on their next
+heartbeat as before. During a rolling upgrade, an agent that registered
+through an older controller is asked to register again once its heartbeat
+reaches an upgraded leader; until then, removing its node does not keep it
+out.
 
 Slurm restricts this command to dynamic nodes without running jobs or
 reservation membership; Spur uses its native registered-node removal rules and
