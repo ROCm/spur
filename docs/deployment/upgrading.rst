@@ -1082,19 +1082,19 @@ Configured node list (``admission.node_names``)
 
 This release adds the optional ``[admission] node_names`` list (see
 :ref:`configured-node-list`). Only ``scontrol reconfigure`` writes its new Raft
-log entry, ``NodeInventoryUpdate``, and only when the edited file, the file the
-controller started with, or Raft has a list. Otherwise ``scontrol reconfigure``
-first waits for earlier Raft writes to apply, so on a heavily loaded controller it
-can fail with a timeout; rerun it.
+log entry, ``NodeInventoryUpdate``, and only when the list in the edited file
+differs from the saved one, or when no list is saved yet and the file the
+controller started with has one. A removed field counts as no list. Every
+``scontrol reconfigure`` first waits for earlier Raft writes to apply, so on a
+heavily loaded controller it can fail with a timeout; rerun it.
 
 **Upgrade every controller before running scontrol reconfigure with a list.** A
 controller that predates ``NodeInventoryUpdate`` cannot parse it and stops
 replicating until it is upgraded, and it ignores the list in a snapshot. If the
 controllers that predate it are a majority, the entry cannot commit and every
-later write stalls. Once a controller has started with ``node_names`` in its
-file, every ``scontrol reconfigure`` it handles writes the entry, even one made
-only for a partition change or after the field was removed, so do not run any
-``scontrol reconfigure`` until every controller is upgraded. Restarts and agent
+later write stalls. Adding ``node_names`` to the file during a rolling upgrade is
+safe only until the next ``scontrol reconfigure``, even one made for a partition
+change, so add the field after every controller is upgraded. Restarts and agent
 registrations never write it. A rollback after the entry has been written is not
 supported because older controllers cannot replay it: roll forward.
 

@@ -384,10 +384,6 @@ pub enum WalOperation {
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
 
-    NodeInventoryUpdate {
-        inventory: crate::config::NodeInventory,
-    },
-
     // Admission token operations
     TokenCreate {
         token: AdmissionToken,
@@ -514,6 +510,9 @@ pub enum WalOperation {
     JobPreemptSignaled {
         job_id: JobId,
         pending: crate::job::PreemptPending,
+    },
+    NodeInventoryUpdate {
+        inventory: crate::config::NodeInventory,
     },
 }
 

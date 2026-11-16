@@ -242,3 +242,24 @@ def test_edited_node_names_take_effect_only_through_reconfigure(node_names_clust
     c.scontrol("reconfigure")
     assert set(c.sinfo_nodes()) == {kept}
     assert dropped not in c.sinfo_nodes()
+
+
+def _saved_list_writes(c):
+    log = shlex.quote(f"{c.state_dir}/raft/log")
+    output = c.nodes[0].exec(f"grep -l NodeInventoryUpdate {log}/*.json | wc -l")
+    return int(output.strip())
+
+
+def test_reconfigure_writes_node_names_only_when_the_list_changes(node_names_cluster):
+    c = node_names_cluster
+    c.scontrol("reconfigure")
+    saved = _saved_list_writes(c)
+    assert saved == 1
+    c.scontrol("reconfigure")
+    assert _saved_list_writes(c) == saved
+
+    _write_node_names(c, None)
+    c.scontrol("reconfigure")
+    c.scontrol("reconfigure")
+    assert _saved_list_writes(c) == saved + 1
+    assert set(c.sinfo_nodes()) == set(c.node_names)
