@@ -65,19 +65,23 @@ impl CdiCache {
         for extra in cdi_spec_dirs {
             cdi_dirs.push(PathBuf::from(extra));
         }
+        let live = auto_detect.then(crate::cdi::discovery::discover_to_cdi);
+        Self::load_with(&cdi_dirs, live.as_deref())
+    }
 
+    /// Load specs from exactly `cdi_dirs`, then merge `live` discovery when given.
+    pub fn load_with(cdi_dirs: &[PathBuf], live: Option<&[CdiSpec]>) -> Self {
         let mut cache = Self::new();
-        let errors = cache.load_from_dirs(&cdi_dirs);
+        let errors = cache.load_from_dirs(cdi_dirs);
         if !errors.is_empty() {
             warn!("CDI spec loading errors:\n{}", errors);
         }
 
-        if auto_detect {
-            let live = crate::cdi::discovery::discover_to_cdi();
+        if let Some(live) = live {
             if cache.is_empty() {
-                cache.add_specs(&live);
+                cache.add_specs(live);
             } else {
-                cache.refresh_topology(&live);
+                cache.refresh_topology(live);
             }
         }
 
@@ -604,20 +608,31 @@ mod tests {
     }
 
     #[test]
-    fn test_load_uses_ondisk_when_present() {
+    fn on_disk_specs_win_over_live_discovery() {
         let dir = tempfile::tempdir().unwrap();
         make_amd_spec(&["0"])
             .write_json(&dir.path().join("amd.json"))
             .unwrap();
+        let live = [make_amd_spec(&["0", "1"])];
 
-        let cache = CdiCache::load(&[dir.path().to_string_lossy().into_owned()], true);
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
     }
 
     #[test]
-    fn test_load_empty_without_auto_detect() {
-        let cache = CdiCache::load(&[], false);
+    fn live_discovery_fills_an_empty_spec_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = [make_amd_spec(&["0", "1"])];
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn no_spec_dirs_and_no_live_discovery_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], None);
         assert!(cache.is_empty());
     }
 
