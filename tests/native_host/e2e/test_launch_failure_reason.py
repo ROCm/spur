@@ -9,6 +9,8 @@ rather than looking like the script exited or was killed.
 
 import time
 
+import pytest
+
 from cluster import job_state, parse_job_id, wait_job
 
 
@@ -158,4 +160,81 @@ class TestLaunchFailureReason:
         reason = _reason_line(cluster, job_id)
         print(f"state={state}")
         assert state == "CA"
+        assert "JobLaunchFailure" not in reason
+
+    def test_unwritable_output_is_a_launch_failure(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        cluster.start()
+        out_path = "/root/spur-denied-out.txt"
+        marker_path = "/tmp/spur-denied-output-marker"
+        for node in cluster.nodes:
+            node.exec(f"rm -f '{marker_path}'", check=False)
+        script = cluster.write_file(
+            "denied-out.sh",
+            "#!/bin/bash\n"
+            "echo SCRIPT_RAN\n"
+            f"echo SCRIPT_RAN > {marker_path}\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "denied-out", "-N", "1", "-o", out_path, script])
+        )
+        assert job_id is not None
+        state = wait_job(cluster, job_id, timeout=90)
+        reason = _reason_line(cluster, job_id)
+        marker = _marker_report(cluster, marker_path)
+        body = cluster.read_output_on_any_node(out_path)
+        print(f"state={state} stdout_body={body!r}")
+        assert state == "F"
+        assert "SCRIPT_RAN" not in body
+        assert "PRESENT" not in marker
+        assert "JobLaunchFailure" in reason
+        assert "RaisedSignal" not in reason
+
+    def test_a_companion_launch_failure_does_not_relabel_the_script(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        if len(cluster.nodes) < 2:
+            pytest.skip("needs two nodes")
+        prolog = cluster.write_file(
+            "hooks/task-prolog-companion.sh",
+            "#!/bin/bash\n"
+            "if [ \"${SPUR_NODEID:-0}\" != \"0\" ]; then\n"
+            "  echo \"companion refused this launch\" >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "exit 0\n",
+            all_nodes=True,
+        )
+        cluster.start({"hooks": {"task_prolog": prolog}})
+        script = cluster.write_file(
+            "companion-runs.sh",
+            "#!/bin/bash\n"
+            "echo SCRIPT_RAN\n"
+            "echo SCRIPT_RAN > /tmp/spur-launch-marker-$SPUR_JOB_ID\n"
+            "exit 1\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(
+                [
+                    "-J",
+                    "companion-fail",
+                    "-N",
+                    "2",
+                    "-o",
+                    f"{cluster.remote_dir}/companion.out",
+                    script,
+                ]
+            )
+        )
+        assert job_id is not None
+        state = wait_job(cluster, job_id, timeout=90)
+        reason = _reason_line(cluster, job_id)
+        show = cluster.scontrol("show", "job", str(job_id))
+        print(show)
+        marker = _marker_report(cluster, f"/tmp/spur-launch-marker-{job_id}")
+        body = cluster.read_output_on_any_node(f"{cluster.remote_dir}/companion.out")
+        print(f"state={state} stdout_body={body!r}")
+        assert state == "F"
+        assert "SCRIPT_RAN" in body
+        assert "PRESENT" in marker
+        assert "NonZeroExitCode" in reason
         assert "JobLaunchFailure" not in reason
