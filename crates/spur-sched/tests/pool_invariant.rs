@@ -11,7 +11,8 @@ use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::cpu_topology::{CpuRecord, CpuTopology};
 use spur_core::node::Node;
 use spur_core::resource::{
-    build_node_allocation, GpuLinkType, GpuResource, ResourceAllocations, ResourceSet,
+    build_node_allocation, GpuLinkType, GpuResource, ResourceAllocations, ResourceRequest,
+    ResourceSet,
 };
 use spur_sched::cons_tres::{AllocError, CapacityChange, NodeAllocation};
 
@@ -163,27 +164,20 @@ impl Bed {
     }
 
     /// The job is placed as the scheduler does it: counts, then a stamped allocation.
-    fn request(&self, shape: Shape) -> ResourceSet {
+    fn request(&self, shape: Shape) -> ResourceRequest {
         let rc = self.reserved_cpus_per_gpu();
         let (gpus, cpus) = match shape {
             Shape::Cpu(n) => (0, n),
             Shape::Gpu(g, mult, extra) => (g, mult * rc + extra),
         };
-        let mut gpu_list = self.node.total_resources.gpus.clone();
-        gpu_list.truncate(gpus as usize);
-        for gpu in &mut gpu_list {
-            gpu.gpu_type = "any".into();
-        }
-        ResourceSet {
-            cpus,
-            gpus: gpu_list,
-            ..Default::default()
-        }
+        let mut request = ResourceRequest::with_scalar(cpus, 0);
+        request.add_devices("gpu", None, gpus);
+        request
     }
 
     fn start(&mut self, shape: Shape) -> Result<(), String> {
         let request = self.request(shape);
-        if request.gpus.len() > self.node.total_resources.gpus.len()
+        if request.device_count("gpu") as usize > self.node.total_resources.gpus.len()
             || !self.node.can_satisfy_request(&request)
         {
             return Ok(());

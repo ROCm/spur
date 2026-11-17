@@ -602,7 +602,7 @@ impl Node {
     }
 
     /// Whether available inventory can satisfy a count-based request.
-    pub fn can_satisfy_request(&self, request: &ResourceSet) -> bool {
+    pub fn can_satisfy_request(&self, request: &crate::resource::ResourceRequest) -> bool {
         match self.layout_blocked_alloc() {
             Some(blocked) => {
                 let mut used = self.alloc_resources.clone();
@@ -614,7 +614,7 @@ impl Node {
     }
 
     /// Whether `request` fits the empty node; false means never on this node.
-    pub fn can_ever_satisfy(&self, request: &ResourceSet) -> bool {
+    pub fn can_ever_satisfy(&self, request: &crate::resource::ResourceRequest) -> bool {
         self.fits_beside(&ResourceAllocations::default(), request)
     }
 
@@ -659,12 +659,16 @@ impl Node {
             .and_then(crate::core_layout::CoreLayout::pools)
     }
 
-    fn fits_beside(&self, used: &ResourceAllocations, request: &ResourceSet) -> bool {
+    fn fits_beside(
+        &self,
+        used: &ResourceAllocations,
+        request: &crate::resource::ResourceRequest,
+    ) -> bool {
         self.total_resources
             .can_satisfy_with_allocated(used, request)
             && self
                 .cpu_pools()
-                .is_none_or(|p| p.admits(used, request.cpus, request.gpus.len() as u32))
+                .is_none_or(|p| p.admits(used, request.cpus, request.device_count("gpu")))
     }
 
     /// Whether the node has any unallocated CPU headroom (a saturated node is full).
@@ -1228,17 +1232,10 @@ mod tests {
         node
     }
 
-    fn request(cpus: u32, gpus: u32) -> ResourceSet {
-        let mut gpu_list = reserved_node().total_resources.gpus;
-        gpu_list.truncate(gpus as usize);
-        for g in &mut gpu_list {
-            g.gpu_type = "any".into();
-        }
-        ResourceSet {
-            cpus,
-            gpus: gpu_list,
-            ..Default::default()
-        }
+    fn request(cpus: u32, gpus: u32) -> crate::resource::ResourceRequest {
+        let mut request = crate::resource::ResourceRequest::with_scalar(cpus, 0);
+        request.add_devices("gpu", None, gpus);
+        request
     }
 
     #[test]

@@ -5789,7 +5789,7 @@ pub(crate) mod tests {
     fn request_per_node(
         nodes: &[String],
         totals: &HashMap<String, ResourceSet>,
-        request: &ResourceSet,
+        request: &spur_core::resource::ResourceRequest,
     ) -> HashMap<String, ResourceAllocations> {
         nodes
             .iter()
@@ -7480,13 +7480,13 @@ pub(crate) mod tests {
             one.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
             one.spec.memory_per_gpu_mb = Some(1000);
             let request = backfill::job_resource_request(&one);
-            assert_eq!((request.gpus.len(), request.memory_mb), (8, 8000));
+            assert_eq!((request.device_count("gpu"), request.memory_mb), (8, 8000));
 
             let mut two = one.clone();
             two.spec.num_nodes = 2;
             let request = backfill::job_resource_request(&two);
             assert_eq!(
-                (request.gpus.len(), request.memory_mb),
+                (request.device_count("gpu"), request.memory_mb),
                 (1, 1000),
                 "spread over two nodes, each node only needs one"
             );

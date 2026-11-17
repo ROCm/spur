@@ -60,24 +60,8 @@ mod tests {
         };
 
         // Request 4 mi300x GPUs
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            gpus: (0..4)
-                .map(|i| GpuResource {
-                    device_id: i,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(64, 256_000);
+        req.add_devices("gpu", Some("mi300x"), 4);
 
         assert!(node.can_satisfy(&req));
     }
@@ -104,24 +88,8 @@ mod tests {
         };
 
         // Request 8 GPUs but node only has 4
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            gpus: (0..8)
-                .map(|i| GpuResource {
-                    device_id: i,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(64, 256_000);
+        req.add_devices("gpu", Some("mi300x"), 8);
 
         assert!(!node.can_satisfy(&req));
     }
@@ -148,22 +116,8 @@ mod tests {
         };
 
         // Request h100 GPUs on a mi300x node
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "h100".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
-                topology: None,
-                stable_id: 0,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            }],
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(64, 256_000);
+        req.add_devices("gpu", Some("h100"), 1);
 
         assert!(!node.can_satisfy(&req));
     }
@@ -190,24 +144,8 @@ mod tests {
         };
 
         // Request "any" GPU type
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            gpus: (0..4)
-                .map(|i| GpuResource {
-                    device_id: i,
-                    gpu_type: "any".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(64, 256_000);
+        req.add_devices("gpu", None, 4);
 
         assert!(node.can_satisfy(&req));
     }
