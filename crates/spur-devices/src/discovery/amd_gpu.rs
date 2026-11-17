@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use tracing::{debug, warn};
 
 use crate::cdi::annotations::{self, DeviceMetadata};
-use crate::cdi::spec::{
-    CdiDevice, CdiSpec, ContainerEdits, DeviceNode, Mount, GENERATED_CDI_VERSION,
+use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, Mount, GENERATED_CDI_VERSION};
+use crate::pci::{bdf_from_identity, encode_stable_id, PciIdentity};
+use crate::sysfs::{
+    char_device_node, parse_kv_file, read_numa_node, read_sysfs_string, under_root,
 };
 use crate::topology::DeviceTopology;
 use crate::types::LinkType;
@@ -21,13 +21,13 @@ const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
 const GPU_SUPPLEMENTARY_GROUPS: [&str; 2] = ["video", "render"];
 
-pub fn discover_to_cdi() -> Vec<CdiSpec> {
-    discover_to_cdi_from_root(Path::new("/"))
+pub fn discover_gpu_cdi() -> Vec<CdiSpec> {
+    discover_gpu_cdi_from_root(Path::new("/"))
 }
 
 /// Reads `sys/`, `dev/`, `opt/rocm/` and `etc/group` under `root`; the spec still
 /// names host paths, since that is where a job will find them.
-fn discover_to_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
+pub(super) fn discover_gpu_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
     let gpus = discover_amd_gpus_from_root(&root.join("sys"));
     if gpus.is_empty() {
         return Vec::new();
@@ -227,29 +227,6 @@ fn read_io_links(node_path: &Path) -> Vec<KfdIoLink> {
     links
 }
 
-fn parse_kv_file(path: &Path) -> Option<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (key, value) = line.split_once(' ')?;
-        map.insert(key.to_string(), value.to_string());
-    }
-    Some(map)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PciIdentity {
-    domain: u32,
-    bus: u8,
-    device: u8,
-    function: u8,
-    partition_rank: u8,
-}
-
 /// Maps render minor to PCI identity. The low three bits of `location_id` are
 /// the PCI function for a lone KFD node, and the kernel's partition number when
 /// one device has several KFD nodes. So a device with several real functions,
@@ -285,45 +262,6 @@ fn resolve_pci_identities(nodes: &[KfdGpuNode]) -> HashMap<u32, PciIdentity> {
             (node.render_minor, identity)
         })
         .collect()
-}
-
-fn bdf_from_identity(id: &PciIdentity) -> String {
-    format!(
-        "{:04x}:{:02x}:{:02x}.{}",
-        id.domain, id.bus, id.device, id.function
-    )
-}
-
-/// Low 8 bits of a stable_id are the partition index; the rest is the PCIe BDF
-/// anchor (domain:bus:dev.func). Mask these off (`id & !STABLE_ID_PARTITION_MASK`)
-/// to get the physical GPU identity — two stable_ids share silicon iff their BDF
-/// anchors are equal.
-pub const STABLE_ID_PARTITION_MASK: u64 = 0xFF;
-
-/// Encode a reload-invariant device id from the PCIe BDF (domain:bus:dev.func
-/// anchor) plus a per-partition rank. The domain occupies bits 24..39, so two
-/// GPUs on different PCI domains with the same bus:dev.func no longer collide.
-///
-/// The exporter hooks in `examples/hooks/dme/common.sh` and
-/// `examples/hooks/gpu-node/common-env.sh` decode this layout from KFD
-/// topology to find render IDs; change them together with it.
-fn encode_stable_id(id: &PciIdentity) -> u64 {
-    (u64::from(id.domain & 0xffff) << 24)
-        | (u64::from(id.bus) << 16)
-        | (u64::from(id.device) << 11)
-        | (u64::from(id.function) << 8)
-        | u64::from(id.partition_rank)
-}
-
-/// Decode a stable_id's BDF anchor back to the k8s-DRA `dddd:bb:dd.f` form
-/// (e.g. `0000:19:00.0`), the value the DRA driver publishes as
-/// `resource.kubernetes.io/pciBusID`.
-pub fn stable_id_to_bdf(stable_id: u64) -> String {
-    let domain = (stable_id >> 24) & 0xffff;
-    let bus = (stable_id >> 16) & 0xff;
-    let dev = (stable_id >> 11) & 0x1f;
-    let func = (stable_id >> 8) & 0x07;
-    format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
 }
 
 fn format_unique_id(unique_id: u64) -> String {
@@ -425,10 +363,6 @@ fn build_shared_edits(root: &Path) -> ContainerEdits {
 
     edits.additional_gids = gpu_supplementary_gids_from_group_file(&under_root(root, "/etc/group"));
     edits
-}
-
-fn under_root(root: &Path, host_path: &str) -> std::path::PathBuf {
-    root.join(host_path.trim_start_matches('/'))
 }
 
 fn lookup_group_gid_in(group_file: &str, name: &str) -> Option<u32> {
@@ -534,7 +468,7 @@ fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
                 topology: Some(DeviceTopology {
                     pci_bdf: pci_bdf.clone(),
                     numa_node,
-                    pci_root: crate::ualink::pci_root(&device_path),
+                    pci_root: crate::pci::pci_root(&device_path),
                     vram_bytes: node.vram_bytes,
                     fabric: crate::ualink::observe(&device_path),
                 }),
@@ -644,74 +578,9 @@ pub(crate) fn normalize_gpu_name(name: &str) -> String {
     }
 }
 
-fn read_numa_node(device_path: &Path) -> Option<u32> {
-    read_sysfs_string(&device_path.join("numa_node")).and_then(|s| {
-        let val: i32 = s.parse().ok()?;
-        if val >= 0 {
-            Some(val as u32)
-        } else {
-            None
-        }
-    })
-}
-
-fn read_sysfs_string(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-#[cfg(unix)]
-struct DeviceStat {
-    major: i64,
-    minor: i64,
-    file_mode: u32,
-    uid: u32,
-    gid: u32,
-}
-
-#[cfg(unix)]
-fn stat_device_node(path: &Path) -> Option<DeviceStat> {
-    let meta = std::fs::metadata(path).ok()?;
-    let rdev = meta.rdev();
-    if rdev == 0 {
-        return None;
-    }
-    let major = (((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)) as i64;
-    let minor = ((rdev & 0xff) | ((rdev >> 12) & !0xff)) as i64;
-    let mode = meta.mode();
-    // Lower 12 bits: file permission bits (e.g. 0o666)
-    let file_mode = mode & 0o7777;
-    let uid = meta.uid();
-    let gid = meta.gid();
-    Some(DeviceStat {
-        major,
-        minor,
-        file_mode,
-        uid,
-        gid,
-    })
-}
-
-/// A character device node with the host's major/minor and ownership, when it exists.
-fn char_device_node(root: &Path, path: String) -> DeviceNode {
-    let stat = stat_device_node(&under_root(root, &path));
-    DeviceNode {
-        path,
-        host_path: None,
-        r#type: Some("c".into()),
-        major: stat.as_ref().map(|s| s.major),
-        minor: stat.as_ref().map(|s| s.minor),
-        file_mode: stat.as_ref().map(|s| s.file_mode),
-        permissions: Some("rwm".into()),
-        uid: stat.as_ref().map(|s| s.uid),
-        gid: stat.as_ref().map(|s| s.gid),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::pci::{stable_id_to_bdf, STABLE_ID_PARTITION_MASK};
     #[test]
     fn vram_observation_distinguishes_missing_from_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -929,7 +798,7 @@ mod tests {
             .expect("fixture sys dir has a parent")
             .to_path_buf();
 
-        let specs = discover_to_cdi_from_root(&root);
+        let specs = discover_gpu_cdi_from_root(&root);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].kind, AMD_CDI_KIND);
         assert_eq!(specs[0].devices.len(), 15);

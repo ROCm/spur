@@ -3856,7 +3856,7 @@ mod tests {
     /// bits) plus a low-8-bit partition rank. Two ids with the same `bus` share
     /// physical silicon.
     fn sid(bus: u64, partition: u64) -> u64 {
-        (bus << 16) | (partition & spur_devices::cdi::STABLE_ID_PARTITION_MASK)
+        (bus << 16) | (partition & spur_devices::pci::STABLE_ID_PARTITION_MASK)
     }
 
     #[test]
