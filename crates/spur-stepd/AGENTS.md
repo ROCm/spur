@@ -210,7 +210,8 @@ control socket. The supervisor translates them to the workload:
 
 1. Try cgroup-wide signal via `cgroup.procs` enumeration (reaches descendants
    outside the process group)
-2. If cgroup signal reached nobody: fall back to process-group `kill`
+2. If cgroup signal reached nobody: fall back to `RunningJob::signal_workload`
+   (process-group `kill`; behind a launcher, its descendants)
 3. On SIGKILL: additionally write `1` to `cgroup.kill` for atomic kernel-level
    kill (catches pid-reuse races)
 
@@ -219,7 +220,8 @@ same cgroup-first path.
 
 Both go through `executor::deliver_signal`, which applies the launcher rule in
 `crates/spurd/AGENTS.md` (Job execution). The supervisor decides it from its own
-launch config (`TrackedProcess::of_launch`) and holds it as `Stepd::tracking`,
+launch config (`TrackedProcess::of_launch`) and holds it as `Stepd::tracked`
+(set through the `Stepd::tracking` builder),
 so a signal that spares the launcher does not end the step: `poll_completion`
 reports the step finished only when the tracked process exits.
 

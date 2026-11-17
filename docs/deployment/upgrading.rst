@@ -1078,6 +1078,17 @@ the agents are upgraded silently does nothing for jobs on those nodes.
 **Kubernetes operator nodes get no grace.** Victims on nodes managed by
 ``spur-k8s`` are preempted at once whatever the QOS or partition ``GraceTime``.
 
+**Steps on nodes where** ``spurd`` **runs as root now keep their grace and kill
+wait.** There, the grace warning and the SIGTERM of a cancel or time limit used to
+end a job's ``srun`` steps at once, even a step that traps SIGTERM. After the
+upgrade such a step keeps running through its grace, and while its job is still
+running a stop waits up to the kill wait before the SIGKILL. Expect longer
+``COMPLETING`` times, and a preemptor that starts later, than before. The fix is
+in the agent and the per-job supervisor, so it needs upgraded agents. A job or
+``srun`` step launched before its node's agent was upgraded keeps the old
+behavior until it ends, because the supervisor that runs it keeps running through
+the upgrade.
+
 The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
 ignores it.

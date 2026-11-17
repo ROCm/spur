@@ -239,7 +239,7 @@ that still needs its nodes starts a fresh grace.
 
 ## Known limitation
 
-The kill waits do not yet reach `srun` steps: when a job is stopped (time limit, `scancel`, inactivity
+The kill waits do not reach `srun` steps once the batch script exits: when a job is stopped (time limit, `scancel`, inactivity
 limit or preempt-cancel), `spurd` reports the job finished on the node within milliseconds while its
 `srun` steps are still running or already killed, so the controller ends the job and frees the node
 before the steps get their wait. A step that handles SIGTERM does get its wait while the job is still

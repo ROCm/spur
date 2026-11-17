@@ -882,7 +882,8 @@ the job is preempted immediately.
 * **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
   process in the job, waits up to the kill wait (5 seconds by default), then
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
-  The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+  The wait does not reach ``srun`` steps once the batch script exits
+  (:ref:`kill wait note <kill-wait-steps-caveat>`).
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
@@ -1513,8 +1514,8 @@ time limit, where earlier releases gave it 2 seconds.
    ``srun`` client handles only Ctrl-C, so the SIGTERM of a stop ends a
    foreground ``srun``, and a batch script that is just ``srun my_app`` then
    exits and ends the job. A step that handles SIGTERM gets the wait when the
-   batch script keeps running, for example because it traps SIGTERM and does not
-   depend on the ``srun`` client.
+   batch script keeps running, for example because it traps SIGTERM and keeps
+   running after the ``srun`` client exits.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
