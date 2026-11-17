@@ -9,7 +9,7 @@ use spur_core::gpu_request::GpuRequest;
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
 use spur_core::partition::Partition;
-use spur_core::resource::{AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource};
+use spur_core::resource::{AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource, ResourceSet};
 
 fn now() -> chrono::DateTime<Utc> {
     chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()

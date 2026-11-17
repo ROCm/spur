@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 pub use spur_devices::topology::DeviceTopology;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// GPU interconnect type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -258,6 +258,73 @@ impl ResourceAllocations {
     }
 }
 
+/// A requested device kind: a gres name and an optional type (`None` takes any).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceKey {
+    pub gres_name: String,
+    pub device_type: Option<String>,
+}
+
+impl DeviceKey {
+    pub fn new(gres_name: &str, device_type: Option<&str>) -> Self {
+        Self {
+            gres_name: gres_name.to_string(),
+            device_type: device_type.map(str::to_string),
+        }
+    }
+
+    /// The key a node's countable `generic` pool uses for this gres.
+    pub fn generic_key(&self) -> String {
+        match &self.device_type {
+            Some(t) => format!("{}:{t}", self.gres_name),
+            None => self.gres_name.clone(),
+        }
+    }
+}
+
+/// What one node must provide for a job. Demand, not inventory: devices are
+/// counts by kind, never concrete devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceRequest {
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub devices: BTreeMap<DeviceKey, u32>,
+}
+
+impl ResourceRequest {
+    pub fn with_scalar(cpus: u32, memory_mb: u64) -> Self {
+        Self {
+            cpus,
+            memory_mb,
+            ..Default::default()
+        }
+    }
+
+    pub fn add_devices(&mut self, gres_name: &str, device_type: Option<&str>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        *self
+            .devices
+            .entry(DeviceKey::new(gres_name, device_type))
+            .or_insert(0) += count;
+    }
+
+    /// Replace every request for `gres_name` with `count` devices of `device_type`.
+    pub fn set_devices(&mut self, gres_name: &str, device_type: Option<&str>, count: u32) {
+        self.devices.retain(|key, _| key.gres_name != gres_name);
+        self.add_devices(gres_name, device_type, count);
+    }
+
+    pub fn device_count(&self, gres_name: &str) -> u32 {
+        self.devices
+            .iter()
+            .filter(|(key, _)| key.gres_name == gres_name)
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
 impl ResourceSet {
     /// Backfill a stable id from the positional device id for legacy/mixed-version
     /// inventories that predate stable_id (serde/proto default it to 0).
@@ -336,8 +403,24 @@ impl ResourceSet {
         }
     }
 
-    /// Check if this inventory can satisfy a count-based request with no prior allocation.
-    pub fn can_satisfy(&self, request: &ResourceSet) -> bool {
+    /// A request for everything this node has, as an exclusive job needs.
+    pub fn as_request(&self) -> ResourceRequest {
+        let mut request = ResourceRequest::with_scalar(self.cpus, self.memory_mb);
+        for gpu in &self.gpus {
+            request.add_devices("gpu", Some(&gpu.gpu_type), 1);
+        }
+        for (pool, &count) in &self.generic {
+            let (name, device_type) = match pool.split_once(':') {
+                Some((name, t)) => (name, Some(t)),
+                None => (pool.as_str(), None),
+            };
+            request.add_devices(name, device_type, u32::try_from(count).unwrap_or(u32::MAX));
+        }
+        request
+    }
+
+    /// Check if this inventory can satisfy a request with no prior allocation.
+    pub fn can_satisfy(&self, request: &ResourceRequest) -> bool {
         self.can_satisfy_with_allocated(&ResourceAllocations::default(), request)
     }
 
@@ -345,52 +428,38 @@ impl ResourceSet {
     pub fn can_satisfy_with_allocated(
         &self,
         allocated: &ResourceAllocations,
-        request: &ResourceSet,
+        request: &ResourceRequest,
     ) -> bool {
         let avail_cpus = self.cpus.saturating_sub(allocated.cpus);
         let avail_mem = self.memory_mb.saturating_sub(allocated.memory_mb);
         if avail_cpus < request.cpus || avail_mem < request.memory_mb {
             return false;
         }
-        if !request.gpus.is_empty() && self.holds_unknown_gpu(allocated) {
-            return false;
-        }
+        request
+            .devices
+            .iter()
+            .all(|(key, &count)| self.free_count(allocated, key) >= u64::from(count))
+    }
 
-        let mut avail_gpus = self.gpu_counts();
-        let total_avail: u32 = avail_gpus.values().sum();
-        for dev in allocated.devices.get("gpu").into_iter().flatten() {
-            if let Some(gpu) = self.gpus.iter().find(|g| g.stable_id == dev.device_id) {
-                *avail_gpus.entry(gpu.gpu_type.clone()).or_insert(0) = avail_gpus
-                    .get(&gpu.gpu_type)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(dev.count as u32);
-            }
+    /// Free units of `key`: specific devices when this node hands the gres out
+    /// by id, otherwise what is left of its countable pool.
+    fn free_count(&self, allocated: &ResourceAllocations, key: &DeviceKey) -> u64 {
+        if self.allocates_by_id(&key.gres_name) {
+            return self
+                .available_device_ids(allocated, &key.gres_name, key.device_type.as_deref())
+                .len() as u64;
         }
+        let pool = key.generic_key();
+        self.generic
+            .get(&pool)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(allocated.generic_count(&pool))
+    }
 
-        let req_gpus = request.gpu_counts();
-        for (gpu_type, count) in &req_gpus {
-            if gpu_type == "any" {
-                if total_avail.saturating_sub(allocated.total_device_count("gpu") as u32) < *count {
-                    return false;
-                }
-            } else if avail_gpus.get(gpu_type).copied().unwrap_or(0) < *count {
-                return false;
-            }
-        }
-
-        for (name, count) in &request.generic {
-            let avail = self
-                .generic
-                .get(name)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(allocated.generic_count(name));
-            if avail < *count {
-                return false;
-            }
-        }
-        true
+    /// Whether this node hands out `gres_name` as specific devices, not a count.
+    fn allocates_by_id(&self, gres_name: &str) -> bool {
+        gres_name == "gpu"
     }
 
     /// An allocated id the inventory lost means a held device may now be
@@ -538,37 +607,37 @@ pub fn aggregate_allocations(
 pub fn build_node_allocation(
     inventory: &ResourceSet,
     current_alloc: &ResourceAllocations,
-    request: &ResourceSet,
+    request: &ResourceRequest,
 ) -> ResourceAllocations {
     let mut alloc = ResourceAllocations::with_scalar(request.cpus, request.memory_mb);
     alloc.generation = inventory.generation;
 
-    let req_gpus = request.gpu_counts();
-    for (gpu_type, count) in req_gpus {
-        let dtype = if gpu_type == "any" {
-            None
-        } else {
-            Some(gpu_type.as_str())
-        };
-        let mut effective_alloc = current_alloc.clone();
-        effective_alloc.add(&alloc);
-        let picked = inventory.pick_devices(&effective_alloc, "gpu", dtype, count);
-        alloc
-            .devices
-            .entry("gpu".into())
-            .or_default()
-            .extend(picked);
-    }
-
-    for (name, count) in &request.generic {
-        if *count > 0 {
+    for (key, &count) in &request.devices {
+        if count == 0 {
+            continue;
+        }
+        if inventory.allocates_by_id(&key.gres_name) {
+            let mut effective_alloc = current_alloc.clone();
+            effective_alloc.add(&alloc);
+            let picked = inventory.pick_devices(
+                &effective_alloc,
+                &key.gres_name,
+                key.device_type.as_deref(),
+                count,
+            );
             alloc
                 .devices
-                .entry(name.clone())
+                .entry(key.gres_name.clone())
+                .or_default()
+                .extend(picked);
+        } else {
+            alloc
+                .devices
+                .entry(key.generic_key())
                 .or_default()
                 .push(AllocatedDevice {
                     device_id: 0,
-                    count: *count,
+                    count: u64::from(count),
                 });
         }
     }
@@ -778,26 +847,8 @@ mod tests {
     #[test]
     fn test_can_satisfy() {
         let avail = sample_inventory();
-        let req = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 32,
-            memory_mb: 128_000,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
-                stable_id: 0,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            }],
-            generic: HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let mut req = ResourceRequest::with_scalar(32, 128_000);
+        req.add_devices("gpu", Some("mi300x"), 1);
         assert!(avail.can_satisfy(&req));
     }
 
@@ -809,55 +860,12 @@ mod tests {
             .devices
             .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
 
-        let req_one = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 1,
-            memory_mb: 1,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
-                stable_id: 0,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            }],
-            generic: HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let mut req_one = ResourceRequest::with_scalar(1, 1);
+        req_one.add_devices("gpu", Some("mi300x"), 1);
         assert!(inventory.can_satisfy_with_allocated(&allocated, &req_one));
 
-        let req_two = ResourceSet {
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
-                    stable_id: 0,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
-                    stable_id: 0,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        };
+        let mut req_two = ResourceRequest::default();
+        req_two.add_devices("gpu", Some("mi300x"), 2);
         assert!(!inventory.can_satisfy_with_allocated(&allocated, &req_two));
     }
 
@@ -964,15 +972,9 @@ mod tests {
     #[test]
     fn a_node_holding_an_id_it_no_longer_has_cannot_satisfy_a_gpu_request() {
         let inventory = two_gpu_inventory(0x11_0000, 0x12_0000);
-        let mut one_gpu = ResourceSet {
-            cpus: 1,
-            ..Default::default()
-        };
-        one_gpu.gpus.push(inventory.gpus[0].clone());
-        let cpu_only = ResourceSet {
-            cpus: 1,
-            ..Default::default()
-        };
+        let mut one_gpu = ResourceRequest::with_scalar(1, 0);
+        one_gpu.add_devices("gpu", Some("mi300x"), 1);
+        let cpu_only = ResourceRequest::with_scalar(1, 0);
 
         let orphaned = ResourceAllocations::from_device_ids("gpu", &[0x11_0100]);
         assert!(!inventory.can_satisfy_with_allocated(&orphaned, &one_gpu));
@@ -985,26 +987,8 @@ mod tests {
     #[test]
     fn test_build_node_allocation() {
         let inventory = sample_inventory();
-        let request = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 8,
-            memory_mb: 16_000,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
-                stable_id: 0,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            }],
-            generic: HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let mut request = ResourceRequest::with_scalar(8, 16_000);
+        request.add_devices("gpu", Some("mi300x"), 1);
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         assert_eq!(alloc.cpus, 8);
         assert_eq!(alloc.device_ids("gpu"), vec![0]);
@@ -1067,39 +1051,9 @@ mod tests {
             generation: 0,
             topology: None,
         };
-        let request = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 8,
-            memory_mb: 16_000,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
-                    stable_id: 0,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "h100".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::NVLink,
-                    topology: None,
-                    stable_id: 0,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                },
-            ],
-            generic: HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let mut request = ResourceRequest::with_scalar(8, 16_000);
+        request.add_devices("gpu", Some("mi300x"), 1);
+        request.add_devices("gpu", Some("h100"), 1);
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         let mut ids = alloc.device_ids("gpu");
         ids.sort();
@@ -1485,30 +1439,124 @@ mod accounting_tests {
         let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
         assert_eq!(allocated.allocated_count("gpu", Some("mi300x"), &inv), 1);
 
-        let req = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 1,
-            memory_mb: 1,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: Vec::new(),
-                link_type: GpuLinkType::XGMI,
-                topology: None,
-                stable_id: 0,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            }],
-            generic: HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let mut req = ResourceRequest::with_scalar(1, 1);
+        req.add_devices("gpu", Some("mi300x"), 1);
         assert!(
             !inv.can_satisfy_with_allocated(&allocated, &req),
             "the held stable_id 128 mi300x must not be re-offered"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn mixed_inventory() -> ResourceSet {
+        let gpu = |device_id: u32, gpu_type: &str| GpuResource {
+            device_id,
+            gpu_type: gpu_type.into(),
+            memory_mb: 0,
+            peer_gpus: Vec::new(),
+            link_type: GpuLinkType::PCIe,
+            topology: None,
+            stable_id: u64::from(device_id) + 1,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
+        };
+        ResourceSet {
+            cpus: 16,
+            memory_mb: 1024,
+            gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi250x")],
+            generic: [("bandwidth:lustre".to_string(), 100)].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn device_counts_sum_every_type_of_a_gres() {
+        let mut req = ResourceRequest::default();
+        req.add_devices("gpu", Some("mi300x"), 2);
+        req.add_devices("gpu", None, 1);
+        req.add_devices("gpu", Some("mi300x"), 1);
+        req.add_devices("nic", None, 4);
+        assert_eq!(req.device_count("gpu"), 4);
+        assert_eq!(req.device_count("nic"), 4);
+        assert_eq!(req.device_count("license"), 0);
+    }
+
+    #[test]
+    fn setting_a_gres_replaces_every_earlier_request_for_it() {
+        let mut req = ResourceRequest::default();
+        req.add_devices("gpu", Some("mi300x"), 2);
+        req.add_devices("nic", None, 1);
+        req.set_devices("gpu", None, 3);
+        assert_eq!(
+            req.devices,
+            [
+                (DeviceKey::new("gpu", None), 3),
+                (DeviceKey::new("nic", None), 1)
+            ]
+            .into()
+        );
+        req.set_devices("gpu", None, 0);
+        assert_eq!(req.device_count("gpu"), 0);
+        assert!(!req.devices.keys().any(|k| k.gres_name == "gpu"));
+    }
+
+    #[test]
+    fn an_untyped_device_request_takes_any_type() {
+        let inv = mixed_inventory();
+        let mut three = ResourceRequest::default();
+        three.add_devices("gpu", None, 3);
+        assert!(inv.can_satisfy(&three));
+        let mut four = ResourceRequest::default();
+        four.add_devices("gpu", None, 4);
+        assert!(!inv.can_satisfy(&four));
+    }
+
+    #[test]
+    fn a_typed_device_request_takes_only_its_type() {
+        let inv = mixed_inventory();
+        let mut two = ResourceRequest::default();
+        two.add_devices("gpu", Some("mi250x"), 2);
+        assert!(!inv.can_satisfy(&two));
+
+        let mut one = ResourceRequest::default();
+        one.add_devices("gpu", Some("mi250x"), 1);
+        let alloc = build_node_allocation(&inv, &ResourceAllocations::default(), &one);
+        assert_eq!(alloc.device_ids("gpu"), vec![3]);
+    }
+
+    #[test]
+    fn a_whole_node_request_asks_for_everything_the_node_has() {
+        let inv = mixed_inventory();
+        let req = inv.as_request();
+        assert_eq!((req.cpus, req.memory_mb), (16, 1024));
+        assert_eq!(
+            req.devices,
+            [
+                (DeviceKey::new("bandwidth", Some("lustre")), 100),
+                (DeviceKey::new("gpu", Some("mi250x")), 1),
+                (DeviceKey::new("gpu", Some("mi300x")), 2),
+            ]
+            .into()
+        );
+        assert!(inv.can_satisfy(&req));
+        let one_gpu_held = ResourceAllocations::from_device_ids("gpu", &[1]);
+        assert!(!inv.can_satisfy_with_allocated(&one_gpu_held, &req));
+    }
+
+    #[test]
+    fn a_countable_gres_request_draws_on_the_generic_pool() {
+        let inv = mixed_inventory();
+        let mut req = ResourceRequest::default();
+        req.add_devices("bandwidth", Some("lustre"), 60);
+        assert!(inv.can_satisfy(&req));
+
+        let alloc = build_node_allocation(&inv, &ResourceAllocations::default(), &req);
+        assert_eq!(alloc.generic_count("bandwidth:lustre"), 60);
+        assert!(!inv.can_satisfy_with_allocated(&alloc, &req));
     }
 }
 

@@ -11481,7 +11481,7 @@ fn general_pool_shortfall(
     let placement = spur_sched::node_match::NodePlacement::new(job);
     let now = chrono::Utc::now();
     let required = spur_sched::backfill::job_resource_request(job);
-    let gpus = required.gpus.len() as u32;
+    let gpus = required.device_count("gpu");
     let (general, need) = nodes
         .values()
         .filter(|n| placement.eligible(n, reservations, now))
@@ -17644,16 +17644,8 @@ state = "UP"
 
         // The stale positional ids match no live stable_id; the real GPUs must
         // not read free.
-        let want_two_gpus = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 0,
-            memory_mb: 0,
-            gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
-            generic: Default::default(),
-            generation: 0,
-            topology: None,
-        };
+        let mut want_two_gpus = spur_core::resource::ResourceRequest::default();
+        want_two_gpus.add_devices("gpu", Some("mi300x"), 2);
         {
             let node = cm.get_node("n1").unwrap();
             assert!(

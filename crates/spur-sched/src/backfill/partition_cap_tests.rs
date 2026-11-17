@@ -6,7 +6,7 @@ use super::*;
 use crate::partition_cap::{PartitionNodeUsage, RunningCharge};
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
-use spur_core::resource::{AllocatedDevice, GpuLinkType, GpuResource};
+use spur_core::resource::{AllocatedDevice, GpuLinkType, GpuResource, ResourceSet};
 
 fn now() -> chrono::DateTime<Utc> {
     chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()

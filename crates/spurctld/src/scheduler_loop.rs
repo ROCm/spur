@@ -2416,7 +2416,7 @@ fn satisfiable_victim_set(
 
 /// What one node must hold for `job`: the per-node minimum, except that a one-node
 /// job needs its whole GPU total on that node.
-fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
+fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceRequest {
     use spur_core::gpu_request::{resolve_gpu_demand, GpuDemand};
 
     let mut request = backfill::job_resource_request(job);
@@ -2424,8 +2424,13 @@ fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
         Ok(GpuDemand::Total { count, .. }) if job.spec.num_nodes <= 1 => count,
         _ => return request,
     };
-    if let Some(gpu) = request.gpus.first().cloned() {
-        request.gpus = vec![gpu; total as usize];
+    let gpu_key = request
+        .devices
+        .keys()
+        .find(|key| key.gres_name == "gpu")
+        .cloned();
+    if let Some(key) = gpu_key {
+        request.set_devices("gpu", key.device_type.as_deref(), total);
     }
     request.memory_mb = spur_core::partition_limits::node_memory_mb(
         &job.spec,
@@ -5700,7 +5705,7 @@ pub(crate) mod tests {
     fn request_per_node(
         nodes: &[String],
         totals: &HashMap<String, ResourceSet>,
-        request: &ResourceSet,
+        request: &spur_core::resource::ResourceRequest,
     ) -> HashMap<String, ResourceAllocations> {
         nodes
             .iter()
@@ -7236,13 +7241,13 @@ pub(crate) mod tests {
             one.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
             one.spec.memory_per_gpu_mb = Some(1000);
             let request = node_request(&one);
-            assert_eq!((request.gpus.len(), request.memory_mb), (8, 8000));
+            assert_eq!((request.device_count("gpu"), request.memory_mb), (8, 8000));
 
             let mut two = one.clone();
             two.spec.num_nodes = 2;
             let request = node_request(&two);
             assert_eq!(
-                (request.gpus.len(), request.memory_mb),
+                (request.device_count("gpu"), request.memory_mb),
                 (1, 1000),
                 "spread over two nodes, each node only needs one"
             );
