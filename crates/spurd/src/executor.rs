@@ -436,6 +436,39 @@ pub enum RunningJob {
     AllocationOnly,
 }
 
+/// What the process a launch tracks is, relative to the user's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedProcess {
+    /// The workload itself (or the shell that runs it).
+    Workload,
+    /// A namespace launcher (`unshare`, `nsenter`, a container's waiting parent)
+    /// that forks the workload and relays its exit status. It dies on signals it
+    /// has no handler for, which ends the step while the workload still runs.
+    Launcher,
+}
+
+impl TrackedProcess {
+    /// SIGKILL is not spared: the launcher goes down with its workload.
+    fn spares_launcher(self, sig: Signal) -> bool {
+        self == Self::Launcher && sig != Signal::SIGKILL
+    }
+
+    /// Decided from the launch alone so a supervisor reading a persisted launch
+    /// spec reaches the same answer as the launch that produced the process.
+    pub fn of_launch(cfg: &JobLaunchConfig, is_root: bool) -> Self {
+        // A container fork-waits in its parent whether or not spurd is root. A
+        // joined step's script `exec`s `nsenter`, and every job a step can join
+        // has a pid namespace, so `nsenter` forks and waits.
+        let launcher = cfg.container.is_some()
+            || cfg.joins_parent_namespaces
+            || would_use_namespaces(cfg, is_root);
+        match launcher {
+            true => Self::Launcher,
+            false => Self::Workload,
+        }
+    }
+}
+
 /// Split a finished process's wait status into (exit_code, signal).
 /// Slurm parity: WIFEXITED -> (code, 0); WIFSIGNALED -> (0, sig).
 pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
@@ -563,6 +596,28 @@ impl RunningJob {
             }
             RunningJob::AllocationOnly => Ok(()),
         }
+    }
+
+    /// The tracked pid while it can still be signalled.
+    fn live_pid(&self) -> Option<i32> {
+        match self {
+            RunningJob::Managed { child } => child.id().map(|pid| pid as i32),
+            RunningJob::Forked { pid, reaped, .. } => (!*reaped).then_some(*pid),
+            RunningJob::AllocationOnly => None,
+        }
+    }
+
+    /// Signal the user's workload. When the tracked process is a launcher this
+    /// reaches every descendant of it but not the launcher itself; otherwise it
+    /// is [`Self::kill_signal`].
+    pub fn signal_workload(&self, sig: Signal, tracked: TrackedProcess) -> anyhow::Result<()> {
+        if !tracked.spares_launcher(sig) {
+            return self.kill_signal(sig);
+        }
+        if let Some(pid) = self.live_pid() {
+            kill_descendants(pid, sig);
+        }
+        Ok(())
     }
 }
 
@@ -1645,16 +1700,46 @@ pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
 /// Signals every pid in the cgroup with any signal (unlike `cgroup_kill`,
 /// SIGKILL-only). Returns the count signaled; `Ok(0)` means no tracked pids.
 pub fn cgroup_signal(cgroup_path: &Path, sig: Signal) -> std::io::Result<usize> {
+    cgroup_signal_except(cgroup_path, sig, None)
+}
+
+/// [`cgroup_signal`] that leaves `except` alone.
+pub fn cgroup_signal_except(
+    cgroup_path: &Path,
+    sig: Signal,
+    except: Option<i32>,
+) -> std::io::Result<usize> {
     let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
     let mut signaled = 0;
     for pid_str in pids.lines() {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if signal::kill(Pid::from_raw(pid), sig).is_ok() {
+            if Some(pid) != except && signal::kill(Pid::from_raw(pid), sig).is_ok() {
                 signaled += 1;
             }
         }
     }
     Ok(signaled)
+}
+
+/// Delivers `sig` to a job's workload: the cgroup's processes first, since they
+/// include descendants a process-group signal misses, and the tracked process's
+/// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
+/// A launcher is spared everything but SIGKILL.
+pub fn deliver_signal(
+    cgroup_path: Option<&Path>,
+    job: &RunningJob,
+    tracked: TrackedProcess,
+    sig: Signal,
+) -> anyhow::Result<()> {
+    let spared = job.live_pid().filter(|_| tracked.spares_launcher(sig));
+    match cgroup_path.map(|path| cgroup_signal_except(path, sig, spared)) {
+        Some(Ok(count)) if count > 0 => Ok(()),
+        Some(Err(error)) => {
+            warn!(%error, "cgroup.procs signal failed, falling back to the tracked process");
+            job.signal_workload(sig, tracked)
+        }
+        _ => job.signal_workload(sig, tracked),
+    }
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1801,11 +1886,15 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
 
 /// Recursively signal a process and all its descendants (children first).
 pub(crate) fn kill_process_tree(pid: i32, sig: Signal) {
-    let children = get_child_pids(pid);
-    for child in &children {
-        kill_process_tree(*child, sig);
-    }
+    kill_descendants(pid, sig);
     let _ = signal::kill(Pid::from_raw(pid), sig);
+}
+
+/// [`kill_process_tree`] without `pid` itself.
+fn kill_descendants(pid: i32, sig: Signal) {
+    for child in get_child_pids(pid) {
+        kill_process_tree(child, sig);
+    }
 }
 
 /// Read immediate child PIDs from /proc/<pid>/task/<pid>/children.
@@ -3375,6 +3464,56 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_signal_except_leaves_the_named_pid_alone() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut spared = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn spared sleep");
+        let mut signaled = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signaled sleep");
+        std::fs::write(
+            cgroup.path().join("cgroup.procs"),
+            format!("{}\n{}\n", spared.id(), signaled.id()),
+        )
+        .expect("seed cgroup.procs");
+
+        let count = cgroup_signal_except(cgroup.path(), Signal::SIGKILL, Some(spared.id() as i32))
+            .expect("signal all but one");
+
+        assert_eq!(count, 1);
+        let status = signaled.wait().expect("wait for signaled child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            spared.try_wait().expect("poll spared child").is_none(),
+            "the spared pid must not have been signaled"
+        );
+        spared.kill().expect("clean up spared child");
+        spared.wait().expect("reap spared child");
+    }
+
+    #[test]
+    fn cgroup_signal_except_none_signals_everyone() {
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(cgroup.path().join("cgroup.procs"), child.id().to_string())
+            .expect("seed cgroup.procs");
+
+        let count =
+            cgroup_signal_except(cgroup.path(), Signal::SIGKILL, None).expect("signal everyone");
+
+        assert_eq!(count, 1);
+        child.wait().expect("wait for signaled child");
+    }
+
+    #[test]
     fn cgroup_signal_reports_the_read_failure_when_theres_no_cgroup() {
         let missing = std::path::Path::new("/nonexistent/spur-cgroup-signal-test");
         assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
@@ -4128,6 +4267,99 @@ mod tests {
         };
 
         assert!(!would_use_namespaces(&step, true));
+    }
+
+    fn container_launch() -> ContainerLaunchConfig {
+        ContainerLaunchConfig {
+            config: ContainerConfig {
+                image: "docker://job-image".into(),
+                mounts: Vec::new(),
+                workdir: None,
+                name: None,
+                readonly: false,
+                mount_home: false,
+                remap_root: false,
+                gpu_devices: Vec::new(),
+                environment: HashMap::new(),
+                container_env: HashMap::new(),
+                entrypoint: None,
+                uid: 1000,
+                gid: 1000,
+                username: "spur".into(),
+                home_dir: "/home/spur".into(),
+                device_plan: None,
+            },
+            rootfs: PathBuf::from("/tmp/rootfs"),
+        }
+    }
+
+    #[test]
+    fn a_batch_job_under_unshare_tracks_a_launcher() {
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(false), true),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_step_entering_its_jobs_namespaces_tracks_a_launcher() {
+        let step = JobLaunchConfig {
+            joins_parent_namespaces: true,
+            step_id: 3,
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&step, true),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_container_job_tracks_a_launcher_with_or_without_root() {
+        let container = JobLaunchConfig {
+            container: Some(container_launch()),
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&container, true),
+            TrackedProcess::Launcher
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&container, false),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_launch_without_a_launcher_tracks_the_workload() {
+        let pmix = JobLaunchConfig {
+            pmix_multi_task: true,
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(false), false),
+            TrackedProcess::Workload,
+            "rootless batch job"
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(true), true),
+            TrackedProcess::Workload,
+            "allocation holder"
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&pmix, true),
+            TrackedProcess::Workload,
+            "multi-rank pmix wrapper"
+        );
+    }
+
+    #[test]
+    fn a_launcher_is_spared_every_signal_but_sigkill() {
+        for sig in [Signal::SIGTERM, Signal::SIGUSR1, Signal::SIGSTOP] {
+            assert!(TrackedProcess::Launcher.spares_launcher(sig), "{sig:?}");
+            assert!(!TrackedProcess::Workload.spares_launcher(sig), "{sig:?}");
+        }
+        assert!(!TrackedProcess::Launcher.spares_launcher(Signal::SIGKILL));
     }
 
     #[test]

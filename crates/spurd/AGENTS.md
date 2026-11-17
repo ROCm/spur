@@ -483,7 +483,11 @@ metrics).
 
 ### Job execution
 - Jobs are forked as their own process-group leaders. Signals go to the
-  negative PID (the whole group), not just the tracked process.
+  negative PID (the whole group), not just the tracked process. Except that
+  the tracked process can be a namespace launcher (`unshare`, `nsenter`, a
+  container's waiting parent): then non-KILL signals skip it and reach only its
+  descendants (`executor::deliver_signal`, `TrackedProcess`), or the supervisor
+  would report the step finished while the workload still runs.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a

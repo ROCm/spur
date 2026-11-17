@@ -217,6 +217,17 @@ control socket. The supervisor translates them to the workload:
 `Shutdown` triggers `begin_teardown()` internally, sending SIGTERM via the
 same cgroup-first path.
 
+Both go through `executor::deliver_signal`. The tracked process is often a
+*launcher*, not the workload: `unshare` (rootful batch job), `nsenter` (a step
+joining its job's namespaces), or a container's waiting parent
+(`TrackedProcess::of_launch`, derived from the launch config so it is the same
+on every path). The launcher dies on signals it has no handler for, which would
+end the step while the workload still runs. So every signal except SIGKILL
+skips the launcher: the cgroup walk excludes its pid, and the fallback
+(`RunningJob::signal_workload`) signals its descendants instead of the process
+group. SIGKILL still takes the launcher down with the workload. The launcher
+exits on its own once the workload does, relaying its status.
+
 ## I/O management
 
 - stderr is inherited from the double-fork (lands in the spurd agent log)

@@ -768,6 +768,9 @@ impl PtyHandoff {
 
 pub struct Stepd {
     job: Mutex<RunningJob>,
+    /// Whether `job` is the workload or a launcher in front of it; decides who a
+    /// non-KILL signal may reach.
+    tracked: crate::executor::TrackedProcess,
     /// Owned by this supervisor: launch hands the cgroup over and nothing else
     /// on the node tracks it, so teardown here is what removes it.
     cgroup_path: Mutex<Option<PathBuf>>,
@@ -787,6 +790,7 @@ impl Stepd {
         let job_pid = job.pid().unwrap_or(0) as i32;
         Self {
             job: Mutex::new(job),
+            tracked: crate::executor::TrackedProcess::Workload,
             cgroup_path: Mutex::new(None),
             snapshot: Arc::new(Mutex::new(StepdSnapshot {
                 job_id,
@@ -802,6 +806,11 @@ impl Stepd {
             launch_gate: Mutex::new(()),
             pty_handoff: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn tracking(mut self, tracked: crate::executor::TrackedProcess) -> Self {
+        self.tracked = tracked;
+        self
     }
 
     pub async fn snapshot(&self) -> StepdSnapshot {
@@ -866,25 +875,13 @@ impl Stepd {
             )
         })?;
         let job = self.job.lock().await;
-        // Cgroup membership is the canonical kill-target set, reaching
-        // descendants a plain process-group signal can't. Falls back
-        // whenever it didn't reach anyone: no cgroup, an unreadable
-        // cgroup.procs, or a cgroup that exists but has no pid in it yet
-        // (the launch-vs-move_to_cgroup race).
-        let cgroup_result = self
-            .cgroup_path
-            .lock()
-            .await
-            .as_deref()
-            .map(|path| crate::executor::cgroup_signal(path, signal));
-        match cgroup_result {
-            Some(Ok(count)) if count > 0 => {}
-            Some(Err(error)) => {
-                tracing::warn!(%error, "cgroup.procs signal failed, falling back to process group");
-                job.kill_signal(signal).map_err(io::Error::other)?;
-            }
-            _ => job.kill_signal(signal).map_err(io::Error::other)?,
-        }
+        crate::executor::deliver_signal(
+            self.cgroup_path.lock().await.as_deref(),
+            &job,
+            self.tracked,
+            signal,
+        )
+        .map_err(io::Error::other)?;
         if signal == nix::sys::signal::Signal::SIGKILL {
             if let Some(cgroup_path) = self.cgroup_path.lock().await.as_deref() {
                 // Atomic kernel-level SIGKILL, reaching anything a
@@ -903,17 +900,13 @@ impl Stepd {
         drop(launch_gate);
         let job = self.job.lock().await;
         let sigterm = nix::sys::signal::Signal::SIGTERM;
-        let cgroup_signaled = self
-            .cgroup_path
-            .lock()
-            .await
-            .as_deref()
-            .and_then(|path| crate::executor::cgroup_signal(path, sigterm).ok())
-            .is_some_and(|count| count > 0);
-        if !cgroup_signaled {
-            if let Err(error) = job.kill_signal(sigterm) {
-                tracing::warn!(%error, "failed to terminate stepd process during teardown");
-            }
+        if let Err(error) = crate::executor::deliver_signal(
+            self.cgroup_path.lock().await.as_deref(),
+            &job,
+            self.tracked,
+            sigterm,
+        ) {
+            tracing::warn!(%error, "failed to terminate stepd process during teardown");
         }
     }
 }
@@ -2432,12 +2425,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     };
+    let mut tracked = crate::executor::TrackedProcess::Workload;
     let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
         .allocation_only
     {
         (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
     } else {
-        match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
+        let config = launch_spec.into_launch_config();
+        tracked =
+            crate::executor::TrackedProcess::of_launch(&config, nix::unistd::geteuid().is_root());
+        match crate::executor::launch_job(&config, spank.as_ref()).await {
             Ok(result) => (
                 result.job,
                 result.cgroup_path,
@@ -2485,7 +2482,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
     }
-    let session = Arc::new(Stepd::new(job, job_id, run_attempt, step_id));
+    let session = Arc::new(Stepd::new(job, job_id, run_attempt, step_id).tracking(tracked));
     session.adopt_cgroup(launched_cgroup).await;
     if awaits_pty_handoff(step_id, deposited) {
         session.await_pty_handoff(pty_handoff);
@@ -4903,6 +4900,263 @@ mod tests {
         .await
         .expect("job must die via the process-group fallback");
         assert_eq!(status.1, libc::SIGTERM, "must have died from SIGTERM");
+    }
+
+    /// A shell with no handler for any signal, standing in for `unshare` /
+    /// `nsenter`: it backgrounds a worker that traps TERM (reporting it) and
+    /// USR1 (exiting 7), then relays the worker's exit status.
+    const LAUNCHER_SCRIPT: &str = "sh -c 'trap \"echo term\" TERM; trap \"exit 7\" USR1; \
+         echo ready $$; while :; do sleep 0.05; done' & wait $!; exit $?";
+    /// The same worker with nothing in front of it.
+    const WORKLOAD_SCRIPT: &str = "trap \"echo term\" TERM; trap \"exit 7\" USR1; \
+         echo ready $$; while :; do sleep 0.05; done";
+
+    struct StandIn {
+        session: Stepd,
+        output: tokio::io::BufReader<tokio::process::ChildStdout>,
+        launcher_pid: u32,
+    }
+
+    impl StandIn {
+        async fn line(&mut self) -> String {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .await
+                .expect("read stand-in output");
+            line.trim().to_string()
+        }
+
+        async fn finished(&self) -> StepdSnapshot {
+            loop {
+                self.session.poll_completion().await.expect("poll");
+                let snapshot = self.session.snapshot().await;
+                if !snapshot.active {
+                    return snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Returns once the worker has installed its handlers, so no signal can
+    /// outrun them. A `cgroup` gets a fake `cgroup.procs` listing both processes.
+    async fn spawn_stand_in(
+        script: &str,
+        tracked: crate::executor::TrackedProcess,
+        cgroup: Option<&std::path::Path>,
+    ) -> StandIn {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn stand-in");
+        let launcher_pid = child.id().expect("stand-in pid");
+        let output = tokio::io::BufReader::new(child.stdout.take().expect("stand-in stdout"));
+        let session = Stepd::new(
+            RunningJob::managed(child),
+            90,
+            1,
+            spur_core::step::STEP_BATCH,
+        )
+        .tracking(tracked);
+        let mut stand_in = StandIn {
+            session,
+            output,
+            launcher_pid,
+        };
+        let ready = stand_in.line().await;
+        let worker_pid: u32 = ready
+            .strip_prefix("ready ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("worker announces its pid");
+        if let Some(cgroup) = cgroup {
+            // Without a launcher the worker is the tracked process itself.
+            let mut pids = vec![launcher_pid];
+            if worker_pid != launcher_pid {
+                pids.push(worker_pid);
+            }
+            let procs: Vec<String> = pids.iter().map(u32::to_string).collect();
+            std::fs::write(cgroup.join("cgroup.procs"), procs.join("\n"))
+                .expect("seed cgroup.procs");
+            stand_in
+                .session
+                .adopt_cgroup(Some(cgroup.to_path_buf()))
+                .await;
+        }
+        stand_in
+    }
+
+    async fn assert_worker_signaled_but_step_still_running(stand_in: &mut StandIn) {
+        assert_eq!(stand_in.line().await, "term", "the worker must see TERM");
+        stand_in.session.poll_completion().await.expect("poll");
+        assert!(
+            stand_in.session.snapshot().await.active,
+            "the launcher must survive, so the step is not reported finished"
+        );
+        assert!(
+            std::path::Path::new(&format!("/proc/{}", stand_in.launcher_pid)).exists(),
+            "the launcher process must still exist"
+        );
+    }
+
+    async fn assert_step_completes_with_the_workers_status(stand_in: &StandIn) {
+        stand_in
+            .session
+            .signal(nix::sys::signal::Signal::SIGUSR1 as i32)
+            .await
+            .expect("send SIGUSR1");
+        let snapshot = stand_in.finished().await;
+        assert_eq!(snapshot.exit_code, Some(7));
+        assert_eq!(snapshot.signal, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_signal_reaches_the_worker_behind_a_launcher_not_the_launcher() {
+        let mut stand_in = spawn_stand_in(
+            LAUNCHER_SCRIPT,
+            crate::executor::TrackedProcess::Launcher,
+            None,
+        )
+        .await;
+
+        stand_in
+            .session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+
+        assert_worker_signaled_but_step_still_running(&mut stand_in).await;
+        assert_step_completes_with_the_workers_status(&stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn a_cgroup_signal_skips_the_launcher_and_reaches_the_worker() {
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        let mut stand_in = spawn_stand_in(
+            LAUNCHER_SCRIPT,
+            crate::executor::TrackedProcess::Launcher,
+            Some(cgroup.path()),
+        )
+        .await;
+
+        stand_in
+            .session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+
+        assert_worker_signaled_but_step_still_running(&mut stand_in).await;
+        assert_step_completes_with_the_workers_status(&stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn teardown_terminates_the_worker_behind_a_launcher_not_the_launcher() {
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        let mut stand_in = spawn_stand_in(
+            LAUNCHER_SCRIPT,
+            crate::executor::TrackedProcess::Launcher,
+            Some(cgroup.path()),
+        )
+        .await;
+
+        stand_in.session.begin_teardown().await;
+
+        assert_worker_signaled_but_step_still_running(&mut stand_in).await;
+        assert_step_completes_with_the_workers_status(&stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn teardown_without_a_cgroup_terminates_the_worker_not_the_launcher() {
+        let mut stand_in = spawn_stand_in(
+            LAUNCHER_SCRIPT,
+            crate::executor::TrackedProcess::Launcher,
+            None,
+        )
+        .await;
+
+        stand_in.session.begin_teardown().await;
+
+        assert_worker_signaled_but_step_still_running(&mut stand_in).await;
+        assert_step_completes_with_the_workers_status(&stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn sigkill_still_ends_the_launcher_and_the_worker() {
+        use tokio::io::AsyncBufReadExt;
+        for with_cgroup in [false, true] {
+            let cgroup = tempfile::tempdir().expect("tempdir");
+            let mut stand_in = spawn_stand_in(
+                LAUNCHER_SCRIPT,
+                crate::executor::TrackedProcess::Launcher,
+                with_cgroup.then(|| cgroup.path()),
+            )
+            .await;
+
+            stand_in
+                .session
+                .signal(nix::sys::signal::Signal::SIGKILL as i32)
+                .await
+                .expect("send SIGKILL");
+
+            let snapshot = stand_in.finished().await;
+            assert_eq!(
+                snapshot.signal,
+                Some(libc::SIGKILL),
+                "cgroup: {with_cgroup}"
+            );
+            // Every holder of the output pipe has gone once it reads EOF.
+            let mut rest = String::new();
+            let read = stand_in
+                .output
+                .read_line(&mut rest)
+                .await
+                .expect("read to EOF");
+            assert_eq!(
+                read, 0,
+                "the worker outlived SIGKILL (cgroup: {with_cgroup})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_reaches_a_tracked_workload_itself() {
+        let mut stand_in = spawn_stand_in(
+            WORKLOAD_SCRIPT,
+            crate::executor::TrackedProcess::Workload,
+            None,
+        )
+        .await;
+
+        stand_in
+            .session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+
+        assert_eq!(stand_in.line().await, "term");
+        stand_in.session.poll_completion().await.expect("poll");
+        assert!(stand_in.session.snapshot().await.active);
+        assert_step_completes_with_the_workers_status(&stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn a_tracked_workload_with_a_cgroup_is_signaled_itself() {
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        let mut stand_in = spawn_stand_in(
+            WORKLOAD_SCRIPT,
+            crate::executor::TrackedProcess::Workload,
+            Some(cgroup.path()),
+        )
+        .await;
+
+        stand_in.session.begin_teardown().await;
+
+        assert_eq!(stand_in.line().await, "term");
+        assert_step_completes_with_the_workers_status(&stand_in).await;
     }
 
     #[tokio::test]
