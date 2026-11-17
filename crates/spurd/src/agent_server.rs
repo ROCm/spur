@@ -48,6 +48,10 @@ use crate::reporter::NodeReporter;
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
 /// devices" so they cannot inherit the runtime's all-visible default.
+fn gpu_selection(gpu_ids: &[u64]) -> spur_devices::DeviceSelection {
+    spur_devices::DeviceSelection::from([("gpu".to_string(), gpu_ids.to_vec())])
+}
+
 fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
     if allocated_device_ids.is_empty() {
         spur_core::task_launch::gpu_deny_visibility(env);
@@ -7188,7 +7192,7 @@ impl SlurmAgent for AgentService {
 
         let injection = {
             let reg = self.device_registry.lock().await;
-            reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
+            reg.build_job_injection_plans(&gpu_selection(&allocated_device_ids), spec.uid, spec.gid)
         };
         let (host_device_plan, container_device_plan) = match injection {
             Ok(plans) => plans,
@@ -8891,7 +8895,7 @@ impl SlurmAgent for AgentService {
                 .device_registry
                 .lock()
                 .await
-                .build_job_injection_plans("gpu", &launch_gpus, req.uid, req.gid)
+                .build_job_injection_plans(&gpu_selection(&launch_gpus), req.uid, req.gid)
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
                 })?;
@@ -10261,8 +10265,7 @@ impl SlurmAgent for AgentService {
                                     .lock()
                                     .await
                                     .build_job_injection_plans(
-                                        "gpu",
-                                        &gpu_devices,
+                                        &gpu_selection(&gpu_devices),
                                         entry.uid,
                                         entry.gid,
                                     )
@@ -10886,7 +10889,7 @@ impl AgentService {
             .device_registry
             .lock()
             .await
-            .build_job_injection_plans("gpu", gpu_devices, uid, gid)
+            .build_job_injection_plans(&gpu_selection(gpu_devices), uid, gid)
             .map_err(|e| {
                 error!(job_id, error = %e, "device registry resolution failed");
                 Status::failed_precondition(format!("device resolution failed: {}", e))

@@ -13,6 +13,24 @@ pub enum DeviceCapability {
     CountablePool,
 }
 
+/// What a device is for, which decides the runtime env a job gets for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceClass {
+    Gpu,
+    Nic,
+    Other,
+}
+
+impl DeviceClass {
+    pub fn of(gres_name: &str) -> Self {
+        match gres_name {
+            "gpu" => Self::Gpu,
+            "nic" | "vnic" => Self::Nic,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviceEntry {
     pub gres_name: String,
@@ -45,6 +63,10 @@ impl DeviceEntry {
         self.capability == DeviceCapability::CountablePool
     }
 
+    pub fn class(&self) -> DeviceClass {
+        DeviceClass::of(&self.gres_name)
+    }
+
     /// Host paths of this device's own nodes, excluding nodes shared by its kind.
     pub fn node_paths(&self) -> impl Iterator<Item = &str> {
         self.device_edits
@@ -61,8 +83,12 @@ pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
     let gres_name = kind_to_gres_name(&cached.kind);
 
     let vendor = vendor_from_kind(&cached.kind);
+    let gpu_visibility_vars = match DeviceClass::of(&gres_name) {
+        DeviceClass::Gpu => gpu_visibility_for_vendor(vendor.as_deref()),
+        DeviceClass::Nic | DeviceClass::Other => Default::default(),
+    };
     let inject_actions = InjectActions {
-        gpu_visibility_vars: gpu_visibility_for_vendor(vendor.as_deref()),
+        gpu_visibility_vars,
     };
 
     DeviceEntry {

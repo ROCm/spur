@@ -10,10 +10,10 @@ use crate::cdi::cache::CdiCache;
 use crate::gres::cache::CountableGresPool;
 use crate::gres::cache::{ExpandedGresDevice, GresCache};
 use crate::inject::{
-    apply_spur_job_device_env, device_ids_for_gres, merge_edits_from_devices,
-    ContainerInjectionPlan, ContainerInjector, HostInjectionPlan, HostInjector, InjectActions,
+    build_injection_plans, ContainerInjectionPlan, HostInjectionPlan, InjectActions,
 };
 use crate::registry::entry::{entry_matches_gres_name, from_cdi, DeviceCapability, DeviceEntry};
+use crate::types::DeviceSelection;
 
 pub struct DeviceRegistry {
     devices: Vec<DeviceEntry>,
@@ -73,23 +73,24 @@ impl DeviceRegistry {
         Ok(resolved)
     }
 
-    /// Build host/container injection plans for a job from allocated device IDs.
+    /// Build one host/container injection plan covering every allocated kind.
     pub fn build_job_injection_plans(
         &self,
-        gres_name: &str,
-        allocated_ids: &[u64],
+        selection: &DeviceSelection,
         job_uid: u32,
         job_gid: u32,
     ) -> Result<(HostInjectionPlan, ContainerInjectionPlan)> {
-        let devices = self.resolve_by_ids(gres_name, allocated_ids)?;
-        let edits = merge_edits_from_devices(&devices);
+        let mut devices = Vec::new();
+        for (gres_name, ids) in selection {
+            devices.extend(self.resolve_by_ids(gres_name, ids)?);
+        }
+        Ok(build_injection_plans(&devices, job_uid, job_gid))
+    }
 
-        let gpu_ids = device_ids_for_gres(&devices, gres_name);
-        let mut host = HostInjector::plan(&edits, &gpu_ids);
-        let mut container = ContainerInjector::plan(&edits, &gpu_ids, job_uid, job_gid);
-        apply_spur_job_device_env(&mut host.env, &devices);
-        apply_spur_job_device_env(&mut container.env, &devices);
-        Ok((host, container))
+    pub fn has_injectable(&self, gres_name: &str) -> bool {
+        self.devices
+            .iter()
+            .any(|e| e.is_injectable() && e.gres_name == gres_name)
     }
 
     /// The registry to inject from: `pinned` ids keep `previous`'s device even
@@ -314,7 +315,7 @@ mod tests {
     use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use crate::gres::cache::GresCache;
     use crate::gres::entry::GresEntry;
-    use crate::inject::{build_injection_plans, merge_edits_from_devices};
+    use crate::inject::merge_edits_from_devices;
     use crate::registry::entry::kind_matches_gres_name;
     use std::collections::HashSet;
 
@@ -348,6 +349,147 @@ mod tests {
             gid: None,
         });
         entry
+    }
+
+    fn node(path: &str) -> DeviceNode {
+        DeviceNode {
+            path: path.into(),
+            host_path: None,
+            r#type: None,
+            major: None,
+            minor: None,
+            file_mode: None,
+            permissions: None,
+            uid: None,
+            gid: None,
+        }
+    }
+
+    fn spec(kind: &str, devices: &[(&str, &str)], shared: ContainerEdits) -> CdiSpec {
+        CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: kind.into(),
+            annotations: Default::default(),
+            devices: devices
+                .iter()
+                .map(|(name, path)| CdiDevice {
+                    name: (*name).into(),
+                    annotations: Default::default(),
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![node(path)],
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            container_edits: (!shared.is_empty()).then_some(shared),
+        }
+    }
+
+    fn shared_nodes(paths: &[&str]) -> ContainerEdits {
+        ContainerEdits {
+            device_nodes: paths.iter().map(|p| node(p)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn registry_of(specs: &[CdiSpec]) -> DeviceRegistry {
+        let mut cache = CdiCache::new();
+        cache.add_specs(specs);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+        reg
+    }
+
+    fn selection(entries: &[(&str, &[u64])]) -> DeviceSelection {
+        entries
+            .iter()
+            .map(|(gres, ids)| ((*gres).to_string(), ids.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn one_plan_covers_every_allocated_kind() {
+        let reg = registry_of(&[
+            spec(
+                "amd.com/gpu",
+                &[("0", "/dev/dri/renderD128"), ("1", "/dev/dri/renderD129")],
+                shared_nodes(&["/dev/kfd"]),
+            ),
+            spec(
+                "example.com/nic",
+                &[("0", "/dev/infiniband/uverbs0")],
+                shared_nodes(&["/dev/infiniband/rdma_cm"]),
+            ),
+        ]);
+
+        let (host, container) = reg
+            .build_job_injection_plans(&selection(&[("gpu", &[0, 1]), ("nic", &[0])]), 1000, 1000)
+            .unwrap();
+
+        assert_eq!(host.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0,1");
+        for path in [
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129",
+            "/dev/kfd",
+            "/dev/infiniband/uverbs0",
+            "/dev/infiniband/rdma_cm",
+        ] {
+            assert!(host.device_paths.contains(&path.to_string()), "{path}");
+        }
+        assert_eq!(container.device_nodes.len(), 5);
+    }
+
+    #[test]
+    fn a_non_gpu_amd_kind_sets_no_gpu_visibility() {
+        let reg = registry_of(&[spec(
+            "amd.com/nic",
+            &[("0", "/dev/infiniband/uverbs0")],
+            ContainerEdits::default(),
+        )]);
+
+        let (host, container) = reg
+            .build_job_injection_plans(&selection(&[("nic", &[0])]), 1000, 1000)
+            .unwrap();
+
+        assert!(
+            !host.env.contains_key("ROCR_VISIBLE_DEVICES"),
+            "an empty ROCR list would hide the job's GPUs"
+        );
+        assert!(!container.env.contains_key("ROCR_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn two_specs_of_one_kind_both_contribute_their_shared_edits() {
+        let reg = registry_of(&[
+            spec(
+                "amd.com/gpu",
+                &[("0", "/dev/dri/renderD128")],
+                shared_nodes(&["/dev/kfd"]),
+            ),
+            spec(
+                "amd.com/gpu",
+                &[("extra", "/dev/dri/renderD200")],
+                shared_nodes(&["/dev/vendor-ctl"]),
+            ),
+        ]);
+
+        let (host, _) = reg
+            .build_job_injection_plans(&selection(&[("gpu", &[0, 1])]), 1000, 1000)
+            .unwrap();
+
+        assert!(host.device_paths.contains(&"/dev/kfd".to_string()));
+        assert!(host.device_paths.contains(&"/dev/vendor-ctl".to_string()));
+    }
+
+    #[test]
+    fn injectable_kinds_are_reported_by_gres_name() {
+        let reg = registry_of(&[spec(
+            "amd.com/nic",
+            &[("0", "/dev/infiniband/uverbs0")],
+            ContainerEdits::default(),
+        )]);
+        assert!(reg.has_injectable("nic"));
+        assert!(!reg.has_injectable("gpu"));
     }
 
     #[test]
@@ -785,7 +927,7 @@ mod tests {
     fn test_build_job_injection_plans_no_devices_empty_registry() {
         let reg = DeviceRegistry::new();
         let (host_plan, container_plan) = reg
-            .build_job_injection_plans("gpu", &[], 1000, 1000)
+            .build_job_injection_plans(&DeviceSelection::new(), 1000, 1000)
             .unwrap();
         assert!(host_plan.env.is_empty());
         assert!(container_plan.env.is_empty());
@@ -798,7 +940,7 @@ mod tests {
         populate_registry(&mut reg, &cache, &[]);
 
         let (host_plan, container_plan) = reg
-            .build_job_injection_plans("gpu", &[], 1000, 1000)
+            .build_job_injection_plans(&DeviceSelection::new(), 1000, 1000)
             .unwrap();
         assert!(host_plan.env.is_empty());
         assert!(container_plan.env.is_empty());
@@ -811,7 +953,7 @@ mod tests {
         populate_registry(&mut reg, &cache, &[]);
 
         let (host_plan, container_plan) = reg
-            .build_job_injection_plans("gpu", &[0, 1], 1000, 1000)
+            .build_job_injection_plans(&selection(&[("gpu", &[0, 1])]), 1000, 1000)
             .unwrap();
         assert_eq!(host_plan.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0,1");
         assert_eq!(host_plan.env.get("SPUR_JOB_GPUS").unwrap(), "0,1");
@@ -1185,20 +1327,6 @@ mod tests {
         let (host_plan, container_plan) = build_injection_plans(&resolved, 1000, 1000);
         assert_eq!(host_plan.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0");
         assert_eq!(container_plan.device_nodes.len(), 3);
-    }
-
-    fn node(path: &str) -> DeviceNode {
-        DeviceNode {
-            path: path.into(),
-            host_path: None,
-            r#type: None,
-            major: None,
-            minor: None,
-            file_mode: None,
-            permissions: None,
-            uid: None,
-            gid: None,
-        }
     }
 
     /// Auto-detected GPUs as discovery reports them: `cardN` and `renderD{128+N}`

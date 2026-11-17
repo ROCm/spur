@@ -135,8 +135,11 @@ device_id). Returns error if any ID is missing.
 Two injectors: `HostInjector` and `ContainerInjector`. Both consume
 `MergedEdits` (device-specific + shared edits, deduplicated).
 
-`merge_edits_from_devices()`: aggregates per-device edits; applies
-shared edits once per kind.
+`DeviceRegistry::build_job_injection_plans()` takes a `DeviceSelection`
+(gres name -> stable ids) and builds one plan across every allocated kind.
+
+`merge_edits_from_devices()`: aggregates per-device edits; applies each
+distinct set of shared edits once (two specs of one kind both contribute).
 
 **ContainerInjectionPlan**: device nodes (with uid/gid fallback to job
 owner), bind mounts (sorted by depth), env vars, hooks, additional GIDs.
@@ -149,7 +152,8 @@ existing), all device paths.
 **GPU visibility**: sets vendor-appropriate env var
 (ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK) to
 the comma-separated device_id list. Empty device list -> empty string
-(hides all GPUs).
+(hides all GPUs). Only `DeviceClass::Gpu` entries (gres `gpu`) carry
+visibility vars, so a NIC of vendor `amd` never sets ROCR_VISIBLE_DEVICES.
 
 `SPUR_JOB_GPUS` env var is always set when GPU gres devices are present.
 

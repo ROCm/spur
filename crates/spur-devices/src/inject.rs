@@ -101,14 +101,16 @@ pub struct HostInjectionPlan {
 /// Merge container edits and inject actions from resolved registry entries.
 pub fn merge_edits_from_devices(devices: &[&DeviceEntry]) -> MergedEdits {
     let mut result = MergedEdits::default();
-    let mut shared_applied: HashSet<String> = HashSet::new();
+    // Keyed by content, not kind: two specs of one kind (or GRES entries, which
+    // share one internal kind) can each carry their own shared edits.
+    let mut shared_applied: Vec<&ContainerEdits> = Vec::new();
 
     for dev in devices {
         result.device_edits.append(&dev.device_edits);
 
-        if !shared_applied.contains(&dev.kind) && !dev.shared_edits.is_empty() {
+        if !dev.shared_edits.is_empty() && !shared_applied.contains(&&dev.shared_edits) {
             result.shared_edits.append(&dev.shared_edits);
-            shared_applied.insert(dev.kind.clone());
+            shared_applied.push(&dev.shared_edits);
         }
 
         result.inject_actions.merge(&dev.inject_actions);
