@@ -607,16 +607,22 @@ class TestGracePartialExitKeepsOtherRankRunning:
     def cluster_config_overrides(self):
         return _config("cancel")
 
-    def test_grace_partial_exit_keeps_other_rank_running(self, two_node_accounting_cluster):
+    # Rank 0 runs on the batch node, where a root agent wraps a joined step in
+    # `nsenter`; rank 1 runs on the other node. Each rank is the survivor once, so
+    # the wrapped step is checked as the one that must keep running.
+    @pytest.mark.parametrize(
+        "leaving_rank", [0, 1], ids=["rank0-leaves-rank1-keeps-running", "rank1-leaves-rank0-keeps-running"]
+    )
+    def test_grace_partial_exit_keeps_other_rank_running(self, two_node_accounting_cluster, leaving_rank):
         cluster = two_node_accounting_cluster
         _create_graced_qos_pair(cluster, grace_secs=_PARTIAL_GRACE_SECS)
-        rank0_marker = f"{cluster.remote_dir}/rank-rank0.marker"
+        left_marker = f"{cluster.remote_dir}/rank-left.marker"
         checkpoint_marker = f"{cluster.remote_dir}/rank-checkpoint.marker"
         done_marker = f"{cluster.remote_dir}/rank-done.marker"
-        # Rank 0 leaves on the warning; rank 1 keeps checkpointing for longer than
+        # One rank leaves on the warning; the other keeps checkpointing for longer than
         # kill_wait_secs, so only a stray SIGTERM or SIGKILL could cut it short.
         on_term = (
-            f'if [ "$SPUR_PROCID" = 0 ]; then echo left >> {rank0_marker}; exit 0; fi; '
+            f'if [ "$SPUR_PROCID" = {leaving_rank} ]; then echo left >> {left_marker}; exit 0; fi; '
             f"for i in $(seq 1 {_CHECKPOINT_SECS}); do echo ckpt >> {checkpoint_marker}; sleep 1; done; "
             f"echo done >> {done_marker}; exit 0"
         )
@@ -626,9 +632,9 @@ class TestGracePartialExitKeepsOtherRankRunning:
         try:
             warned_at = _wait_for_warning(cluster, victim)
             wait_until(
-                lambda: "left" in _read(cluster, rank0_marker),
+                lambda: "left" in _read(cluster, left_marker),
                 timeout_s=_DEADLINE_MARGIN_SECS, interval_s=1,
-                desc="rank 0 to leave on the warning",
+                desc=f"rank {leaving_rank} to leave on the warning",
             )
 
             # A rank exiting is a step event, not a node report: the job stays running and
@@ -640,10 +646,10 @@ class TestGracePartialExitKeepsOtherRankRunning:
             assert job_state(cluster.squeue_all(), victim.job_id) == "R", (
                 "the victim must keep running while another rank is still checkpointing"
             )
-            _assert_scontrol_state(cluster, victim.job_id, "RUNNING", "after rank 0 left")
+            _assert_scontrol_state(cluster, victim.job_id, "RUNNING", f"after rank {leaving_rank} left")
             checkpoints = _marker_lines(cluster, checkpoint_marker)
             assert 0 < len(checkpoints) < _CHECKPOINT_SECS, (
-                f"rank 1 must still be checkpointing, saw {len(checkpoints)} of {_CHECKPOINT_SECS} lines"
+                f"the other rank must still be checkpointing, saw {len(checkpoints)} of {_CHECKPOINT_SECS} lines"
             )
             assert job_state(cluster.squeue_all(), aggressor_id) == "PD", (
                 "the preemptor must wait while the victim still has a rank running"
@@ -655,7 +661,7 @@ class TestGracePartialExitKeepsOtherRankRunning:
             wait_until(
                 lambda: "done" in _read(cluster, done_marker),
                 timeout_s=_CHECKPOINT_SECS + _SLACK_SECS, interval_s=2,
-                desc="rank 1 to finish its checkpoint",
+                desc="the other rank to finish its checkpoint",
             )
             terminal = wait_job(cluster, victim.job_id, timeout=_SLACK_SECS)
             assert time.time() - warned_at < _PARTIAL_GRACE_SECS, (
@@ -668,7 +674,7 @@ class TestGracePartialExitKeepsOtherRankRunning:
                 "no rank may be sent a second SIGTERM"
             )
             assert len(_marker_lines(cluster, checkpoint_marker)) == _CHECKPOINT_SECS, (
-                "rank 1 must complete every checkpoint step, not be killed part-way"
+                "the other rank must complete every checkpoint step, not be killed part-way"
             )
 
             wait_job_state(cluster, aggressor_id, "R", timeout=_SLACK_SECS)
