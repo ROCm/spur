@@ -170,13 +170,13 @@ output (`-p`/`-P`). Commands: `add`, `modify`, `delete`, `show`, `list`.
 is `Cancel` (`CancelJob`, signal 0; `-b`/`-f` are ignored). Any other signal
 (name, `SIG`-prefixed, number 1-31, any case) is `SignalJob` with target
 `Steps` by default, `Batch` with `-b`, `Full` with `-f` (`-f` wins over `-b`).
-`CancelJob` always cancels whatever signal it carries (`srun`/`salloc`/`sbatch
---wait` Ctrl-C relies on it). A signal never falls back to `CancelJob`: a controller that predates
-`SignalJob` answers `Unimplemented`, reported as an error with exit 1. Filter
-mode without `--state` selects only RUNNING jobs for a signal. A signal to a
-gone job fails (exit 1); a cancel of one does not (`counts_as_failure`).
-`SignalJob` carries a 30 s request timeout, since the controller waits on each
-node's agent.
+`CancelJob` always cancels whatever signal it carries (Ctrl-C in `srun`,
+`salloc` and `sbatch --wait` relies on it). A signal never falls back to
+`CancelJob`: a controller that predates `SignalJob` answers `Unimplemented`,
+reported as an error with exit 1. Filter mode without `--state` selects only
+RUNNING jobs for a signal. A signal to a gone job fails (exit 1); a cancel of
+one does not (`counts_as_failure`). `SignalJob` carries a 30 s request timeout,
+since the controller waits on each node's agent.
 
 ### Admin (scontrol)
 
