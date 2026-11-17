@@ -139,8 +139,11 @@ via `spur-client`, blocking on a lazily-initialized tokio runtime.
 
 - `slurm_init_job_desc_msg(desc)` -- zero a `SlurmJobDescMsg`
 - `slurm_submit_batch_job(desc, job_id)` -- submit via `SubmitJob` RPC
-- `slurm_kill_job(job_id, signal, flags)` -- cancel via `CancelJob` RPC; a
-  signal other than 0 or 9 is delivered to the job's steps without cancelling it
+- `slurm_kill_job(job_id, signal, flags)` -- signal 0 or 9 cancels via the
+  `CancelJob` RPC; any other signal is delivered via `SignalJob` without
+  cancelling the job. `flags` selects the target: `KILL_FULL_JOB` signals every
+  step and the batch script, else `KILL_JOB_BATCH` signals the batch shell only,
+  else the job's steps; other flag bits are ignored
 
 **Query:**
 

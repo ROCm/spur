@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::OnceLock;
 
+use spur_proto::proto::{CancelJobRequest, SignalJobRequest, SignalTarget};
 use types::*;
 
 /// Global controller address (set via SLURM_CONTROLLER_ADDR env var or slurm_init).
@@ -290,23 +291,65 @@ pub extern "C" fn slurm_load_partitions(
     }
 }
 
-/// Kill (cancel) a job.
-#[no_mangle]
-pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_int {
-    let result = runtime().block_on(async {
-        use spur_proto::proto::CancelJobRequest;
+/// libslurm `KILL_*` flag bits (`slurm.h`) that select a signal's target.
+const KILL_JOB_BATCH: u16 = 1 << 0;
+const KILL_FULL_JOB: u16 = 1 << 3;
 
+const SIGNAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a `slurm_kill_job` call asks the controller to do.
+#[derive(Debug, PartialEq, Eq)]
+enum KillAction {
+    Cancel { signal: i32 },
+    Signal { signal: i32, target: SignalTarget },
+}
+
+/// Signals 0 and 9 end the job; any other signal is delivered without ending it, to the
+/// target the flags select. `KILL_FULL_JOB` wins over `KILL_JOB_BATCH`, as `scancel -f -b` does.
+fn kill_action(signal: u16, flags: u16) -> KillAction {
+    let signal = i32::from(signal);
+    if matches!(signal, 0 | 9) {
+        return KillAction::Cancel { signal };
+    }
+    let target = if flags & KILL_FULL_JOB != 0 {
+        SignalTarget::Full
+    } else if flags & KILL_JOB_BATCH != 0 {
+        SignalTarget::Batch
+    } else {
+        SignalTarget::Steps
+    };
+    KillAction::Signal { signal, target }
+}
+
+/// Kill a job (signal 0 or 9), or signal it without ending it (any other signal).
+#[no_mangle]
+pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, flags: u16) -> c_int {
+    let result = runtime().block_on(async {
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
         let mut client = spur_proto::controller_client(channel);
 
-        client
-            .cancel_job(CancelJobRequest {
-                job_id,
-                signal: signal as i32,
-                user: String::new(),
-            })
-            .await
-            .ok()?;
+        match kill_action(signal, flags) {
+            KillAction::Cancel { signal } => {
+                client
+                    .cancel_job(CancelJobRequest {
+                        job_id,
+                        signal,
+                        user: String::new(),
+                    })
+                    .await
+                    .ok()?;
+            }
+            KillAction::Signal { signal, target } => {
+                let mut request = tonic::Request::new(SignalJobRequest {
+                    job_id,
+                    signal,
+                    target: target as i32,
+                    user: String::new(),
+                });
+                request.set_timeout(SIGNAL_RPC_TIMEOUT);
+                client.signal_job(request).await.ok()?;
+            }
+        }
 
         Some(())
     });
@@ -438,6 +481,60 @@ mod tests {
         assert_eq!(
             crate::types::SlurmJobDescMsg::default().num_tasks,
             crate::types::NO_VAL
+        );
+    }
+
+    #[test]
+    fn signals_zero_and_nine_cancel_whatever_the_flags() {
+        for signal in [0, 9] {
+            for flags in [0, KILL_JOB_BATCH, KILL_FULL_JOB, u16::MAX] {
+                assert_eq!(
+                    kill_action(signal, flags),
+                    KillAction::Cancel {
+                        signal: i32::from(signal)
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_signals_go_to_the_target_the_flags_select() {
+        let signal = |flags| kill_action(10, flags);
+        let to = |target| KillAction::Signal { signal: 10, target };
+        assert_eq!(signal(0), to(SignalTarget::Steps));
+        assert_eq!(signal(KILL_JOB_BATCH), to(SignalTarget::Batch));
+        assert_eq!(signal(KILL_FULL_JOB), to(SignalTarget::Full));
+        assert_eq!(
+            signal(KILL_FULL_JOB | KILL_JOB_BATCH),
+            to(SignalTarget::Full)
+        );
+    }
+
+    #[test]
+    fn flag_bits_that_select_no_target_are_ignored() {
+        let steps_only = 1 << 2;
+        let others = !(KILL_JOB_BATCH | KILL_FULL_JOB);
+        assert_eq!(
+            kill_action(15, steps_only),
+            KillAction::Signal {
+                signal: 15,
+                target: SignalTarget::Steps
+            }
+        );
+        assert_eq!(
+            kill_action(15, others),
+            KillAction::Signal {
+                signal: 15,
+                target: SignalTarget::Steps
+            }
+        );
+        assert_eq!(
+            kill_action(15, others | KILL_JOB_BATCH),
+            KillAction::Signal {
+                signal: 15,
+                target: SignalTarget::Batch
+            }
         );
     }
 }
