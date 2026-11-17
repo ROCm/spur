@@ -13,7 +13,7 @@ use crate::inject::{
     build_injection_plans, ContainerInjectionPlan, HostInjectionPlan, InjectActions,
 };
 use crate::registry::entry::{entry_matches_gres_name, from_cdi, DeviceCapability, DeviceEntry};
-use crate::types::DeviceSelection;
+use crate::selection::DeviceSelection;
 
 pub struct DeviceRegistry {
     devices: Vec<DeviceEntry>,
@@ -89,7 +89,7 @@ impl DeviceRegistry {
         job_gid: u32,
     ) -> Result<(HostInjectionPlan, ContainerInjectionPlan)> {
         let mut devices = Vec::new();
-        for (gres_name, ids) in selection {
+        for (gres_name, ids) in selection.iter() {
             devices.extend(self.resolve_by_ids(gres_name, ids)?);
         }
         Ok(build_injection_plans(&devices, job_uid, job_gid))
@@ -500,8 +500,9 @@ mod tests {
     fn selection(entries: &[(&str, &[u64])]) -> DeviceSelection {
         entries
             .iter()
-            .map(|(gres, ids)| ((*gres).to_string(), ids.to_vec()))
-            .collect()
+            .fold(DeviceSelection::new(), |sel, (gres, ids)| {
+                sel.with(gres, ids.to_vec())
+            })
     }
 
     #[test]

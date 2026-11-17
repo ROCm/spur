@@ -7,6 +7,7 @@ pub mod gres;
 pub mod inject;
 pub mod pci;
 pub mod registry;
+pub mod selection;
 mod sysfs;
 pub mod topology;
 pub mod types;
@@ -19,4 +20,5 @@ pub use inject::{
     InjectActions, MergedEdits,
 };
 pub use registry::{DeviceCapability, DeviceClass, DeviceEntry, DeviceRegistry};
-pub use types::{DeviceSelection, LinkType};
+pub use selection::DeviceSelection;
+pub use types::LinkType;

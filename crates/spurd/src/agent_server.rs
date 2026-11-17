@@ -49,7 +49,7 @@ use crate::reporter::NodeReporter;
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
 /// devices" so they cannot inherit the runtime's all-visible default.
 fn gpu_selection(gpu_ids: &[u64]) -> spur_devices::DeviceSelection {
-    spur_devices::DeviceSelection::from([("gpu".to_string(), gpu_ids.to_vec())])
+    spur_devices::DeviceSelection::new().with("gpu", gpu_ids.to_vec())
 }
 
 fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
