@@ -19,8 +19,8 @@ static on-disk CDI spec that the test rewrites between refresh ticks:
 Each GPU carries a `spur.amd.com/stable-id` annotation (a BDF-anchored u32
 computed like the Rust `encode_stable_id`) that becomes the GPU's stable_id in
 the scheduler, plus a `spur.amd.com/render-minor` annotation (injection still
-keys the device node off the minor). The controller prints one `gpu:<type>:1`
-Gres entry per device, so `node_gpu_count` returns the device count.
+keys the device node off the minor). `node_gpu_count` sums the counts of the
+node's `gpu[:type]:count` Gres entries, so it returns the device count.
 """
 
 import json
