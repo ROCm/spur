@@ -3681,6 +3681,7 @@ dependencies = [
 name = "spur-proto"
 version = "0.16.0"
 dependencies = [
+ "h2",
  "prost",
  "prost-types",
  "tonic",

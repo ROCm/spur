@@ -40,6 +40,11 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
+# HTTP/2 layer under hyper/tonic. Floored at >=0.4.20: earlier 0.4.x releases
+# predate DATA-frame and send-buffer fixes this project relies on under heavy
+# concurrent streaming. Not used directly; the floor just keeps the resolver
+# off older 0.4.x.
+h2 = "0.4.20"
 
 # REST API
 axum = { version = "0.8", features = ["json"] }
