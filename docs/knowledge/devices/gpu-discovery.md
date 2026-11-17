@@ -155,8 +155,8 @@ Real nonzero stable_ids from KFD discovery are never overwritten.
 `ResourceSet` (resource.rs) carries the node's inventory:
 
 - `cpus`, `memory_mb` -- scalar resources
-- `gpus: Vec<GpuResource>` -- per-GPU: device_id, gpu_type, memory_mb,
-  peer_gpus, link_type, stable_id, topology
+- `devices: Vec<Device>` -- every allocatable device: gres_name, device_type,
+  stable_id, index (positional), topology. `gpus()` views the GPUs.
 - `generic: HashMap<String, u64>` -- countable GRES (bandwidth, licenses)
 - `generation` -- bumped on every topology rebuild
 
@@ -170,7 +170,7 @@ GPU's `stable_id`.
 within a node. For GPUs:
 
 - `gpu_allocated: Vec<bool>` -- one bool per GPU in the inventory
-- `gpus: Vec<GpuResource>` -- the node's GPU table
+- `gpus: Vec<Device>` -- the node's GPU table
 
 Key operations:
 

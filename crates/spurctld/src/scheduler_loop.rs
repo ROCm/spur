@@ -5034,10 +5034,10 @@ pub async fn send_suspend_to_agents(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use spur_core::device::Device;
     use spur_core::job::{Job, JobSpec};
     use spur_core::resource::{
-        build_exclusive_allocation, build_node_allocation, GpuLinkType, GpuResource,
-        ResourceAllocations, ResourceSet,
+        build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
 
@@ -5660,30 +5660,28 @@ pub(crate) mod tests {
         );
     }
 
-    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<Device>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus,
             memory_mb,
-            gpus,
+            devices: gpus,
             generic: HashMap::new(),
             generation: 0,
             topology: None,
         }
     }
 
-    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
-        GpuResource {
-            device_id,
-            gpu_type: gpu_type.into(),
-            memory_mb: 192_000,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::PCIe,
-            topology: None,
+    fn gpu(device_id: u32, gpu_type: &str) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: gpu_type.into(),
             stable_id: device_id as u64,
             numa_node: None,
             affinity_cpus: Vec::new(),
+            index: device_id,
+            topology: None,
         }
     }
 
@@ -5831,7 +5829,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_a,
             generation: 0,
             topology: None,
@@ -5844,7 +5842,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_b,
             generation: 0,
             topology: None,
@@ -7259,18 +7257,8 @@ pub(crate) mod tests {
             // search never revisits a pick, so nothing is evicted (a documented limit).
             let gpu_node = |name: &str, count: u32| {
                 let mut n = node(name, 4);
-                n.total_resources.gpus = (0..count)
-                    .map(|i| spur_core::resource::GpuResource {
-                        device_id: i,
-                        gpu_type: "mi300x".into(),
-                        memory_mb: 0,
-                        peer_gpus: vec![],
-                        link_type: spur_core::resource::GpuLinkType::XGMI,
-                        topology: None,
-                        stable_id: u64::from(i) + 1,
-                        numa_node: None,
-                        affinity_cpus: Vec::new(),
-                    })
+                n.total_resources.devices = (0..count)
+                    .map(|i| spur_core::device::Device::gpu(u64::from(i) + 1, "mi300x", i))
                     .collect();
                 n
             };

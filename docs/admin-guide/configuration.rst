@@ -2580,8 +2580,9 @@ converges to hardware changes without an agent restart — see
      - File-based or countable GRES pools; see below.
 
 Each ``[[devices.gres]]`` entry uses Slurm GRES syntax with fields ``name``
-(required), ``type``, ``file``, ``multiple_files``, ``count``, ``cores``, ``links``,
-and ``flags`` ([string]). Examples:
+(required), ``type``, ``file``, ``multiple_files``, ``count``, ``cores`` and
+``flags`` ([string]). ``links`` is accepted for Slurm compatibility but has no
+effect. Examples:
 
 .. code-block:: toml
 
@@ -2603,8 +2604,8 @@ reserved cores; on other kinds it is accepted and has no effect. To set
 or from a CDI spec), give an entry of the same ``name`` that names one of its
 device nodes, for example a GPU's render node or a NIC's ``uverbs`` node. The
 entry is merged into the devices it names instead of adding a device: its
-``type``, ``cores`` and ``links``, where set, replace what discovery or the CDI
-annotations reported, and each device keeps its discovered device nodes.
+``type`` and ``cores``, where set, replace what discovery or the CDI annotations
+reported, and each device keeps its discovered device nodes.
 ``/dev/kfd`` and other nodes every device of a kind shares do not name a
 device. A node several devices share, such as the ``/dev/dri/cardN`` of a
 partitioned GPU, names all of them unless the entry also names a node of only

@@ -5779,28 +5779,12 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
     // Backfill so no stable_id==0 from a legacy/mixed-version agent reaches accounting.
+    #[allow(deprecated)]
+    let legacy_gpus = r.gpus;
     let mut rs = spur_core::resource::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
-        gpus: r
-            .gpus
-            .into_iter()
-            .map(|g| spur_core::resource::GpuResource {
-                device_id: g.device_id,
-                gpu_type: g.gpu_type,
-                memory_mb: g.memory_mb,
-                peer_gpus: g.peer_gpus,
-                link_type: match g.link_type {
-                    1 => spur_core::resource::GpuLinkType::XGMI,
-                    2 => spur_core::resource::GpuLinkType::NVLink,
-                    _ => spur_core::resource::GpuLinkType::PCIe,
-                },
-                topology: g.topology.map(spur_core::device_topology::from_proto),
-                stable_id: g.stable_id,
-                numa_node: g.numa_node,
-                affinity_cpus: g.affinity_cpus,
-            })
-            .collect(),
+        devices: spur_core::device::devices_from_proto(r.devices, legacy_gpus),
         generic: r.generic,
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
@@ -6522,37 +6506,13 @@ pub(crate) fn allocations_to_proto(
 pub(crate) fn resource_to_proto(
     r: &spur_core::resource::ResourceSet,
 ) -> spur_proto::proto::ResourceSet {
+    let (devices, legacy_gpus) = spur_core::device::devices_to_proto(&r.devices);
+    #[allow(deprecated)]
     spur_proto::proto::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
-        gpus: r
-            .gpus
-            .iter()
-            .map(|g| spur_proto::proto::GpuResource {
-                device_id: g.device_id,
-                gpu_type: g.gpu_type.clone(),
-                memory_mb: g.memory_mb,
-                peer_gpus: g.peer_gpus.clone(),
-                link_type: match g.link_type {
-                    spur_core::resource::GpuLinkType::XGMI => {
-                        spur_proto::proto::GpuLinkType::GpuLinkXgmi as i32
-                    }
-                    spur_core::resource::GpuLinkType::NVLink => {
-                        spur_proto::proto::GpuLinkType::GpuLinkNvlink as i32
-                    }
-                    spur_core::resource::GpuLinkType::PCIe => {
-                        spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
-                    }
-                },
-                topology: g
-                    .topology
-                    .as_ref()
-                    .map(spur_core::device_topology::to_proto),
-                stable_id: g.stable_id,
-                numa_node: g.numa_node,
-                affinity_cpus: g.affinity_cpus.clone(),
-            })
-            .collect(),
+        gpus: legacy_gpus,
+        devices,
         generic: r.generic.clone(),
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
@@ -7170,18 +7130,18 @@ mod tests {
 
     #[test]
     fn resource_set_proto_round_trip_preserves_stable_id_generation_topology_and_affinity() {
-        use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+        use spur_core::device::Device;
+        use spur_core::resource::ResourceSet;
         let rs = ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: vec![GpuResource {
-                device_id: 1,
-                gpu_type: "mi300x".into(),
-                memory_mb: 196_608,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
+            devices: vec![Device {
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
+                stable_id: 129,
+                index: 1,
                 topology: Some(spur_core::resource::DeviceTopology {
                     pci_bdf: Some("0001:04:00.0".into()),
                     fabric: Some(spur_core::device_topology::FabricObservation {
@@ -7192,7 +7152,6 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                stable_id: 129,
                 numa_node: Some(1),
                 affinity_cpus: vec![64, 65, 192, 193],
             }],
@@ -7202,8 +7161,8 @@ mod tests {
         };
         let back = proto_to_resource_set(resource_to_proto(&rs));
         assert_eq!(back.generation, 42);
-        assert_eq!(back.gpus[0].stable_id, 129);
-        assert_eq!(back.gpus[0].device_id, 1);
+        assert_eq!(back.devices[0].stable_id, 129);
+        assert_eq!(back.devices[0].index, 1);
         assert_eq!(back, rs);
     }
 
@@ -13297,10 +13256,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_rejects_a_changed_fabric_binding() {
+        use spur_core::device::Device;
         use spur_core::fabric::{FabricObservation, ObservationStatus};
         use spur_core::resource::{
-            AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource, ResourceAllocations,
-            ResourceSet,
+            AllocatedDevice, DeviceTopology, ResourceAllocations, ResourceSet,
         };
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
@@ -13317,13 +13276,11 @@ mod tests {
                 local_endpoints: vec!["1".into()],
                 ..Default::default()
             };
-            let gpu = GpuResource {
-                device_id: 0,
+            let gpu = Device {
+                gres_name: "gpu".into(),
+                device_type: "test".into(),
                 stable_id: 42,
-                gpu_type: "test".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
+                index: 0,
                 topology: Some(DeviceTopology {
                     fabric: Some(fabric),
                     ..Default::default()
@@ -13340,7 +13297,7 @@ mod tests {
                         memory_mb: 16000,
                         generation: 7,
                         fabric_binding_version: 1,
-                        gpus: vec![gpu],
+                        devices: vec![gpu],
                         ..Default::default()
                     },
                     "127.0.0.1".into(),
@@ -13356,7 +13313,7 @@ mod tests {
         };
         let domain_is = |domain: &str| {
             svc.cluster.get_node("n1").is_some_and(|node| {
-                node.total_resources.gpus[0]
+                node.total_resources.devices[0]
                     .topology
                     .as_ref()
                     .and_then(|t| t.fabric.as_ref())
@@ -16369,7 +16326,8 @@ mod tests {
                 generation,
                 fabric_binding_version: 1,
                 block_file_revision: None,
-                gpus: vec![spur_proto::proto::GpuResource {
+                devices: vec![spur_proto::proto::Device {
+                    gres_name: "gpu".into(),
                     stable_id: 42,
                     topology: Some(spur_proto::proto::DeviceTopology {
                         pci_bdf: Some("0001:04:00.0".into()),
@@ -17326,7 +17284,7 @@ mod tests {
     fn node_to_proto_carries_cpu_shape_gpu_cpus_and_capabilities() {
         use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
         use spur_core::cpu_topology::{CpuRecord, CpuTopology};
-        use spur_core::resource::{GpuLinkType, GpuResource};
+        use spur_core::device::Device;
         let records: Vec<CpuRecord> = (0..4)
             .flat_map(|core| {
                 [core, core + 4].map(|cpu| CpuRecord {
@@ -17337,21 +17295,14 @@ mod tests {
                 })
             })
             .collect();
-        let gpu = |stable_id: u64, numa_node: Option<u32>| GpuResource {
-            device_id: stable_id as u32,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            stable_id,
-            topology: None,
+        let gpu = |stable_id: u64, numa_node: Option<u32>| Device {
             numa_node,
-            affinity_cpus: vec![],
+            ..Device::gpu(stable_id, "mi300x", stable_id as u32)
         };
         let mut node = spur_core::node::Node::new(
             "n1".into(),
             spur_core::resource::ResourceSet {
-                gpus: vec![gpu(1, Some(0)), gpu(2, None)],
+                devices: vec![gpu(1, Some(0)), gpu(2, None)],
                 ..Default::default()
             },
         );

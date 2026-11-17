@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::config::NodeConfig;
 use crate::cpu_topology::{parse_cpu_list, CpuListError, CpuTopology};
-use crate::resource::{GpuResource, ResourceAllocations};
+use crate::device::Device;
+use crate::resource::ResourceAllocations;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuReservedCpus {
@@ -128,11 +129,12 @@ impl NodeCoreSettings {
 
 impl CoreLayout {
     /// `Ok(None)` when the node sets neither spec cores nor reserved cores per
-    /// GPU. `memory_mb` is the node's detected memory, 0 when unknown.
+    /// GPU. `memory_mb` is the node's detected memory, 0 when unknown. Only
+    /// the GPUs among `devices` reserve cores.
     pub fn compute(
         topology: Option<&CpuTopology>,
         settings: &NodeCoreSettings,
-        gpus: &[GpuResource],
+        devices: &[Device],
         memory_mb: u64,
         previous: &[GpuReservedCpus],
     ) -> Result<Option<CoreLayout>, LayoutError> {
@@ -165,7 +167,7 @@ impl CoreLayout {
         };
         let excluded: BTreeSet<usize> = spec_cores.union(&trimmed).copied().collect();
         let reserved = match restricted {
-            Some(per_gpu) => pick_reserved_cores(topology, gpus, per_gpu, &excluded, previous)
+            Some(per_gpu) => pick_reserved_cores(topology, devices, per_gpu, &excluded, previous)
                 .map_err(|e| within_cap(e, cap.filter(|_| !trimmed.is_empty())))?,
             None => Vec::new(),
         };
@@ -393,12 +395,12 @@ type GpuNear = (u64, Result<BTreeSet<usize>, LayoutError>);
 /// the fresh rule when history fragments the cores too much to fit.
 fn pick_reserved_cores(
     topology: &CpuTopology,
-    gpus: &[GpuResource],
+    devices: &[Device],
     per_gpu: u32,
     excluded: &BTreeSet<usize>,
     previous: &[GpuReservedCpus],
 ) -> Result<Vec<(u64, BTreeSet<usize>)>, LayoutError> {
-    let mut ordered: Vec<&GpuResource> = gpus.iter().collect();
+    let mut ordered: Vec<&Device> = devices.iter().filter(|d| d.is_gpu()).collect();
     ordered.sort_by_key(|g| g.stable_id);
     // Resolved once so a bad `cores=` warns once per compute; each phase still
     // surfaces an affinity error where it reaches that GPU, as before.
@@ -484,7 +486,7 @@ fn fill_reserved_cores(
 
 /// Cores near a GPU (its configured CPUs if any, else its NUMA node's), plus
 /// the configured CPUs not online on the node.
-fn near_cores(topology: &CpuTopology, gpu: &GpuResource) -> (BTreeSet<usize>, Vec<u32>) {
+fn near_cores(topology: &CpuTopology, gpu: &Device) -> (BTreeSet<usize>, Vec<u32>) {
     if gpu.affinity_cpus.is_empty() {
         let cores = gpu.numa_node.map_or_else(BTreeSet::new, |numa| {
             (0..topology.cores.len())
@@ -512,7 +514,7 @@ fn near_cores(topology: &CpuTopology, gpu: &GpuResource) -> (BTreeSet<usize>, Ve
 /// not online on the node are ignored.
 fn gpu_affinity_cores(
     topology: &CpuTopology,
-    gpu: &GpuResource,
+    gpu: &Device,
 ) -> Result<BTreeSet<usize>, LayoutError> {
     let (cores, dropped) = near_cores(topology, gpu);
     // One warning per GPU per layout recompute (not per CPU), so a wide
@@ -535,7 +537,7 @@ fn gpu_affinity_cores(
 
 /// CPUs `restricted_cores_per_gpu` picks a GPU's reserved cores from; empty
 /// when it has no `cores=` and no NUMA node. Silent, for display paths.
-pub fn gpu_affinity_cpus(topology: &CpuTopology, gpu: &GpuResource) -> Vec<u32> {
+pub fn gpu_affinity_cpus(topology: &CpuTopology, gpu: &Device) -> Vec<u32> {
     cpus_of(topology, &near_cores(topology, gpu).0)
 }
 
@@ -1175,20 +1177,13 @@ mod tests {
         assert!(restart_only_node_changes(&old, &new).is_empty());
     }
 
-    fn gpus_on_numa(per_numa: u32) -> Vec<GpuResource> {
+    fn gpus_on_numa(per_numa: u32) -> Vec<Device> {
         (0..2u32)
             .flat_map(|numa| (0..per_numa).map(move |_| numa))
             .enumerate()
-            .map(|(n, numa)| GpuResource {
-                device_id: n as u32,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: crate::resource::GpuLinkType::XGMI,
-                stable_id: 0x100 + n as u64,
-                topology: None,
+            .map(|(n, numa)| Device {
                 numa_node: Some(numa),
-                affinity_cpus: vec![],
+                ..Device::gpu(0x100 + n as u64, "mi300x", n as u32)
             })
             .collect()
     }
@@ -1201,7 +1196,7 @@ mod tests {
         }
     }
 
-    fn reserved_layout(settings: &NodeCoreSettings, gpus: &[GpuResource]) -> CoreLayout {
+    fn reserved_layout(settings: &NodeCoreSettings, gpus: &[Device]) -> CoreLayout {
         CoreLayout::compute(Some(&example_node()), settings, gpus, 0, &[])
             .unwrap()
             .unwrap()
@@ -1223,6 +1218,20 @@ mod tests {
         assert_eq!(layout.gpu_reserved[4].cpus, fifth, "first GPU of NUMA 1");
         assert_eq!(layout.general_cpus.len(), 256 - 8 * 16);
         assert!(layout.spec_cpus.is_empty());
+    }
+
+    #[test]
+    fn compute_ignores_nics_on_a_mixed_inventory() {
+        let gpus = gpus_on_numa(1);
+        let mut mixed = gpus.clone();
+        mixed.push(Device {
+            numa_node: Some(0),
+            ..Device::new("nic", "vnic", 0x900, 0)
+        });
+        assert_eq!(
+            reserved_layout(&restricted(8), &mixed),
+            reserved_layout(&restricted(8), &gpus)
+        );
     }
 
     #[test]
@@ -1250,7 +1259,7 @@ mod tests {
 
     fn sticky(
         settings: &NodeCoreSettings,
-        gpus: &[GpuResource],
+        gpus: &[Device],
         previous: &[GpuReservedCpus],
     ) -> CoreLayout {
         CoreLayout::compute(Some(&example_node()), settings, gpus, 0, previous)
@@ -1316,7 +1325,7 @@ mod tests {
     fn a_removed_gpu_and_a_new_gpu_recompute_together() {
         let gpus = gpus_on_numa(4);
         let before = reserved_layout(&restricted(8), &gpus);
-        let mut kept: Vec<GpuResource> = gpus
+        let mut kept: Vec<Device> = gpus
             .iter()
             .filter(|g| g.stable_id != 0x100)
             .cloned()
@@ -1375,7 +1384,7 @@ mod tests {
     fn a_removed_gpus_cores_go_only_to_short_gpus() {
         let gpus = gpus_on_numa(4);
         let before = reserved_layout(&restricted(8), &gpus);
-        let kept: Vec<GpuResource> = gpus
+        let kept: Vec<Device> = gpus
             .iter()
             .filter(|g| g.stable_id != 0x100)
             .cloned()
@@ -1620,7 +1629,7 @@ mod tests {
     #[test]
     fn too_few_unique_cores_is_a_layout_error() {
         // Five GPUs on NUMA 0 at 16 cores each need 80 of its 64 cores.
-        let gpus: Vec<GpuResource> = gpus_on_numa(5).into_iter().take(5).collect();
+        let gpus: Vec<Device> = gpus_on_numa(5).into_iter().take(5).collect();
         assert_eq!(
             CoreLayout::compute(Some(&example_node()), &restricted(16), &gpus, 0, &[]),
             Err(LayoutError::TooFewCores {

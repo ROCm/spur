@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_core::device::Device;
+use spur_core::resource::ResourceSet;
 
 fn gpu(device_id: u64) -> ResourceAllocations {
     let mut allocation = scalar();
@@ -19,16 +20,14 @@ fn register_gpu_node(cm: &ClusterManager) {
         resources: ResourceSet {
             cpus: 8,
             memory_mb: 200,
-            gpus: [7, 8]
+            devices: [7, 8]
                 .into_iter()
                 .enumerate()
-                .map(|(index, stable_id)| GpuResource {
-                    device_id: index as u32,
-                    gpu_type: "test".into(),
-                    memory_mb: 100,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::PCIe,
+                .map(|(index, stable_id)| Device {
+                    gres_name: "gpu".into(),
+                    device_type: "test".into(),
                     stable_id,
+                    index: index as u32,
                     topology: None,
                     numa_node: None,
                     affinity_cpus: Vec::new(),

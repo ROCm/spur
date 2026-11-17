@@ -115,7 +115,7 @@ and countable pools (count-only, no device paths).
    `merge_targets()`). Only its own nodes count (`own_node_paths()`, so not
    `/dev/kfd`). A node only one discovered entry has names that entry; when
    none does, a shared node (a partitioned GPU's `cardN`) names every entry
-   behind it. Its `type`/`cores`/`links` merge onto the named entries (device
+   behind it. Its `type`/`cores` merge onto the named entries (device
    nodes stay discovery's) and its other own nodes are dropped with a warning.
    An entry naming no discovered entry stays a candidate.
 3. GRES countable pools
@@ -125,8 +125,8 @@ and countable pools (count-only, no device paths).
 
 `DeviceEntry` (entry.rs) carries all scheduling-relevant fields:
 gres_name, kind, device_id, stable_id, capability (Injectable vs
-CountablePool), memory_mb, numa_node, cores, links, link_type, pci_bdf,
-topology, vendor, inject_actions, device/shared edits. `node_paths()` yields the
+CountablePool), pci_bdf, topology,
+vendor, inject_actions, device/shared edits. `node_paths()` yields the
 device's own node paths (not its kind's shared ones).
 
 `resolve_by_ids()` looks up devices by stable_id (not positional
@@ -166,12 +166,6 @@ round-trips through annotation maps. Key fields: gpu-type, memory-mb,
 numa-node, cores (range notation: "0-3,8,16-18"), links (weight matrix),
 link-type, pci-bdf, compute-partition, memory-partition, unique-id,
 render-minor, stable-id, auto-detected.
-
-## Link type resolution
-
-`resolve_link_type()` (entry.rs): explicit annotation wins. Otherwise
-infers from link weights + vendor (AMD -> XGMI, NVIDIA -> NVLink,
-unknown -> PCIe). Default is PCIe when no link data present.
 
 ## Testing
 

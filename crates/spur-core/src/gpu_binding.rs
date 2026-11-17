@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::resource::{DeviceTopology, GpuResource, ResourceAllocations, ResourceSet};
+use crate::device::Device;
+use crate::resource::{DeviceTopology, ResourceAllocations, ResourceSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -46,11 +47,11 @@ impl BoundGpu {
     }
 }
 
-impl From<&GpuResource> for BoundGpu {
-    fn from(gpu: &GpuResource) -> Self {
+impl From<&Device> for BoundGpu {
+    fn from(gpu: &Device) -> Self {
         Self {
             stable_id: gpu.stable_id,
-            gpu_type: gpu.gpu_type.clone(),
+            gpu_type: gpu.device_type.clone(),
             topology: gpu.topology.clone(),
         }
     }
@@ -74,8 +75,7 @@ impl GpuBinding {
             node: node.into(),
             generation: allocation.generation,
             gpus: inventory
-                .gpus
-                .iter()
+                .gpus()
                 .filter(|gpu| ids.contains(&gpu.stable_id))
                 .map(BoundGpu::from)
                 .collect(),
@@ -138,10 +138,9 @@ impl GpuBinding {
         }
         for expected in &self.gpus {
             let mut found = inventory
-                .gpus
-                .iter()
+                .gpus()
                 .filter(|g| g.stable_id == expected.stable_id);
-            let same = |gpu: &GpuResource| match check {
+            let same = |gpu: &Device| match check {
                 BindingCheck::Dispatch => {
                     BoundGpu::from(gpu).device_facts() == expected.device_facts()
                 }
@@ -219,19 +218,18 @@ pub fn from_proto(binding: spur_proto::proto::GpuPropertyBinding) -> GpuBinding 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{AllocatedDevice, GpuLinkType};
+    use crate::device::Device;
+    use crate::resource::AllocatedDevice;
 
     fn fixture() -> (ResourceSet, ResourceAllocations) {
         let inventory = ResourceSet {
             generation: 7,
             fabric_binding_version: GPU_PROPERTIES_CAPABILITY,
-            gpus: vec![GpuResource {
-                device_id: 0,
+            devices: vec![Device {
+                gres_name: "gpu".into(),
+                device_type: "test".into(),
                 stable_id: 128,
-                gpu_type: "test".into(),
-                memory_mb: 24,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
+                index: 0,
                 topology: Some(DeviceTopology {
                     pci_root: Some("pci0001:00".into()),
                     numa_node: Some(0),
@@ -258,7 +256,7 @@ mod tests {
         let (mut inventory, mut allocation) = fixture();
         let mut binding = GpuBinding::new("n0", &inventory, &allocation).unwrap();
         binding.rename_gpus(&[(128, 0x110001)].into());
-        inventory.gpus[0].stable_id = 0x110001;
+        inventory.devices[0].stable_id = 0x110001;
         allocation
             .devices
             .insert("gpu".into(), vec![AllocatedDevice::injectable(0x110001)]);
@@ -276,11 +274,11 @@ mod tests {
             match mutate {
                 0 => changed.generation += 1,
                 1 => changed.fabric_binding_version = 2,
-                2 => changed.gpus[0].gpu_type = "changed".into(),
-                3 => changed.gpus[0].topology.as_mut().unwrap().pci_root = Some("other".into()),
-                4 => changed.gpus[0].topology.as_mut().unwrap().numa_node = None,
-                5 => changed.gpus[0].topology.as_mut().unwrap().vram_bytes = Some(0),
-                _ => changed.gpus.clear(),
+                2 => changed.devices[0].device_type = "changed".into(),
+                3 => changed.devices[0].topology.as_mut().unwrap().pci_root = Some("other".into()),
+                4 => changed.devices[0].topology.as_mut().unwrap().numa_node = None,
+                5 => changed.devices[0].topology.as_mut().unwrap().vram_bytes = Some(0),
+                _ => changed.devices.clear(),
             }
             assert!(binding.validate("n0", &changed, &allocation).is_err());
         }
@@ -301,7 +299,7 @@ mod tests {
     fn step_check_ignores_generation_and_vpod_wide_fields_only() {
         use spur_devices::topology::{FabricObservation, ObservationIssueKind, ObservationStatus};
         let (mut inventory, allocation) = fixture();
-        inventory.gpus[0].topology.as_mut().unwrap().fabric = Some(FabricObservation {
+        inventory.devices[0].topology.as_mut().unwrap().fabric = Some(FabricObservation {
             status: ObservationStatus::Consistent,
             fabric_domain_id: Some("15".into()),
             endpoint_id: Some("1".into()),
@@ -312,7 +310,7 @@ mod tests {
         let binding = GpuBinding::new("n0", &inventory, &allocation).unwrap();
         let mut changed = inventory.clone();
         changed.generation += 1;
-        let fabric = changed.gpus[0]
+        let fabric = changed.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -324,7 +322,7 @@ mod tests {
         assert!(binding.validate("n0", &changed, &allocation).is_err());
         binding.validate_step("n0", &changed, &allocation).unwrap();
         let mut peer = inventory.clone();
-        let fabric = peer.gpus[0]
+        let fabric = peer.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -337,7 +335,7 @@ mod tests {
         binding.validate_step("n0", &peer, &allocation).unwrap();
         for mutate in 0..5 {
             let mut own = changed.clone();
-            let topology = own.gpus[0].topology.as_mut().unwrap();
+            let topology = own.devices[0].topology.as_mut().unwrap();
             let fabric = topology.fabric.as_mut().unwrap();
             match mutate {
                 0 => fabric.fabric_domain_id = Some("16".into()),

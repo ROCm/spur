@@ -99,8 +99,8 @@ NVIDIA GPUs (`h100`, `a100`, etc.) use `nvidia.com/gpu`. Default is AMD.
 Watches nodes matching the label selector. Extracts resources from
 `status.allocatable`: CPU (whole cores, millicore-aware), memory, GPU count
 (`amd.com/gpu` preferred over `nvidia.com/gpu`). GPU metadata from labels:
-`spur.amd.com/gpu-type`, `spur.amd.com/gpu-memory-mb`, `spur.amd.com/gpu-link`
-(xgmi/nvlink/pcie).
+`spur.amd.com/gpu-type` and `spur.amd.com/gpu-memory-mb` (reported as the
+device's VRAM). GPUs are sent as `ResourceSet.devices`.
 
 Fingerprint-based re-registration: only re-registers when resources change.
 Taint tracking: `node.kubernetes.io/not-ready` NoSchedule maps to spurctld
@@ -156,7 +156,6 @@ or native JWKS from spur.conf. Forged credentials are logged with peer address.
 | `spur.amd.com/target-node` | Pod placement tracking |
 | `spur.amd.com/gpu-type` | GPU type for resource inventory |
 | `spur.amd.com/gpu-memory-mb` | GPU memory for resource inventory |
-| `spur.amd.com/gpu-link` | GPU interconnect (xgmi/nvlink) |
 
 ## CLI flags
 

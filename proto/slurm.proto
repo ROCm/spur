@@ -16,11 +16,25 @@ import "google/protobuf/empty.proto";
 message ResourceSet {
   uint32 cpus = 1;
   uint64 memory_mb = 2;
-  repeated GpuResource gpus = 3;
+  // Deprecated: the GPUs of `devices`, still filled for older readers. Removed
+  // in a future release; read `devices`.
+  repeated GpuResource gpus = 3 [deprecated = true];
   map<string, uint64> generic = 4;  // licenses, etc.
   uint64 generation = 5;  // bumped by the agent on each topology rebuild
   uint32 fabric_binding_version = 6; // shared capability level: native fabric=1, file=2, GPU properties=3
   optional string block_file_revision = 7;
+  repeated Device devices = 8;  // every allocatable device, of every kind
+}
+
+// One allocatable device: a GPU, a NIC, or any other kind a node reports.
+message Device {
+  string gres_name = 1;    // "gpu", "nic", ...
+  string device_type = 2;  // "mi300x", "pollara400"; empty when untyped
+  uint64 stable_id = 3;    // allocation identity, unique per gres_name on a node
+  uint32 index = 4;        // positional index the vendor runtime numbers it by
+  DeviceTopology topology = 5;
+  optional uint32 numa_node = 6;
+  repeated uint32 affinity_cpus = 7;  // CPU IDs from `[[devices.gres]] cores=`; empty = its NUMA node's
 }
 
 message AllocatedDevice {
@@ -42,6 +56,7 @@ message ResourceAllocations {
   uint32 reserved_cpus = 7;  // of `cpus`, how many come from the GPUs' reserved cores
 }
 
+// Deprecated with ResourceSet.gpus: superseded by Device.
 message GpuResource {
   uint32 device_id = 1;
   string gpu_type = 2;       // "mi300x", "h100"

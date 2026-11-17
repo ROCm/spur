@@ -527,8 +527,7 @@ impl Node {
             .as_ref()
             .map_or(&[][..], |l| l.gpu_reserved.as_slice());
         self.total_resources
-            .gpus
-            .iter()
+            .gpus()
             .filter_map(|gpu| {
                 let reserved = picks
                     .iter()
@@ -571,11 +570,7 @@ impl Node {
             .filter(|(id, &cpus)| {
                 cpus > 0
                     && !held.contains(id)
-                    && self
-                        .total_resources
-                        .gpus
-                        .iter()
-                        .any(|g| g.stable_id == **id)
+                    && self.total_resources.gpus().any(|g| g.stable_id == **id)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -1157,24 +1152,13 @@ mod tests {
     /// 4 general CPUs and 2 GPUs reserving 4 CPUs each.
     fn reserved_node() -> Node {
         use crate::core_layout::{CoreLayout, GpuReservedCpus};
-        use crate::resource::{GpuLinkType, GpuResource};
-        let gpu = |id: u64| GpuResource {
-            device_id: id as u32,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            stable_id: id,
-            topology: None,
-            numa_node: None,
-            affinity_cpus: vec![],
-        };
+        use crate::device::Device;
         let mut node = Node::new(
             "n1".into(),
             ResourceSet {
                 cpus: 12,
                 memory_mb: 1024,
-                gpus: vec![gpu(1), gpu(2)],
+                devices: vec![Device::gpu(1, "mi300x", 0), Device::gpu(2, "mi300x", 1)],
                 ..Default::default()
             },
         );
@@ -1202,6 +1186,46 @@ mod tests {
         let mut request = crate::resource::ResourceRequest::with_scalar(cpus, 0);
         request.add_devices("gpu", None, gpus);
         request
+    }
+
+    #[test]
+    fn a_gpu_and_vnic_request_reserves_only_for_its_gpus() {
+        let mut node = reserved_node();
+        node.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+        let mut req = request(6, 1);
+        req.add_devices("vnic", None, 1);
+        assert!(node.cpu_pools().unwrap().admits(
+            &node.alloc_resources,
+            req.cpus,
+            req.device_count("gpu")
+        ));
+        let mut too_many = request(7, 1);
+        too_many.add_devices("vnic", None, 1);
+        assert!(!node.cpu_pools().unwrap().admits(
+            &node.alloc_resources,
+            too_many.cpus,
+            too_many.device_count("gpu")
+        ));
+    }
+
+    #[test]
+    fn a_nic_only_request_uses_the_general_pool() {
+        let node = reserved_node();
+        let mut within = request(4, 0);
+        within.add_devices("vnic", None, 1);
+        let mut beyond = request(5, 0);
+        beyond.add_devices("vnic", None, 1);
+        let pools = node.cpu_pools().unwrap();
+        assert!(pools.admits(
+            &node.alloc_resources,
+            within.cpus,
+            within.device_count("gpu")
+        ));
+        assert!(!pools.admits(
+            &node.alloc_resources,
+            beyond.cpus,
+            beyond.device_count("gpu")
+        ));
     }
 
     #[test]
@@ -1269,12 +1293,12 @@ mod tests {
         );
 
         node.detected_resources.topology = Some(twelve_cpu_topology());
-        node.total_resources.gpus[0].numa_node = Some(0);
-        node.total_resources.gpus[1].affinity_cpus = vec![8, 9];
-        let mut third = node.total_resources.gpus[0].clone();
+        node.total_resources.devices[0].numa_node = Some(0);
+        node.total_resources.devices[1].affinity_cpus = vec![8, 9];
+        let mut third = node.total_resources.devices[0].clone();
         third.stable_id = 3;
         third.numa_node = None;
-        node.total_resources.gpus.push(third);
+        node.total_resources.devices.push(third);
         assert_eq!(
             node.socket_core_thread(),
             Some(crate::cpu_topology::SocketCoreThread {

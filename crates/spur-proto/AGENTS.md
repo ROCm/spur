@@ -93,9 +93,10 @@ openraft messages; spur-proto does not interpret them.
 | `JobInfo` | Full job record returned by queries and accounting |
 | `NodeInfo` | Node state, resources, topology, labels, features |
 | `PartitionInfo` | Partition config and membership |
-| `ResourceSet` | Advertised node capacity (CPUs, memory, GPUs with topology) |
+| `ResourceSet` | Advertised node capacity (CPUs, memory, `devices` of every kind) |
 | `ResourceAllocations` | What a job holds on a node |
-| `GpuResource` | Per-device GPU identity: type, memory, peer links, stable BDF id |
+| `Device` | One allocatable device (GPU, NIC, ...): gres name, type, stable id, index, topology |
+| `GpuResource` | Deprecated: GPU-only entry of `ResourceSet.gpus`, still filled for older readers |
 | `GpuRequest` | GPU ask at job/node/task granularity |
 | `PmixLaunchPlan` | Multi-node PMIx server bootstrap parameters |
 | `ContainerSpec` | OCI container config for steps (image, mounts, env, entrypoint) |
