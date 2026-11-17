@@ -507,12 +507,16 @@ metrics).
 
   The launcher exits on its own once the workload does, relaying its status. On
   a rootful node the batch shell is PID 1 of its namespace, so it reacts only to
-  a signal it traps.
+  a signal it traps. The same holds for a container's command, on rootless
+  agents too: the signal used to kill the waiting parent and end the step, but
+  now an unhandled SIGTERM leaves the command running until the SIGKILL, so it
+  ends with signal 9 rather than 15.
 - The agent signals processes itself in two places and applies the same rule
   there. `CancelStep` on a supervised step goes through its supervisor
   (`SignalAllocation`) and arms a SIGKILL after `STEP_CANCEL_ESCALATION`
   (`MIN_KILL_WAIT`, 5 s), since a container's command is PID 1 and ignores
-  unhandled signals. Only if the supervisor is unreachable, or the step has
+  unhandled signals. Both run detached, so a wedged supervisor or a dropped
+  `CancelStep` RPC cannot skip the SIGKILL. Only if the supervisor is unreachable, or the step has
   none, does it use `signal_step_tree` with the `TrackedProcess` recorded on the
   `ActiveStep` (a supervised step's tracked pid is the supervisor's workload
   pid, so it can be a launcher), again with the epoch-checked SIGKILL.

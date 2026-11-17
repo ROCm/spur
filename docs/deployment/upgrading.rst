@@ -1078,20 +1078,39 @@ the agents are upgraded silently does nothing for jobs on those nodes.
 **Kubernetes operator nodes get no grace.** Victims on nodes managed by
 ``spur-k8s`` are preempted at once whatever the QOS or partition ``GraceTime``.
 
-**Steps on nodes where** ``spurd`` **runs as root now keep their grace and kill
-wait.** There, the grace warning and the SIGTERM of a cancel or time limit used to
-end a job's ``srun`` steps at once, even a step that traps SIGTERM. After the
-upgrade such a step keeps running through its grace, and while its job is still
-running a stop waits up to the kill wait before the SIGKILL. Expect longer
-``COMPLETING`` times, and a preemptor that starts later, than before. The fix is
-in the agent and the per-job supervisor, so it needs upgraded agents. A job or
-``srun`` step launched before its node's agent was upgraded keeps the old
-behavior until it ends, because the supervisor that runs it keeps running through
-the upgrade.
-
 The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
 ignores it.
+
+.. _launcher-signal-upgrade-notes:
+
+Signals reach the workload, not its launcher
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On agents running as root, and for container jobs and steps on any agent, the
+process ``spurstepd`` tracks is a launcher (``unshare``, ``nsenter``, or the
+parent that waits for a container) and not the workload. Every signal except
+SIGKILL used to go to that launcher, which could die on it and end the step
+while the workload ran on. Signals now go to the workload and skip the launcher.
+
+- **A step that traps SIGTERM keeps its grace and kill wait.** The preemption
+  grace warning and the SIGTERM of a cancel or time limit used to end a job's
+  ``srun`` steps at once behind ``nsenter`` (steps on the batch node), and
+  behind ``unshare`` on ``util-linux`` 2.34 but not 2.39. A step that traps SIGTERM
+  now runs through its grace, and while its job is still running a stop waits up
+  to the kill wait before the SIGKILL. Expect longer ``COMPLETING`` times, and a
+  preemptor that starts later.
+- **A container command without a SIGTERM handler runs until the SIGKILL.** It is
+  PID 1 of its PID namespace, so it ignores a signal it has no handler for. It
+  used to end when SIGTERM killed the waiting parent, with signal 15; it now ends
+  at the SIGKILL, with signal 9, as under ``docker stop``. This applies to
+  rootless agents too, and to every ``srun --container-image=`` step, because the
+  command is ``exec``'d.
+- **The fix needs upgraded agents.** A job or ``srun`` step launched before its
+  node's agent was upgraded keeps the old behavior until it ends, because its
+  supervisor keeps running through the upgrade. A step launched after the upgrade
+  inside such a job gets its grace, but a stop still ends it at once: the job's
+  older supervisor ends the batch script.
 
 Preemption handoff
 ~~~~~~~~~~~~~~~~~~

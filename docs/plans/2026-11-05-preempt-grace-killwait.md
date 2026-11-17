@@ -397,8 +397,9 @@ root (`root-spurd`), by overriding the `agent_as_root` fixture. Only the root ru
   `PREEMPTED`.
 - `test_grace_partial_exit_multi_node`: two nodes, one rank exits on the warning; skipped below two
   nodes.
-- `test_grace_partial_exit_keeps_other_rank_running`: two nodes, rank 0 leaves on the warning and
-  rank 1 keeps writing its checkpoint past the kill wait; the job stays `R` and rank 1 finishes.
+- `test_grace_partial_exit_keeps_other_rank_running`: two nodes, one rank leaves on the warning and
+  the other keeps writing its checkpoint past the kill wait; the job stays `R` and that rank
+  finishes. It runs once with each rank as the one that leaves.
 - `test_partition_grace_time`: a partition `GraceTime` with the QOS unset gives a grace; QOS
   `GraceTime=0` gives immediate preemption.
 - `test_time_limit_uses_timeout_kill_wait`: a job that ignores SIGTERM sits in `CG` for the timeout
