@@ -5155,9 +5155,21 @@ mod tests {
                 std::ptr::null(),
             ];
             let mut fds = [0 as libc::c_int; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            // Close-on-exec keeps the write end out of the worker's exec; dup2 onto
+            // stdout clears the flag for the one copy the worker needs.
+            assert_eq!(
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0,
+                "pipe"
+            );
             match unsafe { libc::fork() } {
-                -1 => panic!("fork the stand-in launcher"),
+                -1 => {
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    panic!("fork the stand-in launcher")
+                }
                 0 => unsafe {
                     // Handlers inherited from other tests would survive a fork
                     // that does not exec.
@@ -5235,12 +5247,15 @@ mod tests {
 
     impl Drop for NsenterStandIn {
         fn drop(&mut self) {
-            // A pid of 0 or less would signal a whole process group.
-            if self.settled || self.worker <= 0 {
+            // The worker's pid is still 0 when spawn failed before it announced
+            // itself, and a pid of 0 or less would signal a whole process group.
+            if self.settled || self.launcher <= 0 {
                 return;
             }
             unsafe {
-                libc::kill(self.worker, libc::SIGKILL);
+                if self.worker > 0 {
+                    libc::kill(self.worker, libc::SIGKILL);
+                }
                 libc::kill(self.launcher, libc::SIGKILL);
                 libc::waitpid(self.launcher, std::ptr::null_mut(), 0);
             }

@@ -449,11 +449,9 @@ pub enum TrackedProcess {
 }
 
 impl TrackedProcess {
-    /// Whether a signal must not reach the launcher. KILL takes it down with its
-    /// workload. CONT must reach it: `nsenter` stops itself when its child
-    /// stops and resumes the child only once resumed itself. STOP must not,
-    /// because an `nsenter` stopped from outside while it is mid-way through
-    /// mirroring the child's stop stops a second time on resume and never wakes.
+    /// KILL and CONT reach the launcher: `nsenter` mirrors its child's stop and
+    /// resumes it only once continued itself. STOP must not, or an `nsenter`
+    /// mid-mirror stops a second time and never wakes. All else would kill it.
     fn spares_launcher(self, sig: Signal) -> bool {
         self == Self::Launcher && !matches!(sig, Signal::SIGKILL | Signal::SIGCONT)
     }
@@ -1745,11 +1743,9 @@ fn signal_pids_except(pids: &[i32], sig: Signal, except: Option<i32>) -> usize {
 /// Delivers `sig` to a job's workload: the cgroup's processes first, since they
 /// include descendants a process-group signal misses, and the tracked process's
 /// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
-/// A launcher gets only the signals [`TrackedProcess::spares_launcher`] lets
-/// through. CONT goes after the workload: the workload is continued first, so
-/// an `nsenter` that has not yet read its child's stop report never reads it
-/// and does not stop itself. KILL goes before it: a launcher that outlives its
-/// worker's death relays the worker's status as its own exit.
+/// A launcher gets only what [`TrackedProcess::spares_launcher`] allows: KILL
+/// first, so it cannot relay the worker's death as its own exit; CONT last, so
+/// an `nsenter` that has not read the child's stop report never reads it.
 pub fn deliver_signal(
     cgroup_path: Option<&Path>,
     job: &RunningJob,
