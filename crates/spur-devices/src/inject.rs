@@ -76,7 +76,10 @@ pub struct HookPlan {
     pub env: Vec<String>,
 }
 
+/// Persisted in a supervisor's launch.json, so every field must default when an
+/// older or newer build wrote the file.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContainerInjectionPlan {
     pub device_nodes: Vec<DeviceNodePlan>,
     pub mounts: Vec<BindMountPlan>,
@@ -85,7 +88,10 @@ pub struct ContainerInjectionPlan {
     pub additional_gids: Vec<u32>,
 }
 
+/// Persisted in a supervisor's launch.json, so every field must default when an
+/// older or newer build wrote the file.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,
@@ -653,5 +659,24 @@ mod tests {
         assert_eq!(a.gpu_visibility_vars.len(), 2);
         assert!(a.gpu_visibility_vars.contains("ROCR_VISIBLE_DEVICES"));
         assert!(a.gpu_visibility_vars.contains("CUDA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn host_plan_missing_fields_deserializes_to_defaults() {
+        let plan: HostInjectionPlan = serde_json::from_str(r#"{"env":{"A":"1"}}"#)
+            .expect("a persisted host plan missing newer fields must load");
+        assert_eq!(plan.env.get("A").map(String::as_str), Some("1"));
+        assert!(plan.visible_devices.is_empty());
+        assert!(plan.device_paths.is_empty());
+    }
+
+    #[test]
+    fn container_plan_missing_fields_deserializes_to_defaults() {
+        let plan: ContainerInjectionPlan = serde_json::from_str(r#"{"device_nodes":[]}"#)
+            .expect("a persisted container plan missing newer fields must load");
+        assert!(plan.mounts.is_empty());
+        assert!(plan.env.is_empty());
+        assert!(plan.hooks.is_empty());
+        assert!(plan.additional_gids.is_empty());
     }
 }
