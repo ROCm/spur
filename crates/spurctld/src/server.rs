@@ -1187,7 +1187,7 @@ impl ControllerService {
         user: &str,
         job_id: spur_core::job::JobId,
         signal: i32,
-        target: SignalTarget,
+        raw_target: i32,
     ) -> Result<(), Status> {
         let job = self.job_visible_to(job_id, identity)?;
         spur_core::auth::check_job_owner(
@@ -1198,6 +1198,7 @@ impl ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
         validate_signal_number(signal)?;
+        let target = signal_target_or_default(raw_target)?;
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {job_id} is not running (state {})",
@@ -1852,10 +1853,9 @@ impl SlurmController for ControllerService {
         let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
-        let target = signal_target_or_default(req.target)?;
         annotate(
             &audit,
-            signal_annotation(req.job_id, req.signal, target, &req.user),
+            signal_annotation(req.job_id, req.signal, req.target, &req.user),
         );
 
         self.signal_running_job(
@@ -1863,7 +1863,7 @@ impl SlurmController for ControllerService {
             &req.user,
             req.job_id,
             req.signal,
-            target,
+            req.target,
         )
         .await?;
         Ok(Response::new(()))
@@ -4909,13 +4909,14 @@ fn signal_target_or_default(raw: i32) -> Result<SignalTarget, Status> {
 fn signal_annotation(
     job_id: spur_core::job::JobId,
     signal: i32,
-    target: SignalTarget,
+    raw_target: i32,
     user: &str,
 ) -> Annotation {
-    let target = match target {
-        SignalTarget::Batch => "batch",
-        SignalTarget::Full => "full",
-        SignalTarget::Steps | SignalTarget::Unspecified => "steps",
+    let target = match SignalTarget::try_from(raw_target) {
+        Ok(SignalTarget::Batch) => "batch".to_string(),
+        Ok(SignalTarget::Full) => "full".to_string(),
+        Ok(SignalTarget::Steps | SignalTarget::Unspecified) => "steps".to_string(),
+        Err(_) => format!("unknown ({raw_target})"),
     };
     Annotation::new(
         &job_id.to_string(),
@@ -12943,6 +12944,18 @@ mod tests {
                 &format!("signal {signal} to a hidden job"),
             );
         }
+
+        let unknown_target = SignalJobRequest {
+            job_id: jobs.running,
+            signal: 10,
+            target: 99,
+            user: "bob".into(),
+        };
+        let result = svc
+            .signal_job(as_caller(unknown_target, &bob))
+            .await
+            .map(|_| ());
+        assert_not_found(result, jobs.running, "an unknown target to a hidden job");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
