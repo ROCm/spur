@@ -301,11 +301,12 @@ class TestSupervisedGpuReclaim:
         finally:
             cluster.scancel(str(retry_id))
 
-    # A plain scancel (signal=0) reaches graceful_cancel, which spawns its own
-    # release-wait regardless of a dead supervisor -- the confirmed-dead
-    # fencing only has sole responsibility on a non-lethal explicit signal,
-    # where no release-wait is ever spawned.
-    def test_a_non_lethal_signal_still_reclaims_a_confirmed_dead_supervisors_gpu(
+    # `scancel --signal KILL` is the one signal form that still cancels: the CLI
+    # maps it to CancelJob, as it does a plain scancel. No CLI command delivers a
+    # non-lethal signal through the agent's CancelJob any more (`--signal USR1`
+    # goes to SignalJob, which never fences), so that path is covered only by the
+    # agent's unit tests.
+    def test_scancel_signal_kill_reclaims_a_confirmed_dead_supervisors_gpu(
         self, gpu_cluster
     ):
         cluster = gpu_cluster
@@ -317,10 +318,10 @@ class TestSupervisedGpuReclaim:
 
         before = _supervisor_pids(cluster)
         hold = cluster.write_file(
-            "gpu-nonlethal-reclaim-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
+            "gpu-signal-kill-reclaim-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
         )
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "gpu-nonlethal-reclaim", "-N", "1", "-w", node, gres, hold])
+            cluster.sbatch(["-J", "gpu-signal-kill-reclaim", "-N", "1", "-w", node, gres, hold])
         )
         assert job_id is not None
         try:
@@ -340,10 +341,7 @@ class TestSupervisedGpuReclaim:
                 assert time.time() < deadline, f"supervisor {supervisor_pid} did not die"
                 time.sleep(1)
 
-            # SIGUSR1 is never expected to terminate a job, so send_explicit_signal
-            # never spawns a release-wait for it -- only the confirmed-dead fencing
-            # can explain a release on this path.
-            cluster.cli(["scancel", "--signal", "USR1", str(job_id)])
+            cluster.cli(["scancel", "--signal", "KILL", str(job_id)])
             assert wait_job(cluster, job_id, timeout=60) in ("CA", "CD", "F", "GONE"), (
                 "the controller must still see a terminal state: a bare local "
                 "release without reporting completion would leave it Running there"
@@ -353,7 +351,7 @@ class TestSupervisedGpuReclaim:
 
         retry_id = parse_job_id(
             cluster.sbatch(
-                ["-J", "gpu-nonlethal-reclaim-retry", "-N", "1", "-w", node, gres, hold]
+                ["-J", "gpu-signal-kill-reclaim-retry", "-N", "1", "-w", node, gres, hold]
             )
         )
         assert retry_id is not None
