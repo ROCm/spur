@@ -152,6 +152,19 @@ class TestSrunContainerStepNewRootfs:
         assert code == 0, f"srun --container-image failed (exit {code}):\n{out}"
         assert MARKER_CONTENT in out, f"step ran on host, not in container:\n{out}"
 
+    def test_labeled_tasks_run_their_generated_wrapper(self, step_container_cluster):
+        """Several tasks per node and --label run through a wrapper spurd writes in
+        the job's spool folder on the host, which pivot_root would otherwise hide."""
+        cluster = step_container_cluster
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-n", "2", "--label", "-t", "0:02",
+            f"--container-image={cluster.step_container_image}",
+            "cat", MARKER_PATH,
+        ])
+        assert code == 0, f"labeled two-task container step failed (exit {code}):\n{out}"
+        for rank in (0, 1):
+            assert f"[{rank}] {MARKER_CONTENT}" in out, f"no output from rank {rank}:\n{out}"
+
     def test_bind_mount(self, step_container_cluster):
         # Mount a directory (the common case, matching the batch container test);
         # file bind mounts are a separate, untested edge case.
@@ -472,6 +485,34 @@ class TestSrunContainerStepNsenter:
         assert MARKER_CONTENT in out, (
             f"nested srun did not enter parent container:\n{diag}\noutput:\n{out}"
         )
+
+    def test_nested_labeled_tasks_run_their_wrapper_in_the_parent_container(
+        self, step_container_cluster
+    ):
+        """A labeled, multi-task nested srun runs a wrapper spurd writes in the job's
+        spool folder on the host; the parent container must see that folder."""
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        out_path = f"{cluster.remote_dir}/nsenter-labeled.out"
+        script = cluster.write_file(
+            "nsenter-labeled.sh",
+            f"#!/bin/bash\n{cluster.bin_dir}/srun -n 2 --label cat '{MARKER_PATH}'\n",
+        )
+        sb = cluster.sbatch([
+            "-J", "nsenter-labeled", "-N", "1", "-n", "2", "-t", "0:03", "-o", out_path,
+            f"--container-image={img}",
+            *_toolchain_mounts(cluster),
+            script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        diag = cluster.debug_job(job_id)
+        for rank in (0, 1):
+            assert f"[{rank}] {MARKER_CONTENT}" in out, (
+                f"no output from rank {rank} of the nested step:\n{diag}\noutput:\n{out}"
+            )
 
     def test_nested_srun_naming_the_jobs_image_enters_the_container(self, step_container_cluster):
         """Repeating the job's own image on a nested `srun` (or inheriting it

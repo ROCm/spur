@@ -24,6 +24,7 @@ pub mod mpi_plugin;
 pub mod privdrop;
 pub mod pty;
 pub mod reporter;
+pub(crate) mod scratch;
 pub mod seccomp;
 pub mod spec;
 pub mod step_completion;

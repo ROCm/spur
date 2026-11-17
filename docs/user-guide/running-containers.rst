@@ -86,6 +86,28 @@ An interactive shell in a container with your home directory mounted:
 
    srun --container-image ubuntu:22.04 --container-mount-home bash
 
+How the Image Is Treated
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The node agent prepares the container as root before handing it to you, so it
+never lets anything in your image lead that work onto the node itself:
+
+- A mount destination (``--container-mounts``, ``--container-mount-home``) is
+  resolved the way the container will see it: links in the image are followed
+  inside the image. With ``/lib -> usr/lib`` in the image, a mount on
+  ``/lib/modules`` lands on the image's ``/usr/lib/modules``; an absolute link
+  such as ``/data -> /scratch`` leads to the image's own ``/scratch``, never the
+  node's. ``/tmp`` and ``/etc``, where Spur writes the job's entry script and its
+  account and DNS files, are resolved the same way, so ``/tmp -> var/tmp`` works.
+- The container refuses to start when the image's ``/dev``, ``/proc``, ``/sys``
+  or ``/run`` is a link, or when ``/etc/passwd`` or ``/etc/group`` is a link or
+  anything but a regular file, such as a FIFO or a device node.
+- A user name or home directory containing ``:`` or a control character such
+  as a newline is refused, since it would corrupt the container's
+  ``/etc/passwd``.
+- The image's ``/etc/resolv.conf`` is replaced with the node's DNS settings,
+  even when the image ships it as a link.
+
 Environment Inside the Container
 --------------------------------
 
@@ -148,6 +170,11 @@ flags above apply to a step's ``srun`` and behave as follows:
    ``sbatch --container-image=A`` no longer runs the step in ``A`` and exits 0
    with the flag ignored. It now fails, so scripts that rely on that must drop
    the step's ``--container-image`` or submit the job without one.
+
+Every container Spur starts for a job, the batch job's and each fresh step's, has
+the job's spool folder ``/var/spool/spur/job<id>`` mounted read-only at the same
+path. Spur keeps the wrappers it generates for steps with several tasks per node,
+``--label`` or ``--mpi=pmix`` there, so those steps run in either kind of container.
 
 Allocate first, then run steps from inside the allocation shell. By default a
 single step fans out one container per allocated node; ``-N`` or ``-w`` limits
