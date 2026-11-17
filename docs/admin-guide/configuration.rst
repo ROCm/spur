@@ -2582,7 +2582,9 @@ converges to hardware changes without an agent restart — see
 Each ``[[devices.gres]]`` entry uses Slurm GRES syntax with fields ``name``
 (required), ``type``, ``file``, ``multiple_files``, ``count``, ``cores`` and
 ``flags`` ([string]). ``links`` is accepted for Slurm compatibility but has no
-effect. Examples:
+effect. An entry with ``file`` is a set of devices of any kind: the
+node reports each one, the scheduler hands out specific devices, and a job is
+given the device nodes it was allocated. Examples:
 
 .. code-block:: toml
 
@@ -2590,6 +2592,11 @@ effect. Examples:
    name = "gpu"
    file = "/dev/dri/renderD[128-129]"
    flags = ["amd_gpu_env"]
+
+   [[devices.gres]]
+   name = "nic"
+   type = "pollara400"
+   file = "/dev/infiniband/uverbs[0-1]"
 
    [[devices.gres]]
    name = "bandwidth"

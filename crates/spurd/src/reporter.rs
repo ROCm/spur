@@ -1578,7 +1578,7 @@ pub fn refresh_block_file(resources: &mut ResourceSet, path: Option<&std::path::
         });
 }
 
-/// Injectable GPU registry entries as the scheduler's devices.
+/// Injectable registry entries of every kind as the scheduler's devices.
 fn devices_from_registry(
     registry: &DeviceRegistry,
     topology: Option<&spur_core::cpu_topology::CpuTopology>,
@@ -1586,7 +1586,7 @@ fn devices_from_registry(
     registry
         .list()
         .iter()
-        .filter(|e| e.is_injectable() && e.gres_name == "gpu")
+        .filter(|e| e.is_injectable())
         .map(|entry| Device {
             gres_name: entry.gres_name.clone(),
             device_type: entry.resource_type.clone().unwrap_or_default(),
@@ -2932,6 +2932,45 @@ mod tests {
 
         let resources = discover_resources(&reg);
         assert_eq!(resources.generic.get("bandwidth:lustre"), Some(&4096));
+    }
+
+    #[test]
+    fn discovered_resources_report_every_injectable_kind() {
+        let mut reg = DeviceRegistry::new();
+        let gres_cache = GresCache::from_entries(&[
+            GresEntry {
+                name: "gpu".into(),
+                r#type: Some("mi300x".into()),
+                file: Some("/dev/dri/renderD128".into()),
+                ..Default::default()
+            },
+            GresEntry {
+                name: "nic".into(),
+                r#type: Some("pollara400".into()),
+                file: Some("/dev/infiniband/uverbs[0-1]".into()),
+                ..Default::default()
+            },
+        ]);
+        reg.populate(&CdiCache::new(), &gres_cache);
+
+        let resources = discover_resources(&reg);
+        let kinds: Vec<(&str, &str)> = resources
+            .devices
+            .iter()
+            .map(|d| (d.gres_name.as_str(), d.device_type.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("gpu", "mi300x"),
+                ("nic", "pollara400"),
+                ("nic", "pollara400")
+            ]
+        );
+        assert!(
+            resources.generic.is_empty(),
+            "injectable devices are not counted"
+        );
     }
 
     #[test]
