@@ -161,6 +161,16 @@ impl DeviceRegistry {
         Ok(build_injection_plans(&devices, job_uid, job_gid))
     }
 
+    /// Whether jobs here are granted RDMA device nodes by allocation, so the rest
+    /// of `/dev/infiniband` can be withheld from them.
+    pub fn allocates_rdma_nodes(&self) -> bool {
+        self.devices
+            .iter()
+            .filter(|e| e.is_injectable())
+            .flat_map(|e| e.node_paths())
+            .any(|path| path.starts_with("/dev/infiniband/"))
+    }
+
     /// Whether `key` (`name` or `name:type`) names one of this node's countable pools.
     pub fn has_countable_pool(&self, key: &str) -> bool {
         self.devices
@@ -653,6 +663,30 @@ mod tests {
             .fold(DeviceSelection::new(), |sel, (gres, ids)| {
                 sel.with(gres, ids.to_vec())
             })
+    }
+
+    #[test]
+    fn a_node_allocates_rdma_only_when_it_hands_out_infiniband_nodes() {
+        let gres = |name: &str, file: &str| GresEntry {
+            name: name.into(),
+            file: Some(file.into()),
+            ..Default::default()
+        };
+        let allocates = |entries: &[GresEntry]| {
+            let mut reg = DeviceRegistry::new();
+            populate_registry(&mut reg, &CdiCache::new(), entries);
+            reg.allocates_rdma_nodes()
+        };
+        assert!(!allocates(&[]));
+        assert!(!allocates(&[gres("gpu", "/dev/dri/renderD128")]));
+        assert!(!allocates(&[GresEntry {
+            name: "hca".into(),
+            count: Some(4),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }]));
+        assert!(allocates(&[gres("nic", "/dev/infiniband/uverbs[0-1]")]));
+        assert!(allocates(&[gres("hca", "/dev/infiniband/uverbs0")]));
     }
 
     #[test]

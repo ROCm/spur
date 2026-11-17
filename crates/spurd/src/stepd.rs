@@ -57,6 +57,8 @@ pub struct StepdLaunchSpec {
     #[serde(default)]
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     #[serde(default)]
+    pub node_allocates_rdma: bool,
+    #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
     #[serde(default)]
     pub hooks: spur_core::config::HooksConfig,
@@ -280,6 +282,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             io_mode: config.io_mode,
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
+            node_allocates_rdma: config.node_allocates_rdma,
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
             plugstack_path: String::new(),
@@ -351,6 +354,7 @@ impl StepdLaunchSpec {
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
+            node_allocates_rdma: self.node_allocates_rdma,
             memlock: self.memlock.into(),
             io_mode: self.io_mode,
             pmix_multi_task: self.pmix_multi_task,
@@ -4719,6 +4723,7 @@ mod tests {
             io_mode: crate::executor::LaunchIo::File,
             container: None,
             host_device_plan: None,
+            node_allocates_rdma: false,
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
             plugstack_path: String::new(),
@@ -4753,6 +4758,16 @@ mod tests {
             spec.into_launch_config().io_mode,
             crate::executor::LaunchIo::Pty
         );
+    }
+
+    #[test]
+    fn a_relaunched_supervisor_keeps_withholding_rdma() {
+        let mut config = launch_spec().into_launch_config();
+        config.node_allocates_rdma = true;
+        let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
+        let persisted: StepdLaunchSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(persisted.into_launch_config().node_allocates_rdma);
     }
 
     #[test]
@@ -5080,6 +5095,7 @@ mod tests {
             "gpu_devices",
             "container",
             "host_device_plan",
+            "node_allocates_rdma",
             "container_rootfs_mode",
             "hooks",
             "plugstack_path",
@@ -5101,6 +5117,10 @@ mod tests {
         assert!(restored.resources.devices.is_empty());
         assert!(restored.container.is_none());
         assert!(restored.host_device_plan.is_none());
+        assert!(
+            !restored.node_allocates_rdma,
+            "a job launched before the field keeps RDMA open"
+        );
         assert!(restored.container_rootfs_mode.is_none());
         assert_eq!(
             serde_json::to_value(&restored.hooks).expect("encode default hooks"),

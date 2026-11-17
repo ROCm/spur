@@ -89,6 +89,22 @@ For the NICs it holds on a node, a job gets:
 These replace any value the job sets itself. GPU visibility variables are not
 affected by NICs.
 
+Isolation
+---------
+
+With ``[cgroup] constrain_devices`` and ``constrain_rdma_devices`` (both on by
+default), a job on a NIC node can open only the ``uverbs`` nodes of its own
+NICs, plus ``rdma_cm``. Opening another NIC fails with ``EPERM``, and a job
+that requested no NICs gets no RDMA device at all. To keep all of
+``/dev/infiniband/`` open to every job instead:
+
+.. code-block:: toml
+
+   [cgroup]
+   constrain_rdma_devices = false
+
+This does not reset a NIC's RDMA state between jobs.
+
 Configuring NICs by hand
 ------------------------
 

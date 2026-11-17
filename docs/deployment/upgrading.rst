@@ -1426,6 +1426,28 @@ fails and drains the nodes still running a copy. Its outcome is taken from the
 first node alone. Every controller applies these older entries the same way, so
 controllers on different releases never disagree about a job.
 
+RDMA device access on AI NIC nodes (``constrain_rdma_devices``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur now discovers AMD Pollara AI NICs and schedules them per job
+(:doc:`/admin-guide/ai-nics`). On a node that hands out RDMA devices per job, a
+job can open only the RDMA devices it was allocated, plus ``rdma_cm``. This
+covers a node with Pollara NICs and ``auto_detect`` on, and a node with a
+``[[devices.gres]]`` entry whose files are under ``/dev/infiniband/``.
+
+**Effect:** a job on such a node that uses RDMA without requesting NICs, for
+example MPI over verbs, now fails to open ``/dev/infiniband/uverbsN`` with
+``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
+as before:
+
+.. code-block:: toml
+
+   [cgroup]
+   constrain_rdma_devices = false
+
+Other nodes are not affected. Jobs already running when ``spurd`` is upgraded
+keep the access they started with.
+
 Generic device inventory
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1495,7 +1517,10 @@ Node inventory now lists every allocatable device, of every kind, in
   devices before the controllers, or drain those nodes first. An older
   controller does not see those devices, so it cannot allocate them, and the
   upgraded agent keeps ignoring count-only ``[[devices.gres]]`` entries of the
-  same name, so jobs that request them pend. An older agent ignores allocations
+  same name, so jobs that request them pend. On a node with Pollara NICs the
+  upgraded agent also keeps withholding their RDMA devices from jobs that were
+  not allocated them: such jobs fail to open them with ``EPERM``, or NCCL and
+  RCCL silently fall back to TCP. An older agent ignores allocations
   of device kinds other than GPUs, so a job allocated NICs before the rollback
   keeps running without them claimed on the node. If the older agent
   rewrites a running job's state, which it does when GPU ids change, its
