@@ -295,7 +295,7 @@ pub extern "C" fn slurm_load_partitions(
 const KILL_JOB_BATCH: u16 = 1 << 0;
 const KILL_FULL_JOB: u16 = 1 << 3;
 
-const SIGNAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const KILL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a `slurm_kill_job` call asks the controller to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -330,14 +330,13 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, flags: u16) -> c_i
 
         match kill_action(signal, flags) {
             KillAction::Cancel { signal } => {
-                client
-                    .cancel_job(CancelJobRequest {
-                        job_id,
-                        signal,
-                        user: String::new(),
-                    })
-                    .await
-                    .ok()?;
+                let mut request = tonic::Request::new(CancelJobRequest {
+                    job_id,
+                    signal,
+                    user: String::new(),
+                });
+                request.set_timeout(KILL_RPC_TIMEOUT);
+                client.cancel_job(request).await.ok()?;
             }
             KillAction::Signal { signal, target } => {
                 let mut request = tonic::Request::new(SignalJobRequest {
@@ -346,7 +345,7 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, flags: u16) -> c_i
                     target: target as i32,
                     user: String::new(),
                 });
-                request.set_timeout(SIGNAL_RPC_TIMEOUT);
+                request.set_timeout(KILL_RPC_TIMEOUT);
                 client.signal_job(request).await.ok()?;
             }
         }
