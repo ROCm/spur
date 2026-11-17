@@ -652,9 +652,11 @@ How it behaves:
   ``MaxTRESPU``, ``MaxJobsPU``, ``MaxTRESPJ``, ``GrpTRES`` and ``MaxWall``.
   Submit-count limits (``MaxSubmitJobsPU``, ``MaxSubmitJobsPA``, ``GrpSubmit``)
   and ``GrpWall`` on a partition QOS are not enforced.
-- The partition QOS is checked while scheduling, never at submit. ``DenyOnLimit``
-  on it has no effect, and a job that can never meet its ``MaxTRESPJ`` or
-  ``MaxWall`` is accepted and pends with that limit as its reason.
+- The partition QOS limits are checked while scheduling, never at submit.
+  ``DenyOnLimit`` on it has no effect, and a job that can never meet its
+  ``MaxTRESPJ`` or ``MaxWall`` is accepted and pends with that limit as its reason.
+- A job that requests no wall time takes the partition QOS ``MaxWall`` as its time
+  limit, as it does a job QOS one (see :ref:`maxwall-default`).
 - ``GrpTRES=node=N`` counts distinct nodes, as for a job QOS: a job that packs
   onto a node the partition QOS already holds needs no new node (see
   :ref:`grptres-node-packing`).
@@ -735,8 +737,10 @@ report ``UNLIMITED``, and the running-job watchdog — which acts on a job's own
 limit — would have no deadline to enforce, so the cap would hold only for jobs
 that named a limit themselves.
 
-Both the QOS and the association carry ``maxwall``, and a job has to satisfy
-both, so the smaller of the two is what it inherits.
+The QOS, the association and the partition QOS (see `Partition QOS: capping a
+user across accounts`_) all carry ``maxwall``, and a job has to satisfy each, so
+the smallest is what it inherits. A job that may run in several partitions takes
+the smallest partition QOS ``maxwall`` among them.
 
 The limit is filled in at submit, so ``squeue`` and ``scontrol show job`` report
 it, and it is the job's own limit from then on: a later change to the QOS does
@@ -746,7 +750,7 @@ Precedence for a job that requests nothing, first match winning:
 
 1. The partition's ``DefaultTime``, or the chain described under
    ``default_time_limit_minutes`` in :doc:`configuration`.
-2. The smaller of the QOS and association ``maxwall``.
+2. The smallest of the QOS, association and partition QOS ``maxwall``.
 3. Otherwise the job stays unbounded.
 
 So a partition ``DefaultTime`` shorter than ``maxwall`` still wins — ``maxwall``

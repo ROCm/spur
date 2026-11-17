@@ -547,6 +547,33 @@ async fn a_partition_qos_has_no_effect_with_accounting_disabled() {
     assert!(schedulable(&cm, id).is_some());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_with_no_time_limit_defaults_to_the_partition_qos_max_wall() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 2).await;
+    cm.qos_cache().insert(Qos {
+        name: "usercap".into(),
+        limits: QosLimits {
+            max_wall_minutes: Some(60),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            time_limit: None,
+            ..gpu_job("alice", "acct-a", "qa")
+        },
+    );
+
+    assert_eq!(
+        cm.get_job(id).unwrap().spec.time_limit,
+        Some(chrono::Duration::minutes(60))
+    );
+}
+
 #[test]
 fn a_partition_update_logged_before_partition_qos_replays_unchanged() {
     const LEGACY: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"DRAIN","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null}}"#;

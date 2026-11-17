@@ -1461,7 +1461,7 @@ impl ClusterManager {
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
         // that actually governs the job. A limit the hook set is left alone.
-        let wall_caps = self.wall_caps(&spec);
+        let wall_caps = self.wall_caps(&spec, &partitions);
         apply_default_time_limit(
             &mut spec,
             &partitions,
@@ -8267,7 +8267,20 @@ impl ClusterManager {
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
-    fn wall_caps(&self, spec: &JobSpec) -> WallCaps {
+    fn wall_caps(&self, spec: &JobSpec, partitions: &[Partition]) -> WallCaps {
+        let loaded_qos = |name: &str| {
+            self.qos_cache
+                .is_loaded()
+                .then(|| self.qos_cache.get(name))
+                .flatten()
+        };
+        let partition_qos_minutes = partitions_for_defaulting(spec, partitions)
+            .into_iter()
+            .filter_map(|p| p.qos.as_deref().filter(|q| !q.is_empty()))
+            .filter_map(|name| loaded_qos(name)?.limits.max_wall_minutes)
+            .filter(|m| *m > 0)
+            .min();
+
         let qos_minutes = spec
             .qos
             .as_deref()
@@ -8288,6 +8301,7 @@ impl ClusterManager {
         WallCaps {
             qos_minutes,
             account_minutes,
+            partition_qos_minutes,
         }
     }
 
@@ -13329,6 +13343,8 @@ fn partitions_for_defaulting<'a>(
 pub(crate) struct WallCaps {
     qos_minutes: Option<u32>,
     account_minutes: Option<u32>,
+    /// The smallest partition QOS `MaxWall` among the partitions the job may run in.
+    partition_qos_minutes: Option<u32>,
 }
 
 impl WallCaps {
@@ -13341,7 +13357,7 @@ impl WallCaps {
 /// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
 /// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
 /// so the default fits every requested partition; if any requested partition
-/// resolves to no bound the governing QOS's or account's `MaxWall` supplies the
+/// resolves to no bound the governing QOS's, account's or partition QOS's `MaxWall` supplies the
 /// limit instead, and a job with neither stays unbounded (unchanged upgrade
 /// behavior).
 fn apply_default_time_limit(
@@ -13387,15 +13403,16 @@ fn apply_default_time_limit(
     }
 }
 
-/// The per-job wall ceiling as a default. A job has to satisfy the QOS's and the
-/// account's `MaxWall` both, so the smaller of the two is the limit it is really
-/// held to. That value is then kept under the requested partitions' `MaxTime`,
+/// The per-job wall ceiling as a default. A job has to satisfy the QOS's, the
+/// account's and the partition QOS's `MaxWall` all, so the smallest is the limit it
+/// is really held to. That value is then kept under the requested partitions' `MaxTime`,
 /// above which the job would pend forever on a limit it never asked for — where
 /// today it simply runs unbounded.
 fn wall_cap_default(requested: &[&Partition], caps: WallCaps) -> Option<u32> {
     let cap = [
         WallCaps::usable(caps.qos_minutes),
         WallCaps::usable(caps.account_minutes),
+        WallCaps::usable(caps.partition_qos_minutes),
     ]
     .into_iter()
     .flatten()
@@ -39698,7 +39715,7 @@ state = "UP"
     fn qos_wall(minutes: u32) -> WallCaps {
         WallCaps {
             qos_minutes: Some(minutes),
-            account_minutes: None,
+            ..Default::default()
         }
     }
 
@@ -39764,6 +39781,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: Some(720),
             account_minutes: Some(360),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(360)));
@@ -39775,6 +39793,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: None,
             account_minutes: Some(90),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(90)));
@@ -39786,6 +39805,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: Some(720),
             account_minutes: Some(0),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
@@ -39859,7 +39879,7 @@ state = "UP"
         spec.qos = Some("burst".into());
         spec.account = Some("eng".into());
 
-        let caps = cluster.wall_caps(&spec);
+        let caps = cluster.wall_caps(&spec, &[]);
         assert!(caps.qos_minutes.is_none());
         assert!(caps.account_minutes.is_none());
     }
