@@ -164,6 +164,19 @@ src/
   pty.rs              PTY primitives: openpty with optional window size, pre_exec
                       hook to make the slave the controlling terminal. Used by
                       executor (batch PTY launch) and interactive session handler.
+
+  startup_spool.rs    One-shot orphan job-spool cleanup at startup: discovers
+                      `job<N>` dirs, asks the controller (strict GetJobs, batches
+                      of 128) which are terminal or absent below next_job_id,
+                      keeps anything owned locally, in a runtime session, a
+                      populated cgroup, or held by a process (/proc scan), then
+                      deletes the rest. 60 s budget; any doubt keeps the dir.
+
+  spool_fs.rs         Descriptor-relative spool deletion shared by startup and
+                      completion cleanup: follows symlinks only in the root path,
+                      never beneath it, no mount crossing (openat2 with an
+                      openat + mnt_id fallback), streamed readdir, 256-level
+                      depth cap, identity re-checks, kept_reason() for logging.
 ```
 
 ---
@@ -318,7 +331,9 @@ src/
     replay never looks like a dead node.
 12. Replay unacknowledged stepd completions, spawn retry background task.
 13. Build `AgentService`, adopt recovered stepds, replay allocations (then
-    `request_heartbeat()`), settle stale stepds.
+    `request_heartbeat()`), settle stale stepds, then run the one-shot orphan
+    job-spool cleanup (`startup_spool::run`, bounded by a 60 s budget) before
+    anything serves.
 14. Bind agent-socket Unix listener for supervisor completion notifications.
 15. Adopt any running spurd-owned k0s unit, spawn the k0s supervise loop.
 16. Start the reaper/monitor loop (`start_monitor`).
@@ -646,6 +661,15 @@ metrics).
   and spurd. spurd's own runtime state lives in `<state_dir>/runtime/`.
 - On SIGTERM with held stepds, spurd does NOT deregister -- it preserves
   registration so the controller does not fence running jobs.
+- Startup spool cleanup only deletes after an *authoritative* GetJobs answer;
+  an older controller never sets `authoritative`, so nothing is deleted until
+  controllers are upgraded. Absence counts only below `next_job_id`.
+- The spool and cgroup roots are fixed paths, so two spurd instances of
+  different clusters on one host can delete each other's leftover spools.
+  Isolated test instances need a private mount namespace for `/var/spool`.
+- The startup pass skips with cgroups disabled and treats any unreadable
+  `/proc` entry as "keep everything" for its batch; reading other processes
+  needs `CAP_SYS_PTRACE`.
 
 ### Job execution
 - Jobs are forked as their own process-group leaders. Signals go to the
