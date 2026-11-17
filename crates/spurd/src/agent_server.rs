@@ -5415,25 +5415,41 @@ impl AgentService {
     /// outlives it: a container's command is PID 1 of its namespace and
     /// ignores signals it has no handler for. `false` if the supervisor could
     /// not be reached and nothing was sent.
+    ///
+    /// Both the escalation and the signal run detached, so the controller
+    /// dropping this RPC while the supervisor is slow to answer cancels neither.
     async fn cancel_supervised_step(
         &self,
         descriptor: &crate::stepd::StepdDescriptor,
         signal: i32,
     ) -> bool {
-        if let Err(error) =
-            crate::stepd::signal_allocation(descriptor, uuid::Uuid::new_v4().to_string(), signal)
-                .await
-        {
-            warn!(job_id = descriptor.job_id, step_id = descriptor.step_id, %error,
-                "step supervisor signal failed");
-            return false;
-        }
         let context = self.completion_listener_context();
-        let descriptor = descriptor.clone();
-        tokio::spawn(async move {
-            sigkill_stepd_after(&context, &descriptor, STEP_CANCEL_ESCALATION).await;
-        });
-        true
+        let escalation = {
+            let descriptor = descriptor.clone();
+            tokio::spawn(async move {
+                sigkill_stepd_after(&context, &descriptor, STEP_CANCEL_ESCALATION).await;
+            })
+        };
+        let signalled = {
+            let descriptor = descriptor.clone();
+            tokio::spawn(async move {
+                crate::stepd::signal_allocation(
+                    &descriptor,
+                    uuid::Uuid::new_v4().to_string(),
+                    signal,
+                )
+                .await
+            })
+        };
+        let error = match signalled.await {
+            Ok(Ok(())) => return true,
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => error.to_string(),
+        };
+        escalation.abort();
+        warn!(job_id = descriptor.job_id, step_id = descriptor.step_id, %error,
+            "step supervisor signal failed");
+        false
     }
 
     /// Launch the interactive session's own workload through `spurstepd`,
@@ -27167,6 +27183,82 @@ mod tests {
             svc.step_cancel_requested(descriptor.job_id, descriptor.step_id)
                 .await
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_step_arms_the_sigkill_even_when_the_supervisor_never_answers_the_signal() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_service();
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let (descriptor, listener) = step_session(state.path(), 42, 2);
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        svc.register_test_step(descriptor.job_id, descriptor.step_id, None)
+            .await;
+
+        // The first request is read and left unanswered; the second is acknowledged.
+        let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let supervisor_descriptor = descriptor.clone();
+        let _supervisor = tokio::spawn(async move {
+            let mut unanswered = Vec::new();
+            for answer in [false, true] {
+                let (stream, _) = crate::stepd::accept_hello(
+                    &listener,
+                    &supervisor_descriptor,
+                    &supervisor_descriptor.capability,
+                )
+                .await
+                .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                let request: crate::stepd::StepdRequest =
+                    serde_json::from_str(&line).expect("decode runtime request");
+                requests_tx.send(request).expect("report the request");
+                if !answer {
+                    unanswered.push(writer);
+                    continue;
+                }
+                let ack = serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                    .expect("encode acknowledgement");
+                writer
+                    .write_all(format!("{ack}\n").as_bytes())
+                    .await
+                    .expect("acknowledge runtime request");
+            }
+        });
+
+        // The controller abandons the RPC while the supervisor still sits on the signal.
+        tokio::select! {
+            _ = svc.cancel_step(Request::new(CancelStepRequest {
+                job_id: descriptor.job_id,
+                step_id: descriptor.step_id,
+                signal: 0,
+                run_attempt: 0,
+            })) => panic!("the supervisor never answered, so the cancel cannot have finished"),
+            first = requests.recv() => assert!(matches!(
+                first,
+                Some(crate::stepd::StepdRequest::SignalAllocation { signal }) if signal == SIGTERM
+            )),
+        }
+
+        tokio::time::advance(STEP_CANCEL_ESCALATION + std::time::Duration::from_secs(1)).await;
+        // Paused-time stand-in for "never arrives": it fires only once everything is idle.
+        let second = tokio::select! {
+            second = requests.recv() => second,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => None,
+        };
+        assert!(matches!(
+            second,
+            Some(crate::stepd::StepdRequest::SignalAllocation { signal })
+                if signal == nix::sys::signal::Signal::SIGKILL as i32
+        ));
     }
 
     #[tokio::test]
