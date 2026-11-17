@@ -250,6 +250,15 @@ between nodes; open that port if a host firewall default-denies it.
    ``bird`` and ``vxlan``) on upgrade alone. Reprovision with
    ``spur k8s down --reset`` followed by ``spur k8s up`` to pick up the change.
 
+.. note::
+
+   By default the kubelet pulls one image at a time, so a small image can wait
+   behind large model images. To pull images in parallel, set
+   ``serialize_image_pulls`` and ``max_parallel_image_pulls`` in ``[cluster]``.
+   Like the network config, the setting does not hot-reload. To apply it to a
+   running cluster without ``--reset``, see the procedure in
+   :ref:`the configuration reference <image-pulls>`.
+
 Storage
 ~~~~~~~
 
