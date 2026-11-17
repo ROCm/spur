@@ -171,6 +171,9 @@ src/
                       keeps anything owned locally, in a runtime session, a
                       populated cgroup, or held by a process (/proc scan), then
                       deletes the rest. 60 s budget; any doubt keeps the dir.
+                      Also unnamed container rootfs dirs (`job_<N>`,
+                      `step_<N>_<M>` in container_dir()): unmounted in the pass,
+                      then deleted by a background task after serving.
 
   spool_fs.rs         Descriptor-relative spool deletion shared by startup and
                       completion cleanup: follows symlinks only in the root path,
@@ -339,7 +342,9 @@ src/
 15. Adopt any running spurd-owned k0s unit, spawn the k0s supervise loop.
 16. Start the reaper/monitor loop (`start_monitor`).
 17. Spawn periodic inventory-refresh loop (debounced, seen-twice).
-18. Start the gRPC server (with auth middleware).
+18. Start the gRPC server (with auth middleware), then spawn the background
+    deletion of orphan container rootfs dirs queued in step 13
+    (`RootfsCleanup::spawn`; dropping the handle stops it on exit).
 19. Report recovered/stale sessions to the controller.
 20. Wait on SIGTERM or server exit.
 
@@ -546,6 +551,15 @@ Inspired by Enroot.
 - **Bind mounts**: `ContainerConfig.mounts` (source:target:ro/rw).
 - **Process model**: raw `fork()` (not tokio::Command) with the container init
   done between fork and exec. PID tracked via `pidfd_open` on kernels >= 5.3.
+- **Rootfs dirs**: unnamed `job_<N>` / `step_<N>_<M>` (step ids from 0), named
+  ones at the sanitized name, under `container_dir()` (`$SPUR_CONTAINER_DIR` >
+  `/var/spool/spur/containers` > `$HOME/.spur/containers`). Normal teardown
+  (`cleanup_rootfs`) removes them; leftovers from a crash are removed by the
+  startup orphan pass, which unmounts layers first (no lazy detach) and keeps a
+  rootfs held as a process root or bound anywhere (per-namespace mountinfo).
+- **Overlay mode currently always falls back to extraction**: `upper` is a
+  tmpfs but `work` sits on the base filesystem, which overlayfs rejects, so
+  every rootfs is a full unsquashfs tree.
 
 ---
 
