@@ -2704,6 +2704,59 @@ fn settle_lost_teardown(
     }
 }
 
+/// What a dead supervisor is reported as.
+///
+/// A real workload exit wins, so a failure file cannot relabel a script that
+/// ran. A failure file with no real exit, including the exit an agent restart
+/// invents, is a launch failure.
+fn completion_for_dead_supervisor(
+    recorded_exit: Option<(i32, i32)>,
+    exit_was_synthesized: bool,
+    launch_failure: Option<String>,
+) -> (i32, i32, Option<String>) {
+    if let Some((code, signal)) = recorded_exit.filter(|_| !exit_was_synthesized) {
+        return (code, signal, None);
+    }
+    if launch_failure.is_some() {
+        return (1, 0, launch_failure);
+    }
+    match recorded_exit {
+        Some((code, signal)) => (code, signal, None),
+        None => (0, nix::sys::signal::Signal::SIGKILL as i32, None),
+    }
+}
+
+#[cfg(test)]
+mod dead_supervisor_completion {
+    use super::completion_for_dead_supervisor;
+
+    #[test]
+    fn a_synthesized_kill_keeps_a_recorded_launch_failure() {
+        let (code, signal, reason) = completion_for_dead_supervisor(
+            Some((0, 9)),
+            true,
+            Some("open stdout: permission denied".into()),
+        );
+        assert_eq!((code, signal), (1, 0));
+        assert_eq!(reason.as_deref(), Some("open stdout: permission denied"));
+    }
+
+    #[test]
+    fn a_real_exit_is_not_relabeled_when_a_failure_file_exists() {
+        let (code, signal, reason) =
+            completion_for_dead_supervisor(Some((1, 0)), false, Some("supervisor polling".into()));
+        assert_eq!((code, signal), (1, 0));
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn a_death_with_no_record_stays_a_kill() {
+        let (code, signal, reason) = completion_for_dead_supervisor(None, false, None);
+        assert_eq!((code, signal), (0, 9));
+        assert!(reason.is_none());
+    }
+}
+
 async fn fence_dead_stepd(
     context: &CompletionListenerContext,
     descriptor: crate::stepd::StepdDescriptor,
@@ -2741,22 +2794,20 @@ async fn fence_dead_stepd(
         )
         .ok()
         .flatten();
-    let launch_failure = if recorded_exit.is_none() {
-        store.recorded_failure(
+    let exit_was_synthesized = store
+        .observed_exit_was_synthesized(
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
         )
-    } else {
-        None
-    };
-    // A missing workload exit used to be reported as SIGKILL, so a supervisor
-    // that died before exec looked like the script had been killed.
-    let (exit_code, signal) = match (&recorded_exit, launch_failure.as_deref()) {
-        (Some(exit), _) => *exit,
-        (None, Some(_)) => (1, 0),
-        (None, None) => (0, nix::sys::signal::Signal::SIGKILL as i32),
-    };
+        .unwrap_or(false);
+    let recorded_failure = store.recorded_failure(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    );
+    let (exit_code, signal, launch_failure) =
+        completion_for_dead_supervisor(recorded_exit, exit_was_synthesized, recorded_failure);
     if recorded_exit.is_none() {
         if let Some(reason) = &launch_failure {
             warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %reason,
@@ -3045,16 +3096,23 @@ async fn replay_runtime_completions(
                 .epilog_failed
                 .then(|| drain_for(EPILOG_FAILED_DRAIN_REASON)),
         };
-        let launch_failure = store.recorded_failure(
+        let recorded_failure = store.recorded_failure(
             completion.job_id,
             completion.run_attempt,
             completion.step_id,
         );
-        let (exit_code, signal) = if launch_failure.is_some() {
-            (1, 0)
-        } else {
-            (completion.exit_code, completion.signal)
-        };
+        let exit_was_synthesized = store
+            .observed_exit_was_synthesized(
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+            )
+            .unwrap_or(false);
+        let (exit_code, signal, launch_failure) = completion_for_dead_supervisor(
+            Some((completion.exit_code, completion.signal)),
+            exit_was_synthesized,
+            recorded_failure,
+        );
         if report_runtime_completion(
             store,
             controller_addr,

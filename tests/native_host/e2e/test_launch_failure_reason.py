@@ -75,7 +75,7 @@ def _sacct(cluster, job_id: int) -> str:
                 "JobID,State,ExitCode,Reason,ReasonDetail",
             ]
         )
-        if str(job_id) in last:
+        if str(job_id) in last and "FAILED" in last:
             print(f"sacct job {job_id}: {last.strip()}")
             return last
         time.sleep(2)
@@ -96,11 +96,12 @@ class TestLaunchFailureReason:
         cluster.start({"hooks": {"task_prolog": prolog}})
 
         out_path = f"{cluster.remote_dir}/launch-refused.out"
+        marker_path = f"{cluster.remote_dir}/never-ran"
         script = cluster.write_file(
             "never-runs.sh",
             "#!/bin/bash\n"
             "echo SCRIPT_RAN\n"
-            "echo SCRIPT_RAN > /tmp/spur-launch-marker-$SPUR_JOB_ID\n",
+            f"echo SCRIPT_RAN > {marker_path}\n",
         )
         submitted = cluster.sbatch(
             ["-J", "launch-refused", "-N", "1", "-o", out_path, script]
@@ -110,7 +111,7 @@ class TestLaunchFailureReason:
         state = wait_job(cluster, job_id, timeout=90)
         reason = _reason_line(cluster, job_id)
         stdout = _stdout_report(cluster, out_path)
-        marker = _marker_report(cluster, f"/tmp/spur-launch-marker-{job_id}")
+        marker = _marker_report(cluster, marker_path)
         accounting = _sacct(cluster, job_id)
         body = cluster.read_output_on_any_node(out_path)
         print(f"state={state} stdout_sizes={stdout} stdout_body={body!r}")
@@ -166,9 +167,7 @@ class TestLaunchFailureReason:
         cluster = unstarted_cluster
         cluster.start()
         out_path = "/root/spur-denied-out.txt"
-        marker_path = "/tmp/spur-denied-output-marker"
-        for node in cluster.nodes:
-            node.exec(f"rm -f '{marker_path}'", check=False)
+        marker_path = f"{cluster.remote_dir}/denied-ran"
         script = cluster.write_file(
             "denied-out.sh",
             "#!/bin/bash\n"
@@ -209,7 +208,7 @@ class TestLaunchFailureReason:
             "companion-runs.sh",
             "#!/bin/bash\n"
             "echo SCRIPT_RAN\n"
-            "echo SCRIPT_RAN > /tmp/spur-launch-marker-$SPUR_JOB_ID\n"
+            f"echo SCRIPT_RAN > {cluster.remote_dir}/companion-ran\n"
             "exit 1\n",
         )
         job_id = parse_job_id(
@@ -230,7 +229,7 @@ class TestLaunchFailureReason:
         reason = _reason_line(cluster, job_id)
         show = cluster.scontrol("show", "job", str(job_id))
         print(show)
-        marker = _marker_report(cluster, f"/tmp/spur-launch-marker-{job_id}")
+        marker = _marker_report(cluster, f"{cluster.remote_dir}/companion-ran")
         body = cluster.read_output_on_any_node(f"{cluster.remote_dir}/companion.out")
         print(f"state={state} stdout_body={body!r}")
         assert state == "F"

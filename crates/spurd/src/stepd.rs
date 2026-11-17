@@ -2535,7 +2535,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     };
     if let Err(error) = result {
         teardown(cgroup).await?;
-        record_launch_failure(&session_dir, &stderr_path, &error);
+        // The workload was already launched. The failure file is read back as
+        // "the script never started", so a supervisor error after that must not
+        // be stored there.
+        tracing::warn!(job_id, %error, "supervisor failed after the workload was launched");
         return Err(error.into());
     }
     let snapshot = session.snapshot().await;
@@ -2859,14 +2862,28 @@ impl StepdStore {
         {
             return Ok(false);
         }
+        // A failure file means the workload never started. A synthesized kill
+        // would be read later as the real outcome, and the reason dropped.
+        let launch_failed = self
+            .recorded_failure(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+            .is_some();
+        let (exit_code, signal) = if launch_failed {
+            (1, 0)
+        } else {
+            (0, nix::sys::signal::Signal::SIGKILL as i32)
+        };
         self.obligations(
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
         )
         .append(&StepdObligation::ExitObserved {
-            exit_code: 0,
-            signal: nix::sys::signal::Signal::SIGKILL as i32,
+            exit_code,
+            signal,
             synthesized: true,
         })?;
         Ok(true)
@@ -3326,6 +3343,25 @@ impl StepdStore {
                 } => Some((*exit_code, *signal)),
                 _ => None,
             }))
+    }
+
+    /// Whether the last recorded exit was invented rather than observed.
+    /// False when no exit is recorded.
+    pub(crate) fn observed_exit_was_synthesized(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<bool> {
+        let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
+        Ok(obligations
+            .iter()
+            .rev()
+            .find_map(|obligation| match obligation {
+                StepdObligation::ExitObserved { synthesized, .. } => Some(*synthesized),
+                _ => None,
+            })
+            .unwrap_or(false))
     }
 
     /// The epilog outcome recorded after the last exit, or `None` while the
@@ -4890,6 +4926,32 @@ mod tests {
             )],
             "the ordinary completion replay must pick the loss up"
         );
+    }
+
+    #[test]
+    fn a_lost_supervisor_that_recorded_a_launch_failure_is_not_a_kill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = descriptor(44, 1, 999_999);
+        let session_dir = write_descriptor(&store, &lost);
+        fs::write(
+            session_dir.join(FAILURE_FILE),
+            b"open stdout: permission denied",
+        )
+        .expect("write failure file");
+
+        assert!(store
+            .record_lost_supervisor_exit(&lost)
+            .expect("record the lost supervisor's exit"));
+        assert_eq!(
+            store
+                .observed_exit(44, 1, spur_core::step::STEP_BATCH)
+                .expect("read observed exit"),
+            Some((1, 0))
+        );
+        assert!(store
+            .observed_exit_was_synthesized(44, 1, spur_core::step::STEP_BATCH)
+            .expect("read synthesized flag"));
     }
 
     // The headline of supervised execution is that a job survives an agent

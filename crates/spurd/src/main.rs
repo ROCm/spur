@@ -400,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(true) => warn!(
                 job_id = descriptor.job_id,
                 run_attempt = descriptor.run_attempt,
-                "supervisor lost while the agent was down; reporting its job as killed"
+                "supervisor lost while the agent was down; its completion will be reported"
             ),
             Ok(false) => {}
             Err(error) => warn!(
