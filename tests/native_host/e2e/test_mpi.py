@@ -88,9 +88,11 @@ def assert_one_mpi_world(
     assert all(r.size == expected_size for r in rows), (
         f"not all ranks report size={expected_size}:\n{out}"
     )
-    pids = {r.pid for r in rows}
-    assert len(pids) == expected_size, (
-        f"expected {expected_size} distinct PIDs, got {len(pids)}:\n{out}"
+    # A pid is only unique within a host; a multi-node world can legitimately
+    # reuse the same pid on different hosts, so identify a process by (host, pid).
+    procs = {(r.host, r.pid) for r in rows}
+    assert len(procs) == expected_size, (
+        f"expected {expected_size} distinct (host, pid) processes, got {len(procs)}:\n{out}"
     )
     if expected_hosts is not None:
         actual_hosts = sorted({r.host for r in rows})
@@ -711,7 +713,7 @@ class TestMpirunMultiNode:
         assert len(hosts) == 3, f"expected 3 hosts, got {hosts}:\n{out}"
 
     def test_mpirun_duplicate_driver_guard_m6(self, mpi_multi_node_cluster):
-        """M6: exactly N lines, N distinct PIDs — proves single driver."""
+        """M6: exactly N lines, N distinct (host, pid) processes — proves single driver."""
         cluster = mpi_multi_node_cluster
         self._skip_if_no_inter_node_ssh(cluster)
         hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
