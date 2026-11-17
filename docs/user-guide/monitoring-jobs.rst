@@ -1541,7 +1541,7 @@ the job.
 
 .. note::
 
-   For a job started with a container entrypoint (``container_entrypoint``), the
+   For a job started with ``container_entrypoint`` set, the
    batch step's PID 1 inside the container is an ``sh -c`` wrapper and the script's
    shell is its child. ``scancel -b`` reaches the wrapper, not the script's shell,
    and as PID 1 the wrapper discards signals it does not trap. So ``-b`` has no
