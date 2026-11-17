@@ -26,27 +26,27 @@ pub struct ScancelArgs {
     /// Job IDs to cancel or signal
     pub job_ids: Vec<u32>,
 
-    /// Cancel all jobs for this user
+    /// Cancel or signal all jobs for this user
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
-    /// Cancel jobs in this partition
+    /// Cancel or signal jobs in this partition
     #[arg(short = 'p', long)]
     pub partition: Option<String>,
 
-    /// Cancel jobs in this state
+    /// Cancel or signal jobs in this state
     #[arg(short = 't', long)]
     pub state: Option<String>,
 
-    /// Cancel jobs with this name
+    /// Cancel or signal jobs with this name
     #[arg(short = 'n', long)]
     pub name: Option<String>,
 
-    /// Cancel jobs for this account
+    /// Cancel or signal jobs for this account
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
-    /// Cancel jobs in this reservation
+    /// Cancel or signal jobs in this reservation
     #[arg(short = 'R', long)]
     pub reservation: Option<String>,
 
@@ -69,7 +69,7 @@ pub struct ScancelArgs {
     #[arg(short = 'Q', long)]
     pub quiet: bool,
 
-    /// Interactive: confirm each cancellation
+    /// Interactive: confirm each cancellation or signal
     #[arg(short = 'i', long)]
     pub interactive: bool,
 
@@ -364,7 +364,7 @@ fn parse_action(signal: Option<&str>, batch: bool, full: bool) -> Result<Action>
 }
 
 const SIGKILL: i32 = 9;
-const MAX_SIGNAL: i32 = 64;
+const MAX_SIGNAL: i32 = 31;
 
 /// Linux signal numbers, which is what the agents deliver.
 const SIGNAL_NAMES: [(&str, i32); 31] = [
@@ -774,7 +774,7 @@ mod tests {
             ("HUP", 1),
             ("usr2", 12),
             ("CONT", 18),
-            ("64", 64),
+            ("31", 31),
         ] {
             assert_eq!(
                 parse_action(Some(text), false, false).unwrap(),
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn an_unknown_or_out_of_range_signal_is_rejected() {
-        for text in ["BOGUS", "SIG", "", "0", "-1", "65", "1000"] {
+        for text in ["BOGUS", "SIG", "", "0", "-1", "32", "64", "1000"] {
             let err = parse_action(Some(text), false, false).unwrap_err();
             assert_eq!(
                 err.to_string(),

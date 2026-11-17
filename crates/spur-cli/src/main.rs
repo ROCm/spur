@@ -357,7 +357,7 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
         "  alloc       Allocate resources for an interactive session"
     )?;
     writeln!(w, "  queue       View the job queue")?;
-    writeln!(w, "  cancel      Cancel pending or running jobs")?;
+    writeln!(w, "  cancel      Cancel or signal pending or running jobs")?;
     writeln!(w, "  nodes       View cluster node information")?;
     writeln!(w, "  history     View job accounting history")?;
     writeln!(w, "  accounts    Manage accounts, users, and QOS")?;

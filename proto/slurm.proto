@@ -843,14 +843,15 @@ message GetJobRequest {
 
 message CancelJobRequest {
   uint32 job_id = 1;
-  int32 signal = 2;  // 0 or 9 = cancel, else routed to SignalJob (steps only)
+  // CancelJob always cancels; a non-zero signal is only audited. SignalJob signals without cancelling.
+  int32 signal = 2;
   string user = 3;   // For authorization
 }
 
 // Signal a running job. Unlike CancelJob, the job keeps running unless it dies of the signal.
 message SignalJobRequest {
   uint32 job_id = 1;
-  int32 signal = 2;          // 1..=64
+  int32 signal = 2;          // 1..=31
   SignalTarget target = 3;   // UNSPECIFIED means STEPS
   string user = 4;           // For authorization
 }
@@ -1353,7 +1354,10 @@ message AgentCancelJobRequest {
 enum SignalTarget {
   SIGNAL_TARGET_UNSPECIFIED = 0;
   SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
-  SIGNAL_TARGET_BATCH = 2;   // the batch shell process only, not its children or any step; FAILED_PRECONDITION if the run has no batch step, UNAVAILABLE if that shell cannot be signalled; agents predating batch support return UNIMPLEMENTED
+  // The batch shell process only, not its children or any step. FAILED_PRECONDITION if the
+  // run has no batch step, UNAVAILABLE if that shell cannot be signalled; agents predating
+  // batch support return UNIMPLEMENTED.
+  SIGNAL_TARGET_BATCH = 2;
   SIGNAL_TARGET_FULL = 3;    // everything in the run
 }
 

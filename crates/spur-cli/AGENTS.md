@@ -168,7 +168,7 @@ output (`-p`/`-P`). Commands: `add`, `modify`, `delete`, `show`, `list`.
 
 `parse_action` maps `-s`/`-b`/`-f` to one `Action`. No `-s`, or `-s KILL`/9,
 is `Cancel` (`CancelJob`, signal 0; `-b`/`-f` are ignored). Any other signal
-(name, `SIG`-prefixed, number 1-64, any case) is `SignalJob` with target
+(name, `SIG`-prefixed, number 1-31, any case) is `SignalJob` with target
 `Steps` by default, `Batch` with `-b`, `Full` with `-f` (`-f` wins over `-b`).
 A signal never falls back to `CancelJob`: a controller that predates
 `SignalJob` answers `Unimplemented`, reported as an error with exit 1. Filter
