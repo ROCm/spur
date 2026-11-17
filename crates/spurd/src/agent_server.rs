@@ -46,7 +46,7 @@ use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
 fn gpu_selection(gpu_ids: &[u64]) -> spur_devices::DeviceSelection {
-    spur_devices::DeviceSelection::from([("gpu".to_string(), gpu_ids.to_vec())])
+    spur_devices::DeviceSelection::new().with("gpu", gpu_ids.to_vec())
 }
 
 /// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
