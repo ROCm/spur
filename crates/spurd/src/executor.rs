@@ -2524,6 +2524,7 @@ pub(crate) fn job_spool_mount(dir: &ScratchDir) -> crate::container::BindMount {
         source: path.clone(),
         target: path,
         readonly: true,
+        kind: crate::container::MountKind::Bind,
     }
 }
 

@@ -214,7 +214,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_image")]
     pub container_image: Option<String>,
 
-    /// Container bind mounts ("/src:/dst:ro")
+    /// Container mounts, repeatable or comma-separated ("/src:/dst:ro", "tmpfs:/dst:size=1G")
     #[arg(long)]
     pub container_mounts: Vec<String>,
 

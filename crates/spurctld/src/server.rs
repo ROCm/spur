@@ -5180,7 +5180,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.container_image)
         },
-        container_mounts: spec.container_mounts,
+        container_mounts: spur_core::container_mount::normalize(&spec.container_mounts)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?,
         container_workdir: if spec.container_workdir.is_empty() {
             None
         } else {
@@ -14994,6 +14995,34 @@ mod tests {
         let core = proto_to_job_spec(spec).unwrap();
         assert_eq!(core.num_tasks, 4);
         assert_eq!(core.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn proto_to_job_spec_stores_a_comma_mount_list_as_separate_mounts() {
+        let spec = spur_proto::proto::JobSpec {
+            container_mounts: vec!["/data:/data,/models:/models:ro".into(), "tmpfs:/c".into()],
+            ..Default::default()
+        };
+        let core = proto_to_job_spec(spec).unwrap();
+        assert_eq!(
+            core.container_mounts,
+            vec!["/data:/data", "/models:/models:ro", "tmpfs:/c"]
+        );
+    }
+
+    #[test]
+    fn proto_to_job_spec_rejects_a_mount_it_cannot_parse_and_names_it() {
+        let spec = spur_proto::proto::JobSpec {
+            container_mounts: vec!["/data:/data,/scratch".into()],
+            ..Default::default()
+        };
+        let status = proto_to_job_spec(spec).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'/scratch'"),
+            "{}",
+            status.message()
+        );
     }
 
     #[test]

@@ -1131,3 +1131,150 @@ class TestSrunContainerStepSupervision:
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
         _assert_ticks_not_replayed(out)
+
+
+# ---------------------------------------------------------------------------
+# --container-mounts: comma lists, tmpfs, read-only, and loud failures
+# ---------------------------------------------------------------------------
+
+def _make_bind_sources(cluster, names: list) -> dict:
+    """One directory per name on every node, each holding a file naming it."""
+    dirs = {}
+    for name in names:
+        path = f"{cluster.remote_dir}/mounts-{name}"
+        for node in cluster.nodes:
+            node.exec(f"mkdir -p '{path}' && echo 'src-{name}' > '{path}/id'")
+        dirs[name] = path
+    return dirs
+
+
+_MOUNT_PROBE = (
+    "for d in /m/data /m/scratch /m/models; do "
+    'if [ -f "$d/id" ]; then echo "$d=$(cat "$d/id")"; else echo "$d=MISSING"; fi; done; '
+    "ls -d /m/* 2>&1 | sed 's/^/LS=/'"
+)
+
+
+class TestContainerMounts:
+    def _sbatch_probe(self, cluster, name: str, mount_args: list, body: str):
+        out_path = f"{cluster.remote_dir}/{name}.out"
+        script = cluster.write_file(f"{name}.sh", f"#!/bin/bash\n{body}\n")
+        sb = cluster.sbatch(
+            ["-J", name, "-N", "1", "-t", "0:03", "-o", out_path,
+             f"--container-image={cluster.step_container_image}", *mount_args, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        state = wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        print(f"[{name}] job={job_id} state={state}\n{out}")
+        return job_id, state, out
+
+    def test_a_comma_list_mounts_every_entry(self, step_container_cluster):
+        cluster = step_container_cluster
+        src = _make_bind_sources(cluster, ["data", "scratch", "models"])
+        listed = ",".join(f"{src[n]}:/m/{n}" for n in ["data", "scratch", "models"])
+        _, state, out = self._sbatch_probe(
+            cluster, "mounts-list", [f"--container-mounts={listed}"], _MOUNT_PROBE
+        )
+        for n in ["data", "scratch", "models"]:
+            assert f"/m/{n}=src-{n}" in out, f"mount {n} missing (state {state}):\n{out}"
+
+    def test_a_two_entry_list_is_two_mounts_not_one_comma_named_target(
+        self, step_container_cluster
+    ):
+        cluster = step_container_cluster
+        src = _make_bind_sources(cluster, ["data", "scratch"])
+        listed = f"{src['data']}:/m/data,{src['scratch']}:/m/scratch"
+        _, state, out = self._sbatch_probe(
+            cluster, "mounts-two", [f"--container-mounts={listed}"], _MOUNT_PROBE
+        )
+        assert "/m/data=src-data" in out and "/m/scratch=src-scratch" in out, (
+            f"state {state}:\n{out}"
+        )
+        assert "," not in "".join(l for l in out.splitlines() if l.startswith("LS=")), out
+
+    def test_a_repeated_flag_still_mounts_every_entry(self, step_container_cluster):
+        cluster = step_container_cluster
+        src = _make_bind_sources(cluster, ["data", "scratch", "models"])
+        flags = [f"--container-mounts={src[n]}:/m/{n}" for n in ["data", "scratch", "models"]]
+        _, state, out = self._sbatch_probe(cluster, "mounts-repeat", flags, _MOUNT_PROBE)
+        for n in ["data", "scratch", "models"]:
+            assert f"/m/{n}=src-{n}" in out, f"mount {n} missing (state {state}):\n{out}"
+
+    def test_a_batch_step_splits_its_own_comma_list(self, step_container_cluster):
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        src = _make_bind_sources(cluster, ["data", "scratch", "models"])
+        listed = ",".join(f"{src[n]}:/m/{n}" for n in ["data", "scratch", "models"])
+        out_path = f"{cluster.remote_dir}/mounts-step.out"
+        script = cluster.write_file(
+            "mounts-step.sh",
+            "#!/bin/bash\n"
+            f"{cluster.bin_dir}/srun --container-image='{img}' "
+            f"--container-mounts='{listed}' bash -c {shlex.quote(_MOUNT_PROBE)}\n"
+            'echo "SRUN_EXIT=$?"\n',
+        )
+        sb = cluster.sbatch(["-J", "mounts-step", "-N", "1", "-t", "0:03", "-o", out_path, script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        state = wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        print(f"[mounts-step] job={job_id} state={state}\n{out}")
+        for n in ["data", "scratch", "models"]:
+            assert f"/m/{n}=src-{n}" in out, f"step mount {n} missing:\n{out}"
+        assert "SRUN_EXIT=0" in out, out
+
+    def test_an_unparseable_mount_is_refused_at_submit_and_named(self, step_container_cluster):
+        cluster = step_container_cluster
+        src = _make_bind_sources(cluster, ["data"])
+        for bad in [f"{src['data']}:/m/data,nocolon", f"{src['data']}:/m/data:z"]:
+            script = cluster.write_file("mounts-bad.sh", "#!/bin/bash\necho RAN\n")
+            code, out = cluster.sbatch_with_exit(
+                ["-J", "mounts-bad", "-N", "1", "-t", "0:02",
+                 f"--container-image={cluster.step_container_image}",
+                 f"--container-mounts={bad}", script]
+            )
+            print(f"[mounts-bad] spec={bad} exit={code}\n{out}")
+            assert code != 0, f"{bad!r} was accepted:\n{out}"
+            named = "nocolon" if bad.endswith("nocolon") else bad
+            assert named in out, f"error does not name {named!r}:\n{out}"
+
+    def test_a_missing_bind_source_fails_the_job_and_names_the_mount(
+        self, step_container_cluster
+    ):
+        cluster = step_container_cluster
+        missing = f"{cluster.remote_dir}/mounts-no-such-dir"
+        for node in cluster.nodes:
+            node.exec_allow_fail(f"test ! -e '{missing}'")
+        job_id, state, out = self._sbatch_probe(
+            cluster, "mounts-missing", [f"--container-mounts={missing}:/m/data"], "echo RAN"
+        )
+        diag = cluster.debug_job(job_id)
+        print(f"[mounts-missing] diag:\n{diag}")
+        assert "RAN" not in out, f"job ran without its mount (state {state}):\n{out}"
+        assert state != "CD", f"job completed without its mount:\n{diag}"
+        assert f"{missing}:/m/data" in diag + out, f"failure does not name the mount:\n{diag}"
+
+    def test_a_tmpfs_mount_has_its_size_and_is_writable(self, step_container_cluster):
+        cluster = step_container_cluster
+        body = (
+            "grep ' /m/cache ' /proc/mounts | sed 's/^/MOUNT=/'; "
+            "echo hi > /m/cache/f && echo WRITE=ok || echo WRITE=fail"
+        )
+        _, state, out = self._sbatch_probe(
+            cluster, "mounts-tmpfs", ["--container-mounts=tmpfs:/m/cache:size=64M"], body
+        )
+        mount_line = next((l for l in out.splitlines() if l.startswith("MOUNT=")), "")
+        assert mount_line.startswith("MOUNT=tmpfs /m/cache tmpfs"), f"state {state}:\n{out}"
+        assert "size=65536k" in mount_line, mount_line
+        assert "WRITE=ok" in out, out
+
+    def test_a_read_only_bind_refuses_writes(self, step_container_cluster):
+        cluster = step_container_cluster
+        src = _make_bind_sources(cluster, ["data"])
+        body = "cat /m/data/id; touch /m/data/new 2>&1 && echo WRITE=ok || echo WRITE=refused"
+        _, state, out = self._sbatch_probe(
+            cluster, "mounts-ro", [f"--container-mounts={src['data']}:/m/data:ro"], body
+        )
+        assert "src-data" in out and "WRITE=refused" in out, f"state {state}:\n{out}"

@@ -129,12 +129,23 @@ fn container_dir() -> PathBuf {
     system_dir.to_path_buf()
 }
 
-/// A parsed bind mount specification.
+/// A parsed `--container-mounts` entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindMount {
     pub source: String,
     pub target: String,
     pub readonly: bool,
+    #[serde(default)]
+    pub kind: MountKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MountKind {
+    #[default]
+    Bind,
+    Tmpfs {
+        size_bytes: Option<u64>,
+    },
 }
 
 /// Container configuration for a job.
@@ -184,6 +195,7 @@ pub fn maybe_bind_auth_socket(
         source: displayed.clone(),
         target: displayed,
         readonly: false,
+        kind: MountKind::Bind,
     });
 }
 
@@ -436,22 +448,30 @@ fn setup_rootfs_extract(image_path: &Path, rootfs: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Parse a bind mount spec like "/src:/dst:ro" into a BindMount.
-pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    match parts.len() {
-        2 => Ok(BindMount {
-            source: parts[0].to_string(),
-            target: parts[1].to_string(),
-            readonly: false,
-        }),
-        3 => Ok(BindMount {
-            source: parts[0].to_string(),
-            target: parts[1].to_string(),
-            readonly: parts[2].contains("ro"),
-        }),
-        _ => bail!("invalid mount spec '{}' — expected /src:/dst[:ro]", spec),
-    }
+/// Parse `--container-mounts` values; any entry this agent cannot apply fails the whole set.
+pub fn parse_mounts(values: &[String]) -> anyhow::Result<Vec<BindMount>> {
+    use spur_core::container_mount::{parse_list, MountSource};
+    parse_list(values)?
+        .into_iter()
+        .map(|m| {
+            let (source, kind) = match m.source {
+                MountSource::Path(path) => (path, MountKind::Bind),
+                MountSource::Tmpfs { size_bytes } => {
+                    ("tmpfs".to_string(), MountKind::Tmpfs { size_bytes })
+                }
+                MountSource::Pvc(claim) => bail!(
+                    "invalid mount spec 'pvc:{claim}:{}': pvc mounts need the Kubernetes agent",
+                    m.target
+                ),
+            };
+            Ok(BindMount {
+                source,
+                target: m.target,
+                readonly: m.readonly,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// Clean up an unnamed container rootfs.
@@ -490,13 +510,21 @@ pub fn cleanup_rootfs(base: &str, mode: &RootfsMode) {
 /// source type — bind mounts require the target to already exist. Returns a
 /// handle to it, which a mount through [`fd_path`] cannot be redirected from.
 pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow::Result<OwnedFd> {
-    let root = crate::scratch::ScratchDir::open(rootfs)
-        .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
     let kind = if source.is_dir() {
         crate::scratch::MountPoint::Dir
     } else {
         crate::scratch::MountPoint::File
     };
+    mount_point_in(rootfs, target, kind)
+}
+
+fn mount_point_in(
+    rootfs: &Path,
+    target: &str,
+    kind: crate::scratch::MountPoint,
+) -> anyhow::Result<OwnedFd> {
+    let root = crate::scratch::ScratchDir::open(rootfs)
+        .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
     crate::scratch::open_mount_point(&root, Path::new(target), kind)
         .with_context(|| format!("creating mount target {target} in {}", rootfs.display()))
 }
@@ -745,11 +773,56 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
 /// Process user-specified `--container-mounts` with source-type detection.
 pub fn mount_user_binds(rootfs: &Path, mounts: &[BindMount]) -> anyhow::Result<()> {
     for m in mounts {
-        let source = Path::new(&m.source);
-        bind_mount(rootfs, source, &m.target, m.readonly)
-            .with_context(|| format!("user mount {}:{}", m.source, m.target))?;
+        match m.kind {
+            MountKind::Bind => {
+                let source = Path::new(&m.source);
+                if !source.exists() {
+                    bail!(
+                        "user mount {}:{}: source {} does not exist on this node",
+                        m.source,
+                        m.target,
+                        m.source
+                    );
+                }
+                bind_mount(rootfs, source, &m.target, m.readonly)
+                    .with_context(|| format!("user mount {}:{}", m.source, m.target))?;
+            }
+            MountKind::Tmpfs { size_bytes } => {
+                tmpfs_mount(rootfs, &m.target, size_bytes, m.readonly)
+                    .with_context(|| format!("user mount tmpfs:{}", m.target))?;
+            }
+        }
     }
     Ok(())
+}
+
+fn tmpfs_mount(
+    rootfs: &Path,
+    target: &str,
+    size_bytes: Option<u64>,
+    readonly: bool,
+) -> anyhow::Result<()> {
+    let point = mount_point_in(rootfs, target, crate::scratch::MountPoint::Dir)?;
+    let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    if readonly {
+        flags |= MsFlags::MS_RDONLY;
+    }
+    nix::mount::mount(
+        Some("tmpfs"),
+        &fd_path(&point),
+        Some("tmpfs"),
+        flags,
+        Some(tmpfs_options(size_bytes).as_str()),
+    )
+    .with_context(|| format!("mount tmpfs at {target}"))?;
+    Ok(())
+}
+
+fn tmpfs_options(size_bytes: Option<u64>) -> String {
+    match size_bytes {
+        Some(size) => format!("mode=1777,size={size}"),
+        None => "mode=1777".to_string(),
+    }
 }
 
 /// Bind-mount user home directory into the rootfs.
@@ -1430,48 +1503,80 @@ mod tests {
 
     // --- Mount parsing ---
 
-    #[test]
-    fn test_parse_mount_basic() {
-        let m = parse_mount("/data:/data").unwrap();
-        assert_eq!(m.source, "/data");
-        assert_eq!(m.target, "/data");
-        assert!(!m.readonly);
+    fn mounts(values: &[&str]) -> anyhow::Result<Vec<BindMount>> {
+        parse_mounts(&values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
-    fn test_parse_mount_readonly() {
-        let m = parse_mount("/src:/dst:ro").unwrap();
-        assert_eq!(m.source, "/src");
-        assert_eq!(m.target, "/dst");
-        assert!(m.readonly);
-    }
-
-    #[test]
-    fn test_parse_mount_rw_explicit() {
-        let m = parse_mount("/src:/dst:rw").unwrap();
-        assert!(!m.readonly);
-    }
-
-    #[test]
-    fn test_parse_mount_one_part_fails() {
-        let err = parse_mount("/only-one-part").unwrap_err();
-        assert!(
-            err.to_string().contains("invalid mount spec"),
-            "expected 'invalid mount spec', got: {}",
-            err
+    fn a_comma_list_becomes_one_bind_per_entry() {
+        let parsed = mounts(&["/data:/data,/scratch:/scratch:ro,/models:/models"]).unwrap();
+        let summary: Vec<_> = parsed
+            .iter()
+            .map(|m| (m.source.as_str(), m.target.as_str(), m.readonly, &m.kind))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("/data", "/data", false, &MountKind::Bind),
+                ("/scratch", "/scratch", true, &MountKind::Bind),
+                ("/models", "/models", false, &MountKind::Bind),
+            ]
         );
-        assert!(err.to_string().contains("/src:/dst"));
     }
 
     #[test]
-    fn test_parse_mount_empty_fails() {
-        assert!(parse_mount("").is_err());
+    fn a_tmpfs_entry_carries_its_size() {
+        let parsed = mounts(&["tmpfs:/cache:size=64M"]).unwrap();
+        assert_eq!(parsed[0].target, "/cache");
+        assert_eq!(
+            parsed[0].kind,
+            MountKind::Tmpfs {
+                size_bytes: Some(64 << 20)
+            }
+        );
+        assert_eq!(tmpfs_options(Some(64 << 20)), "mode=1777,size=67108864");
+        assert_eq!(tmpfs_options(None), "mode=1777");
     }
 
     #[test]
-    fn test_parse_mount_too_many_parts_fails() {
-        let err = parse_mount("/a:/b:ro:extra:parts").unwrap_err();
-        assert!(err.to_string().contains("invalid mount spec"));
+    fn one_bad_entry_fails_the_set_and_is_named() {
+        for (values, named) in [
+            (&["/a:/a,/b:/b,nocolon"][..], "nocolon"),
+            (&["/a:/a", "/src:/dst:z"][..], "/src:/dst:z"),
+            (&["pvc:claim:/data"][..], "pvc:claim:/data"),
+        ] {
+            let err = format!("{:#}", mounts(values).unwrap_err());
+            assert!(err.contains(named), "{values:?} gave: {err}");
+        }
+    }
+
+    #[test]
+    fn a_missing_bind_source_fails_and_names_the_mount() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let missing = rootfs.path().join("no-such-dir");
+        let user_mounts = vec![BindMount {
+            source: missing.display().to_string(),
+            target: "/data".into(),
+            readonly: false,
+            kind: MountKind::Bind,
+        }];
+        let err = format!(
+            "{:#}",
+            mount_user_binds(rootfs.path(), &user_mounts).unwrap_err()
+        );
+        assert!(
+            err.contains(&format!("{}:/data", missing.display())),
+            "{err}"
+        );
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn a_config_written_before_tmpfs_support_reads_as_bind() {
+        let old = r#"{"source":"/data","target":"/data","readonly":true}"#;
+        let m: BindMount = serde_json::from_str(old).unwrap();
+        assert_eq!(m.kind, MountKind::Bind);
+        assert!(m.readonly);
     }
 
     // --- Image resolution ---
@@ -2251,6 +2356,7 @@ mod tests {
             source: "/dev/null".into(),
             target: "/etc/resolv.conf".into(),
             readonly: false,
+            kind: MountKind::Bind,
         }];
         mount_dns(rootfs.path(), &user_mounts).unwrap();
 

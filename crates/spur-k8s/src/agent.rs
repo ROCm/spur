@@ -482,7 +482,7 @@ impl SlurmAgent for VirtualAgent {
         };
 
         // Parse container_mounts → volumes + volume_mounts
-        let (mut volumes, mut volume_mounts) = parse_mounts(&spec.container_mounts);
+        let (mut volumes, mut volume_mounts) = parse_mounts(&spec.container_mounts)?;
 
         // Set working_dir from work_dir or container_workdir
         let working_dir = if !spec.container_workdir.is_empty() {
@@ -1043,57 +1043,53 @@ impl VirtualAgent {
     }
 }
 
-/// Parse container_mounts ("/src:/dst:ro" or "pvc:name:/dst") into K8s volumes + mounts.
-fn parse_mounts(mounts: &[String]) -> (Vec<Volume>, Vec<VolumeMount>) {
+/// Map `--container-mounts` onto pod volumes; an entry that does not parse refuses the launch.
+fn parse_mounts(mounts: &[String]) -> Result<(Vec<Volume>, Vec<VolumeMount>), Status> {
+    use spur_core::container_mount::{parse_list, MountSource};
+    let specs = parse_list(mounts).map_err(|e| Status::failed_precondition(e.to_string()))?;
     let mut volumes = Vec::new();
     let mut volume_mounts = Vec::new();
 
-    for (i, mount_str) in mounts.iter().enumerate() {
-        let parts: Vec<&str> = mount_str.split(':').collect();
-
-        if parts.len() >= 2 && parts[0] == "pvc" {
-            // PVC mount: "pvc:claim-name:/dst"
-            if parts.len() >= 3 {
-                let vol_name = format!("pvc-{}", i);
-                volumes.push(Volume {
-                    name: vol_name.clone(),
-                    persistent_volume_claim: Some(
-                        k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                            claim_name: parts[1].to_string(),
-                            read_only: Some(parts.get(3).is_some_and(|&v| v == "ro")),
-                        },
-                    ),
-                    ..Default::default()
-                });
-                volume_mounts.push(VolumeMount {
-                    name: vol_name,
-                    mount_path: parts[2].to_string(),
-                    read_only: Some(parts.get(3).is_some_and(|&v| v == "ro")),
-                    ..Default::default()
-                });
-            }
-        } else if parts.len() >= 2 {
-            // hostPath mount: "/src:/dst[:ro]"
-            let vol_name = format!("hostpath-{}", i);
-            let read_only = parts.get(2).is_some_and(|&v| v == "ro");
-            volumes.push(Volume {
-                name: vol_name.clone(),
+    for (i, m) in specs.into_iter().enumerate() {
+        let volume = match m.source {
+            MountSource::Path(path) => Volume {
+                name: format!("hostpath-{i}"),
                 host_path: Some(HostPathVolumeSource {
-                    path: parts[0].to_string(),
+                    path,
                     type_: Some("DirectoryOrCreate".into()),
                 }),
                 ..Default::default()
-            });
-            volume_mounts.push(VolumeMount {
-                name: vol_name,
-                mount_path: parts[1].to_string(),
-                read_only: Some(read_only),
+            },
+            MountSource::Pvc(claim_name) => Volume {
+                name: format!("pvc-{i}"),
+                persistent_volume_claim: Some(
+                    k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                        claim_name,
+                        read_only: Some(m.readonly),
+                    },
+                ),
                 ..Default::default()
-            });
-        }
+            },
+            MountSource::Tmpfs { size_bytes } => Volume {
+                name: format!("tmpfs-{i}"),
+                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                    medium: Some("Memory".into()),
+                    size_limit: size_bytes.map(|b| Quantity(b.to_string())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        volume_mounts.push(VolumeMount {
+            name: volume.name.clone(),
+            mount_path: m.target,
+            read_only: Some(m.readonly),
+            ..Default::default()
+        });
+        volumes.push(volume);
     }
 
-    (volumes, volume_mounts)
+    Ok((volumes, volume_mounts))
 }
 
 /// Sanitize a string for use in K8s resource names.
@@ -1310,7 +1306,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_hostpath() {
         let mounts = vec!["/data:/mnt/data:ro".to_string(), "/tmp:/tmp".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols.len(), 2);
         assert_eq!(vmounts.len(), 2);
         assert_eq!(vmounts[0].mount_path, "/mnt/data");
@@ -1322,7 +1318,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_hostpath_source_path() {
         let mounts = vec!["/host/data:/container/data".to_string()];
-        let (vols, _) = parse_mounts(&mounts);
+        let (vols, _) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols.len(), 1);
         let hp = vols[0].host_path.as_ref().unwrap();
         assert_eq!(hp.path, "/host/data");
@@ -1336,7 +1332,7 @@ mod tests {
             "/c:/d".to_string(),
             "/e:/f".to_string(),
         ];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols[0].name, "hostpath-0");
         assert_eq!(vols[1].name, "hostpath-1");
         assert_eq!(vols[2].name, "hostpath-2");
@@ -1351,7 +1347,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_pvc() {
         let mounts = vec!["pvc:my-claim:/data".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols.len(), 1);
         assert_eq!(vmounts.len(), 1);
         assert_eq!(vmounts[0].mount_path, "/data");
@@ -1361,7 +1357,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_pvc_claim_name() {
         let mounts = vec!["pvc:training-data:/mnt/data".to_string()];
-        let (vols, _) = parse_mounts(&mounts);
+        let (vols, _) = parse_mounts(&mounts).unwrap();
         let pvc = vols[0].persistent_volume_claim.as_ref().unwrap();
         assert_eq!(pvc.claim_name, "training-data");
     }
@@ -1369,7 +1365,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_pvc_readonly() {
         let mounts = vec!["pvc:datasets:/data:ro".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         let pvc = vols[0].persistent_volume_claim.as_ref().unwrap();
         assert_eq!(pvc.read_only, Some(true));
         assert_eq!(vmounts[0].read_only, Some(true));
@@ -1378,7 +1374,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_pvc_readwrite() {
         let mounts = vec!["pvc:output:/results".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         let pvc = vols[0].persistent_volume_claim.as_ref().unwrap();
         assert_eq!(pvc.read_only, Some(false));
         assert_eq!(vmounts[0].read_only, Some(false));
@@ -1387,7 +1383,7 @@ mod tests {
     #[test]
     fn test_parse_mounts_pvc_naming() {
         let mounts = vec!["pvc:a:/x".to_string(), "pvc:b:/y".to_string()];
-        let (vols, _) = parse_mounts(&mounts);
+        let (vols, _) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols[0].name, "pvc-0");
         assert_eq!(vols[1].name, "pvc-1");
     }
@@ -1401,7 +1397,7 @@ mod tests {
             "pvc:checkpoints:/checkpoints".to_string(),
             "/logs:/var/log".to_string(),
         ];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         assert_eq!(vols.len(), 3);
         assert_eq!(vmounts.len(), 3);
         // First is hostPath
@@ -1417,27 +1413,43 @@ mod tests {
     #[test]
     fn test_parse_mounts_empty() {
         let mounts: Vec<String> = vec![];
-        let (vols, vmounts) = parse_mounts(&mounts);
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
         assert!(vols.is_empty());
         assert!(vmounts.is_empty());
     }
 
     #[test]
-    fn test_parse_mounts_single_component_ignored() {
-        // A single component (no colon) should be skipped
-        let mounts = vec!["just-a-path".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
-        assert!(vols.is_empty());
-        assert!(vmounts.is_empty());
+    fn an_unparseable_mount_refuses_the_launch_and_is_named() {
+        for spec in ["just-a-path", "pvc:my-claim", "/src:/dst:z"] {
+            let status = parse_mounts(&[spec.to_string()]).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(status.message().contains(spec), "{}", status.message());
+        }
     }
 
     #[test]
-    fn test_parse_mounts_pvc_missing_mount_path_ignored() {
-        // "pvc:name" without mount path should be skipped (parts.len() < 3)
-        let mounts = vec!["pvc:my-claim".to_string()];
-        let (vols, vmounts) = parse_mounts(&mounts);
-        assert!(vols.is_empty());
-        assert!(vmounts.is_empty());
+    fn a_comma_list_becomes_one_volume_per_entry() {
+        let mounts = vec!["/a:/a,/b:/b:ro".to_string()];
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
+        assert_eq!(vols.len(), 2);
+        assert_eq!(vmounts[0].mount_path, "/a");
+        assert_eq!(vmounts[1].mount_path, "/b");
+        assert_eq!(vmounts[1].read_only, Some(true));
+    }
+
+    #[test]
+    fn a_tmpfs_mount_is_a_memory_backed_empty_dir_with_its_size() {
+        let mounts = vec!["tmpfs:/cache:size=64M".to_string()];
+        let (vols, vmounts) = parse_mounts(&mounts).unwrap();
+        let empty_dir = vols[0].empty_dir.as_ref().unwrap();
+        assert_eq!(empty_dir.medium.as_deref(), Some("Memory"));
+        assert_eq!(
+            empty_dir.size_limit.as_ref().map(|q| q.0.as_str()),
+            Some("67108864")
+        );
+        assert!(vols[0].host_path.is_none());
+        assert_eq!(vmounts[0].name, vols[0].name);
+        assert_eq!(vmounts[0].mount_path, "/cache");
     }
 
     // --- GPU vendor detection ---
