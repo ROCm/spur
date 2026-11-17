@@ -425,16 +425,11 @@ fn resolve_node_field(
         }
         'G' => {
             if let Some(ref r) = node.total_resources {
-                let gpus: Vec<String> = r
-                    .devices
-                    .iter()
-                    .filter(|d| d.gres_name == "gpu")
-                    .map(|g| format!("gpu:{}:{}", g.device_type, 1))
-                    .collect();
-                if gpus.is_empty() {
+                let gres = crate::gres_fmt::node_gres(r);
+                if gres.is_empty() {
                     "(null)".into()
                 } else {
-                    gpus.join(",")
+                    gres.join(",")
                 }
             } else {
                 "(null)".into()
