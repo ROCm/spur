@@ -1194,7 +1194,7 @@ class TestContainerMounts:
         assert "/m/data=src-data" in out and "/m/scratch=src-scratch" in out, (
             f"state {state}:\n{out}\n{diag}"
         )
-        listing = [l for l in out.splitlines() if l.startswith("LS=")]
+        listing = [line for line in out.splitlines() if line.startswith("LS=")]
         assert listing == ["LS=/m/data", "LS=/m/scratch"], out
 
     def test_a_repeated_flag_still_mounts_every_entry(self, step_container_cluster):
@@ -1267,7 +1267,7 @@ class TestContainerMounts:
         assert "RAN" not in out, f"job ran without its mount (state {state}):\n{out}"
         assert state != "CD", f"job completed without its mount:\n{diag}"
         reported = [
-            l for l in diag.splitlines() if f"source {missing} does not exist" in l
+            line for line in diag.splitlines() if f"source {missing} does not exist" in line
         ]
         assert reported, f"failure does not name the missing source:\n{diag}"
         print(f"[mounts-missing] reported as: {reported[0].strip()[-200:]!a}")
@@ -1282,7 +1282,9 @@ class TestContainerMounts:
         state, out, diag = self._sbatch_probe(
             cluster, "mounts-tmpfs", ["--container-mounts=tmpfs:/m/cache:size=64M"], body
         )
-        mount_line = next((l for l in out.splitlines() if l.startswith("MOUNT=")), "")
+        mount_line = next(
+            (line for line in out.splitlines() if line.startswith("MOUNT=")), ""
+        )
         assert mount_line.startswith("MOUNT=tmpfs /m/cache tmpfs"), (
             f"state {state}:\n{out}\n{diag}"
         )
