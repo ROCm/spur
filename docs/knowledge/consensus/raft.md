@@ -71,6 +71,7 @@ serde enum.  Every cluster state change is one variant.
 | `NodeStateChange` | Transition node state (Idle, Down, etc.) with reason |
 | `NodeLabelsUpdate` | Set/remove node labels |
 | `NodeRemove` | Deregister a node |
+| `NodeInventoryUpdate` | Save the `admission.node_names` list and delete unlisted nodes in one entry; refused while a node is busy, reserved, or a Kubernetes member |
 
 ### Partitions, reservations, tokens
 
@@ -177,8 +178,8 @@ Two leadership checks are available:
 
 `ClusterSnapshot` is a JSON-serialized struct containing all cluster state:
 jobs, nodes, reservations, partitions, deleted partition names, steps, license
-pool, admission tokens, burst buffer total, k0s state, and `next_job_id`
-high-water mark.  Serialized via `serde_json::to_vec`.
+pool, admission tokens, the saved `admission.node_names` list, burst buffer
+total, k0s state, and `next_job_id` high-water mark.  Serialized via `serde_json::to_vec`.
 
 ### Chunked transport
 

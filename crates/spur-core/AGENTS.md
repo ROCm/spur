@@ -84,6 +84,7 @@ src/
 | `[scheduler]`    | `SchedulerConfig`    | Backfill interval, fairshare halflife, preempt_type, idle-fill knobs |
 | `[accounting]`   | `AccountingConfig`   | PostgreSQL URL, fairshare refresh, QOS enforcement flags |
 | `[auth]`         | `AuthConfig`         | Plugin (jwt/spur/none), AuthMode, jwt_key, cluster_admins, private_data |
+| `[admission]`    | `AdmissionConfig`    | Admission mode (open/token), optional `node_names` list expanded to `NodeInventory` |
 | `[network]`      | `NetworkConfig`      | WireGuard mesh toggle, CIDR, agent port |
 | `[kubernetes]`   | `KubernetesConfig`   | External k8s integration (SpurJob CRDs) |
 | `[cluster]`      | `ClusterConfig`      | Native k0s lifecycle (spur k8s up/down), CNI, storage provisioner |

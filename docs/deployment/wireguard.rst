@@ -131,6 +131,8 @@ key, so the controller leaves the node out of mesh membership. If ``spurctld``
 names the wrong interface, it cannot read peer endpoints, and worker-to-worker
 tunnels may fall back to hub-and-spoke.
 
+.. _wireguard-remove-node:
+
 Removing a node from the mesh
 =============================
 
@@ -141,8 +143,10 @@ Removing a node from the mesh
    mutation; it does not touch cluster state. Under a SPUR-managed k0s cluster the
    controller's reconcile loop rebuilds mesh membership from live node inventory
    every ~30s, so if the node is still registered it will simply re-push the peer
-   you just removed. Run ``spur node remove <node>`` (or the equivalent) first, so
-   the reconcile no longer includes it, then remove the peer.
+   you just removed. Run ``spur node remove <node>``, or drop it from
+   ``admission.node_names`` and run ``scontrol reconfigure`` (see
+   :ref:`configured-node-list`; remove its Kubernetes membership first), so the
+   reconcile no longer includes it, then remove the peer.
 
 When a node leaves, drop its peer entry so it does not linger as a "ghost" peer
 (and, on the node itself, tear the interface down so it does not rejoin on

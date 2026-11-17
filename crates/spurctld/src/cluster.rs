@@ -22,7 +22,7 @@ use spur_core::accounting::{
     AccountLimits, PerUserCaps, Qos, ScopeLimitUsage, TresRecord, TresType, UserLimitUsage,
 };
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::config::{EnforcePartLimits, HealthCheck, NodeInventory, SlurmConfig};
 use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
@@ -609,6 +609,11 @@ pub struct ClusterManager {
         RwLock<BTreeMap<(JobId, u64), spur_core::preemption_usage::PreemptionRelease>>,
     preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
+    node_inventory: RwLock<Option<NodeInventory>>,
+    startup_node_inventory: NodeInventory,
+    node_names_unsaved_warned: std::sync::atomic::AtomicBool,
+    node_names_mismatch_warned: std::sync::atomic::AtomicBool,
+    reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
     /// partitions with the same name from re-appearing on restart.
@@ -1031,6 +1036,7 @@ impl ClusterManager {
         if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
             external.load_block_file().map_err(anyhow::Error::msg)?;
         }
+        let startup_node_inventory = config.admission.node_inventory()?;
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -1052,6 +1058,11 @@ impl ClusterManager {
             preemption_confirmations: RwLock::new(BTreeMap::new()),
             preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
+            node_inventory: RwLock::new(None),
+            startup_node_inventory,
+            node_names_unsaved_warned: std::sync::atomic::AtomicBool::new(false),
+            node_names_mismatch_warned: std::sync::atomic::AtomicBool::new(false),
+            reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
@@ -2961,7 +2972,7 @@ impl ClusterManager {
         // exclusion can apply first, so the apply's refusal is the answer that counts.
         if !resp.job_started {
             anyhow::bail!(
-                "job {} lost a concurrent reservation race or now excludes a chosen node",
+                "job {} lost a concurrent reservation race or a chosen node is no longer eligible",
                 job_id
             );
         }
@@ -4202,6 +4213,8 @@ impl ClusterManager {
         capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
+        self.check_node_inventory(&name)?;
+        self.warn_node_names_not_applied();
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
@@ -4217,6 +4230,13 @@ impl ClusterManager {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
         };
+        // A node removed after the pre-check must not come back as a fresh record before the list is saved.
+        if matches!(action, RegistrationAction::Register)
+            && self.node_inventory.read().is_none()
+            && self.startup_node_inventory.excludes(&name)
+        {
+            return Err(excluded_by_node_names(&name));
+        }
 
         match action {
             RegistrationAction::Skip => {
@@ -4232,21 +4252,23 @@ impl ClusterManager {
                             && existing.version.as_deref() != Some(version.as_str()))
                         || existing.capabilities != capabilities;
                     if needs_update {
-                        self.propose(WalOperation::NodeUpdate {
-                            name: name.clone(),
-                            hostname: hostname.clone(),
-                            // Resend the raw detected report: NodeUpdate apply stores
-                            // this into detected_resources, so sending the clamped
-                            // total here would corrupt the raw inventory.
-                            resources: existing.detected_resources.clone(),
-                            address,
-                            port,
-                            wg_pubkey,
-                            version,
-                            source: source.clone(),
-                            capabilities,
-                        })
-                        .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        let response = self
+                            .propose(WalOperation::NodeUpdate {
+                                name: name.clone(),
+                                hostname: hostname.clone(),
+                                // Resend the raw detected report: NodeUpdate apply stores
+                                // this into detected_resources, so sending the clamped
+                                // total here would corrupt the raw inventory.
+                                resources: existing.detected_resources.clone(),
+                                address,
+                                port,
+                                wg_pubkey,
+                                version,
+                                source: source.clone(),
+                                capabilities,
+                            })
+                            .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        reject_excluded_registration(&response, &name)?;
                         info!(node = %name, "node comm address or metadata updated");
                     }
                     if existing.source != source {
@@ -4257,18 +4279,20 @@ impl ClusterManager {
                 }
             }
             RegistrationAction::Update => {
-                self.propose(WalOperation::NodeUpdate {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                let response = self
+                    .propose(WalOperation::NodeUpdate {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        source: source.clone(),
+                        capabilities,
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -4277,19 +4301,21 @@ impl ClusterManager {
                 self.warn_partition_cap_overcommit(&name);
             }
             RegistrationAction::Register => {
-                self.propose(WalOperation::NodeRegister {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    labels,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                let response = self
+                    .propose(WalOperation::NodeRegister {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        labels,
+                        source: source.clone(),
+                        capabilities,
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
@@ -4297,6 +4323,86 @@ impl ClusterManager {
                 info!(node = %name, "node registered");
                 self.warn_partition_cap_overcommit(&name);
             }
+        }
+        self.check_node_inventory(&name)
+    }
+
+    /// Only `scontrol reconfigure` saves node_names, so a rolling upgrade never writes
+    /// the new log entry on its own; until then this leader filters by its startup list.
+    fn warn_node_names_not_applied(&self) {
+        let Some(listed) = &self.startup_node_inventory.names else {
+            return;
+        };
+        let matches_saved = self
+            .node_inventory
+            .read()
+            .as_ref()
+            .map(|saved| saved.names.as_ref() == Some(listed));
+        let (flag, message) = match matches_saved {
+            Some(true) => return,
+            Some(false) => (
+                &self.node_names_mismatch_warned,
+                "admission.node_names loaded at startup differs from the saved list; \
+                 the saved list applies until `scontrol reconfigure`",
+            ),
+            None => (
+                &self.node_names_unsaved_warned,
+                "admission.node_names is not saved yet; run `scontrol reconfigure` to apply it",
+            ),
+        };
+        warn_once(flag, message);
+    }
+
+    fn committed_inventory_excludes(&self, name: &str) -> bool {
+        self.node_inventory
+            .read()
+            .as_ref()
+            .is_some_and(|inventory| inventory.excludes(name))
+    }
+
+    /// With a saved node_names list, registered nodes are all listed, so an unregistered name
+    /// is either excluded or not yet registered; earlier log entries stay unfenced on replay.
+    fn references_unregistered(&self, nodes: &HashMap<String, Node>, name: &str) -> bool {
+        !nodes.contains_key(name)
+            && self
+                .node_inventory
+                .read()
+                .as_ref()
+                .is_some_and(|inventory| inventory.names.is_some())
+    }
+
+    fn k0s_inventory_error<'a>(
+        &self,
+        nodes: &HashMap<String, Node>,
+        references: impl IntoIterator<Item = &'a String>,
+    ) -> Option<String> {
+        references
+            .into_iter()
+            .find(|name| self.references_unregistered(nodes, name))
+            .map(|name| format!("Kubernetes membership references node '{name}', which is not registered or not in admission.node_names"))
+    }
+
+    fn reservation_inventory_error(
+        &self,
+        nodes: &HashMap<String, Node>,
+        names: &[String],
+    ) -> Option<String> {
+        names
+            .iter()
+            .find(|name| self.references_unregistered(nodes, name))
+            .map(|name| format!("reservation names node '{name}', which is not registered or not in admission.node_names"))
+    }
+
+    pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
+        let registered = self.nodes.read().contains_key(name);
+        let inventory = self.node_inventory.read();
+        let excluded = match inventory.as_ref() {
+            Some(saved) => saved.excludes(name),
+            // Until the list is saved it only gates new names; registered nodes leave via reconfigure.
+            None => !registered && self.startup_node_inventory.excludes(name),
+        };
+        if excluded {
+            return Err(excluded_by_node_names(name));
         }
         Ok(())
     }
@@ -5287,13 +5393,16 @@ impl ClusterManager {
         // both observe the same prior phase and double-count the transition.
         let _accounting = self.k0s_phase_accounting.lock();
         let from = self.k0s.read().phase;
-        self.propose(WalOperation::K0sSetPhase {
+        let response = self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
             control_plane_nodes,
             member_nodes,
             reset_requested,
         })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         if from != phase {
             let cluster = self.config().cluster_name.clone();
             self.k8s_metrics
@@ -5316,7 +5425,10 @@ impl ClusterManager {
     /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
     /// narrow it (see the `cluster_add_nodes` handler guard).
     pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        let response = self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         Ok(())
     }
 
@@ -6726,11 +6838,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Re-read spur.conf and apply it to the running controller. Leader-only, and
-    /// the swap is in-memory here — no WAL entry carries it, so followers keep
-    /// their startup config. Per-field scope: docs/admin-guide/configuration.rst,
-    /// "Applying configuration changes" section.
+    /// Leader-only: node_names and partitions replicate through Raft; other sections swap
+    /// in memory here. Per-field scope: configuration.rst, "Applying configuration changes".
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let _reconfigure = self.reconfigure_lock.lock();
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
@@ -6806,6 +6917,29 @@ impl ClusterManager {
                 restart_only.join(", ")
             );
         }
+        let inventory = new_config
+            .admission
+            .node_inventory()
+            .map_err(|error| NodeInventoryError::Invalid(error.to_string()))?;
+        self.validate_node_inventory(&inventory)
+            .map_err(|error| NodeInventoryError::Refused(error.to_string()))?;
+        // A timed-out earlier write can still apply, so compare only after it has.
+        self.wait_for_node_inventory_writes()?;
+        // Writing only on a change keeps the new WAL op out of unrelated reloads during upgrades.
+        let unchanged = match &*self.node_inventory.read() {
+            Some(saved) => *saved == inventory,
+            None => inventory.names.is_none() && self.startup_node_inventory.names.is_none(),
+        };
+        // Saved before partitions so an apply-time refusal leaves nothing half-applied.
+        if !unchanged {
+            let response = self.propose(WalOperation::NodeInventoryUpdate { inventory })?;
+            if let Some(error) = response.node_inventory_error {
+                return Err(NodeInventoryError::Refused(error).into());
+            }
+        }
+        // The saved list now matches this leader's file, so a startup-list mismatch is stale.
+        self.node_names_mismatch_warned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -6919,6 +7053,62 @@ impl ClusterManager {
         Ok(())
     }
 
+    fn wait_for_node_inventory_writes(&self) -> anyhow::Result<()> {
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Raft is not initialized"))?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(self.propose_timeout, async {
+                    // Relies on OpenRaft 0.9 sending metrics on every core-loop pass (guarded by
+                    // tests); a read index would miss an appended but uncommitted earlier write.
+                    let mut metrics = raft.metrics();
+                    let mut metrics = raft
+                        .with_raft_state(move |_| {
+                            metrics.mark_unchanged();
+                            metrics
+                        })
+                        .await?;
+                    metrics.changed().await?;
+                    let last = metrics.borrow().last_log_index;
+                    raft.wait(None)
+                        .applied_index_at_least(last, "node inventory reload")
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("reconfigure: waiting for prior Raft writes timed out")
+                })?
+            })
+        })
+    }
+
+    fn validate_node_inventory(&self, inventory: &NodeInventory) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        let reservations = self.reservations.read();
+        let removed =
+            inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
+        // Heartbeat GPU reconcile edits these counters outside Raft, so they can disagree with job
+        // holds; apply can't check them deterministically, so the leader refuses here.
+        for name in removed {
+            let node = &nodes[&name];
+            if node.alloc_resources.cpus > 0
+                || node.alloc_resources.memory_mb > 0
+                || node.alloc_resources.has_devices()
+            {
+                anyhow::bail!(
+                    "node '{name}' still has allocated resources; wait for them to be released, \
+                     or remove it with `spur node remove`"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
         if res.end_time <= res.start_time {
@@ -6942,6 +7132,9 @@ impl ClusterManager {
         let resp = self
             .propose(WalOperation::ReservationCreate { reservation: res })
             .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = resp.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         if !resp.reservation_created {
             return Err(ReservationError::already_exists(format!(
                 "reservation '{}' already exists",
@@ -7019,17 +7212,21 @@ impl ClusterManager {
         self.validate_reservation_storage_overlap(&preview, Some(name))
             .map_err(|e| ReservationError::invalid(e.to_string()))?;
 
-        self.propose(WalOperation::ReservationUpdate {
-            name: name.to_string(),
-            duration_minutes,
-            add_nodes: add_expanded,
-            remove_nodes: remove_nodes.to_vec(),
-            add_users: add_users.to_vec(),
-            remove_users: remove_users.to_vec(),
-            add_accounts: add_accounts.to_vec(),
-            remove_accounts: remove_accounts.to_vec(),
-        })
-        .map_err(|e| ReservationError::raft(e.to_string()))?;
+        let response = self
+            .propose(WalOperation::ReservationUpdate {
+                name: name.to_string(),
+                duration_minutes,
+                add_nodes: add_expanded,
+                remove_nodes: remove_nodes.to_vec(),
+                add_users: add_users.to_vec(),
+                remove_users: remove_users.to_vec(),
+                add_accounts: add_accounts.to_vec(),
+                remove_accounts: remove_accounts.to_vec(),
+            })
+            .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = response.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         Ok(())
     }
 
@@ -9144,6 +9341,15 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
+                // Only a saved node_names list fences placement; earlier log entries keep
+                // their original placement behavior on replay.
+                if let Some(name) = node_names
+                    .iter()
+                    .find(|name| self.references_unregistered(&nodes, name))
+                {
+                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto an unregistered node");
+                    return ClientResponse::default();
+                }
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
                 // second propose for the same job must not double-charge nodes.
                 // Not gated on job state — a legitimate JobStart can apply against
@@ -9659,6 +9865,10 @@ impl ClusterManager {
                 source,
                 capabilities,
             } => {
+                if self.committed_inventory_excludes(name) {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
@@ -9723,6 +9933,10 @@ impl ClusterManager {
                 source,
                 capabilities,
             } => {
+                if self.committed_inventory_excludes(name) {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
                 if let Some(node) = nodes.get_mut(name) {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
@@ -9893,6 +10107,29 @@ impl ClusterManager {
                     reason = reason.as_deref().unwrap_or(""),
                     "node removed from cluster"
                 );
+            }
+            WalOperation::NodeInventoryUpdate { inventory } => {
+                let reservations = self.reservations.read();
+                let removed = match inventory_removals(
+                    inventory,
+                    &nodes,
+                    &jobs,
+                    &reservations,
+                    &self.k0s.read(),
+                ) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        response.node_inventory_error = Some(error.to_string());
+                        return response;
+                    }
+                };
+                for name in removed {
+                    nodes.remove(&name);
+                    info!(node = %name, "node removed: absent from admission.node_names");
+                    self.k8s_metrics
+                        .remove_node(&self.config().cluster_name, &name);
+                }
+                *self.node_inventory.write() = Some(inventory.clone());
             }
             WalOperation::TokenCreate { token } => {
                 self.tokens.write().insert(token.id.clone(), token.clone());
@@ -10072,6 +10309,10 @@ impl ClusterManager {
                 self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
+                if let Some(error) = self.reservation_inventory_error(&nodes, &reservation.nodes) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 if reservations.iter().any(|r| r.name == reservation.name) {
                     warn!(
@@ -10094,6 +10335,10 @@ impl ClusterManager {
                 add_accounts,
                 remove_accounts,
             } => {
+                if let Some(error) = self.reservation_inventory_error(&nodes, add_nodes) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 Self::apply_reservation_update_locked(
                     reservations.as_mut(),
@@ -10165,6 +10410,10 @@ impl ClusterManager {
                 }
             }
             WalOperation::K0sMemberNodesAdd { nodes: add } => {
+                if let Some(error) = self.k0s_inventory_error(&nodes, add.iter()) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut k0s = self.k0s.write();
                 k0s.member_nodes = crate::cluster_k8s::merge_member_nodes(&k0s.member_nodes, add);
             }
@@ -10180,6 +10429,16 @@ impl ClusterManager {
                 member_nodes,
                 reset_requested,
             } => {
+                if *phase != spur_core::k0s::K0sPhase::Down {
+                    let references = control_plane_node
+                        .iter()
+                        .chain(control_plane_nodes)
+                        .chain(member_nodes);
+                    if let Some(error) = self.k0s_inventory_error(&nodes, references) {
+                        response.node_inventory_error = Some(error);
+                        return response;
+                    }
+                }
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 k0s.reset_requested = *reset_requested;
@@ -10251,6 +10510,127 @@ pub struct LayoutDelivery {
     pub error: String,
 }
 
+fn excluded_by_node_names(name: &str) -> RegisterNodeError {
+    RegisterNodeError::PermissionDenied(format!(
+        "node {name} is not allowed by admission.node_names"
+    ))
+}
+
+/// A user-fixable node_names failure in reconfigure: an invalid list or a refused removal.
+#[derive(Debug)]
+pub(crate) enum NodeInventoryError {
+    Invalid(String),
+    Refused(String),
+}
+
+impl std::fmt::Display for NodeInventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Invalid(message) | Self::Refused(message)) = self;
+        write!(f, "reconfigure: {message}")
+    }
+}
+
+impl std::error::Error for NodeInventoryError {}
+
+fn reject_excluded_registration(
+    response: &ClientResponse,
+    name: &str,
+) -> Result<(), RegisterNodeError> {
+    if response.node_registration_rejected {
+        return Err(excluded_by_node_names(name));
+    }
+    Ok(())
+}
+
+fn inventory_removals(
+    inventory: &NodeInventory,
+    nodes: &HashMap<String, Node>,
+    jobs: &HashMap<JobId, Job>,
+    reservations: &[Reservation],
+    k0s: &spur_core::k0s::K0sClusterState,
+) -> anyhow::Result<Vec<String>> {
+    let Some(names) = &inventory.names else {
+        return Ok(Vec::new());
+    };
+    let removed = unlisted_node_names(names, nodes);
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let held: HashSet<_> = jobs
+        .values()
+        .filter(|job| !job.state.is_finalized())
+        .flat_map(Job::held_nodes)
+        .collect();
+    let reserved: HashMap<_, _> = reservations
+        .iter()
+        .flat_map(|reservation| {
+            reservation
+                .nodes
+                .iter()
+                .map(move |name| (name, &reservation.name))
+        })
+        .collect();
+    for name in &removed {
+        if held.contains(name) {
+            anyhow::bail!(
+                "node '{name}' still has job allocations; drain it and wait for completion"
+            );
+        }
+        let node = &nodes[name];
+        if let Some(reservation) = reserved.get(name) {
+            anyhow::bail!(
+                "node '{name}' belongs to reservation '{reservation}'; remove that reference first"
+            );
+        }
+        let k0s_up = k0s.phase != spur_core::k0s::K0sPhase::Down;
+        if node.k0s_role.is_some() || (k0s_up && k0s.is_member(name)) {
+            use spur_core::k0s::K0sRole;
+            if !k0s_up {
+                anyhow::bail!(
+                    "node '{name}' still has a Kubernetes role; retry once the teardown finishes"
+                );
+            }
+            if k0s.member_nodes.is_empty() {
+                anyhow::bail!(
+                    "node '{name}' belongs to the managed Kubernetes cluster, which spans every \
+                     node; run `spur k8s down` first"
+                );
+            }
+            if matches!(node.k0s_role, Some(K0sRole::Controller | K0sRole::Single)) {
+                anyhow::bail!(
+                    "node '{name}' is a Kubernetes control-plane node; run `spur k8s down` first"
+                );
+            }
+            if k0s.phase == spur_core::k0s::K0sPhase::Degraded {
+                anyhow::bail!(
+                    "node '{name}' belongs to the degraded Kubernetes cluster; run `spur k8s down` first"
+                );
+            }
+            anyhow::bail!(
+                "node '{name}' belongs to the managed Kubernetes cluster; remove that membership \
+                 first with `spur k8s remove-nodes`"
+            );
+        }
+    }
+    Ok(removed)
+}
+
+fn warn_once(latch: &std::sync::atomic::AtomicBool, message: &str) {
+    if !latch.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!("{message}");
+    }
+}
+
+fn unlisted_node_names(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> Vec<String> {
+    let mut unlisted: Vec<_> = nodes
+        .keys()
+        .filter(|name| !listed.contains(*name))
+        .cloned()
+        .collect();
+    unlisted.sort();
+    unlisted
+}
+
 const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Snapshot data for Raft serialization.
@@ -10259,6 +10639,8 @@ const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::fro
 struct ClusterSnapshot {
     #[serde(default)]
     preemption_usage: preemption_usage::UsageLedger,
+    #[serde(default)]
+    node_inventory: Option<NodeInventory>,
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
@@ -10426,8 +10808,10 @@ impl StateMachineApply for ClusterManager {
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
         let preemption_usage = self.preemption_usage.read().clone();
+        let node_inventory = self.node_inventory.read().clone();
         let snap = ClusterSnapshot {
             preemption_usage,
+            node_inventory,
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
@@ -10446,6 +10830,7 @@ impl StateMachineApply for ClusterManager {
 
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
+        *self.node_inventory.write() = snap.node_inventory;
 
         // Fold in the persisted high-water mark so evicting the high-id tail
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
@@ -12751,7 +13136,15 @@ pub(crate) mod gated {
         dir: &TempDir,
         config: SlurmConfig,
     ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
-        let mut cm = ClusterManager::new(config, dir.path()).unwrap();
+        cluster_with_config_path(dir, config, None).await
+    }
+
+    pub(crate) async fn cluster_with_config_path(
+        dir: &TempDir,
+        config: SlurmConfig,
+        path: Option<std::path::PathBuf>,
+    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+        let mut cm = ClusterManager::new_with_config_path(config, dir.path(), path).unwrap();
         cm.propose_timeout = std::time::Duration::from_millis(200);
         let cm = Arc::new(cm);
         let gate = Arc::new(ApplyGate::default());
@@ -12807,6 +13200,7 @@ pub(crate) mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    mod node_inventory;
     mod partition_limits;
 
     #[test]
@@ -13805,7 +14199,11 @@ state = "UP"
             "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
@@ -13823,7 +14221,11 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.jobs_private());
 
         std::fs::write(
@@ -13832,7 +14234,11 @@ state = "UP"
              private_data = [\"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.users_private());
         assert!(cm.config().auth.accounts_private());
         assert!(cm.config().auth.reservations_private());
@@ -13846,7 +14252,10 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"nodes\"]\n",
         )
         .unwrap();
-        cm.reconfigure()
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
             .expect_err("an unsupported category must not go live");
         assert!(
             cm.config().auth.accounts_private(),
@@ -13866,7 +14275,11 @@ state = "UP"
             "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
@@ -13890,7 +14303,11 @@ state = "UP"
             "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let avail = cm.available_licenses();
         assert_eq!(
@@ -40545,6 +40962,7 @@ state = "UP"
 
         let snap = ClusterSnapshot {
             preemption_usage: Default::default(),
+            node_inventory: None,
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),

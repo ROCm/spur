@@ -130,6 +130,7 @@ outside the WAL for performance.
 | `JobPreemptRequeue` | Atomic preempt + requeue to Pending |
 | `JobPreemptCancel` | Atomic preempt + cancel |
 | `NodeRegister` | New node joins the cluster |
+| `NodeInventoryUpdate` | Saves `admission.node_names`, deleting unlisted nodes |
 | `NodeStateChange` | Node state transition |
 | `ReservationCreate/Update/Delete` | Reservation management |
 | `PartitionCreate/Update/Delete` | Partition management |
@@ -357,6 +358,7 @@ override the exit-code-based decision.
       |
       v
   RegisterAgent RPC ---> spurctld proposes WalOperation::NodeRegister
+      |                  (refused if a saved admission.node_names excludes it)
       |
       | state: UNKNOWN -> IDLE
       v

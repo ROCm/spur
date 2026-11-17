@@ -1506,10 +1506,13 @@ even when its agent or container no longer exists:
 
 These commands use the existing native node-removal RPC and its checks for
 allocated running, completing, or suspended jobs. Drain a node and wait for
-its jobs to finish before removing it. ``NodeName=`` accepts a hostname,
-a comma-separated list, a hostlist such as ``gpu[001-004]``, or ``ALL`` for
-every registered node. A malformed hostlist with an empty component, such as
-``gpu[]`` or ``gpu[1,]``, is rejected before connecting.
+its jobs to finish before removing it. A removed node registers again on its
+agent's next heartbeat or start unless ``admission.node_names`` excludes it; to
+keep it out, use :ref:`configured-node-list`.
+``NodeName=`` accepts a hostname, a comma-separated list, a hostlist such as
+``gpu[001-004]``, or ``ALL`` for every registered node. A malformed hostlist with
+an empty component, such as ``gpu[]`` or ``gpu[1,]``, is rejected before
+connecting.
 Overlapping targets are removed once, in the order of
 their first appearance. A failed removal is reported per node; remaining
 nodes are still attempted, and the command exits unsuccessfully if any

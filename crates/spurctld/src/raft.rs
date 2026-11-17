@@ -162,6 +162,13 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    /// Why an op was refused under admission.node_names: it named an unregistered node,
+    /// or a node it would delete is still in use.
+    #[serde(default)]
+    pub node_inventory_error: Option<String>,
+    /// True when a `NodeRegister`/`NodeUpdate` named a node the saved list excludes.
+    #[serde(default)]
+    pub node_registration_rejected: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

@@ -511,6 +511,9 @@ pub enum WalOperation {
         job_id: JobId,
         pending: crate::job::PreemptPending,
     },
+    NodeInventoryUpdate {
+        inventory: crate::config::NodeInventory,
+    },
 }
 
 impl WalOperation {
@@ -698,6 +701,7 @@ impl WalOperation {
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
             | Self::NodeLabelsUpdate { .. }
+            | Self::NodeInventoryUpdate { .. }
             | Self::TokenCreate { .. }
             | Self::TokenRevoke { .. }
             | Self::PartitionCreate { .. }
@@ -748,6 +752,7 @@ impl WalOperation {
             | Self::NodeRegister { .. }
             | Self::NodeUpdate { .. }
             | Self::NodeLabelsUpdate { .. }
+            | Self::NodeInventoryUpdate { .. }
             | Self::TokenCreate { .. }
             | Self::TokenRevoke { .. }
             | Self::PartitionCreate { .. }
@@ -770,6 +775,20 @@ impl WalOperation {
 #[cfg(test)]
 mod job_state_change_wal_tests {
     use super::*;
+
+    #[test]
+    fn node_inventory_has_a_stable_wire_form() {
+        const FROZEN: &str = r#"{"NodeInventoryUpdate":{"inventory":{"names":["n1"]}}}"#;
+        let op: super::WalOperation = serde_json::from_str(FROZEN).unwrap();
+        let super::WalOperation::NodeInventoryUpdate { inventory } = &op else {
+            panic!("inventory operation");
+        };
+        assert_eq!(
+            inventory.names.clone().unwrap(),
+            ["n1".to_string()].into_iter().collect()
+        );
+        assert_eq!(serde_json::to_string(&op).unwrap(), FROZEN);
+    }
 
     /// A reason's variant name is its wire form in the Raft log, and a controller
     /// on an older binary cannot read a name it does not know. Freeze the newest

@@ -236,7 +236,7 @@ with `-m gpu` without manual tags.
 | **GPU / devices** | `test_gpu.py`, `test_devices.py`, `test_device_isolation.py`, `test_gpu_deny.py`, `test_gpu_identity_change.py` | HIP tests, CDI auto-detect, GPU isolation, deny lists. |
 | **Containers** | `test_container.py`, `test_srun_container.py` | squashfs rootfs, image import, Docker image env. |
 | **MPI / RCCL** | `test_mpi.py`, `test_rccl.py`, `test_srun_multi_node.py` | PMIx plugin, multi-node collectives. |
-| **Auth** | `test_auth_dispatch.py`, `test_salloc_step_auth.py`, `test_private_data.py`, `test_admission.py`, `test_job_submit_hook.py` | JWT dispatch, step auth, job_submit Lua hooks. |
+| **Auth** | `test_auth_dispatch.py`, `test_salloc_step_auth.py`, `test_private_data.py`, `test_admission.py`, `test_config_node_removal.py`, `test_job_submit_hook.py` | JWT dispatch, step auth, `admission.node_names` removal, job_submit Lua hooks. |
 | **Cgroups** | `test_cgroup_limits.py`, `test_cgroup_cleanup_quarantine.py`, `test_step_cgroups.py`, `test_old_attempt_cgroup_cleanup.py` | Resource limits, cleanup, quarantine. |
 | **Steps** | `test_concurrent_steps.py`, `test_srun_step_output.py`, `test_srun_pty.py` | Overlapping steps, PTY sessions. |
 | **HA / consensus** | `test_controller_failover.py`, `test_controller_graceful_shutdown.py`, `test_leadership_blip_health.py`, `test_raft_write_timeout.py` | Leader election, failover, blip recovery. |
