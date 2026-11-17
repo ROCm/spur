@@ -276,12 +276,12 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let topology = (gpu_memory_mb > 0).then(|| spur_proto::proto::DeviceTopology {
+    let topology = (gpu_memory_mb > 0).then(|| spur_core::device::DeviceTopology {
         vram_bytes: Some(gpu_memory_mb * 1024 * 1024),
         ..Default::default()
     });
-    let devices = (0..gpu_count)
-        .map(|i| spur_proto::proto::Device {
+    let inventory: Vec<spur_core::device::Device> = (0..gpu_count)
+        .map(|i| spur_core::device::Device {
             numa_node: None,
             affinity_cpus: Vec::new(),
             gres_name: "gpu".into(),
@@ -293,6 +293,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
             topology: topology.clone(),
         })
         .collect();
+    let (devices, gpus) = spur_core::device::devices_to_proto(&inventory);
 
     #[allow(deprecated)]
     ResourceSet {
@@ -300,7 +301,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         block_file_revision: None,
         cpus,
         memory_mb,
-        gpus: Vec::new(),
+        gpus,
         devices,
         generic: Default::default(),
         generation: 0,
@@ -562,6 +563,24 @@ mod tests {
         for gpu in &res.devices {
             assert_eq!(vram_mb(gpu), Some(196608));
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn an_older_controller_still_reads_the_gpus() {
+        let mut alloc = BTreeMap::new();
+        alloc.insert("amd.com/gpu".into(), Quantity("2".into()));
+        let mut labels = BTreeMap::new();
+        labels.insert("spur.amd.com/gpu-type".into(), "mi300x".into());
+        labels.insert("spur.amd.com/gpu-memory-mb".into(), "196608".into());
+
+        let res = extract_resources(&make_node("gpu-node", labels, alloc, vec![]));
+        let legacy: Vec<(u32, &str, u64)> = res
+            .gpus
+            .iter()
+            .map(|g| (g.device_id, g.gpu_type.as_str(), g.memory_mb))
+            .collect();
+        assert_eq!(legacy, vec![(0, "mi300x", 196608), (1, "mi300x", 196608)]);
     }
 
     #[test]
