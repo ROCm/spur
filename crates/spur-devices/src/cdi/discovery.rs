@@ -356,7 +356,6 @@ struct DiscoveredGpu {
 impl DiscoveredGpu {
     fn to_cdi_device(&self) -> CdiDevice {
         let render_path = format!("/dev/dri/renderD{}", self.render_minor);
-        let card_path = format!("/dev/dri/card{}", self.card_id.unwrap_or(self.device_index));
 
         let meta = DeviceMetadata {
             gpu_type: Some(self.gpu_type.clone()),
@@ -375,33 +374,12 @@ impl DiscoveredGpu {
             stable_id: Some(self.stable_id),
         };
 
-        let render_stat = stat_device_node(&render_path);
-        let card_stat = stat_device_node(&card_path);
-
-        let device_nodes = vec![
-            DeviceNode {
-                path: render_path,
-                host_path: None,
-                r#type: Some("c".into()),
-                major: render_stat.as_ref().map(|s| s.major),
-                minor: render_stat.as_ref().map(|s| s.minor),
-                file_mode: render_stat.as_ref().map(|s| s.file_mode),
-                permissions: Some("rwm".into()),
-                uid: render_stat.as_ref().map(|s| s.uid),
-                gid: render_stat.as_ref().map(|s| s.gid),
-            },
-            DeviceNode {
-                path: card_path,
-                host_path: None,
-                r#type: Some("c".into()),
-                major: card_stat.as_ref().map(|s| s.major),
-                minor: card_stat.as_ref().map(|s| s.minor),
-                file_mode: card_stat.as_ref().map(|s| s.file_mode),
-                permissions: Some("rwm".into()),
-                uid: card_stat.as_ref().map(|s| s.uid),
-                gid: card_stat.as_ref().map(|s| s.gid),
-            },
-        ];
+        let mut device_nodes = vec![char_device_node(render_path)];
+        // Only a card linked to this render node in sysfs: a guessed index can
+        // name another GPU's card, which the job would then be granted.
+        if let Some(card_id) = self.card_id {
+            device_nodes.push(char_device_node(format!("/dev/dri/card{card_id}")));
+        }
 
         CdiDevice {
             name: self.device_index.to_string(),
@@ -418,18 +396,7 @@ fn build_shared_edits() -> ContainerEdits {
     let mut edits = ContainerEdits::default();
 
     if Path::new("/dev/kfd").exists() {
-        let kfd_stat = stat_device_node("/dev/kfd");
-        edits.device_nodes.push(DeviceNode {
-            path: "/dev/kfd".into(),
-            host_path: None,
-            r#type: Some("c".into()),
-            major: kfd_stat.as_ref().map(|s| s.major),
-            minor: kfd_stat.as_ref().map(|s| s.minor),
-            file_mode: kfd_stat.as_ref().map(|s| s.file_mode),
-            permissions: Some("rwm".into()),
-            uid: kfd_stat.as_ref().map(|s| s.uid),
-            gid: kfd_stat.as_ref().map(|s| s.gid),
-        });
+        edits.device_nodes.push(char_device_node("/dev/kfd".into()));
     }
 
     for lib_path in &["/opt/rocm/lib", "/opt/rocm/lib64"] {
@@ -718,6 +685,22 @@ fn stat_device_node(path: &str) -> Option<DeviceStat> {
     })
 }
 
+/// A character device node with the host's major/minor and ownership, when it exists.
+fn char_device_node(path: String) -> DeviceNode {
+    let stat = stat_device_node(&path);
+    DeviceNode {
+        path,
+        host_path: None,
+        r#type: Some("c".into()),
+        major: stat.as_ref().map(|s| s.major),
+        minor: stat.as_ref().map(|s| s.minor),
+        file_mode: stat.as_ref().map(|s| s.file_mode),
+        permissions: Some("rwm".into()),
+        uid: stat.as_ref().map(|s| s.uid),
+        gid: stat.as_ref().map(|s| s.gid),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -985,6 +968,41 @@ mod tests {
         assert_eq!(
             dev.annotations.get(annotations::UNIQUE_ID).unwrap(),
             "abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_card_link_injects_no_card_node() {
+        let gpu = DiscoveredGpu {
+            device_index: 3,
+            render_minor: 131,
+            topology: None,
+            stable_id: 0,
+            card_id: None,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            numa_node: None,
+            pci_bdf: None,
+            link_type: LinkType::Pcie,
+            links: vec![-1],
+            compute_partition: None,
+            memory_partition: None,
+            unique_id: None,
+        };
+
+        let dev = gpu.to_cdi_device();
+        let paths: Vec<&str> = dev
+            .container_edits
+            .as_ref()
+            .unwrap()
+            .device_nodes
+            .iter()
+            .map(|n| n.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/dev/dri/renderD131"],
+            "a guessed card node may belong to another GPU"
         );
     }
 

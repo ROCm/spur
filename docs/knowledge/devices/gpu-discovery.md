@@ -43,8 +43,11 @@ For each qualifying node the discovery reads:
 | Compute/memory partition | `current_compute_partition`, `current_memory_partition` sysfs attributes |
 | Unique ID | `unique_id` from properties, or sysfs `unique_id` file |
 
-The result is a `CdiSpec` with kind `amd.com/gpu`. Each device gets two device
-nodes (renderD\* and card\*) with stat-derived major/minor/mode/uid/gid. Shared
+The result is a `CdiSpec` with kind `amd.com/gpu`. Each device gets its
+renderD\* node, plus the card\* node that `/sys/class/drm` links to that render
+node, with stat-derived major/minor/mode/uid/gid. When no card links to the
+render node, the device carries the render node alone: a guessed card index can
+name another GPU's card. Shared
 edits include `/dev/kfd`, ROCm library bind-mounts (`/opt/rocm/lib`,
 `/opt/rocm/lib64`), and `video`/`render` supplementary GIDs.
 
