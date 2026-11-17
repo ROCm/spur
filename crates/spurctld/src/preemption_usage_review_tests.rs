@@ -285,6 +285,7 @@ fn legacy_preemptions_do_not_depend_on_snapshot_position() {
                 signal: 0,
                 run_attempt: 1,
                 at: None,
+                launch_detail: None,
             });
             start(cm, 10, 1, &[("n1", scalar())]);
             assert_eq!(cm.preemption_usage(), PreemptionUsage::default());
@@ -317,6 +318,7 @@ fn terminal_request_with_draining_victim_does_not_propose_eviction() {
         signal: 0,
         run_attempt: 1,
         at: Some(chrono::DateTime::UNIX_EPOCH),
+        launch_detail: None,
     });
     assert!(!cm.preemption_usage.read().tracks_request(10));
     assert!(cm.scan_terminal_retention(now).evictable.contains(&10));
@@ -677,6 +679,7 @@ fn an_eviction_from_an_older_leader_keeps_its_old_meaning_on_upgraded_replicas()
                 signal: 0,
                 run_attempt: 1,
                 at: None,
+                launch_detail: None,
             },
         );
         assert!(!replica.preemption_usage.read().tracks_request(10));
@@ -711,6 +714,7 @@ fn claimed_preemption_flow_matches_across_replicas_and_a_midway_snapshot() {
         signal: 0,
         run_attempt: 1,
         at: Some(at),
+        launch_detail: None,
     });
     let midway = log.len();
     log.push(WalOperation::JobPreemptCancel {
