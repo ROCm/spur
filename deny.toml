@@ -4,6 +4,11 @@ all-features = true
 [advisories]
 yanked = "warn"
 unmaintained = "workspace"
+ignore = [
+    # The core types, scheduler, controller, CLI, Raft log and accounting
+    # database use chrono's types, so moving off it is a migration of its own.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained and has no fixed release" },
+]
 [licenses]
 confidence-threshold = 0.8
 
