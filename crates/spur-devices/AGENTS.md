@@ -12,10 +12,14 @@ src/
   lib.rs              -- public re-exports
   types.rs            -- LinkType enum (Pcie, Xgmi, Nvlink)
   inject.rs           -- injection plan builders (host + container)
+  pci.rs              -- PCI identity, stable-id encoding (BDF + partition rank), PCI host bridge lookup
+  sysfs.rs            -- sysfs and /dev readers shared by every discovery (root-relative for fixtures)
+  discovery/
+    mod.rs            -- discover_all_cdi(): every kind found on this host
+    amd_gpu.rs        -- KFD-based AMD GPU auto-detection -> CdiSpec (discover_gpu_cdi)
   cdi/
     spec.rs           -- CDI spec data model (CdiSpec, CdiDevice, ContainerEdits, DeviceNode, Mount, Hook)
     cache.rs          -- CdiCache: load specs from /etc/cdi, /var/run/cdi, or in-memory
-    discovery.rs      -- KFD-based AMD GPU auto-detection -> CdiSpec
     annotations.rs    -- spur.amd.com/* annotation keys + DeviceMetadata struct
   gres/
     entry.rs          -- GresEntry (Slurm-style resource config), hostlist expansion, flag-driven env injection
@@ -49,9 +53,10 @@ Accepts `.json`, `.yaml`, `.yml` files. Later directories have higher
 priority (same qualified name -> later dir wins).
 
 `CdiCache::load()` optionally runs auto-detection when no on-disk specs
-exist and `auto_detect` is true.
+exist and `auto_detect` is true. `CdiCache::load_with()` takes the spec
+directories and live specs explicitly, so tests never read the host.
 
-## GPU auto-detection (discovery.rs)
+## GPU auto-detection (discovery/amd_gpu.rs)
 
 Reads `/sys/class/kfd/kfd/topology/nodes` to enumerate AMD GPUs. Filters
 by vendor_id 0x1002, simd_count > 0, cpu_cores == 0. Extracts:
@@ -61,11 +66,12 @@ by vendor_id 0x1002, simd_count > 0, cpu_cores == 0. Extracts:
 - IO link topology (XGMI detection from link_type=2)
 - Compute/memory partition, unique ID, numa node
 
-Produces `CdiSpec` with `amd.com/gpu` kind. Each GPU gets two device
-nodes (renderD* and card*) with stat-derived major/minor/mode/uid/gid.
+Produces `CdiSpec` with `amd.com/gpu` kind. Each GPU gets its renderD*
+node, plus the card* node sysfs links to it (never a guessed index), with
+stat-derived major/minor/mode/uid/gid.
 Shared edits include `/dev/kfd`, ROCm lib mounts, video/render GIDs.
 
-**stable_id**: BDF-derived reload-invariant device identifier. Encodes
+**stable_id** (pci.rs): BDF-derived reload-invariant device identifier. Encodes
 domain:bus:dev.func plus intra-BDF partition rank. Low 8 bits =
 partition index (STABLE_ID_PARTITION_MASK = 0xFF). Survives driver
 reloads that shift render minor numbers. Bit layout (`encode_stable_id`):
@@ -166,5 +172,6 @@ unknown -> PCIe). Default is PCIe when no link data present.
 cargo test -p spur-devices
 ```
 
-Uses tempfile for filesystem-based CDI spec tests. KFD topology tests
-use synthetic sysfs fixtures. No network or hardware required.
+Uses tempfile for filesystem-based CDI spec tests. Discovery runs against a
+filesystem root (`discover_gpu_cdi_from_root`), so KFD topology tests use
+synthetic sysfs fixtures. No network, hardware, or host files required.

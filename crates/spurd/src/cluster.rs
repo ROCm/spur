@@ -594,7 +594,7 @@ const CDI_SPEC_PATH: &str = "/etc/cdi/amd.json";
 /// k8s-device-plugin; acceptable for Phase-2 containerd injection — a native spur-device-plugin is
 /// a later milestone.
 async fn write_cdi_spec() -> anyhow::Result<()> {
-    let specs = spur_devices::cdi::discovery::discover_to_cdi();
+    let specs = spur_devices::discovery::discover_gpu_cdi();
     if specs.is_empty() {
         info!("no AMD GPUs discovered; not writing a CDI spec");
         return Ok(());

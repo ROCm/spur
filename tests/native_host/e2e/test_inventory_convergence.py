@@ -42,7 +42,7 @@ GPU_TYPE = "mi300x"
 
 
 def _encode_stable_id(bus: int, dev: int, func: int, partition: int) -> int:
-    """Mirror the Rust `encode_stable_id` (crates/spur-devices/src/cdi/discovery.rs):
+    """Mirror the Rust `encode_stable_id` (crates/spur-devices/src/pci.rs):
     a reload-invariant device id from the PCIe BDF anchor plus a per-partition
     rank. Two ids share physical silicon iff their BDF (bus/dev/func) is equal.
     Domain is omitted (single-domain), matching the Rust encoding.

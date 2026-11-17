@@ -65,7 +65,7 @@ impl CdiCache {
         for extra in cdi_spec_dirs {
             cdi_dirs.push(PathBuf::from(extra));
         }
-        let live = auto_detect.then(crate::cdi::discovery::discover_to_cdi);
+        let live = auto_detect.then(crate::discovery::discover_all_cdi);
         Self::load_with(&cdi_dirs, live.as_deref())
     }
 

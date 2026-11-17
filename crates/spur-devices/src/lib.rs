@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod cdi;
+pub mod discovery;
 pub mod gres;
 pub mod inject;
+pub mod pci;
 pub mod registry;
+mod sysfs;
 pub mod topology;
 pub mod types;
 pub mod ualink;
