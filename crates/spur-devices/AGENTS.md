@@ -17,6 +17,7 @@ src/
   discovery/
     mod.rs            -- discover_all_cdi(): every kind found on this host
     amd_gpu.rs        -- KFD-based AMD GPU auto-detection -> CdiSpec (discover_gpu_cdi)
+    amd_nic.rs        -- Pollara AI NICs (ionic + RDMA) from PCI sysfs -> amd.com/nic, amd.com/vnic
   cdi/
     spec.rs           -- CDI spec data model (CdiSpec, CdiDevice, ContainerEdits, DeviceNode, Mount, Hook)
     cache.rs          -- CdiCache: load specs from /etc/cdi, /var/run/cdi, or in-memory

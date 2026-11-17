@@ -2565,7 +2565,8 @@ converges to hardware changes without an agent restart — see
    * - ``auto_detect``
      - bool
      - ``true``
-     - Discover devices from sysfs (AMD GPUs via KFD) for every device kind
+     - Discover devices from sysfs (AMD GPUs via KFD, AMD Pollara AI NICs as
+       ``nic`` and their virtual functions as ``vnic``) for every device kind
        that has no on-disk CDI spec; an on-disk spec of one kind does not stop
        discovery of another. For a kind with an on-disk spec, only refresh
        topology for its matching AMD devices; see :doc:`fabric-observation`.

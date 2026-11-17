@@ -254,6 +254,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         shared_edits: expanded.shared_edits.clone(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
         numa_node: None,
         cores: expanded.cores.clone(),
     }
@@ -274,6 +275,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         shared_edits: Default::default(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
         numa_node: None,
         cores: None,
     }
@@ -313,16 +315,6 @@ fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
 /// The CDI cache iterates in hash order, so the qualified name settles ties.
 fn sort_cdi_entries(entries: &mut [(String, DeviceEntry)]) {
     entries.sort_by(|(a_name, a), (b_name, b)| cdi_sort_key(a, b).then_with(|| a_name.cmp(b_name)));
-}
-
-fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
-    entry.is_injectable()
-        && entry_matches_gres_name(entry, gres_name)
-        && entry.stable_id == stable_id
-}
-
-fn primary_device_path(entry: &DeviceEntry) -> &str {
-    entry.node_paths().next().unwrap_or("")
 }
 
 enum Merge {
@@ -416,6 +408,16 @@ fn merge_targets<'a>(
         .map(|(path, _)| *path)
         .collect();
     MergeTargets { targets, dropped }
+}
+
+fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
+    entry.is_injectable()
+        && entry_matches_gres_name(entry, gres_name)
+        && entry.stable_id == stable_id
+}
+
+fn primary_device_path(entry: &DeviceEntry) -> &str {
+    entry.node_paths().next().unwrap_or("")
 }
 
 const GRES_KIND: &str = "spur.internal/gres";

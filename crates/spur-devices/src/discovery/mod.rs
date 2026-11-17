@@ -4,6 +4,7 @@
 //! Live device discovery: each vendor/kind module reads sysfs and emits CDI specs.
 
 mod amd_gpu;
+mod amd_nic;
 
 use std::path::Path;
 
@@ -17,5 +18,7 @@ pub fn discover_all_cdi() -> Vec<CdiSpec> {
 }
 
 pub(crate) fn discover_all_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
-    amd_gpu::discover_gpu_cdi_from_root(root)
+    let mut specs = amd_gpu::discover_gpu_cdi_from_root(root);
+    specs.extend(amd_nic::discover_nic_cdi_from_root(root));
+    specs
 }

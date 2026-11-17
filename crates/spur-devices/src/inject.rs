@@ -448,8 +448,6 @@ mod tests {
     fn gpu_device_entry(device_id: u32) -> DeviceEntry {
         use crate::registry::entry::{DeviceCapability, DeviceEntry};
         DeviceEntry {
-            numa_node: None,
-            cores: None,
             gres_name: "gpu".into(),
             resource_type: None,
             kind: "amd.com/gpu".into(),
@@ -463,6 +461,9 @@ mod tests {
             shared_edits: ContainerEdits::default(),
             topology: None,
             stable_id: 0,
+            rdma_device: None,
+            numa_node: None,
+            cores: None,
         }
     }
 
