@@ -52,8 +52,9 @@ Default search paths: `/etc/cdi`, `/var/run/cdi`, plus any extras.
 Accepts `.json`, `.yaml`, `.yml` files. Later directories have higher
 priority (same qualified name -> later dir wins).
 
-`CdiCache::load()` optionally runs auto-detection when no on-disk specs
-exist and `auto_detect` is true. `CdiCache::load_with()` takes the spec
+`CdiCache::load()` optionally runs auto-detection when `auto_detect` is true:
+live specs fill every kind with no on-disk spec, and only refresh topology for
+kinds that have one. `CdiCache::load_with()` takes the spec
 directories and live specs explicitly, so tests never read the host.
 
 ## GPU auto-detection (discovery/amd_gpu.rs)

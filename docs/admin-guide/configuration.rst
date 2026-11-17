@@ -2565,9 +2565,10 @@ converges to hardware changes without an agent restart — see
    * - ``auto_detect``
      - bool
      - ``true``
-     - Discover GPUs from AMD KFD sysfs when the CDI cache is empty (AMD only).
-       Also refresh topology for matching AMD devices in on-disk CDI specs;
-       see :doc:`fabric-observation`.
+     - Discover devices from sysfs (AMD GPUs via KFD) for every device kind
+       that has no on-disk CDI spec; an on-disk spec of one kind does not stop
+       discovery of another. For a kind with an on-disk spec, only refresh
+       topology for its matching AMD devices; see :doc:`fabric-observation`.
    * - ``cdi_spec_dirs``
      - [string]
      - ``[]``

@@ -21,7 +21,9 @@ from `/etc/cdi`, `/var/run/cdi`, plus any operator-configured extra directories.
 Later directories have higher priority -- a qualified name that appears in both
 `/etc/cdi` and `/var/run/cdi` takes the `/var/run/cdi` version.
 
-**Auto-detection.** When no on-disk specs exist and `auto_detect` is enabled,
+**Auto-detection.** With `auto_detect` enabled, live discovery fills in every
+device kind that has no on-disk spec (`CdiCache::merge_live`); a kind with an
+on-disk spec only gets a topology refresh. For GPUs,
 `discover_gpu_cdi()` (`spur-devices/src/discovery/amd_gpu.rs`) enumerates AMD GPUs from the KFD topology
 (`/sys/class/kfd/kfd/topology/nodes`). A KFD node qualifies as an AMD GPU when:
 
