@@ -93,17 +93,21 @@ Isolation
 ---------
 
 With ``[cgroup] constrain_devices`` and ``constrain_rdma_devices`` (both on by
-default), a job on a NIC node can open only the ``uverbs`` nodes of its own
-NICs, plus ``rdma_cm``. Opening another NIC fails with ``EPERM``, and a job
-that requested no NICs gets no RDMA device at all. To keep all of
-``/dev/infiniband/`` open to every job instead:
+default), a job on a NIC node can open the ``uverbs`` node of a NIC only if the
+NIC is allocated to it. Opening another job's NIC fails with ``EPERM``, and a
+job that requested no NICs reaches none of them. RDMA nodes Spur does not
+allocate stay open to every job: ``rdma_cm``, and the devices of HCAs Spur does
+not manage, such as a storage NIC. To keep all of ``/dev/infiniband/`` open to
+every job instead:
 
 .. code-block:: toml
 
    [cgroup]
    constrain_rdma_devices = false
 
-This does not reset a NIC's RDMA state between jobs.
+A job keeps the access it started with for all of its steps, even if NICs
+appear or disappear on the node while it runs. This does not reset a NIC's RDMA
+state between jobs.
 
 Configuring NICs by hand
 ------------------------

@@ -154,14 +154,20 @@ impl DeviceRegistry {
         Ok(build_injection_plans(&devices, job_uid, job_gid))
     }
 
-    /// Whether jobs here are granted RDMA device nodes by allocation, so the rest
-    /// of `/dev/infiniband` can be withheld from them.
-    pub fn allocates_rdma_nodes(&self) -> bool {
-        self.devices
+    /// RDMA device nodes jobs here get only by allocation, so a job that was
+    /// not allocated one can be denied it. Sorted for a stable launch spec.
+    pub fn allocation_gated_rdma_nodes(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .devices
             .iter()
             .filter(|e| e.is_injectable())
             .flat_map(|e| e.node_paths())
-            .any(|path| path.starts_with("/dev/infiniband/"))
+            .filter(|path| path.starts_with("/dev/infiniband/"))
+            .map(str::to_owned)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Whether `key` (`name` or `name:type`) names one of this node's countable pools.
@@ -653,27 +659,33 @@ mod tests {
     }
 
     #[test]
-    fn a_node_allocates_rdma_only_when_it_hands_out_infiniband_nodes() {
+    fn only_the_rdma_nodes_the_registry_hands_out_are_gated() {
         let gres = |name: &str, file: &str| GresEntry {
             name: name.into(),
             file: Some(file.into()),
             ..Default::default()
         };
-        let allocates = |entries: &[GresEntry]| {
+        let gated = |entries: &[GresEntry]| {
             let mut reg = DeviceRegistry::new();
             populate_registry(&mut reg, &CdiCache::new(), entries);
-            reg.allocates_rdma_nodes()
+            reg.allocation_gated_rdma_nodes()
         };
-        assert!(!allocates(&[]));
-        assert!(!allocates(&[gres("gpu", "/dev/dri/renderD128")]));
-        assert!(!allocates(&[GresEntry {
+        assert!(gated(&[]).is_empty());
+        assert!(gated(&[gres("gpu", "/dev/dri/renderD128")]).is_empty());
+        assert!(gated(&[GresEntry {
             name: "hca".into(),
             count: Some(4),
             flags: vec!["count_only".into()],
             ..Default::default()
-        }]));
-        assert!(allocates(&[gres("nic", "/dev/infiniband/uverbs[0-1]")]));
-        assert!(allocates(&[gres("hca", "/dev/infiniband/uverbs0")]));
+        }])
+        .is_empty());
+        assert_eq!(
+            gated(&[
+                gres("nic", "/dev/infiniband/uverbs[1-2]"),
+                gres("gpu", "/dev/dri/renderD128"),
+            ]),
+            ["/dev/infiniband/uverbs1", "/dev/infiniband/uverbs2"]
+        );
     }
 
     #[test]

@@ -193,9 +193,9 @@ pub struct JobLaunchConfig {
     pub mpi: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
-    /// The node grants RDMA device nodes by allocation, so `[cgroup]` may
-    /// withhold the ones this job was not given.
-    pub node_allocates_rdma: bool,
+    /// RDMA nodes the node hands out by allocation, withheld from the job
+    /// unless allocated to it (see `device_cgroup::JobDevices`).
+    pub gated_rdma: Vec<String>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
     /// cgroup-v2 enforcement settings from `[cgroup]`.
@@ -642,7 +642,7 @@ async fn spawn_job_process(
     // Set up cgroup for isolation
     let devices = device_cgroup::JobDevices {
         allocated: allocated_device_paths(cfg.host_device_plan.as_ref()),
-        node_allocates_rdma: cfg.node_allocates_rdma,
+        gated_rdma: &cfg.gated_rdma,
     };
     let cgroup_path = CgroupGuard(setup_cgroup(
         CgroupScope {
@@ -4565,7 +4565,7 @@ mod tests {
             partition: String::new(),
             nodelist: String::new(),
             host_device_plan: None,
-            node_allocates_rdma: false,
+            gated_rdma: Vec::new(),
             memlock: MemlockLimit::Unlimited,
             cgroup: CgroupConfig::default(),
             io_mode: LaunchIo::File,

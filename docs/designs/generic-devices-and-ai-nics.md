@@ -45,11 +45,13 @@ pub struct Device {
 - **Environment**: `NCCL_IB_HCA` as an exact-match list (`=ionic_0,...`),
   `PCIDEVICE_AMD_COM_NIC`/`VNIC` like the AMD network device plugin, and
   `SPUR_JOB_NICS`/`VNICS`.
-- **Isolation**: on a node whose registry hands out `/dev/infiniband` nodes by
-  allocation, the device filter keeps only `rdma_cm` from that directory.
-  `[cgroup] constrain_rdma_devices` turns this off. Whether the node allocates
-  RDMA travels in the launch spec, defaulting to false, so a supervisor
-  relaunched from a pre-upgrade spec keeps RDMA open.
+- **Isolation**: the `/dev/infiniband` nodes the registry hands out by
+  allocation leave the device filter's host-infrastructure set, so a job reaches
+  one only through its allocation; other RDMA nodes stay open.
+  `[cgroup] constrain_rdma_devices` turns this off. The list is fixed when a job
+  starts and persisted with its resources, so every step of the job, and a job
+  adopted after an agent restart, gets the same access; a job started before
+  the list existed has none and keeps RDMA open.
 
 ## Deprecation policy
 

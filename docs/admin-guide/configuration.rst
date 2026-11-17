@@ -2917,8 +2917,9 @@ statistics.
      - Agent restart
      - On a node that hands out RDMA devices per job (AI NICs, or a
        ``[[devices.gres]]`` entry with files under ``/dev/infiniband/``), a job
-       can open only the RDMA devices it was allocated, plus ``rdma_cm``.
-       ``false`` keeps all of ``/dev/infiniband/`` open to every job. No effect
+       can open those RDMA devices only if they are allocated to it; other
+       ``/dev/infiniband/`` nodes stay open. ``false`` keeps all of
+       ``/dev/infiniband/`` open to every job. No effect
        on other nodes, or with ``constrain_devices = false``. See
        :doc:`ai-nics`.
    * - ``extra_device_paths``
@@ -2997,9 +2998,8 @@ isolation boundary and worth knowing:
   ``/dev/infiniband/`` (RDMA verbs, for MPI and for NCCL or RCCL over InfiniBand),
   and the MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by
   path when the filter is built, so a node without that hardware grants nothing extra.
-  On a node that hands out RDMA devices per job, ``constrain_rdma_devices`` narrows
-  ``/dev/infiniband/`` to ``rdma_cm``; each RDMA device then comes only with an
-  allocation.
+  On a node that hands out RDMA devices per job, ``constrain_rdma_devices`` takes
+  those devices out of this set, so each comes only with an allocation.
 
 The vendor control nodes a GPU runtime initializes through — ``/dev/nvidiactl``,
 ``/dev/nvidia-uvm`` and the like — are **not** in this set. They reach a job through

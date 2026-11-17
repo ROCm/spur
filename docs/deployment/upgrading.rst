@@ -1314,13 +1314,14 @@ RDMA device access on AI NIC nodes (``constrain_rdma_devices``)
 
 Spur now discovers AMD Pollara AI NICs and schedules them per job
 (:doc:`/admin-guide/ai-nics`). On a node that hands out RDMA devices per job, a
-job can open only the RDMA devices it was allocated, plus ``rdma_cm``. This
-covers a node with Pollara NICs and ``auto_detect`` on, and a node with a
-``[[devices.gres]]`` entry whose files are under ``/dev/infiniband/``.
+job can open those devices only if they are allocated to it. This covers a node
+with Pollara NICs and ``auto_detect`` on, and a node with a ``[[devices.gres]]``
+entry whose files are under ``/dev/infiniband/``. RDMA nodes Spur does not
+allocate, such as ``rdma_cm`` or another vendor's HCA, stay open.
 
-**Effect:** a job on such a node that uses RDMA without requesting NICs, for
-example MPI over verbs, now fails to open ``/dev/infiniband/uverbsN`` with
-``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
+**Effect:** a job on such a node that uses those NICs without requesting them,
+for example MPI over verbs, now fails to open their ``/dev/infiniband/uverbsN``
+with ``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
 as before:
 
 .. code-block:: toml
@@ -1404,9 +1405,10 @@ Node inventory now lists every allocatable device, of every kind, in
   RCCL silently fall back to TCP. An older agent ignores allocations
   of device kinds other than GPUs, so a job allocated NICs before the rollback
   keeps running without them claimed on the node. If the older agent
-  rewrites a running job's state, which it does when GPU ids change, its
-  non-GPU devices are dropped from it and stay unclaimed after rolling forward.
-  Upgrade in the opposite order: controllers first.
+  rewrites a running job's state, which it does when GPU ids change, the job's
+  NICs and its RDMA restriction are dropped from it: after rolling forward,
+  other jobs can still be allocated those NICs and the job's later steps can
+  open every RDMA device. Upgrade in the opposite order: controllers first.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``. The

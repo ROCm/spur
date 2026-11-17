@@ -78,17 +78,16 @@ const HOST_INFRA_DEVICE_DIRS: &[&str] = &[
 
 const RDMA_DEVICE_DIR: &str = "/dev/infiniband";
 
-/// Kept when RDMA is withheld: the connection manager reaches no NIC without
-/// that NIC's own `uverbs` node, which only an allocation grants.
-const RDMA_SHARED_NODES: &[&str] = &["rdma_cm"];
-
 /// IB and NVIDIA majors are assigned dynamically, so these resolve by path like any
 /// allocated node; a node without that hardware has nothing to stat.
 ///
 /// GPU nodes are deliberately absent — per-GPU compute (`/dev/nvidia<N>`, `/dev/kfd`,
 /// `/dev/dri/*`) and vendor control (`nvidiactl`, `nvidia-uvm`) alike arrive through the
 /// allocation's CDI edits, so a job with no GPU gets none. Gating them there is the point.
-fn host_infra_device_paths_under(root: &Path, withhold_rdma: bool) -> Vec<String> {
+///
+/// `gated_rdma` are RDMA nodes the node hands out by allocation; they leave the
+/// set, so a job reaches one only through its own allocation.
+fn host_infra_device_paths_under(root: &Path, gated_rdma: &[String]) -> Vec<String> {
     let under_root = |path: &str| root.join(path.trim_start_matches('/'));
     let mut paths: Vec<String> = HOST_INFRA_DEVICE_NODES
         .iter()
@@ -96,10 +95,10 @@ fn host_infra_device_paths_under(root: &Path, withhold_rdma: bool) -> Vec<String
         .collect();
     for dir in HOST_INFRA_DEVICE_DIRS {
         let mut entries = device_dir_entries(&under_root(dir));
-        if withhold_rdma && *dir == RDMA_DEVICE_DIR {
+        if *dir == RDMA_DEVICE_DIR {
             entries.retain(|path| {
                 let name = path.rsplit('/').next().unwrap_or_default();
-                RDMA_SHARED_NODES.contains(&name)
+                !gated_rdma.contains(&format!("{RDMA_DEVICE_DIR}/{name}"))
             });
         }
         paths.extend(entries);
@@ -125,9 +124,9 @@ fn device_dir_entries(dir: &Path) -> Vec<String> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JobDevices<'a> {
     pub allocated: &'a [String],
-    /// The node grants RDMA device nodes by allocation; false for a launch
-    /// from an agent that predates the field, which keeps RDMA open.
-    pub node_allocates_rdma: bool,
+    /// RDMA nodes the node handed out by allocation when the job started;
+    /// empty for a job started before they were recorded, which keeps RDMA open.
+    pub gated_rdma: &'a [String],
 }
 
 /// Host infrastructure, the operator's additions, then the job's own allocation.
@@ -141,8 +140,12 @@ fn device_paths_for_job_under(
     cgroup: &CgroupConfig,
     devices: JobDevices,
 ) -> Vec<String> {
-    let withhold_rdma = cgroup.constrain_rdma_devices && devices.node_allocates_rdma;
-    let mut paths = host_infra_device_paths_under(root, withhold_rdma);
+    let gated_rdma = if cgroup.constrain_rdma_devices {
+        devices.gated_rdma
+    } else {
+        &[]
+    };
+    let mut paths = host_infra_device_paths_under(root, gated_rdma);
     paths.extend(cgroup.extra_device_paths.iter().cloned());
     paths.extend(devices.allocated.iter().cloned());
     paths
@@ -691,7 +694,7 @@ mod tests {
 
     #[test]
     fn host_infra_list_covers_the_shared_nodes_no_allocation_grants() {
-        let paths = host_infra_device_paths_under(Path::new("/"), false);
+        let paths = host_infra_device_paths_under(Path::new("/"), &[]);
         assert!(
             paths.iter().any(|p| p == "/dev/fuse"),
             "/dev/fuse is host infrastructure, not an allocatable device"
@@ -718,7 +721,7 @@ mod tests {
     /// Listing one here would hand every job on the node a GPU.
     #[test]
     fn host_infra_list_excludes_per_gpu_compute_nodes() {
-        let paths = host_infra_device_paths_under(Path::new("/"), false);
+        let paths = host_infra_device_paths_under(Path::new("/"), &[]);
         for forbidden in [
             "/dev/kfd",
             "/dev/nvidia0",
@@ -760,17 +763,26 @@ mod tests {
     }
 
     /// A host with RDMA and MIG capability nodes, under a temp root.
+    /// Two allocatable NICs (uverbs0, uverbs1), an HCA the registry does not
+    /// hand out (uverbs2), shared RDMA nodes, and MIG capability nodes.
     fn rdma_host() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let ib = root.path().join("dev/infiniband");
         std::fs::create_dir_all(&ib).unwrap();
-        for node in ["rdma_cm", "umad0", "uverbs0", "uverbs1"] {
+        for node in ["rdma_cm", "umad0", "uverbs0", "uverbs1", "uverbs2"] {
             std::fs::write(ib.join(node), b"").unwrap();
         }
         let caps = root.path().join("dev/nvidia-caps");
         std::fs::create_dir_all(&caps).unwrap();
         std::fs::write(caps.join("nvidia-cap1"), b"").unwrap();
         root
+    }
+
+    fn gated_nics() -> Vec<String> {
+        vec![
+            "/dev/infiniband/uverbs0".to_string(),
+            "/dev/infiniband/uverbs1".to_string(),
+        ]
     }
 
     fn names_under<'a>(paths: &'a [String], dir: &str) -> Vec<&'a str> {
@@ -781,47 +793,52 @@ mod tests {
     }
 
     #[test]
-    fn withheld_rdma_leaves_only_the_connection_manager() {
+    fn only_allocation_gated_rdma_nodes_leave_host_infrastructure() {
         let host = rdma_host();
-        let paths = host_infra_device_paths_under(host.path(), true);
-        assert_eq!(names_under(&paths, "/dev/infiniband/"), ["rdma_cm"]);
+        let paths = host_infra_device_paths_under(host.path(), &gated_nics());
+        assert_eq!(
+            names_under(&paths, "/dev/infiniband/"),
+            ["rdma_cm", "umad0", "uverbs2"]
+        );
         assert_eq!(names_under(&paths, "/dev/nvidia-caps/"), ["nvidia-cap1"]);
 
-        let open = host_infra_device_paths_under(host.path(), false);
+        let open = host_infra_device_paths_under(host.path(), &[]);
         assert_eq!(
             names_under(&open, "/dev/infiniband/"),
-            ["rdma_cm", "umad0", "uverbs0", "uverbs1"]
+            ["rdma_cm", "umad0", "uverbs0", "uverbs1", "uverbs2"]
         );
     }
 
     #[test]
-    fn rdma_is_withheld_only_where_allocated_and_not_opted_out() {
+    fn a_job_reaches_only_its_own_nic_unless_opted_out() {
         let host = rdma_host();
         let allocated = vec!["/dev/infiniband/uverbs1".to_string()];
-        let rdma_names = |constrain_rdma_devices: bool, node_allocates_rdma: bool| {
+        let gated = gated_nics();
+        let rdma_names = |constrain_rdma_devices: bool, gated_rdma: &[String]| {
             let cgroup = CgroupConfig {
                 constrain_rdma_devices,
                 ..Default::default()
             };
             let devices = JobDevices {
                 allocated: &allocated,
-                node_allocates_rdma,
+                gated_rdma,
             };
             let paths = device_paths_for_job_under(host.path(), &cgroup, devices);
-            names_under(&paths, "/dev/infiniband/")
+            let mut names: Vec<String> = names_under(&paths, "/dev/infiniband/")
                 .into_iter()
                 .map(str::to_owned)
-                .collect::<Vec<_>>()
+                .collect();
+            names.sort();
+            names.dedup();
+            names
         };
-        assert_eq!(rdma_names(true, true), ["rdma_cm", "uverbs1"]);
         assert_eq!(
-            rdma_names(false, true),
-            ["rdma_cm", "umad0", "uverbs0", "uverbs1", "uverbs1"]
+            rdma_names(true, &gated),
+            ["rdma_cm", "umad0", "uverbs1", "uverbs2"]
         );
-        assert_eq!(
-            rdma_names(true, false),
-            ["rdma_cm", "umad0", "uverbs0", "uverbs1", "uverbs1"]
-        );
+        let everything = ["rdma_cm", "umad0", "uverbs0", "uverbs1", "uverbs2"];
+        assert_eq!(rdma_names(false, &gated), everything);
+        assert_eq!(rdma_names(true, &[]), everything);
     }
 
     #[test]
@@ -863,7 +880,7 @@ mod tests {
             &cgroup,
             JobDevices {
                 allocated: &allocated,
-                node_allocates_rdma: false,
+                gated_rdma: &[],
             },
         );
         assert!(paths.iter().any(|p| p == "/dev/dri/renderD128"));

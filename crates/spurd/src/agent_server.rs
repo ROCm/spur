@@ -1365,6 +1365,8 @@ pub struct TrackedJob {
     user: String,
     partition: String,
     devices: spur_devices::DeviceSelection,
+    /// RDMA nodes withheld from the job unless allocated, fixed at its start.
+    gated_rdma: Vec<String>,
     cpus: u32,
     memory_mb: u64,
     /// The node's schedulable memory, for a typed step's ceiling check when
@@ -2354,6 +2356,7 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         user: own(&descriptor.owner),
         partition: descriptor.resources.partition.clone(),
         devices: descriptor.resources.devices.clone(),
+        gated_rdma: descriptor.resources.gated_rdma.clone(),
         cpus: descriptor.resources.cpus,
         memory_mb: descriptor.resources.memory_mb,
         memory_ceiling_mb: descriptor.resources.memory_ceiling_mb,
@@ -7335,9 +7338,12 @@ impl SlurmAgent for AgentService {
         let mut reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
 
-        let injection = {
+        let (injection, gated_rdma) = {
             let reg = self.device_registry.lock().await;
-            reg.build_job_injection_plans(&devices, spec.uid, spec.gid)
+            (
+                reg.build_job_injection_plans(&devices, spec.uid, spec.gid),
+                reg.allocation_gated_rdma_nodes(),
+            )
         };
         let (host_device_plan, container_device_plan) = match injection {
             Ok(plans) => plans,
@@ -7421,7 +7427,7 @@ impl SlurmAgent for AgentService {
                 &cpu_ids,
                 crate::device_cgroup::JobDevices {
                     allocated: &host_device_plan.device_paths,
-                    node_allocates_rdma: self.node_allocates_rdma().await,
+                    gated_rdma: &gated_rdma,
                 },
                 &crate::step_resources::StepLimits::default(),
             );
@@ -7507,7 +7513,7 @@ impl SlurmAgent for AgentService {
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
             host_device_plan: Some(host_device_plan),
-            node_allocates_rdma: self.node_allocates_rdma().await,
+            gated_rdma,
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
             io_mode: if spec.pty {
@@ -7703,6 +7709,7 @@ impl SlurmAgent for AgentService {
                         user: launch_cfg.user,
                         partition: launch_cfg.partition,
                         devices: launch_cfg.devices,
+                        gated_rdma: launch_cfg.gated_rdma,
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
                         memory_ceiling_mb: launch_cfg.memory_ceiling_mb,
@@ -8319,11 +8326,12 @@ impl SlurmAgent for AgentService {
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
         let memory_ceiling_mb = self.resolve_memory_ceiling(req.job_id, req.node_memory_ceiling_mb);
 
-        // Resolved before the running lock and the reservation: this is the one
-        // step that awaits another lock, and failing here needs no release.
+        // Resolved before the running lock and the reservation: these await the
+        // registry lock, and failing here needs no release.
         let host_device_plan = self
             .resolve_host_device_plan(req.job_id, &devices, req.uid, req.gid)
             .await?;
+        let gated_rdma = self.gated_rdma_nodes().await;
         let device_paths = host_device_plan
             .as_ref()
             .map(|p| p.device_paths.clone())
@@ -8433,7 +8441,7 @@ impl SlurmAgent for AgentService {
             &alloc_result.cpu_ids,
             crate::device_cgroup::JobDevices {
                 allocated: &device_paths,
-                node_allocates_rdma: self.node_allocates_rdma().await,
+                gated_rdma: &gated_rdma,
             },
             &crate::step_resources::StepLimits::default(),
         );
@@ -8534,7 +8542,7 @@ impl SlurmAgent for AgentService {
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
                 host_device_plan,
-                node_allocates_rdma: self.node_allocates_rdma().await,
+                gated_rdma: gated_rdma.clone(),
                 memlock: self.limits.memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -8645,6 +8653,7 @@ impl SlurmAgent for AgentService {
                 user: req.user,
                 partition: req.partition,
                 devices: devices.clone(),
+                gated_rdma,
                 cpus,
                 memory_mb,
                 memory_ceiling_mb,
@@ -8939,6 +8948,7 @@ impl SlurmAgent for AgentService {
             job_attempt,
             allocation,
             job_nodelist,
+            job_gated_rdma,
         ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -8986,6 +8996,7 @@ impl SlurmAgent for AgentService {
                 tracked.run_attempt,
                 Self::tracked_allocation(tracked),
                 tracked.nodelist.clone(),
+                tracked.gated_rdma.clone(),
             )
         };
         self.check_step_allocation(&allocation, &job_nodelist)
@@ -9438,7 +9449,7 @@ impl SlurmAgent for AgentService {
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
                 host_device_plan,
-                node_allocates_rdma: self.node_allocates_rdma().await,
+                gated_rdma: job_gated_rdma,
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -10257,6 +10268,7 @@ impl SlurmAgent for AgentService {
             nodelist,
             user,
             allocation,
+            gated_rdma,
         ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&init.job_id).ok_or_else(|| {
@@ -10275,6 +10287,7 @@ impl SlurmAgent for AgentService {
                 tracked.nodelist.clone(),
                 tracked.user.clone(),
                 Self::tracked_allocation(tracked),
+                tracked.gated_rdma.clone(),
             )
         };
         self.check_step_allocation(&allocation, &nodelist).await?;
@@ -10528,7 +10541,7 @@ impl SlurmAgent for AgentService {
                         nodelist,
                         mpi: String::new(),
                         host_device_plan,
-                        node_allocates_rdma: self.node_allocates_rdma().await,
+                        gated_rdma,
                         memlock: self.limits.memlock,
                         cgroup: self.cgroup.clone(),
                         io_mode: executor::LaunchIo::Pty,
@@ -11036,8 +11049,11 @@ impl AgentService {
 
     /// Host-side device injection plan for a launch that has no container of
     /// its own. `None` for a launch holding no devices (an empty plan either way).
-    async fn node_allocates_rdma(&self) -> bool {
-        self.device_registry.lock().await.allocates_rdma_nodes()
+    async fn gated_rdma_nodes(&self) -> Vec<String> {
+        self.device_registry
+            .lock()
+            .await
+            .allocation_gated_rdma_nodes()
     }
 
     async fn resolve_host_device_plan(
@@ -12422,6 +12438,7 @@ impl TrackedJob {
             user: "testuser".into(),
             partition: String::new(),
             devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
+            gated_rdma: Vec::new(),
             fabric_binding: None,
             gpu_binding: None,
             cpus: 1,
@@ -17474,7 +17491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_node_handing_out_nics_withholds_rdma() {
+    async fn only_the_nics_a_node_hands_out_are_gated() {
         let svc_with = |registry: DeviceRegistry| {
             AgentService::new(
                 test_reporter(),
@@ -17483,12 +17500,37 @@ mod tests {
                 spur_core::config::MemlockLimit::Unlimited,
             )
         };
-        assert!(
+        assert_eq!(
             svc_with(test_gpu_and_nic_registry())
-                .node_allocates_rdma()
-                .await
+                .gated_rdma_nodes()
+                .await,
+            ["/dev/infiniband/uverbs0", "/dev/infiniband/uverbs1"]
         );
-        assert!(!svc_with(DeviceRegistry::new()).node_allocates_rdma().await);
+        assert!(svc_with(DeviceRegistry::new())
+            .gated_rdma_nodes()
+            .await
+            .is_empty());
+    }
+
+    #[test]
+    fn an_adopted_job_keeps_the_rdma_gating_it_started_with() {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            0,
+            0,
+            0,
+            std::path::PathBuf::from("/run/spur/7.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(tracked_from_session(&descriptor, true)
+            .gated_rdma
+            .is_empty());
+        descriptor.resources.gated_rdma = vec!["/dev/infiniband/uverbs0".into()];
+        assert_eq!(
+            tracked_from_session(&descriptor, true).gated_rdma,
+            ["/dev/infiniband/uverbs0"]
+        );
     }
 
     #[tokio::test]
@@ -18304,7 +18346,7 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             host_device_plan: None,
-            node_allocates_rdma: false,
+            gated_rdma: Vec::new(),
             memlock: spur_core::config::MemlockLimit::Unlimited,
             cgroup: spur_core::config::CgroupConfig::default(),
             io_mode: executor::LaunchIo::File,
@@ -18454,6 +18496,7 @@ mod tests {
             memory_mb: 4096,
             memory_ceiling_mb: 0,
             devices: spur_devices::DeviceSelection::new().with("gpu", vec![2, 3]),
+            gated_rdma: Vec::new(),
             cpu_ids: vec![0, 1, 2, 3, 4, 5, 6, 7],
             partition: "gpu".into(),
             nodelist: "node-a,node-b".into(),
@@ -21020,7 +21063,6 @@ mod tests {
                 stable_id: device_id as u64,
                 numa_node: None,
                 affinity_cpus: Vec::new(),
-
                 index: device_id,
                 topology: None,
             })
@@ -21811,7 +21853,6 @@ mod tests {
                     stable_id: 128,
                     numa_node: None,
                     affinity_cpus: Vec::new(),
-
                     index: 0,
                     topology: None,
                 }],
@@ -24396,6 +24437,7 @@ mod tests {
             user: "testuser".into(),
             partition: String::new(),
             devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
+            gated_rdma: Vec::new(),
             cpus: 1,
             memory_mb: 0,
             memory_ceiling_mb: 0,
@@ -25847,6 +25889,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
+                gated_rdma: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -26400,6 +26443,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
+                gated_rdma: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -26490,6 +26534,7 @@ mod tests {
                 user: "testuser".into(),
                 partition: String::new(),
                 devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
+                gated_rdma: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -27030,7 +27075,6 @@ mod tests {
             stable_id,
             numa_node: None,
             affinity_cpus: Vec::new(),
-
             index: device_id,
             topology: None,
         }
@@ -27725,7 +27769,6 @@ mod tests {
             stable_id,
             numa_node: None,
             affinity_cpus: Vec::new(),
-
             index: 0,
             topology: None,
         };
