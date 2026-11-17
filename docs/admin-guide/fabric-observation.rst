@@ -89,7 +89,8 @@ regenerating the specs. GRES-only entries do not acquire topology automatically.
 Integration contract
 --------------------
 
-``GpuResource.topology`` is optional in persisted inventory and the gRPC API.
+``Device.topology`` (and the deprecated ``GpuResource.topology``) is optional in
+persisted inventory and the gRPC API.
 Older agents and saved inventories omit it. New agents send typed
 ``DeviceTopology`` and ``FabricObservation`` messages through registration;
 node/resource responses preserve them. Unknown wire status values map to

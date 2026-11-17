@@ -166,9 +166,6 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         kind: GRES_KIND.into(),
         device_id: 0,
         capability: DeviceCapability::Injectable,
-        memory_mb: 0,
-        links: expanded.links.clone(),
-        link_type: None,
         pci_bdf: None,
         vendor: expanded.vendor.clone(),
         inject_actions: expanded.inject_actions.clone(),
@@ -189,9 +186,6 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         kind: GRES_KIND.into(),
         device_id: 0,
         capability: DeviceCapability::CountablePool,
-        memory_mb: 0,
-        links: None,
-        link_type: None,
         pci_bdf: None,
         vendor: None,
         inject_actions: InjectActions::default(),
@@ -278,9 +272,6 @@ fn merge_into_discovered(
         }
         if configured.cores.is_some() {
             device.cores = configured.cores.clone();
-        }
-        if configured.links.is_some() {
-            device.links = configured.links.clone();
         }
         device.inject_actions.merge(&configured.inject_actions);
     }
@@ -907,47 +898,6 @@ mod tests {
 
         assert_eq!(reg.injectable_count(), 2);
         assert_eq!(reg.countable_count(), 0);
-    }
-
-    #[test]
-    fn test_populate_link_type_from_annotation() {
-        let spec = CdiSpec {
-            cdi_version: "0.6.0".into(),
-            kind: "amd.com/gpu".into(),
-            annotations: Default::default(),
-            devices: vec![CdiDevice {
-                name: "0".into(),
-                annotations: [(annotations::LINK_TYPE.into(), "xgmi".into())].into(),
-                container_edits: Some(ContainerEdits {
-                    device_nodes: vec![DeviceNode {
-                        path: "/dev/dri/renderD128".into(),
-                        host_path: None,
-                        r#type: None,
-                        major: None,
-                        minor: None,
-                        file_mode: None,
-                        permissions: None,
-                        uid: None,
-                        gid: None,
-                    }],
-                    ..Default::default()
-                }),
-            }],
-            container_edits: None,
-        };
-
-        let mut cache = CdiCache::new();
-        cache.add_specs(&[spec]);
-        let mut reg = DeviceRegistry::new();
-        populate_registry(&mut reg, &cache, &[]);
-
-        let gpu = reg.resolve_by_ids("gpu", &[0]).unwrap()[0];
-        assert_eq!(gpu.vendor.as_deref(), Some("amd"));
-        assert_eq!(gpu.link_type, Some(crate::types::LinkType::Xgmi));
-        assert_eq!(
-            crate::registry::entry::resolve_link_type(gpu),
-            crate::types::LinkType::Xgmi
-        );
     }
 
     #[test]

@@ -755,7 +755,7 @@ address = "http://peer-a:6817"
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256000,
-            gpus: vec![],
+            devices: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
             topology: None,

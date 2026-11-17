@@ -8,6 +8,7 @@
 
 #[cfg(test)]
 mod tests {
+    use spur_core::device::Device;
     use spur_core::resource::*;
     use spur_core::step::*;
     use spur_sched::cons_tres::*;
@@ -84,24 +85,22 @@ mod tests {
 
     #[test]
     fn t01_9_cons_tres_basic_alloc() {
-        let gpus: Vec<GpuResource> = (0..8)
-            .map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
+        let gpus: Vec<Device> = (0..8)
+            .map(|i| Device {
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
                 stable_id: i as u64,
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                index: i,
+                topology: None,
             })
             .collect();
 
         let resources = ResourceSet {
             cpus: 128,
             memory_mb: 512_000,
-            gpus,
+            devices: gpus,
             ..Default::default()
         };
 

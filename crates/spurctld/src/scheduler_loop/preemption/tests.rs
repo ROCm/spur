@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use spur_core::device::Device;
 use spur_core::gpu_request::GpuRequest;
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_core::resource::ResourceSet;
 use spur_sched::immediate::PlacementRequest;
 
 struct Fixture {
@@ -24,17 +25,13 @@ impl Fixture {
         let inventory = ResourceSet {
             cpus,
             memory_mb: 100,
-            gpus: (0..4)
-                .map(|index| GpuResource {
-                    device_id: index,
-                    stable_id: 1000 + u64::from(index),
-                    gpu_type: if index < 2 { "a" } else { "b" }.into(),
-                    memory_mb: 100,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::PCIe,
-                    topology: None,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
+            devices: (0..4)
+                .map(|index| {
+                    Device::gpu(
+                        1000 + u64::from(index),
+                        if index < 2 { "a" } else { "b" },
+                        index,
+                    )
                 })
                 .collect(),
             ..Default::default()
@@ -290,10 +287,10 @@ fn blocked_gpu_seeding_is_bounded_outside_the_request_scope() {
     let mut f = Fixture::new(4);
     let mut other = f.nodes[0].clone();
     other.name = "other".into();
-    let gpu = other.total_resources.gpus[0].clone();
-    other.total_resources.gpus = (0..128)
-        .map(|id| GpuResource {
-            device_id: id,
+    let gpu = other.total_resources.devices[0].clone();
+    other.total_resources.devices = (0..128)
+        .map(|id| Device {
+            index: id,
             stable_id: u64::from(id),
             ..gpu.clone()
         })
@@ -368,7 +365,7 @@ fn unpinned_selector_keeps_its_budget_with_partition_charges() {
         for with_gpus in [false, true] {
             let mut f = Fixture::new(4);
             if !with_gpus {
-                f.nodes[0].total_resources.gpus.clear();
+                f.nodes[0].total_resources.devices.clear();
             }
             f.nodes[0].partitions = vec!["default".into()];
             let template = f.nodes[0].clone();
@@ -523,7 +520,7 @@ fn topology_victims_enable_normal_scheduler_placement() {
 fn pinned_selector_keeps_its_budget_with_many_irrelevant_nodes() {
     for count in [64, 128, 512, 1024] {
         let mut f = Fixture::new(4);
-        f.nodes[0].total_resources.gpus.clear();
+        f.nodes[0].total_resources.devices.clear();
         f.nodes[0].partitions = vec!["default".into()];
         f.nodes.extend((1..count).map(|index| {
             let mut node = Node::new(
@@ -648,8 +645,8 @@ fn exclusive_gpu_total_selects_only_a_node_with_enough_gpus() {
         f.nodes.push(other);
         let big = usize::from(!big_first);
         let small = 1 - big;
-        f.nodes[big].total_resources.gpus.truncate(2);
-        f.nodes[small].total_resources.gpus.truncate(1);
+        f.nodes[big].total_resources.devices.truncate(2);
+        f.nodes[small].total_resources.devices.truncate(1);
         for index in 0..2 {
             let allocation =
                 spur_core::resource::build_exclusive_allocation(&f.nodes[index].total_resources, 0);
@@ -1442,7 +1439,7 @@ fn snapshot_preserves_suspension_timing_for_controller_grace() {
 fn malformed_injectable_gpu_counts_defer_before_victim_selection() {
     for count in [0, 2, u64::from(u32::MAX) + 1] {
         let mut f = Fixture::new(4);
-        f.nodes[0].total_resources.gpus.truncate(2);
+        f.nodes[0].total_resources.devices.truncate(2);
         f.hold(1, 0, 0, &[1000], false);
         f.hold(2, 4, 0, &[], true);
         f.holders[0]
@@ -1674,12 +1671,12 @@ fn full_gpu_cluster_fits_snapshot_and_selection_limits() {
     let mut template = f.nodes[0].clone();
     template.partitions = vec!["default".into()];
     template.features = vec!["gpu".into(), "compute".into()];
-    template.total_resources.gpus = (0..8)
+    template.total_resources.devices = (0..8)
         .map(|i| {
-            let mut gpu = template.total_resources.gpus[0].clone();
-            gpu.device_id = i;
+            let mut gpu = template.total_resources.devices[0].clone();
+            gpu.index = i;
             gpu.stable_id = u64::from(i) + 1000;
-            gpu.gpu_type = "MI300X".into();
+            gpu.device_type = "MI300X".into();
             gpu
         })
         .collect();

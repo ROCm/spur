@@ -68,7 +68,7 @@ pub struct FabricView {
 }
 
 pub fn has_native_fabric(resources: &crate::resource::ResourceSet) -> bool {
-    resources.gpus.iter().any(|gpu| {
+    resources.gpus().any(|gpu| {
         gpu.topology
             .as_ref()
             .and_then(|t| t.fabric.as_ref())
@@ -115,7 +115,7 @@ impl FabricView {
         let mut unresolved = Vec::new();
         let mut device_counts = BTreeMap::new();
         for node in nodes {
-            for gpu in &node.total_resources.gpus {
+            for gpu in node.total_resources.gpus() {
                 *device_counts
                     .entry(FabricDeviceKey {
                         node: node.name.clone(),
@@ -582,8 +582,9 @@ impl TryFrom<spur_proto::proto::GetFabricTopologyResponse> for FabricView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::Device;
     use crate::node::NodeState;
-    use crate::resource::{DeviceTopology, GpuLinkType, GpuResource, ResourceSet};
+    use crate::resource::{DeviceTopology, ResourceSet};
 
     #[test]
     fn legacy_topology_view_defaults_to_no_notices() {
@@ -608,13 +609,11 @@ mod tests {
                 cpus: 8,
                 memory_mb: 1000,
                 generation: 7,
-                gpus: vec![GpuResource {
-                    device_id: 0,
+                devices: vec![Device {
+                    gres_name: "gpu".into(),
+                    device_type: "test".into(),
                     stable_id: 42,
-                    gpu_type: "test".into(),
-                    memory_mb: 100,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::PCIe,
+                    index: 0,
                     topology: Some(DeviceTopology {
                         pci_bdf: Some("0001:04:00.0".into()),
                         fabric: Some(FabricObservation {
@@ -643,7 +642,7 @@ mod tests {
     }
 
     fn observation(node: &mut Node) -> &mut FabricObservation {
-        node.total_resources.gpus[0]
+        node.total_resources.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -697,9 +696,9 @@ mod tests {
     #[test]
     fn multiple_logical_partitions_share_one_physical_endpoint() {
         let mut nodes = nodes();
-        let mut gpu = nodes[0].total_resources.gpus[0].clone();
+        let mut gpu = nodes[0].total_resources.devices[0].clone();
         gpu.stable_id = 43;
-        nodes[0].total_resources.gpus.push(gpu);
+        nodes[0].total_resources.devices.push(gpu);
         let result = view(&nodes);
         assert!(
             result.blocks[0].issues.is_empty(),
@@ -708,7 +707,7 @@ mod tests {
         );
         assert_eq!(result.blocks[0].members.len(), 3);
         assert_eq!(result.blocks[0].active_endpoints.len(), 2);
-        nodes[0].total_resources.gpus[1]
+        nodes[0].total_resources.devices[1]
             .topology
             .as_mut()
             .unwrap()
@@ -771,7 +770,7 @@ mod tests {
     #[test]
     fn duplicate_logical_id_across_blocks_is_invalid() {
         let mut nodes = nodes();
-        let mut gpu = nodes[0].total_resources.gpus[0].clone();
+        let mut gpu = nodes[0].total_resources.devices[0].clone();
         gpu.topology
             .as_mut()
             .unwrap()
@@ -779,7 +778,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .physical_domain_id = Some("rack-b".into());
-        nodes[0].total_resources.gpus.push(gpu);
+        nodes[0].total_resources.devices.push(gpu);
         assert!(view(&nodes)
             .blocks
             .iter()
@@ -797,7 +796,7 @@ mod tests {
             serde_json::from_str::<FabricManifest>(&encoded).unwrap(),
             manifest
         );
-        nodes[1].total_resources.gpus[0].stable_id = 43;
+        nodes[1].total_resources.devices[0].stable_id = 43;
         assert!(manifest
             .resolve(&view(&nodes))
             .unwrap_err()

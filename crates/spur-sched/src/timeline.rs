@@ -354,7 +354,8 @@ impl NodeTimeline {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use spur_core::resource::{AllocatedDevice, GpuResource};
+    use spur_core::device::Device;
+    use spur_core::resource::AllocatedDevice;
 
     fn make_timeline() -> NodeTimeline {
         NodeTimeline::new(
@@ -369,16 +370,14 @@ mod tests {
 
     fn make_gpu_timeline(num_gpus: usize) -> NodeTimeline {
         let gpus = (0..num_gpus)
-            .map(|i| GpuResource {
-                device_id: i as u32,
-                gpu_type: "mi355x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: spur_core::resource::GpuLinkType::PCIe,
-                topology: None,
-                stable_id: i as u64,
+            .map(|i| Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: "mi355x".into(),
+                stable_id: i as u64,
+                index: i as u32,
+                topology: None,
             })
             .collect();
         NodeTimeline::new(
@@ -386,7 +385,7 @@ mod tests {
             ResourceSet {
                 cpus: 192,
                 memory_mb: 2_000_000,
-                gpus,
+                devices: gpus,
                 ..Default::default()
             },
         )

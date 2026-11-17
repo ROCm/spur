@@ -22,7 +22,8 @@ src/
   config.rs              -- SlurmConfig (TOML), all config sections (~5000 lines)
   job.rs                 -- JobSpec, Job, JobState, PendingReason, state machine
   node.rs                -- Node, NodeState, NodeEvent, NodeSource, NodeOverlay
-  resource.rs            -- ResourceSet, ResourceAllocations, GpuResource, parse_gres
+  resource.rs            -- ResourceSet, ResourceRequest, ResourceAllocations, parse_gres
+  device.rs              -- Device (every allocatable device kind), legacy GPU wire/serde shapes
   gpu_request.rs         -- GpuRequest, GpuDemand, resolve_gpu_demand, distribute_total
   gpu_binding.rs         -- GpuBinding, BoundGpu, per-node GPU selection validated at dispatch/step
   gpu_identity.rs        -- stable_id-to-silicon mapping, LayoutDiff, safe GPU renames
@@ -269,19 +270,27 @@ persisted; derived from live reservation/backfill state.
 
 ### ResourceSet (inventory)
 
-Per-node schedulable inventory: `cpus`, `memory_mb`, `gpus: Vec<GpuResource>`,
-`generic: HashMap<String, u64>`, `generation`. The `clamped()` method applies
-operator caps and reserved memory from `NodeConfig`.
+Per-node schedulable inventory: `cpus`, `memory_mb`, `devices: Vec<Device>`,
+`generic: HashMap<String, u64>`, `generation`. `gpus()` / `devices_of(gres)`
+view one kind. The `clamped()` method applies operator caps and reserved
+memory from `NodeConfig`. Serde still writes the deprecated GPU-only `gpus`
+list (and reads it from older entries) for one release; see device.rs.
 
-### GpuResource
+### Device
 
-Individual GPU: `device_id` (positional), `gpu_type` (e.g. "mi300x"),
-`memory_mb`, `peer_gpus`, `link_type` (PCIe/XGMI/NVLink), `stable_id`,
+One allocatable device of any kind: `gres_name` ("gpu", "nic", ...),
+`device_type` (e.g. "mi300x"), `stable_id`, positional `index`, `topology`,
 `numa_node`, `affinity_cpus` (from `[[devices.gres]] cores=`; empty means
 "use `numa_node`'s CPUs"). The latter two feed `core_layout`'s per-GPU
-reserved-core placement.
-Allocation keys on `stable_id`, not positional `device_id`, so a mid-set GPU
-removal does not renumber existing allocations.
+reserved-core placement for GPUs.
+Allocation keys on `stable_id`, not positional `index`, so a mid-set removal
+does not renumber existing allocations. A gres a node reports devices for is
+allocated by id; any other gres draws on the countable `generic` pool.
+
+### ResourceRequest (demand)
+
+What one node must provide: `cpus`, `memory_mb`, and device counts keyed by
+`DeviceKey { gres_name, device_type: Option<_> }` (`None` takes any type).
 
 ### ResourceAllocations (consumed)
 
@@ -501,7 +510,7 @@ to 256 bytes (must be applied before proposing, never in apply/restore).
 
 ### Breaking changes
 
-- Adding a field to `JobSpec`, `Job`, `Node`, `ResourceSet`, `GpuResource`,
+- Adding a field to `JobSpec`, `Job`, `Node`, `ResourceSet`, `Device`,
   `ResourceAllocations`, `Partition`, `Reservation`, or any type nested inside
   `WalOperation` that cannot deserialize when absent will crash the controller
   on upgrade. Use `#[serde(default)]`, or a plain `Option<T>` (an `Option`

@@ -251,8 +251,8 @@ impl DefinedBlock {
         let mut count = 0;
         let agrees = self.nodes.iter().all(|name| {
             nodes.get(name.as_str()).is_some_and(|node| {
-                !node.total_resources.gpus.is_empty()
-                    && node.total_resources.gpus.iter().all(|gpu| {
+                node.total_resources.gpus().next().is_some()
+                    && node.total_resources.gpus().all(|gpu| {
                         let device = FabricDeviceKey {
                             node: name.clone(),
                             stable_id: gpu.stable_id,
@@ -311,10 +311,10 @@ impl DefinedBlock {
             if node.total_resources.generation == 0 {
                 issues.insert(format!("missing_inventory_generation:{name}"));
             }
-            if node.total_resources.gpus.is_empty() {
+            if node.total_resources.gpus().next().is_none() {
                 issues.insert(format!("node_has_no_gpus:{name}"));
             }
-            for gpu in &node.total_resources.gpus {
+            for gpu in node.total_resources.gpus() {
                 let device = FabricDeviceKey {
                     node: node.name.clone(),
                     stable_id: gpu.stable_id,
@@ -374,9 +374,8 @@ pub fn is_membership_error(issue: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{
-        AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource, ResourceAllocations, ResourceSet,
-    };
+    use crate::device::Device;
+    use crate::resource::{AllocatedDevice, DeviceTopology, ResourceAllocations, ResourceSet};
 
     fn fixture(file: &BlockFile, native: bool) -> (DateTime<Utc>, Vec<Node>) {
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -390,14 +389,12 @@ mod tests {
                         generation: 7,
                         fabric_binding_version: 2,
                         block_file_revision: Some(file.revision.clone()),
-                        gpus: (0..2)
-                            .map(|g| GpuResource {
-                                device_id: g,
+                        devices: (0..2)
+                            .map(|g| Device {
+                                gres_name: "gpu".into(),
+                                device_type: "test".into(),
                                 stable_id: 42 + g as u64,
-                                gpu_type: "test".into(),
-                                memory_mb: 100,
-                                peer_gpus: vec![],
-                                link_type: GpuLinkType::PCIe,
+                                index: g,
                                 topology: native.then(|| DeviceTopology {
                                     pci_bdf: Some(format!("000{}:04:00.0", g + 1)),
                                     fabric: Some(crate::fabric::FabricObservation {
@@ -518,7 +515,7 @@ mod tests {
         let file = BlockFile::parse("BlockName=b Nodes=n[2-3]").unwrap();
         let (now, mut nodes) = fixture(&file, true);
         for node in &mut nodes[2..] {
-            for gpu in &mut node.total_resources.gpus {
+            for gpu in node.total_resources.gpus_mut() {
                 gpu.topology = None;
             }
         }
@@ -564,7 +561,7 @@ mod tests {
         let file = BlockFile::parse("BlockName=a Nodes=n0,n2").unwrap();
         let (now, mut nodes) = fixture(&file, true);
         for node in &mut nodes[2..] {
-            for gpu in &mut node.total_resources.gpus {
+            for gpu in node.total_resources.gpus_mut() {
                 gpu.topology = None;
             }
         }
@@ -581,7 +578,7 @@ mod tests {
     fn incomplete_native_observations_never_fall_back_to_file_membership() {
         let file = BlockFile::parse("BlockName=a Nodes=n[0-1]").unwrap();
         let (now, mut nodes) = fixture(&file, true);
-        let fabric = nodes[0].total_resources.gpus[0]
+        let fabric = nodes[0].total_resources.devices[0]
             .topology
             .as_mut()
             .unwrap()

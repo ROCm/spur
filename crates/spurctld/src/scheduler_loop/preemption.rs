@@ -51,12 +51,14 @@ impl Snapshot {
                     || current.memory_mb != observed.memory_mb
                     || current.generation != observed.generation
                     || current.generic != observed.generic
-                    || current.gpus.len() != observed.gpus.len()
-                    || current.gpus.iter().zip(&observed.gpus).any(|(a, b)| {
-                        a.stable_id != b.stable_id
-                            || a.device_id != b.device_id
-                            || a.gpu_type != b.gpu_type
-                            || a.memory_mb != b.memory_mb
+                    || current.devices.len() != observed.devices.len()
+                    || current.devices.iter().zip(&observed.devices).any(|(a, b)| {
+                        a.gres_name != b.gres_name
+                            || a.stable_id != b.stable_id
+                            || a.index != b.index
+                            || a.device_type != b.device_type
+                            || a.topology.as_ref().and_then(|t| t.vram_bytes)
+                                != b.topology.as_ref().and_then(|t| t.vram_bytes)
                     })
                 {
                     return None;
@@ -406,7 +408,7 @@ fn direct_victims(
         };
         let device_work = node
             .total_resources
-            .gpus
+            .devices
             .len()
             .checked_add(1)?
             .checked_mul(

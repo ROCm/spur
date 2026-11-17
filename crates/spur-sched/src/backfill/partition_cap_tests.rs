@@ -4,9 +4,10 @@
 use super::tests::Recorder;
 use super::*;
 use crate::partition_cap::{PartitionNodeUsage, RunningCharge};
+use spur_core::device::Device;
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
-use spur_core::resource::{AllocatedDevice, GpuLinkType, GpuResource, ResourceSet};
+use spur_core::resource::{AllocatedDevice, ResourceSet};
 
 fn now() -> chrono::DateTime<Utc> {
     chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
@@ -33,17 +34,15 @@ fn node(name: &str, cpus: u32, memory_mb: u64, partitions: &[&str]) -> Node {
 /// Eight GPUs: stable ids 0-3 are `a100`, 4-7 are `mi300x`.
 fn gpu_node(name: &str, partitions: &[&str]) -> Node {
     let mut n = node(name, 64, 256_000, partitions);
-    n.total_resources.gpus = (0..8u32)
-        .map(|i| GpuResource {
-            device_id: i,
-            gpu_type: if i < 4 { "a100" } else { "mi300x" }.into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::PCIe,
-            topology: None,
-            stable_id: u64::from(i),
+    n.total_resources.devices = (0..8u32)
+        .map(|i| Device {
             numa_node: None,
             affinity_cpus: Vec::new(),
+            gres_name: "gpu".into(),
+            device_type: if i < 4 { "a100" } else { "mi300x" }.into(),
+            stable_id: u64::from(i),
+            index: i,
+            topology: None,
         })
         .collect();
     n
@@ -1275,7 +1274,7 @@ fn a_gpu_total_is_spread_within_a_typed_caps_running_headroom() {
 #[test]
 fn default_memory_per_gpu_follows_each_nodes_gpu_share() {
     let mut small = gpu_node("n2", &["gpu"]);
-    small.total_resources.gpus.truncate(1);
+    small.total_resources.devices.truncate(1);
     let fx = Fixture::new(
         vec![gpu_node("n1", &["gpu"]), small],
         vec![Partition {

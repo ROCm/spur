@@ -556,8 +556,8 @@ Reserved cores per GPU, per-step shares and CPU billing
   ``memory.high``. Upgrade every ``spurd`` before changing spec cores,
   ``reserved_memory_mb``, ``restricted_cores_per_gpu`` or a node's GPUs while
   jobs run.
-- ``[[devices.gres]]`` ``type``, ``cores`` and ``links`` **now override what
-  discovery reports** for the devices an entry names, so an existing entry can
+- ``[[devices.gres]]`` ``type`` and ``cores`` **now override what discovery
+  reports** for the devices an entry names, so an existing entry can
   change a GPU's type on upgrade. Device nodes of an entry that belong to none
   of the devices it names are dropped with a warning in the ``spurd`` log, and
   an entry that shares a device node with a discovered or CDI device is
@@ -1425,6 +1425,31 @@ exits: it moves to ``COMPLETING``, then after ``scheduler.complete_wait_secs``
 fails and drains the nodes still running a copy. Its outcome is taken from the
 first node alone. Every controller applies these older entries the same way, so
 controllers on different releases never disagree about a job.
+
+Generic device inventory
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Node inventory now lists every allocatable device, of every kind, in
+``ResourceSet.devices`` (``gres_name``, ``device_type``, ``stable_id``,
+``index``, ``topology``). GPUs are entries with ``gres_name = "gpu"``.
+
+* **Deprecated: ``ResourceSet.gpus`` and ``GpuResource``.** The gRPC API still
+  fills the GPU-only ``gpus`` list for this release, so existing clients keep
+  working, but it will be removed in a future release. Read ``devices``.
+  ``GpuResource.peer_gpus`` is now always empty and ``link_type`` always PCIe,
+  whatever the GPUs' real links: an ``XGMI`` node reports PCIe, so treat both as
+  unknown. ``memory_mb`` is derived from the device's VRAM
+  (``topology.vram_bytes``).
+* **Raft log and snapshots.** A controller reads node inventories written by
+  earlier releases, and keeps writing the old ``gpus`` list next to
+  ``devices``, so you can roll back to the previous release.
+* **Agent state files.** An upgraded ``spurd`` reads the
+  ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
+  wrote. After a rollback, an older ``spurd`` ignores fences the newer one
+  wrote, as it would an unreadable file.
+* **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
+  the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
+  both only fed ``peer_gpus`` and ``link_type``.
 
 See Also
 --------
