@@ -644,7 +644,7 @@ job's ``srun`` steps by default, to the batch script's shell with ``-b``, and to
 the steps, the batch script and its children with ``-f``/``--full``. A job
 with no steps gets nothing from a plain ``-s``, and ``scancel`` still exits ``0``. Nodes managed by the Kubernetes
 operator cannot be signalled and answer with an error. See
-:ref:`scancel signals <scancel-signals>`, including the limit on ``-b`` for jobs in
+:ref:`scancel signals <scancel-signals>`, including the known limits for jobs in
 a PID namespace.
 
 The new ``scancel`` calls the controller's ``SignalJob`` RPC, so upgrade

@@ -1527,17 +1527,18 @@ the job.
    ends the job. It exits with the program's own status, so a crashed program
    still fails the job and does not fire ``afterok`` dependents.
 
-   Alternatively use ``--full``, which also reaches the processes the script
-   started, subject to the limitation below.
+   ``--full`` also reaches the processes the script started, but see the
+   limitation below.
 
 .. note::
 
    Known limitation: on nodes where jobs run in a PID namespace (``spurd``
-   running as root, the default), a signal sent to the steps, which is the
-   default target of ``scancel -s`` and part of ``--full``, can end the step even
-   when the program traps the signal, because it also reaches the step's
-   ``nsenter`` or ``unshare`` wrapper process. The batch-shell target (``-b``) is
-   not affected.
+   running as root, the default), the signal also reaches the wrapper process
+   around its target. A signal to the steps (the default for ``-s``) can end the
+   step even when the program traps it. With ``--full`` the signal also reaches
+   the wrapper that runs the batch script, so the whole job can end, recorded as
+   ``FAILED`` with that signal, even when the script traps it. The batch-shell
+   target (``-b``) is not affected.
 
 .. note::
 

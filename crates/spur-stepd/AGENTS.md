@@ -225,7 +225,9 @@ signals that wrapper's sole child, the shell that runs the script. With a
 shell is its child, so `-b` reaches the wrapper, which as PID 1 discards signals it
 does not trap: the batch target has no effect for such a job. On a rootful
 (PID-namespace) launch the steps target also reaches the step's `nsenter`/`unshare`
-wrapper, so it can end a step whose program traps the signal.
+wrapper, so it can end a step whose program traps the signal. The full target also
+reaches the batch step's `unshare` wrapper, which dies of it, so the batch step
+reports finished and the whole job can end FAILED with that signal.
 
 ## I/O management
 
