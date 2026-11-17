@@ -698,6 +698,61 @@ class TestSrunStepDeviceVisibility:
             f"must see its render node(s)\noutput:\n{out}"
         )
 
+    def test_job_and_steps_off_gpu_ordinal_zero_run_a_kernel(self, gpu_cluster):
+        # Behind the /dev/dri tmpfs ROCr counts only the job's own GPUs, so a
+        # node-wide ordinal other than 0 names nothing there. A blocker takes the
+        # first GPU so the job under test starts off ordinal 0; each launch shape
+        # (batch script, step joining the job, step of a bare allocation) must
+        # then still run a kernel.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster, min_count=3)
+        _require_rootful(cluster)
+
+        gpu_bin = cluster.compile_hip_fixture("gpu_alloc_test.hip")
+        node = cluster.node_names[0]
+        name = "rocr-rank"
+        script = cluster.write_file(
+            f"{name}.sh", f"#!/bin/bash\n{gpu_bin}\necho BATCH_DONE\nsleep 300\n"
+        )
+        out_path = f"{cluster.remote_dir}/{name}.out"
+        blocker = _hold_job(cluster, f"{name}-blocker", ["--gres=gpu:1"])
+        job_id = None
+        try:
+            sb = cluster.sbatch(
+                ["-J", name, "-N", "1", "-w", node, "--gres=gpu:2", "-o", out_path, script]
+            )
+            job_id = parse_job_id(sb)
+            assert job_id is not None, f"sbatch failed: {sb}"
+            batch = cluster.wait_output(out_path, "BATCH_DONE", timeout=120)
+            joined_code, joined = cluster.srun_in_allocation(job_id, ["-n2", "-l", gpu_bin])
+            cluster.scancel(str(job_id))
+            job_id = None
+            bare_code, bare = cluster.salloc_run(
+                f"srun -n2 -l {gpu_bin}\n",
+                salloc_args=["-N", "1", "-w", node, "--gres=gpu:2", "-t", "0:05"],
+            )
+        finally:
+            if job_id is not None:
+                cluster.scancel(str(job_id))
+            cluster.scancel(str(blocker))
+
+        gpus = re.search(r"SPUR_JOB_GPUS=(\S+)", batch)
+        assert gpus and "0" not in gpus.group(1).split(","), (
+            f"the blocker must hold GPU 0 so the job starts off it\n{batch}"
+        )
+        assert "ALLOC_OK 2/2" in batch, (
+            f"the batch script could not run a kernel on both GPUs\n{batch}"
+        )
+        assert joined_code == 0 and joined.count("ALLOC_OK 1/1") == 2, (
+            f"each task of a step in the job must run a kernel (exit {joined_code})"
+            f"\n{joined}"
+        )
+        assert bare_code == 0 and bare.count("ALLOC_OK 1/1") == 2, (
+            f"each task of a step in a bare allocation must run a kernel "
+            f"(exit {bare_code})\n{bare}"
+        )
+
 
 @pytest.mark.rootful
 class TestDeviceIsolationConfig:
