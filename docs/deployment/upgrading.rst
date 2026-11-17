@@ -231,7 +231,7 @@ The playbook proceeds in order:
 4. **Verify.** Submit a real test job to confirm the upgraded cluster schedules work.
 
 Until every controller is upgraded, a node removed with ``spur node remove`` or
-``scontrol delete NodeName=`` may register again; see :ref:`removed-node-keep-out`.
+``scontrol delete NodeName=`` may register again; see :ref:`keeping a removed node out <removed-node-keep-out>`.
 
 The rolling upgrade is controlled with these ``-e`` flags:
 
