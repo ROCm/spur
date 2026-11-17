@@ -221,7 +221,9 @@ be preempted by a job from the same or lower partition tier.
 
 **Victim selection** -- candidates are sorted by ascending QOS priority (cheapest
 first). The scheduler proves that evicting the selected victim set would
-actually place the pending job before committing.
+actually place the pending job before committing. A nodelist shorter than `-N`
+names nodes placement must use, so each of them has to be free or evacuable and
+their victims are taken first, whatever they cost.
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching

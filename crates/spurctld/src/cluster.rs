@@ -28831,6 +28831,40 @@ state = "UP"
         assert_the_preemptor_keeps_the_room(&cm, preemptor, sibling);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_nodelist_whose_listed_node_is_held_cancels_no_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster_capped(&dir, 10).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 2, Some("n1")));
+        let job = cm.get_job(preemptor).unwrap();
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&job],
+            &cm.config().scheduler,
+        )
+        .await;
+        assert_eq!(cm.get_job(victim).unwrap().preempted_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_nodelist_whose_listed_node_is_held_reclaims_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster_capped(&dir, 10).await;
+        let mut burst = cm.qos_cache().get("burst").expect("burst QOS inserted");
+        burst.idle_fill_preemptable = true;
+        cm.qos_cache().insert(burst);
+        let borrowed = run_burst_job(&cm, "n2");
+        let reclaimer = submit_and_wait(&cm, pool_job("reclaimer", 2, Some("n1")));
+        let job = cm.get_job(reclaimer).unwrap();
+        assert!(crate::scheduler_loop::reclaim_for(&cm, &[&job])
+            .await
+            .is_empty());
+        assert_eq!(cm.get_job(borrowed).unwrap().state, JobState::Running);
+    }
+
     /// Two jobs with room for one, each pinned behind its own burst job. Once one of
     /// them has evicted, the other is refused by the cap and so is never offered a
     /// victim of its own.

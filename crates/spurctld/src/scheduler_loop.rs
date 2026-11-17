@@ -2337,6 +2337,10 @@ struct VictimPool<'a> {
 /// touched. A partial eviction destroys work without helping anyone, and an
 /// unplaceable job has no satisfiable set at all — which is what stops a job that
 /// can never be placed from evicting one victim per cycle forever (§8.2).
+///
+/// Placement puts every listed node of an additive nodelist into the allocation,
+/// so each one must be free or evacuable, and its victims go first whatever
+/// they cost.
 fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
     pool: &VictimPool<'_>,
@@ -2345,10 +2349,15 @@ fn satisfiable_victim_set(
 ) -> Option<HashSet<spur_core::job::JobId>> {
     let (nodes, reservations) = (state.nodes, state.reservations);
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
-    if state.listed_node_handed_off(reclaimer, &placement) {
+    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    if state.listed_node_handed_off(reclaimer, &placement)
+        || placement.additive_listed_node_unavailable(nodes, reservations, now, &required)
+    {
         return None;
     }
-    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    let mandatory = |node: &spur_core::node::Node| {
+        placement.nodelist_is_additive() && placement.is_listed(&node.name)
+    };
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
@@ -2378,7 +2387,6 @@ fn satisfiable_victim_set(
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
             None if cap_frees(node, &[]) => have += 1,
-            None => {}
             Some(on_node)
                 if on_node.iter().all(|id| {
                     pool.evictable.contains(id)
@@ -2387,9 +2395,15 @@ fn satisfiable_victim_set(
                             .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
                 }) && cap_frees(node, on_node) =>
             {
-                evacuable.push((node.name.as_str(), on_node));
+                if mandatory(node) {
+                    have += 1;
+                    victims.extend(on_node.iter().copied());
+                } else {
+                    evacuable.push((node.name.as_str(), on_node));
+                }
             }
-            Some(_) => {}
+            _ if mandatory(node) => return None,
+            _ => {}
         }
     }
 
@@ -6210,6 +6224,62 @@ pub(crate) mod tests {
             )
             .expect("both nodes recoverable");
             assert_eq!(victims, [7, 8].into_iter().collect());
+        }
+
+        /// The victim set for a two-node job that lists only `n1`.
+        fn victims_for_n1_and_one_more(
+            nodes: &[Node],
+            occupants: &[(&'static str, Vec<spur_core::job::JobId>)],
+            evictable: &[spur_core::job::JobId],
+            priorities: &[(spur_core::job::JobId, i32)],
+        ) -> Option<HashSet<spur_core::job::JobId>> {
+            let mut job = reclaimer(2, 1);
+            job.spec.nodelist = Some("n1".into());
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                occupants.iter().cloned().collect();
+            let evictable: HashSet<spur_core::job::JobId> = evictable.iter().copied().collect();
+            let priority: HashMap<spur_core::job::JobId, i32> =
+                priorities.iter().copied().collect();
+            victim_set_without_handoffs(
+                &job,
+                &VictimPool {
+                    evictable: &evictable,
+                    occupants: &occupants,
+                    priority: &priority,
+                    max_priority: None,
+                },
+                nodes,
+                &[],
+                Utc::now(),
+            )
+        }
+
+        #[test]
+        fn a_short_nodelist_evicts_nothing_when_its_listed_node_cannot_be_freed() {
+            let nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            let held =
+                victims_for_n1_and_one_more(&nodes, &[("n1", vec![9]), ("n2", vec![7])], &[7], &[]);
+            assert_eq!(held, None);
+        }
+
+        #[test]
+        fn a_short_nodelist_evicts_nothing_when_its_listed_node_is_down() {
+            let mut nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            nodes[0].state = spur_core::node::NodeState::Down;
+            let down = victims_for_n1_and_one_more(&nodes, &[("n2", vec![7])], &[7], &[]);
+            assert_eq!(down, None);
+        }
+
+        #[test]
+        fn a_short_nodelist_frees_its_listed_node_before_cheaper_ones() {
+            let nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            let victims = victims_for_n1_and_one_more(
+                &nodes,
+                &[("n1", vec![7]), ("n2", vec![8]), ("n3", vec![9])],
+                &[7, 8, 9],
+                &[(7, 5000), (8, 10), (9, 20)],
+            );
+            assert_eq!(victims, Some([7, 8].into_iter().collect()));
         }
 
         #[test]

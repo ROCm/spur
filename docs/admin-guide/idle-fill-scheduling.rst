@@ -177,7 +177,9 @@ opportunistic tier. Within it, QOS priority decides what happens, under two rule
 **A reclaim takes the cheapest opportunistic run first.** A job with a quota claim
 evicts the lowest-priority opportunistic run available — typically a burst job — and
 climbs to a dearer borrowed run only if that was not enough. Only as many nodes as
-the claim needs are taken.
+the claim needs are taken. A job whose ``--nodelist`` is shorter than its node count
+must run on the listed nodes, so their runs are taken first whatever they cost, and
+nothing is taken if one of those nodes cannot be freed.
 
 **An opportunistic job may only displace work cheaper than itself.** A borrowed job
 that needs nodes can reclaim from an ``idlefillpreemptable`` QOS of strictly lower
