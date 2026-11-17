@@ -51,9 +51,9 @@ runs inside the container.
      - Description
    * - ``--container-image <ref|/path.sqsh>``
      - Image to run in. A registry reference, a stored name, or a ``.sqsh`` path.
-   * - ``--container-mounts <src>:<dst>[:ro]``
-     - Bind-mount a host path into the container. Repeatable; append ``:ro`` for
-       read-only.
+   * - ``--container-mounts <mount>[,<mount>...]``
+     - Mount host paths or a tmpfs into the container. Repeatable, or give several
+       mounts separated by commas. See `Container Mounts`_.
    * - ``--container-workdir <dir>``
      - Working directory inside the container.
    * - ``--container-name <name>``
@@ -129,6 +129,56 @@ never lets anything in your image lead that work onto the node itself:
   ``/etc/passwd``.
 - The image's ``/etc/resolv.conf`` is replaced with the node's DNS settings,
   even when the image ships it as a link.
+
+Container Mounts
+----------------
+
+Each mount takes one of these forms:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Form
+     - Mounts
+   * - ``<src>:<dst>``
+     - The host path ``<src>`` at ``<dst>``. ``<src>`` must be an absolute path
+       that exists on the compute node.
+   * - ``tmpfs:<dst>``
+     - An empty in-memory filesystem at ``<dst>``, writable by every user in the
+       container. Add ``:size=<n>`` to cap it, with an optional ``K``, ``M`` or
+       ``G`` suffix (``tmpfs:/cache:size=8G``). Its contents are gone when the
+       container exits.
+   * - ``pvc:<claim>:<dst>``
+     - A PersistentVolumeClaim, on Kubernetes partitions only.
+
+Append ``:ro`` to any form for read-only, or ``:rw`` to say read-write
+explicitly. These two commands are the same:
+
+.. code-block:: bash
+
+   sbatch --container-image=/images/pytorch.sqsh \
+          --container-mounts=/data:/data:ro,/scratch:/scratch,tmpfs:/cache:size=8G \
+          train.sh
+
+   sbatch --container-image=/images/pytorch.sqsh \
+          --container-mounts=/data:/data:ro \
+          --container-mounts=/scratch:/scratch \
+          --container-mounts=tmpfs:/cache:size=8G \
+          train.sh
+
+A comma always separates two mounts, so a path that contains a comma cannot be
+mounted.
+
+A mount Spur cannot read is rejected before the job or step starts, and the error
+names it. That covers an unknown flag, a relative source path, an empty entry, or
+``ro`` with ``rw``. On a native node, a bind source that does not exist fails the
+job or step, and the node agent's log names the mount. A ``pvc:`` mount on a native
+node is refused at launch: the job stays pending, is retried, and is held after
+repeated failures. Spur never drops a mount and runs the job without it.
+
+On Kubernetes partitions, a bind source that does not exist on the node is created
+as an empty directory.
 
 Environment Inside the Container
 --------------------------------

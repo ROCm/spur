@@ -3892,6 +3892,13 @@ struct ContainerLaunchRequest {
     auth_socket: bool,
 }
 
+/// The controller reads a failed-precondition launch as the agent refusing the job,
+/// as it does for an image the node cannot resolve.
+fn container_mounts(values: &[String]) -> Result<Vec<crate::container::BindMount>, Status> {
+    crate::container::parse_mounts(values)
+        .map_err(|e| Status::failed_precondition(format!("{e:#}")))
+}
+
 fn build_container_launch(
     cluster_id: &str,
     allow_root_jobs: bool,
@@ -3903,11 +3910,7 @@ fn build_container_launch(
     ),
     Status,
 > {
-    let mounts: Vec<crate::container::BindMount> = req
-        .mounts
-        .iter()
-        .filter_map(|m| crate::container::parse_mount(m).ok())
-        .collect();
+    let mounts = container_mounts(&req.mounts)?;
 
     let mut cfg = crate::container::ContainerConfig {
         image: req.image.clone(),
@@ -7385,11 +7388,7 @@ impl SlurmAgent for AgentService {
         let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
-            let mounts: Vec<crate::container::BindMount> = spec
-                .container_mounts
-                .iter()
-                .filter_map(|m| crate::container::parse_mount(m).ok())
-                .collect();
+            let mounts = container_mounts(&spec.container_mounts)?;
 
             let username = spec.user.clone();
             let uid = spec.uid;
@@ -9875,11 +9874,7 @@ impl SlurmAgent for AgentService {
             let step_uid = req.uid;
             let step_gid = req.gid;
 
-            let mounts: Vec<crate::container::BindMount> = c
-                .mounts
-                .iter()
-                .filter_map(|m| crate::container::parse_mount(m).ok())
-                .collect();
+            let mounts = container_mounts(&c.mounts)?;
 
             let username = env
                 .get("USER")
