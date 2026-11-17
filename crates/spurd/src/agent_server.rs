@@ -45,9 +45,9 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
-/// The devices a dispatch names that this node injects into the job: its GPUs,
-/// plus every other kind the registry holds devices for. Countable pools have
-/// nothing to inject.
+/// The devices a dispatch names, by kind. Countable pools have nothing to
+/// inject; every other kind is kept even when the registry no longer has it,
+/// so resolving its plan fails the launch instead of running without it.
 fn allocated_selection(
     allocated: Option<&ResourceAllocations>,
     registry: &DeviceRegistry,
@@ -57,7 +57,9 @@ fn allocated_selection(
         return selection;
     };
     for (gres, held) in &allocated.devices {
-        if gres == "gpu" || registry.has_injectable(gres) {
+        // Pool keys may carry a type (`name:type`); device kinds never do.
+        let is_pool = gres.contains(':') || registry.has_countable_pool(gres);
+        if gres == "gpu" || !is_pool {
             selection.set(gres, held.devices.iter().map(|d| d.device_id).collect());
         }
     }
@@ -17285,6 +17287,45 @@ mod tests {
                 .with("gpu", vec![0])
                 .with("nic", vec![1])
         );
+    }
+
+    #[test]
+    fn a_device_kind_this_node_lost_still_reaches_the_launch() {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let mut registry = DeviceRegistry::new();
+        registry.populate(
+            &CdiCache::new(),
+            &GresCache::from_entries(&[GresEntry {
+                name: "scratch".into(),
+                count: Some(8),
+                flags: vec!["count_only".into()],
+                ..Default::default()
+            }]),
+        );
+        let held = |device_id, count| DeviceAllocations {
+            devices: vec![AllocatedDevice { device_id, count }],
+        };
+        let allocated = ResourceAllocations {
+            devices: [
+                ("nic".to_string(), held(1, 1)),
+                ("scratch".to_string(), held(0, 2)),
+                ("bandwidth:lustre".to_string(), held(0, 64)),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let selection = super::allocated_selection(Some(&allocated), &registry);
+        assert_eq!(
+            selection,
+            spur_devices::DeviceSelection::new().with("nic", vec![1]),
+            "the NIC must reach plan resolution so its absence fails the launch"
+        );
+        assert!(registry
+            .build_job_injection_plans(&selection, 0, 0)
+            .is_err());
     }
 
     fn test_gpu_registry() -> DeviceRegistry {
