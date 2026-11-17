@@ -1509,6 +1509,13 @@ time limit, where earlier releases gave it 2 seconds.
    stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
    and the final kill of a preempted job. The preemption grace is not affected.
 
+   So a step gets the kill wait only while the job is still running. The
+   ``srun`` client handles only Ctrl-C, so the SIGTERM of a stop ends a
+   foreground ``srun``, and a batch script that is just ``srun my_app`` then
+   exits and ends the job. A step that handles SIGTERM gets the wait when the
+   batch script keeps running, for example because it traps SIGTERM and does not
+   depend on the ``srun`` client.
+
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
 .. code-block:: bash

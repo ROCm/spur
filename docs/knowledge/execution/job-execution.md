@@ -180,6 +180,11 @@ The parent reads the pipe; "OK" means success, anything starting with "E:" is
 an error message. A `pidfd_open` on the child prevents PID recycling on
 kernels >= 5.3.
 
+The pid a launch tracks is sometimes a launcher, not the workload: `unshare`
+for a namespaced job, the waiting parent for a container, `nsenter` for a step
+joining its job. Signals treat a launcher differently; the rule is in
+`crates/spurd/AGENTS.md` (Job execution).
+
 ### IO modes
 
 - **File:** stdout/stderr are opened as regular files (append or truncate per

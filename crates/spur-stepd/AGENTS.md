@@ -217,20 +217,11 @@ control socket. The supervisor translates them to the workload:
 `Shutdown` triggers `begin_teardown()` internally, sending SIGTERM via the
 same cgroup-first path.
 
-Both go through `executor::deliver_signal`. The tracked process is often a
-*launcher*, not the workload: `unshare` (rootful batch job), `nsenter` (a step
-joining its job's namespaces), or a container's waiting parent
-(`TrackedProcess::of_launch`, derived from the launch config so it is the same
-on every path). The launcher dies on signals it has no handler for, which would
-end the step while the workload still runs. So every signal except KILL and
-CONT skips the launcher: the cgroup walk excludes its pid, and the fallback
-(`RunningJob::signal_workload`) signals its descendants instead of the process
-group. SIGKILL takes the launcher down with the workload, launcher first, so
-it cannot relay the dying workload's status as its own exit. SIGCONT reaches it
-too, after the workload: `nsenter` stops itself when its child stops and
-resumes the child only once resumed. SIGSTOP does not: `nsenter` mirrors the
-child's stop by itself, and a second, external stop can leave it stopped for
-good. The launcher exits on its own once the workload does, relaying its status.
+Both go through `executor::deliver_signal`, which applies the launcher rule in
+`crates/spurd/AGENTS.md` (Job execution). The supervisor decides it from its own
+launch config (`TrackedProcess::of_launch`) and holds it as `Stepd::tracking`,
+so a signal that spares the launcher does not end the step: `poll_completion`
+reports the step finished only when the tracked process exits.
 
 ## I/O management
 

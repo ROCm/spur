@@ -242,8 +242,10 @@ that still needs its nodes starts a fresh grace.
 The kill waits do not yet reach `srun` steps: when a job is stopped (time limit, `scancel`, inactivity
 limit or preempt-cancel), `spurd` reports the job finished on the node within milliseconds while its
 `srun` steps are still running or already killed, so the controller ends the job and frees the node
-before the steps get their wait. Two e2e tests assert the intended
-behaviour and are marked `xfail` until it is fixed (see the test inventory).
+before the steps get their wait. A step that handles SIGTERM does get its wait while the job is still
+running, for example when the batch script traps SIGTERM and does not depend on the `srun` client,
+which handles only Ctrl-C. Two e2e tests assert the intended behaviour and are marked `xfail` until
+it is fixed (see the test inventory).
 
 ## Follow-ups
 
@@ -380,10 +382,15 @@ stored seconds, or null for a clear, and a clear given together with a value rec
 
 ### End-to-end tests (`tests/native_host/e2e/`)
 
-`test_preemption_grace.py`:
+`test_preemption_grace.py` runs every test twice, with `spurd` as a regular user (`user-spurd`) and as
+root (`root-spurd`), by overriding the `agent_as_root` fixture. Only the root runs put the job and its
+`srun` steps behind a namespace launcher (`unshare`, `nsenter`; the signal rule is in
+`crates/spurd/AGENTS.md`, Job execution):
 
 - `test_grace_cancel_mode`: victim warned, stays running through the grace and the preemptor waits,
   victim ends cancelled with `PreemptedBy`, `sacct` shows `PREEMPTED`, `sdiag` counts one preemption.
+- `test_grace_checkpoint_single_node`: a step that traps the warning and checkpoints once a second keeps
+  running through the grace and finishes all its checkpoints before the deadline.
 - `test_grace_requeue_mode`: the same for requeue mode, ending with the victim pending again.
 - `test_grace_survives_spurd_restart`: restarting `spurd` mid-grace does not reset or cut it short.
 - `test_exit_during_grace_is_preempted`: a victim that exits cleanly on the warning is recorded
@@ -396,6 +403,9 @@ stored seconds, or null for a clear, and a clear given together with a value rec
   `GraceTime=0` gives immediate preemption.
 - `test_time_limit_uses_timeout_kill_wait`: a job that ignores SIGTERM sits in `CG` for the timeout
   wait and ends `TIMEOUT`.
+- `test_scancel_kill_wait_reaches_srun_steps` and `test_time_limit_kill_wait_reaches_srun_steps`: a batch
+  script and an `srun` step both trap SIGTERM and keep ticking; both tick through the kill wait after
+  `scancel` or at the time limit, and the job ends `CANCELLED` or `TIMEOUT` once it is over.
 
 `test_inactive_limit.py`: `test_a_live_salloc_survives_a_controller_restart_under_native_auth`
 predates this work. The class `TestInactiveLimitKillWait` adds two tests marked

@@ -483,21 +483,38 @@ metrics).
 
 ### Job execution
 - Jobs are forked as their own process-group leaders. Signals go to the
-  negative PID (the whole group), not just the tracked process. Except that
-  the tracked process can be a namespace launcher (`unshare`, `nsenter`, a
-  container's waiting parent): then every signal except KILL and CONT skips
-  it and reaches only its descendants (`executor::deliver_signal`,
-  `TrackedProcess`), or the supervisor would report the step finished while
-  the workload still runs.
+  negative PID (the whole group), not just the tracked process, except under
+  the **launcher rule**. On a rootful node the tracked process is often a
+  *launcher*, not the workload: `unshare` (batch script, standalone `srun`),
+  `nsenter` (an `srun` step joining its job), or a container's waiting parent
+  (`TrackedProcess::of_launch`, derived from the launch config). A launcher dies
+  on signals it has no handler for, so the supervisor would report the step
+  finished while the workload still runs. `executor::deliver_signal` and
+  `RunningJob::signal_workload` therefore treat it by signal
+  (`TrackedProcess::spares_launcher`):
+  - SIGKILL reaches it first, so it cannot relay the dying workload's status as
+    its own exit.
+  - SIGCONT reaches it after the workload: the workload is continued first, so
+    an `nsenter` that has not yet read its child's stop report never reads it.
+  - SIGSTOP skips it: `nsenter` mirrors its child's stop itself, and a second,
+    external stop can leave it stopped for good.
+  - Every other signal skips it. It reaches the cgroup's members except the
+    launcher's pid, or without a cgroup the launcher's descendants instead of
+    the process group.
+
+  The launcher exits on its own once the workload does, relaying its status. On
+  a rootful node the batch shell is PID 1 of its namespace, so it reacts only to
+  a signal it traps.
 - The agent signals processes itself in two places and applies the same rule
   there. `CancelStep` on a supervised step goes through its supervisor
-  (`SignalAllocation`) and arms a SIGKILL after `STEP_CANCEL_ESCALATION`, since a
-  container's command is PID 1 and ignores unhandled signals. Only if the
-  supervisor is unreachable, or the step has none, does it use `signal_step_tree`
-  with the `TrackedProcess` recorded on the `ActiveStep` (a supervised step's
-  tracked pid is the supervisor's workload pid, so it can be a launcher), again
-  with the epoch-checked SIGKILL. Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
-  with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
+  (`SignalAllocation`) and arms a SIGKILL after `STEP_CANCEL_ESCALATION`, since
+  a container's command is PID 1 and ignores unhandled signals. Only if the
+  supervisor is unreachable, or the step has none, does it use
+  `signal_step_tree` with the `TrackedProcess` recorded on the `ActiveStep` (a
+  supervised step's tracked pid is the supervisor's workload pid, so it can be a
+  launcher), again with the epoch-checked SIGKILL. Unsupervised jobs (test-only
+  legacy launch) use `RunningJob::signal_workload` with
+  `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a
