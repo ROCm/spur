@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 pub use spur_devices::topology::DeviceTopology;
+pub use spur_devices::DeviceSelection;
 
 use crate::resource::GpuLinkType;
 
