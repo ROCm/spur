@@ -2425,32 +2425,40 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     };
-    let mut tracked = crate::executor::TrackedProcess::Workload;
-    let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
-        .allocation_only
-    {
-        (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
-    } else {
-        let config = launch_spec.into_launch_config();
-        tracked =
-            crate::executor::TrackedProcess::of_launch(&config, nix::unistd::geteuid().is_root());
-        match crate::executor::launch_job(&config, spank.as_ref()).await {
-            Ok(result) => (
-                result.job,
-                result.cgroup_path,
-                Some((result.stdout_path, result.stderr_path)),
-                result.task_environment,
-                result.pty_master,
-            ),
-            Err(error) => {
-                if let Some(pmix) = pmix.as_ref() {
-                    pmix.stop();
+    let (job, tracked, launched_cgroup, launched_output, task_environment, pty_master) =
+        if launch_spec.allocation_only {
+            (
+                RunningJob::AllocationOnly,
+                crate::executor::TrackedProcess::Workload,
+                None,
+                None,
+                HashMap::new(),
+                None,
+            )
+        } else {
+            let config = launch_spec.into_launch_config();
+            let tracked = crate::executor::TrackedProcess::of_launch(
+                &config,
+                nix::unistd::geteuid().is_root(),
+            );
+            match crate::executor::launch_job(&config, spank.as_ref()).await {
+                Ok(result) => (
+                    result.job,
+                    tracked,
+                    result.cgroup_path,
+                    Some((result.stdout_path, result.stderr_path)),
+                    result.task_environment,
+                    result.pty_master,
+                ),
+                Err(error) => {
+                    if let Some(pmix) = pmix.as_ref() {
+                        pmix.stop();
+                    }
+                    cleanup_failed_launch(&error);
+                    return Err(anyhow::anyhow!(error.to_string()));
                 }
-                cleanup_failed_launch(&error);
-                return Err(anyhow::anyhow!(error.to_string()));
             }
-        }
-    };
+        };
     let workload_pid = job.pid().unwrap_or(0);
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
@@ -5119,6 +5127,187 @@ mod tests {
                 read, 0,
                 "the worker outlived SIGKILL (cgroup: {with_cgroup})"
             );
+        }
+    }
+
+    /// What util-linux `nsenter` does once it has forked: wait for the child
+    /// with `WUNTRACED`, stop itself when the child stops, and continue the
+    /// child once it has been continued itself. Forked rather than spawned so
+    /// it can be written with async-signal-safe calls only; the child runs
+    /// `worker` under `sh` with its stdout on the returned pipe.
+    struct NsenterStandIn {
+        launcher: i32,
+        worker: i32,
+        output: std::io::BufReader<std::fs::File>,
+        settled: bool,
+    }
+
+    impl NsenterStandIn {
+        fn spawn(worker: &str) -> Self {
+            use std::os::fd::FromRawFd;
+            let sh = std::ffi::CString::new("/bin/sh").expect("program");
+            let dash_c = std::ffi::CString::new("-c").expect("flag");
+            let script = std::ffi::CString::new(worker).expect("script");
+            let argv = [
+                sh.as_ptr(),
+                dash_c.as_ptr(),
+                script.as_ptr(),
+                std::ptr::null(),
+            ];
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            match unsafe { libc::fork() } {
+                -1 => panic!("fork the stand-in launcher"),
+                0 => unsafe {
+                    // Handlers inherited from other tests would survive a fork
+                    // that does not exec.
+                    for sig in [libc::SIGTERM, libc::SIGUSR1, libc::SIGCONT, libc::SIGCHLD] {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
+                    let child = libc::fork();
+                    if child == 0 {
+                        libc::dup2(fds[1], libc::STDOUT_FILENO);
+                        libc::execv(sh.as_ptr(), argv.as_ptr());
+                        libc::_exit(127);
+                    }
+                    loop {
+                        let mut status = 0;
+                        if libc::waitpid(child, &mut status, libc::WUNTRACED) < 0 {
+                            libc::_exit(1);
+                        }
+                        if libc::WIFSTOPPED(status) {
+                            libc::raise(libc::SIGSTOP);
+                            libc::kill(child, libc::SIGCONT);
+                            continue;
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        }
+                        libc::_exit(128 + libc::WTERMSIG(status));
+                    }
+                },
+                launcher => {
+                    unsafe { libc::close(fds[1]) };
+                    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+                    let mut stand_in = Self {
+                        launcher,
+                        worker: 0,
+                        output: std::io::BufReader::new(reader),
+                        settled: false,
+                    };
+                    stand_in.worker = stand_in
+                        .line()
+                        .strip_prefix("ready ")
+                        .and_then(|pid| pid.parse().ok())
+                        .expect("worker announces its pid");
+                    stand_in
+                }
+            }
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .expect("read worker output");
+            line.trim().to_string()
+        }
+
+        /// The launcher is this process's child, so its stop can be awaited
+        /// without consuming it and without a timeout.
+        fn await_launcher_stopped(&self) {
+            use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+            let pid = nix::unistd::Pid::from_raw(self.launcher);
+            let status = waitid(Id::Pid(pid), WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT)
+                .expect("wait for the launcher to stop");
+            assert!(matches!(status, WaitStatus::Stopped(..)), "{status:?}");
+        }
+
+        fn launcher_state(&self) -> char {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.launcher))
+                .expect("read launcher stat");
+            // The state follows the parenthesised command name.
+            let after_comm = stat.rsplit(')').next().expect("stat has a command name");
+            after_comm.trim_start().chars().next().expect("state field")
+        }
+    }
+
+    impl Drop for NsenterStandIn {
+        fn drop(&mut self) {
+            // A pid of 0 or less would signal a whole process group.
+            if self.settled || self.worker <= 0 {
+                return;
+            }
+            unsafe {
+                libc::kill(self.worker, libc::SIGKILL);
+                libc::kill(self.launcher, libc::SIGKILL);
+                libc::waitpid(self.launcher, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspend_and_resume_through_a_launcher_that_mirrors_stops_leave_the_step_running() {
+        use nix::sys::signal::Signal;
+        for with_cgroup in [false, true] {
+            let cgroup = tempfile::tempdir().expect("tempdir");
+            let mut stand_in = NsenterStandIn::spawn(
+                "trap \"exit 7\" USR1; echo ready $$; while :; do sleep 0.05; done",
+            );
+            let session = Stepd::new(
+                RunningJob::Forked {
+                    pid: stand_in.launcher,
+                    _pidfd: None,
+                    reaped: false,
+                },
+                91,
+                1,
+                spur_core::step::STEP_BATCH,
+            )
+            .tracking(crate::executor::TrackedProcess::Launcher);
+            if with_cgroup {
+                std::fs::write(
+                    cgroup.path().join("cgroup.procs"),
+                    format!("{}\n{}\n", stand_in.launcher, stand_in.worker),
+                )
+                .expect("seed cgroup.procs");
+                session
+                    .adopt_cgroup(Some(cgroup.path().to_path_buf()))
+                    .await;
+            }
+
+            session
+                .signal(Signal::SIGSTOP as i32)
+                .await
+                .expect("suspend");
+            stand_in.await_launcher_stopped();
+            session
+                .signal(Signal::SIGCONT as i32)
+                .await
+                .expect("resume");
+
+            // Delivery of the resume is synchronous, so a launcher that was
+            // not sent it is still stopped here.
+            assert_ne!(
+                stand_in.launcher_state(),
+                'T',
+                "the launcher must be resumed or it never resumes its child (cgroup: {with_cgroup})"
+            );
+            session
+                .signal(Signal::SIGUSR1 as i32)
+                .await
+                .expect("send SIGUSR1");
+            // Completes only if the resumed launcher reaps the worker.
+            let mut snapshot = session.snapshot().await;
+            while snapshot.active {
+                session.poll_completion().await.expect("poll");
+                snapshot = session.snapshot().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            stand_in.settled = true;
+            assert_eq!(snapshot.exit_code, Some(7));
+            assert_eq!(snapshot.signal, Some(0));
         }
     }
 

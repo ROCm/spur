@@ -448,9 +448,13 @@ pub enum TrackedProcess {
 }
 
 impl TrackedProcess {
-    /// SIGKILL is not spared: the launcher goes down with its workload.
+    /// Whether a signal must not reach the launcher. KILL takes it down with its
+    /// workload. CONT must reach it: `nsenter` stops itself when its child
+    /// stops and resumes the child only once resumed itself. STOP must not,
+    /// because an `nsenter` stopped from outside while it is mid-way through
+    /// mirroring the child's stop stops a second time on resume and never wakes.
     fn spares_launcher(self, sig: Signal) -> bool {
-        self == Self::Launcher && sig != Signal::SIGKILL
+        self == Self::Launcher && !matches!(sig, Signal::SIGKILL | Signal::SIGCONT)
     }
 
     /// Decided from the launch alone so a supervisor reading a persisted launch
@@ -607,16 +611,20 @@ impl RunningJob {
         }
     }
 
-    /// Signal the user's workload. When the tracked process is a launcher this
-    /// reaches every descendant of it but not the launcher itself; otherwise it
-    /// is [`Self::kill_signal`].
+    /// Signal the user's workload. Behind a launcher this reaches every
+    /// descendant of it, and the launcher itself only for the signals it must
+    /// get; otherwise it is [`Self::kill_signal`].
     pub fn signal_workload(&self, sig: Signal, tracked: TrackedProcess) -> anyhow::Result<()> {
-        if !tracked.spares_launcher(sig) {
+        if tracked != TrackedProcess::Launcher || sig == Signal::SIGKILL {
             return self.kill_signal(sig);
         }
-        if let Some(pid) = self.live_pid() {
-            kill_descendants(pid, sig);
-        }
+        let Some(pid) = self.live_pid() else {
+            return Ok(());
+        };
+        // Walks the launcher's tree, not its process group, so a process that
+        // left the tree is missed; teardown's SIGKILL escalation covers that.
+        kill_descendants(pid, sig);
+        signal_launcher(Some(pid), tracked, sig);
         Ok(())
     }
 }
@@ -1724,21 +1732,34 @@ pub fn cgroup_signal_except(
 /// Delivers `sig` to a job's workload: the cgroup's processes first, since they
 /// include descendants a process-group signal misses, and the tracked process's
 /// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
-/// A launcher is spared everything but SIGKILL.
+/// A launcher gets only the signals [`TrackedProcess::spares_launcher`] lets
+/// through, and always after the workload: `nsenter` that wakes while its child
+/// is still stopped stops itself again and never resumes it.
 pub fn deliver_signal(
     cgroup_path: Option<&Path>,
     job: &RunningJob,
     tracked: TrackedProcess,
     sig: Signal,
 ) -> anyhow::Result<()> {
-    let spared = job.live_pid().filter(|_| tracked.spares_launcher(sig));
-    match cgroup_path.map(|path| cgroup_signal_except(path, sig, spared)) {
-        Some(Ok(count)) if count > 0 => Ok(()),
+    let launcher = job
+        .live_pid()
+        .filter(|_| tracked == TrackedProcess::Launcher);
+    match cgroup_path.map(|path| cgroup_signal_except(path, sig, launcher)) {
+        Some(Ok(count)) if count > 0 => {
+            signal_launcher(launcher, tracked, sig);
+            Ok(())
+        }
         Some(Err(error)) => {
             warn!(%error, "cgroup.procs signal failed, falling back to the tracked process");
             job.signal_workload(sig, tracked)
         }
         _ => job.signal_workload(sig, tracked),
+    }
+}
+
+fn signal_launcher(launcher: Option<i32>, tracked: TrackedProcess, sig: Signal) {
+    if let Some(pid) = launcher.filter(|_| !tracked.spares_launcher(sig)) {
+        let _ = signal::kill(Pid::from_raw(pid), sig);
     }
 }
 
@@ -4354,12 +4375,19 @@ mod tests {
     }
 
     #[test]
-    fn a_launcher_is_spared_every_signal_but_sigkill() {
-        for sig in [Signal::SIGTERM, Signal::SIGUSR1, Signal::SIGSTOP] {
+    fn a_launcher_is_spared_every_signal_but_kill_and_cont() {
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGUSR1,
+            Signal::SIGHUP,
+            Signal::SIGSTOP,
+        ] {
             assert!(TrackedProcess::Launcher.spares_launcher(sig), "{sig:?}");
             assert!(!TrackedProcess::Workload.spares_launcher(sig), "{sig:?}");
         }
-        assert!(!TrackedProcess::Launcher.spares_launcher(Signal::SIGKILL));
+        for sig in [Signal::SIGKILL, Signal::SIGCONT] {
+            assert!(!TrackedProcess::Launcher.spares_launcher(sig), "{sig:?}");
+        }
     }
 
     #[test]
