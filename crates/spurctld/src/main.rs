@@ -17,6 +17,7 @@ mod metrics_proto;
 mod metrics_server;
 mod native_keys;
 mod node_liveness;
+mod partition_patch;
 mod pmix_dispatch;
 mod raft;
 mod raft_server;

@@ -29,6 +29,7 @@ src/
   rpc_middleware.rs        Tower layer: RPC path/timing recording
   metrics_proto.rs         Protobuf-to-snapshot converters for OpenMetrics export
   metrics_server.rs        Axum HTTP server exporting /metrics/* endpoints (OpenMetrics 1.0)
+  partition_patch.rs       PartitionPatch (the update_partition input) and the PartitionUpdate entries built from it or spur.conf (wal_from_config)
 
   accounting/
     mod.rs                 Bring-up orchestration: connect-with-retry, activate caches/loops
@@ -405,6 +406,8 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 **`cluster.rs` apply is the durable write path:** Durable replicated state must change only via `propose()` → `apply_operation()`. Some leader-local or transient fields (heartbeat stats, pending reasons, scheduler marks, WG pubkeys, BB staging state, GPU stable_id mappings, job output paths) are written directly and must tolerate loss on failover. `update_job` writes durable spec fields (`time_limit`, `partition`, `comment`, `account`, `qos`) directly — these are not replicated. Direct-write functions: `advance_bb_staging_for()`, `complete_bb_stage_in()`, `reconcile_node_gpu_allocations()`, `set_job_output_paths()`. Any other mutation to `jobs`, `nodes`, `partitions`, `reservations`, `steps`, `tokens`, or `k0s` would diverge from the WAL and break replication.
 
 **Testing patterns:** `server.rs` and `rest/handlers.rs` have extensive test suites that construct a `ClusterManager` with `new()` + direct `apply_operation()` calls (no Raft), then drive handlers through `ControllerService` or Axum `oneshot()`. This tests the handler logic without election timing. The `test_support` module in `server.rs` provides `no_leader_service()` and `test_slurm_config()` helpers.
+
+**Adding a partition field:** thread it through `PartitionPatch` (and the gRPC handler that fills it) → `PartitionPatch::into_wal` (and `wal_from_config` for `reconfigure`) → `WalOperation::PartitionUpdate` → the apply arm in `cluster.rs`. If the field can be cleared, follow the clearable-field rule in `crates/spur-core/AGENTS.md` (WAL section, invariant 7): copy `grace_time`, never a bare `Option<Option<T>>`. Test the apply by serializing the entry to JSON and back (see `cluster/tests/partition_clears.rs`): the leader applies its in-memory entry, so an in-memory-only test passes while followers and restarts lose the change.
 
 **Idle-fill / borrow semantics:** Jobs over their QOS group-node cap may borrow spare capacity, but this is evaluated at the team level (total legitimate + borrowed), not per-run. A per-run check is wrong once a QOS has 2+ borrowed runs: each measures itself against the same headroom, all read "became legitimate", and the reclaimable set comes back empty while the team physically sits over its cap.
 
