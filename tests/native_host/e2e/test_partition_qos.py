@@ -23,7 +23,9 @@ _CACHE_REFRESH = 15
 _GUARD_SECS = 15
 
 
-def _config(*, idle_fill: bool = False, second_capped: bool = False) -> dict:
+def _config(
+    *, idle_fill: bool = False, second_capped: bool = False, no_default_time: bool = False
+) -> dict:
     base = {
         "state": "UP",
         "nodes": "ALL",
@@ -37,6 +39,9 @@ def _config(*, idle_fill: bool = False, second_capped: bool = False) -> dict:
     ]
     if second_capped:
         partitions.append({**base, "name": "capped2", "qos": "usercap"})
+    if no_default_time:
+        unbounded = {k: v for k, v in base.items() if k != "default_time"}
+        partitions.append({**unbounded, "name": "nodefault", "qos": "usercap"})
     return {
         "partitions": partitions,
         "scheduler": {
@@ -81,12 +86,16 @@ def _reason(cluster, job_id: int) -> str:
     return show
 
 
-def _partition_of(cluster, job_id: int) -> str:
+def _job_field(cluster, job_id: int, key: str) -> str:
     show = cluster.scontrol("show", "job", str(job_id))
     for field in show.split():
-        if field.startswith("EffectivePartition="):
-            return field.removeprefix("EffectivePartition=")
+        if field.startswith(f"{key}="):
+            return field.removeprefix(f"{key}=")
     return ""
+
+
+def _partition_of(cluster, job_id: int) -> str:
+    return _job_field(cluster, job_id, "EffectivePartition")
 
 
 def _idle_nodes(cluster) -> int:
@@ -261,5 +270,102 @@ class TestIdleFillDoesNotLendPastThePartitionCap:
             ids.append(over)
             _stays_pending(c, over, "QOSMaxNodePerUserLimit")
             assert _idle_nodes(c) > 0, "a free node must exist, so lending was possible"
+        finally:
+            _cancel(c, ids)
+
+
+class TestPartitionQosReviewCases:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config(no_default_time=True)
+
+    def test_a_suspended_job_still_holds_its_place_under_the_cap(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 2)
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "maxtresperuser=node=1"])
+        time.sleep(_CACHE_REFRESH)
+        ids = []
+        try:
+            first = _submit(c, "a1", "acct-a")
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+
+            c.scontrol("suspend", str(first))
+            wait_job_state(c, first, "S", timeout=60)
+            print(c.squeue_all())
+
+            second = _submit(c, "b1", "acct-b")
+            ids.append(second)
+            _stays_pending(c, second, "QOSMaxNodePerUserLimit")
+            assert _idle_nodes(c) > 0, "a free node must exist, so only the cap holds the job"
+        finally:
+            _cancel(c, ids)
+
+    def test_reconfigure_keeps_a_partition_qos_set_at_runtime(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 2)
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "maxtresperuser=node=1"])
+        time.sleep(_CACHE_REFRESH)
+        ids = []
+        try:
+            c.scontrol("update", "PartitionName=open", "QOS=usercap")
+            c.scontrol("reconfigure")
+            show = c.scontrol("show", "partition", "open")
+            print(show)
+            assert "QoS=usercap" in show, f"reconfigure dropped the runtime QOS:\n{show}"
+
+            first = _submit(c, "a1", "acct-a", "-p", "open")
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+            second = _submit(c, "b1", "acct-b", "-p", "open")
+            ids.append(second)
+            _stays_pending(c, second, "QOSMaxNodePerUserLimit")
+        finally:
+            _cancel(c, ids)
+
+    def test_a_group_node_cap_lets_a_job_share_a_held_node(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 2)
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "grptres=node=1"])
+        time.sleep(_CACHE_REFRESH)
+        small = ("-N1", "-n1")
+        ids = []
+        try:
+            first = _submit(c, "a1", "acct-a", shape=small)
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+
+            packed = _submit(c, "b1", "acct-b", shape=small)
+            ids.append(packed)
+            wait_job_state(c, packed, "R", timeout=90)
+            print(c.squeue_all())
+            assert _job_field(c, packed, "NodeList") == _job_field(c, first, "NodeList"), (
+                "the job must land on the node the QOS already holds"
+            )
+
+            whole = _submit(c, "a2", "acct-a")
+            ids.append(whole)
+            _stays_pending(c, whole, "QOSGrpNodeLimit")
+            assert _idle_nodes(c) > 0, "a free node must exist, so only the cap holds the job"
+        finally:
+            _cancel(c, ids)
+
+    def test_a_job_with_no_time_limit_takes_the_partition_qos_max_wall(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "maxwall=60"])
+        time.sleep(_CACHE_REFRESH)
+        ids = []
+        try:
+            job = _submit(c, "untimed", "acct-a", "-p", "nodefault")
+            ids.append(job)
+            limit = _job_field(c, job, "TimeLimit")
+            print(f"TimeLimit={limit}")
+            assert limit == "01:00:00", f"expected the 60-minute MaxWall, got {limit}"
         finally:
             _cancel(c, ids)
