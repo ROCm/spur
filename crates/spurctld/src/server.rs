@@ -1138,7 +1138,7 @@ impl ControllerService {
     ) -> Result<(), Status> {
         // Skipping the lookup for a verified admin keeps a credential working on a controller that
         // shares no user directory with the login nodes and cannot resolve the name at all.
-        if self.caller_is_admin(identity) || self.caller_is_operator(identity) {
+        if identity.is_none() || self.caller_is_admin(identity) || self.caller_is_operator(identity) {
             return Ok(());
         }
         // NSS can reach sssd/LDAP over the network, so it must not run on a runtime worker.
