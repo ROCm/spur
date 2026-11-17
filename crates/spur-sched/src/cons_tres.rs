@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use spur_core::core_layout::{reserved_share, GpuReservedCpus};
-use spur_core::device::Device;
+use spur_core::device::{Device, DeviceSelection};
 use spur_core::job::RunKey;
 use spur_core::resource::ResourceSet;
 
@@ -142,6 +142,9 @@ pub enum AllocError {
     /// A launch's GPUs' reserved CPUs are held by a job not holding those GPUs,
     /// i.e. one placed under an earlier core layout; it frees them on its own.
     ReservedCpusHeld,
+
+    /// Another job on this node already holds one of these non-GPU devices.
+    DevicesUnavailable { gres: String },
 }
 
 /// Outcome of applying a fresh inventory to a node's live allocation.
@@ -445,6 +448,50 @@ impl NodeAllocation {
             .unwrap_or_default()
     }
 
+    /// Record the non-GPU devices of `run_attempt`'s reservation, refusing any
+    /// another job on this node already holds.
+    pub fn claim_devices(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        devices: &DeviceSelection,
+    ) -> Result<(), AllocError> {
+        if self.owner_attempt(job_id) != Some(run_attempt) {
+            return Err(AllocError::Superseded);
+        }
+        for (gres, ids) in devices.iter() {
+            let held_elsewhere = self
+                .owners
+                .iter()
+                .filter(|(owner, _)| **owner != job_id)
+                .any(|(_, owned)| {
+                    owned
+                        .result
+                        .devices
+                        .of(gres)
+                        .iter()
+                        .any(|id| ids.contains(id))
+                });
+            if held_elsewhere {
+                return Err(AllocError::DevicesUnavailable { gres: gres.into() });
+            }
+        }
+        if let Some(owned) = self.owners.get_mut(&job_id) {
+            for (gres, ids) in devices.iter() {
+                owned.result.devices.set(gres, ids.to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-GPU devices `run_attempt` of `job_id` holds.
+    pub fn owner_devices(&self, job_id: u32, run_attempt: u32) -> Option<DeviceSelection> {
+        self.owners
+            .get(&job_id)
+            .filter(|owned| owned.run_attempt == run_attempt)
+            .map(|owned| owned.result.devices.clone())
+    }
+
     /// GPU ids `run_attempt` of `job_id` holds, in the order it reserved them.
     pub fn owner_gpu_ids(&self, job_id: u32, run_attempt: u32) -> Option<&[u64]> {
         self.owners
@@ -605,6 +652,7 @@ impl NodeAllocation {
             cpu_ids,
             gpu_ids: gpu_device_ids.to_vec(),
             memory_mb,
+            devices: DeviceSelection::new(),
         };
         self.owners.insert(
             job_id,
@@ -773,6 +821,7 @@ impl NodeAllocation {
             cpu_ids: cpu_ids.to_vec(),
             gpu_ids: gpu_device_ids.to_vec(),
             memory_mb,
+            devices: DeviceSelection::new(),
         };
         // Committed outright: an adopted job is already running, and leaving it
         // `launching` would let reconcile reclaim it once the TTL elapsed.
@@ -889,6 +938,8 @@ pub struct AllocationResult {
     pub gpu_ids: Vec<u64>,
     /// Allocated memory in MB.
     pub memory_mb: u64,
+    /// Allocated devices of every other kind, by gres name.
+    pub devices: DeviceSelection,
 }
 
 impl AllocationResult {
@@ -916,6 +967,58 @@ mod tests {
     use super::*;
     use spur_core::core_layout::GpuReservedCpus;
     use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+
+    fn nics(ids: &[u64]) -> spur_core::device::DeviceSelection {
+        spur_core::device::DeviceSelection::new().with("nic", ids.to_vec())
+    }
+
+    #[test]
+    fn a_device_claimed_by_one_job_is_unavailable_to_another() {
+        let mut node = make_node(8, 1024, 0, "");
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
+        node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
+
+        assert_eq!(
+            node.claim_devices(2, 1, &nics(&[0x850000, 0x050000])),
+            Err(AllocError::DevicesUnavailable { gres: "nic".into() })
+        );
+        assert!(node.claim_devices(2, 1, &nics(&[0x850000])).is_ok());
+    }
+
+    #[test]
+    fn releasing_a_job_frees_its_device_claims() {
+        let mut node = make_node(8, 1024, 0, "");
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
+        assert!(node.release_job(1));
+
+        node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
+        assert!(node.claim_devices(2, 1, &nics(&[0x050000])).is_ok());
+    }
+
+    #[test]
+    fn devices_are_claimed_only_on_the_jobs_current_reservation() {
+        let mut node = make_node(8, 1024, 0, "");
+        assert_eq!(
+            node.claim_devices(9, 1, &nics(&[0x050000])),
+            Err(AllocError::Superseded)
+        );
+        node.allocate_for_job(1, 2, 1, 0, &[]).unwrap();
+        assert_eq!(
+            node.claim_devices(1, 1, &nics(&[0x050000])),
+            Err(AllocError::Superseded)
+        );
+    }
+
+    #[test]
+    fn a_job_reclaiming_its_own_devices_is_not_a_conflict() {
+        let mut node = make_node(8, 1024, 0, "");
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
+        assert!(node.claim_devices(1, 1, &nics(&[0x050000])).is_ok());
+        assert_eq!(node.owner_devices(1, 1), Some(nics(&[0x050000])));
+    }
 
     fn make_node(cpus: u32, mem: u64, num_gpus: usize, gpu_type: &str) -> NodeAllocation {
         make_node_with_ids(cpus, mem, (0..num_gpus as u32).collect(), gpu_type)
@@ -1563,6 +1666,7 @@ mod tests {
             cpu_ids: vec![0, 1, 2, 3],
             gpu_ids: vec![0, 1],
             memory_mb: 128_000,
+            devices: DeviceSelection::new(),
         };
         assert_eq!(alloc.cpu_list(), "0,1,2,3");
         assert_eq!(alloc.gpu_list(), "0,1");
@@ -2021,6 +2125,25 @@ mod tests {
         node.commit_job(job_id, 1);
         node.set_gpu_reserved(&reserved_pools());
         placed.cpu_ids
+    }
+
+    #[test]
+    fn reserved_pools_and_nic_claims_coexist() {
+        let mut node = pooled_node_with_nics(&[10, 11]);
+        let gpu_job = node.allocate_for_job(1, 1, 4, 0, &[1]).unwrap();
+        assert_eq!(sorted(gpu_job.cpu_ids), vec![0, 1, 8, 9]);
+        node.claim_devices(1, 1, &nics(&[10])).unwrap();
+
+        node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
+        assert_eq!(
+            node.claim_devices(2, 1, &nics(&[10])),
+            Err(AllocError::DevicesUnavailable { gres: "nic".into() })
+        );
+        assert!(node.claim_devices(2, 1, &nics(&[11])).is_ok());
+
+        node.release_job(1);
+        node.allocate_for_job(3, 1, 4, 0, &[1]).unwrap();
+        assert!(node.claim_devices(3, 1, &nics(&[10])).is_ok());
     }
 
     #[test]

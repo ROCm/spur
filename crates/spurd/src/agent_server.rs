@@ -8249,6 +8249,10 @@ impl SlurmAgent for AgentService {
                         Status::resource_exhausted("allocated cores unavailable on this node")
                     }
                     AllocError::ReservedCpusHeld => reserved_cpus_held_refusal(),
+
+                    AllocError::DevicesUnavailable { gres } => Status::resource_exhausted(format!(
+                        "controller-allocated {gres} devices unavailable on this node"
+                    )),
                 })?;
             result
         };
@@ -11105,6 +11109,11 @@ impl AgentService {
                         ));
                     }
                 }
+            }
+            Err(AllocError::DevicesUnavailable { gres }) => {
+                return Err(Status::resource_exhausted(format!(
+                    "controller-allocated {gres} devices unavailable on this node"
+                )));
             }
             Err(AllocError::GpusUnknown) => {
                 warn!(
