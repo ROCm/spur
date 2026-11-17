@@ -4229,25 +4229,52 @@ pub async fn send_cancel_to_nodes(
     }
 }
 
-/// Cancel `runs` at `node`'s address, for a node already gone from the node table.
-pub fn spawn_cancel_runs_on_node(node: &Node, runs: &[(spur_core::job::JobId, u32)], signal: i32) {
+pub(crate) const SIGKILL: i32 = 9;
+/// Caps the kills one removed-node report can trigger.
+const MAX_REMOVED_NODE_KILLS: usize = 64;
+
+/// SIGKILL `runs` at `node`'s address, for a node already gone from the node table.
+pub fn spawn_kill_runs_on_node(node: &Node, runs: &[(spur_core::job::JobId, u32)]) {
     let Some(agent_addr) = node_comm_http_url(node) else {
-        warn!(node = %node.name, "no comm address — cannot cancel jobs on removed node");
+        warn!(node = %node.name, "no comm address — cannot kill runs on removed node");
         return;
     };
-    spawn_cancel_runs_at(&agent_addr, runs, signal);
+    spawn_kill_runs_at(agent_addr, runs);
 }
 
-pub fn spawn_cancel_runs_at(agent_addr: &str, runs: &[(spur_core::job::JobId, u32)], signal: i32) {
-    for &(job_id, run_attempt) in runs {
-        tokio::spawn(cancel_one_agent(
-            agent_addr.to_string(),
-            job_id,
-            run_attempt,
-            signal,
-            0,
-        ));
+/// SIGKILL `runs` at `agent_addr` over one connection, deduplicated and capped.
+pub fn spawn_kill_runs_at(agent_addr: String, runs: &[(spur_core::job::JobId, u32)]) {
+    let mut runs = runs.to_vec();
+    runs.sort_unstable();
+    runs.dedup();
+    runs.truncate(MAX_REMOVED_NODE_KILLS);
+    if runs.is_empty() {
+        return;
     }
+    tokio::spawn(async move {
+        let kill = async {
+            let mut client = crate::agent_client::connect(agent_addr.clone()).await?;
+            for (job_id, run_attempt) in runs {
+                client
+                    .cancel_job(AgentCancelJobRequest {
+                        job_id,
+                        signal: SIGKILL,
+                        run_attempt,
+                        kill_wait_secs: 0,
+                    })
+                    .await?;
+                debug!(job_id, run_attempt, agent = %agent_addr, "killed run on removed node");
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(CANCEL_RPC_TIMEOUT, kill).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(agent = %agent_addr, %error, "could not kill runs on removed node")
+            }
+            Err(_) => warn!(agent = %agent_addr, "killing runs on removed node timed out"),
+        }
+    });
 }
 
 /// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has a

@@ -2369,14 +2369,21 @@ impl SlurmController for ControllerService {
         let Some(node) = self.cluster.get_node(&req.name) else {
             return Err(Status::not_found(format!("node {} not found", req.name)));
         };
-        let runs = self.cluster.runs_on_node(&req.name);
+        let mut runs = self.cluster.runs_on_node(&req.name);
         let evicted = self
             .cluster
             .remove_node(&req.name, req.force, reason)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        // Also any run placed between the capture above and the removal.
+        runs.extend(
+            evicted
+                .iter()
+                .filter_map(|fin| self.cluster.get_job(fin.job_id))
+                .map(|job| (job.job_id, job.run_attempt)),
+        );
         self.spawn_cancel_for_evicted(&evicted);
         // The fan-out above resolves addresses from the node table, which no longer has this node.
-        crate::scheduler_loop::spawn_cancel_runs_on_node(&node, &runs, 9);
+        crate::scheduler_loop::spawn_kill_runs_on_node(&node, &runs);
         self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(spur_proto::proto::DeregisterNodeResponse {
             evicted_jobs_count: evicted.len() as u32,
@@ -2837,13 +2844,17 @@ impl SlurmController for ControllerService {
                 info!(node = %req.hostname, "refusing heartbeats from the spurd this node was removed under");
             }
             // Nothing runs on a removed node legitimately; repeating each beat retries a lost kill.
-            if let Some(url) = &deleted.comm_url {
-                let runs: Vec<_> = req
-                    .running_jobs
-                    .iter()
-                    .map(|run| (run.job_id, run.run_attempt))
-                    .collect();
-                crate::scheduler_loop::spawn_cancel_runs_at(url, &runs, 9);
+            let runs: Vec<_> = req
+                .running_jobs
+                .iter()
+                .map(|run| (run.job_id, run.run_attempt))
+                .collect();
+            match deleted.comm_url {
+                Some(url) => crate::scheduler_loop::spawn_kill_runs_at(url, &runs),
+                None if !runs.is_empty() => {
+                    warn!(node = %req.hostname, "no comm address — cannot kill runs on removed node")
+                }
+                None => {}
             }
             // Not NotFound: that would send the agent straight back to re-register.
             Err(register_node_rpc_status(
@@ -9306,7 +9317,6 @@ mod tests {
 
         wait_for_cancel(&n1_cancelled, job_id).await;
         wait_for_cancel(&n2_cancelled, job_id).await;
-        assert_eq!(n1_cancelled.lock().unwrap().len(), 1);
         assert_eq!(n1_cancelled.lock().unwrap()[0].run_attempt, run_attempt);
         assert_eq!(n2_cancelled.lock().unwrap()[0].run_attempt, run_attempt);
         assert!(svc.cluster.get_node("n1").is_none());
@@ -9349,6 +9359,93 @@ mod tests {
         wait_for_cancel(&cancelled, 42).await;
         let cancel = cancelled.lock().unwrap()[0];
         assert_eq!((cancel.run_attempt, cancel.signal), (3, 9));
+    }
+
+    // An older spurd sends no instance; it must never be refused, kept out, or killed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_spurd_is_always_admitted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (agent, cancelled) = spawn_cancel_recording_agent().await;
+        let registration = |instance: &str| {
+            Request::new(RegisterAgentRequest {
+                hostname: "n1".into(),
+                address: "127.0.0.1".into(),
+                port: agent.port().into(),
+                agent_instance: instance.into(),
+                ..Default::default()
+            })
+        };
+        let old_heartbeat = |job_id: u32| {
+            Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                running_jobs: (job_id > 0)
+                    .then(|| spur_proto::proto::RunningJobStatus {
+                        job_id,
+                        run_attempt: 3,
+                        ..Default::default()
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        svc.register_agent(registration("first"))
+            .await
+            .expect("a current spurd registers");
+        await_registered_node(&svc, "n1").await;
+        svc.cluster
+            .remove_node("n1", false, None)
+            .expect("delete n1");
+
+        let unknown = svc
+            .heartbeat(old_heartbeat(42))
+            .await
+            .expect_err("n1 is gone");
+        assert_eq!(
+            unknown.code(),
+            Code::NotFound,
+            "an older spurd re-registers on NotFound"
+        );
+        svc.register_agent(registration(""))
+            .await
+            .expect("an older spurd is admitted over the keep-out record");
+        await_registered_node(&svc, "n1").await;
+        let accepted = svc
+            .heartbeat(old_heartbeat(0))
+            .await
+            .expect("its heartbeats are accepted")
+            .into_inner();
+
+        assert!(!accepted.reregister);
+        assert!(!svc.cluster.is_deleted_agent("n1", "first"));
+        assert!(
+            !cancelled_jobs(&cancelled).contains(&42),
+            "no removed-node kill reaches an older spurd"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removed_node_kills_are_deduplicated_and_capped() {
+        let (agent, cancelled) = spawn_cancel_recording_agent().await;
+        let mut runs: Vec<(u32, u32)> = (1..=100).map(|job| (job, 1)).collect();
+        runs.push((1, 1));
+
+        crate::scheduler_loop::spawn_kill_runs_at(format!("http://{agent}"), &runs);
+
+        for _ in 0..400 {
+            if cancelled.lock().unwrap().len() >= 64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let jobs = cancelled_jobs(&cancelled);
+        assert_eq!(jobs, (1..=64).collect::<Vec<_>>());
+        assert!(cancelled
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|kill| kill.signal == crate::scheduler_loop::SIGKILL));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

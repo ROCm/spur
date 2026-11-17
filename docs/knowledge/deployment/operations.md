@@ -332,7 +332,8 @@ tunnels for Raft elections.
 
 Deregister from the cluster **first** (`spur node remove <node>`), then drop
 the mesh peer (`spur net remove-peer`).  In HA, remove the peer on every
-controller.  With `[admission] node_names`, drop the name from the list and run
+controller.  Disable `spurd` on the departed host: a restarted `spurd` adds
+the node back.  With `[admission] node_names`, drop the name from the list and run
 `scontrol reconfigure` instead; it deletes the node and keeps it from
 registering again.
 

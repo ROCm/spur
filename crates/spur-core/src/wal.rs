@@ -386,6 +386,11 @@ pub enum WalOperation {
         reason: Option<String>,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// The spurd to keep out, set by the leader so every replica records the same one.
+        #[serde(default)]
+        agent_instance: String,
+        #[serde(default)]
+        comm_url: Option<String>,
     },
 
     // Admission token operations
@@ -1507,6 +1512,8 @@ mod deregistration_wal_tests {
             name: "gpu01".into(),
             reason: Some("decommission".into()),
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1822,6 +1829,8 @@ mod deregistration_wal_tests {
             name: "n0".into(),
             reason: None,
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1883,6 +1892,24 @@ mod deregistration_wal_tests {
             } => {
                 assert!(capabilities.is_empty());
                 assert!(agent_instance.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_remove_without_a_keep_out_record_still_deserializes() {
+        let op: WalOperation =
+            serde_json::from_str(r#"{"NodeRemove":{"name":"n1","reason":null}}"#)
+                .expect("frozen NodeRemove must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeRemove {
+                agent_instance,
+                comm_url,
+                ..
+            } => {
+                assert!(agent_instance.is_empty());
+                assert_eq!(comm_url, None);
             }
             _ => panic!("wrong variant"),
         }

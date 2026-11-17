@@ -1946,8 +1946,8 @@ matches, and the first matching entry wins.
    stops, the node stays in the inventory as ``down`` with the reason
    ``agent shutdown``. It returns to service when the agent registers and sends
    heartbeats again. An operator drain is kept through the restart. A removed
-   node whose ``spurd`` reports an instance ID returns only when that ``spurd``
-   restarts; see :doc:`accounting`. This differs
+   node stays out while its ``spurd`` keeps running and returns when ``spurd``
+   restarts (older agents return at once); see :ref:`removed-node-keep-out`. This differs
    from Slurm, where ``NodeName=`` lines in ``slurm.conf`` define the node set.
    For configuration-driven removal in Spur, see :ref:`configured-node-list`.
 

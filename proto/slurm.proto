@@ -1207,7 +1207,7 @@ message RunningJobStatus {
 }
 
 message HeartbeatResponse {
-  bool reregister = 1;               // held layout differs from the node's current one: register again
+  bool reregister = 1;               // register again: held layout differs, or the agent's instance is unrecorded
 }
 
 message StepdRecoveryRequest {

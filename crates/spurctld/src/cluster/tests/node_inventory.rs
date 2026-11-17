@@ -700,6 +700,8 @@ fn removed_unlisted_node_cannot_reregister_before_the_list_is_saved() {
         name: "old".into(),
         reason: None,
         at: None,
+        agent_instance: String::new(),
+        comm_url: None,
     });
     drop(held);
     assert!(matches!(

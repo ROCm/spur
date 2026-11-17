@@ -230,6 +230,9 @@ The playbook proceeds in order:
    resumed**, so it stays schedulable for the whole swap. See :ref:`upgrading-in-place`.
 4. **Verify.** Submit a real test job to confirm the upgraded cluster schedules work.
 
+Until every controller is upgraded, a node removed with ``spur node remove`` or
+``scontrol delete NodeName=`` may register again; see :ref:`removed-node-keep-out`.
+
 The rolling upgrade is controlled with these ``-e`` flags:
 
 .. list-table::

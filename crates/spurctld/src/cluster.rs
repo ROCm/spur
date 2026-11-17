@@ -4238,9 +4238,8 @@ impl ClusterManager {
 
     /// True the first time this process refuses `name`'s heartbeat since it was removed.
     pub(crate) fn first_refused_heartbeat(&self, name: &str) -> bool {
-        self.deleted_heartbeats_logged
-            .lock()
-            .insert(name.to_string())
+        let mut logged = self.deleted_heartbeats_logged.lock();
+        !logged.contains(name) && logged.insert(name.to_string())
     }
 
     pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
@@ -4421,7 +4420,7 @@ impl ClusterManager {
                 reject_excluded_registration(&response, &name)?;
                 {
                     let mut nodes = self.nodes.write();
-                    // Absent if the apply refused it or a delete landed since.
+                    // Removal takes the same lock, so absence here is only a sanity check.
                     let Some(node) = nodes.get_mut(&name) else {
                         drop(nodes);
                         if self.is_deleted_agent(&name, &agent_instance) {
@@ -5926,12 +5925,12 @@ impl ClusterManager {
         force: bool,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        {
-            let nodes = self.nodes.read();
-            if !nodes.contains_key(name) {
-                anyhow::bail!("node '{}' not found", name);
-            }
-        }
+        // Serialized with registration, so a register's pre-check never races this removal.
+        let node_lock = self.node_registration_lock(name);
+        let _registration = node_lock.lock();
+        let Some(node) = self.get_node(name) else {
+            anyhow::bail!("node '{}' not found", name);
+        };
         if !force && self.node_has_running_jobs(name) {
             anyhow::bail!(
                 "node '{}' has running jobs; use --force to evict them",
@@ -5943,6 +5942,8 @@ impl ClusterManager {
             name: name.to_string(),
             reason,
             at: None,
+            agent_instance: node.agent_instance.clone().unwrap_or_default(),
+            comm_url: crate::scheduler_loop::node_comm_http_url(&node),
         })?;
         self.forget_node_report(name);
         self.k8s_metrics
@@ -9991,10 +9992,7 @@ impl ClusterManager {
                     response.node_registration_rejected = true;
                     return response;
                 }
-                if self.is_deleted_agent(name, agent_instance) {
-                    warn!(node = %name, "ignoring registration from the spurd this node was deleted under");
-                    return response;
-                }
+                // Unconditional: replicas' keep-out records can differ after a mixed-version upgrade.
                 self.deleted_nodes.write().remove(name);
                 self.deleted_heartbeats_logged.lock().remove(name);
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
@@ -10199,7 +10197,13 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason, .. } => {
+            WalOperation::NodeRemove {
+                name,
+                reason,
+                agent_instance,
+                comm_url,
+                ..
+            } => {
                 let failure = NodeFailure {
                     node: name.clone(),
                     reason: reason.clone().unwrap_or_default(),
@@ -10231,15 +10235,15 @@ impl ClusterManager {
                     if let Some(role) = node.k0s_role {
                         self.k0s_role_counts.dec(role);
                     }
-                    if let Some(instance) = &node.agent_instance {
-                        let deleted = DeletedAgent {
-                            agent_instance: instance.clone(),
-                            comm_url: crate::scheduler_loop::node_comm_http_url(node),
-                        };
-                        self.deleted_nodes.write().insert(name.clone(), deleted);
-                    }
                 }
                 nodes.remove(name);
+                if !agent_instance.is_empty() {
+                    let deleted = DeletedAgent {
+                        agent_instance: agent_instance.clone(),
+                        comm_url: comm_url.clone(),
+                    };
+                    self.deleted_nodes.write().insert(name.clone(), deleted);
+                }
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),
@@ -20197,6 +20201,8 @@ state = "UP"
             name: "worker1".into(),
             reason: Some("decommissioned".into()),
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -41345,6 +41351,8 @@ state = "UP"
             name: "n1".into(),
             reason: Some("decommission".into()),
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
         assert!(cm.get_node("n1").is_none());
     }
@@ -41362,6 +41370,8 @@ state = "UP"
             name: "n1".into(),
             reason: None,
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
@@ -41478,11 +41488,13 @@ state = "UP"
         }
     }
 
-    fn remove_op(name: &str) -> WalOperation {
+    fn remove_op(name: &str, instance: &str) -> WalOperation {
         WalOperation::NodeRemove {
             name: name.into(),
             reason: None,
             at: None,
+            agent_instance: instance.into(),
+            comm_url: None,
         }
     }
 
@@ -41540,18 +41552,50 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn apply_ignores_a_registration_from_the_deleted_spurd() {
+    async fn replicas_apply_a_registration_whatever_their_delete_records_say() {
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (kept_out, unrecorded) = (test_cluster(&dir_a).await, test_cluster(&dir_b).await);
+        for (cm, recorded) in [(&kept_out, "first"), (&unrecorded, "")] {
+            cm.apply_operation(&agent_register_op("n1", "first"));
+            cm.apply_operation(&remove_op("n1", recorded));
+        }
+        assert!(kept_out.is_deleted_agent("n1", "first"));
+
+        for cm in [&kept_out, &unrecorded] {
+            cm.apply_operation(&agent_register_op("n1", "first"));
+            assert!(cm.get_node("n1").is_some());
+            assert!(!cm.is_deleted_agent("n1", "first"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_path_registration_records_the_new_instance() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+        cm.register_agent_node(
+            "second".into(),
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
 
-        cm.apply_operation(&agent_register_op("n1", "first"));
-        cm.apply_operation(&remove_op("n1"));
-        cm.apply_operation(&agent_register_op("n1", "first"));
-        assert!(cm.get_node("n1").is_none());
-
-        cm.apply_operation(&agent_register_op("n1", "second"));
-        assert!(cm.get_node("n1").is_some());
-        assert!(!cm.is_deleted_agent("n1", "first"));
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.total_resources.cpus, 8, "took the update path");
+        assert_eq!(node.agent_instance.as_deref(), Some("second"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41588,30 +41632,19 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replayed_node_update_carries_the_instance_into_the_delete_record() {
+    async fn removal_records_only_the_instance_its_entry_carries() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&agent_register_op("n1", "first"));
-        cm.apply_operation(&WalOperation::NodeUpdate {
-            name: "n1".into(),
-            hostname: "n1".into(),
-            resources: ResourceSet {
-                cpus: 4,
-                memory_mb: 8000,
-                ..Default::default()
-            },
-            address: "127.0.0.1".into(),
-            port: 6818,
-            wg_pubkey: String::new(),
-            version: String::new(),
-            source: spur_core::node::NodeSource::NativeHost,
-            capabilities: Vec::new(),
-            agent_instance: "second".into(),
-        });
-        cm.apply_operation(&remove_op("n1"));
+        cm.apply_operation(&remove_op("n1", ""));
+        assert!(
+            !cm.is_deleted_agent("n1", "first"),
+            "an entry from an older leader records nothing"
+        );
 
+        cm.apply_operation(&agent_register_op("n1", ""));
+        cm.apply_operation(&remove_op("n1", "second"));
         assert!(cm.is_deleted_agent("n1", "second"));
-        assert!(!cm.is_deleted_agent("n1", "first"));
         assert!(
             !cm.is_deleted_agent("n1", ""),
             "an empty instance never matches"
@@ -41623,7 +41656,8 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&agent_register_op("n1", "first"));
-        cm.apply_operation(&remove_op("n1"));
+        cm.apply_operation(&remove_op("n1", "first"));
+        assert!(cm.is_deleted_agent("n1", "first"));
 
         cm.apply_operation(&agent_register_op("n1", ""));
 
@@ -41673,13 +41707,13 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&agent_register_op("n1", "first"));
-        cm.apply_operation(&remove_op("n1"));
+        cm.apply_operation(&remove_op("n1", "first"));
         let bytes = cm.snapshot_state().unwrap();
 
         let other_dir = TempDir::new().unwrap();
         let restored = test_cluster(&other_dir).await;
         restored.apply_operation(&agent_register_op("n2", "other"));
-        restored.apply_operation(&remove_op("n2"));
+        restored.apply_operation(&remove_op("n2", "other"));
         restored.restore_from_snapshot(&bytes).unwrap();
         assert!(restored.is_deleted_agent("n1", "first"));
         assert!(

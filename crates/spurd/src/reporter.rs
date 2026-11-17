@@ -639,9 +639,8 @@ impl NodeReporter {
         match result {
             Ok(resp) => {
                 debug!(load, free_mem, "heartbeat sent");
-                // The controller asks for re-registration when the layout it
-                // expects differs from what this node reported enforcing, so
-                // a changed spec policy is redelivered without a restart.
+                // Redelivers a changed spec policy, or records this process's
+                // instance, without a restart.
                 if resp.reregister {
                     info!("controller requested re-registration; re-registering");
                     if let Err(e) = self.register().await {

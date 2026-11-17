@@ -1533,26 +1533,32 @@ For a removal reason or to evict active jobs, use
 option. Node removal requires Administrator when the caller has a verified
 identity; see :ref:`privileged-operations`.
 
+.. _removed-node-keep-out:
+
 Removal does not stop the agent or change ``spur.conf``. A ``spurd`` that
 keeps running after its node is removed stays out: its heartbeats are refused,
-and it logs ``node <name> was deleted; restart its spurd to add it back`` once
-instead of registering again. A forced removal also stops the node's evicted
-jobs on that ``spurd``, and any job it still reports is stopped again on each
-refused heartbeat. Restarting ``spurd`` (or rebooting the host) adds the
-node back, as a restarted ``slurmd`` re-creates a deleted Slurm dynamic node.
-To keep a host out for good, also stop and disable ``spurd`` on it, for
-example with ``systemctl disable --now spurd``.
+and it logs ``node <name> was deleted; restart its spurd to add it back``
+instead of registering again (once, and again after a controller outage). A
+forced removal also kills (SIGKILL) the node's evicted jobs on that ``spurd``,
+and any job it still reports is killed again on each refused heartbeat.
+Restarting ``spurd`` (or rebooting the host) adds the node back, as a
+restarted ``slurmd`` re-creates a deleted Slurm dynamic node. To keep a host
+out for good, also stop and disable ``spurd`` on it, for example with
+``systemctl disable --now spurd``. This is not a security control; with token
+admission, also revoke the host's admission token (``spur token revoke``).
 
 Each ``spurd`` process sends a random instance ID, so the controller can tell
 a restart from the process that was running when the node was removed. The
 record of which ``spurd`` to keep out is replicated and survives a controller
 restart or failover. Nodes registered by agents older than this release, or by
 the Kubernetes operator, send no instance ID and register again on their next
-heartbeat as before. During a rolling upgrade, a removal sticks only once
-both the leader and the controller the agent talks to run this release;
-removals made earlier may not stick. An agent that registered through an
-older controller is asked to register again once its heartbeat reaches an
-upgraded leader.
+heartbeat as before.
+
+During a rolling upgrade, keeping a removed node out is best effort: controllers
+older than this release drop the instance ID from the log entries they store
+and forward. Once every controller runs this release, restart each ``spurd``
+(or let a heartbeat reach the leader, which asks agents it has no instance for
+to register again) before relying on removals to stick.
 
 Slurm restricts this command to dynamic nodes without running jobs or
 reservation membership; Spur uses its native registered-node removal rules and
