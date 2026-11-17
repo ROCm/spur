@@ -95,6 +95,19 @@ impl DeviceRegistry {
         Ok(build_injection_plans(&devices, job_uid, job_gid))
     }
 
+    /// Whether `key` (`name` or `name:type`) names one of this node's countable pools.
+    pub fn has_countable_pool(&self, key: &str) -> bool {
+        self.devices
+            .iter()
+            .filter(|e| e.is_countable_pool())
+            .any(
+                |e| match e.resource_type.as_deref().filter(|t| !t.is_empty()) {
+                    Some(t) => key == format!("{}:{t}", e.gres_name),
+                    None => key == e.gres_name,
+                },
+            )
+    }
+
     pub fn has_injectable(&self, gres_name: &str) -> bool {
         self.devices
             .iter()
