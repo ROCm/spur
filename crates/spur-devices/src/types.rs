@@ -7,3 +7,6 @@ pub enum LinkType {
     Xgmi,
     Nvlink,
 }
+
+/// Allocated devices of a job by gres name ("gpu", "nic", ...), as stable ids.
+pub type DeviceSelection = std::collections::BTreeMap<String, Vec<u64>>;
