@@ -1148,10 +1148,11 @@ def _make_bind_sources(cluster, names: list) -> dict:
     return dirs
 
 
+# The test image has no sed or grep, so probes stick to bash builtins and cat.
 _MOUNT_PROBE = (
     "for d in /m/data /m/scratch /m/models; do "
     'if [ -f "$d/id" ]; then echo "$d=$(cat "$d/id")"; else echo "$d=MISSING"; fi; done; '
-    "ls -d /m/* 2>&1 | sed 's/^/LS=/'"
+    'for p in /m/*; do echo "LS=$p"; done'
 )
 
 
@@ -1193,7 +1194,8 @@ class TestContainerMounts:
         assert "/m/data=src-data" in out and "/m/scratch=src-scratch" in out, (
             f"state {state}:\n{out}\n{diag}"
         )
-        assert "," not in "".join(l for l in out.splitlines() if l.startswith("LS=")), out
+        listing = [l for l in out.splitlines() if l.startswith("LS=")]
+        assert listing == ["LS=/m/data", "LS=/m/scratch"], out
 
     def test_a_repeated_flag_still_mounts_every_entry(self, step_container_cluster):
         cluster = step_container_cluster
@@ -1254,12 +1256,17 @@ class TestContainerMounts:
         )
         assert "RAN" not in out, f"job ran without its mount (state {state}):\n{out}"
         assert state != "CD", f"job completed without its mount:\n{diag}"
-        assert f"{missing}:/m/data" in diag + out, f"failure does not name the mount:\n{diag}"
+        reported = [
+            l for l in diag.splitlines() if f"source {missing} does not exist" in l
+        ]
+        assert reported, f"failure does not name the missing source:\n{diag}"
+        print(f"[mounts-missing] reported as: {reported[0].strip()[-200:]!a}")
 
     def test_a_tmpfs_mount_has_its_size_and_is_writable(self, step_container_cluster):
         cluster = step_container_cluster
         body = (
-            "grep ' /m/cache ' /proc/mounts | sed 's/^/MOUNT=/'; "
+            "while read -r dev mnt fs opts _; do "
+            '[ "$mnt" = /m/cache ] && echo "MOUNT=$dev $mnt $fs $opts"; done < /proc/mounts; '
             "echo hi > /m/cache/f && echo WRITE=ok || echo WRITE=fail"
         )
         state, out, diag = self._sbatch_probe(
