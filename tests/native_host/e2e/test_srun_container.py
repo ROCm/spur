@@ -1229,20 +1229,30 @@ class TestContainerMounts:
             assert f"/m/{n}=src-{n}" in out, f"step mount {n} missing:\n{out}\n{diag}"
         assert "SRUN_EXIT=0" in out, out
 
-    def test_an_unparseable_mount_is_refused_at_submit_and_named(self, step_container_cluster):
+    @pytest.mark.parametrize(
+        "suffix, named",
+        [
+            (",nocolon", "nocolon"),
+            (":z", "unknown flag 'z'"),
+            (":size=64M", "size= only applies to a tmpfs mount"),
+        ],
+        ids=["entry-without-target", "unknown-flag", "unsupported-option"],
+    )
+    def test_an_unparseable_mount_is_refused_at_submit_and_named(
+        self, step_container_cluster, suffix, named
+    ):
         cluster = step_container_cluster
         src = _make_bind_sources(cluster, ["data"])
-        for bad in [f"{src['data']}:/m/data,nocolon", f"{src['data']}:/m/data:z"]:
-            script = cluster.write_file("mounts-bad.sh", "#!/bin/bash\necho RAN\n")
-            code, out = cluster.sbatch_with_exit(
-                ["-J", "mounts-bad", "-N", "1", "-t", "2",
-                 f"--container-image={cluster.step_container_image}",
-                 f"--container-mounts={bad}", script]
-            )
-            print(f"[mounts-bad] spec={bad} exit={code}\n{out}")
-            assert code != 0, f"{bad!r} was accepted:\n{out}"
-            named = "nocolon" if bad.endswith("nocolon") else bad
-            assert named in out, f"error does not name {named!r}:\n{out}"
+        bad = f"{src['data']}:/m/data{suffix}"
+        script = cluster.write_file("mounts-bad.sh", "#!/bin/bash\necho RAN\n")
+        code, out = cluster.sbatch_with_exit(
+            ["-J", "mounts-bad", "-N", "1", "-t", "2",
+             f"--container-image={cluster.step_container_image}",
+             f"--container-mounts={bad}", script]
+        )
+        print(f"[mounts-bad] spec={bad} exit={code}\n{out}")
+        assert code != 0, f"{bad!r} was accepted:\n{out}"
+        assert named in out, f"error does not name {named!r}:\n{out}"
 
     def test_a_missing_bind_source_fails_the_job_and_names_the_mount(
         self, step_container_cluster
