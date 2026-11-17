@@ -16,7 +16,6 @@ pub struct CachedDevice {
     pub device: CdiDevice,
     pub kind: String,
     pub shared_edits: Option<crate::cdi::spec::ContainerEdits>,
-    pub spec_annotations: HashMap<String, String>,
     pub source_path: String,
     pub priority: i32,
 }
@@ -272,7 +271,6 @@ impl CdiCache {
                     device: device.clone(),
                     kind: spec.kind.clone(),
                     shared_edits: spec.container_edits.clone(),
-                    spec_annotations: spec.annotations.clone(),
                     source_path: source_path.to_owned(),
                     priority,
                 },
