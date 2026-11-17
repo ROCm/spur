@@ -426,3 +426,8 @@ WireGuard
 XCP
 yml
 zstd
+Pollara
+Pensando
+ionic
+uverbs
+HCA

@@ -1,14 +1,14 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::cdi::spec::{ContainerEdits, DeviceNode, Mount};
-use crate::registry::entry::DeviceEntry;
+use crate::registry::entry::{DeviceClass, DeviceEntry};
 
 #[derive(Clone, Debug, Default)]
 pub struct InjectActions {
@@ -140,10 +140,42 @@ pub(crate) fn apply_spur_job_device_env(
     devices: &[&DeviceEntry],
 ) {
     let gpu_ids = device_ids_for_gres(devices, "gpu");
-    if gpu_ids.is_empty() {
-        return;
+    if !gpu_ids.is_empty() {
+        env.insert("SPUR_JOB_GPUS".into(), format_device_id_list(&gpu_ids));
     }
-    env.insert("SPUR_JOB_GPUS".into(), format_device_id_list(&gpu_ids));
+    apply_nic_env(env, devices);
+}
+
+/// NCCL/RCCL HCA selection, the AMD network device plugin's `PCIDEVICE_*`,
+/// and Spur's own positional list per NIC kind.
+fn apply_nic_env(env: &mut HashMap<String, String>, devices: &[&DeviceEntry]) {
+    let mut indices: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
+    let mut bdfs: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut hcas: Vec<&str> = Vec::new();
+    for nic in devices.iter().filter(|d| d.class() == DeviceClass::Nic) {
+        indices
+            .entry(&nic.gres_name)
+            .or_default()
+            .push(nic.device_id);
+        if let Some(bdf) = &nic.pci_bdf {
+            bdfs.entry(&nic.kind).or_default().push(bdf);
+        }
+        hcas.extend(nic.rdma_device.as_deref());
+    }
+    for (gres, ids) in indices {
+        env.insert(
+            format!("SPUR_JOB_{}S", gres.to_uppercase()),
+            format_device_id_list(&ids),
+        );
+    }
+    for (kind, list) in bdfs {
+        let name = kind.to_uppercase().replace(['.', '/', '-'], "_");
+        env.insert(format!("PCIDEVICE_{name}"), list.join(","));
+    }
+    if !hcas.is_empty() {
+        // A leading "=" makes NCCL match names exactly instead of by prefix.
+        env.insert("NCCL_IB_HCA".into(), format!("={}", hcas.join(",")));
+    }
 }
 
 pub fn build_injection_plans(
@@ -485,6 +517,101 @@ mod tests {
         let mut env = HashMap::new();
         apply_spur_job_device_env(&mut env, &refs);
         assert!(!env.contains_key("SPUR_JOB_GPUS"));
+    }
+
+    fn nic_entry(gres: &str, device_id: u32, rdma: &str, bdf: &str) -> DeviceEntry {
+        DeviceEntry {
+            gres_name: gres.into(),
+            kind: format!("amd.com/{gres}"),
+            rdma_device: Some(rdma.into()),
+            pci_bdf: Some(bdf.into()),
+            ..gpu_device_entry(device_id)
+        }
+    }
+
+    fn device_env(devices: &[DeviceEntry]) -> HashMap<String, String> {
+        let refs: Vec<&DeviceEntry> = devices.iter().collect();
+        let mut env = HashMap::new();
+        apply_spur_job_device_env(&mut env, &refs);
+        env
+    }
+
+    #[test]
+    fn nic_env_uses_exact_match_hca_list() {
+        let env = device_env(&[
+            nic_entry("nic", 0, "ionic_1", "0000:05:00.0"),
+            nic_entry("nic", 1, "ionic_10", "0000:85:00.0"),
+        ]);
+        assert_eq!(env["NCCL_IB_HCA"], "=ionic_1,ionic_10");
+    }
+
+    #[test]
+    fn nic_env_sets_pcidevice_like_the_k8s_plugin() {
+        let env = device_env(&[
+            nic_entry("nic", 0, "ionic_0", "0000:05:00.0"),
+            nic_entry("nic", 1, "ionic_1", "0000:85:00.0"),
+            nic_entry("vnic", 0, "ionic_2", "0000:05:00.1"),
+        ]);
+        assert_eq!(env["PCIDEVICE_AMD_COM_NIC"], "0000:05:00.0,0000:85:00.0");
+        assert_eq!(env["PCIDEVICE_AMD_COM_VNIC"], "0000:05:00.1");
+        assert_eq!(env["NCCL_IB_HCA"], "=ionic_0,ionic_1,ionic_2");
+    }
+
+    #[test]
+    fn nic_env_lists_positional_nics_per_kind() {
+        let env = device_env(&[
+            nic_entry("nic", 1, "ionic_1", "0000:85:00.0"),
+            nic_entry("vnic", 0, "ionic_2", "0000:05:00.1"),
+        ]);
+        assert_eq!(env["SPUR_JOB_NICS"], "1");
+        assert_eq!(env["SPUR_JOB_VNICS"], "0");
+    }
+
+    #[test]
+    fn a_nic_without_rdma_or_pci_identity_sets_only_its_index() {
+        let nic = DeviceEntry {
+            gres_name: "nic".into(),
+            kind: "spur.internal/gres".into(),
+            ..gpu_device_entry(3)
+        };
+        let env = device_env(&[nic]);
+        assert_eq!(
+            env,
+            HashMap::from([("SPUR_JOB_NICS".to_string(), "3".to_string())])
+        );
+    }
+
+    #[test]
+    fn nic_only_selection_sets_no_gpu_visibility() {
+        let nics = [
+            nic_entry("nic", 0, "ionic_0", "0000:05:00.0"),
+            nic_entry("nic", 1, "ionic_1", "0000:85:00.0"),
+        ];
+        let refs: Vec<&DeviceEntry> = nics.iter().collect();
+        let (host, container) = build_injection_plans(&refs, 1000, 1000);
+        for env in [&host.env, &container.env] {
+            let gpu_vars: Vec<&String> = env
+                .keys()
+                .filter(|k| k.contains("VISIBLE_DEVICES") || *k == "SPUR_JOB_GPUS")
+                .collect();
+            assert!(gpu_vars.is_empty(), "{gpu_vars:?}");
+            assert_eq!(env["NCCL_IB_HCA"], "=ionic_0,ionic_1");
+        }
+    }
+
+    #[test]
+    fn a_gpu_and_nic_job_gets_both_envs() {
+        let mut gpu = gpu_device_entry(0);
+        gpu.inject_actions = InjectActions {
+            gpu_visibility_vars: HashSet::from(["ROCR_VISIBLE_DEVICES".into()]),
+        };
+        let devices = [gpu, nic_entry("nic", 0, "ionic_0", "0000:05:00.0")];
+        let refs: Vec<&DeviceEntry> = devices.iter().collect();
+        let (host, _) = build_injection_plans(&refs, 1000, 1000);
+        assert_eq!(host.env["ROCR_VISIBLE_DEVICES"], "0");
+        assert_eq!(host.env["SPUR_JOB_GPUS"], "0");
+        assert_eq!(host.env["SPUR_JOB_NICS"], "0");
+        assert_eq!(host.env["NCCL_IB_HCA"], "=ionic_0");
     }
 
     #[test]
