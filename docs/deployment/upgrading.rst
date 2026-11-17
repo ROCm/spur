@@ -947,6 +947,21 @@ change them while that file exists.
    :ref:`gpu-partition-mode-change` for the separate, still-destructive case
    of actually switching a GPU's partition mode.
 
+GPU card nodes in the auto-detected CDI spec
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Discovery now grants a GPU its ``/dev/dri/card<N>`` node only when sysfs links
+that card to the GPU's render node. Older builds guessed ``card<index>`` when no
+link was found, which could name another device's card.
+
+* On upgrade, ``spurd`` rewrites a Spur-owned ``/etc/cdi/amd.json`` (one carrying
+  Spur's ``auto-detected`` annotation) that grants other device nodes than live
+  discovery finds. A spec without that annotation is left alone; regenerate it
+  yourself. Manual edits to a Spur-owned spec are reverted the same way.
+* Jobs running at upgrade keep the device access they started with.
+* With ``[devices] auto_detect = false``, the spec is never rewritten.
+* Rolling ``spurd`` back to an older build brings the guessed card node back.
+
 Bounded controller shutdown (``shutdown_grace_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -4,7 +4,7 @@
 //! Keeps a Spur-written `/etc/cdi/amd.json` in sync with live GPU discovery;
 //! a spec without Spur's `auto-detected` annotation is someone else's.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -36,12 +36,32 @@ fn gpu_stable_ids(specs: &[CdiSpec]) -> HashSet<&str> {
         .collect()
 }
 
+/// Each GPU's stable id with the device nodes it grants: a spec granting other
+/// nodes for the same GPU (an older build's guessed card node) is stale too.
+fn gpu_grants(specs: &[CdiSpec]) -> BTreeSet<(&str, BTreeSet<&str>)> {
+    specs
+        .iter()
+        .filter(|spec| spec.kind == AMD_CDI_KIND)
+        .flat_map(|spec| &spec.devices)
+        .filter_map(|device| {
+            let id = device.annotations.get(STABLE_ID)?;
+            let nodes = device
+                .container_edits
+                .iter()
+                .flat_map(|edits| &edits.device_nodes)
+                .map(|node| node.path.as_str())
+                .collect();
+            Some((id.as_str(), nodes))
+        })
+        .collect()
+}
+
 /// A failed live scan (`live` empty) must never make a good spec look stale.
 pub fn is_stale(on_disk: &CdiSpec, live: &[CdiSpec]) -> bool {
     if live.is_empty() {
         return false;
     }
-    gpu_stable_ids(std::slice::from_ref(on_disk)) != gpu_stable_ids(live)
+    gpu_grants(std::slice::from_ref(on_disk)) != gpu_grants(live)
 }
 
 pub fn write_specs(dir: &Path, specs: &[CdiSpec]) -> anyhow::Result<()> {
@@ -161,6 +181,35 @@ mod tests {
         let on_disk = spec(true, &["1", "2"]);
         let live = vec![spec(true, &["2", "1"])];
         assert!(!is_stale(&on_disk, &live));
+    }
+
+    #[test]
+    fn a_spec_granting_other_device_nodes_is_stale() {
+        let with_nodes = |paths: &[&str]| {
+            let mut spec = spec(true, &["1"]);
+            spec.devices[0].container_edits = Some(spur_devices::cdi::spec::ContainerEdits {
+                device_nodes: paths
+                    .iter()
+                    .map(|p| spur_devices::cdi::spec::DeviceNode {
+                        path: (*p).into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            spec
+        };
+        let guessed_card = with_nodes(&["/dev/dri/renderD128", "/dev/dri/card0"]);
+        let live = vec![with_nodes(&["/dev/dri/renderD128"])];
+        assert!(is_stale(&guessed_card, &live));
+        assert!(!is_stale(&live[0], &live));
     }
 
     #[test]
