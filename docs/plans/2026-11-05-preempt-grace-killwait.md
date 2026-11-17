@@ -249,9 +249,7 @@ behaviour and are marked `xfail` until it is fixed (see the test inventory).
 
 ## Follow-ups
 
-- Route `scancel --signal`, `-b` and `--full` through `SignalJob` and retire the signal form of
-  `CancelJob`.
-- Grace on `spur-k8s` nodes, and `scancel --signal` there currently deleting the job's Pods.
+- Grace on `spur-k8s` nodes, and signalling a job there (`SignalJob` is refused on those nodes).
 - Honour a user `--signal` as the warning signal (Slurm's `send_user_signal`).
 - Reservation end like Slurm: end `TIMEOUT`, stop immediately and use the timeout wait.
 - Change `update_partition` from positional arguments to a patch type; it already takes several

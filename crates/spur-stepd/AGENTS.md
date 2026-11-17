@@ -220,7 +220,12 @@ same cgroup-first path.
 The agent's `SignalJob` batch target does not use `SignalAllocation`: it asks
 `QueryState` for `job_pid` and signals only the batch shell. `job_pid` is the
 wrapper (`unshare` or a container shepherd) on a namespaced launch, so spurd
-signals that wrapper's sole child, the shell that runs the script.
+signals that wrapper's sole child, the shell that runs the script. With a
+`container_entrypoint` the container's PID 1 is an `sh -c` wrapper and the script
+shell is its child, so `-b` reaches the wrapper, which as PID 1 discards signals it
+does not trap: the batch target has no effect for such a job. On a rootful
+(PID-namespace) launch the steps target also reaches the step's `nsenter`/`unshare`
+wrapper, so it can end a step whose program traps the signal.
 
 ## I/O management
 

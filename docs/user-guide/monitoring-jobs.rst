@@ -1470,7 +1470,7 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 .. _scancel-signals:
 
 **Signal jobs without ending them.** ``--signal``/``-s`` takes a signal name
-(``USR1`` or ``SIGUSR1``, in any case) or a number from 1 to 64. Any signal
+(``USR1`` or ``SIGUSR1``, in any case) or a number from 1 to 31. Any signal
 other than ``KILL`` (9) is delivered and the job keeps running; plain ``scancel``
 and ``-s KILL`` are what end a job. Three flags choose which processes get the
 signal:
@@ -1496,7 +1496,7 @@ signal:
        have no effect here.
 
 With a filter such as ``-u`` or ``-n``, a signal goes to the matching running jobs
-(``-p``, ``-A`` and ``-R`` without ``-u`` match every user's jobs); pass
+(``-n``, ``-p``, ``-A`` and ``-R`` without ``-u`` match every user's jobs); pass
 ``--state`` to select others. If a job cannot be signalled, ``scancel`` says why
 on ``stderr`` and exits ``1``: the job is not running, has no batch script
 (``-b``) or its batch script has already exited, or no node could be reached.
@@ -1520,14 +1520,32 @@ the job.
       #!/bin/bash
       trap 'save_checkpoint' USR1
       srun ./train & pid=$!
-      while ! wait "$pid" && kill -0 "$pid" 2>/dev/null; do :; done
+      until wait "$pid"; do rc=$?; kill -0 "$pid" 2>/dev/null || exit "$rc"; done
 
    The loop is needed because ``wait`` returns as soon as a trapped signal
    arrives; without it the script would run off its end and exit, which as PID 1
-   ends the job.
+   ends the job. It exits with the program's own status, so a crashed program
+   still fails the job and does not fire ``afterok`` dependents.
 
    Alternatively use ``--full``, which also reaches the processes the script
-   started.
+   started, subject to the limitation below.
+
+.. note::
+
+   Known limitation: on nodes where jobs run in a PID namespace (``spurd``
+   running as root, the default), a signal sent to the steps, which is the
+   default target of ``scancel -s`` and part of ``--full``, can end the step even
+   when the program traps the signal, because it also reaches the step's
+   ``nsenter`` or ``unshare`` wrapper process. The batch-shell target (``-b``) is
+   not affected.
+
+.. note::
+
+   For a job started with a container entrypoint (``container_entrypoint``), the
+   batch step's PID 1 inside the container is an ``sh -c`` wrapper and the script's
+   shell is its child. ``scancel -b`` reaches the wrapper, not the script's shell,
+   and as PID 1 the wrapper discards signals it does not trap. So ``-b`` has no
+   effect on such a job.
 
 **Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
 to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It

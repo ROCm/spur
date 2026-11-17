@@ -258,6 +258,14 @@ The agent gates controller-only RPCs (job launch, cancel) on
 `Identity::is_controller()`, which checks `id.user == "spurctld"`. A valid
 *user* token authenticates but cannot drive controller-only RPCs.
 
+### PrivateData and job-control RPCs
+
+Under `private_data = ["jobs"]`, `SuspendJob`, `ResumeJob`, `SignalJob` and
+`CancelJob` answer NOT_FOUND ("job N not found") for a job the caller may not
+see, identical to a nonexistent id. The visibility check runs before any
+argument validation, state check or ownership check, so no answer confirms that
+a hidden job exists, or what state or owner it has.
+
 ## 7. Permissive mode behavior
 
 `permissive` is the default mode, designed as a migration path from no-auth
@@ -283,9 +291,6 @@ Consequences for authorization:
 - `PrivateData` scoping: anonymous callers get `ReadScope::All` (unrestricted
   view), so `private_data` categories only restrict identified non-operator
   users.
-- Under `private_data = ["jobs"]`, `SuspendJob`, `ResumeJob`, `SignalJob` and
-  `CancelJob` answer NOT_FOUND ("job N not found") for a job the caller may not see,
-  identical to a nonexistent id and checked before any state or ownership check.
 - Job spec binding (`bind_job_spec`): unauthenticated callers are left as-is,
   meaning the client-supplied `user`/`uid`/`gid` is trusted.
 

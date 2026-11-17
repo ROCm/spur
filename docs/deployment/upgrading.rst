@@ -649,10 +649,12 @@ a PID namespace.
 
 The new ``scancel`` calls the controller's ``SignalJob`` RPC, so upgrade
 ``spurctld`` before ``spur-cli``: a new ``scancel`` against an older controller
-refuses a signal with an error and does not cancel the job. An older ``scancel
--s`` against this controller still delivers the signal to the job's steps without
-cancelling it; its ``-b`` has no effect, and in filter mode each pending job is
-reported as an error. Upgrade the CLI for ``-b`` and ``--full``. Delivering
+refuses a signal with an error and does not cancel the job. ``CancelJob`` always
+cancels, whatever signal it carries, so a ``scancel`` from a CLI older than this
+release still cancels the job when given ``-s``, until the CLI is upgraded.
+``srun``, ``salloc`` and ``sbatch --wait`` still end the job on Ctrl-C. The C FFI
+``slurm_kill_job`` follows the same rule: signal 0 or 9 cancels, any other signal
+is delivered without cancelling, to the target its ``flags`` select. Delivering
 ``-b`` needs the ``spurd`` on the job's nodes upgraded too.
 
 Job preemption policy (``preempt_type``)

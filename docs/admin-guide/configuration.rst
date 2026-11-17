@@ -1444,7 +1444,10 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        and REST ``/job/{id}`` report it as not found. Job-control commands
        (``scontrol suspend``, ``scontrol resume``, ``scancel``) answer
        "not found" for a job the caller may not see, exactly as for a job that
-       does not exist, whatever its state or owner.
+       does not exist, whatever its state or owner. A plain ``scancel`` of such
+       a job therefore exits ``0`` silently, like one for an already-gone job,
+       ``scancel -s`` reports "not found" and exits ``1``, and REST
+       ``DELETE /job/{id}`` answers ``404``.
    * - ``"usage"``
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is

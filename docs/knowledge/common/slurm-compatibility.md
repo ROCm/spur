@@ -100,8 +100,14 @@ client-side; cancel by plain job ID.
 **scancel signals.** `-s SIG` (other than KILL/9) calls `SignalJob` and leaves
 the job running: `Steps` target by default, `Batch` with `-b` (the batch shell
 process only), `Full` with `-f` (`-f` wins over `-b`). No signal or `-s KILL`
-cancels. Kubernetes-operator nodes cannot be signalled. In a PID namespace the
-batch shell is PID 1, so `-b` only has an effect if the script traps the signal.
+cancels. Signals are numbers 1-31 or their names. Kubernetes-operator nodes
+cannot be signalled. In a PID namespace the batch shell is PID 1, so `-b` only
+has an effect if the script traps the signal, and a signal to the steps (the
+default, and `-f`) can end a step whose program traps it, because it also
+reaches the step's `nsenter`/`unshare` wrapper. With `container_entrypoint`,
+`-b` reaches a wrapper shell rather than the script and has no effect.
+`CancelJob` always cancels, whatever signal it carries; only `SignalJob`
+signals without cancelling.
 
 **sacct --jobs** filters are applied server-side: `GetJobHistoryRequest.job_ids`
 is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
