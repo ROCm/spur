@@ -1558,7 +1558,7 @@ async fn sigkill_stepd_after(
         job_id = descriptor.job_id,
         run_attempt = descriptor.run_attempt,
         step_id = descriptor.step_id,
-        "runtime grace period expired, sending SIGKILL"
+        "kill wait expired, sending SIGKILL"
     );
     let sent = crate::stepd::signal_allocation(
         descriptor,
@@ -1568,7 +1568,7 @@ async fn sigkill_stepd_after(
     .await;
     if let Err(error) = &sent {
         warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
-            "failed to SIGKILL stepd after grace period");
+            "failed to SIGKILL stepd after the kill wait");
     }
     sent.is_ok()
 }

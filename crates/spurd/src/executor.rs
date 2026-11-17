@@ -1746,10 +1746,10 @@ fn signal_pids_except(pids: &[i32], sig: Signal, except: Option<i32>) -> usize {
 /// include descendants a process-group signal misses, and the tracked process's
 /// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
 /// A launcher gets only the signals [`TrackedProcess::spares_launcher`] lets
-/// through. CONT and the like go after the workload, because `nsenter` that
-/// wakes while its child is still stopped stops itself again and never resumes
-/// it. KILL goes before it: a launcher that outlives its worker's death relays
-/// the worker's status as its own exit.
+/// through. CONT goes after the workload: the workload is continued first, so
+/// an `nsenter` that has not yet read its child's stop report never reads it
+/// and does not stop itself. KILL goes before it: a launcher that outlives its
+/// worker's death relays the worker's status as its own exit.
 pub fn deliver_signal(
     cgroup_path: Option<&Path>,
     job: &RunningJob,
