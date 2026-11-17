@@ -225,7 +225,8 @@ on every path). The launcher dies on signals it has no handler for, which would
 end the step while the workload still runs. So every signal except KILL and
 CONT skips the launcher: the cgroup walk excludes its pid, and the fallback
 (`RunningJob::signal_workload`) signals its descendants instead of the process
-group. SIGKILL takes the launcher down with the workload. SIGCONT reaches it
+group. SIGKILL takes the launcher down with the workload, launcher first, so
+it cannot relay the dying workload's status as its own exit. SIGCONT reaches it
 too, after the workload: `nsenter` stops itself when its child stops and
 resumes the child only once resumed. SIGSTOP does not: `nsenter` mirrors the
 child's stop by itself, and a second, external stop can leave it stopped for

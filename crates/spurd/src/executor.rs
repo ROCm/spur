@@ -1720,24 +1720,36 @@ pub fn cgroup_signal_except(
     sig: Signal,
     except: Option<i32>,
 ) -> std::io::Result<usize> {
-    let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
-    let mut signaled = 0;
-    for pid_str in pids.lines() {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if Some(pid) != except && signal::kill(Pid::from_raw(pid), sig).is_ok() {
-                signaled += 1;
-            }
-        }
-    }
-    Ok(signaled)
+    Ok(signal_pids_except(
+        &cgroup_member_pids(cgroup_path)?,
+        sig,
+        except,
+    ))
+}
+
+fn cgroup_member_pids(cgroup_path: &Path) -> std::io::Result<Vec<i32>> {
+    let procs = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
+    Ok(procs
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect())
+}
+
+fn signal_pids_except(pids: &[i32], sig: Signal, except: Option<i32>) -> usize {
+    pids.iter()
+        .filter(|pid| Some(**pid) != except)
+        .filter(|pid| signal::kill(Pid::from_raw(**pid), sig).is_ok())
+        .count()
 }
 
 /// Delivers `sig` to a job's workload: the cgroup's processes first, since they
 /// include descendants a process-group signal misses, and the tracked process's
 /// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
 /// A launcher gets only the signals [`TrackedProcess::spares_launcher`] lets
-/// through, and always after the workload: `nsenter` that wakes while its child
-/// is still stopped stops itself again and never resumes it.
+/// through. CONT and the like go after the workload, because `nsenter` that
+/// wakes while its child is still stopped stops itself again and never resumes
+/// it. KILL goes before it: a launcher that outlives its worker's death relays
+/// the worker's status as its own exit.
 pub fn deliver_signal(
     cgroup_path: Option<&Path>,
     job: &RunningJob,
@@ -1747,9 +1759,19 @@ pub fn deliver_signal(
     let launcher = job
         .live_pid()
         .filter(|_| tracked == TrackedProcess::Launcher);
-    match cgroup_path.map(|path| cgroup_signal_except(path, sig, launcher)) {
-        Some(Ok(count)) if count > 0 => {
-            signal_launcher(launcher, tracked, sig);
+    let except = launcher.filter(|_| tracked.behind_launcher(sig));
+    // Read before anything is signalled: killing the launcher first reparents
+    // its children, and the fallback tree walk below could no longer find them.
+    let members = cgroup_path.map(cgroup_member_pids);
+    match members {
+        Some(Ok(pids)) if pids.iter().any(|pid| Some(*pid) != except) => {
+            if sig == Signal::SIGKILL {
+                signal_launcher(launcher, tracked, sig);
+            }
+            signal_pids_except(&pids, sig, except);
+            if sig != Signal::SIGKILL {
+                signal_launcher(launcher, tracked, sig);
+            }
             Ok(())
         }
         Some(Err(error)) => {
