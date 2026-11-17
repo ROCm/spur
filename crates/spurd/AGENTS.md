@@ -485,9 +485,8 @@ metrics).
 - Jobs are forked as their own process-group leaders. Signals go to the
   negative PID (the whole group), not just the tracked process. The one
   exception is the `SignalJob` batch target, which signals only the batch
-  shell's PID. For a container with `container_entrypoint` that PID is an `sh -c`
-  wrapper (the script shell is its child), so the batch target does not reach the
-  script's shell there.
+  shell's PID; its `container_entrypoint` consequence is under "scancel signals"
+  in [slurm-compatibility](../../docs/knowledge/common/slurm-compatibility.md).
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a
