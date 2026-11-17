@@ -118,6 +118,39 @@ def test_deleted_node_stays_out_until_its_agent_restarts(cluster):
     wait_node_state(cluster, name, ["idle"])
 
 
+def test_readded_node_runs_jobs(cluster):
+    index, name = _delete_last_node(cluster)
+    _wait_told_deleted(cluster, index)
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
+
+    output = f"{cluster.remote_dir}/delete-readded.out"
+    out = cluster.sbatch(["-N", "1", "-w", name, "-t", "2", "--wrap", "echo readded", "-o", output])
+    job_id = parse_job_id(out)
+    assert job_id is not None, out
+    try:
+        wait_job_state(cluster, job_id, "CD")
+        assert "JobState=COMPLETED" in cluster.scontrol("show", "job", str(job_id))
+        assert cluster.nodes[index].exec(f"cat {output}").strip() == "readded"
+    finally:
+        cluster.cli_allow_fail(["scancel", str(job_id)])
+
+
+def test_second_delete_keeps_the_restarted_agent_out(cluster):
+    index, name = _delete_last_node(cluster)
+    _wait_told_deleted(cluster, index)
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
+    assert DELETED not in cluster.spurd_log(index)
+
+    _delete_last_node(cluster)
+    _wait_told_deleted(cluster, index)
+    assert name not in cluster.sinfo_nodes()
+
+    cluster.restart_agent(index)
+    wait_node_state(cluster, name, ["idle"])
+
+
 def test_deleted_node_stays_out_across_a_controller_restart(cluster):
     if cluster.ha_controller_count > 1:
         pytest.skip("restart_controller() supports one controller")
