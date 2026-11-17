@@ -446,25 +446,22 @@ mod tests {
     fn gpu_device_entry(device_id: u32) -> DeviceEntry {
         use crate::registry::entry::{DeviceCapability, DeviceEntry};
         DeviceEntry {
-            index: device_id,
+            numa_node: None,
+            cores: None,
             gres_name: "gpu".into(),
             resource_type: None,
             kind: "amd.com/gpu".into(),
             device_id,
             capability: DeviceCapability::Injectable,
             memory_mb: 0,
-            numa_node: None,
-            cores: None,
             links: None,
             link_type: None,
             pci_bdf: None,
             vendor: Some("amd".into()),
             inject_actions: InjectActions::default(),
             capacity: 1,
-            allocated: 0,
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
-            device_paths: Vec::new(),
             topology: None,
             stable_id: 0,
         }

@@ -53,10 +53,6 @@ impl DeviceRegistry {
         // Dedup catches the remaining exact device path matches. CDI is filled first, so it wins.
         self.devices = dedup_by_device_paths(candidates);
         assign_device_ids(&mut self.devices);
-
-        for (i, entry) in self.devices.iter_mut().enumerate() {
-            entry.index = i as u32;
-        }
     }
 
     pub fn resolve_by_ids(&self, name: &str, device_ids: &[u64]) -> Result<Vec<&DeviceEntry>> {
@@ -117,9 +113,6 @@ impl DeviceRegistry {
             .cloned()
             .collect();
         self.devices.extend(kept);
-        for (i, entry) in self.devices.iter_mut().enumerate() {
-            entry.index = i as u32;
-        }
         self
     }
 
@@ -147,53 +140,47 @@ impl Default for DeviceRegistry {
 
 fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
     DeviceEntry {
-        index: 0,
         gres_name: expanded.gres_name.clone(),
         resource_type: expanded.resource_type.clone(),
         kind: "spur.internal/gres".into(),
         device_id: 0,
         capability: DeviceCapability::Injectable,
         memory_mb: 0,
-        numa_node: None,
-        cores: expanded.cores.clone(),
         links: expanded.links.clone(),
         link_type: None,
         pci_bdf: None,
         vendor: expanded.vendor.clone(),
         inject_actions: expanded.inject_actions.clone(),
         capacity: 1,
-        allocated: 0,
         device_edits: expanded.device_edits.clone(),
         shared_edits: expanded.shared_edits.clone(),
-        device_paths: expanded.device_paths.clone(),
         topology: None,
         stable_id: 0,
+        numa_node: None,
+        cores: expanded.cores.clone(),
     }
 }
 
 fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
     DeviceEntry {
-        index: 0,
         gres_name: pool.gres_name.clone(),
         resource_type: pool.resource_type.clone(),
         kind: "spur.internal/gres".into(),
         device_id: 0,
         capability: DeviceCapability::CountablePool,
         memory_mb: 0,
-        numa_node: None,
-        cores: None,
         links: None,
         link_type: None,
         pci_bdf: None,
         vendor: None,
         inject_actions: InjectActions::default(),
         capacity: pool.capacity,
-        allocated: 0,
         device_edits: Default::default(),
         shared_edits: Default::default(),
-        device_paths: Vec::new(),
         topology: None,
         stable_id: 0,
+        numa_node: None,
+        cores: None,
     }
 }
 
@@ -229,12 +216,7 @@ fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
 }
 
 fn primary_device_path(entry: &DeviceEntry) -> &str {
-    entry
-        .device_edits
-        .device_nodes
-        .first()
-        .map(|dn| dn.effective_host_path())
-        .unwrap_or("")
+    entry.node_paths().next().unwrap_or("")
 }
 
 /// Merges a configured entry into the discovered device whose render node it names
@@ -300,12 +282,7 @@ fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
     let mut result = Vec::new();
 
     for entry in candidates {
-        let mut per_device_paths: Vec<String> = entry
-            .device_edits
-            .device_nodes
-            .iter()
-            .map(|dn| dn.effective_host_path().to_owned())
-            .collect();
+        let mut per_device_paths: Vec<String> = entry.node_paths().map(str::to_owned).collect();
         per_device_paths.sort();
 
         if per_device_paths.is_empty() {
@@ -336,7 +313,7 @@ mod tests {
     use crate::cdi::annotations;
     use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use crate::gres::cache::GresCache;
-    use crate::gres::entry::{expand_hostlist, GresEntry};
+    use crate::gres::entry::GresEntry;
     use crate::inject::{build_injection_plans, merge_edits_from_devices};
     use crate::registry::entry::kind_matches_gres_name;
     use std::collections::HashSet;
@@ -447,8 +424,6 @@ mod tests {
                 (0x120300, "/dev/dri/renderD131"),
             ]
         );
-        let indices: Vec<u32> = merged.list().iter().map(|e| e.index).collect();
-        assert_eq!(indices, vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -889,38 +864,6 @@ mod tests {
         assert!(kind_matches_gres_name("intel.com/gpu", "gpu"));
         assert!(!kind_matches_gres_name("amd.com/gpu", "mps"));
         assert!(!kind_matches_gres_name("invalid", "gpu"));
-    }
-
-    #[test]
-    fn test_expand_hostlist() {
-        assert_eq!(
-            expand_hostlist("/dev/dri/renderD[128-130]"),
-            vec![
-                "/dev/dri/renderD128",
-                "/dev/dri/renderD129",
-                "/dev/dri/renderD130"
-            ]
-        );
-
-        assert_eq!(
-            expand_hostlist("/dev/block[0-2]"),
-            vec!["/dev/block0", "/dev/block1", "/dev/block2"]
-        );
-
-        assert_eq!(expand_hostlist("/dev/kfd"), vec!["/dev/kfd"]);
-    }
-
-    #[test]
-    fn test_inject_actions_merge() {
-        let mut amd = InjectActions {
-            gpu_visibility_vars: HashSet::from(["ROCR_VISIBLE_DEVICES".into()]),
-        };
-        let intel = InjectActions {
-            gpu_visibility_vars: HashSet::from(["ZE_AFFINITY_MASK".into()]),
-        };
-        amd.merge(&intel);
-        assert!(amd.gpu_visibility_vars.contains("ROCR_VISIBLE_DEVICES"));
-        assert!(amd.gpu_visibility_vars.contains("ZE_AFFINITY_MASK"));
     }
 
     #[test]

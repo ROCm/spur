@@ -62,9 +62,7 @@ struct KfdGpuNode {
     domain: u32,
     hive_id: u64,
     unique_id: u64,
-    num_xcc: u32,
     vram_bytes: Option<u64>,
-    gfx_target_version: u32,
     io_links: Vec<KfdIoLink>,
 }
 
@@ -73,7 +71,6 @@ struct KfdIoLink {
     node_to: u32,
     link_type: u32,
     weight: u32,
-    max_bandwidth: u64,
 }
 
 fn discover_kfd_gpus_from_root(root: &Path) -> Vec<KfdGpuNode> {
@@ -143,12 +140,7 @@ fn discover_kfd_gpus_from_root(root: &Path) -> Vec<KfdGpuNode> {
                 .get("unique_id")
                 .and_then(|s| parse_u64(s))
                 .unwrap_or(0),
-            num_xcc: props.get("num_xcc").and_then(|s| parse_u32(s)).unwrap_or(0),
             vram_bytes,
-            gfx_target_version: props
-                .get("gfx_target_version")
-                .and_then(|s| parse_u32(s))
-                .unwrap_or(0),
             io_links,
         });
     }
@@ -217,10 +209,6 @@ fn read_io_links(node_path: &Path) -> Vec<KfdIoLink> {
             node_to,
             link_type: props.get("type").and_then(|s| parse_u32(s)).unwrap_or(0),
             weight: props.get("weight").and_then(|s| parse_u32(s)).unwrap_or(0),
-            max_bandwidth: props
-                .get("max_bandwidth")
-                .and_then(|s| parse_u64(s))
-                .unwrap_or(0),
         });
     }
 
@@ -730,14 +718,11 @@ mod tests {
                 domain: 0,
                 hive_id: 1,
                 unique_id: 1,
-                num_xcc: 4,
                 vram_bytes: Some(0),
-                gfx_target_version: 0,
                 io_links: vec![KfdIoLink {
                     node_to: 3,
                     link_type: 2,
                     weight: 20,
-                    max_bandwidth: 64000,
                 }],
             },
             KfdGpuNode {
@@ -748,14 +733,11 @@ mod tests {
                 domain: 0,
                 hive_id: 1,
                 unique_id: 2,
-                num_xcc: 4,
                 vram_bytes: Some(0),
-                gfx_target_version: 0,
                 io_links: vec![KfdIoLink {
                     node_to: 2,
                     link_type: 2,
                     weight: 20,
-                    max_bandwidth: 64000,
                 }],
             },
         ];
@@ -995,9 +977,7 @@ mod tests {
             domain: 0,
             hive_id: 0,
             unique_id: 0,
-            num_xcc: 4,
             vram_bytes: Some(0),
-            gfx_target_version: 0,
             io_links: Vec::new(),
         }
     }
