@@ -399,6 +399,11 @@ spur self-update          # download + replace binaries (stable)
 spur self-update --nightly
 ```
 
+`spur update` is the same binary-upgrade command. Both aliases parse arguments
+before invoking the updater: `--help` / `-h` prints help without network or install
+work, and unknown arguments fail with a usage error. Use `spur control update`
+for job or node changes.
+
 The updater downloads the tarball, verifies SHA-256, and replaces binaries
 atomically (rename to `.spur-old`, copy new, delete backups; rollback on
 failure).  **Does not restart daemons.**

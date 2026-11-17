@@ -54,6 +54,7 @@ src/
   scontrol.rs          scontrol -- admin control (show/update/create/delete)
   scrontab.rs          scrontab -- recurring cron-style jobs
   sdiag.rs             sdiag -- scheduler diagnostics
+  self_update.rs       Self-update argument parsing before network/install work
   sinfo.rs             sinfo -- node/partition information
   smd.rs               smd -- node health monitoring
   sprio.rs             sprio -- job priority breakdown

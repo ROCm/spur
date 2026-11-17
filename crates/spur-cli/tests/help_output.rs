@@ -8,9 +8,32 @@ fn spur_bin() -> std::path::PathBuf {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "salloc", "sbatch", "srun", "squeue", "scancel", "sinfo", "sacct", "sacctmgr", "scontrol",
-    "sprio", "sshare", "sstat", "sdiag", "sreport", "strigger", "sattach", "scrontab", "smd",
-    "net", "node", "k8s", "image", "exec", "token",
+    "salloc",
+    "sbatch",
+    "srun",
+    "squeue",
+    "scancel",
+    "sinfo",
+    "sacct",
+    "sacctmgr",
+    "scontrol",
+    "sprio",
+    "sshare",
+    "sstat",
+    "sdiag",
+    "sreport",
+    "strigger",
+    "sattach",
+    "scrontab",
+    "smd",
+    "net",
+    "node",
+    "k8s",
+    "image",
+    "exec",
+    "token",
+    "self-update",
+    "update",
 ];
 
 /// `--help` must render through clap: help text on stdout, exit 0, nothing on
@@ -96,4 +119,55 @@ fn subcommand_parse_error_fails_on_stderr() {
         String::from_utf8_lossy(&out.stderr).contains("error:"),
         "parse error should report on stderr",
     );
+}
+
+#[test]
+fn self_update_help_and_bad_arguments_do_not_replace_binaries() {
+    let dir = tempfile::TempDir::new().expect("temporary install directory");
+    let binary = dir.path().join("spur");
+    std::fs::copy(spur_bin(), &binary).expect("copy CLI into the test install directory");
+    let original = std::fs::read(&binary).expect("read CLI");
+    for name in ["spurctld", "spurd", "spurstepd", "spurauthd"] {
+        std::fs::write(dir.path().join(name), name).expect("write sibling binary fixture");
+    }
+    for command in ["self-update", "update"] {
+        for args in [vec!["--help"], vec!["-h"], vec!["--nightly", "--help"]] {
+            let out = Command::new(&binary)
+                .arg(command)
+                .args(args)
+                .env("SPUR_CONF", dir.path().join("missing.conf"))
+                .output()
+                .expect("run self-update help");
+            assert_eq!(out.status.code(), Some(0));
+            assert!(out.stderr.is_empty());
+            let stdout = String::from_utf8(out.stdout).expect("UTF-8 help");
+            assert!(stdout.contains("Usage:") && stdout.contains("--nightly"));
+            assert!(stdout.contains("spur control update"));
+        }
+        for args in [
+            vec!["--unknown"],
+            vec!["node", "n1", "state=resume"],
+            vec!["node", "n1", "--nightly"],
+        ] {
+            let out = Command::new(&binary)
+                .arg(command)
+                .args(args)
+                .env("SPUR_CONF", dir.path().join("missing.conf"))
+                .output()
+                .expect("run self-update with invalid arguments");
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"));
+        }
+    }
+    assert_eq!(
+        std::fs::read(binary).expect("read CLI after commands"),
+        original
+    );
+    for name in ["spurctld", "spurd", "spurstepd", "spurauthd"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(name)).expect("read sibling binary"),
+            name
+        );
+    }
 }

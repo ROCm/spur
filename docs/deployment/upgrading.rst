@@ -76,6 +76,11 @@ nightly channel instead of the latest stable release:
 
    spur self-update --nightly
 
+Both aliases accept ``--help`` (or ``-h``) without checking for updates or changing
+files. Unknown options and positional arguments are rejected before an update
+starts. ``spur update`` always means a binary upgrade; use ``spur control update``
+to change a job or node.
+
 The updater downloads the release tarball, verifies it against its published SHA256
 checksum, then replaces each binary atomically: the current binary is renamed to
 ``<name>.spur-old`` as a backup, the new binary is copied into place, and the backups are
