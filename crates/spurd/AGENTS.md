@@ -515,11 +515,13 @@ metrics).
   there. `CancelStep` on a supervised step goes through its supervisor
   (`SignalAllocation`) and arms a SIGKILL after `STEP_CANCEL_ESCALATION`
   (`MIN_KILL_WAIT`, 5 s), since a container's command is PID 1 and ignores
-  unhandled signals. Both run detached, so a wedged supervisor or a dropped
-  `CancelStep` RPC cannot skip the SIGKILL. Only if the supervisor is unreachable, or the step has
-  none, does it use `signal_step_tree` with the `TrackedProcess` recorded on the
-  `ActiveStep` (a supervised step's tracked pid is the supervisor's workload
-  pid, so it can be a launcher), again with the epoch-checked SIGKILL.
+  unhandled signals. Both run detached, so a dropped `CancelStep` RPC cannot
+  skip the SIGKILL. It is a request to the same supervisor, so a wedged one can
+  still fail to deliver it; job-level teardown (`force_kill_stepd`) bounds that
+  case. Only if the supervisor is unreachable, or the step has none, does it
+  use `signal_step_tree` with the `TrackedProcess` recorded on the `ActiveStep`
+  (a supervised step's tracked pid is the supervisor's workload pid, so it can
+  be a launcher), again with the epoch-checked SIGKILL.
   Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
   with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked

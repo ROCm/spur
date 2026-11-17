@@ -607,9 +607,11 @@ class TestGracePartialExitKeepsOtherRankRunning:
     def cluster_config_overrides(self):
         return _config("cancel")
 
-    # Rank 0 runs on the batch node, where a root agent wraps a joined step in
-    # `nsenter`; rank 1 runs on the other node. Each rank is the survivor once, so
-    # the wrapped step is checked as the one that must keep running.
+    # On a root agent rank 0, on the batch node, runs behind `nsenter` (it joins the
+    # job's namespaces), and rank 1, on the other node, behind `unshare --pid --mount
+    # --fork`. That node's allocation holder is unwrapped but the step is not
+    # (`would_use_namespaces`). Each rank is the survivor once, so both launchers are
+    # checked as the one whose step must keep running.
     @pytest.mark.parametrize(
         "leaving_rank", [0, 1], ids=["rank0-leaves-rank1-keeps-running", "rank1-leaves-rank0-keeps-running"]
     )
