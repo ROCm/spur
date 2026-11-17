@@ -94,6 +94,16 @@ def _job_field(cluster, job_id: int, key: str) -> str:
     return ""
 
 
+def _partition_qos(show: str, name: str) -> str:
+    for block in show.split("PartitionName=")[1:]:
+        fields = block.split()
+        if fields and fields[0] == name:
+            for field in fields:
+                if field.startswith("QoS="):
+                    return field.removeprefix("QoS=")
+    return ""
+
+
 def _partition_of(cluster, job_id: int) -> str:
     return _job_field(cluster, job_id, "EffectivePartition")
 
@@ -314,7 +324,8 @@ class TestPartitionQosReviewCases:
             c.scontrol("reconfigure")
             show = c.scontrol("show", "partition", "open")
             print(show)
-            assert "QoS=usercap" in show, f"reconfigure dropped the runtime QOS:\n{show}"
+            qos = _partition_qos(show, "open")
+            assert qos == "usercap", f"reconfigure left QoS={qos} on open:\n{show}"
 
             first = _submit(c, "a1", "acct-a", "-p", "open")
             ids.append(first)
