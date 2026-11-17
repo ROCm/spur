@@ -8,6 +8,10 @@ A victim with a grace is warned (SIGCONT, SIGTERM to its srun steps only) and st
 until the deadline, then the partition's preempt_mode cancels or requeues it. Needs Postgres
 on node 0 for the preemption tests (accounting_cluster fixture); the time-limit test needs
 only the plain cluster.
+
+Every test runs twice, with spurd as a regular user and as root. Only a root spurd wraps a
+job in namespaces behind a launcher (``unshare`` for the batch script, ``nsenter`` for an
+srun step), so only that mode shows whether a warning signal reaches the work behind it.
 """
 
 import re
@@ -69,6 +73,25 @@ _KILL_WAIT_MARGIN_SECS = 5
 _ZERO_GRACE_END_BOUND = _KILL_WAIT_SECS + 20
 
 _QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
+
+# One checkpoint line a second: long enough to span several polls, short enough to end
+# well inside _GRACE_SECS even after the scheduler's delay in delivering the warning.
+_SINGLE_NODE_CHECKPOINT_SECS = 20
+_CHECKPOINT_PROGRESS_LINES = 5
+
+# Time limit of the stubborn job. It has to outlast the srun step starting and installing
+# its traps, which is awaited after the job is already running.
+_STUBBORN_TIME_LIMIT = "00:00:30"
+# Probes of "still running" sit this far before the kill wait expires, and span a window
+# long enough to hold a tick at one a second.
+_KILL_WAIT_PROBE_END_SECS = 2
+_KILL_WAIT_PROBE_SPAN_SECS = 2
+
+
+@pytest.fixture(params=[False, True], ids=["user-spurd", "root-spurd"])
+def agent_as_root(request):
+    """Run every test in this module with spurd as a regular user and again as root."""
+    return request.param
 
 
 def _config(preempt_mode: str) -> dict:
@@ -159,12 +182,100 @@ def _submit_victim(cluster, prefix: str, *, sbatch_args: list[str],
     assert job_id is not None, "victim submit failed"
     wait_job_state(cluster, job_id, "R", timeout=60)
     _assert_scontrol_state(cluster, job_id, "RUNNING", "victim initial")
+    _wait_steps_ready(cluster, job_id, ready_marker, nodes)
+    return _Victim(job_id, step_marker, batch_marker)
+
+
+def _wait_steps_ready(cluster, job_id: int, ready_marker: str, nodes: int) -> None:
     wait_until(
         lambda: _marker_lines(cluster, ready_marker).count("READY") == nodes,
         timeout_s=_STEP_READY_WAIT_SECS, interval_s=1,
         desc=f"job {job_id}'s srun step to install its signal traps on {nodes} node(s)",
     )
-    return _Victim(job_id, step_marker, batch_marker)
+
+
+class _StubbornJob:
+    """A job whose batch script and srun step both trap SIGTERM and keep ticking."""
+
+    def __init__(self, job_id: int, step_term: str, batch_term: str, step_ticks: str, batch_ticks: str):
+        self.job_id = job_id
+        self.step_term = step_term
+        self.batch_term = batch_term
+        self.step_ticks = step_ticks
+        self.batch_ticks = batch_ticks
+
+
+def _submit_stubborn(cluster, prefix: str, *, node: str, sbatch_args: list[str]) -> _StubbornJob:
+    """Submit a job that records SIGTERM and carries on, then wait for its srun step's traps.
+
+    Both scripts write a tick line a second, so a test can tell whether each is still alive
+    at a given moment without relying on the job state alone. The batch script leaves when
+    its step does, so a step that dies early also ends the job.
+    """
+    def marker(name: str) -> str:
+        return f"{cluster.remote_dir}/{prefix}-{name}.marker"
+
+    step_script = cluster.write_file(
+        f"{prefix}-step.sh",
+        "#!/bin/bash\n"
+        f"trap 'echo TERM >> {marker('step-term')}' TERM\n"
+        f"echo READY >> {marker('ready')}\n"
+        f"while true; do echo tick >> {marker('step-ticks')}; sleep 1; done\n",
+        all_nodes=True,
+    )
+    batch_script = cluster.write_file(
+        f"{prefix}-stubborn.sh",
+        "#!/bin/bash\n"
+        f"trap 'echo TERM >> {marker('batch-term')}' TERM\n"
+        f"srun -N1 {step_script} &\n"
+        "pid=$!\n"
+        f'while kill -0 "$pid" 2>/dev/null; do echo tick >> {marker("batch-ticks")}; sleep 1; done\n',
+    )
+    job_id = parse_job_id(
+        cluster.sbatch(["-N1", f"--nodelist={node}", "-J", prefix, *sbatch_args, batch_script])
+    )
+    assert job_id is not None, f"{prefix} submit failed"
+    wait_job_state(cluster, job_id, "R", timeout=60)
+    _wait_steps_ready(cluster, job_id, marker("ready"), 1)
+    return _StubbornJob(job_id, marker("step-term"), marker("batch-term"),
+                        marker("step-ticks"), marker("batch-ticks"))
+
+
+def _tick_counts(cluster, job: _StubbornJob) -> dict[str, int]:
+    return {
+        "srun step": _marker_lines(cluster, job.step_ticks).count("tick"),
+        "batch script": _marker_lines(cluster, job.batch_ticks).count("tick"),
+    }
+
+
+def _sleep_until(deadline: float) -> None:
+    remaining = deadline - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _assert_ticking_through_kill_wait(cluster, job: _StubbornJob, kill_wait_secs: int,
+                                      event_at: float, event: str) -> None:
+    """Both scripts must still tick just before the kill wait that began at *event_at* ends."""
+    probe_end = event_at + kill_wait_secs - _KILL_WAIT_PROBE_END_SECS
+    _sleep_until(probe_end - _KILL_WAIT_PROBE_SPAN_SECS)
+    earlier = _tick_counts(cluster, job)
+    _sleep_until(probe_end)
+    later = _tick_counts(cluster, job)
+    for role, count in later.items():
+        assert count > earlier[role], (
+            f"job {job.job_id}'s {role} stopped ticking ({earlier[role]} lines, then {count}) "
+            f"within the {kill_wait_secs}s kill wait after {event}: SIGTERM must leave it "
+            f"running until the kill wait expires, so it ended early"
+        )
+
+
+def _assert_stubborn_got_term(cluster, job: _StubbornJob, event: str) -> None:
+    """Surviving only means something if the SIGTERM really reached the scripts."""
+    for role, path in (("srun step", job.step_term), ("batch script", job.batch_term)):
+        assert "TERM" in _marker_lines(cluster, path), (
+            f"job {job.job_id}'s {role} never recorded the SIGTERM sent on {event}"
+        )
 
 
 def _queue_aggressor(cluster, prefix: str, *, sbatch_args: list[str], nodes: int = 1) -> int:
@@ -279,6 +390,72 @@ class TestGraceCancelMode:
             _cleanup(cluster, victim.job_id, aggressor_id)
 
 
+class TestGraceCheckpointSingleNode:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config("cancel")
+
+    def test_grace_checkpoint_single_node(self, accounting_cluster):
+        cluster = accounting_cluster
+        node = cluster.node_names[0]
+        _create_graced_qos_pair(cluster)
+        checkpoint_marker = f"{cluster.remote_dir}/single-checkpoint.marker"
+        on_term = (
+            f"for i in $(seq 1 {_SINGLE_NODE_CHECKPOINT_SECS}); "
+            f"do echo ckpt >> {checkpoint_marker}; sleep 1; done; exit 0"
+        )
+        victim = _submit_victim(cluster, "single", sbatch_args=[f"--nodelist={node}"],
+                                step_on_term=on_term)
+        aggressor_id = _queue_aggressor(cluster, "single", sbatch_args=[f"--nodelist={node}"])
+
+        try:
+            warned_at = _wait_for_warning(cluster, victim)
+            wait_until(
+                lambda: len(_marker_lines(cluster, checkpoint_marker)) >= _CHECKPOINT_PROGRESS_LINES
+                or job_state(cluster.squeue_all(), victim.job_id) != "R",
+                timeout_s=_WARNING_WAIT_SECS, interval_s=1,
+                desc=f"job {victim.job_id}'s step to checkpoint or its job to end",
+            )
+            written = len(_marker_lines(cluster, checkpoint_marker))
+            state = job_state(cluster.squeue_all(), victim.job_id)
+            assert state == "R" and written >= _CHECKPOINT_PROGRESS_LINES, (
+                f"job {victim.job_id} (victim) was warned and its srun step is checkpointing: "
+                f"expected it RUNNING with at least {_CHECKPOINT_PROGRESS_LINES} checkpoint lines, "
+                f"got state {state!r} and {written} lines; the step ended during its grace "
+                f"instead of being left to checkpoint"
+            )
+            _assert_scontrol_state(cluster, victim.job_id, "RUNNING", "victim while checkpointing")
+            assert job_state(cluster.squeue_all(), aggressor_id) == "PD", (
+                "the preemptor must wait while the victim's step is checkpointing"
+            )
+
+            terminal = wait_job(cluster, victim.job_id, timeout=_GRACE_SECS)
+            assert time.time() - warned_at < _GRACE_SECS, (
+                f"job {victim.job_id} (victim) must end before its {_GRACE_SECS}s grace deadline"
+            )
+            written = len(_marker_lines(cluster, checkpoint_marker))
+            assert written == _SINGLE_NODE_CHECKPOINT_SECS, (
+                f"job {victim.job_id}'s srun step wrote {written} of "
+                f"{_SINGLE_NODE_CHECKPOINT_SECS} checkpoint lines: it was ended during its "
+                f"grace instead of being allowed to finish"
+            )
+            assert _marker_lines(cluster, victim.step_marker).count("TERM") == 1, (
+                f"job {victim.job_id}'s srun step must be warned exactly once"
+            )
+            assert terminal in ("CA", "GONE"), (
+                f"a victim that finishes its checkpoint is preempted, not completed; got {terminal!r}"
+            )
+            if terminal != "GONE":
+                _assert_scontrol_state(cluster, victim.job_id, "CANCELLED", "victim after checkpoint")
+
+            wait_job_state(cluster, aggressor_id, "R", timeout=_SLACK_SECS)
+            assert wait_job(cluster, aggressor_id, timeout=_SLACK_SECS) == "CD"
+            _assert_no_launch_rejection(cluster)
+            _assert_sacct_preempted(cluster, victim.job_id, aggressor_id)
+        finally:
+            _cleanup(cluster, victim.job_id, aggressor_id)
+
+
 class TestGraceRequeueMode:
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -375,8 +552,11 @@ class TestExitDuringGrace:
 
 
 @pytest.fixture
-def two_node_accounting_cluster(ssh_nodes, request):
-    """accounting_cluster, skipped before any deploy when fewer than 2 nodes exist."""
+def two_node_accounting_cluster(ssh_nodes, agent_as_root, request):
+    """accounting_cluster, skipped before any deploy when fewer than 2 nodes exist.
+
+    Takes agent_as_root only so pytest parametrises the tests using it; the value is
+    read by accounting_cluster."""
     if len(ssh_nodes) < 2:
         pytest.skip(
             f"Multi-node tests require at least 2 nodes in SPUR_TEST_NODES "
@@ -599,3 +779,59 @@ class TestTimeLimitKillWait:
             assert "Reason=TimeLimit" in show, show
         finally:
             _cleanup(cluster, job_id)
+
+
+class TestCancelKillWaitReachesSteps:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {**_AUTH_ROOT, "scheduler": {"kill_wait_secs": _KILL_WAIT_SECS}}
+
+    def test_scancel_kill_wait_reaches_srun_steps(self, cluster):
+        job = _submit_stubborn(cluster, "cancel-wait", node=cluster.node_names[0], sbatch_args=[])
+
+        try:
+            cancelled_at = time.time()
+            cluster.scancel(job.job_id)
+
+            _assert_ticking_through_kill_wait(cluster, job, _KILL_WAIT_SECS, cancelled_at, "scancel")
+            _assert_stubborn_got_term(cluster, job, "scancel")
+            assert wait_job(cluster, job.job_id, timeout=_KILL_WAIT_SECS + _SLACK_SECS) == "CA", (
+                f"the job must end CANCELLED once the kill wait is over:\n{cluster.debug_job(job.job_id)}"
+            )
+        finally:
+            _cleanup(cluster, job.job_id)
+
+
+class TestTimeLimitKillWaitReachesSteps:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            **_AUTH_ROOT,
+            "scheduler": {"timeout_kill_wait_secs": _LONG_TIMEOUT_KILL_WAIT_SECS},
+        }
+
+    def test_time_limit_kill_wait_reaches_srun_steps(self, cluster):
+        job = _submit_stubborn(cluster, "limit-wait", node=cluster.node_names[0],
+                               sbatch_args=[f"--time={_STUBBORN_TIME_LIMIT}"])
+
+        try:
+            wait_job_state(cluster, job.job_id, "CG", timeout=_SLACK_SECS + 30)
+            in_completing_since = time.time()
+
+            _assert_ticking_through_kill_wait(
+                cluster, job, _LONG_TIMEOUT_KILL_WAIT_SECS, in_completing_since, "the time limit",
+            )
+            _assert_stubborn_got_term(cluster, job, "the time limit")
+            assert job_state(cluster.squeue_all(), job.job_id) == "CG", (
+                f"job {job.job_id} must stay COMPLETING for the whole {_LONG_TIMEOUT_KILL_WAIT_SECS}s "
+                f"timeout kill wait while its srun step keeps running"
+            )
+
+            assert wait_job(cluster, job.job_id, timeout=_LONG_TIMEOUT_KILL_WAIT_SECS + _SLACK_SECS) == "TO", (
+                f"the job must end TIMEOUT once the kill wait is over:\n{cluster.debug_job(job.job_id)}"
+            )
+            show = cluster.scontrol("show", "job", str(job.job_id))
+            assert "JobState=TIMEOUT" in show, show
+            assert "Reason=TimeLimit" in show, show
+        finally:
+            _cleanup(cluster, job.job_id)

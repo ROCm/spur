@@ -195,12 +195,23 @@ def cluster_config_overrides():
 
 
 @pytest.fixture
-def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+def agent_as_root():
+    """Override this fixture in tests/modules to run spurd as root (via sudo).
+
+    Read by the ``cluster`` and ``accounting_cluster`` fixtures. Defaults to a
+    regular-user spurd, so a file that does not override it is unaffected.
+    """
+    return False
+
+
+@pytest.fixture
+def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, agent_as_root):
     """
     Per-test fixture: a fully running Spur cluster with default config.
     Torn down (processes killed, dirs removed) after the test.
     """
     spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir,
+                                   agent_as_root=agent_as_root,
                                    config_overrides=cluster_config_overrides)
     yield spur_cluster
     spur_cluster.teardown()
@@ -351,7 +362,7 @@ def ha_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
-def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, agent_as_root):
     """
     Per-test fixture: a running cluster with Postgres on node 0.
 
@@ -371,7 +382,7 @@ def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     except RuntimeError as e:
         pytest.skip(str(e))
     try:
-        c.deploy(config_overrides=cluster_config_overrides)
+        c.deploy(config_overrides=cluster_config_overrides, agent_as_root=agent_as_root)
     except Exception:
         c.teardown()
         raise
