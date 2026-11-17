@@ -353,6 +353,18 @@ impl ResourceRequest {
             .or_insert(0) += count;
     }
 
+    /// Each gres's typed keys before its untyped one, so `nic:pollara400` gets
+    /// its type before a plain `nic` takes from the same devices.
+    pub fn devices_typed_first(&self) -> Vec<(&DeviceKey, u32)> {
+        let mut keys: Vec<(&DeviceKey, u32)> = self
+            .devices
+            .iter()
+            .map(|(key, &count)| (key, count))
+            .collect();
+        keys.sort_by_key(|(key, _)| (key.gres_name.as_str(), key.device_type.is_none()));
+        keys
+    }
+
     /// Replace every request for `gres_name` with `count` devices of `device_type`.
     pub fn set_devices(&mut self, gres_name: &str, device_type: Option<&str>, count: u32) {
         self.devices.retain(|key, _| key.gres_name != gres_name);
@@ -473,6 +485,11 @@ impl ResourceSet {
                 Some((name, t)) => (name, Some(t)),
                 None => (pool.as_str(), None),
             };
+            // A pool sharing its name with a kind handed out by id is not
+            // requestable here; the job already takes every such device.
+            if self.allocates_by_id(name) {
+                continue;
+            }
             request.add_devices(name, device_type, u32::try_from(count).unwrap_or(u32::MAX));
         }
         request
@@ -494,20 +511,39 @@ impl ResourceSet {
         if avail_cpus < request.cpus || avail_mem < request.memory_mb {
             return false;
         }
-        request
-            .devices
-            .iter()
-            .all(|(key, &count)| self.free_count(allocated, key) >= u64::from(count))
+        // Picks are simulated so typed and untyped keys of one gres cannot both
+        // count the same free device.
+        let mut picked = allocated.clone();
+        for (key, count) in request.devices_typed_first() {
+            if !self.allocates_by_id(&key.gres_name) {
+                if self.free_pool_count(allocated, key) < u64::from(count) {
+                    return false;
+                }
+                continue;
+            }
+            let free =
+                self.available_device_ids(&picked, &key.gres_name, key.device_type.as_deref());
+            if free.len() < count as usize {
+                return false;
+            }
+            picked
+                .devices
+                .entry(key.gres_name.clone())
+                .or_default()
+                .extend(
+                    free.into_iter()
+                        .take(count as usize)
+                        .map(|device_id| AllocatedDevice {
+                            device_id,
+                            count: 1,
+                        }),
+                );
+        }
+        true
     }
 
-    /// Free units of `key`: specific devices when this node hands the gres out
-    /// by id, otherwise what is left of its countable pool.
-    fn free_count(&self, allocated: &ResourceAllocations, key: &DeviceKey) -> u64 {
-        if self.allocates_by_id(&key.gres_name) {
-            return self
-                .available_device_ids(allocated, &key.gres_name, key.device_type.as_deref())
-                .len() as u64;
-        }
+    /// What is left of the countable pool `key` names.
+    fn free_pool_count(&self, allocated: &ResourceAllocations, key: &DeviceKey) -> u64 {
         let pool = key.generic_key();
         self.generic
             .get(&pool)
@@ -657,7 +693,7 @@ pub fn build_node_allocation(
     let mut alloc = ResourceAllocations::with_scalar(request.cpus, request.memory_mb);
     alloc.generation = inventory.generation;
 
-    for (key, &count) in &request.devices {
+    for (key, count) in request.devices_typed_first() {
         if count == 0 {
             continue;
         }
@@ -1624,6 +1660,50 @@ mod device_inventory_tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn nic_request(untyped: u32, typed: u32) -> ResourceRequest {
+        let mut request = ResourceRequest::with_scalar(1, 0);
+        request.add_devices("nic", None, untyped);
+        request.add_devices("nic", Some("pollara400"), typed);
+        request
+    }
+
+    #[test]
+    fn typed_and_untyped_requests_for_one_gres_share_its_devices() {
+        let node = gpu_and_nic_node();
+        assert!(node.can_satisfy(&nic_request(1, 1)));
+        assert!(
+            !node.can_satisfy(&nic_request(2, 1)),
+            "three NICs cannot come from two"
+        );
+    }
+
+    #[test]
+    fn a_typed_request_gets_its_type_before_an_untyped_one_takes_it() {
+        let node = ResourceSet {
+            cpus: 4,
+            devices: vec![nic(0x050000, 0), Device::new("nic", "cx7", 0x060000, 1)],
+            ..Default::default()
+        };
+        let request = nic_request(1, 1);
+        assert!(node.can_satisfy(&request));
+        let alloc = build_node_allocation(&node, &ResourceAllocations::default(), &request);
+        let mut ids = alloc.device_ids("nic");
+        ids.sort();
+        assert_eq!(ids, vec![0x050000, 0x060000]);
+    }
+
+    #[test]
+    fn an_exclusive_job_fits_a_node_with_a_countable_pool_named_like_a_device_kind() {
+        let node = ResourceSet {
+            cpus: 4,
+            memory_mb: 1024,
+            devices: vec![nic(0x050000, 0)],
+            generic: HashMap::from([("gpu".to_string(), 8), ("nic".to_string(), 4)]),
+            ..Default::default()
+        };
+        assert!(node.can_satisfy(&node.as_request()));
     }
 
     #[test]
