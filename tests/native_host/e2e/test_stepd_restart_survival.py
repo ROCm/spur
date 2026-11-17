@@ -245,6 +245,9 @@ class TestSupervisedGpuReclaim:
     cancel has to free it, not just wait on a teardown that will never come.
     """
 
+    # The agent's non-lethal CancelJob path (confirmed-dead fencing with no
+    # release-wait) is covered only by the unit test
+    # send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal.
     def test_cancelling_a_job_whose_supervisor_died_frees_its_gpu_promptly(
         self, gpu_cluster
     ):
@@ -297,65 +300,6 @@ class TestSupervisedGpuReclaim:
         try:
             # Well inside the crash watchdog's own ~15s tick, so only the
             # cancel's own reclaim can explain a release this fast.
-            wait_job_state(cluster, retry_id, "R", timeout=10)
-        finally:
-            cluster.scancel(str(retry_id))
-
-    # `scancel --signal KILL` is the one signal form that still cancels: the CLI
-    # maps it to CancelJob, as it does a plain scancel. No CLI command delivers a
-    # non-lethal signal through the agent's CancelJob any more (`--signal USR1`
-    # goes to SignalJob, which never fences), so that path is covered only by the
-    # agent's unit tests.
-    def test_scancel_signal_kill_reclaims_a_confirmed_dead_supervisors_gpu(
-        self, gpu_cluster
-    ):
-        cluster = gpu_cluster
-        cluster.gpu_preflight(1)
-        node = cluster.node_names[0]
-        gpu_count = cluster.node_gpu_count(node)
-        assert gpu_count >= 1, f"{node} must expose at least one schedulable GPU"
-        gres = f"--gres=gpu:{gpu_count}"
-
-        before = _supervisor_pids(cluster)
-        hold = cluster.write_file(
-            "gpu-signal-kill-reclaim-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
-        )
-        job_id = parse_job_id(
-            cluster.sbatch(["-J", "gpu-signal-kill-reclaim", "-N", "1", "-w", node, gres, hold])
-        )
-        assert job_id is not None
-        try:
-            wait_job_state(cluster, job_id, "R")
-
-            new_pids = _supervisor_pids(cluster) - before
-            assert len(new_pids) == 1, (
-                f"expected exactly one new supervisor for job {job_id}, got {new_pids}"
-            )
-            supervisor_pid = next(iter(new_pids))
-
-            prefix = cluster._sudo_prefix() if cluster.agent_as_root else ""
-            cluster.nodes[0].exec_allow_fail(f"{prefix}kill -9 {supervisor_pid}")
-
-            deadline = time.time() + 30
-            while supervisor_pid in _supervisor_pids(cluster):
-                assert time.time() < deadline, f"supervisor {supervisor_pid} did not die"
-                time.sleep(1)
-
-            cluster.cli(["scancel", "--signal", "KILL", str(job_id)])
-            assert wait_job(cluster, job_id, timeout=60) in ("CA", "CD", "F", "GONE"), (
-                "the controller must still see a terminal state: a bare local "
-                "release without reporting completion would leave it Running there"
-            )
-        finally:
-            cluster.cli_allow_fail(["scancel", str(job_id)])
-
-        retry_id = parse_job_id(
-            cluster.sbatch(
-                ["-J", "gpu-signal-kill-reclaim-retry", "-N", "1", "-w", node, gres, hold]
-            )
-        )
-        assert retry_id is not None
-        try:
             wait_job_state(cluster, retry_id, "R", timeout=10)
         finally:
             cluster.scancel(str(retry_id))
