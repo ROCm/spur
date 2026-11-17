@@ -1120,6 +1120,18 @@ release cannot load the snapshot. To downgrade:
    move it along.
 #. Downgrade the controllers.
 
+Node epilog after a failed launch
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The node ``epilog`` now also runs when a launch fails after the node
+``prolog`` ran, before the agent reports the failure. Before, nothing undid
+the prolog for a job that never started, so whatever it wrote, such as the
+exporter label files in :doc:`/admin-guide/dme-integration`, stayed on the
+node. An epilog that assumes the job ran, for example one that reads the
+job's output, now also sees jobs that never started. It gets the same
+environment as the prolog, and a failure drains the node as it does after a
+normal job.
+
 See Also
 --------
 
