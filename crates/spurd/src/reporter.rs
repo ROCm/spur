@@ -5024,4 +5024,97 @@ mod tests {
         std::fs::write(dir.path().join(FENCES_FILE), b"{").unwrap();
         assert_eq!(load_fences(dir.path()), Fences::default());
     }
+
+    /// Written by the last build before the generic device inventory. An upgraded
+    /// agent must still read it, or a restart loses its id-rename precision.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_BASELINE_JSON: &str = r#"{
+        "cpus": 64,
+        "memory_mb": 524288,
+        "gpus": [
+            {
+                "device_id": 0,
+                "gpu_type": "mi300x",
+                "memory_mb": 196608,
+                "peer_gpus": [1],
+                "link_type": "XGMI",
+                "stable_id": 1114112,
+                "topology": {
+                    "pci_bdf": "0000:11:00.0",
+                    "numa_node": 0,
+                    "pci_root": "pci0000:00",
+                    "vram_bytes": 206158430208,
+                    "fabric": null
+                },
+                "numa_node": 0,
+                "affinity_cpus": [0, 1, 64, 65]
+            },
+            {
+                "device_id": 1,
+                "gpu_type": "mi300x",
+                "memory_mb": 196608,
+                "peer_gpus": [0],
+                "link_type": "XGMI",
+                "stable_id": 1179648,
+                "topology": null,
+                "numa_node": 1,
+                "affinity_cpus": []
+            }
+        ],
+        "generic": {
+            "bandwidth:lustre": 4096
+        },
+        "generation": 5,
+        "fabric_binding_version": 3,
+        "block_file_revision": null
+    }"#;
+
+    /// Same build as the baseline above; a fence pins pre-repartition GPUs.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_FENCES_JSON: &str = r#"{
+        "anchors": {
+            "1114112": [
+                {
+                    "device_id": 0,
+                    "gpu_type": "mi300x",
+                    "memory_mb": 49152,
+                    "peer_gpus": [],
+                    "link_type": "PCIe",
+                    "stable_id": 1114113,
+                    "topology": null,
+                    "numa_node": 0,
+                    "affinity_cpus": [0, 1]
+                }
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn a_baseline_from_an_older_build_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(BASELINE_FILE), FROZEN_BASELINE_JSON).unwrap();
+
+        let baseline = load_baseline(dir.path()).expect("an older baseline must load");
+        let ids: Vec<u64> = baseline.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(ids, vec![0x110000, 0x120000]);
+        assert_eq!(baseline.gpus[0].gpu_type, "mi300x");
+        assert_eq!(baseline.generation, 5);
+        assert_eq!(baseline.generic.get("bandwidth:lustre"), Some(&4096));
+        assert_eq!(baseline.gpus[0].numa_node, Some(0));
+        assert_eq!(baseline.gpus[0].affinity_cpus, vec![0, 1, 64, 65]);
+    }
+
+    #[test]
+    fn fences_from_an_older_build_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FENCES_FILE), FROZEN_FENCES_JSON).unwrap();
+
+        let fences = load_fences(dir.path());
+        assert_eq!(
+            fences.pinned_by_anchor(),
+            [(0x110000, vec![0x110001])].into()
+        );
+        assert_eq!(fences.anchors[&0x110000][0].numa_node, Some(0));
+        assert_eq!(fences.anchors[&0x110000][0].affinity_cpus, vec![0, 1]);
+    }
 }

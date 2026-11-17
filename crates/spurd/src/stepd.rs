@@ -3786,8 +3786,9 @@ mod launch_spec_compat {
     use super::StepdLaunchSpec;
 
     /// Captured from a build that predates every optional field below. A
-    /// supervisor re-reads its launch.json after the agent restarts, so a field
-    /// added without a default would strand running work rather than fail loudly.
+    /// supervisor decodes launch.json once, at start, and may be a different build
+    /// than the agent that wrote it, so a field added without a default would
+    /// strand the launch rather than fail loudly.
     /// Never regenerate this: its value is that it stays at the old shape.
     const FROZEN_LAUNCH_JSON: &str = r##"{
         "job_id": 42,
@@ -3937,6 +3938,279 @@ mod launch_spec_compat {
         assert!(!spec.allocation_only);
         assert!(!spec.pmix_multi_task);
         assert_eq!(spec.run_attempt, 0);
+    }
+}
+
+#[cfg(test)]
+mod device_state_compat {
+    use super::{StepdDescriptor, StepdLaunchSpec};
+
+    /// Captured from the last build before generic device selection. An agent
+    /// upgraded under a running job reads a descriptor its old supervisor wrote,
+    /// so the GPUs it holds must survive the decode.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_GPU_DESCRIPTOR_JSON: &str = r##"{
+        "cleanup_timeout_secs": 60,
+        "format_version": 1,
+        "job_id": 42,
+        "run_attempt": 1,
+        "step_id": 4294967291,
+        "pid": 999999,
+        "process_start_ticks": 7,
+        "launcher_pid": 0,
+        "launcher_start_ticks": 0,
+        "socket_path": "/run/spur/runtime.sock",
+        "cgroup_path": "/sys/fs/cgroup/spur/test",
+        "capability": "frozen-capability",
+        "owner": "",
+        "uid": 0,
+        "gid": 0,
+        "work_dir": "",
+        "has_pid_namespace": false,
+        "has_user_namespace": false,
+        "has_mount_namespace": false,
+        "resources": {
+            "fabric_binding": null,
+            "gpu_binding": {
+                "node": "node-1",
+                "generation": 3,
+                "gpus": [
+                    {
+                        "stable_id": 1114112,
+                        "gpu_type": "mi300x",
+                        "topology": {
+                            "pci_bdf": "0000:11:00.0",
+                            "numa_node": 0,
+                            "pci_root": null,
+                            "vram_bytes": null,
+                            "fabric": null
+                        }
+                    }
+                ]
+            },
+            "cpus": 4,
+            "memory_mb": 2048,
+            "memory_ceiling_mb": 8192,
+            "gpu_devices": [1114112, 1179648],
+            "cpu_ids": [0, 1, 2, 3],
+            "partition": "gpu",
+            "nodelist": "node-1",
+            "mpi": "",
+            "step_limits": {
+                "cpus": 2,
+                "memory_mb": 1024,
+                "gpus": [1114112],
+                "cpu_ids": [0, 1],
+                "overlap": true
+            }
+        },
+        "workload_pid": 0,
+        "workload_start_ticks": 0,
+        "stdout_path": "",
+        "stderr_path": "",
+        "container_rootfs_mode": null,
+        "container_image": "",
+        "cred_id": "",
+        "cred_kid": "",
+        "cred_digest": "",
+        "pty_step_id": null
+    }"##;
+
+    /// Captured from the same build. A supervisor from another build than the agent
+    /// that wrote launch.json must still decode the device plans in it.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_GPU_LAUNCH_JSON: &str = r##"{
+        "job_id": 42,
+        "step_id": 4294967291,
+        "cgroup": {
+            "cleanup_timeout_secs": 60,
+            "enabled": true,
+            "required": false,
+            "constrain_cores": true,
+            "cpu_quota": false,
+            "constrain_ram_space": true,
+            "allowed_ram_percent": 100,
+            "constrain_swap": false,
+            "allowed_swap_percent": 0,
+            "min_ram_mb": 30,
+            "oom_kill_job": true,
+            "constrain_devices": true,
+            "extra_device_paths": []
+        },
+        "script": "true",
+        "work_dir": "/tmp",
+        "name": "runtime-test",
+        "user": "spur",
+        "node": "node-a",
+        "array_job_id": null,
+        "array_task_id": null,
+        "environment": {},
+        "stdout_path": "",
+        "stderr_path": "",
+        "stdin_path": "",
+        "cpus": 1,
+        "memory_mb": 0,
+        "memory_ceiling_mb": 8192,
+        "cpu_ids": [],
+        "gpu_devices": [1114112, 1179648],
+        "open_mode": null,
+        "uid": 1000,
+        "gid": 1000,
+        "partition": "default",
+        "nodelist": "node-a",
+        "memlock": "Inherit",
+        "io_mode": "File",
+        "container": {
+            "config": {
+                "image": "docker://rocm/dev",
+                "mounts": [],
+                "workdir": null,
+                "name": null,
+                "readonly": false,
+                "mount_home": true,
+                "remap_root": false,
+                "gpu_devices": [1114112, 1179648],
+                "environment": {},
+                "container_env": {},
+                "entrypoint": null,
+                "uid": 1000,
+                "gid": 1000,
+                "username": "someone",
+                "home_dir": "/home/someone",
+                "withheld_socket": null,
+                "device_plan": {
+                    "device_nodes": [
+                        {
+                            "host_path": "/dev/dri/renderD128",
+                            "container_path": "/dev/dri/renderD128",
+                            "dev_type": "c",
+                            "major": 226,
+                            "minor": 128,
+                            "permissions": "rwm",
+                            "uid": 1000,
+                            "gid": 1000
+                        }
+                    ],
+                    "mounts": [
+                        {
+                            "source": "/opt/rocm/lib",
+                            "target": "/opt/rocm/lib",
+                            "readonly": true
+                        }
+                    ],
+                    "env": {},
+                    "hooks": [],
+                    "additional_gids": [44]
+                }
+            },
+            "rootfs": "/var/spool/spur/rootfs/42"
+        },
+        "host_device_plan": {
+            "env": {
+                "ROCR_VISIBLE_DEVICES": "0,1"
+            },
+            "visible_devices": ["/dev/dri/renderD128"],
+            "device_paths": ["/dev/dri/renderD128", "/dev/kfd"]
+        },
+        "container_rootfs_mode": null,
+        "hooks": {
+            "prolog": null,
+            "epilog": null,
+            "epilog_timeout_secs": 120,
+            "prolog_slurmctld": null,
+            "epilog_slurmctld": null,
+            "task_prolog": null,
+            "task_epilog": null,
+            "srun_prolog": null,
+            "srun_epilog": null,
+            "job_submit": null,
+            "job_submit_lua": null
+        },
+        "plugstack_path": "",
+        "controller_addr": "",
+        "reporting_node": "",
+        "run_attempt": 1,
+        "capability": "test-capability",
+        "allocation_only": false,
+        "pmix_multi_task": false,
+        "joins_parent_namespaces": false,
+        "allocation_holder": false,
+        "has_pid_namespace": false,
+        "has_user_namespace": false,
+        "has_mount_namespace": false,
+        "resources": {
+            "fabric_binding": null,
+            "gpu_binding": null,
+            "cpus": 4,
+            "memory_mb": 2048,
+            "memory_ceiling_mb": 8192,
+            "gpu_devices": [1114112, 1179648],
+            "cpu_ids": [0, 1, 2, 3],
+            "partition": "gpu",
+            "nodelist": "node-1",
+            "mpi": "",
+            "step_limits": {
+                "cpus": 2,
+                "memory_mb": 1024,
+                "gpus": [1114112],
+                "cpu_ids": [0, 1],
+                "overlap": true
+            }
+        },
+        "pmix": null,
+        "cred_id": "",
+        "cred_kid": "",
+        "cred_digest": "",
+        "pty_step_id": null
+    }"##;
+
+    #[test]
+    fn a_descriptor_holding_gpus_from_an_older_build_keeps_them() {
+        let d: StepdDescriptor =
+            serde_json::from_str(FROZEN_GPU_DESCRIPTOR_JSON).expect("older descriptor.json");
+
+        assert_eq!(d.resources.gpu_devices, vec![0x110000, 0x120000]);
+        let binding = d
+            .resources
+            .gpu_binding
+            .expect("the GPU binding must survive");
+        assert_eq!(binding.generation, 3);
+        assert_eq!(binding.gpus[0].stable_id, 0x110000);
+        assert_eq!(binding.gpus[0].gpu_type, "mi300x");
+        assert_eq!(d.resources.memory_ceiling_mb, 8192);
+        assert_eq!(d.resources.step_limits.gpus, Some(vec![0x110000]));
+        assert_eq!(d.resources.step_limits.cpu_ids, vec![0, 1]);
+        assert!(d.resources.step_limits.overlap);
+    }
+
+    #[test]
+    fn a_launch_spec_with_device_plans_from_an_older_build_keeps_them() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_GPU_LAUNCH_JSON).expect("older launch.json");
+
+        assert_eq!(spec.resources.gpu_devices, vec![0x110000, 0x120000]);
+        assert_eq!(
+            spec.gpu_devices,
+            vec![0x110000, 0x120000],
+            "the hook context's GPUs"
+        );
+        let host = spec.host_device_plan.expect("the host plan must survive");
+        assert_eq!(host.visible_devices, vec!["/dev/dri/renderD128"]);
+        assert_eq!(host.device_paths, vec!["/dev/dri/renderD128", "/dev/kfd"]);
+        assert_eq!(
+            host.env.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("0,1")
+        );
+        let container = spec.container.expect("the container block must survive");
+        assert_eq!(container.config.gpu_devices, vec![0x110000, 0x120000]);
+        let plan = container
+            .config
+            .device_plan
+            .expect("the container plan must survive");
+        assert_eq!(plan.device_nodes[0].host_path, "/dev/dri/renderD128");
+        assert_eq!(plan.additional_gids, vec![44]);
+        assert_eq!(spec.resources.step_limits.gpus, Some(vec![0x110000]));
+        assert_eq!(spec.resources.memory_ceiling_mb, 8192);
     }
 }
 

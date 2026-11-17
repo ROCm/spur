@@ -2461,3 +2461,115 @@ mod evict_wal_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod node_update_wal_compat {
+    use super::*;
+
+    /// A `NodeUpdate` as the last build before the generic device inventory wrote
+    /// it. A new controller replays the log from the start, so this must decode
+    /// into the same GPUs or the node's allocations orphan on upgrade.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_NODE_UPDATE_JSON: &str = r#"{
+        "NodeUpdate": {
+            "name": "gpu-1",
+            "hostname": "gpu-1",
+            "resources": {
+                "cpus": 64,
+                "memory_mb": 524288,
+                "gpus": [
+                    {
+                        "device_id": 0,
+                        "gpu_type": "mi300x",
+                        "memory_mb": 196608,
+                        "peer_gpus": [1],
+                        "link_type": "XGMI",
+                        "stable_id": 1114112,
+                        "topology": {
+                            "pci_bdf": "0000:11:00.0",
+                            "numa_node": 0,
+                            "pci_root": "pci0000:00",
+                            "vram_bytes": 206158430208,
+                            "fabric": null
+                        },
+                        "numa_node": 0,
+                        "affinity_cpus": [0, 1, 64, 65]
+                    },
+                    {
+                        "device_id": 1,
+                        "gpu_type": "mi300x",
+                        "memory_mb": 196608,
+                        "peer_gpus": [0],
+                        "link_type": "XGMI",
+                        "stable_id": 1179648,
+                        "topology": null,
+                        "numa_node": 1,
+                        "affinity_cpus": [32, 33, 96, 97]
+                    }
+                ],
+                "generic": {
+                    "bandwidth:lustre": 4096
+                },
+                "generation": 5,
+                "fabric_binding_version": 3,
+                "block_file_revision": null,
+                "topology": {
+                    "cores": [
+                        {
+                            "socket": 0,
+                            "numa_node": 0,
+                            "cpus": [0, 64]
+                        },
+                        {
+                            "socket": 0,
+                            "numa_node": 0,
+                            "cpus": [1, 65]
+                        },
+                        {
+                            "socket": 1,
+                            "numa_node": 1,
+                            "cpus": [32, 96]
+                        },
+                        {
+                            "socket": 1,
+                            "numa_node": 1,
+                            "cpus": [33, 97]
+                        }
+                    ]
+                }
+            },
+            "address": "10.0.0.1",
+            "port": 6818,
+            "wg_pubkey": "",
+            "version": "0.16.0",
+            "source": {
+                "type": "NativeHost"
+            },
+            "capabilities": [],
+            "agent_instance": ""
+        }
+    }"#;
+
+    #[test]
+    fn a_node_update_holding_gpus_from_an_older_build_replays() {
+        let op: WalOperation =
+            serde_json::from_str(FROZEN_NODE_UPDATE_JSON).expect("older NodeUpdate entry");
+        let WalOperation::NodeUpdate { resources, .. } = op else {
+            panic!("wrong variant");
+        };
+        let ids: Vec<u64> = resources.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(ids, vec![0x110000, 0x120000]);
+        assert_eq!(resources.gpus[0].gpu_type, "mi300x");
+        assert_eq!(
+            resources.gpus[0]
+                .topology
+                .as_ref()
+                .and_then(|t| t.vram_bytes),
+            Some(206158430208)
+        );
+        assert_eq!(resources.generation, 5);
+        assert_eq!(resources.gpus[0].numa_node, Some(0));
+        assert_eq!(resources.gpus[1].affinity_cpus, vec![32, 33, 96, 97]);
+        assert!(resources.topology.is_some());
+    }
+}
