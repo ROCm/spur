@@ -1340,7 +1340,9 @@ Spur restricts a job to its allocated GPUs in two layers:
 - **Access.** With ``[cgroup] constrain_devices`` (on by default) the job's cgroup
   carries a default-deny BPF device filter, so opening the device node of a GPU the
   job was not allocated fails with ``EPERM`` in the kernel, whatever the
-  environment says.
+  environment says. On a node with AI NICs the same filter limits RDMA devices
+  to the job's own NICs (``constrain_rdma_devices``, see
+  :doc:`/admin-guide/ai-nics`).
 
 The filter is attached to the job's cgroup, so it covers every process the agent
 starts for the job: the batch payload, ``srun`` steps, ``spur exec``, and

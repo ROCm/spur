@@ -2911,6 +2911,16 @@ statistics.
        ``ROCR_VISIBLE_DEVICES`` to. Installing the filter needs ``CAP_BPF`` and
        ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``) — ``CAP_BPF`` alone is insufficient for a
        cgroup-device program; without them the job runs with no device isolation.
+   * - ``constrain_rdma_devices``
+     - bool
+     - ``true``
+     - Agent restart
+     - On a node that hands out RDMA devices per job (AI NICs, or a
+       ``[[devices.gres]]`` entry with files under ``/dev/infiniband/``), a job
+       can open only the RDMA devices it was allocated, plus ``rdma_cm``.
+       ``false`` keeps all of ``/dev/infiniband/`` open to every job. No effect
+       on other nodes, or with ``constrain_devices = false``. See
+       :doc:`ai-nics`.
    * - ``extra_device_paths``
      - [string]
      - ``[]``
@@ -2987,6 +2997,9 @@ isolation boundary and worth knowing:
   ``/dev/infiniband/`` (RDMA verbs, for MPI and for NCCL or RCCL over InfiniBand),
   and the MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by
   path when the filter is built, so a node without that hardware grants nothing extra.
+  On a node that hands out RDMA devices per job, ``constrain_rdma_devices`` narrows
+  ``/dev/infiniband/`` to ``rdma_cm``; each RDMA device then comes only with an
+  allocation.
 
 The vendor control nodes a GPU runtime initializes through — ``/dev/nvidiactl``,
 ``/dev/nvidia-uvm`` and the like — are **not** in this set. They reach a job through

@@ -7419,7 +7419,10 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 memory_ceiling_mb,
                 &cpu_ids,
-                &host_device_plan.device_paths,
+                crate::device_cgroup::JobDevices {
+                    allocated: &host_device_plan.device_paths,
+                    node_allocates_rdma: self.node_allocates_rdma().await,
+                },
                 &crate::step_resources::StepLimits::default(),
             );
             match allocation_cgroup(setup, self.cgroup.required) {
@@ -7504,6 +7507,7 @@ impl SlurmAgent for AgentService {
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
             host_device_plan: Some(host_device_plan),
+            node_allocates_rdma: self.node_allocates_rdma().await,
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
             io_mode: if spec.pty {
@@ -8427,7 +8431,10 @@ impl SlurmAgent for AgentService {
             memory_mb,
             memory_ceiling_mb,
             &alloc_result.cpu_ids,
-            &device_paths,
+            crate::device_cgroup::JobDevices {
+                allocated: &device_paths,
+                node_allocates_rdma: self.node_allocates_rdma().await,
+            },
             &crate::step_resources::StepLimits::default(),
         );
         let cgroup_path = match allocation_cgroup(setup, self.cgroup.required) {
@@ -8527,6 +8534,7 @@ impl SlurmAgent for AgentService {
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
                 host_device_plan,
+                node_allocates_rdma: self.node_allocates_rdma().await,
                 memlock: self.limits.memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -9430,6 +9438,7 @@ impl SlurmAgent for AgentService {
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
                 host_device_plan,
+                node_allocates_rdma: self.node_allocates_rdma().await,
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -10519,6 +10528,7 @@ impl SlurmAgent for AgentService {
                         nodelist,
                         mpi: String::new(),
                         host_device_plan,
+                        node_allocates_rdma: self.node_allocates_rdma().await,
                         memlock: self.limits.memlock,
                         cgroup: self.cgroup.clone(),
                         io_mode: executor::LaunchIo::Pty,
@@ -11026,6 +11036,10 @@ impl AgentService {
 
     /// Host-side device injection plan for a launch that has no container of
     /// its own. `None` for a launch holding no devices (an empty plan either way).
+    async fn node_allocates_rdma(&self) -> bool {
+        self.device_registry.lock().await.allocates_rdma_nodes()
+    }
+
     async fn resolve_host_device_plan(
         &self,
         job_id: u32,
@@ -17460,6 +17474,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_node_handing_out_nics_withholds_rdma() {
+        let svc_with = |registry: DeviceRegistry| {
+            AgentService::new(
+                test_reporter(),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(registry)),
+                spur_core::config::MemlockLimit::Unlimited,
+            )
+        };
+        assert!(
+            svc_with(test_gpu_and_nic_registry())
+                .node_allocates_rdma()
+                .await
+        );
+        assert!(!svc_with(DeviceRegistry::new()).node_allocates_rdma().await);
+    }
+
+    #[tokio::test]
     async fn a_dispatch_naming_a_nic_another_job_holds_is_refused() {
         let svc = nic_agent();
         let (spec, allocated) = nic_dispatch(1);
@@ -18272,6 +18304,7 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             host_device_plan: None,
+            node_allocates_rdma: false,
             memlock: spur_core::config::MemlockLimit::Unlimited,
             cgroup: spur_core::config::CgroupConfig::default(),
             io_mode: executor::LaunchIo::File,
