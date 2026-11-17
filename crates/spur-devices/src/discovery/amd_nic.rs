@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use tracing::{debug, warn};
+
 use crate::cdi::annotations;
 use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, GENERATED_CDI_VERSION};
 use crate::pci::stable_id_from_bdf;
@@ -37,6 +39,7 @@ struct DiscoveredNic {
 /// One spec per NIC kind present, devices in BDF order.
 pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
     let sysfs = root.join("sys");
+    let rdma = rdma_devices_by_function(&sysfs);
     let uverbs = uverbs_by_rdma_device(&sysfs);
     let mut by_kind: BTreeMap<&str, Vec<DiscoveredNic>> = BTreeMap::new();
     let Ok(functions) = std::fs::read_dir(sysfs.join("bus/pci/devices")) else {
@@ -47,7 +50,7 @@ pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
         let Some(kind) = pollara_kind(&path) else {
             continue;
         };
-        if let Some(nic) = discover_nic(&path, &uverbs) {
+        if let Some(nic) = discover_nic(&path, &rdma, &uverbs) {
             by_kind.entry(kind).or_default().push(nic);
         }
     }
@@ -72,17 +75,61 @@ fn pollara_kind(function: &Path) -> Option<&'static str> {
 }
 
 /// Without an RDMA device and its uverbs node a NIC is no use to a job.
-fn discover_nic(function: &Path, uverbs: &HashMap<String, String>) -> Option<DiscoveredNic> {
+fn discover_nic(
+    function: &Path,
+    rdma: &HashMap<String, String>,
+    uverbs: &HashMap<String, String>,
+) -> Option<DiscoveredNic> {
     let bdf = function.file_name()?.to_str()?.to_owned();
-    let rdma_device = first_entry(&function.join("infiniband"))?;
+    let Some(rdma_device) = rdma.get(&bdf).cloned() else {
+        debug!(%bdf, "ionic function has no RDMA device; not an AI NIC");
+        return None;
+    };
+    let Some(uverbs) = uverbs.get(&rdma_device).cloned() else {
+        warn!(%bdf, %rdma_device, "AI NIC has no uverbs node (is ib_uverbs loaded?); skipping it");
+        return None;
+    };
     Some(DiscoveredNic {
         stable_id: stable_id_from_bdf(&bdf)?,
-        uverbs: uverbs.get(&rdma_device)?.clone(),
+        uverbs,
         netdev: first_entry(&function.join("net")),
         numa_node: read_numa_node(function),
         rdma_device,
         bdf,
     })
+}
+
+/// The RDMA device of each PCI function. `ionic_rdma` may bind an auxiliary
+/// device under the function, so the function is the nearest ancestor of the
+/// RDMA device's parent that is named like a PCI address.
+fn rdma_devices_by_function(sysfs: &Path) -> HashMap<String, String> {
+    let Ok(entries) = std::fs::read_dir(sysfs.join("class/infiniband")) else {
+        return HashMap::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    let mut by_function = HashMap::new();
+    for name in names {
+        let Ok(parent) = sysfs
+            .join("class/infiniband")
+            .join(&name)
+            .join("device")
+            .canonicalize()
+        else {
+            continue;
+        };
+        let function = parent
+            .ancestors()
+            .filter_map(|p| p.file_name()?.to_str())
+            .find(|component| stable_id_from_bdf(component).is_some());
+        if let Some(function) = function {
+            by_function.entry(function.to_owned()).or_insert(name);
+        }
+    }
+    by_function
 }
 
 /// `uverbsN` numbering is independent of the RDMA device's own, so map by `ibdev`.
@@ -180,6 +227,8 @@ mod tests {
         device: &'a str,
         driver: Option<&'a str>,
         rdma: Option<&'a str>,
+        /// Parent the RDMA device under an auxiliary device, as `ionic_rdma` binds.
+        auxiliary: bool,
         netdev: Option<&'a str>,
         numa_node: &'a str,
     }
@@ -192,6 +241,7 @@ mod tests {
                 device: "0x1002",
                 driver: Some("ionic"),
                 rdma: Some(rdma),
+                auxiliary: false,
                 netdev: Some(netdev),
                 numa_node: "0",
             }
@@ -210,7 +260,15 @@ mod tests {
                 symlink(&dir, real.join("driver")).unwrap();
             }
             if let Some(rdma) = self.rdma {
-                fs::create_dir_all(real.join("infiniband").join(rdma)).unwrap();
+                let parent = if self.auxiliary {
+                    real.join("ionic.rdma.0")
+                } else {
+                    real.clone()
+                };
+                fs::create_dir_all(parent.join("infiniband").join(rdma)).unwrap();
+                let class = sys.join("class/infiniband").join(rdma);
+                fs::create_dir_all(&class).unwrap();
+                symlink(&parent, class.join("device")).unwrap();
             }
             if let Some(netdev) = self.netdev {
                 fs::create_dir_all(real.join("net").join(netdev)).unwrap();
@@ -321,6 +379,29 @@ mod tests {
                 .collect();
             assert_eq!(shared, vec!["/dev/infiniband/rdma_cm"], "{}", spec.kind);
         }
+    }
+
+    #[test]
+    fn an_rdma_device_under_an_auxiliary_device_belongs_to_its_function() {
+        let dir = tempfile::tempdir().unwrap();
+        PciFunction {
+            auxiliary: true,
+            ..PciFunction::pollara("0000:05:00.0", "ionic_0", "enp5s0")
+        }
+        .write(dir.path());
+        uverbs(dir.path(), "uverbs3", "ionic_0");
+        let specs = discover_nic_cdi_from_root(dir.path());
+        assert_eq!(
+            device_nodes(&specs[0]),
+            vec![vec!["/dev/infiniband/uverbs3".to_string()]]
+        );
+        assert_eq!(
+            specs[0].devices[0]
+                .annotations
+                .get(annotations::PCI_BDF)
+                .map(String::as_str),
+            Some("0000:05:00.0")
+        );
     }
 
     #[test]
