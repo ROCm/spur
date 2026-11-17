@@ -1254,6 +1254,15 @@ impl crate::reporter::HeldRun for TrackedJob {
 }
 
 impl TrackedJob {
+    /// A job's tracked process is a launcher exactly when it was started in a pid
+    /// namespace: `unshare` for a rootful batch job, the waiting parent of a container.
+    fn tracked_process(&self) -> executor::TrackedProcess {
+        match self.has_pid_namespace {
+            true => executor::TrackedProcess::Launcher,
+            false => executor::TrackedProcess::Workload,
+        }
+    }
+
     /// Take the cgroup path, leaving `None`. Whichever teardown path reaches
     /// the job first takes it, so the removal it authorizes happens once.
     fn take_cgroup(&mut self) -> Option<std::path::PathBuf> {
@@ -3309,6 +3318,9 @@ fn next_step_epoch() -> u64 {
 struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
+    /// Whether `pid` is the workload or a launcher in front of it; decides who a
+    /// non-KILL signal may reach.
+    tracked: executor::TrackedProcess,
     epoch: u64,
     /// The step's own run_attempt, so a job-wide cancel for one attempt
     /// can't reach an unsupervised step of a different, still-live one.
@@ -3317,6 +3329,14 @@ struct ActiveStep {
     /// `stream_job_output` can tail them live keyed on (job_id, step_id).
     stdout_path: String,
     stderr_path: String,
+}
+
+/// A step's process, captured so it can be signalled outside the `active_steps` lock.
+struct StepTarget {
+    key: (u32, u32),
+    pid: u32,
+    epoch: u64,
+    tracked: executor::TrackedProcess,
 }
 
 struct ActiveStepGuard {
@@ -3365,9 +3385,16 @@ fn cancelled_step_response() -> RunCommandResponse {
 /// the process group (host steps are group leaders, so this also covers a
 /// double-forked descendant that reparented out of the `/proc` tree).
 /// Best-effort; warns only when the tracked pid cannot be signalled at all.
-fn signal_step_tree(pid: u32, signal: i32) {
+///
+/// A launcher is signalled through its descendants instead: the group signal
+/// would end it, and with it the step, while the workload still runs.
+fn signal_step_tree(pid: u32, signal: i32, tracked: executor::TrackedProcess) {
     let sig =
         nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+    if tracked.behind_launcher(sig) {
+        crate::executor::signal_launcher_tree(pid as i32, tracked, sig);
+        return;
+    }
     let target = nix::unistd::Pid::from_raw(pid as i32);
     crate::executor::kill_process_tree(pid as i32, sig);
     if let Err(pg_err) = nix::sys::signal::killpg(target, sig) {
@@ -4197,8 +4224,26 @@ async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor
     None
 }
 
+/// Records the process a step is tracked by, and whether a cancel already
+/// arrived while it was launching.
+async fn record_step_pid(
+    active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    step_key: (u32, u32),
+    pid: u32,
+    tracked: executor::TrackedProcess,
+) -> bool {
+    let mut steps = active_steps.lock().await;
+    let Some(step) = steps.get_mut(&step_key) else {
+        return false;
+    };
+    step.pid = Some(pid);
+    step.tracked = tracked;
+    step.cancel_requested
+}
+
 async fn run_tokio_step_to_spool(
     mut cmd: tokio::process::Command,
+    tracked: executor::TrackedProcess,
     step_files: crate::executor::StepOutputFiles,
     active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     step_key: (u32, u32),
@@ -4223,17 +4268,9 @@ async fn run_tokio_step_to_spool(
     }
 
     if let Some(pid) = child.id() {
-        let cancel_now = {
-            let mut steps = active_steps.lock().await;
-            if let Some(step) = steps.get_mut(&step_key) {
-                step.pid = Some(pid);
-                step.cancel_requested
-            } else {
-                false
-            }
-        };
+        let cancel_now = record_step_pid(active_steps, step_key, pid, tracked).await;
         if cancel_now {
-            signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
+            signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32, tracked);
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Ok(None);
@@ -4485,15 +4522,13 @@ async fn run_containerized_step(
 
             // Register PID for cancellation.
             let raw_pid = child_pid.as_raw() as u32;
-            let cancel_now = {
-                let mut steps = active_steps.lock().await;
-                if let Some(step) = steps.get_mut(&step_key) {
-                    step.pid = Some(raw_pid);
-                    step.cancel_requested
-                } else {
-                    false
-                }
-            };
+            let cancel_now = record_step_pid(
+                active_steps,
+                step_key,
+                raw_pid,
+                executor::TrackedProcess::Launcher,
+            )
+            .await;
             if cancel_now {
                 // SIGKILL the whole subtree: the workload is a grandchild that
                 // is PID 1 of its namespace and would ignore SIGTERM from here.
@@ -5248,21 +5283,13 @@ impl AgentService {
         drop(admission);
         drop(lifecycle);
 
-        // Record the workload's pid, not the supervisor's, so the existing
+        // Record the supervisor's tracked pid, not the supervisor itself, so the
         // cancel path signals the step's own tree and leaves its reporter alive.
+        // That pid can be a launcher, which `tracked` keeps the cancel off.
         if let Some(pid) = supervised_step_workload_pid(&descriptor).await {
-            let cancel_now = {
-                let mut steps = self.active_steps.lock().await;
-                match steps.get_mut(&step_key) {
-                    Some(step) => {
-                        step.pid = Some(pid);
-                        step.cancel_requested
-                    }
-                    None => false,
-                }
-            };
-            if cancel_now {
-                signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
+            let tracked = executor::TrackedProcess::of_launch(cfg, self.spurd_is_root);
+            if record_step_pid(&self.active_steps, step_key, pid, tracked).await {
+                signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32, tracked);
             }
         }
 
@@ -5900,6 +5927,9 @@ struct LaunchPlan {
     /// happens inside the entered namespace via `setpriv`, so the child hook is
     /// skipped.
     apply_priv_in_child: bool,
+    /// `nsenter` forks and waits when it enters a pid namespace, so the process
+    /// the caller tracks is then a launcher rather than the command.
+    tracked: executor::TrackedProcess,
 }
 
 /// Decide how to enter a job and run `command`, shared by `exec_in_job`,
@@ -5919,12 +5949,18 @@ fn build_launch_plan(
             program: "nsenter".to_string(),
             args: build_nsenter_argv(entry, priv_drop, command),
             apply_priv_in_child: false,
+            tracked: if entry.has_pid_namespace {
+                executor::TrackedProcess::Launcher
+            } else {
+                executor::TrackedProcess::Workload
+            },
         }
     } else {
         LaunchPlan {
             program: command[0].clone(),
             args: command[1..].to_vec(),
             apply_priv_in_child: true,
+            tracked: executor::TrackedProcess::Workload,
         }
     }
 }
@@ -7755,18 +7791,15 @@ impl SlurmAgent for AgentService {
         } else {
             nix::sys::signal::Signal::SIGTERM as i32
         };
-        let pid = {
+        let target = {
             let mut steps = self.active_steps.lock().await;
-            match steps.get_mut(&step_key) {
-                Some(step) => {
-                    step.cancel_requested = true;
-                    step.pid
-                }
-                None => None,
-            }
+            steps.get_mut(&step_key).map(|step| {
+                step.cancel_requested = true;
+                (step.pid, step.tracked)
+            })
         };
-        if let Some(pid) = pid {
-            signal_step_tree(pid, signal);
+        if let Some((Some(pid), tracked)) = target {
+            signal_step_tree(pid, signal, tracked);
         }
         Ok(Response::new(()))
     }
@@ -9147,6 +9180,7 @@ impl SlurmAgent for AgentService {
                 .register(&mut cmd);
             run_tokio_step_to_spool(
                 cmd,
+                plan.tracked,
                 step_files,
                 &self.active_steps,
                 step_key,
@@ -9330,6 +9364,7 @@ impl SlurmAgent for AgentService {
                 .register(&mut cmd);
             run_tokio_step_to_spool(
                 cmd,
+                plan.tracked,
                 step_files,
                 &self.active_steps,
                 step_key,
@@ -10133,6 +10168,7 @@ impl SlurmAgent for AgentService {
                         ActiveStep {
                             epoch: step_epoch,
                             pid: Some(pid),
+                            tracked: executor::TrackedProcess::of_launch(&cfg, self.spurd_is_root),
                             ..Default::default()
                         },
                     );
@@ -11023,7 +11059,7 @@ impl AgentService {
             let sig = nix::sys::signal::Signal::try_from(signal)
                 .unwrap_or(nix::sys::signal::Signal::SIGTERM);
             info!(job_id, signal, "sending explicit signal to job");
-            let _ = tracked.job.kill_signal(sig);
+            let _ = tracked.job.signal_workload(sig, tracked.tracked_process());
             (tracked.run_attempt, sig)
         };
         if signal_expected_to_terminate(sig) {
@@ -11141,7 +11177,7 @@ impl AgentService {
             return Ok(());
         };
         info!(job_id, signal, "signalling the unsupervised job");
-        if let Err(error) = tracked.job.kill_signal(sig) {
+        if let Err(error) = tracked.job.signal_workload(sig, tracked.tracked_process()) {
             warn!(job_id, signal, %error, "failed to signal the unsupervised job");
         }
         Ok(())
@@ -11180,7 +11216,7 @@ impl AgentService {
         let Some(tracked) = jobs.get(&job_id) else {
             return;
         };
-        let _ = tracked.job.kill_signal(sig);
+        let _ = tracked.job.signal_workload(sig, tracked.tracked_process());
     }
 
     /// Signal every in-flight step of a job. Allocation-only jobs (standalone
@@ -11215,8 +11251,8 @@ impl AgentService {
         if targets.is_empty() {
             return;
         }
-        for (_key, pid, _epoch) in &targets {
-            signal_step_tree(*pid, signal);
+        for target in &targets {
+            signal_step_tree(target.pid, signal, target.tracked);
         }
         // Escalate to SIGKILL: a container-init step ignores the graceful signal.
         // Compare epochs (not pids) so a step that reused the (job, step) key
@@ -11224,16 +11260,16 @@ impl AgentService {
         let active_steps = self.active_steps.clone();
         tokio::spawn(async move {
             tokio::time::sleep(escalate_after).await;
-            let still: Vec<u32> = {
+            let still: Vec<(u32, executor::TrackedProcess)> = {
                 let steps = active_steps.lock().await;
                 targets
                     .iter()
-                    .filter(|(key, _pid, epoch)| steps.get(key).map(|s| s.epoch) == Some(*epoch))
-                    .map(|(_key, pid, _epoch)| *pid)
+                    .filter(|t| steps.get(&t.key).map(|s| s.epoch) == Some(t.epoch))
+                    .map(|t| (t.pid, t.tracked))
                     .collect()
             };
-            for pid in still {
-                signal_step_tree(pid, nix::sys::signal::Signal::SIGKILL as i32);
+            for (pid, tracked) in still {
+                signal_step_tree(pid, nix::sys::signal::Signal::SIGKILL as i32, tracked);
             }
         });
     }
@@ -11242,15 +11278,15 @@ impl AgentService {
     /// the steps are not marked cancelled, so a step still launching is not
     /// aborted, and nothing escalates to SIGKILL.
     async fn signal_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
-        for (_key, pid, _epoch) in self
+        for target in self
             .unsupervised_step_targets(job_id, run_attempt, false)
             .await
         {
-            signal_step_tree(pid, signal);
+            signal_step_tree(target.pid, signal, target.tracked);
         }
     }
 
-    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process,
+    /// Snapshots the job's unsupervised steps with a process,
     /// so the caller signals outside the lock: holding `active_steps` across the
     /// /proc walk would stall every run_command. `mark_cancelled` also flags a step with no pid.
     async fn unsupervised_step_targets(
@@ -11258,7 +11294,7 @@ impl AgentService {
         job_id: u32,
         run_attempt: u32,
         mark_cancelled: bool,
-    ) -> Vec<((u32, u32), u32, u64)> {
+    ) -> Vec<StepTarget> {
         let supervised: Vec<spur_core::step::StepId> =
             stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
                 .iter()
@@ -11275,7 +11311,12 @@ impl AgentService {
             }
             step.cancel_requested |= mark_cancelled;
             if let Some(pid) = step.pid {
-                targets.push((*key, pid, step.epoch));
+                targets.push(StepTarget {
+                    key: *key,
+                    pid,
+                    epoch: step.epoch,
+                    tracked: step.tracked,
+                });
             }
         }
         targets
@@ -11409,7 +11450,9 @@ impl AgentService {
                 kill_wait_secs = kill_wait.as_secs(),
                 "graceful cancel: SIGTERM, then SIGKILL after the kill wait"
             );
-            let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
+            let _ = tracked
+                .job
+                .signal_workload(nix::sys::signal::Signal::SIGTERM, tracked.tracked_process());
             (tracked.run_attempt, tokio::time::Instant::now())
         };
         wait_for_exit_and_teardown(
@@ -19859,7 +19902,11 @@ mod tests {
         let pid = child.id().expect("spawned child should have pid");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
+        signal_step_tree(
+            pid,
+            nix::sys::signal::Signal::SIGTERM as i32,
+            executor::TrackedProcess::Workload,
+        );
 
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
@@ -26457,5 +26504,395 @@ mod tests {
             "non-interactive bridge dropped output after input close, got: {text:?}"
         );
         assert!(got_exit, "bridge did not report an exit status");
+    }
+
+    /// A shell with no signal handlers, standing in for `unshare` / `nsenter`: it
+    /// backgrounds a worker that reports TERM (running `on_term`), reports HUP,
+    /// and exits 7 on USR1, then relays the worker's status.
+    fn launcher_script(on_term: &str) -> String {
+        format!(
+            "sh -c 'trap \"{on_term}\" TERM; trap \"echo hup\" HUP; trap \"exit 7\" USR1; \
+             echo ready $$; while :; do sleep 0.05; done' & wait $!; echo relayed $?"
+        )
+    }
+
+    /// A launcher that does not wait on its worker, so the worker stopping does
+    /// not end it the way it ends `dash`'s `wait`.
+    const SUSPENDABLE_LAUNCHER_SCRIPT: &str =
+        "sh -c 'echo ready $$; while :; do sleep 0.05; done' \
+         & while :; do sleep 0.05; done";
+
+    const TERM_IS_REPORTED: &str = "echo term";
+    const TERM_ENDS_THE_WORKER: &str = "echo term; exit 7";
+
+    struct LauncherStandIn {
+        child: Option<tokio::process::Child>,
+        pid: u32,
+        worker: i32,
+        output: tokio::io::BufReader<tokio::process::ChildStdout>,
+    }
+
+    impl LauncherStandIn {
+        /// Returns once the worker has installed its handlers, so no signal can
+        /// outrun them.
+        async fn spawn(on_term: &str) -> Self {
+            Self::spawn_script(&launcher_script(on_term)).await
+        }
+
+        async fn spawn_script(script: &str) -> Self {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the stand-in launcher");
+            let pid = child.id().expect("stand-in pid");
+            let output = tokio::io::BufReader::new(child.stdout.take().expect("stand-in stdout"));
+            let mut stand_in = Self {
+                child: Some(child),
+                pid,
+                worker: 0,
+                output,
+            };
+            let ready = stand_in.line().await;
+            stand_in.worker = ready
+                .strip_prefix("ready ")
+                .and_then(|pid| pid.parse().ok())
+                .expect("the worker announces its pid");
+            stand_in
+        }
+
+        fn job(&mut self) -> executor::RunningJob {
+            let child = self.child.take().expect("the launcher is still owned here");
+            executor::RunningJob::Managed { child }
+        }
+
+        /// The next line the stand-in printed; empty once every writer is gone.
+        async fn line(&mut self) -> String {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .await
+                .expect("read stand-in output");
+            line.trim().to_string()
+        }
+
+        /// The worker ends with 7 and a surviving launcher relays that.
+        async fn assert_launcher_relays_the_worker_exit(&mut self) {
+            assert_eq!(
+                self.line().await,
+                "relayed 7",
+                "the launcher must survive to relay the workload's exit"
+            );
+        }
+    }
+
+    impl Drop for LauncherStandIn {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    fn launcher_job(stand_in: &mut LauncherStandIn) -> TrackedJob {
+        TrackedJob {
+            job: stand_in.job(),
+            has_pid_namespace: true,
+            ..TrackedJob::allocation_only(None)
+        }
+    }
+
+    fn test_service() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    const SIGTERM: i32 = nix::sys::signal::Signal::SIGTERM as i32;
+    const SIGHUP: i32 = nix::sys::signal::Signal::SIGHUP as i32;
+    const SIGUSR1: i32 = nix::sys::signal::Signal::SIGUSR1 as i32;
+
+    #[test]
+    fn a_job_in_a_pid_namespace_is_tracked_as_a_launcher() {
+        let mut job = TrackedJob::allocation_only(None);
+        assert_eq!(job.tracked_process(), executor::TrackedProcess::Workload);
+
+        job.has_pid_namespace = true;
+        assert_eq!(job.tracked_process(), executor::TrackedProcess::Launcher);
+    }
+
+    #[test]
+    fn a_step_entering_a_pid_namespace_is_planned_as_a_launcher() {
+        let entry = |has_pid_namespace| crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
+            pid: 4242,
+            has_pid_namespace,
+            has_user_namespace: false,
+            has_mount_namespace: true,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/tmp".into(),
+            cgroup_path: None,
+        };
+        let command = ["id".to_string()];
+
+        let pid_namespaced = build_launch_plan(&entry(true), None, &command);
+        assert_eq!(pid_namespaced.tracked, executor::TrackedProcess::Launcher);
+
+        // Without a pid namespace to enter, nsenter execs the command in place.
+        let mount_only = build_launch_plan(&entry(false), None, &command);
+        assert_eq!(mount_only.tracked, executor::TrackedProcess::Workload);
+
+        let direct = build_launch_plan(
+            &crate::job_entry::JobEntry {
+                pid: 0,
+                ..entry(true)
+            },
+            None,
+            &command,
+        );
+        assert_eq!(direct.tracked, executor::TrackedProcess::Workload);
+    }
+
+    #[tokio::test]
+    async fn signal_step_tree_reaches_the_workload_behind_a_launcher_not_the_launcher() {
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+
+        signal_step_tree(stand_in.pid, SIGTERM, executor::TrackedProcess::Launcher);
+        assert_eq!(stand_in.line().await, "term");
+
+        signal_step_tree(stand_in.pid, SIGUSR1, executor::TrackedProcess::Launcher);
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    #[tokio::test]
+    async fn signal_step_tree_kill_takes_the_launcher_and_the_workload() {
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+
+        signal_step_tree(
+            stand_in.pid,
+            nix::sys::signal::Signal::SIGKILL as i32,
+            executor::TrackedProcess::Launcher,
+        );
+
+        // The launcher can see the worker die and relay it before its own KILL
+        // lands, so only the end of output proves both processes are gone.
+        while !stand_in.line().await.is_empty() {}
+        stand_in
+            .child
+            .as_mut()
+            .expect("launcher handle")
+            .wait()
+            .await
+            .expect("reap the launcher");
+    }
+
+    #[tokio::test]
+    async fn signal_step_tree_still_signals_a_tracked_workload_through_its_group() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+
+        signal_step_tree(stand_in.pid, SIGTERM, executor::TrackedProcess::Workload);
+
+        let status = stand_in
+            .child
+            .as_mut()
+            .expect("launcher handle")
+            .wait()
+            .await
+            .expect("reap the tracked process");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[tokio::test]
+    async fn cancel_step_signals_the_workload_behind_a_launcher_step_not_the_launcher() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let (job_id, step_id) = (31, 2);
+        svc.register_test_step(job_id, step_id, None).await;
+        record_step_pid(
+            &svc.active_steps,
+            (job_id, step_id),
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await;
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id,
+            step_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel the step");
+        assert_eq!(stand_in.line().await, "term");
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id,
+            step_id,
+            signal: SIGUSR1,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("signal the step");
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+        assert!(svc.step_cancel_requested(job_id, step_id).await);
+    }
+
+    #[tokio::test]
+    async fn record_step_pid_notes_the_tracked_process_and_reports_a_pending_cancel() {
+        let svc = test_service();
+        let key = (32, 1);
+
+        assert!(
+            !record_step_pid(
+                &svc.active_steps,
+                key,
+                99,
+                executor::TrackedProcess::Launcher
+            )
+            .await,
+            "a step nobody registered has no cancel to report"
+        );
+
+        svc.register_test_step(key.0, key.1, None).await;
+        assert!(
+            !record_step_pid(
+                &svc.active_steps,
+                key,
+                99,
+                executor::TrackedProcess::Launcher
+            )
+            .await
+        );
+        {
+            let steps = svc.active_steps.lock().await;
+            let step = steps.get(&key).expect("registered step");
+            assert_eq!(step.pid, Some(99));
+            assert_eq!(step.tracked, executor::TrackedProcess::Launcher);
+        }
+
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&key)
+            .expect("registered step")
+            .cancel_requested = true;
+        assert!(
+            record_step_pid(
+                &svc.active_steps,
+                key,
+                100,
+                executor::TrackedProcess::Workload
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn signalling_a_jobs_unsupervised_steps_spares_a_launcher_step() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let (job_id, step_id) = (33, 4);
+        svc.register_test_step(job_id, step_id, None).await;
+        record_step_pid(
+            &svc.active_steps,
+            (job_id, step_id),
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await;
+
+        svc.signal_active_steps_for_job(job_id, 0, SIGHUP).await;
+        assert_eq!(stand_in.line().await, "hup");
+
+        svc.cancel_active_steps_for_job(job_id, 0, SIGUSR1, std::time::Duration::from_secs(3600))
+            .await;
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_signal_to_an_unsupervised_job_spares_its_launcher() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let job_id = 34;
+        svc.insert_test_job(job_id, launcher_job(&mut stand_in))
+            .await;
+
+        svc.deliver_signal(job_id, 0, SIGTERM, SignalTarget::Full)
+            .await
+            .expect("deliver TERM");
+        assert_eq!(stand_in.line().await, "term");
+
+        svc.deliver_signal(job_id, 0, SIGUSR1, SignalTarget::Full)
+            .await
+            .expect("deliver USR1");
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    #[tokio::test]
+    async fn an_explicit_signal_to_an_unsupervised_job_spares_its_launcher() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let job_id = 35;
+        svc.insert_test_job(job_id, launcher_job(&mut stand_in))
+            .await;
+
+        svc.send_explicit_signal(job_id, 0, SIGHUP).await;
+        assert_eq!(stand_in.line().await, "hup");
+
+        svc.send_explicit_signal(job_id, 0, SIGUSR1).await;
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_of_an_unsupervised_job_lets_the_launcher_relay_the_exit() {
+        let svc = test_service();
+        svc.start_monitor("http://127.0.0.1:1".into());
+        let mut stand_in = LauncherStandIn::spawn(TERM_ENDS_THE_WORKER).await;
+        let job_id = 36;
+        svc.insert_test_job(job_id, launcher_job(&mut stand_in))
+            .await;
+
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
+
+        assert_eq!(stand_in.line().await, "term");
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    #[tokio::test]
+    async fn suspending_an_unsupervised_job_stops_the_workload_and_not_the_launcher() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn_script(SUSPENDABLE_LAUNCHER_SCRIPT).await;
+        let job_id = 37;
+        svc.insert_test_job(job_id, launcher_job(&mut stand_in))
+            .await;
+        let launcher = stand_in.pid as i32;
+
+        svc.suspend_signal(job_id, false).await;
+        assert_eq!(await_proc_state(stand_in.worker, &['T']).await, 'T');
+        assert_ne!(
+            proc_state(launcher),
+            'T',
+            "a launcher stopped from outside never resumes its stopped child"
+        );
+
+        svc.suspend_signal(job_id, true).await;
+        assert!(matches!(
+            await_proc_state(stand_in.worker, &['R', 'S']).await,
+            'R' | 'S'
+        ));
+        assert!(matches!(proc_state(launcher), 'R' | 'S'));
     }
 }

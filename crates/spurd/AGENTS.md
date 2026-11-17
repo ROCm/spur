@@ -489,6 +489,12 @@ metrics).
   it and reaches only its descendants (`executor::deliver_signal`,
   `TrackedProcess`), or the supervisor would report the step finished while
   the workload still runs.
+- The agent signals processes itself in two places and applies the same rule
+  there. `CancelStep` and the other step signals go through `signal_step_tree`
+  with the `TrackedProcess` recorded on the `ActiveStep` (a supervised step's
+  tracked pid is the supervisor's workload pid, so it can be a launcher).
+  Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
+  with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a

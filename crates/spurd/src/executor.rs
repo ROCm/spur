@@ -437,9 +437,10 @@ pub enum RunningJob {
 }
 
 /// What the process a launch tracks is, relative to the user's workload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackedProcess {
     /// The workload itself (or the shell that runs it).
+    #[default]
     Workload,
     /// A namespace launcher (`unshare`, `nsenter`, a container's waiting parent)
     /// that forks the workload and relays its exit status. It dies on signals it
@@ -455,6 +456,12 @@ impl TrackedProcess {
     /// mirroring the child's stop stops a second time on resume and never wakes.
     fn spares_launcher(self, sig: Signal) -> bool {
         self == Self::Launcher && !matches!(sig, Signal::SIGKILL | Signal::SIGCONT)
+    }
+
+    /// Whether `sig` must be delivered through the launcher's descendants rather
+    /// than the tracked process's group, which would take the launcher with it.
+    pub(crate) fn behind_launcher(self, sig: Signal) -> bool {
+        self == Self::Launcher && sig != Signal::SIGKILL
     }
 
     /// Decided from the launch alone so a supervisor reading a persisted launch
@@ -615,16 +622,12 @@ impl RunningJob {
     /// descendant of it, and the launcher itself only for the signals it must
     /// get; otherwise it is [`Self::kill_signal`].
     pub fn signal_workload(&self, sig: Signal, tracked: TrackedProcess) -> anyhow::Result<()> {
-        if tracked != TrackedProcess::Launcher || sig == Signal::SIGKILL {
+        if !tracked.behind_launcher(sig) {
             return self.kill_signal(sig);
         }
-        let Some(pid) = self.live_pid() else {
-            return Ok(());
-        };
-        // Walks the launcher's tree, not its process group, so a process that
-        // left the tree is missed; teardown's SIGKILL escalation covers that.
-        kill_descendants(pid, sig);
-        signal_launcher(Some(pid), tracked, sig);
+        if let Some(pid) = self.live_pid() {
+            signal_launcher_tree(pid, tracked, sig);
+        }
         Ok(())
     }
 }
@@ -1755,6 +1758,14 @@ pub fn deliver_signal(
         }
         _ => job.signal_workload(sig, tracked),
     }
+}
+
+/// Signals everything under the launcher `pid`, then the launcher itself if
+/// `sig` is one it must get. Walks the tree, not the process group, so a process
+/// that left the tree is missed; teardown's SIGKILL escalation covers that.
+pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
+    kill_descendants(pid, sig);
+    signal_launcher(Some(pid), tracked, sig);
 }
 
 fn signal_launcher(launcher: Option<i32>, tracked: TrackedProcess, sig: Signal) {
