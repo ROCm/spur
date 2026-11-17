@@ -10,7 +10,6 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
-use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -1642,11 +1641,18 @@ async fn try_preempt_with_handoffs(
         .collect();
 
     for pending in unscheduled {
+        // With this pass's packing hint, as placement reads it, so only victims on
+        // nodes the job could start on this pass are offered.
+        let placement = spur_sched::node_match::NodePlacement::new(pending);
         // Scoped to the nodes this job could actually use: a victim wedged
         // elsewhere must not block preemption across the whole cluster.
         let waiting_on_release = draining_victims.iter().any(|victim| {
             preemptor_awaiting_release(victim) == Some(pending.job_id)
-                && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
+                && preempt_overlaps_pending_nodes(
+                    &placement,
+                    &victim.allocated_nodes,
+                    cluster_nodes,
+                )
         });
         if waiting_on_release {
             continue;
@@ -1661,7 +1667,11 @@ async fn try_preempt_with_handoffs(
         // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
-            if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
+            if !preempt_overlaps_pending_nodes(
+                &placement,
+                &candidate.allocated_nodes,
+                cluster_nodes,
+            ) {
                 continue;
             }
 
@@ -2327,6 +2337,10 @@ struct VictimPool<'a> {
 /// touched. A partial eviction destroys work without helping anyone, and an
 /// unplaceable job has no satisfiable set at all — which is what stops a job that
 /// can never be placed from evicting one victim per cycle forever (§8.2).
+///
+/// Placement puts every listed node of an additive nodelist into the allocation,
+/// so each one must be free or evacuable, and its victims go first whatever
+/// they cost.
 fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
     pool: &VictimPool<'_>,
@@ -2335,10 +2349,15 @@ fn satisfiable_victim_set(
 ) -> Option<HashSet<spur_core::job::JobId>> {
     let (nodes, reservations) = (state.nodes, state.reservations);
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
-    if state.listed_node_handed_off(reclaimer, &placement) {
+    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    if state.listed_node_handed_off(reclaimer, &placement)
+        || placement.additive_listed_node_unavailable(nodes, reservations, now, &required)
+    {
         return None;
     }
-    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    let mandatory = |node: &spur_core::node::Node| {
+        placement.nodelist_is_additive() && placement.is_listed(&node.name)
+    };
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
@@ -2368,7 +2387,6 @@ fn satisfiable_victim_set(
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
             None if cap_frees(node, &[]) => have += 1,
-            None => {}
             Some(on_node)
                 if on_node.iter().all(|id| {
                     pool.evictable.contains(id)
@@ -2377,9 +2395,15 @@ fn satisfiable_victim_set(
                             .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
                 }) && cap_frees(node, on_node) =>
             {
-                evacuable.push((node.name.as_str(), on_node));
+                if mandatory(node) {
+                    have += 1;
+                    victims.extend(on_node.iter().copied());
+                } else {
+                    evacuable.push((node.name.as_str(), on_node));
+                }
             }
-            Some(_) => {}
+            _ if mandatory(node) => return None,
+            _ => {}
         }
     }
 
@@ -2442,41 +2466,22 @@ pub(crate) fn preemptor_awaiting_release(
     }
 }
 
-/// True when `candidate` occupies a node the pending job could target.
+/// True when one of `occupied` is a node the pending job behind `pending` could be
+/// placed on, by placement's reading of its `--nodelist`, `--exclude` and partitions.
+/// Node state, features and capacity are left to the caller.
 pub(crate) fn preempt_overlaps_pending_nodes(
-    pending: &spur_core::job::Job,
-    candidate: &spur_core::job::Job,
+    pending: &spur_sched::node_match::NodePlacement<'_>,
+    occupied: &[String],
     nodes: &[spur_core::node::Node],
 ) -> bool {
-    if candidate.allocated_nodes.is_empty() {
+    if occupied.is_empty() {
         return false;
     }
-    let occupied: HashSet<&str> = candidate
-        .allocated_nodes
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    if let Some(ref nodelist) = pending.spec.nodelist {
-        return nodelist
-            .split(',')
-            .map(str::trim)
-            .any(|n| occupied.contains(n));
-    }
-
-    let partitions: Vec<&str> =
-        requested_partition_names(pending.spec.partition.as_deref()).collect();
-
+    let occupied: HashSet<&str> = occupied.iter().map(String::as_str).collect();
     nodes.iter().any(|node| {
-        if !occupied.contains(node.name.as_str()) {
-            return false;
-        }
-        if partitions.is_empty() {
-            return true;
-        }
-        partitions
-            .iter()
-            .any(|p| node.partitions.iter().any(|np| np == p))
+        occupied.contains(node.name.as_str())
+            && pending.allows_name(&node.name)
+            && pending.in_partition(node)
     })
 }
 
@@ -5630,6 +5635,64 @@ pub(crate) mod tests {
         job
     }
 
+    /// Whether a victim on `victim_node` is one `pending` could use, among n1 to n3 in
+    /// "batch" and n4 in "debug".
+    fn victim_node_usable(pending: JobSpec, victim_node: &str) -> bool {
+        let nodes = [
+            node_in("n1", &["batch"]),
+            node_in("n2", &["batch"]),
+            node_in("n3", &["batch"]),
+            node_in("n4", &["debug"]),
+        ];
+        let pending = job_with_spec(pending);
+        preempt_overlaps_pending_nodes(
+            &spur_sched::node_match::NodePlacement::new(&pending),
+            &[victim_node.to_string()],
+            &nodes,
+        )
+    }
+
+    #[test]
+    fn a_victim_on_a_node_the_pending_job_excludes_is_not_offered() {
+        let spec = JobSpec {
+            exclude: Some("n[1-2]".into()),
+            ..Default::default()
+        };
+        assert!(!victim_node_usable(spec.clone(), "n2"));
+        assert!(victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_on_a_node_in_the_pending_jobs_nodelist_range_is_offered() {
+        let spec = JobSpec {
+            nodelist: Some("n[1-2]".into()),
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec.clone(), "n2"));
+        assert!(!victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_outside_a_nodelist_shorter_than_the_node_count_is_offered() {
+        let spec = JobSpec {
+            nodelist: Some("n1".into()),
+            num_nodes: 2,
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec, "n3"));
+    }
+
+    #[test]
+    fn a_victim_on_a_listed_node_outside_the_pending_jobs_partition_is_not_offered() {
+        let spec = JobSpec {
+            partition: Some("batch".into()),
+            nodelist: Some("n1,n4".into()),
+            ..Default::default()
+        };
+        assert!(victim_node_usable(spec.clone(), "n1"));
+        assert!(!victim_node_usable(spec, "n4"));
+    }
+
     #[test]
     fn grace_time_prefers_the_qos_value() {
         let job = job_in_partitions("gpu");
@@ -6161,6 +6224,62 @@ pub(crate) mod tests {
             )
             .expect("both nodes recoverable");
             assert_eq!(victims, [7, 8].into_iter().collect());
+        }
+
+        /// The victim set for a two-node job that lists only `n1`.
+        fn victims_for_n1_and_one_more(
+            nodes: &[Node],
+            occupants: &[(&'static str, Vec<spur_core::job::JobId>)],
+            evictable: &[spur_core::job::JobId],
+            priorities: &[(spur_core::job::JobId, i32)],
+        ) -> Option<HashSet<spur_core::job::JobId>> {
+            let mut job = reclaimer(2, 1);
+            job.spec.nodelist = Some("n1".into());
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                occupants.iter().cloned().collect();
+            let evictable: HashSet<spur_core::job::JobId> = evictable.iter().copied().collect();
+            let priority: HashMap<spur_core::job::JobId, i32> =
+                priorities.iter().copied().collect();
+            victim_set_without_handoffs(
+                &job,
+                &VictimPool {
+                    evictable: &evictable,
+                    occupants: &occupants,
+                    priority: &priority,
+                    max_priority: None,
+                },
+                nodes,
+                &[],
+                Utc::now(),
+            )
+        }
+
+        #[test]
+        fn a_short_nodelist_evicts_nothing_when_its_listed_node_cannot_be_freed() {
+            let nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            let held =
+                victims_for_n1_and_one_more(&nodes, &[("n1", vec![9]), ("n2", vec![7])], &[7], &[]);
+            assert_eq!(held, None);
+        }
+
+        #[test]
+        fn a_short_nodelist_evicts_nothing_when_its_listed_node_is_down() {
+            let mut nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            nodes[0].state = spur_core::node::NodeState::Down;
+            let down = victims_for_n1_and_one_more(&nodes, &[("n2", vec![7])], &[7], &[]);
+            assert_eq!(down, None);
+        }
+
+        #[test]
+        fn a_short_nodelist_frees_its_listed_node_before_cheaper_ones() {
+            let nodes = vec![node("n1", 4), node("n2", 4), node("n3", 4)];
+            let victims = victims_for_n1_and_one_more(
+                &nodes,
+                &[("n1", vec![7]), ("n2", vec![8]), ("n3", vec![9])],
+                &[7, 8, 9],
+                &[(7, 5000), (8, 10), (9, 20)],
+            );
+            assert_eq!(victims, Some([7, 8].into_iter().collect()));
         }
 
         #[test]
