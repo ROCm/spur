@@ -2603,8 +2603,9 @@ same ``name`` that names the GPU's render node. The entry is merged into that GP
 instead of adding a second one: its ``type``, ``cores`` and ``links``, where set,
 replace what discovery or the CDI annotations reported, and the GPU keeps its
 discovered device nodes. A GPU with no ``cores`` uses the CPUs of its NUMA node.
-An entry that names no known render node (for example only ``/dev/dri/cardN``)
-is kept as a device of its own. Each partition of a partitioned GPU has its own
+An entry that names no known render node but only other nodes of a known
+device (for example only ``/dev/dri/cardN``) is dropped, since that device is
+already reported. Each partition of a partitioned GPU has its own
 render node, so give one entry per partition.
 
 .. code-block:: toml
