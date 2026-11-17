@@ -36,8 +36,8 @@ pub struct Partition {
     pub deny_accounts: Vec<String>,
     pub deny_qos: Vec<String>,
 
-    /// Slurm's partition QOS: its limits apply to every job in the partition on
-    /// top of the job's own QOS, counted across all accounts and job QOSes.
+    /// Limits apply to every job in the partition on top of the job's own
+    /// QOS, counted across all accounts and job QOSes.
     #[serde(default)]
     pub qos: Option<String>,
 

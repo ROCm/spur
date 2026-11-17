@@ -485,6 +485,68 @@ async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_users_only_running_job_counts_toward_the_partition_cap_when_borrowed() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 1).await;
+    let borrowed = run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
+    cm.jobs.write().get_mut(&borrowed).unwrap().idle_fill = true;
+
+    let next = submit_and_wait(&cm, gpu_job("alice", "acct-b", "qb"));
+
+    assert!(schedulable(&cm, next).is_none());
+    assert_eq!(
+        cm.get_job(next).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partition_qos_that_is_also_the_job_qos_still_applies_as_the_job_qos() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 2).await;
+    let elsewhere = |spec: JobSpec| JobSpec {
+        partition: Some("default".into()),
+        ..spec
+    };
+    run_on(&cm, elsewhere(gpu_job("alice", "acct-a", "usercap")), "n1");
+    run_on(&cm, elsewhere(gpu_job("alice", "acct-a", "usercap")), "n2");
+
+    let in_gpu = submit_and_wait(&cm, gpu_job("alice", "acct-a", "usercap"));
+
+    assert!(schedulable(&cm, in_gpu).is_none());
+    assert_eq!(
+        cm.get_job(in_gpu).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partition_qos_has_no_effect_with_accounting_disabled() {
+    let dir = TempDir::new().unwrap();
+    let cm = test_cluster(&dir).await;
+    assert!(!cm.config().accounting.enabled());
+    register_node(&cm, "n1", 8, 16000);
+    cm.create_partition(Partition {
+        name: "gpu".into(),
+        nodes: "ALL".into(),
+        qos: Some("usercap".into()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            account: None,
+            qos: None,
+            ..gpu_job("alice", "acct-a", "qa")
+        },
+    );
+
+    assert!(schedulable(&cm, id).is_some());
+}
+
 #[test]
 fn a_partition_update_logged_before_partition_qos_replays_unchanged() {
     const LEGACY: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"DRAIN","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null}}"#;
