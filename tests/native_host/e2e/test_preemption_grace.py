@@ -82,10 +82,12 @@ _CHECKPOINT_PROGRESS_LINES = 5
 # Time limit of the stubborn job. It has to outlast the srun step starting and installing
 # its traps, which is awaited after the job is already running.
 _STUBBORN_TIME_LIMIT = "00:00:30"
-# Probes of "still running" sit this far before the kill wait expires, and span a window
-# long enough to hold a tick at one a second.
-_KILL_WAIT_PROBE_END_SECS = 2
+# A "still running" probe spans a window long enough to hold a tick at one a second. It ends
+# this far before a kill wait expires: 2 s when timed from the moment the signal is requested,
+# which can only be early; 9 s when timed from observing COMPLETING, which polling makes late.
 _KILL_WAIT_PROBE_SPAN_SECS = 2
+_PROBE_MARGIN_FROM_REQUEST_SECS = 2
+_PROBE_MARGIN_FROM_OBSERVED_SECS = 9
 
 
 @pytest.fixture(params=[False, True], ids=["user-spurd", "root-spurd"])
@@ -255,9 +257,9 @@ def _sleep_until(deadline: float) -> None:
 
 
 def _assert_ticking_through_kill_wait(cluster, job: _StubbornJob, kill_wait_secs: int,
-                                      event_at: float, event: str) -> None:
-    """Both scripts must still tick just before the kill wait that began at *event_at* ends."""
-    probe_end = event_at + kill_wait_secs - _KILL_WAIT_PROBE_END_SECS
+                                      event_at: float, event: str, margin_secs: int) -> None:
+    """Both scripts must still tick *margin_secs* before the kill wait that began at *event_at* ends."""
+    probe_end = event_at + kill_wait_secs - margin_secs
     _sleep_until(probe_end - _KILL_WAIT_PROBE_SPAN_SECS)
     earlier = _tick_counts(cluster, job)
     _sleep_until(probe_end)
@@ -793,7 +795,9 @@ class TestCancelKillWaitReachesSteps:
             cancelled_at = time.time()
             cluster.scancel(job.job_id)
 
-            _assert_ticking_through_kill_wait(cluster, job, _KILL_WAIT_SECS, cancelled_at, "scancel")
+            _assert_ticking_through_kill_wait(
+                cluster, job, _KILL_WAIT_SECS, cancelled_at, "scancel", _PROBE_MARGIN_FROM_REQUEST_SECS,
+            )
             _assert_stubborn_got_term(cluster, job, "scancel")
             assert wait_job(cluster, job.job_id, timeout=_KILL_WAIT_SECS + _SLACK_SECS) == "CA", (
                 f"the job must end CANCELLED once the kill wait is over:\n{cluster.debug_job(job.job_id)}"
@@ -820,6 +824,7 @@ class TestTimeLimitKillWaitReachesSteps:
 
             _assert_ticking_through_kill_wait(
                 cluster, job, _LONG_TIMEOUT_KILL_WAIT_SECS, in_completing_since, "the time limit",
+                _PROBE_MARGIN_FROM_OBSERVED_SECS,
             )
             _assert_stubborn_got_term(cluster, job, "the time limit")
             assert job_state(cluster.squeue_all(), job.job_id) == "CG", (
