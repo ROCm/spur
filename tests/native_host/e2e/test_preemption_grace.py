@@ -78,6 +78,8 @@ _QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
 # well inside _GRACE_SECS even after the scheduler's delay in delivering the warning.
 _SINGLE_NODE_CHECKPOINT_SECS = 20
 _CHECKPOINT_PROGRESS_LINES = 5
+# Lines come at one a second after the warning lands, so allow that plus polling latency.
+_CHECKPOINT_PROGRESS_WAIT_SECS = _CHECKPOINT_PROGRESS_LINES + _SLACK_SECS
 
 # Time limit of the stubborn job. It has to outlast the srun step starting and installing
 # its traps, which is awaited after the job is already running.
@@ -211,8 +213,9 @@ def _submit_stubborn(cluster, prefix: str, *, node: str, sbatch_args: list[str])
     """Submit a job that records SIGTERM and carries on, then wait for its srun step's traps.
 
     Both scripts write a tick line a second, so a test can tell whether each is still alive
-    at a given moment without relying on the job state alone. The batch script leaves when
-    its step does, so a step that dies early also ends the job.
+    at a given moment without relying on the job state alone. The batch ticks independently
+    of its srun client, which has no SIGTERM handler and dies on the signal, so only the
+    kill wait's SIGKILL ends the job.
     """
     def marker(name: str) -> str:
         return f"{cluster.remote_dir}/{prefix}-{name}.marker"
@@ -230,8 +233,7 @@ def _submit_stubborn(cluster, prefix: str, *, node: str, sbatch_args: list[str])
         "#!/bin/bash\n"
         f"trap 'echo TERM >> {marker('batch-term')}' TERM\n"
         f"srun -N1 {step_script} &\n"
-        "pid=$!\n"
-        f'while kill -0 "$pid" 2>/dev/null; do echo tick >> {marker("batch-ticks")}; sleep 1; done\n',
+        f'while true; do echo tick >> {marker("batch-ticks")}; sleep 1; done\n',
     )
     job_id = parse_job_id(
         cluster.sbatch(["-N1", f"--nodelist={node}", "-J", prefix, *sbatch_args, batch_script])
@@ -415,7 +417,7 @@ class TestGraceCheckpointSingleNode:
             wait_until(
                 lambda: len(_marker_lines(cluster, checkpoint_marker)) >= _CHECKPOINT_PROGRESS_LINES
                 or job_state(cluster.squeue_all(), victim.job_id) != "R",
-                timeout_s=_WARNING_WAIT_SECS, interval_s=1,
+                timeout_s=_CHECKPOINT_PROGRESS_WAIT_SECS, interval_s=1,
                 desc=f"job {victim.job_id}'s step to checkpoint or its job to end",
             )
             written = len(_marker_lines(cluster, checkpoint_marker))

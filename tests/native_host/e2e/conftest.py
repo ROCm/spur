@@ -162,15 +162,24 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
 def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False,
                     config_overrides: dict | None = None,
                     agent_labels: dict[int, dict[str, str]] | None = None):
-    """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
+    """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure or skip."""
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         c.deploy(config_overrides=config_overrides, agent_as_root=agent_as_root,
                  agent_labels=agent_labels)
-    except Exception:
+    except BaseException:
         c.teardown()
         raise
     return c
+
+
+def _assert_agent_runs_as_root(c: SpurCluster) -> None:
+    """Fail a root-mode run whose spurd is not root: it would use no namespaces, no launcher,
+    and pass without exercising the root path."""
+    agent_user = c.spurd_agent_user(0)
+    if agent_user != "root":
+        c.teardown()
+        pytest.fail(f"agent_as_root needs a rootful spurd, got user {agent_user!r}")
 
 
 def _provision_cluster(ssh_nodes, remote_bin_dir):
@@ -213,6 +222,8 @@ def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, agent_as_root):
     spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir,
                                    agent_as_root=agent_as_root,
                                    config_overrides=cluster_config_overrides)
+    if agent_as_root:
+        _assert_agent_runs_as_root(spur_cluster)
     yield spur_cluster
     spur_cluster.teardown()
 
@@ -383,9 +394,11 @@ def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, agen
         pytest.skip(str(e))
     try:
         c.deploy(config_overrides=cluster_config_overrides, agent_as_root=agent_as_root)
-    except Exception:
+    except BaseException:
         c.teardown()
         raise
+    if agent_as_root:
+        _assert_agent_runs_as_root(c)
     yield c
     c.teardown()
 
