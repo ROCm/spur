@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 pub use spur_devices::topology::DeviceTopology;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::device::{Device, LegacyGpu, GPU_GRES};
 
@@ -301,6 +301,15 @@ impl ResourceAllocations {
     }
 }
 
+/// What an allocation holds of one gres on a node: specific ids, plus count-only
+/// holds that name no id, of any type or of one type.
+#[derive(Debug, Default)]
+struct Holds {
+    by_id: HashSet<u64>,
+    untyped: u64,
+    typed: BTreeMap<String, u64>,
+}
+
 /// A requested device kind: a gres name and an optional type (`None` takes any).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceKey {
@@ -555,14 +564,33 @@ impl ResourceSet {
         crate::device::allocates_by_id(gres_name, self.devices_of(gres_name).next().is_some())
     }
 
-    /// An allocated id the inventory lost means a held device may now be
-    /// reported under another id, so none of this node's devices of that kind
-    /// can be trusted free.
-    fn holds_unknown_device(&self, allocated: &ResourceAllocations, gres_name: &str) -> bool {
-        allocated
-            .device_ids(gres_name)
-            .iter()
-            .any(|id| !self.devices_of(gres_name).any(|d| d.stable_id == *id))
+    /// What `allocated` holds of `gres_name`. Builds before NICs were reported by
+    /// id recorded a count-only `{device_id: 0, count}` under `name` or
+    /// `name:type`; those count as anonymous holds until their jobs end. GPUs
+    /// always were by id, so for them an unknown id 0 is an unknown device. `None`
+    /// when an id the inventory lost is held: the held device may now be
+    /// reported under another id, so none of this kind can be trusted free.
+    fn holds(&self, allocated: &ResourceAllocations, gres_name: &str) -> Option<Holds> {
+        let mut holds = Holds::default();
+        let known = |id: u64| self.devices_of(gres_name).any(|d| d.stable_id == id);
+        for held in allocated.devices.get(gres_name).into_iter().flatten() {
+            if known(held.device_id) {
+                holds.by_id.insert(held.device_id);
+                holds.untyped += held.count.saturating_sub(1);
+            } else if held.device_id == 0 && gres_name != crate::device::GPU_GRES {
+                holds.untyped += held.count;
+            } else {
+                return None;
+            }
+        }
+        let typed_prefix = format!("{gres_name}:");
+        for (key, entries) in &allocated.devices {
+            if let Some(device_type) = key.strip_prefix(&typed_prefix) {
+                let count: u64 = entries.iter().map(|d| d.count).sum();
+                *holds.typed.entry(device_type.to_string()).or_default() += count;
+            }
+        }
+        Some(holds)
     }
 
     /// Return unallocated device IDs for an injectable gres type.
@@ -572,18 +600,44 @@ impl ResourceSet {
         gres_name: &str,
         device_type: Option<&str>,
     ) -> Vec<u64> {
-        if self.holds_unknown_device(allocated, gres_name) {
+        let Some(holds) = self.holds(allocated, gres_name) else {
             return Vec::new();
+        };
+        let mut free_by_type: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+        for device in self.devices_of(gres_name) {
+            if !holds.by_id.contains(&device.stable_id) {
+                free_by_type
+                    .entry(device.device_type.as_str())
+                    .or_default()
+                    .push(device.stable_id);
+            }
         }
-        let allocated_ids: std::collections::HashSet<u64> =
-            allocated.device_ids(gres_name).into_iter().collect();
+        // Anonymous typed holds take devices of their type off the end, so the
+        // ids a typed and an untyped request see are the same ones.
+        for (held_type, count) in &holds.typed {
+            if let Some(free) = free_by_type.get_mut(held_type.as_str()) {
+                let keep = free.len().saturating_sub(*count as usize);
+                free.truncate(keep);
+            }
+        }
+        let total = free_by_type
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_sub(holds.untyped as usize);
+        let wanted = |device: &&Device| match device_type {
+            None | Some("any") => true,
+            Some(t) => device.device_type == t,
+        };
         self.devices_of(gres_name)
-            .filter(|d| !allocated_ids.contains(&d.stable_id))
-            .filter(|d| match device_type {
-                None | Some("any") => true,
-                Some(t) => d.device_type == t,
+            .filter(wanted)
+            .filter(|d| {
+                free_by_type
+                    .get(d.device_type.as_str())
+                    .is_some_and(|free| free.contains(&d.stable_id))
             })
             .map(|d| d.stable_id)
+            .take(total)
             .collect()
     }
 
@@ -1659,6 +1713,104 @@ mod device_inventory_tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn nic_node(nics: &[(u64, &str)]) -> ResourceSet {
+        ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            devices: nics
+                .iter()
+                .enumerate()
+                .map(|(i, (id, t))| Device::new("nic", t, *id, i as u32))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// An allocation as builds before by-id NICs recorded a count-only `key`.
+    fn legacy(key: &str, count: u64) -> ResourceAllocations {
+        let mut alloc = ResourceAllocations::default();
+        alloc.devices.insert(
+            key.to_string(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count,
+            }],
+        );
+        alloc
+    }
+
+    #[test]
+    fn a_stale_positional_gpu_id_zero_withholds_every_gpu() {
+        let node = gpu_and_nic_node();
+        let held = legacy("gpu", 1);
+        assert!(node.available_device_ids(&held, "gpu", None).is_empty());
+        let mut one_gpu = ResourceRequest::with_scalar(1, 0);
+        one_gpu.add_devices("gpu", None, 1);
+        assert!(!node.can_satisfy_with_allocated(&held, &one_gpu));
+    }
+
+    #[test]
+    fn an_unknown_gpu_id_zero_with_a_count_withholds_every_gpu() {
+        let mut node = gpu_and_nic_node();
+        node.devices.push(Device::gpu(0x130000, "mi300x", 2));
+        assert!(node
+            .available_device_ids(&legacy("gpu", 2), "gpu", None)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_legacy_count_hold_of_positional_nics_counts_against_them() {
+        let node = nic_node(&[(0, "p"), (1, "p"), (2, "p"), (3, "p")]);
+        let free = node.available_device_ids(&legacy("nic", 2), "nic", None);
+        assert_eq!(free.len(), 2);
+        assert!(!free.contains(&0));
+    }
+
+    #[test]
+    fn a_legacy_count_hold_of_pci_encoded_nics_is_not_an_unknown_device() {
+        let node = nic_node(&[(0x050000, "p"), (0x850000, "p"), (0x860000, "p")]);
+        assert_eq!(
+            node.available_device_ids(&legacy("nic", 2), "nic", None)
+                .len(),
+            1
+        );
+        assert!(node.can_satisfy_with_allocated(&legacy("nic", 2), &nic_request(1, 0)));
+        assert!(!node.can_satisfy_with_allocated(&legacy("nic", 2), &nic_request(2, 0)));
+    }
+
+    #[test]
+    fn a_legacy_typed_count_hold_counts_against_its_type() {
+        let node = nic_node(&[
+            (0x050000, "pollara400"),
+            (0x850000, "pollara400"),
+            (0x860000, "other"),
+        ]);
+        let held = legacy("nic:pollara400", 1);
+        assert_eq!(
+            node.available_device_ids(&held, "nic", Some("pollara400"))
+                .len(),
+            1
+        );
+        assert_eq!(node.available_device_ids(&held, "nic", None).len(), 2);
+    }
+
+    #[test]
+    fn releasing_a_legacy_count_hold_after_by_id_picks_leaves_only_the_picks() {
+        let node = nic_node(&[(0, "p"), (1, "p"), (2, "p"), (3, "p")]);
+        let mut held = legacy("nic", 2);
+        let new = build_node_allocation(&node, &held, &nic_request(1, 0));
+        assert_eq!(new.device_ids("nic"), vec![1]);
+        held.add(&new);
+        held.subtract(&legacy("nic", 2));
+        assert_eq!(held.devices["nic"], new.devices["nic"]);
+    }
+
+    #[test]
+    fn an_exclusive_request_waits_for_a_legacy_count_hold() {
+        let node = nic_node(&[(0x050000, "p"), (0x850000, "p")]);
+        assert!(!node.can_satisfy_with_allocated(&legacy("nic", 1), &node.as_request()));
     }
 
     fn node_with_shadowing_pools() -> ResourceSet {
