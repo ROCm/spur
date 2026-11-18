@@ -6,6 +6,7 @@ mod fairshare;
 mod grpc;
 mod notifier;
 pub(crate) mod preemption;
+pub(crate) mod qos_level;
 mod reconcile;
 pub(crate) mod txn;
 
@@ -403,9 +404,9 @@ pub async fn association_maps(
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
                 .collect();
-            if !set.is_empty() {
-                allowed_qos.insert(key, set);
-            }
+            // Insert even when the set is empty: the key's presence means a
+            // list applies, and an empty one allows no QOS.
+            allowed_qos.insert(key, set);
         }
     }
 

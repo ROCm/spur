@@ -39,11 +39,12 @@ pub struct AssociationCache {
     kick: Notify,
 }
 
-/// Whether `qos` is usable given an association's allow-list and pinned
-/// default: unrestricted if neither is set, otherwise it must be a member
-/// of the allow-list or match the default exactly.
-pub(crate) fn qos_permitted(allowed: &HashSet<String>, default: Option<&str>, qos: &str) -> bool {
-    (allowed.is_empty() && default.is_none()) || allowed.contains(qos) || default == Some(qos)
+/// Whether `qos` is usable. `None` means no allow-list applies anywhere above
+/// the user, so any QOS is allowed; the default only fills in a job that did
+/// not name one. Once a list applies, the QOS has to be on it, and an empty
+/// list allows nothing.
+pub(crate) fn qos_permitted(allowed: Option<&HashSet<String>>, qos: &str) -> bool {
+    allowed.is_none_or(|list| list.contains(qos))
 }
 
 /// Direct coordinator assignments plus every account under them. Slurm gives
@@ -187,9 +188,9 @@ impl AssociationCache {
     }
 
     /// Check `qos` is usable by this concrete (user, account) association:
-    /// the association must exist, and if it's been scoped to an allow-list
-    /// and/or a pinned default QOS, `qos` must be one of them. Membership
-    /// and QOS are read under one lock so a concurrent refresh can't
+    /// the association must exist, and if an allow-list applies, `qos` must
+    /// be on it. A pinned default does not restrict the list. Membership
+    /// and the list are read under one lock so a concurrent refresh can't
     /// validate one against the other's stale snapshot (see `resolve()`).
     /// Permissive while the cache hasn't loaded — at startup before the
     /// first fetch completes, or while the accounting DB stays
@@ -205,10 +206,7 @@ impl AssociationCache {
                 "user '{user}' is not associated with account '{account}'"
             ));
         }
-        let empty = HashSet::new();
-        let allowed = snapshot.allowed_qos.get(&key).unwrap_or(&empty);
-        let default = snapshot.default_qos.get(&key);
-        if qos_permitted(allowed, default.map(String::as_str), qos) {
+        if qos_permitted(snapshot.allowed_qos.get(&key), qos) {
             Ok(())
         } else {
             Err(format!(
@@ -218,14 +216,15 @@ impl AssociationCache {
     }
 
     /// The effective account (given, or the user's default), that
-    /// association's default QOS, and its allow-list (empty if unscoped),
-    /// resolved under a single read lock so a concurrent refresh can't
-    /// yield a torn old/new combination.
+    /// association's default QOS, and its allow-list. `None` for the list
+    /// means none applies (any QOS is allowed); `Some` of an empty set allows
+    /// no QOS. Resolved under a single read lock so a concurrent refresh can't
+    /// yield a torn combination.
     pub fn resolve(
         &self,
         user: &str,
         account: Option<&str>,
-    ) -> (Option<String>, Option<String>, HashSet<String>) {
+    ) -> (Option<String>, Option<String>, Option<HashSet<String>>) {
         let snapshot = self.snapshot.read();
         let effective_account = account
             .filter(|a| !a.is_empty())
@@ -246,8 +245,7 @@ impl AssociationCache {
         let allowed_qos = effective_account
             .as_ref()
             .and_then(|acct| snapshot.allowed_qos.get(&(user.to_owned(), acct.clone())))
-            .cloned()
-            .unwrap_or_default();
+            .cloned();
         (effective_account, default_qos, allowed_qos)
     }
 
@@ -469,7 +467,7 @@ mod tests {
         let cache = AssociationCache::new();
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (Some("research".into()), None, HashSet::new())
+            (Some("research".into()), None, None)
         );
     }
 
@@ -520,7 +518,7 @@ mod tests {
     #[test]
     fn resolve_unknown_user_with_no_account_given_resolves_nothing() {
         let cache = AssociationCache::new();
-        assert_eq!(cache.resolve("alice", None), (None, None, HashSet::new()));
+        assert_eq!(cache.resolve("alice", None), (None, None, None));
     }
 
     #[test]
@@ -529,16 +527,9 @@ mod tests {
         cache.insert_default_qos("alice", "research", "highprio");
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (
-                Some("research".into()),
-                Some("highprio".into()),
-                HashSet::new()
-            )
+            (Some("research".into()), Some("highprio".into()), None)
         );
-        assert_eq!(
-            cache.resolve("alice", Some("other")),
-            (None, None, HashSet::new())
-        );
+        assert_eq!(cache.resolve("alice", Some("other")), (None, None, None));
     }
 
     #[test]
@@ -547,7 +538,28 @@ mod tests {
         cache.insert_allowed_qos("alice", "research", &["a", "b"]);
         let (account, _, allowed) = cache.resolve("alice", Some("research"));
         assert_eq!(account.as_deref(), Some("research"));
-        assert_eq!(allowed, HashSet::from(["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            allowed,
+            Some(HashSet::from(["a".to_string(), "b".to_string()]))
+        );
+    }
+
+    #[test]
+    fn resolve_distinguishes_an_empty_list_from_no_list() {
+        let cache = AssociationCache::new();
+        cache.insert_allowed_qos("alice", "research", &[]);
+        cache.insert_association("bob", "research");
+        assert_eq!(
+            cache.resolve("alice", Some("research")).2,
+            Some(HashSet::new())
+        );
+        assert_eq!(cache.resolve("bob", Some("research")).2, None);
+        assert!(cache
+            .check_qos_authorized("alice", "research", "normal")
+            .is_err());
+        assert!(cache
+            .check_qos_authorized("bob", "research", "normal")
+            .is_ok());
     }
 
     #[test]
@@ -564,17 +576,14 @@ mod tests {
             loaded: true,
             ..Snapshot::default()
         });
-        assert_eq!(
-            cache.resolve("alice", Some("research")),
-            (None, None, HashSet::new())
-        );
+        assert_eq!(cache.resolve("alice", Some("research")), (None, None, None));
         assert_eq!(
             cache.resolve("bob", Some("eng")),
-            (Some("eng".into()), Some("new".into()), HashSet::new())
+            (Some("eng".into()), Some("new".into()), None)
         );
         assert_eq!(
             cache.resolve("bob", None),
-            (Some("eng".into()), Some("new".into()), HashSet::new())
+            (Some("eng".into()), Some("new".into()), None)
         );
     }
 
@@ -652,7 +661,8 @@ mod tests {
     }
 
     #[test]
-    fn check_qos_authorized_matches_pinned_default() {
+    fn check_qos_authorized_default_does_not_restrict_other_qos() {
+        // A default only fills in a job that named none. It is not an allow-list.
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "highprio");
         assert!(cache
@@ -660,7 +670,7 @@ mod tests {
             .is_ok());
         assert!(cache
             .check_qos_authorized("alice", "research", "other-teams-qos")
-            .is_err());
+            .is_ok());
     }
 
     #[test]
@@ -696,17 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn check_qos_authorized_default_qos_alone_still_scopes_to_one() {
-        // Pinning only a default (no explicit allow-list) keeps the original
-        // single-QOS behavior for associations never given a list.
+    fn check_qos_authorized_rejects_a_default_that_is_not_on_the_list() {
         let cache = AssociationCache::new();
-        cache.insert_default_qos("alice", "research", "highprio");
+        cache.insert_allowed_qos("alice", "research", &["burst"]);
+        cache.insert_default_qos("alice", "research", "normal");
         assert!(cache
-            .check_qos_authorized("alice", "research", "highprio")
-            .is_ok());
-        assert!(cache
-            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .check_qos_authorized("alice", "research", "normal")
             .is_err());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "burst")
+            .is_ok());
     }
 
     #[test]
