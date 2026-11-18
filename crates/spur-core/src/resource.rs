@@ -481,10 +481,8 @@ impl ResourceSet {
             request.add_devices(&device.gres_name, device_type, 1);
         }
         for (pool, &count) in &self.generic {
-            let (name, device_type) = match pool.split_once(':') {
-                Some((name, t)) => (name, Some(t)),
-                None => (pool.as_str(), None),
-            };
+            let name = crate::device::pool_gres_name(pool);
+            let device_type = pool.split_once(':').map(|(_, t)| t);
             // A pool sharing its name with a kind handed out by id is not
             // requestable here; the job already takes every such device.
             if self.allocates_by_id(name) {
@@ -553,9 +551,8 @@ impl ResourceSet {
     }
 
     /// Whether this node hands out `gres_name` as specific devices, not a count.
-    /// GPUs always are: a node without any can offer none, not a countable pool.
-    fn allocates_by_id(&self, gres_name: &str) -> bool {
-        gres_name == GPU_GRES || self.devices_of(gres_name).next().is_some()
+    pub fn allocates_by_id(&self, gres_name: &str) -> bool {
+        crate::device::allocates_by_id(gres_name, self.devices_of(gres_name).next().is_some())
     }
 
     /// An allocated id the inventory lost means a held device may now be
@@ -659,7 +656,9 @@ pub fn build_exclusive_allocation(inventory: &ResourceSet, memory_mb: u64) -> Re
             .push(AllocatedDevice::injectable(device.stable_id));
     }
     for (name, count) in &inventory.generic {
-        if *count > 0 {
+        // Same rule as the whole-node request: a pool named like a kind handed
+        // out by id is never allocated next to those devices.
+        if *count > 0 && !inventory.allocates_by_id(crate::device::pool_gres_name(name)) {
             alloc
                 .devices
                 .entry(name.clone())
@@ -1660,6 +1659,56 @@ mod device_inventory_tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn node_with_shadowing_pools() -> ResourceSet {
+        let mut node = gpu_and_nic_node();
+        node.generic.extend([
+            ("nic".to_string(), 4),
+            ("nic:pollara400".to_string(), 2),
+            ("gpu".to_string(), 8),
+            ("bandwidth:lustre".to_string(), 100),
+        ]);
+        node
+    }
+
+    #[test]
+    fn an_exclusive_allocation_skips_pools_named_like_a_device_kind() {
+        let alloc = build_exclusive_allocation(&node_with_shadowing_pools(), 0);
+        assert!(!alloc.devices.contains_key("nic:pollara400"));
+        assert!(alloc.devices["nic"].iter().all(|d| d.count == 1));
+        assert!(alloc.devices["gpu"].iter().all(|d| d.count == 1));
+        assert_eq!(
+            alloc.devices["bandwidth:lustre"],
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 100
+            }]
+        );
+    }
+
+    #[test]
+    fn an_exclusive_allocation_holds_exactly_what_the_whole_node_request_asks_for() {
+        let node = node_with_shadowing_pools();
+        let request = node.as_request();
+        assert!(node.can_satisfy(&request));
+        let alloc = build_exclusive_allocation(&node, 0);
+        let mut held: Vec<String> = alloc.devices.keys().cloned().collect();
+        held.sort();
+        let mut asked: Vec<String> = request
+            .devices
+            .keys()
+            .map(|key| {
+                if node.allocates_by_id(&key.gres_name) {
+                    key.gres_name.clone()
+                } else {
+                    key.generic_key()
+                }
+            })
+            .collect();
+        asked.sort();
+        asked.dedup();
+        assert_eq!(held, asked);
     }
 
     fn nic_request(untyped: u32, typed: u32) -> ResourceRequest {
