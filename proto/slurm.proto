@@ -58,6 +58,7 @@ message ResourceAllocations {
 
 // Deprecated with ResourceSet.gpus: superseded by Device.
 message GpuResource {
+  option deprecated = true;
   uint32 device_id = 1;
   string gpu_type = 2;       // "mi300x", "h100"
   uint64 memory_mb = 3;
@@ -191,6 +192,7 @@ message BlockFileNotice {
 }
 
 enum GpuLinkType {
+  option deprecated = true;
   GPU_LINK_PCIE = 0;
   GPU_LINK_XGMI = 1;
   GPU_LINK_NVLINK = 2;
