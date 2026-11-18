@@ -947,6 +947,29 @@ change them while that file exists.
    :ref:`gpu-partition-mode-change` for the separate, still-destructive case
    of actually switching a GPU's partition mode.
 
+GPU auto-detection per CDI kind
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With ``[devices] auto_detect`` on (the default), ``spurd`` now discovers each
+device kind live unless an on-disk CDI spec of that same kind exists. Before, any
+on-disk spec turned live GPU discovery off. Discovered GPUs win over GPUs you
+configured another way:
+
+* **GRES GPUs on nodes with discovered GPUs.** A ``[[devices.gres]]`` GPU whose
+  ``file`` names a discovered GPU is merged into it instead of being reported
+  as a second GPU. Its ``type`` and ``cores``, where set, replace the
+  discovered ones, so jobs that request the configured type keep matching. The
+  GPU uses the discovered device nodes.
+* **GPU ids on nodes with GRES GPUs and a CDI spec of another kind.** Such a node
+  used to keep positional GPU ids; it now discovers its GPUs live and reports
+  PCI-encoded ids. **Drain these nodes before upgrading ``spurd``**, so no
+  running job holds a positional id.
+* **GPU specs under another CDI kind.** A spec under a kind other than
+  ``amd.com/gpu`` (for example ``example.com/gpu``) no longer suppresses
+  ``amd.com/gpu`` discovery. For GPUs both describe, the discovered device wins
+  and the spec's mounts, hooks and environment are not applied. Move them to an
+  ``amd.com/gpu`` spec, or set ``auto_detect = false``.
+
 Bounded controller shutdown (``shutdown_grace_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
