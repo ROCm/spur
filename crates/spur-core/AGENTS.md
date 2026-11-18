@@ -26,7 +26,7 @@ src/
   gpu_request.rs         -- GpuRequest, GpuDemand, resolve_gpu_demand, distribute_total
   gpu_binding.rs         -- GpuBinding, BoundGpu, per-node GPU selection validated at dispatch/step
   gpu_identity.rs        -- stable_id-to-silicon mapping, LayoutDiff, safe GPU renames
-  partition.rs           -- Partition, PartitionState, PreemptType, PreemptMode
+  partition.rs           -- Partition, PartitionState, PreemptType, PreemptMode, VictimOrderKey
   reservation.rs         -- Reservation, ReservationFlags, overlap/access checks
   accounting.rs          -- Account, Qos, QosLimits, AccountLimits, TresRecord, TresType
   account_limits.rs      -- Association-level limit enforcement (mirrors qos.rs)
@@ -104,6 +104,18 @@ src/
 Default ports: gRPC 6817, REST 6820, Raft 6821, Metrics 6822, Agent 6818,
 WireGuard 51820.
 
+### Victim ordering
+
+`SchedulerConfig::preempt_victim_order` is a precedence list of
+`VictimOrderKey` (`partition.rs`): `LeastWork` (`least_work`), `FewestJobs`
+(`fewest_jobs`), and `Hash` (`hash`). `DEFAULT_VICTIM_ORDER` is
+`[LeastWork, FewestJobs, Hash]`; `default_preempt_victim_order()` supplies it
+when the field is absent. Unknown keys fail deserialization; repeated keys
+fail `SlurmConfig::validate()`. An empty list is valid. The live scheduler
+reads the list after `scontrol reconfigure`, including when it is cleared.
+For ranking semantics and the shared preemption/reclaim flow, see
+[victim selection](../../docs/knowledge/scheduler/scheduling.md#victim-selection).
+
 ---
 
 ## 3. Job model
@@ -160,6 +172,12 @@ Held in controller memory. Key fields beyond the spec:
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
 - `preferred_nodes`, `last_sched_eval`: transient per-scheduling-pass hints (`#[serde(skip)]`).
+
+`Job::run_time_at(now)` returns the current run's duration from `start_time`
+to `end_time` (or `now`), excluding accumulated and ongoing suspension and
+clamping at zero. It returns `None` before the run starts. `run_time()` uses
+the current clock; callers comparing several jobs can pass one instant to
+`run_time_at` for a consistent view. Requeue resets the run clock.
 
 ### PendingReason
 
