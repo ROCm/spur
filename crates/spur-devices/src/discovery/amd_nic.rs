@@ -5,8 +5,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Mutex;
 
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::cdi::annotations;
 use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, GENERATED_CDI_VERSION};
@@ -27,17 +28,66 @@ fn kind_of(device: &str) -> Option<&'static str> {
     }
 }
 
-struct DiscoveredNic {
-    bdf: String,
-    stable_id: u64,
-    rdma_device: String,
-    uverbs: String,
-    netdev: Option<String>,
-    numa_node: Option<u32>,
+/// Why discovery passed over an ionic function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Skipped {
+    NoRdmaDevice,
+    NoUverbs { rdma_device: String },
+    UnsupportedAddress,
 }
 
-/// One spec per NIC kind present, devices in BDF order.
-pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
+/// What discovery last said about each NIC. Discovery reruns every refresh, so
+/// it logs only what changed rather than repeating itself each tick.
+#[derive(Debug, Default)]
+struct NicReports {
+    skipped: BTreeMap<String, Skipped>,
+    claimed: Option<Vec<String>>,
+}
+
+impl NicReports {
+    const fn new() -> Self {
+        Self {
+            skipped: BTreeMap::new(),
+            claimed: None,
+        }
+    }
+
+    /// Records why `bdf` was skipped; true when that differs from last time.
+    fn skip(&mut self, bdf: &str, why: Skipped) -> bool {
+        self.skipped.insert(bdf.to_owned(), why.clone()) != Some(why)
+    }
+
+    fn found(&mut self, bdf: &str) {
+        self.skipped.remove(bdf);
+    }
+
+    /// Records the claimed NICs; true when the set changed.
+    fn claim(&mut self, bdfs: Vec<String>) -> bool {
+        let changed = self.claimed.as_ref() != Some(&bdfs);
+        self.claimed = Some(bdfs);
+        changed
+    }
+}
+
+static NIC_REPORTS: Mutex<NicReports> = Mutex::new(NicReports::new());
+
+fn report_skip(bdf: &str, why: &Skipped) {
+    match why {
+        Skipped::NoRdmaDevice => {
+            warn!(%bdf, "ionic function has no RDMA device (is ionic_rdma loaded?); not scheduling it")
+        }
+        Skipped::NoUverbs { rdma_device } => warn!(
+            %bdf,
+            %rdma_device,
+            "AI NIC has no uverbs node (is ib_uverbs loaded?); not scheduling it"
+        ),
+        Skipped::UnsupportedAddress => {
+            warn!(%bdf, "AI NIC's PCI address cannot be encoded as a device id; not scheduling it")
+        }
+    }
+}
+
+fn discover_nic_cdi_with(root: &Path, reports: &mut NicReports) -> Vec<CdiSpec> {
     let sysfs = root.join("sys");
     let rdma = rdma_devices_by_function(&sysfs);
     let uverbs = uverbs_by_rdma_device(&sysfs);
@@ -50,9 +100,31 @@ pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
         let Some(kind) = pollara_kind(&path) else {
             continue;
         };
-        if let Some(nic) = discover_nic(&path, &rdma, &uverbs) {
-            by_kind.entry(kind).or_default().push(nic);
+        let Some(bdf) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        match discover_nic(&path, &bdf, &rdma, &uverbs) {
+            Ok(nic) => {
+                reports.found(&bdf);
+                by_kind.entry(kind).or_default().push(nic);
+            }
+            Err(why) => {
+                if reports.skip(&bdf, why.clone()) {
+                    report_skip(&bdf, &why);
+                }
+            }
         }
+    }
+
+    let mut claimed: Vec<String> = by_kind
+        .values()
+        .flatten()
+        .map(|nic| nic.bdf.clone())
+        .collect();
+    claimed.sort();
+    let had_nics = reports.claimed.as_ref().is_some_and(|c| !c.is_empty());
+    if (had_nics || !claimed.is_empty()) && reports.claim(claimed.clone()) {
+        info!(nics = ?claimed, "claiming every RDMA-enabled ionic function as an AI NIC");
     }
 
     let shared = shared_edits(root);
@@ -63,6 +135,23 @@ pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
             to_spec(kind, &nics, root, &shared)
         })
         .collect()
+}
+
+struct DiscoveredNic {
+    bdf: String,
+    stable_id: u64,
+    rdma_device: String,
+    uverbs: String,
+    netdev: Option<String>,
+    numa_node: Option<u32>,
+}
+
+/// One spec per NIC kind present, devices in BDF order.
+pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
+    let mut reports = NIC_REPORTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    discover_nic_cdi_with(root, &mut reports)
 }
 
 fn pollara_kind(function: &Path) -> Option<&'static str> {
@@ -77,25 +166,24 @@ fn pollara_kind(function: &Path) -> Option<&'static str> {
 /// Without an RDMA device and its uverbs node a NIC is no use to a job.
 fn discover_nic(
     function: &Path,
+    bdf: &str,
     rdma: &HashMap<String, String>,
     uverbs: &HashMap<String, String>,
-) -> Option<DiscoveredNic> {
-    let bdf = function.file_name()?.to_str()?.to_owned();
-    let Some(rdma_device) = rdma.get(&bdf).cloned() else {
-        debug!(%bdf, "ionic function has no RDMA device; not an AI NIC");
-        return None;
-    };
-    let Some(uverbs) = uverbs.get(&rdma_device).cloned() else {
-        warn!(%bdf, %rdma_device, "AI NIC has no uverbs node (is ib_uverbs loaded?); skipping it");
-        return None;
-    };
-    Some(DiscoveredNic {
-        stable_id: stable_id_from_bdf(&bdf)?,
+) -> Result<DiscoveredNic, Skipped> {
+    let rdma_device = rdma.get(bdf).cloned().ok_or(Skipped::NoRdmaDevice)?;
+    let uverbs = uverbs
+        .get(&rdma_device)
+        .cloned()
+        .ok_or_else(|| Skipped::NoUverbs {
+            rdma_device: rdma_device.clone(),
+        })?;
+    Ok(DiscoveredNic {
+        stable_id: stable_id_from_bdf(bdf).ok_or(Skipped::UnsupportedAddress)?,
         uverbs,
         netdev: first_entry(&function.join("net")),
         numa_node: read_numa_node(function),
         rdma_device,
-        bdf,
+        bdf: bdf.to_owned(),
     })
 }
 
@@ -318,6 +406,43 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_nic_state_is_reported_once_until_it_changes() {
+        let mut reports = NicReports::default();
+        let no_uverbs = || Skipped::NoUverbs {
+            rdma_device: "ionic_0".into(),
+        };
+        assert!(reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
+        assert!(!reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
+        assert!(reports.skip("0000:05:00.0", no_uverbs()));
+        reports.found("0000:05:00.0");
+        assert!(reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
+    }
+
+    #[test]
+    fn discovery_records_a_nic_without_uverbs() {
+        let dir = tempfile::tempdir().unwrap();
+        PciFunction::pollara("0000:05:00.0", "ionic_0", "enp5s0").write(dir.path());
+        let mut reports = NicReports::default();
+        discover_nic_cdi_with(dir.path(), &mut reports);
+        assert_eq!(
+            reports.skipped.get("0000:05:00.0"),
+            Some(&Skipped::NoUverbs {
+                rdma_device: "ionic_0".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_claimed_set_is_reported_only_when_it_changes() {
+        let mut reports = NicReports::default();
+        let a = "0000:05:00.0".to_string();
+        let b = "0000:85:00.0".to_string();
+        assert!(reports.claim(vec![a.clone()]));
+        assert!(!reports.claim(vec![a.clone()]));
+        assert!(reports.claim(vec![a, b]));
     }
 
     #[test]
