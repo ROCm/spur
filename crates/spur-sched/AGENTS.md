@@ -131,13 +131,16 @@ against candidate nodes:
 | Name allow/deny | `allows_name()` | `--nodelist` and `--exclude`, hostlist-expanded |
 | Partition membership | `in_partition()` | OR across `--partition` values |
 | Feature constraints | `has_features()` | AND across `--constraint` features |
+| Native-only placement | `eligible()` | An explicit multi-node `batch-host` job (`needs_native_nodes()`) skips K8s virtual nodes |
 | Reservation authorization | `reservation_ok()` | Active reservations block unreserved jobs |
 | k0s cluster exclusion | `matches()` | Nodes with a k0s role are never scheduled |
 | Schedulable state | `is_schedulable()` | Node must be Idle/Mixed and no layout block |
 | Exclusive idle check | `matches()` | `--exclusive` jobs require zero allocated resources |
 | Script placement agents | `without_misplacing_agents()` | Drops agents without `CAP_SCRIPT_PLACEMENT` that would launch the job differently; `None` when an additive `--nodelist` needs one |
 
-`eligible()` = name + partition + features + reservation (load-independent).
+`eligible()` = name + partition + features + native-only placement + reservation
+(load-independent). `eligible_on_any_agent()` omits native-only placement so the
+pending-reason classifier can tell when K8s nodes alone would have fit.
 `matches()` = eligible + schedulable + exclusive-idle + k0s gate (feeds the
 pending-reason classifier).
 `matches_for_reservation()` = eligible + up-state + k0s gate + layout block
