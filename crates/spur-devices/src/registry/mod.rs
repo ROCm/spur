@@ -4,7 +4,7 @@
 pub mod device_registry;
 pub mod entry;
 
-pub use device_registry::DeviceRegistry;
+pub use device_registry::{DeviceRegistry, RegistryNote, ShadowedPool};
 pub use entry::{
     entry_matches_gres_name, kind_matches_gres_name, kind_to_gres_name, DeviceCapability,
     DeviceClass, DeviceEntry,

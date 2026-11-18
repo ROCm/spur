@@ -2651,6 +2651,11 @@ entry per partition to set them apart.
    file = "/dev/dri/renderD128"
    cores = "0-15"
 
+A count-only entry named like a kind the node hands out by device (for example
+``gpu``, or ``nic`` on a node with discovered NICs) is ignored. Once a kind was
+handed out by device, it stays so until ``spurd`` restarts, even if all of its
+devices disappear; a restart re-evaluates it.
+
 Node inventory convergence
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 

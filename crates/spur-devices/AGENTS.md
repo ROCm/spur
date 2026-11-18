@@ -122,7 +122,7 @@ and countable pools (count-only, no device paths).
    nodes stay discovery's) and its other own nodes are dropped with a warning.
    An entry naming no discovered entry stays a candidate.
 3. GRES countable pools
-4. Skip CDI aggregates (a device whose nodes are the union of two or more siblings of its kind, like `all`), then dedup whatever did not merge: CDI against CDI by identical node set, a GRES entry against anything that owns one of its own nodes (CDI wins)
+4. Skip CDI aggregates (a device whose nodes are the union of two or more siblings of its kind, like `all`), then dedup whatever did not merge: CDI against CDI by identical node set, a GRES entry against anything that owns one of its own nodes (CDI wins); then drop countable pools named like a kind handed out by id now or before (`populate_with_history`), recording them in `shadowed_pools()`
 5. Assign sequential device_ids per gres_name
 6. Backfill stable_id from device_id when annotation absent
 
