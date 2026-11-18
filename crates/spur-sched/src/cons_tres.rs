@@ -492,6 +492,23 @@ impl NodeAllocation {
             .map(|owned| owned.result.devices.clone())
     }
 
+    /// Non-GPU devices every owner holds, by kind, so inventory refreshes can
+    /// keep reporting a held device that discovery briefly misses.
+    pub fn held_devices(&self) -> DeviceSelection {
+        let mut by_kind: std::collections::BTreeMap<&str, std::collections::BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
+        for owned in self.owners.values() {
+            for (gres, ids) in owned.result.devices.iter() {
+                by_kind.entry(gres).or_default().extend(ids.iter().copied());
+            }
+        }
+        by_kind
+            .into_iter()
+            .fold(DeviceSelection::new(), |selection, (gres, ids)| {
+                selection.with(gres, ids.into_iter().collect())
+            })
+    }
+
     /// GPU ids `run_attempt` of `job_id` holds, in the order it reserved them.
     pub fn owner_gpu_ids(&self, job_id: u32, run_attempt: u32) -> Option<&[u64]> {
         self.owners
@@ -984,6 +1001,27 @@ mod tests {
             Err(AllocError::DevicesUnavailable { gres: "nic".into() })
         );
         assert!(node.claim_devices(2, 1, &nics(&[0x850000])).is_ok());
+    }
+
+    #[test]
+    fn held_devices_lists_the_non_gpu_devices_every_owner_holds() {
+        let mut node = make_node(8, 1024, 0, "");
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
+        node.claim_devices(1, 1, &nics(&[0x850000])).unwrap();
+        node.claim_devices(
+            2,
+            1,
+            &spur_core::device::DeviceSelection::new()
+                .with("nic", vec![0x050000])
+                .with("fpga", vec![0]),
+        )
+        .unwrap();
+
+        let held = node.held_devices();
+        assert_eq!(held.of("nic"), &[0x050000, 0x850000]);
+        assert_eq!(held.of("fpga"), &[0]);
+        assert!(held.gpus().is_empty());
     }
 
     #[test]

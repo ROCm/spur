@@ -34,7 +34,8 @@ pub struct Device {
     #[serde(default, alias = "gpu_type")]
     pub device_type: String,
     /// Allocation identity, unique per `gres_name` on a node; survives a
-    /// mid-set removal, unlike `index`.
+    /// mid-set removal, unlike `index`. Ids of file-backed GRES devices are
+    /// positional, so editing their `file` list renumbers them.
     #[serde(default)]
     pub stable_id: u64,
     /// Positional index the vendor runtime numbers the device by.

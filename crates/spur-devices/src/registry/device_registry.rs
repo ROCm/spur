@@ -122,23 +122,30 @@ impl DeviceRegistry {
     }
 
     /// The registry to inject from: `pinned` ids keep `previous`'s device even
-    /// where the new layout reuses the id; unreported `gres_name` ones drop.
+    /// where the new layout reuses the id, and ids of a reported kind that the
+    /// report left out drop. Kinds the report does not name are left as found.
     pub fn with_pinned(
         mut self,
         previous: &DeviceRegistry,
-        gres_name: &str,
-        reported: &std::collections::HashSet<u64>,
-        pinned: &std::collections::HashSet<u64>,
+        reported: &DeviceSelection,
+        pinned: &DeviceSelection,
     ) -> DeviceRegistry {
+        let names_kind = |selection: &DeviceSelection, gres: &str| {
+            selection.iter().any(|(kind, _)| kind == gres)
+        };
         // Exact name, as the reported inventory is built from it.
-        let is_gres = |e: &DeviceEntry| e.is_injectable() && e.gres_name == gres_name;
+        let is_pinned =
+            |e: &DeviceEntry| e.is_injectable() && pinned.of(&e.gres_name).contains(&e.stable_id);
         self.devices.retain(|e| {
-            !is_gres(e) || (reported.contains(&e.stable_id) && !pinned.contains(&e.stable_id))
+            if !e.is_injectable() || !names_kind(reported, &e.gres_name) {
+                return true;
+            }
+            reported.of(&e.gres_name).contains(&e.stable_id) && !is_pinned(e)
         });
         let kept: Vec<DeviceEntry> = previous
             .devices
             .iter()
-            .filter(|e| is_gres(e) && pinned.contains(&e.stable_id))
+            .filter(|e| is_pinned(e))
             .cloned()
             .collect();
         self.devices.extend(kept);
@@ -663,9 +670,9 @@ mod tests {
             ],
             ..DeviceRegistry::new()
         };
-        let pinned: HashSet<u64> = [0x110000].into();
+        let pinned = DeviceSelection::new().with("gpu", vec![0x110000]);
 
-        let merged = candidate.with_pinned(&previous, "gpu", &pinned, &pinned);
+        let merged = candidate.with_pinned(&previous, &pinned, &pinned);
 
         let entries: Vec<(u64, &str)> = merged
             .list()
@@ -673,6 +680,42 @@ mod tests {
             .map(|e| (e.stable_id, primary_device_path(e)))
             .collect();
         assert_eq!(entries, vec![(0x110000, "/dev/dri/renderD128")]);
+    }
+
+    #[test]
+    fn a_pinned_device_of_any_kind_keeps_its_previous_entry() {
+        let nic = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry.gres_name = "nic".into();
+            entry
+        };
+        let previous = DeviceRegistry {
+            devices: vec![
+                nic(7, "/dev/infiniband/uverbs3"),
+                nic(8, "/dev/infiniband/uverbs4"),
+            ],
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![nic(8, "/dev/infiniband/uverbs0")],
+        };
+        let reported = DeviceSelection::new().with("nic", vec![7, 8]);
+        let pinned = DeviceSelection::new().with("nic", vec![7]);
+
+        let merged = candidate.with_pinned(&previous, &reported, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (8, "/dev/infiniband/uverbs0"),
+                (7, "/dev/infiniband/uverbs3")
+            ]
+        );
     }
 
     #[test]
@@ -701,10 +744,12 @@ mod tests {
             ],
             ..DeviceRegistry::new()
         };
-        let reported: HashSet<u64> = [0x110000, 0x110001, 0x120300].into();
-        let pinned: HashSet<u64> = [0x120300].into();
+        let reported = DeviceSelection::new()
+            .with("gpu", vec![0x110000, 0x110001, 0x120300])
+            .with("nic", vec![0x110003]);
+        let pinned = DeviceSelection::new().with("gpu", vec![0x120300]);
 
-        let merged = candidate.with_pinned(&previous, "gpu", &reported, &pinned);
+        let merged = candidate.with_pinned(&previous, &reported, &pinned);
 
         let entries: Vec<(u64, &str)> = merged
             .list()
