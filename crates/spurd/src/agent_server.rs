@@ -46,12 +46,15 @@ use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
 /// The devices a dispatch names, by kind, under the controller's by-id rule.
-/// A typed key (`name:type`) or a known pool has nothing to inject; any other
-/// kind is kept even when the registry lost it, so the launch fails on it.
+/// A typed key (`name:type`), a known pool or an anonymous count hold has
+/// nothing to inject; an unknown id is kept even when the registry lost its
+/// kind, so the launch fails on it.
 fn allocated_selection(
     allocated: Option<&ResourceAllocations>,
     registry: &DeviceRegistry,
 ) -> spur_devices::DeviceSelection {
+    use spur_core::device::{classify_held, Held};
+
     let mut selection = spur_devices::DeviceSelection::new();
     let Some(allocated) = allocated else {
         return selection;
@@ -61,8 +64,22 @@ fn allocated_selection(
             continue;
         }
         let by_id = spur_core::device::allocates_by_id(gres, registry.has_injectable(gres));
-        if by_id || !registry.has_countable_pool(gres) {
-            selection.set(gres, held.devices.iter().map(|d| d.device_id).collect());
+        if !by_id && registry.has_countable_pool(gres) {
+            continue;
+        }
+        let ids: Vec<u64> = classify_held(
+            gres,
+            held.devices.iter().map(|d| (d.device_id, d.count)),
+            |id| registry.has_injectable_id(gres, id),
+        )
+        .into_iter()
+        .filter_map(|held| match held {
+            Held::Device(id) | Held::Unknown(id) => Some(id),
+            Held::Anonymous(_) => None,
+        })
+        .collect();
+        if !ids.is_empty() {
+            selection.set(gres, ids);
         }
     }
     selection
@@ -17341,6 +17358,49 @@ mod tests {
         assert!(allocated_selection(Some(&allocated), &registry).is_empty());
     }
 
+    fn legacy_nic_count_hold(count: u64) -> ResourceAllocations {
+        ResourceAllocations {
+            devices: [(
+                "nic".to_string(),
+                DeviceAllocations {
+                    devices: vec![AllocatedDevice {
+                        device_id: 0,
+                        count,
+                    }],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_legacy_untyped_count_hold_of_a_known_id_zero_injects_that_device() {
+        let allocated = legacy_nic_count_hold(2);
+        assert_eq!(
+            allocated_selection(Some(&allocated), &test_gpu_and_nic_registry()),
+            spur_devices::DeviceSelection::new().with("nic", vec![0])
+        );
+    }
+
+    #[test]
+    fn a_legacy_untyped_count_hold_without_an_id_zero_injects_nothing() {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let mut registry = DeviceRegistry::new();
+        registry.populate(
+            &CdiCache::new(),
+            &GresCache::from_entries(&[GresEntry {
+                name: "gpu".into(),
+                file: Some("/dev/dri/renderD128".into()),
+                ..Default::default()
+            }]),
+        );
+        let allocated = legacy_nic_count_hold(2);
+        assert!(allocated_selection(Some(&allocated), &registry).is_empty());
+    }
+
     fn nic_dispatch(nic: u64) -> (JobSpec, ResourceAllocations) {
         let spec = JobSpec {
             cpus_per_task: 1,
@@ -22349,7 +22409,7 @@ mod tests {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
             spur_core::config::MemlockLimit::Unlimited,
         );
 
@@ -22403,7 +22463,7 @@ mod tests {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
             spur_core::config::MemlockLimit::Unlimited,
         );
 
@@ -22449,6 +22509,39 @@ mod tests {
 
     // A controller-allocated GPU id absent from this node's inventory is a
     // different failure than one already in use; the message must say so.
+    #[test]
+    fn a_stale_gpu_id_zero_is_selected_so_the_launch_fails_on_it() {
+        assert_eq!(
+            allocated_selection(Some(&gpu_alloc_request(&[0])), &DeviceRegistry::new()),
+            spur_devices::DeviceSelection::new().with("gpu", vec![0])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_on_a_stale_gpu_id_zero_names_the_inventory() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0x110000, 0x120000]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        };
+        let err = svc
+            .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0])))
+            .await
+            .expect_err("GPU 0 is not in this node's inventory");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("not in this node's gpu inventory"),
+            "got: {}",
+            err.message()
+        );
+    }
+
     #[tokio::test]
     async fn a_dispatch_on_an_unknown_gpu_id_names_the_inventory() {
         let svc = AgentService::new(
@@ -22502,7 +22595,7 @@ mod tests {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
             spur_core::config::MemlockLimit::Unlimited,
         );
 
@@ -22604,6 +22697,9 @@ mod tests {
             res.is_ok(),
             "both stale owners must be reclaimed, got {res:?}"
         );
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.owner_gpu_ids(100, 1), Some(&[0, 1][..]));
+        assert_eq!(alloc.owner_attempt(98), None);
     }
 
     // A dispatch spanning a stale GPU and a still-running GPU must reject: the
