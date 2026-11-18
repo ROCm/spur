@@ -303,9 +303,6 @@ fn preferred_victims(
 ) -> Option<HashSet<JobId>> {
     let placement = spur_sched::node_match::NodePlacement::new(request);
     let required = job_resource_request(request);
-    let needs_aware_agents = request
-        .spec
-        .needs_placement_aware_agents(state.script_placement_default);
     let mut on_node: HashMap<&str, Vec<JobId>> = HashMap::new();
     for job in ordered {
         for node in &job.allocated_nodes {
@@ -316,17 +313,26 @@ fn preferred_victims(
     for jobs in on_node.values_mut() {
         jobs.sort_unstable();
     }
+    let mut suitable = Vec::new();
+    for (index, node) in state.nodes.iter().enumerate() {
+        budget.spend(1)?;
+        if placement.matches_for_reservation(node, state.reservations, now)
+            && node.total_resources.can_satisfy(&required)
+            && state.handoff_allows(request, &node.name)
+        {
+            suitable.push(index);
+        }
+    }
+    // Not a deferral: a job pinned to an agent that would misplace its script gets no
+    // preference, and the placement trials then prove no eviction lets it start.
+    let Some(suitable) =
+        placement.without_misplacing_agents(state.nodes, suitable, state.script_placement_default)
+    else {
+        return Some(HashSet::new());
+    };
     let mut empty = 0usize;
     let mut candidates = Vec::new();
-    for node in state.nodes {
-        budget.spend(1)?;
-        if !placement.matches_for_reservation(node, state.reservations, now)
-            || (needs_aware_agents && node.reads_placement_off_script())
-            || !node.total_resources.can_satisfy(&required)
-            || !state.handoff_allows(request, &node.name)
-        {
-            continue;
-        }
+    for node in suitable.into_iter().map(|index| &state.nodes[index]) {
         if let Some(jobs) = on_node.get(node.name.as_str()) {
             candidates.push((node, jobs.as_slice()));
         } else if node.can_satisfy_request(&required) {
