@@ -118,6 +118,7 @@ impl Fixture {
             busy_until: &EMPTY,
             preemption_handoffs: &self.handoffs,
             partition_node_usage: &self.usage,
+            script_placement_default: Default::default(),
         }
     }
 }
@@ -986,6 +987,7 @@ fn victim_selection_profile() {
             busy_until: &empty,
             preemption_handoffs: &HashMap::new(),
             partition_node_usage: &HashMap::new(),
+            script_placement_default: Default::default(),
         };
         let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
         let priorities = HashMap::new();
@@ -1528,7 +1530,10 @@ fn duplicate_device_slices_and_huge_payload_metadata_are_safe() {
         &mut SearchBudget::default(),
     )
     .expect("payload is not placement input");
-    assert!(prepared.job().spec.script.is_none());
+    assert_eq!(
+        prepared.job().spec.script.as_deref(),
+        Some(spur_core::script_placement::ResolvedPlacement::AllNodes.stand_in_script())
+    );
     assert!(prepared.job().spec.environment.is_empty());
 }
 

@@ -1315,11 +1315,11 @@ Jobs that used a placement during the upgrade can stay affected after it: a
 controller upgraded partway through restarts from the snapshot it wrote before its
 upgrade, which lacks their placement.
 
-**Upgrade agents before relying on a placement.** A job whose placement differs
-from the text scan does not start on nodes whose ``spurd`` predates this release.
-The controller logs a warning naming those nodes and retries the job later,
-counting each retry against ``[controller] max_batch_requeue``, so a job that keeps
-landing on such nodes is eventually held.
+**Upgrade agents before relying on a placement.** A node whose ``spurd`` predates
+this release places the script by the text scan. The scheduler keeps a job off such
+nodes when the scan would launch it differently, which only happens for a
+multi-node or ``--mpi=pmix`` job, so that job waits until enough upgraded nodes are
+free. Every other job still runs on any node.
 
 See Also
 --------
