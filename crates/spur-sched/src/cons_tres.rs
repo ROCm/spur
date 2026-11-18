@@ -485,6 +485,7 @@ impl NodeAllocation {
     }
 
     /// Non-GPU devices `run_attempt` of `job_id` holds.
+    #[cfg(test)]
     pub fn owner_devices(&self, job_id: u32, run_attempt: u32) -> Option<DeviceSelection> {
         self.owners
             .get(&job_id)
@@ -554,6 +555,29 @@ impl NodeAllocation {
             .into_iter()
             .filter(|id| !self.launching.contains_key(id))
             .collect()
+    }
+
+    /// Committed owners holding any non-GPU device in `devices`, sorted. A job
+    /// still launching is excluded, as `conflicting_owners` does for GPUs.
+    pub fn device_owners(&self, devices: &DeviceSelection) -> Vec<u32> {
+        let mut owners: Vec<u32> = self
+            .owners
+            .iter()
+            .filter(|(id, _)| !self.launching.contains_key(id))
+            .filter(|(_, owned)| {
+                devices.iter().any(|(gres, ids)| {
+                    owned
+                        .result
+                        .devices
+                        .of(gres)
+                        .iter()
+                        .any(|id| ids.contains(id))
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        owners.sort_unstable();
+        owners
     }
 
     /// Available GPU count (optionally filtered by type).
@@ -1022,6 +1046,29 @@ mod tests {
         assert_eq!(held.of("nic"), &[0x050000, 0x850000]);
         assert_eq!(held.of("fpga"), &[0]);
         assert!(held.gpus().is_empty());
+    }
+
+    #[test]
+    fn device_owners_lists_committed_holders_of_any_named_device() {
+        let mut node = make_node(8, 1024, 0, "");
+        for job in 1..=3 {
+            node.allocate_for_job(job, 1, 1, 0, &[]).unwrap();
+        }
+        node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
+        node.claim_devices(2, 1, &nics(&[0x850000])).unwrap();
+        node.claim_devices(
+            3,
+            1,
+            &spur_core::device::DeviceSelection::new().with("fpga", vec![0]),
+        )
+        .unwrap();
+        node.commit_job(1, 1);
+        node.commit_job(3, 1);
+
+        let wanted = spur_core::device::DeviceSelection::new()
+            .with("nic", vec![0x050000, 0x850000])
+            .with("fpga", vec![0]);
+        assert_eq!(node.device_owners(&wanted), vec![1, 3]);
     }
 
     #[test]

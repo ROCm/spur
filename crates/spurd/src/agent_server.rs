@@ -67,6 +67,51 @@ fn allocated_selection(
     selection
 }
 
+/// Claim `devices` for `job_id`. An owner of one that is neither this job nor
+/// `live` is stale (the controller re-dispatches only after freeing it), so it
+/// is released and the claim retried once, as for GPUs.
+fn claim_devices_reclaiming_stale(
+    alloc: &mut NodeAllocation,
+    job_id: u32,
+    run_attempt: u32,
+    devices: &spur_devices::DeviceSelection,
+    live: &std::collections::HashSet<u32>,
+) -> Result<(), AllocError> {
+    let Err(AllocError::DevicesUnavailable { gres }) =
+        alloc.claim_devices(job_id, run_attempt, devices)
+    else {
+        return alloc.claim_devices(job_id, run_attempt, devices);
+    };
+    let stale: Vec<u32> = alloc
+        .device_owners(devices)
+        .into_iter()
+        .filter(|owner| *owner != job_id && !live.contains(owner))
+        .collect();
+    if stale.is_empty() {
+        return Err(AllocError::DevicesUnavailable { gres });
+    }
+    warn!(
+        job_id,
+        reclaimed = ?stale,
+        "reclaiming stale device owners no longer running, then retrying"
+    );
+    for owner in &stale {
+        alloc.release_job(*owner);
+    }
+    alloc.claim_devices(job_id, run_attempt, devices)
+}
+
+fn device_claim_status(job_id: u32, error: AllocError) -> Status {
+    match error {
+        AllocError::DevicesUnavailable { gres } => Status::resource_exhausted(format!(
+            "controller-allocated {gres} devices unavailable on this node"
+        )),
+        _ => Status::failed_precondition(format!(
+            "job {job_id} lost its reservation while claiming devices"
+        )),
+    }
+}
+
 /// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
@@ -4964,14 +5009,20 @@ impl AgentService {
                 }
                 other => other.map(|_| gpu_ids),
             };
-            let others = resources.devices.excluding("gpu");
-            let restored = restored.and_then(|gpu_ids| {
-                allocation
-                    .claim_devices(descriptor.job_id, descriptor.run_attempt, &others)
-                    .map(|()| gpu_ids)
-            });
             match restored {
                 Ok(gpu_ids) => {
+                    let others = resources.devices.excluding("gpu");
+                    if let Err(error) =
+                        allocation.claim_devices(descriptor.job_id, descriptor.run_attempt, &others)
+                    {
+                        warn!(
+                            job_id = descriptor.job_id,
+                            run_attempt = descriptor.run_attempt,
+                            ?error,
+                            "could not claim an adopted job's non-GPU devices; its cores, \
+                             memory and GPUs are restored, but its devices read free until it ends"
+                        );
+                    }
                     // Rewrite the descriptor forward so the translation is
                     // one-time; harmless if it fails — restore re-translates.
                     if let Some(stable_ids) = translated.filter(|_| !gpu_ids.is_empty()) {
@@ -8298,13 +8349,16 @@ impl SlurmAgent for AgentService {
                         "controller-allocated {gres} devices unavailable on this node"
                     )),
                 })?;
-            if let Err(error) =
-                alloc.claim_devices(req.job_id, req.run_attempt, &devices.excluding("gpu"))
-            {
+            let live: std::collections::HashSet<u32> = jobs.keys().copied().collect();
+            if let Err(error) = claim_devices_reclaiming_stale(
+                &mut alloc,
+                req.job_id,
+                req.run_attempt,
+                &devices.excluding("gpu"),
+                &live,
+            ) {
                 alloc.release_job_if(req.job_id, req.run_attempt);
-                return Err(Status::resource_exhausted(format!(
-                    "controller-allocated devices unavailable on this node: {error:?}"
-                )));
+                return Err(device_claim_status(req.job_id, error));
             }
             result
         };
@@ -11222,17 +11276,18 @@ impl AgentService {
 
         // Under the same lock as the reservation, so two dispatches naming one
         // device cannot both pass; a refused claim must not leave this one held.
-        if let Err(error) = alloc.claim_devices(job_id, run_attempt, &selection.excluding("gpu")) {
+        if let Err(error) = claim_devices_reclaiming_stale(
+            &mut alloc,
+            job_id,
+            run_attempt,
+            &selection.excluding("gpu"),
+            &live,
+        ) {
             alloc.release_job_if(job_id, run_attempt);
-            let AllocError::DevicesUnavailable { gres } = error else {
-                return Err(Status::failed_precondition(format!(
-                    "job {job_id} lost its reservation while claiming devices"
-                )));
-            };
-            warn!(job_id, %gres, "rejecting dispatch: controller-allocated devices already held");
-            return Err(Status::resource_exhausted(format!(
-                "controller-allocated {gres} devices unavailable on this node"
-            )));
+            if let AllocError::DevicesUnavailable { gres } = &error {
+                warn!(job_id, %gres, "rejecting dispatch: controller-allocated devices already held");
+            }
+            return Err(device_claim_status(job_id, error));
         }
         Ok((result, selection))
     }
@@ -17149,6 +17204,85 @@ mod tests {
             ..Default::default()
         };
         (spec, allocated)
+    }
+
+    fn nic_agent() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    /// A committed ledger owner of `nic` that the agent no longer runs.
+    async fn stale_nic_owner(svc: &AgentService, job_id: u32, nic: u64) {
+        let mut alloc = svc.allocation.lock().await;
+        alloc.allocate_for_job(job_id, 1, 1, 0, &[]).unwrap();
+        alloc
+            .claim_devices(
+                job_id,
+                1,
+                &spur_devices::DeviceSelection::new().with("nic", vec![nic]),
+            )
+            .unwrap();
+        alloc.commit_job(job_id, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_owner_of_a_nic_is_reclaimed_on_dispatch() {
+        let svc = nic_agent();
+        stale_nic_owner(&svc, 7, 1).await;
+
+        let (spec, allocated) = nic_dispatch(1);
+        let (_, held) = svc
+            .allocate_local_for_test(8, &spec, Some(&allocated))
+            .await
+            .expect("a stale owner must not block the dispatch");
+        assert_eq!(held.of("nic"), &[1]);
+        assert_eq!(svc.allocation.lock().await.owner_attempt(7), None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_owner_of_a_nic_is_reclaimed_on_register() {
+        let svc = nic_agent();
+        stale_nic_owner(&svc, 7, 1).await;
+        let (_, allocated) = nic_dispatch(1);
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 8,
+            cpus: 1,
+            run_attempt: 1,
+            allocated: Some(allocated),
+            ..Default::default()
+        }))
+        .await
+        .expect("a stale owner must not block the allocation");
+        assert_eq!(svc.allocation.lock().await.owner_attempt(7), None);
+    }
+
+    #[tokio::test]
+    async fn register_job_allocation_reports_a_held_nic_like_a_launch() {
+        let svc = nic_agent();
+        stale_nic_owner(&svc, 7, 1).await;
+        svc.insert_test_job(7, TrackedJob::dummy(0)).await;
+        let (_, allocated) = nic_dispatch(1);
+
+        let refused = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 8,
+                cpus: 1,
+                run_attempt: 1,
+                allocated: Some(allocated),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a live owner holds the NIC");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            refused.message(),
+            "controller-allocated nic devices unavailable on this node"
+        );
     }
 
     #[tokio::test]
