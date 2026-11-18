@@ -4,7 +4,7 @@
 //! Controller policy for where a batch script runs.
 
 use spur_core::job::JobSpec;
-use spur_core::node::{Node, NodeSource, CAP_SCRIPT_PLACEMENT};
+use spur_core::node::{Node, NodeSource};
 use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
 
 pub const BATCH_HOST_K8S_UNSUPPORTED: &str =
@@ -45,13 +45,14 @@ pub fn resolve_run_placement(
             .unwrap_or(cluster_default)
             .resolve(script)
     };
-    // An agent without the capability reads the placement off the script.
     let outdated: Vec<&str> = nodes
         .iter()
-        .filter(|node| !is_k8s(node) && !node.supports(CAP_SCRIPT_PLACEMENT))
+        .filter(|node| node.reads_placement_off_script())
         .map(|node| node.name.as_str())
         .collect();
-    if resolved != scanned && !outdated.is_empty() {
+    if !outdated.is_empty()
+        && resolved.launches_differently_from(scanned, nodes.len(), spec.mpi.as_deref())
+    {
         return Err(PlacementRefusal::Backoff(format!(
             "{resolved} script placement needs a newer spurd on {}",
             outdated.join(",")
@@ -88,6 +89,7 @@ pub fn validate_script_placement_nodelist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::node::CAP_SCRIPT_PLACEMENT;
 
     fn spec(script: &str, requested: Option<ScriptPlacement>) -> JobSpec {
         JobSpec {
@@ -221,6 +223,29 @@ mod tests {
             ),
             Ok(ResolvedPlacement::BatchHost),
             "the old agent's scan places this script the same way"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_predates_placement_still_runs_a_job_it_launches_alike() {
+        let old = [node("n1", NodeSource::NativeHost, &[])];
+        let runner = spec("./runner.sh\n", Some(ScriptPlacement::BatchHost));
+
+        assert_eq!(
+            resolve_run_placement(&runner, &old, ScriptPlacement::Auto),
+            Ok(ResolvedPlacement::BatchHost),
+            "on one node both placements run the script once"
+        );
+        let pmix = JobSpec {
+            mpi: Some("pmix".into()),
+            ..runner
+        };
+        assert!(
+            matches!(
+                resolve_run_placement(&pmix, &old, ScriptPlacement::Auto),
+                Err(PlacementRefusal::Backoff(_))
+            ),
+            "a PMIx batch host launches a rank or a driver depending on the placement"
         );
     }
 

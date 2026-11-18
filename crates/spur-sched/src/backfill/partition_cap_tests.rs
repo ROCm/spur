@@ -158,6 +158,7 @@ impl Fixture {
             busy_until: &self.busy_until,
             preemption_handoffs: &Default::default(),
             partition_node_usage: &self.usage,
+            script_placement_default: Default::default(),
         };
         sched.schedule_with(jobs, &cluster, now(), admission)
     }

@@ -207,6 +207,7 @@ impl Snapshot {
             fabric: state.fabric,
             busy_until: state.busy_until,
             preemption_handoffs: state.preemption_handoffs,
+            script_placement_default: state.script_placement_default,
         }
     }
 }
@@ -302,6 +303,9 @@ fn preferred_victims(
 ) -> Option<HashSet<JobId>> {
     let placement = spur_sched::node_match::NodePlacement::new(request);
     let required = job_resource_request(request);
+    let needs_aware_agents = request
+        .spec
+        .needs_placement_aware_agents(state.script_placement_default);
     let mut on_node: HashMap<&str, Vec<JobId>> = HashMap::new();
     for job in ordered {
         for node in &job.allocated_nodes {
@@ -317,6 +321,7 @@ fn preferred_victims(
     for node in state.nodes {
         budget.spend(1)?;
         if !placement.matches_for_reservation(node, state.reservations, now)
+            || (needs_aware_agents && node.reads_placement_off_script())
             || !node.total_resources.can_satisfy(&required)
             || !state.handoff_allows(request, &node.name)
         {

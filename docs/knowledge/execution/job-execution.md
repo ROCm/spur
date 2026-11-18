@@ -104,8 +104,12 @@ A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 
 Agents advertise `CAP_SCRIPT_PLACEMENT`. An agent without it ignores the field and
-applies the scan, so the controller backs off a run whose placement differs from
-the scan instead of dispatching it there.
+applies the scan (`Node::reads_placement_off_script`). That changes the launch only
+on a multi-node or PMIx run (`ResolvedPlacement::launches_differently_from`): off
+the batch host a node runs the script or holds, and on it only a PMIx launch depends
+on the placement. For a job where it does (`JobSpec::needs_placement_aware_agents`,
+given `ClusterState.script_placement_default`), backfill and the victim search skip
+such nodes, and dispatch backs off a run that still lands on one.
 
 ### Prolog hooks
 

@@ -60,7 +60,9 @@ For each pending job in priority order:
 1. **Find suitable nodes** -- `find_suitable_nodes()` filters by partition,
    features, nodelist/exclude, reservation authorization, node state, k0s
    reservation, and whether an empty node could ever hold it
-   (`Node::can_ever_satisfy`, which includes the general CPU pool below).
+   (`Node::can_ever_satisfy`, which includes the general CPU pool below). A job
+   whose launch an older agent would change skips agents without
+   `CAP_SCRIPT_PLACEMENT` (see `docs/knowledge/execution/job-execution.md#script-placement`).
 
 2. **Compute earliest start per node** -- `earliest_valid_start()` combines
    the timeline's resource availability with reservation conflict checks,

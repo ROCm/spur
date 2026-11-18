@@ -229,8 +229,12 @@ snapshot in the state machine's lock order and retains only placement/policy
 metadata (including suspension timing and live node responsiveness) and still-held
 resource slices. Both compact node copies preserve `not_responding`, so trials
 reject unresponsive nodes through the same placement gate as normal scheduling.
-`placement_job` retains `cpus_per_gpu`; `placement_node` retains `core_layout`
-and `layout_blocked_cpus`. Allocation copies and trial resets preserve
+`placement_job` retains `cpus_per_gpu`; `placement_node` retains `core_layout`,
+`layout_blocked_cpus`, `source`, and `capabilities`. The `PlacementRequest` copy
+also keeps what the [script placement](../execution/job-execution.md#script-placement)
+agent check reads: the requested placement, `mpi`, and the launcher scan as
+`ResolvedPlacement::stand_in_script`, never the script.
+Allocation copies and trial resets preserve
 `reserved_cpus` and `layout_fingerprint`. Release credit follows the node's
 current layout, so an older-layout victim cannot release another holder's
 reserved CPU charge. Immediate trials seed blocked GPUs and refresh timeline

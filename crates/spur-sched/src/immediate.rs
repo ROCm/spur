@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use spur_core::job::{Job, JobSpec};
-use spur_core::node::Node;
+use spur_core::node::{Node, NodeSource};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
+use spur_core::script_placement::ResolvedPlacement;
 
 use crate::node_match::NodePlacement;
 
@@ -124,6 +125,10 @@ impl InputSize {
         self.text(&node.name)?;
         self.strings(&node.partitions)?;
         self.strings(&node.features)?;
+        self.strings(&node.capabilities)?;
+        if let NodeSource::Kubernetes { namespace } = &node.source {
+            self.text(namespace)?;
+        }
         self.strings(
             [&node.layout_error, &node.layout_enforce_error]
                 .into_iter()
@@ -148,6 +153,7 @@ impl InputSize {
                 &spec.constraint,
                 &spec.distribution,
                 &spec.topology,
+                &spec.mpi,
             ]
             .into_iter()
             .flatten(),
@@ -394,6 +400,8 @@ pub fn placement_node(node: &Node) -> Node {
     copy.not_responding = node.not_responding;
     copy.partitions = node.partitions.clone();
     copy.features = node.features.clone();
+    copy.source = node.source.clone();
+    copy.capabilities = node.capabilities.clone();
     copy.weight = node.weight;
     copy.k0s_role = node.k0s_role;
     copy.layout_error = node.layout_error.clone();
@@ -508,7 +516,7 @@ impl PlacementRequest {
             }
         }
         budget.spend(size.entries.checked_add(size.text)?)?;
-        let mut job = placement_job(job);
+        let mut job = request_job(job);
         let before_hostlists = size.entries.checked_add(size.text)?;
         canonicalize_hostlists(&mut job, &mut size, budget)?;
         let hostlist_work = size
@@ -642,6 +650,22 @@ pub fn placement_job(job: &Job) -> Job {
     copy.preferred_nodes = job.preferred_nodes.clone();
     copy.het_job_id = job.het_job_id;
     copy.het_group = job.het_group;
+    copy
+}
+
+/// [`placement_job`] for the job being placed, which also keeps what placement reads
+/// off its batch script: the launcher scan, as a stand-in, but never the script.
+fn request_job(job: &Job) -> Job {
+    let s = &job.spec;
+    let mut copy = placement_job(job);
+    copy.spec.script = s
+        .script
+        .as_deref()
+        .map(|script| ResolvedPlacement::scanned(Some(script)).stand_in_script().into());
+    copy.spec.script_placement = s.script_placement;
+    copy.spec.mpi = s.mpi.clone();
+    copy.spec.srun_job = s.srun_job;
+    copy.spec.interactive = s.interactive;
     copy
 }
 

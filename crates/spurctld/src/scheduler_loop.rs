@@ -1003,18 +1003,19 @@ pub(crate) struct PassView {
     partition_node_usage: PartitionNodeUsage,
     pub(crate) fabric: spur_sched::traits::FabricSchedulingContext,
     topology: Option<spur_core::topology::TopologyTree>,
+    script_placement_default: spur_core::script_placement::ScriptPlacement,
 }
 
 impl PassView {
     /// Read for `in_quota`, the jobs classification admitted, before any borrower
     /// joins: only they own handoffs or lift a node's dispatch cooldown.
     pub(crate) fn read(cluster: &ClusterManager, in_quota: &[spur_core::job::Job]) -> Self {
+        let config = cluster.config();
         let nodes = cluster.nodes_off_dispatch_cooldown(in_quota);
         let reservations = cluster.get_reservations();
         let handoffs = cluster.preemption_handoffs(in_quota, &nodes, &reservations);
         let view = cluster.fabric_view(Utc::now());
-        let topology = cluster
-            .config()
+        let topology = config
             .topology
             .as_ref()
             .and_then(|config| config.build(&cluster.get_nodes(), &view));
@@ -1027,6 +1028,7 @@ impl PassView {
             partition_node_usage: running_partition_usage(cluster),
             fabric: spur_sched::traits::FabricSchedulingContext { view },
             topology,
+            script_placement_default: config.controller.script_placement,
         }
     }
 
@@ -1040,6 +1042,7 @@ impl PassView {
             busy_until: &self.busy_until,
             preemption_handoffs: &self.handoffs,
             partition_node_usage: &self.partition_node_usage,
+            script_placement_default: self.script_placement_default,
         }
     }
 }
@@ -1608,6 +1611,7 @@ pub(crate) async fn try_preempt_beside(
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
+        script_placement_default: Default::default(),
     };
     try_preempt_with_handoffs(
         cluster,
@@ -1640,6 +1644,7 @@ pub(crate) async fn reclaim_for(
         busy_until: &HashMap::new(),
         preemption_handoffs: &HashMap::new(),
         partition_node_usage: &usage,
+        script_placement_default: Default::default(),
     };
     let mut sched = cluster.config().scheduler.clone();
     sched.idle_fill_exempt_secs = 0;
@@ -6546,6 +6551,7 @@ pub(crate) mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: handoffs,
                 partition_node_usage: &Default::default(),
+                script_placement_default: Default::default(),
             };
             satisfiable_victim_set(
                 reclaimer,
@@ -6581,6 +6587,7 @@ pub(crate) mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: &HashMap::new(),
                 partition_node_usage: &Default::default(),
+                script_placement_default: Default::default(),
             };
             satisfiable_victim_set(
                 reclaimer,
@@ -6622,6 +6629,38 @@ pub(crate) mod tests {
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &own).is_some());
             let co_owned = held_by(vec![other, two_nodes.job_id]);
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &co_owned).is_some());
+        }
+
+        #[test]
+        fn reclaim_frees_no_node_whose_agent_would_misplace_the_script() {
+            use spur_core::node::CAP_SCRIPT_PLACEMENT;
+            use spur_core::script_placement::ScriptPlacement;
+
+            let mut nodes = vec![node("n1", 4), node("n2", 4)];
+            nodes[0].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                [("n2", vec![7])].into_iter().collect();
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let pool = TestVictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+                order: None,
+            };
+            let mut runner = reclaimer(2, 4);
+            runner.spec.script = Some("#!/bin/bash\n./runner.sh\n".into());
+            runner.spec.script_placement = Some(ScriptPlacement::BatchHost);
+
+            assert!(
+                victim_set_with_handoffs(&runner, &pool, &nodes, &HashMap::new()).is_none(),
+                "n2's agent would run the script itself, so evicting job 7 helps nobody"
+            );
+            nodes[1].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+            assert_eq!(
+                victim_set_with_handoffs(&runner, &pool, &nodes, &HashMap::new()),
+                Some([7].into_iter().collect())
+            );
         }
 
         fn node(name: &str, cpus: u32) -> Node {
@@ -10742,21 +10781,27 @@ pub(crate) mod tests {
 
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, launches) = spawn_mock_agent_capturing_launches().await;
-            register_node_at(&cm, "n1", addr);
+            let (a1, launches1) = spawn_mock_agent_capturing_launches().await;
+            let (a2, launches2) = spawn_mock_agent_capturing_launches().await;
+            register_node_with_capabilities(&cm, "n1", a1, placement_capable());
+            register_node_at(&cm, "n2", a2);
 
-            let mut spec = runner_spec("old-agent", 1);
+            let mut spec = runner_spec("old-agent", 2);
             spec.script_placement = Some(ScriptPlacement::BatchHost);
             let job_id = submit_and_wait(&cm, spec);
 
-            assert!(!process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await);
+            assert!(
+                !process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await
+            );
             wait_for("backoff applied", || {
                 cm.get_job(job_id).is_some_and(|j| j.requeue_count == 1)
             });
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
-            assert!(job.state_reason().contains("n1"), "{}", job.state_reason());
-            assert!(launches.lock().unwrap().is_empty());
+            let reason = job.state_reason();
+            assert!(reason.contains("n2") && !reason.contains("n1"), "{reason}");
+            assert!(launches1.lock().unwrap().is_empty());
+            assert!(launches2.lock().unwrap().is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -12118,6 +12163,7 @@ pub(crate) mod tests {
                     busy_until: &busy_until,
                     preemption_handoffs: &HashMap::new(),
                     partition_node_usage: &partition_node_usage,
+                    script_placement_default: Default::default(),
                 };
 
                 let mut sched = cm.config().scheduler.clone();
