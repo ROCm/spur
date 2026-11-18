@@ -9179,6 +9179,7 @@ pub(crate) mod tests {
 
             let spec = JobSpec {
                 name: "completing-timeout".into(),
+                script: Some("#!/bin/bash\nsrun ./train\n".into()),
                 user: "testuser".into(),
                 num_nodes: 2,
                 num_tasks: 2,
@@ -9295,6 +9296,7 @@ pub(crate) mod tests {
                 &cm,
                 JobSpec {
                     name: "completing-missing-node".into(),
+                    script: Some("#!/bin/bash\nsrun ./train\n".into()),
                     user: "testuser".into(),
                     num_nodes: 3,
                     num_tasks: 3,
@@ -9351,6 +9353,7 @@ pub(crate) mod tests {
 
             let spec = JobSpec {
                 name: "completing-race".into(),
+                script: Some("#!/bin/bash\nsrun ./train\n".into()),
                 user: "testuser".into(),
                 num_nodes: 2,
                 num_tasks: 2,
