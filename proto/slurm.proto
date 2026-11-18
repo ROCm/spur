@@ -521,10 +521,10 @@ message JobInfo {
   // on live jobs and on history rows recorded before it was kept.
   optional uint64 alloc_cpus = 95;
 
-  // The node a batch job's script runs on (Slurm's BatchHost); empty until placed.
+  // The node a batch job's script runs on (Slurm's BatchHost); empty until the run starts.
   string batch_host = 96;
   // Batch script placement as requested ("" when left to the cluster default)
-  // and as resolved for the current run ("" until dispatched).
+  // and as resolved for the current run ("" until the run starts).
   string script_placement = 97;
   string resolved_script_placement = 98;
 }
