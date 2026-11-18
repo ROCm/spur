@@ -10,6 +10,18 @@ use crate::resource::GpuLinkType;
 
 pub const GPU_GRES: &str = "gpu";
 
+/// Whether a gres is handed out as specific devices rather than counted from a
+/// pool. Controller and agent must agree, so both call this. GPUs always are: a
+/// node without any offers none, not a countable pool.
+pub fn allocates_by_id(gres_name: &str, has_devices_of_name: bool) -> bool {
+    gres_name == GPU_GRES || has_devices_of_name
+}
+
+/// The gres a countable pool key (`name` or `name:type`) belongs to.
+pub fn pool_gres_name(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(name, _)| name)
+}
+
 /// The aliases and defaults let a deprecated GPU-only entry (`GpuResource`) from
 /// the Raft log, a snapshot or an agent's state files read as a GPU device.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -199,6 +211,19 @@ mod tests {
             super::devices_from_proto(Vec::new(), legacy)[0].topology,
             Some(topology)
         );
+    }
+
+    #[test]
+    fn gpus_and_kinds_with_devices_are_allocated_by_id() {
+        assert!(super::allocates_by_id("gpu", false));
+        assert!(super::allocates_by_id("nic", true));
+        assert!(!super::allocates_by_id("nic", false));
+    }
+
+    #[test]
+    fn a_pool_key_names_its_gres_before_the_type() {
+        assert_eq!(super::pool_gres_name("nic:pollara400"), "nic");
+        assert_eq!(super::pool_gres_name("bandwidth"), "bandwidth");
     }
 
     use super::*;
