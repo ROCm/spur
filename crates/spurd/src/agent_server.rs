@@ -94,10 +94,9 @@ fn claim_devices_reclaiming_stale(
     devices: &spur_devices::DeviceSelection,
     live: &std::collections::HashSet<u32>,
 ) -> Result<(), AllocError> {
-    let Err(AllocError::DevicesUnavailable { gres }) =
-        alloc.claim_devices(job_id, run_attempt, devices)
-    else {
-        return alloc.claim_devices(job_id, run_attempt, devices);
+    let gres = match alloc.claim_devices(job_id, run_attempt, devices) {
+        Err(AllocError::DevicesUnavailable { gres }) => gres,
+        other => return other,
     };
     let stale: Vec<u32> = alloc
         .device_owners(devices)
