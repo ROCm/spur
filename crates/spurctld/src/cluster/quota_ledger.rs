@@ -405,6 +405,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_partition_qos_counts_every_run_still_holding_its_allocation() {
+        let mut borrowed = job(1, "alice", "team", JobState::Running, &["n1"]);
+        borrowed.idle_fill = true;
+        let jobs = [
+            borrowed,
+            job(2, "alice", "team", JobState::Suspended, &["n2"]),
+            job(3, "alice", "team", JobState::Completing, &["n3"]),
+            job(4, "alice", "team", JobState::Pending, &[]),
+            job(5, "alice", "team", JobState::Completed, &["n4"]),
+        ];
+        let mut ledger = QuotaLedger::default();
+        ledger.add_partition_qos(&jobs, |_| Some("cap"));
+
+        let usage = ledger.partition_qos("cap", "alice");
+        assert_eq!(usage.user_running_jobs(), 3);
+        assert_eq!(usage.user_submitted_before(9), 0);
+        assert_eq!(usage.scope_running_tres().get(TresType::Node), 3);
+        let mut occupied: Vec<_> = usage.occupied().collect();
+        occupied.sort();
+        assert_eq!(occupied, ["n1", "n2", "n3"]);
+    }
+
+    #[test]
+    fn a_borrowed_start_adds_its_node_to_its_partition_qos() {
+        let (mut borrowed, placed) = starting(1, "alice", &["n1"]);
+        borrowed.idle_fill = true;
+        let mut ledger = QuotaLedger::default();
+        ledger.charge_start(&borrowed, &placed, Some("cap"));
+
+        let usage = ledger.partition_qos("cap", "alice");
+        assert!(usage.occupies("n1"));
+        assert_eq!(usage.user_running_jobs(), 1);
+        assert_eq!(usage.scope_running_tres().get(TresType::Node), 1);
+        assert!(!ledger.qos("team", "alice").occupies("n1"));
+    }
+
+    #[test]
+    fn restore_undoes_a_start_in_every_scope() {
+        let running = job(1, "alice", "team", JobState::Running, &["n1"]);
+        let (start, placed) = starting(2, "alice", &["n2"]);
+        let mut ledger = QuotaLedger::from_jobs([&running]);
+        ledger.add_partition_qos([&running], |_| Some("cap"));
+        let snapshot = ledger.snapshot([(&start, Some("cap"))]);
+        ledger.charge_start(&start, &placed, Some("cap"));
+        ledger.restore(snapshot);
+
+        for usage in [
+            ledger.qos("team", "alice"),
+            ledger.account("acct", "alice"),
+            ledger.partition_qos("cap", "alice"),
+        ] {
+            assert_eq!(usage.user_running_jobs(), 1);
+            assert_eq!(usage.occupied().collect::<Vec<_>>(), ["n1"]);
+        }
+    }
+
     /// What a gate reads for `user` in `scope`, by scanning the whole job table.
     struct Scanned {
         running_jobs: u32,

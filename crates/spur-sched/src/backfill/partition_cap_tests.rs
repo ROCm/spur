@@ -997,20 +997,28 @@ fn each_candidate_partition_plans_its_own_memory_adjusted_request() {
     );
 }
 
-/// Records the memory adjustment of every start it is asked to admit.
+/// Records the partition and memory adjustment of every start it is asked to admit.
 #[derive(Default)]
-struct StartShapes(Vec<Option<spur_core::partition_limits::MemoryAdjustment>>);
+struct StartShapes(
+    Vec<(
+        Option<String>,
+        Option<spur_core::partition_limits::MemoryAdjustment>,
+    )>,
+);
 
 impl StartAdmission for StartShapes {
     fn admit(&mut self, starts: &[JobStart<'_>]) -> bool {
-        self.0.extend(starts.iter().map(|s| s.memory_adjustment));
+        self.0.extend(
+            starts
+                .iter()
+                .map(|s| (s.partition.map(str::to_owned), s.memory_adjustment)),
+        );
         true
     }
 }
 
-/// Each partition reshapes the request differently, so the shape shows which one.
 #[test]
-fn a_start_is_asked_about_in_the_request_its_partition_reshaped() {
+fn a_start_is_asked_about_in_the_partition_and_request_it_runs_with() {
     let fx = Fixture::new(
         vec![
             node("n1", 8, 64_000, &["big"]),
@@ -1032,7 +1040,7 @@ fn a_start_is_asked_about_in_the_request_its_partition_reshaped() {
     assert!(a[0].memory_adjustment.is_some());
     assert_eq!(
         shapes.0,
-        [a[0].memory_adjustment],
+        [(a[0].partition.clone(), a[0].memory_adjustment)],
         "admission sees what dispatch will run"
     );
 }

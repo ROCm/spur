@@ -824,4 +824,194 @@ mod tests {
             "a third node needs no packing credit"
         );
     }
+
+    /// "gpu" carries the partition QOS "usercap" with `limits`, "cpu" none. Both hold
+    /// every node.
+    fn gpu_under_usercap(cm: &ClusterManager, limits: QosLimits) -> Vec<Partition> {
+        cm.qos_cache().insert(Qos {
+            name: "usercap".into(),
+            limits,
+            ..Default::default()
+        });
+        for node in cm.nodes.write().values_mut() {
+            node.partitions = names(&["gpu", "cpu"]);
+        }
+        ["gpu", "cpu"]
+            .into_iter()
+            .map(|name| Partition {
+                name: name.into(),
+                nodes: "ALL".into(),
+                qos: (name == "gpu").then(|| "usercap".to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn one_node_per_user() -> QosLimits {
+        QosLimits {
+            max_tres_per_user: Some(grp(&[(TresType::Node, 1)])),
+            ..Default::default()
+        }
+    }
+
+    fn in_gpu(mut job: Job) -> Job {
+        job.spec.partition = Some("gpu".into());
+        job
+    }
+
+    fn start_in<'a>(job: &'a Job, nodes: &'a [String], partition: &'a str) -> JobStart<'a> {
+        JobStart {
+            partition: Some(partition),
+            ..start(job, nodes)
+        }
+    }
+
+    #[test]
+    fn a_start_is_checked_and_charged_in_the_partition_it_starts_in() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let mut either = job(1, 1);
+        either.spec.partition = Some("gpu,cpu".into());
+        let in_gpu = in_gpu(job(2, 1));
+        let mut later = job(3, 1);
+        later.spec.partition = Some("gpu,cpu".into());
+        let mut limits = admission_in(&cm, &[&either, &in_gpu, &later], partitions);
+
+        assert!(limits.admit(&[start_in(&either, &names(&["n1"]), "cpu")]));
+        assert!(limits.admit(&[start_in(&in_gpu, &names(&["n2"]), "gpu")]));
+        assert!(
+            !limits.admit(&[start_in(&later, &names(&["n3"]), "gpu")]),
+            "cpu would admit it, but it starts in gpu"
+        );
+        assert_eq!(
+            limits.refusals(),
+            vec![(3, PendingReason::QosMaxNodePerUserLimit, None)]
+        );
+    }
+
+    /// A start backfill placed in none of its partitions is charged where its run is:
+    /// in its highest-tier partition.
+    #[test]
+    fn a_start_placed_in_no_partition_is_charged_where_its_run_is() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let (unplaced, next) = (in_gpu(job(1, 1)), in_gpu(job(2, 1)));
+        let mut limits = admission_in(&cm, &[&unplaced, &next], partitions);
+
+        assert!(limits.admit(&[start(&unplaced, &names(&["n1"]))]));
+        assert!(!limits.admit(&[start_in(&next, &names(&["n2"]), "gpu")]));
+        assert_eq!(
+            limits.refusals(),
+            vec![(2, PendingReason::QosMaxNodePerUserLimit, None)]
+        );
+    }
+
+    #[test]
+    fn an_eviction_in_flight_holds_its_partition_qos_room() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let (preemptor, sibling) = (in_gpu(job(1, 1)), in_gpu(job(2, 1)));
+        let mut limits = admission_in(&cm, &[&preemptor, &sibling], partitions);
+        let held = HashMap::from([("usercap".to_string(), 1)]);
+        limits.hold(Eviction::new(&preemptor, job_tres(&preemptor), 0, 0, held));
+
+        assert!(!limits.admit(&[start_in(&sibling, &names(&["n2"]), "gpu")]));
+        assert!(limits.admit(&[start_in(&preemptor, &names(&["n1"]), "gpu")]));
+        assert_eq!(
+            limits.refusals(),
+            vec![(2, PendingReason::QosMaxNodePerUserLimit, None)]
+        );
+    }
+
+    #[test]
+    fn a_recorded_eviction_keeps_a_sibling_under_its_partition_qos_from_fitting() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let (preemptor, sibling) = (in_gpu(job(1, 1)), in_gpu(job(2, 1)));
+        let mut limits = admission_in(&cm, &[&preemptor, &sibling], partitions);
+
+        assert!(limits.fits(&sibling));
+        limits.record_eviction(&preemptor);
+        assert!(!limits.fits(&sibling));
+        assert!(limits.fits(&preemptor), "its own eviction is not counted");
+    }
+
+    #[test]
+    fn a_heterogeneous_batch_over_its_partition_qos_is_refused_whole_and_charges_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let (leader, member) = het_pair();
+        let (leader, member, later) = (in_gpu(leader), in_gpu(member), in_gpu(job(12, 1)));
+        let mut limits = admission_in(&cm, &[&leader, &member, &later], partitions);
+
+        let (n1, n2) = (names(&["n1"]), names(&["n2"]));
+        assert!(!limits.admit(&[start_in(&leader, &n1, "gpu"), start_in(&member, &n2, "gpu")]));
+        // Had the leader's charge on n1 stayed, n3 would be alice's second node.
+        assert!(limits.admit(&[start_in(&later, &names(&["n3"]), "gpu")]));
+    }
+
+    fn one_group_node() -> QosLimits {
+        QosLimits {
+            grp_tres: Some(grp(&[(TresType::Node, 1)])),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_borrower_gets_no_packing_credit_from_its_partition_qos() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_group_node());
+        let holder = in_gpu(running(1, &["n1"]));
+        let mut borrower = in_gpu(job(2, 1));
+        borrower.idle_fill = true;
+        let in_quota = in_gpu(job(3, 1));
+        let limits = admission_in(&cm, &[&holder, &borrower, &in_quota], partitions);
+
+        assert!(limits.fits(&in_quota), "it may pack onto n1");
+        assert!(
+            !limits.fits(&borrower),
+            "it would need a second node for its partition QOS"
+        );
+    }
+
+    /// A borrower runs outside its job QOS node cap only; its partition QOS counts its node.
+    #[test]
+    fn a_borrowed_start_counts_its_node_in_its_partition_qos() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_group_node());
+        let mut borrower = in_gpu(job(1, 1));
+        borrower.idle_fill = true;
+        let in_quota = in_gpu(job(2, 1));
+        let mut limits = admission_in(&cm, &[&borrower, &in_quota], partitions);
+
+        assert!(limits.admit(&[start_in(&borrower, &names(&["n1"]), "gpu")]));
+        assert!(!limits.admit(&[start_in(&in_quota, &names(&["n2"]), "gpu")]));
+        assert_eq!(
+            limits.refusals(),
+            vec![(2, PendingReason::QosGrpNodeLimit, None)]
+        );
+    }
+
+    #[test]
+    fn a_future_slot_over_its_partition_qos_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let cm = cluster(&dir, None, None);
+        let partitions = gpu_under_usercap(&cm, one_node_per_user());
+        let holder = in_gpu(running(1, &["n1"]));
+        let waiting = in_gpu(job(2, 1));
+        let mut limits = admission_in(&cm, &[&holder, &waiting], partitions);
+
+        assert!(!limits.may_reserve(&start_in(&waiting, &names(&["n2"]), "gpu")));
+        assert_eq!(
+            limits.refusals(),
+            vec![(2, PendingReason::QosMaxNodePerUserLimit, None)]
+        );
+    }
 }

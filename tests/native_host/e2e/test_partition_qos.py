@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from cluster import job_state, parse_job_id, wait_job_state
+from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 _SLEEP = "#!/bin/bash\nsleep 900\n"
 _CACHE_REFRESH = 15
@@ -255,6 +255,51 @@ class TestPartitionQosCapsGpusAcrossAccounts:
 
             c.cli_allow_fail(["scancel", str(first)])
             wait_job_state(c, second, "R", timeout=90)
+        finally:
+            _cancel(c, ids)
+
+
+class TestJobsWaitingForABusyNodeHoldNoneOfTheCap:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config()
+
+    def test_jobs_waiting_for_a_busy_node_hold_none_of_the_cap(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 2)
+        busy = c.node_names[0]
+        _two_accounts(c)
+        c.sacctmgr(["add", "qos", "name=usercap", "maxtresperuser=node=1"])
+        time.sleep(_CACHE_REFRESH)
+        ids = []
+        try:
+            # In the uncapped partition, so the cap starts empty.
+            occupied = _submit(c, "hold", "acct-a", "-p", "open", "-w", busy)
+            ids.append(occupied)
+            wait_job_state(c, occupied, "R", timeout=60)
+
+            pinned = [_submit(c, f"pinned-{i}", "acct-a", "-w", busy) for i in range(10)]
+            ids.extend(pinned)
+            free = _submit(c, "free", "acct-b")
+            ids.append(free)
+            try:
+                wait_job_state(c, free, "R", timeout=90)
+            except (AssertionError, TimeoutError) as exc:
+                raise AssertionError(
+                    f"jobs waiting for a busy node held the cap: {_reason(c, free)!r}\n"
+                    f"{c.squeue_all()}"
+                ) from exc
+            out = c.squeue_all()
+            assert all(job_state(out, j) == "PD" for j in pinned), out
+
+            # The free job now holds the cap, so freeing the busy node starts none of them.
+            c.cli_allow_fail(["scancel", str(occupied)])
+            wait_job(c, occupied, timeout=60)
+            _stays_pending(c, pinned[0], "QOSMaxNodePerUserLimit")
+            out = c.squeue_all()
+            assert job_state(out, free) == "R", out
+            started = [j for j in pinned if job_state(out, j) != "PD"]
+            assert not started, f"the cap was over-subscribed by pinned jobs {started}\n{out}"
         finally:
             _cancel(c, ids)
 
