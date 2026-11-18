@@ -2897,6 +2897,7 @@ impl SlurmController for ControllerService {
                 self.stop_remaining_nodes(req.job_id, &result, &req.reporting_node);
                 Ok(Response::new(()))
             }
+            Some(Ok(NodeCompleteResult::StillRunning)) => Ok(Response::new(())),
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
@@ -3340,9 +3341,14 @@ impl SlurmController for ControllerService {
 
         // Not allocated_nodes: a node that already reported (a victim in its grace)
         // was freed and may belong to another job now.
-        let step_nodes =
-            resolve_step_nodes(&job.held_nodes(), req.num_nodes, &req.nodelist, &req.node)
-                .map_err(Status::invalid_argument)?;
+        let step_nodes = resolve_step_nodes(
+            &job.held_nodes(),
+            &job.finished_nodes(),
+            req.num_nodes,
+            &req.nodelist,
+            &req.node,
+        )
+        .map_err(Status::invalid_argument)?;
         self.cluster
             .validate_step_bindings(&job, &step_nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -4051,8 +4057,15 @@ impl SlurmController for ControllerService {
                 .map(Response::new);
         }
 
-        validate_step_nodes_for_run(job_id, req.step_id, step.state, &step.nodes, &held_nodes)
-            .map_err(Status::failed_precondition)?;
+        validate_step_nodes_for_run(
+            job_id,
+            req.step_id,
+            step.state,
+            &step.nodes,
+            &held_nodes,
+            &job.finished_nodes(),
+        )
+        .map_err(Status::failed_precondition)?;
         self.cluster
             .validate_step_bindings(&job, &step.nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -5364,8 +5377,18 @@ fn resolve_step_container(
     }
 }
 
+/// Why a step cannot use `node`: it already ended its part of the job, or never had one.
+fn unavailable_step_node(node: &str, finished: &[String]) -> String {
+    if finished.iter().any(|n| n == node) {
+        format!("node {node} already finished its part of this job")
+    } else {
+        format!("node {node} is not allocated to this job")
+    }
+}
+
 fn resolve_step_nodes(
     allocated: &[String],
+    finished: &[String],
     requested_count: u32,
     requested_list: &str,
     legacy_node: &str,
@@ -5388,7 +5411,7 @@ fn resolve_step_nodes(
                 ));
             }
             if !allocated.contains(node) {
-                return Err(format!("node {node} is not allocated to this job"));
+                return Err(unavailable_step_node(node, finished));
             }
         }
         if requested_count > 0 && requested_count as usize != requested.len() {
@@ -5401,7 +5424,7 @@ fn resolve_step_nodes(
     }
 
     if !legacy_node.is_empty() {
-        let node = select_step_node(allocated, legacy_node)?;
+        let node = select_step_node(allocated, finished, legacy_node)?;
         return Ok(vec![node.to_string()]);
     }
 
@@ -5424,6 +5447,7 @@ fn validate_step_nodes_for_run(
     state: spur_core::step::StepState,
     step_nodes: &[String],
     held: &[String],
+    finished: &[String],
 ) -> Result<(), String> {
     if state != spur_core::step::StepState::Running {
         return Err(format!(
@@ -5435,6 +5459,9 @@ fn validate_step_nodes_for_run(
         return Err(format!("step {job_id}.{step_id} has no nodes"));
     }
     for node in step_nodes {
+        if finished.contains(node) {
+            return Err(unavailable_step_node(node, finished));
+        }
         if !held.contains(node) {
             return Err(format!(
                 "step node {node} is not in the job's current allocation"
@@ -5471,7 +5498,11 @@ fn map_step_plan_to_nodes(
     }
 }
 
-fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
+fn select_step_node<'a>(
+    allocated: &'a [String],
+    finished: &[String],
+    requested: &str,
+) -> Result<&'a str, String> {
     if requested.is_empty() {
         return allocated
             .first()
@@ -5482,7 +5513,7 @@ fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a 
         .iter()
         .find(|n| n.as_str() == requested)
         .map(String::as_str)
-        .ok_or_else(|| format!("node {requested} is not allocated to this job"))
+        .ok_or_else(|| unavailable_step_node(requested, finished))
 }
 
 // ---- Proto conversion helpers ----
@@ -6796,8 +6827,8 @@ fn stragglers_after_report(
     use crate::cluster::NodeCompleteResult;
 
     match result {
-        NodeCompleteResult::Completing => step_launch_stragglers(job, None),
-        NodeCompleteResult::InGrace => step_launch_stragglers(job, Some(reporting_node)),
+        NodeCompleteResult::Completing => ended_run_stragglers(job, None),
+        NodeCompleteResult::InGrace => ended_run_stragglers(job, Some(reporting_node)),
         _ => Vec::new(),
     }
 }
@@ -6822,14 +6853,17 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once one of a job's nodes has reported, for a batch script that
-/// runs on the batch host. With `primary_only`, only the batch script's node
-/// (the first allocated) counts: the others run a hold script that never reports.
-fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
-    let launches_steps = job.script_placement() == ResolvedPlacement::BatchHost;
-    let reporter_ended_the_job = primary_only
-        .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node));
-    if launches_steps && reporter_ended_the_job {
+/// Nodes to stop once a report has ended the run: the batch host's for a
+/// batch-host script, the first failed copy's for a per-node one. With
+/// `primary_only`, only the batch script's node (the first allocated) counts:
+/// the others run a hold script that never reports.
+fn ended_run_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
+    let ended = match job.script_placement() {
+        ResolvedPlacement::BatchHost => primary_only
+            .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node)),
+        ResolvedPlacement::AllNodes => job.first_failed_node.is_some(),
+    };
+    if ended {
         job.held_nodes()
     } else {
         Vec::new()
@@ -12323,16 +12357,66 @@ mod tests {
     }
 
     async fn report_node_finished(svc: &ControllerService, job_id: u32, node: &str) {
+        report_node_exit(svc, job_id, node, 0).await;
+    }
+
+    async fn report_node_exit(svc: &ControllerService, job_id: u32, node: &str, exit_code: i32) {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
         svc.report_job_status(Request::new(ReportJobStatusRequest {
             job_id,
-            state: JobState::Completed.to_proto_i32(),
+            state: state.to_proto_i32(),
+            exit_code,
             reporting_node: node.into(),
             run_attempt,
             ..Default::default()
         }))
         .await
         .expect("completion report accepted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_copy_of_a_per_node_script_stops_the_other_nodes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+
+        report_node_exit(&svc, job_id, "n2", 1).await;
+
+        wait_for_cancel(&n1_cancelled, job_id).await;
+        assert!(
+            n2_cancelled.lock().unwrap().is_empty(),
+            "the failed copy has already ended"
+        );
+    }
+
+    /// The batch-host job's cancel is awaited, so a cancel wrongly sent for the
+    /// per-node job, which reported first, would be seen too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_copy_of_a_per_node_script_stops_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let per_node = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+        let batch_host = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+
+        report_node_finished(&svc, per_node, "n2").await;
+        report_node_finished(&svc, batch_host, "n1").await;
+
+        wait_for_cancel(&n2_cancelled, batch_host).await;
+        assert!(!cancelled_jobs(&n1_cancelled).contains(&per_node));
+        assert!(!cancelled_jobs(&n2_cancelled).contains(&per_node));
+        assert_eq!(
+            svc.cluster.get_job(per_node).expect("job").state,
+            JobState::Running
+        );
     }
 
     /// A non-primary node finishing early leaves the others to run out the grace;
@@ -12400,7 +12484,7 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
             err.message()
-                .contains("n2 is not in the job's current allocation"),
+                .contains("node n2 already finished its part of this job"),
             "unexpected error: {}",
             err.message()
         );
@@ -12599,6 +12683,7 @@ mod tests {
             "in a grace a companion's report is a step event"
         );
         for result in [
+            NodeCompleteResult::StillRunning,
             NodeCompleteResult::AlreadyTerminal,
             NodeCompleteResult::StaleReport,
             NodeCompleteResult::AllDone {
@@ -12611,7 +12696,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_step_launching_script_has_stragglers_to_stop() {
+    fn only_a_report_that_ends_the_run_has_stragglers_to_stop() {
         let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
         job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
         job.node_completions.insert(
@@ -12620,11 +12705,21 @@ mod tests {
         );
 
         job.spec.script = Some("./train\n".into());
-        assert!(step_launch_stragglers(&job, None).is_empty());
+        assert!(
+            ended_run_stragglers(&job, None).is_empty(),
+            "one copy of a per-node script ending cleanly ends nothing"
+        );
+        job.first_failed_node = Some("n1".into());
+        assert_eq!(
+            ended_run_stragglers(&job, None),
+            ["n2".to_string(), "n3".to_string()],
+            "the first failed copy ends a per-node run"
+        );
 
+        job.first_failed_node = None;
         job.spec.script = Some("srun ./train\n".into());
         assert_eq!(
-            step_launch_stragglers(&job, None),
+            ended_run_stragglers(&job, None),
             ["n2".to_string(), "n3".to_string()]
         );
     }
@@ -12643,11 +12738,11 @@ mod tests {
         };
 
         assert!(
-            step_launch_stragglers(&reported("n2"), Some("n2")).is_empty(),
+            ended_run_stragglers(&reported("n2"), Some("n2")).is_empty(),
             "a companion's report signals nobody"
         );
         assert_eq!(
-            step_launch_stragglers(&reported("n1"), Some("n1")),
+            ended_run_stragglers(&reported("n1"), Some("n1")),
             ["n2".to_string()],
             "the primary's report stops the rest"
         );
@@ -17125,19 +17220,19 @@ mod tests {
     #[test]
     fn select_step_node_empty_request_uses_first_allocated() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, ""), Ok("node001"));
+        assert_eq!(select_step_node(&allocated, &[], ""), Ok("node001"));
     }
 
     #[test]
     fn select_step_node_named_request_targets_that_node() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, "node002"), Ok("node002"));
+        assert_eq!(select_step_node(&allocated, &[], "node002"), Ok("node002"));
     }
 
     #[test]
     fn select_step_node_rejects_node_outside_allocation() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        let err = select_step_node(&allocated, "node999").unwrap_err();
+        let err = select_step_node(&allocated, &[], "node999").unwrap_err();
         assert!(err.contains("node999"));
         assert!(err.contains("not allocated"));
     }
@@ -17145,13 +17240,13 @@ mod tests {
     #[test]
     fn select_step_node_empty_request_no_nodes_errors() {
         let allocated: Vec<String> = Vec::new();
-        assert!(select_step_node(&allocated, "").is_err());
+        assert!(select_step_node(&allocated, &[], "").is_err());
     }
 
     #[test]
     fn select_step_node_rejects_comma_joined_request() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(select_step_node(&allocated, "node001,node002").is_err());
+        assert!(select_step_node(&allocated, &[], "node001,node002").is_err());
     }
 
     #[test]
@@ -17162,7 +17257,7 @@ mod tests {
             "node003".to_string(),
         ];
         assert_eq!(
-            resolve_step_nodes(&allocated, 2, "", "").unwrap(),
+            resolve_step_nodes(&allocated, &[], 2, "", "").unwrap(),
             vec!["node001".to_string(), "node002".to_string()]
         );
     }
@@ -17175,7 +17270,7 @@ mod tests {
             "node003".to_string(),
         ];
         assert_eq!(
-            resolve_step_nodes(&allocated, 0, "node[003,001]", "").unwrap(),
+            resolve_step_nodes(&allocated, &[], 0, "node[003,001]", "").unwrap(),
             vec!["node003".to_string(), "node001".to_string()]
         );
     }
@@ -17183,10 +17278,10 @@ mod tests {
     #[test]
     fn resolve_step_nodes_rejects_unallocated_and_oversized_requests() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(resolve_step_nodes(&allocated, 3, "", "")
+        assert!(resolve_step_nodes(&allocated, &[], 3, "", "")
             .unwrap_err()
             .contains("only 2 allocated"));
-        assert!(resolve_step_nodes(&allocated, 0, "node003", "")
+        assert!(resolve_step_nodes(&allocated, &[], 0, "node003", "")
             .unwrap_err()
             .contains("not allocated"));
     }
@@ -17200,13 +17295,22 @@ mod tests {
             spur_core::job::NodeCompletion { code: 0, signal: 0 },
         );
         let held = job.held_nodes();
+        let finished = job.finished_nodes();
 
         assert_eq!(
-            resolve_step_nodes(&held, 0, "", "").unwrap(),
+            resolve_step_nodes(&held, &finished, 0, "", "").unwrap(),
             vec!["node002".to_string(), "node003".to_string()],
             "the default step skips the node that reported"
         );
-        assert!(resolve_step_nodes(&held, 0, "node001", "")
+        assert_eq!(
+            resolve_step_nodes(&held, &finished, 0, "node001", "").unwrap_err(),
+            "node node001 already finished its part of this job"
+        );
+        assert_eq!(
+            resolve_step_nodes(&held, &finished, 0, "", "node001").unwrap_err(),
+            "node node001 already finished its part of this job"
+        );
+        assert!(resolve_step_nodes(&held, &finished, 0, "node009", "")
             .unwrap_err()
             .contains("not allocated"));
     }
@@ -17214,7 +17318,7 @@ mod tests {
     #[test]
     fn resolve_step_nodes_rejects_conflicting_count_and_nodelist() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(resolve_step_nodes(&allocated, 1, "node[001-002]", "")
+        assert!(resolve_step_nodes(&allocated, &[], 1, "node[001-002]", "")
             .unwrap_err()
             .contains("nodelist names 2"));
     }
@@ -17223,33 +17327,52 @@ mod tests {
     fn validate_step_nodes_for_run_requires_running_on_allocated_nodes() {
         use spur_core::step::StepState;
         let allocated = vec!["n1".to_string(), "n2".to_string()];
-        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated)
+        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated, &[])
             .expect("running step on an allocated node is valid");
         assert!(validate_step_nodes_for_run(
             1,
             0,
             StepState::Completed,
             &["n1".into()],
-            &allocated
+            &allocated,
+            &[]
         )
         .unwrap_err()
         .contains("COMPLETED"));
-        assert!(
-            validate_step_nodes_for_run(1, 0, StepState::Pending, &["n1".into()], &allocated)
-                .unwrap_err()
-                .contains("PENDING")
-        );
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Pending,
+            &["n1".into()],
+            &allocated,
+            &[]
+        )
+        .unwrap_err()
+        .contains("PENDING"));
         assert!(validate_step_nodes_for_run(
             1,
             0,
             StepState::Running,
             &["gone".into()],
-            &allocated
+            &allocated,
+            &[]
         )
         .unwrap_err()
         .contains("not in the job's current allocation"));
+        assert_eq!(
+            validate_step_nodes_for_run(
+                1,
+                0,
+                StepState::Running,
+                &["n3".into()],
+                &allocated,
+                &["n3".into()]
+            )
+            .unwrap_err(),
+            "node n3 already finished its part of this job"
+        );
         assert!(
-            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated)
+            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated, &[])
                 .unwrap_err()
                 .contains("has no nodes")
         );

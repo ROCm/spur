@@ -1151,6 +1151,11 @@ pub struct Job {
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
 
+    /// The first node whose copy of a per-node script failed. It ended the run,
+    /// so its exit is the run's. Cleared on requeue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_node: Option<String>,
+
     /// Standalone srun: native step dispatch after allocation registration.
     #[serde(default)]
     pub srun_step_dispatch: bool,
@@ -1315,6 +1320,7 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            first_failed_node: None,
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
             preempt_pending: None,
@@ -1489,6 +1495,15 @@ impl Job {
         self.allocated_nodes
             .iter()
             .filter(|node| self.is_held_on(node))
+            .cloned()
+            .collect()
+    }
+
+    /// The allocated nodes that already reported, in allocation order.
+    pub fn finished_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.node_completions.contains_key(*node))
             .cloned()
             .collect()
     }
@@ -2013,6 +2028,30 @@ mod tests {
             .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
 
         assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
+    }
+
+    #[test]
+    fn finished_nodes_are_the_allocated_ones_that_reported() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions
+            .insert("n3".into(), NodeCompletion { code: 0, signal: 0 });
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 1, signal: 0 });
+
+        assert_eq!(job.finished_nodes(), ["n2".to_string(), "n3".to_string()]);
+    }
+
+    // A snapshot from before the field existed must still restore.
+    #[test]
+    fn a_job_without_a_first_failed_node_still_deserializes() {
+        let mut job = make_job();
+        job.first_failed_node = Some("n2".into());
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("first_failed_node");
+
+        let back: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(back.first_failed_node, None);
     }
 
     #[test]

@@ -110,6 +110,9 @@ pub enum NodeCompleteResult {
     /// Node recorded and freed, but the job is a preemption victim still inside
     /// its grace: it keeps running on the other nodes, which must be left alone.
     InGrace,
+    /// Node recorded and freed; its copy of a per-node script ended cleanly, so
+    /// the job keeps running on the other nodes, which must be left alone.
+    StillRunning,
     /// All allocated nodes have reported; job is now terminal.
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
@@ -868,6 +871,15 @@ fn epilog_hook_context(job_id: JobId, job: Option<&Job>) -> spur_core::hooks::Ho
             .map(|j| hook_memory_mb(&j.spec, &j.per_node_alloc))
             .unwrap_or(0),
     }
+}
+
+/// Whether each node runs its own copy of the run's script, whose exit stands on
+/// its own: a clean one leaves the others running and the first failure ends the
+/// run. salloc and native srun allocations run no script of their own.
+fn runs_per_node(job: &Job) -> bool {
+    job.script_placement() == spur_core::script_placement::ResolvedPlacement::AllNodes
+        && !job.srun_step_dispatch
+        && !job.spec.interactive
 }
 
 /// What a run is charged to and how it runs, recorded with its placement.
@@ -3362,6 +3374,9 @@ impl ClusterManager {
         }
         if job.state == JobState::Running && job.preempt_grace().is_some() {
             return Ok(NodeCompleteResult::InGrace);
+        }
+        if job.state == JobState::Running {
+            return Ok(NodeCompleteResult::StillRunning);
         }
 
         Ok(NodeCompleteResult::Completing)
@@ -8864,9 +8879,14 @@ impl ClusterManager {
     /// Finalize a Completing run whose nodes have all reported, from the
     /// verdict their completions imply. `None` when the state machine refuses.
     fn finalize_reported_run(job: &mut Job, at: DateTime<Utc>) -> Option<JobFinalized> {
-        // Primary = batch node (allocated_nodes[0]); empty when none allocated,
-        // where derived_completion falls back to the worst completion.
-        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+        // The first failed copy of a per-node script, else the batch node
+        // (allocated_nodes[0]); empty when none allocated, where
+        // derived_completion falls back to the worst completion.
+        let primary = job
+            .first_failed_node
+            .clone()
+            .or_else(|| job.allocated_nodes.first().cloned())
+            .unwrap_or_default();
         // spurd flags an OOM kill via a sentinel bit in the signal; detect it,
         // then strip the bit so the stored signal is the real SIGKILL and the
         // job reports OUT_OF_MEMORY.
@@ -8903,6 +8923,7 @@ impl ClusterManager {
         job.exit_code = None;
         job.allocated_nodes.clear();
         job.resolved_placement = None;
+        job.first_failed_node = None;
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.leave_partition();
@@ -9749,8 +9770,15 @@ impl ClusterManager {
                         }
                     }
 
+                    let per_node =
+                        !in_grace && job.state == JobState::Running && runs_per_node(job);
+                    if per_node && (*exit_code != 0 || *signal != 0) {
+                        job.first_failed_node
+                            .get_or_insert_with(|| node_name.clone());
+                    }
+                    let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
                     // A claim carries every node's allocation; only the final report needs a copy.
-                    if in_grace && !job.all_nodes_completed() {
+                    if others_run_on && !job.all_nodes_completed() {
                         None
                     } else {
                         let grace = job.preempt_grace().filter(|_| in_grace).cloned();
@@ -19965,7 +19993,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
-            resolved_placement: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -20315,7 +20343,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
-            resolved_placement: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -20471,7 +20499,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
-            resolved_placement: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -21189,7 +21217,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
-            resolved_placement: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -21962,13 +21990,14 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_primary_node_decides_a_multi_node_outcome() {
+    async fn the_batch_host_decides_a_batch_host_outcome() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         register_node(&cm, "worker2", 8, 16000);
         let mut spec = basic_spec("two-node");
         spec.num_nodes = 2;
+        spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
         let job_id = submit_and_wait(&cm, spec);
         let resources = scalar_alloc(2, 4000);
         cm.start_job(
@@ -22000,6 +22029,79 @@ state = "UP"
         let fin = &resp.jobs_finalized[0];
         assert_eq!(fin.state, JobState::Completed);
         assert_eq!(fin.reason, EndReason::None);
+    }
+
+    fn running_per_node_job(cm: &ClusterManager, nodes: &[&str]) -> JobId {
+        for node in nodes {
+            register_node(cm, node, 8, 16000);
+        }
+        let mut spec = basic_spec("per-node");
+        spec.num_nodes = nodes.len() as u32;
+        spec.script = Some("#!/bin/bash\n./train\n".into());
+        let job_id = submit_and_wait(cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            nodes.iter().map(|n| n.to_string()).collect(),
+            resources.clone(),
+            per_node_for(nodes, resources),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_per_node_job_keeps_running_while_its_copies_finish_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        let early = cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+        assert_eq!(early, NodeCompleteResult::StillRunning);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(
+            job.end_time.is_none(),
+            "nothing starts the completing clock"
+        );
+        assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
+
+        let next = cm.node_complete(job_id, "n3", 0, 0, 0).unwrap();
+        assert_eq!(next, NodeCompleteResult::StillRunning);
+        let last = cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        assert_eq!(
+            last,
+            NodeCompleteResult::AllDone {
+                state: JobState::Completed,
+                exit_code: 0
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_failed_copy_ends_a_per_node_job_with_its_exit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        let failed = cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+        assert_eq!(failed, NodeCompleteResult::Completing);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+
+        // The copies stopped after it end by signal; the run keeps the first failure.
+        cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+        let done = cm.node_complete(job_id, "n3", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+        assert_eq!(cm.get_job(job_id).unwrap().exit_signal, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -38074,17 +38176,31 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_partial_exit_without_a_grace_is_reported_as_completing() {
+    async fn a_partial_exit_without_a_grace_follows_the_script_placement() {
+        use spur_core::script_placement::ResolvedPlacement;
+
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
-        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
-        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let per_node = run_job_in_grace_across(&cm, &["n1", "n2"], PreemptMode::Cancel);
+        let batch_host = run_job_in_grace_across(&cm, &["n3", "n4"], PreemptMode::Cancel);
+        for id in [per_node, batch_host] {
+            cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
+        }
+        cm.jobs
+            .write()
+            .get_mut(&batch_host)
+            .unwrap()
+            .resolved_placement = Some(ResolvedPlacement::BatchHost);
 
-        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+        let attempt = cm.get_job(per_node).unwrap().run_attempt;
+        let first = cm.node_complete(per_node, "n1", 0, 0, attempt).unwrap();
+        assert_eq!(first, NodeCompleteResult::StillRunning);
+        assert_eq!(cm.get_job(per_node).unwrap().state, JobState::Running);
 
+        let attempt = cm.get_job(batch_host).unwrap().run_attempt;
+        let first = cm.node_complete(batch_host, "n3", 0, 0, attempt).unwrap();
         assert_eq!(first, NodeCompleteResult::Completing);
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+        assert_eq!(cm.get_job(batch_host).unwrap().state, JobState::Completing);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -40685,6 +40801,7 @@ state = "UP"
 
         let mut spec_a = basic_spec("job-a-shares-n1");
         spec_a.num_nodes = 2;
+        spec_a.script = Some("#!/bin/bash\nsrun ./a\n".into());
         let job_a = submit_and_wait(&cm, spec_a);
         cm.start_job(
             job_a,

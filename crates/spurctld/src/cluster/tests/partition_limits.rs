@@ -1803,6 +1803,7 @@ async fn a_node_the_job_finished_on_no_longer_charges_the_cap() {
         &per_node_for(&["n1", "n2"], scalar_alloc(8, GIB)),
         RunAttribution {
             effective_partition: Some("cpu".into()),
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             ..Default::default()
         },
     );
