@@ -727,6 +727,25 @@ pub fn startup_held_gpu_ids(
         .collect()
 }
 
+/// Non-GPU devices the adopted supervisors' jobs hold, by kind.
+pub fn startup_held_devices(
+    descriptors: &[crate::stepd::StepdDescriptor],
+) -> spur_devices::DeviceSelection {
+    let mut by_kind: std::collections::BTreeMap<&str, std::collections::BTreeSet<u64>> =
+        std::collections::BTreeMap::new();
+    for descriptor in descriptors {
+        for (gres, ids) in descriptor.resources.devices.iter() {
+            if gres != spur_core::device::GPU_GRES {
+                by_kind.entry(gres).or_default().extend(ids.iter().copied());
+            }
+        }
+    }
+    by_kind.into_iter().fold(
+        spur_devices::DeviceSelection::new(),
+        |selection, (gres, ids)| selection.with(gres, ids.into_iter().collect()),
+    )
+}
+
 fn renamed_gpu_ids(recorded: &[u64], renamed: &HashMap<u64, u64>) -> Vec<u64> {
     recorded
         .iter()

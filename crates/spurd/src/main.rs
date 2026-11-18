@@ -578,10 +578,12 @@ async fn main() -> anyhow::Result<()> {
     // job holds would advertise it as free.
     let current_gpus: Vec<_> = resources.gpus().cloned().collect();
     let held_gpu_ids = agent_server::startup_held_gpu_ids(&recovered_stepds, &current_gpus);
-    let startup = reporter::startup_inventory(
+    let held_devices = agent_server::startup_held_devices(&recovered_stepds);
+    let startup = reporter::startup_inventory_with(
         &resources,
         reporter::load_baseline(stepds.root()).as_ref(),
         &held_gpu_ids,
+        &held_devices,
         &reporter::load_fences(stepds.root()),
     );
     resources = startup.reported;
@@ -590,12 +592,12 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut reg = registry.lock().await;
         let discovered = std::mem::take(&mut *reg);
-        let reported = resources.gpus().map(|g| g.stable_id).collect();
+        let pinned = spur_devices::DeviceSelection::new()
+            .with("gpu", startup.fences.pinned_ids().into_iter().collect());
         *reg = discovered.with_pinned(
             &DeviceRegistry::new(),
-            "gpu",
-            &reported,
-            &startup.fences.pinned_ids(),
+            &reporter::reported_devices(&resources),
+            &pinned,
         );
     }
     info!(
@@ -1137,12 +1139,15 @@ fn spawn_inventory_refresh(
 
             reporter::retain_native_fabric_loss(&old, &mut fresh);
             reporter::refresh_block_file(&mut fresh, block_path);
-            let held_raw: std::collections::HashSet<u64> = {
+            let (held_raw, held_devices): (std::collections::HashSet<u64>, _) = {
                 let a = allocation.lock().await;
-                a.allocated_gpu_ids().into_iter().collect()
+                (
+                    a.allocated_gpu_ids().into_iter().collect(),
+                    a.held_devices(),
+                )
             };
             let committed = reporter.fences();
-            let tick = reporter::plan_tick(&old, &fresh, &held_raw, &committed);
+            let tick = reporter::plan_tick_with(&old, &fresh, &held_raw, &held_devices, &committed);
             let (plan, delta) = (&tick.plan, tick.delta.clone());
             // Every tick, not only on a converge: a holder may exit before the
             // inventory that withholds its released id is applied.
@@ -1213,7 +1218,7 @@ fn spawn_inventory_refresh(
                                     &registry,
                                     candidate,
                                     &reported,
-                                    &tick.pinned_ids(),
+                                    &tick.pinned_devices(),
                                     commit,
                                 )
                                 .await;
@@ -1295,7 +1300,7 @@ fn spawn_inventory_refresh(
                             &registry,
                             candidate,
                             &reconciled,
-                            &tick.pinned_ids(),
+                            &tick.pinned_devices(),
                             commit,
                         )
                         .await;
@@ -1352,16 +1357,16 @@ async fn publish_registry(
     registry: &Arc<Mutex<DeviceRegistry>>,
     candidate: DeviceRegistry,
     reported: &spur_core::resource::ResourceSet,
-    pinned: &std::collections::HashSet<u64>,
+    pinned: &spur_devices::DeviceSelection,
     commit: reporter::BaselineCommit,
 ) {
     if commit != reporter::BaselineCommit::Commit {
         return;
     }
-    let ids = reported.gpus().map(|g| g.stable_id).collect();
+    let reported = reporter::reported_devices(reported);
     let mut reg = registry.lock().await;
     let previous = std::mem::take(&mut *reg);
-    *reg = candidate.with_pinned(&previous, "gpu", &ids, pinned);
+    *reg = candidate.with_pinned(&previous, &reported, pinned);
 }
 
 #[cfg(test)]
@@ -1693,7 +1698,7 @@ mod tests {
             &shared,
             candidate,
             &reported,
-            &[1].into(),
+            &spur_devices::DeviceSelection::new().with("gpu", vec![1]),
             reporter::BaselineCommit::Commit,
         )
         .await;

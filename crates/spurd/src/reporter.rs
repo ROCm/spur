@@ -1046,6 +1046,61 @@ pub fn classify(
     }
 }
 
+/// `classify`, also treating a held non-GPU device that `new` lost as lost.
+pub fn classify_with(
+    old: &ResourceSet,
+    new: &ResourceSet,
+    allocated_stable_ids: &std::collections::HashSet<u64>,
+    held_devices: &spur_devices::DeviceSelection,
+) -> InventoryDelta {
+    let delta = classify(old, new, allocated_stable_ids);
+    if delta == InventoryDelta::FreeCapacityChanged
+        && !lost_held_devices(old, new, held_devices).is_empty()
+    {
+        return InventoryDelta::AllocatedDevicesLost;
+    }
+    delta
+}
+
+/// Held non-GPU devices `old` reported and `new` does not.
+fn lost_held_devices<'a>(
+    old: &'a ResourceSet,
+    new: &ResourceSet,
+    held_devices: &spur_devices::DeviceSelection,
+) -> Vec<&'a Device> {
+    let reports = |set: &ResourceSet, gres: &str, id: u64| {
+        set.devices
+            .iter()
+            .any(|d| d.gres_name == gres && d.stable_id == id)
+    };
+    held_devices
+        .iter()
+        .filter(|(gres, _)| *gres != spur_core::device::GPU_GRES)
+        .flat_map(|(gres, ids)| ids.iter().map(move |id| (gres, *id)))
+        .filter(|(gres, id)| !reports(new, gres, *id))
+        .filter_map(|(gres, id)| {
+            old.devices
+                .iter()
+                .find(|d| d.gres_name == gres && d.stable_id == id)
+        })
+        .collect()
+}
+
+/// Every device `set` reports, by kind.
+pub fn reported_devices(set: &ResourceSet) -> spur_devices::DeviceSelection {
+    let mut by_kind: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+    for device in &set.devices {
+        by_kind
+            .entry(&device.gres_name)
+            .or_default()
+            .push(device.stable_id);
+    }
+    by_kind.into_iter().fold(
+        spur_devices::DeviceSelection::new(),
+        |selection, (gres, ids)| selection.with(gres, ids),
+    )
+}
+
 /// Physical-GPU identity (BDF anchor) of a stable_id: mask off the low
 /// partition bits so two ids on the same silicon compare equal.
 fn bdf_anchor(stable_id: u64) -> u64 {
@@ -1236,6 +1291,8 @@ pub struct TickPlan {
     fresh_anchors: HashSet<u64>,
     /// Held ids `fresh` no longer names as the same silicon.
     lost_held: HashSet<u64>,
+    /// Held non-GPU devices, pinned from the baseline when `fresh` lost them.
+    held_devices: spur_devices::DeviceSelection,
 }
 
 impl TickPlan {
@@ -1270,11 +1327,42 @@ impl TickPlan {
         pinned
     }
 
+    /// Ids of every kind to inject from the previous registry: pinned GPUs, and
+    /// held devices of other kinds that discovery lost this tick.
+    pub fn pinned_devices(&self) -> spur_devices::DeviceSelection {
+        let mut gpus: Vec<u64> = self.pinned_ids().into_iter().collect();
+        gpus.sort_unstable();
+        let mut pinned = spur_devices::DeviceSelection::new().with("gpu", gpus);
+        if self.delta != InventoryDelta::AllocatedDevicesLost {
+            return pinned;
+        }
+        let mut by_kind: std::collections::BTreeMap<&str, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for device in lost_held_devices(&self.plan.baseline, &self.effective, &self.held_devices) {
+            by_kind
+                .entry(&device.gres_name)
+                .or_default()
+                .push(device.stable_id);
+        }
+        for (gres, ids) in by_kind {
+            pinned.set(gres, ids);
+        }
+        pinned
+    }
+
     /// The set to report: a held device the effective set lost is pinned.
     pub fn reported(&self) -> ResourceSet {
         match self.delta {
             InventoryDelta::AllocatedDevicesLost => {
-                reconcile_free_pool(&self.effective, &self.plan.baseline, &self.plan.held)
+                let mut reported =
+                    reconcile_free_pool(&self.effective, &self.plan.baseline, &self.plan.held);
+                let lost: Vec<Device> =
+                    lost_held_devices(&self.plan.baseline, &reported, &self.held_devices)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                reported.devices.extend(lost);
+                reported
             }
             _ => self.effective.clone(),
         }
@@ -1313,7 +1401,23 @@ pub fn plan_tick(
         delta,
         fresh_anchors: fresh.gpus().map(|g| bdf_anchor(g.stable_id)).collect(),
         lost_held,
+        held_devices: spur_devices::DeviceSelection::new(),
     }
+}
+
+/// `plan_tick`, also keeping held non-GPU devices reported while discovery
+/// misses them, so the controller never sees a held device as gone.
+pub fn plan_tick_with(
+    old: &ResourceSet,
+    fresh: &ResourceSet,
+    held: &HashSet<u64>,
+    held_devices: &spur_devices::DeviceSelection,
+    fences: &Fences,
+) -> TickPlan {
+    let mut tick = plan_tick(old, fresh, held, fences);
+    tick.delta = classify_with(old, &tick.effective, &tick.plan.held, held_devices);
+    tick.held_devices = held_devices.clone();
+    tick
 }
 
 /// Install `reported` on the ledger, gated by the fences it was built from so
@@ -1376,10 +1480,22 @@ pub fn startup_inventory(
     held: &HashSet<u64>,
     fences: &Fences,
 ) -> StartupInventory {
+    startup_inventory_with(fresh, baseline, held, &Default::default(), fences)
+}
+
+/// `startup_inventory`, also keeping adopted jobs' non-GPU devices reported
+/// from the baseline while discovery misses them.
+pub fn startup_inventory_with(
+    fresh: &ResourceSet,
+    baseline: Option<&ResourceSet>,
+    held: &HashSet<u64>,
+    held_devices: &spur_devices::DeviceSelection,
+    fences: &Fences,
+) -> StartupInventory {
     let Some(baseline) = baseline else {
         return startup_inventory_without_baseline(fresh, held, fences);
     };
-    let tick = plan_tick(baseline, fresh, held, fences);
+    let tick = plan_tick_with(baseline, fresh, held, held_devices, fences);
     StartupInventory {
         reported: tick.reported(),
         renamed: tick.plan.renamed,
@@ -2798,8 +2914,11 @@ mod tests {
             (sid(0x11, 0), "/dev/dri/renderD200"),
             (sid(0x11, 1), "/dev/dri/renderD201"),
         ]);
-        let reported: HashSet<u64> = tick.reported().gpus().map(|g| g.stable_id).collect();
-        let published = candidate.with_pinned(&previous, "gpu", &reported, &tick.pinned_ids());
+        let published = candidate.with_pinned(
+            &previous,
+            &reported_devices(&tick.reported()),
+            &tick.pinned_devices(),
+        );
 
         let path = |id: u64| {
             published.resolve_by_ids("gpu", &[id]).unwrap()[0]
@@ -5061,6 +5180,58 @@ mod tests {
         assert_eq!(baseline.generic.get("bandwidth:lustre"), Some(&4096));
         assert_eq!(baseline.devices[0].numa_node, Some(0));
         assert_eq!(baseline.devices[0].affinity_cpus, vec![0, 1, 64, 65]);
+    }
+
+    fn with_devices(devices: Vec<Device>) -> ResourceSet {
+        ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            devices,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_held_device_of_any_kind_missing_from_the_fresh_inventory_is_lost() {
+        for kind in ["nic", "vnic", "fpga"] {
+            let old = with_devices(vec![Device::new(kind, "t", 7, 0)]);
+            let new = with_devices(Vec::new());
+            let held = spur_devices::DeviceSelection::new().with(kind, vec![7]);
+            assert_eq!(
+                classify_with(&old, &new, &HashSet::new(), &held),
+                InventoryDelta::AllocatedDevicesLost,
+                "{kind}"
+            );
+            assert_eq!(
+                classify_with(&old, &new, &HashSet::new(), &Default::default()),
+                InventoryDelta::FreeCapacityChanged,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_device_of_any_kind_stays_reported_until_its_holder_exits() {
+        let old = with_devices(vec![
+            Device::new("nic", "t", 7, 0),
+            Device::new("nic", "t", 8, 1),
+        ]);
+        let fresh = with_devices(vec![Device::new("nic", "t", 8, 0)]);
+        let held = spur_devices::DeviceSelection::new().with("nic", vec![7]);
+        let reports_7 = |tick: TickPlan| tick.reported().devices.iter().any(|d| d.stable_id == 7);
+
+        let tick = plan_tick_with(&old, &fresh, &HashSet::new(), &held, &Fences::default());
+        assert_eq!(tick.delta, InventoryDelta::AllocatedDevicesLost);
+        assert_eq!(tick.pinned_devices().of("nic"), &[7]);
+        assert!(reports_7(tick));
+        let free = plan_tick_with(
+            &old,
+            &fresh,
+            &HashSet::new(),
+            &Default::default(),
+            &Fences::default(),
+        );
+        assert!(!reports_7(free));
     }
 
     #[test]
