@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use spur_devices::cdi::annotations::{AUTO_DETECTED, STABLE_ID};
 use spur_devices::cdi::discovery::discover_to_cdi;
-use spur_devices::cdi::spec::CdiSpec;
+use spur_devices::cdi::spec::{CdiDevice, CdiSpec, DeviceNode};
 
 pub const SPEC_PATH: &str = "/etc/cdi/amd.json";
 
@@ -67,6 +67,53 @@ pub fn is_stale(on_disk: &CdiSpec, live: &[CdiSpec], drm_readable: bool) -> bool
         return gpu_stable_ids(on_disk) != gpu_stable_ids(live);
     }
     gpu_grants(on_disk) != gpu_grants(live)
+}
+
+fn device_nodes(device: &CdiDevice) -> impl Iterator<Item = &DeviceNode> {
+    device
+        .container_edits
+        .iter()
+        .flat_map(|edits| &edits.device_nodes)
+}
+
+fn render_node(device: &CdiDevice) -> Option<&str> {
+    device_nodes(device)
+        .map(|node| node.path.as_str())
+        .find(|path| path.starts_with("/dev/dri/renderD"))
+}
+
+fn card_nodes(device: &CdiDevice) -> impl Iterator<Item = &DeviceNode> {
+    device_nodes(device).filter(|node| node.path.starts_with("/dev/dri/card"))
+}
+
+/// A scan without DRM access has no card nodes: a GPU it still sees unchanged
+/// keeps the ones already verified on disk, any other GPU gets none.
+fn keep_card_nodes(on_disk: &CdiSpec, live: &[CdiSpec]) -> Vec<CdiSpec> {
+    let known = |device: &CdiDevice| {
+        let id = device.annotations.get(STABLE_ID)?;
+        let render = render_node(device)?;
+        on_disk.devices.iter().find(|old| {
+            old.annotations.get(STABLE_ID) == Some(id) && render_node(old) == Some(render)
+        })
+    };
+    let mut kept = live.to_vec();
+    for device in kept
+        .iter_mut()
+        .filter(|spec| spec.kind == AMD_CDI_KIND)
+        .flat_map(|spec| spec.devices.iter_mut())
+    {
+        let Some(old) = known(device) else {
+            continue;
+        };
+        let cards: Vec<DeviceNode> = card_nodes(old)
+            .filter(|card| device_nodes(device).all(|node| node.path != card.path))
+            .cloned()
+            .collect();
+        if let Some(edits) = device.container_edits.as_mut() {
+            edits.device_nodes.extend(cards);
+        }
+    }
+    kept
 }
 
 pub fn write_specs(dir: &Path, specs: &[CdiSpec]) -> anyhow::Result<()> {
@@ -126,7 +173,12 @@ pub fn resync_with(dir: &Path, auto_detect: bool, live: &[CdiSpec], drm_readable
         warn_foreign_stale(&on_disk);
         return false;
     }
-    match write_specs(dir, live) {
+    let rewrite = if drm_readable {
+        live.to_vec()
+    } else {
+        keep_card_nodes(&on_disk, live)
+    };
+    match write_specs(dir, &rewrite) {
         Ok(()) => {
             info!(count = live.len(), "rewrote stale Spur-owned CDI spec");
             true
@@ -147,7 +199,7 @@ pub fn resync(dir: &Path, auto_detect: bool) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use spur_devices::cdi::spec::{CdiDevice, GENERATED_CDI_VERSION};
+    use spur_devices::cdi::spec::GENERATED_CDI_VERSION;
 
     use super::*;
 
@@ -287,6 +339,49 @@ mod tests {
         assert!(!resync_with(dir.path(), true, &live, false));
         let kept = CdiSpec::read_file(&dir.path().join(SPEC_FILENAME)).expect("read spec");
         assert_eq!(kept, on_disk);
+    }
+
+    #[test]
+    fn keep_card_nodes_restores_cards_only_for_gpus_with_the_same_id_and_render_node() {
+        let on_disk = with_nodes(&[
+            ("1", &["/dev/dri/renderD128", "/dev/dri/card0"]),
+            ("2", &["/dev/dri/renderD129", "/dev/dri/card1"]),
+        ]);
+        let live = vec![with_nodes(&[
+            ("1", &["/dev/dri/renderD128"]),
+            ("2", &["/dev/dri/renderD130"]),
+            ("3", &["/dev/dri/renderD131"]),
+        ])];
+        let kept = keep_card_nodes(&on_disk, &live);
+        assert_eq!(
+            kept,
+            vec![with_nodes(&[
+                ("1", &["/dev/dri/renderD128", "/dev/dri/card0"]),
+                ("2", &["/dev/dri/renderD130"]),
+                ("3", &["/dev/dri/renderD131"]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_rewrite_without_drm_access_writes_the_kept_card_nodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let on_disk = with_nodes(&[("1", &["/dev/dri/renderD128", "/dev/dri/card0"])]);
+        write_specs(dir.path(), std::slice::from_ref(&on_disk)).expect("seed spec");
+
+        let live = vec![with_nodes(&[
+            ("1", &["/dev/dri/renderD128"]),
+            ("2", &["/dev/dri/renderD129"]),
+        ])];
+        assert!(resync_with(dir.path(), true, &live, false));
+        let written = CdiSpec::read_file(&dir.path().join(SPEC_FILENAME)).expect("read spec");
+        assert_eq!(
+            written,
+            with_nodes(&[
+                ("1", &["/dev/dri/renderD128", "/dev/dri/card0"]),
+                ("2", &["/dev/dri/renderD129"]),
+            ])
+        );
     }
 
     #[test]
