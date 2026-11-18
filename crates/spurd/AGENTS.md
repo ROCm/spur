@@ -351,20 +351,24 @@ does not fence the running jobs.
 
 ### Launch flow (agent_server -> executor)
 1. Controller sends `LaunchJob` RPC with the full job spec.
-2. `AgentService` acquires the `JobLifecycle` lock for this job ID (serializes
-   with any in-progress teardown of the same ID).
-3. Resolves GPU device injection from the allocation + device registry.
-4. Builds `JobLaunchConfig` from the RPC fields + agent config. The script runs
-   where `LaunchJobRequest.script_placement` says (`launch_placement`; empty from
-   an older controller, which falls back to the `auto` text scan). On a
-   `batch-host` launch, a node with `task_offset > 0` and no `task_fanout` runs
+2. `AgentService` verifies the execution credential, then validates the request
+   (target node, root execution, `launch_placement`, the script) before recording
+   the credential in `LaunchAcceptance` or fencing anything, so a refused request
+   leaves the previous run and the credential untouched.
+3. Acquires the `JobLifecycle` lock for this job ID (serializes with any
+   in-progress teardown of the same ID) and fences a displaced older run.
+4. Resolves GPU device injection from the allocation + device registry.
+5. Builds `JobLaunchConfig` from the RPC fields + agent config. The script runs
+   where `LaunchJobRequest.script_placement` says (empty from an older
+   controller, which falls back to the `auto` text scan). On a `batch-host`
+   launch, a node with `task_offset > 0` and no `task_fanout` runs
    `batch_companion_hold_script` as an `allocation_holder`, with stdio on
    `/dev/null` (`batch_stdio`) so it never opens the job's output files.
-5. Prepares a `StepdLaunchSpec` and launches `spurstepd` as the supervisor.
+6. Prepares a `StepdLaunchSpec` and launches `spurstepd` as the supervisor.
    Production always uses spurstepd (`stepd_enabled = true` at
    `agent_server.rs:6125`); direct `executor::launch_job` calls are a
    test-only path gated behind `cfg(test)` via `force_legacy_launch`.
-6. `launch_job` runs the prolog script (if configured), then `spawn_job_process`.
+7. `launch_job` runs the prolog script (if configured), then `spawn_job_process`.
 
 ### spawn_job_process
 - Creates the spool directory (`/var/spool/spur/job<id>/`), writes the job
