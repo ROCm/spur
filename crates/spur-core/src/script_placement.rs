@@ -82,6 +82,18 @@ impl ResolvedPlacement {
         }
     }
 
+    /// Whether an agent that read `scan` off the script would launch a run placed
+    /// `self` differently. Off the batch host a node runs the script or holds; on
+    /// it, only a PMIx job's launch depends on the placement.
+    pub fn launches_differently_from(
+        self,
+        scan: Self,
+        num_nodes: usize,
+        mpi: Option<&str>,
+    ) -> bool {
+        self != scan && (num_nodes > 1 || mpi == Some(crate::mpi::MPI_PMIX))
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BatchHost => "batch-host",
@@ -236,6 +248,17 @@ mod tests {
         }
         let err = "batchhost".parse::<ScriptPlacement>().unwrap_err();
         assert!(err.contains("auto, batch-host, or all-nodes"), "{err}");
+    }
+
+    #[test]
+    fn only_a_multi_node_or_pmix_launch_depends_on_the_placement() {
+        use ResolvedPlacement::{AllNodes, BatchHost};
+
+        assert!(BatchHost.launches_differently_from(AllNodes, 2, None));
+        assert!(!BatchHost.launches_differently_from(AllNodes, 1, None));
+        assert!(!BatchHost.launches_differently_from(AllNodes, 1, Some("mpirun")));
+        assert!(BatchHost.launches_differently_from(AllNodes, 1, Some("pmix")));
+        assert!(!AllNodes.launches_differently_from(AllNodes, 4, Some("pmix")));
     }
 
     #[test]

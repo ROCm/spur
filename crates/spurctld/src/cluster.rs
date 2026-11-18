@@ -23642,6 +23642,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -23683,6 +23684,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -24822,6 +24824,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -24856,6 +24859,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24876,6 +24880,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24908,6 +24913,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24931,6 +24937,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let mut excl_spec = basic_spec("excl");
         excl_spec.exclusive = true;
@@ -24972,6 +24979,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25005,6 +25013,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25043,6 +25052,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25085,6 +25095,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25138,6 +25149,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25191,6 +25203,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25225,6 +25238,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25256,6 +25270,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25436,6 +25451,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -26768,6 +26784,7 @@ state = "UP"
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(
             cm.config().scheduler.max_jobs_per_cycle as usize,
@@ -27645,6 +27662,7 @@ state = "UP"
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
         let assignments = crate::scheduler_loop::claimed_assignments(
@@ -31306,6 +31324,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -31408,6 +31427,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::claimed_assignments(
@@ -32165,6 +32185,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -32247,6 +32268,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -34909,6 +34931,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snap = cm.get_job(job).unwrap();
         cm.update_pending_reasons(&[&snap], &state);

@@ -957,6 +957,27 @@ impl JobSpec {
             .sum();
         by_task.max(by_gpu).max(by_node)
     }
+
+    /// Whether this job's nodes must honor its placement rather than read it off
+    /// the script, as an agent without the `script-placement` capability does.
+    pub fn needs_placement_aware_agents(
+        &self,
+        cluster_default: crate::script_placement::ScriptPlacement,
+    ) -> bool {
+        use crate::script_placement::{ResolvedPlacement, ScriptPlacement};
+
+        let requested = self.script_placement.unwrap_or(cluster_default);
+        // `auto` is the scan itself, so it never differs and needs no scan here.
+        if !self.is_batch() || requested == ScriptPlacement::Auto {
+            return false;
+        }
+        let script = self.script.as_deref();
+        requested.resolve(script).launches_differently_from(
+            ResolvedPlacement::scanned(script),
+            self.num_nodes.max(1) as usize,
+            self.mpi.as_deref(),
+        )
+    }
 }
 
 /// GPUs on each node: a job total spread evenly with the remainder on the first
@@ -2009,6 +2030,57 @@ mod tests {
         job.resolved_placement = Some(ResolvedPlacement::AllNodes);
 
         assert_eq!(job.script_placement(), ResolvedPlacement::AllNodes);
+    }
+
+    fn runner_spec(
+        num_nodes: u32,
+        requested: Option<crate::script_placement::ScriptPlacement>,
+    ) -> JobSpec {
+        JobSpec {
+            script: Some("#!/bin/bash\n./runner.sh\n".into()),
+            script_placement: requested,
+            num_nodes,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_placement_the_scan_would_miss_on_several_nodes_needs_aware_agents() {
+        use crate::script_placement::ScriptPlacement::{Auto, BatchHost};
+
+        assert!(runner_spec(2, Some(BatchHost)).needs_placement_aware_agents(Auto));
+        assert!(
+            runner_spec(2, None).needs_placement_aware_agents(BatchHost),
+            "the cluster default applies to a job that chose nothing"
+        );
+        let pmix = JobSpec {
+            mpi: Some("pmix".into()),
+            ..runner_spec(1, Some(BatchHost))
+        };
+        assert!(
+            pmix.needs_placement_aware_agents(Auto),
+            "a PMIx batch host runs the script as a rank or a driver"
+        );
+    }
+
+    #[test]
+    fn a_launch_the_placement_does_not_change_needs_no_aware_agents() {
+        use crate::script_placement::ScriptPlacement::{AllNodes, Auto, BatchHost};
+
+        assert!(!runner_spec(2, None).needs_placement_aware_agents(Auto));
+        assert!(
+            !runner_spec(2, Some(AllNodes)).needs_placement_aware_agents(BatchHost),
+            "the scan already runs this script on every node"
+        );
+        assert!(
+            !runner_spec(1, Some(BatchHost)).needs_placement_aware_agents(Auto),
+            "one node runs the script once either way"
+        );
+        let srun = JobSpec {
+            srun_job: true,
+            ..runner_spec(2, Some(BatchHost))
+        };
+        assert!(!srun.needs_placement_aware_agents(Auto));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use spur_core::partition::Partition;
 use spur_core::partition_limits::MemoryAdjustment;
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceAllocations;
+use spur_core::script_placement::ScriptPlacement;
 use spur_core::topology::TopologyTree;
 
 use crate::partition_cap::PartitionNodeUsage;
@@ -45,6 +46,8 @@ pub struct ClusterState<'a> {
     /// What each partition's running jobs hold per node, charged against the
     /// partition's `max_tres_per_node` until each charge's own `until`.
     pub partition_node_usage: &'a PartitionNodeUsage,
+    /// `[controller] script_placement`, for a batch job that chooses no placement.
+    pub script_placement_default: ScriptPlacement,
 }
 
 impl ClusterState<'_> {
