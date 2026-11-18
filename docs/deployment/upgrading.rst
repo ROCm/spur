@@ -1357,9 +1357,13 @@ Node inventory now lists every allocatable device, of every kind, in
 * **Count-only pools named like discovered devices are ignored.** On a node
   where Spur reports a kind by device (for example NICs it discovers), a
   count-only ``[[devices.gres]]`` entry with the same name is ignored, with a
-  warning naming it. Remove such ``nic`` and ``vnic`` entries from
-  ``spur.conf``. A count-only ``gpu`` entry is always ignored: GPUs are only
-  scheduled by device.
+  warning whenever the set of ignored entries changes. Remove such ``nic`` and
+  ``vnic`` entries from ``spur.conf``. A count-only ``gpu`` entry is always
+  ignored: GPUs are only scheduled by device. Once ``spurd`` has handed a kind
+  out by device, it keeps doing so until it restarts: if every device of that
+  kind disappears, the node reports none and jobs that request it pend instead
+  of falling back to the count-only entry. A restart of ``spurd`` re-evaluates
+  this.
 * **Per-GPU CPU placement is carried by every device.** A device's NUMA node
   and its ``cores=`` CPUs are reported on the generic ``Device`` (gRPC fields
   ``numa_node`` and ``affinity_cpus``) and still written to the legacy

@@ -19,6 +19,8 @@ pub use inject::{
     build_injection_plans, merge_edits_from_devices, ContainerInjectionPlan, HostInjectionPlan,
     InjectActions, MergedEdits,
 };
-pub use registry::{DeviceCapability, DeviceClass, DeviceEntry, DeviceRegistry};
+pub use registry::{
+    DeviceCapability, DeviceClass, DeviceEntry, DeviceRegistry, RegistryNote, ShadowedPool,
+};
 pub use selection::DeviceSelection;
 pub use types::LinkType;

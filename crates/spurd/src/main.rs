@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use clap::parser::ValueSource;
@@ -560,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize device registry (CDI cache, GRES config, and discovery).
-    let registry = init_device_registry(config.as_ref());
+    let registry = init_device_registry(config.as_ref(), &BTreeSet::new());
     let registry = Arc::new(Mutex::new(registry));
 
     // Discover local resources (CPU/memory from sysfs, GPUs from device registry)
@@ -599,6 +599,8 @@ async fn main() -> anyhow::Result<()> {
             &reporter::reported_devices(&resources),
             &pinned,
         );
+        warn_shadowed_pools(&DeviceRegistry::new(), &reg);
+        log_registry_notes(&DeviceRegistry::new(), &reg);
     }
     info!(
         cpus = resources.cpus,
@@ -1045,7 +1047,10 @@ fn devices_auto_detect(config: Option<&SlurmConfig>) -> bool {
         .auto_detect
 }
 
-fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
+fn init_device_registry(
+    config: Option<&SlurmConfig>,
+    by_id_history: &BTreeSet<String>,
+) -> DeviceRegistry {
     let default_devices = spur_core::config::DevicesConfig::default();
     let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
 
@@ -1068,7 +1073,7 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     let gres_cache = spur_devices::GresCache::from_entries(&gres_entries);
 
     let mut registry = DeviceRegistry::new();
-    registry.populate(&cdi_cache, &gres_cache);
+    registry.populate_with_history(&cdi_cache, &gres_cache, by_id_history);
 
     info!(
         injectable_devices = registry.injectable_count(),
@@ -1096,6 +1101,7 @@ fn spawn_inventory_refresh(
         let mut last_delta = reporter::InventoryDelta::Unchanged;
         let mut last_fp: reporter::InventoryFingerprint = Default::default();
         let mut fence_ages = reporter::FenceAges::default();
+        let mut by_id_history = registry.lock().await.by_id_names();
         let mut interval = tokio::time::interval(reporter::inventory_refresh_interval());
         // `interval` fires immediately on the first tick; skip it so the first
         // real refresh is one full interval in, not at startup.
@@ -1113,7 +1119,7 @@ fn spawn_inventory_refresh(
             // Build the candidate registry locally WITHOUT swapping the shared
             // one: GPU injection must keep using the old positional mapping until
             // this tick commits. Generation is bumped off the currently-reported set.
-            let candidate = init_device_registry(config.as_ref());
+            let candidate = init_device_registry(config.as_ref(), &by_id_history);
             let mut fresh = reporter::discover_resources(&candidate);
             fresh.generation = reporter.snapshot_resources().generation + 1;
 
@@ -1220,6 +1226,7 @@ fn spawn_inventory_refresh(
                                     &reported,
                                     &tick.pinned_devices(),
                                     commit,
+                                    &mut by_id_history,
                                 )
                                 .await;
                             }
@@ -1302,6 +1309,7 @@ fn spawn_inventory_refresh(
                             &reconciled,
                             &tick.pinned_devices(),
                             commit,
+                            &mut by_id_history,
                         )
                         .await;
                     }
@@ -1359,6 +1367,7 @@ async fn publish_registry(
     reported: &spur_core::resource::ResourceSet,
     pinned: &spur_devices::DeviceSelection,
     commit: reporter::BaselineCommit,
+    by_id_history: &mut BTreeSet<String>,
 ) {
     if commit != reporter::BaselineCommit::Commit {
         return;
@@ -1367,6 +1376,67 @@ async fn publish_registry(
     let mut reg = registry.lock().await;
     let previous = std::mem::take(&mut *reg);
     *reg = candidate.with_pinned(&previous, &reported, pinned);
+    warn_shadowed_pools(&previous, &reg);
+    log_registry_notes(&previous, &reg);
+    by_id_history.extend(reg.by_id_names());
+}
+
+/// The registry is rebuilt every refresh, so only a change is worth a warning.
+fn shadowed_pools_to_warn<'a>(
+    previous: &DeviceRegistry,
+    next: &'a DeviceRegistry,
+) -> Option<&'a [spur_devices::ShadowedPool]> {
+    let pools = next.shadowed_pools();
+    (!pools.is_empty() && pools != previous.shadowed_pools()).then_some(pools)
+}
+
+fn warn_shadowed_pools(previous: &DeviceRegistry, next: &DeviceRegistry) {
+    if let Some(pools) = shadowed_pools_to_warn(previous, next) {
+        warn!(
+            ?pools,
+            "countable GRES pools share their name with devices handed out by id; ignoring them"
+        );
+    }
+}
+
+fn registry_notes_to_log<'a>(
+    previous: &DeviceRegistry,
+    next: &'a DeviceRegistry,
+) -> Option<&'a [spur_devices::RegistryNote]> {
+    let notes = next.notes();
+    (!notes.is_empty() && notes != previous.notes()).then_some(notes)
+}
+
+fn log_registry_notes(previous: &DeviceRegistry, next: &DeviceRegistry) {
+    use spur_devices::RegistryNote;
+    for note in registry_notes_to_log(previous, next).unwrap_or_default() {
+        match note {
+            RegistryNote::Merged { paths } => {
+                info!(?paths, "configured device merged into the discovered one")
+            }
+            RegistryNote::DroppedNodes { paths, dropped } => warn!(
+                ?paths,
+                ?dropped,
+                "configured device names nodes the discovered devices it names lack; dropping them"
+            ),
+            RegistryNote::SharedOnly { paths } => warn!(
+                ?paths,
+                "configured device names only nodes every device of its kind shares; dropping it"
+            ),
+            RegistryNote::Duplicate {
+                kind,
+                existing_kind,
+                paths,
+                rule,
+            } => warn!(
+                duplicate_kind = %kind,
+                %existing_kind,
+                ?paths,
+                rule,
+                "device duplicates one already kept; skipping"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1637,6 +1707,7 @@ mod tests {
             &reported,
             &Default::default(),
             reporter::BaselineCommit::Keep,
+            &mut BTreeSet::new(),
         )
         .await;
         assert_eq!(
@@ -1652,6 +1723,7 @@ mod tests {
             &reported,
             &Default::default(),
             reporter::BaselineCommit::Commit,
+            &mut BTreeSet::new(),
         )
         .await;
         assert_eq!(
@@ -1700,11 +1772,99 @@ mod tests {
             &reported,
             &spur_devices::DeviceSelection::new().with("gpu", vec![1]),
             reporter::BaselineCommit::Commit,
+            &mut BTreeSet::new(),
         )
         .await;
 
         let shared = device_paths(&*shared.lock().await);
         assert_eq!(shared, vec![new_devices[0].clone(), old_device]);
+    }
+
+    fn nic_registry(gres: &[spur_devices::GresEntry]) -> DeviceRegistry {
+        let mut reg = DeviceRegistry::new();
+        reg.populate(
+            &CdiCache::new(),
+            &spur_devices::GresCache::from_entries(gres),
+        );
+        reg
+    }
+
+    fn nic_files() -> spur_devices::GresEntry {
+        spur_devices::GresEntry {
+            name: "nic".into(),
+            file: Some("/dev/infiniband/uverbs[0-1]".into()),
+            ..Default::default()
+        }
+    }
+
+    fn nic_pool() -> spur_devices::GresEntry {
+        spur_devices::GresEntry {
+            name: "nic".into(),
+            count: Some(4),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_registry_remembers_kinds_handed_out_by_id_only_on_commit() {
+        let shared = Arc::new(Mutex::new(DeviceRegistry::new()));
+        let reported = spur_core::resource::ResourceSet::default();
+        let mut history = BTreeSet::new();
+
+        publish_registry(
+            &shared,
+            nic_registry(&[nic_files()]),
+            &reported,
+            &Default::default(),
+            reporter::BaselineCommit::Keep,
+            &mut history,
+        )
+        .await;
+        assert!(history.is_empty());
+
+        publish_registry(
+            &shared,
+            nic_registry(&[nic_files()]),
+            &reported,
+            &Default::default(),
+            reporter::BaselineCommit::Commit,
+            &mut history,
+        )
+        .await;
+        assert_eq!(history, BTreeSet::from(["nic".to_string()]));
+    }
+
+    #[test]
+    fn registry_notes_log_only_when_they_change() {
+        let kfd_only = spur_devices::GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/kfd".into()),
+            ..Default::default()
+        };
+        let quiet = nic_registry(&[nic_files()]);
+        let noted = nic_registry(&[nic_files(), kfd_only.clone()]);
+        assert!(registry_notes_to_log(&quiet, &quiet).is_none());
+        assert_eq!(registry_notes_to_log(&quiet, &noted), Some(noted.notes()));
+        let refreshed = nic_registry(&[nic_files(), kfd_only]);
+        assert!(
+            registry_notes_to_log(&noted, &refreshed).is_none(),
+            "an unchanged rebuild logs nothing"
+        );
+        assert!(registry_notes_to_log(&noted, &quiet).is_none());
+    }
+
+    #[test]
+    fn shadowed_pools_warn_only_when_the_set_changes() {
+        let none = registry_with_one_countable_pool();
+        let shadowing = nic_registry(&[nic_files(), nic_pool()]);
+        assert!(shadowed_pools_to_warn(&none, &none).is_none());
+        assert_eq!(
+            shadowed_pools_to_warn(&none, &shadowing),
+            Some(shadowing.shadowed_pools())
+        );
+        assert!(shadowed_pools_to_warn(&shadowing, &shadowing).is_none());
+        assert!(shadowed_pools_to_warn(&shadowing, &none).is_none());
     }
 
     #[tokio::test]
