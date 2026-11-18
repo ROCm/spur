@@ -537,6 +537,30 @@ fn holds_for_batch_host(placement: ResolvedPlacement, task_offset: u32, task_fan
     placement == ResolvedPlacement::BatchHost && task_offset > 0 && !task_fanout
 }
 
+/// The files a batch launch's stdio opens.
+struct BatchStdio {
+    stdout: String,
+    stderr: String,
+    stdin: String,
+}
+
+/// A holder runs no user code, so it leaves the job's files alone: on shared
+/// storage, opening them would truncate what the batch host has written.
+fn batch_stdio(spec: &JobSpec, allocation_holder: bool) -> BatchStdio {
+    if allocation_holder {
+        return BatchStdio {
+            stdout: "/dev/null".into(),
+            stderr: "/dev/null".into(),
+            stdin: String::new(),
+        };
+    }
+    BatchStdio {
+        stdout: spec.stdout_path.clone(),
+        stderr: spec.stderr_path.clone(),
+        stdin: spec.stdin_path.clone(),
+    }
+}
+
 fn execution_status(err: spur_core::native_cred::CredentialError) -> Status {
     use spur_core::native_cred::CredentialStatusCode;
     match err.status_code() {
@@ -7321,6 +7345,7 @@ impl SlurmAgent for AgentService {
             None
         };
 
+        let stdio = batch_stdio(&spec, allocation_holder);
         let launch_cfg = executor::JobLaunchConfig {
             step_id: launch_step,
             job_id,
@@ -7337,9 +7362,9 @@ impl SlurmAgent for AgentService {
             joins_parent_namespaces: false,
             allocation_holder,
             step_limits: Default::default(),
-            stdout_path: spec.stdout_path.clone(),
-            stderr_path: spec.stderr_path.clone(),
-            stdin_path: spec.stdin_path.clone(),
+            stdout_path: stdio.stdout,
+            stderr_path: stdio.stderr,
+            stdin_path: stdio.stdin,
             cpus,
             memory_mb,
             memory_ceiling_mb,
@@ -17768,6 +17793,26 @@ mod tests {
             "an srun fan-out runs on every node"
         );
         assert!(!holds_for_batch_host(AllNodes, 4, false));
+    }
+
+    #[test]
+    fn a_holder_leaves_the_jobs_stdio_files_alone() {
+        let spec = JobSpec {
+            stdout_path: "/shared/out.log".into(),
+            stderr_path: "/shared/err.log".into(),
+            stdin_path: "/shared/in.txt".into(),
+            ..Default::default()
+        };
+
+        let held = batch_stdio(&spec, true);
+        assert_eq!(held.stdout, "/dev/null");
+        assert_eq!(held.stderr, "/dev/null");
+        assert_eq!(held.stdin, "");
+
+        let ran = batch_stdio(&spec, false);
+        assert_eq!(ran.stdout, "/shared/out.log");
+        assert_eq!(ran.stderr, "/shared/err.log");
+        assert_eq!(ran.stdin, "/shared/in.txt");
     }
 
     #[test]
