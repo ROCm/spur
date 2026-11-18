@@ -209,8 +209,8 @@ a GPU repartition), the controller detects whether a held GPU's stable_id
 disappeared:
 
 - If a stable_id an allocation holds is missing from the new inventory, the
-  node cannot offer any GPU until the held job finishes (the
-  `holds_unknown_gpu` check).
+  node cannot offer any GPU until the held job finishes (`ResourceSet::holds`
+  returns `None` for any unknown GPU id, id 0 included).
 - This prevents a repartition from silently reusing a stable_id for a different
   logical device.
 
@@ -395,8 +395,9 @@ shift (e.g. after a driver reload):
   than picking up the new entry that happens to share the id.
 
 A node holding an allocated stable_id that disappeared from the inventory
-offers zero GPUs until the holding job finishes (`holds_unknown_gpu` returns
-true). This is conservative but prevents silent corruption.
+offers zero GPUs until the holding job finishes (`ResourceSet::holds` returns
+`None` for any unknown GPU id, id 0 included). This is conservative but prevents
+silent corruption.
 
 ---
 
