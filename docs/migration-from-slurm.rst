@@ -61,6 +61,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Accepted for compatibility on ``squeue``, ``sinfo``, ``sacct``, ``sstat``, ``sshare``, and ``sreport``. Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. ``sstat`` still prints ``MemAlloc`` with an ``M`` suffix whether or not the flag is passed.
    * - ``sacct`` ``ReqMem``
      - The ``ReqMem`` format field has no value yet and renders empty.
+   * - ``sacct`` row limits
+     - Slurm limits a plain ``sacct`` to jobs since midnight and has no row cap. Spur has no time default. It prints the newest 100 jobs, a number you change with ``--limit``. ``-j`` returns every requested job that has a record, as in Slurm, up to 10000 rows. An id with no record is left out. A page that hides further matches prints ``sacct: warning: results truncated at N; more jobs matched`` to stderr and still exits 0.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``
