@@ -128,6 +128,34 @@ fn exact_cpu_shortfall_spares_every_other_tenant() {
 }
 
 #[test]
+fn unresponsive_nodes_do_not_justify_eviction() {
+    for state in [NodeState::Idle, NodeState::Mixed, NodeState::Allocated] {
+        let mut f = Fixture::new(4);
+        f.hold(1, 4, 0, &[], true);
+        f.nodes[0].state = state;
+        f.nodes[0].not_responding = true;
+        assert_eq!(selected(&f, &request(1, 0)), None, "{state:?}");
+
+        f.nodes[0].not_responding = false;
+        assert_eq!(selected(&f, &request(1, 0)), Some(HashSet::from([1])));
+    }
+}
+
+#[test]
+fn unresponsive_free_capacity_does_not_suppress_necessary_preemption() {
+    let mut f = Fixture::new(4);
+    let mut silent = f.nodes[0].clone();
+    silent.name = "n2".into();
+    silent.not_responding = true;
+    f.nodes.push(silent);
+    f.hold(1, 4, 0, &[], true);
+    assert_eq!(selected(&f, &request(1, 0)), Some(HashSet::from([1])));
+
+    f.nodes[1].not_responding = false;
+    assert_eq!(selected(&f, &request(1, 0)), None);
+}
+
+#[test]
 fn pinned_selector_keeps_its_budget_with_many_irrelevant_nodes() {
     for count in [64, 128, 512, 1024] {
         let mut f = Fixture::new(4);
@@ -658,6 +686,45 @@ fn immediate_trial_rechecks_changed_input_and_restores_scheduler_mode() {
     assert!(
         spur_sched::traits::Scheduler::schedule(&mut scheduler, &[incoming], &f.state()).len() == 1
     );
+}
+
+#[test]
+fn snapshot_preserves_live_node_responsiveness() {
+    use crate::cluster::{tests::set_last_heartbeat, MarkDownPolicy};
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+
+    let mut f = Fixture::new(4);
+    let dir = tempfile::TempDir::new().expect("state directory");
+    let cluster = ClusterManager::new(
+        spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhostname = \"test\"\n",
+        )
+        .expect("config"),
+        dir.path(),
+    )
+    .expect("cluster");
+    let register: WalOperation = serde_json::from_value(serde_json::json!({"NodeRegister": {
+        "name": "n1", "resources": f.nodes[0].total_resources, "address": ""
+    }}))
+    .expect("registration");
+    cluster.apply_operation(&register);
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    set_last_heartbeat(&cluster, "n1", Some(now - chrono::Duration::seconds(200)));
+    cluster.check_node_health_at(90, MarkDownPolicy::Only(HashSet::new()), now);
+
+    let snapshot = Snapshot::capture(&cluster, &f.state(), &[], now, &mut SearchBudget::default())
+        .expect("silent snapshot");
+    assert!(snapshot.nodes[0].state.is_up());
+    assert!(snapshot.nodes[0].not_responding);
+    assert!(!snapshot.nodes[0].is_up_for_work());
+
+    cluster.clear_not_responding();
+    f.nodes[0].not_responding = true;
+    let snapshot = Snapshot::capture(&cluster, &f.state(), &[], now, &mut SearchBudget::default())
+        .expect("responding snapshot");
+    assert!(!snapshot.nodes[0].not_responding);
+    assert!(snapshot.nodes[0].is_up_for_work());
 }
 
 #[test]

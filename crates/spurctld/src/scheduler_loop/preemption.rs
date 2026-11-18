@@ -121,6 +121,7 @@ impl Snapshot {
                 copy.total_resources = consumable_inventory(&live.total_resources);
                 copy.alloc_resources = consumable_allocation(&live.alloc_resources);
                 copy.state = live.state;
+                copy.not_responding = live.not_responding;
                 copy.partitions = live.partitions.clone();
                 copy.features = live.features.clone();
                 copy.weight = live.weight;
@@ -400,6 +401,7 @@ pub(super) fn satisfiable_victim_set(
             node.total_resources = consumable_inventory(&n.total_resources);
             node.alloc_resources = consumable_allocation(&n.alloc_resources);
             node.state = n.state;
+            node.not_responding = n.not_responding;
             node.partitions = n.partitions.clone();
             node.features = n.features.clone();
             node.weight = n.weight;

@@ -1708,15 +1708,13 @@ async fn try_preempt_with_handoffs<'j>(
         .iter()
         .filter(|j| j.state == JobState::Running && j.preempt_grace().is_none())
         .collect();
-    // Resolve once, reused for the occupant map, the policy checks, and the
-    // action decision below.
+    // Ranking and eviction must use the same resolved QOS policy.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
         running
             .iter()
             .map(|j| (j.job_id, cluster.resolve_qos(j)))
             .collect();
-    // `get_jobs` iterates a HashMap, so without this the victim picked among
-    // equally eligible candidates varies run to run. Least important first.
+    // Snapshot holders come from a HashMap; stable ordering breaks eligibility ties.
     running.sort_by_key(|j| (running_qos[&j.job_id].priority, j.job_id));
     // Lets the satisfiability search spend the lowest-QOS-priority victims
     // first; eligibility already proved each candidate a legal victim, so

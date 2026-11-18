@@ -1036,8 +1036,9 @@ Victim selection also checks that releasing the selected allocations would place
 the complete pending request now. Protected co-residents retain their allocations;
 their presence does not shield eligible jobs sharing the node. CPU, memory, GPU
 identity, exclusivity, node-list requirements, reservations, and partition resource
-limits all participate in that check. Only a sufficient set of eligible jobs is
-evicted, and unnecessary victims are removed from that set.
+limits all participate in that check. Nodes flagged ``NOT_RESPONDING`` cannot
+satisfy placement, even while their state remains up. Only a sufficient set of
+eligible jobs is evicted, and unnecessary victims are removed from that set.
 
 The search is bounded and deterministic, rather than an exhaustive search for a
 globally smallest victim set. Reaching an internal resource or work limit defers
