@@ -46,6 +46,7 @@ pub mod quota_names;
 pub mod rbac;
 pub mod reservation;
 pub mod resource;
+pub mod script_placement;
 pub mod spur_env;
 pub mod step;
 pub mod step_shape;

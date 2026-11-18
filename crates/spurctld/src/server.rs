@@ -14,9 +14,8 @@ use tracing::{debug, info, warn};
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
-use spur_core::task_launch::{
-    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
-};
+use spur_core::script_placement::ResolvedPlacement;
+use spur_core::task_launch::{build_step_task_plan, step_needs_pmix_prepare};
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
@@ -4284,7 +4283,7 @@ impl SlurmController for ControllerService {
                     peers.num_nodes,
                     job.spec.mpi.as_deref(),
                     job.allocated_nodes.len() as u32,
-                    job.spec.script.as_deref(),
+                    job.script_placement(),
                 )
             });
 
@@ -6803,14 +6802,10 @@ fn remaining_nodes_stop(
 }
 
 /// Nodes to stop once one of a job's nodes has reported, for a batch script that
-/// launches ranks with `srun`. With `primary_only`, only the batch script's node
+/// runs on the batch host. With `primary_only`, only the batch script's node
 /// (the first allocated) counts: the others run a hold script that never reports.
 fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
-    let launches_steps = job
-        .spec
-        .script
-        .as_deref()
-        .is_some_and(batch_script_uses_step_launch);
+    let launches_steps = job.script_placement() == ResolvedPlacement::BatchHost;
     let reporter_ended_the_job = primary_only
         .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node));
     if launches_steps && reporter_ended_the_job {

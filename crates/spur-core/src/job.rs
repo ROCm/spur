@@ -1432,6 +1432,11 @@ impl Job {
             .or_else(|| self.preempt_grace().map(|pending| pending.deadline))
     }
 
+    /// Where this run's batch script runs.
+    pub fn script_placement(&self) -> crate::script_placement::ResolvedPlacement {
+        crate::script_placement::ResolvedPlacement::scanned(self.spec.script.as_deref())
+    }
+
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
         self.allocated_nodes
@@ -1961,6 +1966,18 @@ mod tests {
             .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
 
         assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
+    }
+
+    #[test]
+    fn a_run_without_a_recorded_placement_follows_its_script() {
+        use crate::script_placement::ResolvedPlacement;
+
+        let mut job = make_job();
+        job.spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
+        assert_eq!(job.script_placement(), ResolvedPlacement::BatchHost);
+
+        job.spec.script = Some("#!/bin/bash\n./train\n".into());
+        assert_eq!(job.script_placement(), ResolvedPlacement::AllNodes);
     }
 
     #[test]
