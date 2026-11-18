@@ -8036,6 +8036,18 @@ impl ClusterManager {
                     .iter()
                     .filter(|n| placement.in_partition(n))
                     .count();
+                let k8s_would_fit = job.spec.needs_native_nodes()
+                    && cluster_state.nodes.iter().any(|n| {
+                        n.is_kubernetes()
+                            && placement.eligible_on_any_agent(n, cluster_state.reservations, now)
+                    });
+                if needed <= partition_size && k8s_would_fit {
+                    job_entry.set_pending_reason_desc(
+                        PendingReason::BadConstraints,
+                        crate::script_placement::BATCH_HOST_K8S_UNSUPPORTED,
+                    );
+                    continue;
+                }
 
                 job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
@@ -25396,6 +25408,49 @@ state = "UP"
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BadConstraints
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_host_job_with_only_k8s_nodes_says_why_it_waits() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "k1", 4, 8000);
+        register_node(&cm, "k2", 4, 8000);
+
+        let mut spec = basic_spec("driver");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        spec.script = Some("#!/bin/bash\n./runner.sh\n".into());
+        spec.script_placement = Some(spur_core::script_placement::ScriptPlacement::BatchHost);
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let k8s = |name: &str| {
+            let mut node = cm.get_node(name).unwrap();
+            node.source = spur_core::node::NodeSource::Kubernetes {
+                namespace: "spur".into(),
+            };
+            node
+        };
+        let nodes = vec![k8s("k1"), k8s("k2")];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
+            busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            script_placement_default: Default::default(),
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::BadConstraints);
+        assert_eq!(
+            job.state_reason(),
+            crate::script_placement::BATCH_HOST_K8S_UNSUPPORTED
         );
     }
 

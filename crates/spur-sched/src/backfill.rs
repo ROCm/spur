@@ -4596,6 +4596,24 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_batch_host_job_runs_on_native_nodes_beside_k8s_ones() {
+        let mut nodes = make_nodes(3);
+        nodes[0].source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        for node in &mut nodes[1..] {
+            node.capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+        }
+        let runner = runner_job(1, 2, Some(ScriptPlacement::BatchHost));
+
+        let assignments = schedule_with_placement_default(&runner, &nodes, ScriptPlacement::Auto);
+        assert_eq!(assignments.len(), 1);
+        let mut placed = assignments[0].nodes.clone();
+        placed.sort();
+        assert_eq!(placed, ["node002", "node003"]);
+    }
+
+    #[test]
     fn a_driver_script_that_can_reach_k8s_nodes_skips_older_agents() {
         let mut nodes = make_nodes(2);
         nodes[0].source = NodeSource::Kubernetes {
