@@ -358,8 +358,9 @@ when any node is unknown, it shows ``N/A``.
 
 The ``GRES`` column (``%G``), like ``Gres=`` in ``scontrol show node``, lists one
 ``name[:type]:count`` entry per device kind, then each countable pool, for
-example ``gpu:mi300x:8,nic:pollara400:8,bandwidth:lustre:4096``. A node with
-none shows ``(null)``.
+example ``gpu:mi300x:8,nic:pollara400:8,bandwidth:lustre:4096``, GPUs first. A
+node with none shows ``(null)`` in ``sinfo`` and no ``Gres=`` line in
+``scontrol``.
 
 ``-R`` / ``--list-reasons`` lists only nodes that are unavailable (``down``,
 ``drain``, ``drng``, ``err``), grouped by the admin reason set when the node was
