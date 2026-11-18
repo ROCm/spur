@@ -599,7 +599,10 @@ QOS keys
        busy node, keeps its place in the queue but does not hold the rest of the
        cap from lower-priority jobs that can start now. A pass re-checks up to
        eight times, so a longer chain of such waiting jobs can still hold the
-       cap. The same applies to an account's ``grptres``.
+       cap. A job that preempted others keeps its share of the cap while the node
+       its preemption frees is held for it (see the preemption note in
+       :doc:`configuration`), so another job under the same cap can't take that
+       room. The same applies to an account's ``grptres``.
    * - ``grpwall``
      - unset (no limit)
      - Aggregate wall-clock budget across all jobs under this QOS. A bare integer
@@ -1056,9 +1059,10 @@ preempt the job that displaced it. Without that rule a self-listing QOS using
 ``preemptmode=requeue`` would ping-pong indefinitely and neither job would
 finish.
 
-Victims are considered least-important-first (by QOS priority, then job ID), so
-within a single QOS the oldest eligible job is picked. At most one victim is
-preempted per pending job per scheduling cycle.
+Among the jobs that pass every guard below, the scheduler builds a set of whole
+nodes that lets the pending job run, as described under *Choosing among eligible
+victims* below. At most one pending job triggers preemption per scheduling
+cycle.
 
 **Guards checked before a victim is selected**
 
@@ -1089,6 +1093,91 @@ failure moves the scheduler on to the next candidate.
        its matched partitions, else the global
        ``scheduler.preempt_exempt_time``. A job with no recorded start time
        gets no protection from this guard.
+
+**Choosing among eligible victims**
+
+The guards decide who *may* be preempted; they do not decide who *is*. Preemption
+only frees whole nodes, so the scheduler adds nodes it can empty entirely until enough
+are free. A node counts only when it could host the pending job once empty, emptying
+it brings its partition back under ``max_tres_per_node``, and every job on it is an
+eligible victim; emptying it evicts every job on it, so a node shared with an
+ineligible job, or with a suspended or completing one, is never chosen. The set is
+worked out in memory first, and nothing is evicted unless the pending job would then
+start on the freed and already idle nodes under the normal placement rules. When no
+set passes, nothing is evicted. If a later eviction fails partway, the victims
+already evicted stay evicted.
+
+Nodes are added to the set one at a time, cheapest first, in this order:
+
+1. The highest QOS ``priority`` among the jobs on the node, lowest first, so the
+   least important work is spent first.
+2. The keys of ``scheduler.preempt_victim_order`` (below).
+3. Node name.
+
+After each node is added, the free nodes are counted again: a multi-node job that is
+already in the set empties every node it spans, so those nodes count as free
+without being added one by one. Without that, a 2-node job waiting behind two
+4-node burst jobs could evict both, when either alone frees enough.
+
+Job ID and submit time are not consulted. ``preempt_victim_order`` ranks nodes that
+tie on QOS priority. It never makes a job preemptable or exempt: eligibility, QOS
+priority and ``preempt_exempt_time`` are settled first. Idle-fill reclaim (see
+:doc:`idle-fill-scheduling`) ranks its own victims the same way.
+
+.. code-block:: toml
+
+   [scheduler]
+   preempt_victim_order = ["least_work", "fewest_jobs", "hash"]
+
+The keys above are the default, so the line is only needed to change the order.
+Keys apply in the order listed: the first that tells two nodes apart decides, and
+later keys only break ties, with node name last. An empty list ``[]`` ranks by node
+name alone, which takes victims of equal QOS priority from the lowest-named node
+first. The recount above applies under ``[]`` too.
+
+``fewest_jobs`` and ``least_work`` are compared per node freed, so a wide job is
+not charged once for every node it empties: the nodes counted are those the pick
+empties, up to the nodes still needed.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Key
+     - Goes first
+   * - ``least_work``
+     - The pick that loses the least work per node freed. Work is the current run's
+       elapsed time, less time spent suspended, times the nodes the job holds, summed
+       over the node's new jobs. The run time restarts on a requeue, and a job with
+       no recorded start time counts as no work. Whole nodes are counted, so ten
+       small jobs sharing a node count as ten node-hours per hour.
+   * - ``fewest_jobs``
+     - The pick that evicts the fewest new jobs per node freed. A job the set
+       already holds adds nothing.
+   * - ``hash``
+     - The node with the lowest stable 64-bit hash of the preempting job's ID and
+       the node name. This removes the bias towards low node names while keeping a
+       given decision repeatable; different preempting jobs spread over different
+       nodes.
+
+None of the keys reads the accounting database or fair-share; they use only what
+the controller holds in memory.
+
+The search is greedy: it never revisits an earlier pick, so the set is not always
+the cheapest one. Under ``[]``, for example, with two nodes needed, a 1-node job on
+``n1`` and a 2-node job on ``n2`` and ``n3``, both jobs are evicted although the
+2-node job alone is enough. A request whose per-node needs differ, such as a GPU
+total spread over several nodes, may find no set that passes the placement check
+even where another set of nodes would have; nothing is evicted then.
+
+``least_work`` comes first in the default because the cost of ``fewest_jobs`` grows
+with the victim's width: with one node needed, it prefers one 64-node job, 64
+node-hours lost, to two 1-node jobs on a single node. List ``fewest_jobs`` first to
+prefer fewer evictions over less lost work.
+
+On upgrade, with no configuration change, the recount and the default keys change
+which victims are chosen and how many jobs are evicted, not only the order among
+tied nodes. Set ``preempt_victim_order = []`` for node-name order among tied nodes.
 
 **Comparison with Slurm**
 
@@ -1490,6 +1579,76 @@ unrecognized state defaults to idle with a warning.
 An allocated node reports ``DRAINING`` until its last CPU or device allocation
 is released, then reports ``DRAINED`` in ``scontrol show node`` while keeping
 the administrative reason. An empty node enters ``DRAINED`` immediately.
+
+To remove a departed node's record, use any of these forms. Removal works
+even when its agent or container no longer exists:
+
+.. code-block:: bash
+
+   scontrol delete NodeName=gpu001
+   scontrol delete node=gpu001
+   scontrol delete node gpu001
+   spur node remove gpu001
+
+These commands use the existing native node-removal RPC and its checks for
+allocated running, completing, or suspended jobs. Drain a node and wait for
+its jobs to finish before removing it. A removed node registers again on its
+agent's next heartbeat or start unless ``admission.node_names`` excludes it; to
+keep it out, use :ref:`configured-node-list`.
+``NodeName=`` accepts a hostname, a comma-separated list, a hostlist such as
+``gpu[001-004]``, or ``ALL`` for every registered node. A malformed hostlist with
+an empty component, such as ``gpu[]`` or ``gpu[1,]``, is rejected before
+connecting.
+Overlapping targets are removed once, in the order of
+their first appearance. A failed removal is reported per node; remaining
+nodes are still attempted, and the command exits unsuccessfully if any
+removal fails. An empty cluster with ``ALL`` is also an error.
+
+``scontrol delete`` accepts one entity and one target as ``key=value`` or
+``key value``. Entity keys are ``NodeName``, ``PartitionName``, and
+``ReservationName``; like Slurm, they ignore case and accept any prefix of at
+least three characters. For example, ``nod``, ``node``, and ``NODENAME`` all
+select nodes, ``par`` and ``partition`` select partitions, and ``res`` and
+``reservation`` select reservations. Target names retain their case. A target
+is required: ``scontrol delete node`` alone is an error. Node targets accept
+the same host lists and ``ALL`` in either syntax. Named Slurm ``NodeSet`` groups
+are not expanded.
+
+For a removal reason or to evict active jobs, use
+``spur node remove <hostlist> --reason "decommissioned"`` or its ``--force``
+option. Node removal requires Administrator when the caller has a verified
+identity; see :ref:`privileged-operations`.
+
+.. _removed-node-keep-out:
+
+Removal does not stop the agent or change ``spur.conf``. A ``spurd`` that
+keeps running after its node is removed stays out: its heartbeats are refused,
+and it logs ``node <name> was deleted; restart its spurd to add it back``
+instead of registering again (once, and again after a controller outage). A
+forced removal also kills (SIGKILL) the node's evicted jobs on that ``spurd``,
+and any job it still reports is killed again on each refused heartbeat.
+Restarting ``spurd`` (or rebooting the host) adds the node back, as a
+restarted ``slurmd`` re-creates a deleted Slurm dynamic node. To keep a host
+out for good, also stop and disable ``spurd`` on it, for example with
+``systemctl disable --now spurd``. This is not a security control; with token
+admission, also revoke the host's admission token (``spur token revoke``).
+
+Each ``spurd`` process sends a random instance ID, so the controller can tell
+a restart from the process that was running when the node was removed. The
+record of which ``spurd`` to keep out is replicated and survives a controller
+restart or failover. Nodes registered by agents older than this release, or by
+the Kubernetes operator, send no instance ID and register again on their next
+heartbeat as before.
+
+During a rolling upgrade, keeping a removed node out is best effort: controllers
+older than this release drop the instance ID from the log entries they store
+and forward. Once every controller runs this release, restart each ``spurd``
+(or let a heartbeat reach the leader, which asks agents it has no instance for
+to register again) before relying on removals to stick.
+
+Slurm restricts this command to dynamic nodes without running jobs or
+reservation membership; Spur uses its native registered-node removal rules and
+does not currently guard reservation membership.
 
 .. note::
 

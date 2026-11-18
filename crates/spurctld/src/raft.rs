@@ -162,6 +162,13 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    /// Why an op was refused under admission.node_names: it named an unregistered node,
+    /// or a node it would delete is still in use.
+    #[serde(default)]
+    pub node_inventory_error: Option<String>,
+    /// True when a `NodeRegister`/`NodeUpdate` named a node the saved list excludes.
+    #[serde(default)]
+    pub node_registration_rejected: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.
@@ -960,6 +967,12 @@ impl RaftHandle {
     /// published [`LeaderSince`] still describes the live term.
     pub fn current_term(&self) -> u64 {
         self.raft.metrics().borrow().current_term
+    }
+
+    /// Whether this node is still the leader of `term`. The term alone is not
+    /// enough: a stopped Raft core keeps its term, but no longer counts as leader.
+    pub fn leads_term(&self, term: u64) -> bool {
+        self.is_leader() && self.current_term() == term
     }
 }
 
@@ -2477,6 +2490,20 @@ mod tests {
         assert!(!handle.is_leader());
         assert_eq!(handle.current_leader(), None);
         assert!(matches!(handle.wait_fatal().await, Fatal::Stopped));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_core_no_longer_leads_the_term_it_held() {
+        let dir = TempDir::new().unwrap();
+        let handle = start_single_node_leader(dir.path(), noop_applier()).await;
+        let term = handle.current_term();
+        assert!(handle.leads_term(term));
+        assert!(!handle.leads_term(term + 1));
+
+        handle.raft.shutdown().await.unwrap();
+
+        assert_eq!(handle.current_term(), term, "stopping keeps the term");
+        assert!(!handle.leads_term(term));
     }
 
     #[tokio::test]

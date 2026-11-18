@@ -5,7 +5,8 @@
 //!
 //! The agent authenticates its callers (see spurd's `auth_middleware`), so every controller → agent
 //! call goes through here rather than `SlurmAgentClient::connect` directly. That keeps a new call
-//! site from silently becoming an unauthenticated one.
+//! site from silently becoming an unauthenticated one. The one call made without a credential is
+//! [`ping_hostname`], for the auth-exempt Ping.
 //!
 //! With `[auth] plugin = "spur"`, each connection Pings the agent (no credential) and mints a
 //! native `ControllerRpc` token for that agent's advertised audience and boot epoch. Otherwise it
@@ -195,6 +196,58 @@ async fn credential_for_channel(channel: Channel) -> ControllerCredential {
 pub async fn connect(
     endpoint: String,
 ) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
+    let channel = agent_endpoint(endpoint)?.connect().await?;
+    let cred = credential_for_channel(channel.clone()).await;
+    // Agent RPCs can return buffered output larger than tonic's default limit.
+    Ok(
+        SlurmAgentClient::new(InterceptedService::new(channel, cred))
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+    )
+}
+
+/// Why [`ping_hostname`] got no hostname from the agent.
+#[derive(Debug)]
+pub enum PingError {
+    Connect(tonic::transport::Error),
+    Rpc(Status),
+}
+
+impl std::fmt::Display for PingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "connect failed: {e:?}"),
+            Self::Rpc(status) => write!(f, "ping failed: {}", status.message()),
+        }
+    }
+}
+
+impl std::error::Error for PingError {}
+
+impl From<tonic::transport::Error> for PingError {
+    fn from(e: tonic::transport::Error) -> Self {
+        Self::Connect(e)
+    }
+}
+
+impl From<Status> for PingError {
+    fn from(status: Status) -> Self {
+        Self::Rpc(status)
+    }
+}
+
+/// Pings an agent and returns the hostname it answers as.
+pub async fn ping_hostname(endpoint: String) -> Result<String, PingError> {
+    // No credential: Ping is auth-exempt, and the address is unverified until its hostname matches.
+    let channel = agent_endpoint(endpoint)?.connect().await?;
+    let response = SlurmAgentClient::new(channel)
+        .ping(Request::new(()))
+        .await?;
+    Ok(response.into_inner().hostname)
+}
+
+/// An agent endpoint with the configured dial budget and keepalive.
+fn agent_endpoint(endpoint: String) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
     let tuning = tuning();
     let mut builder = tonic::transport::Endpoint::from_shared(endpoint)?;
     if tuning.connect_secs > 0 {
@@ -211,14 +264,7 @@ pub async fn connect(
                 builder.keep_alive_timeout(Duration::from_secs(tuning.keepalive_timeout_secs));
         }
     }
-    let channel = builder.connect().await?;
-    let cred = credential_for_channel(channel.clone()).await;
-    // Agent RPCs can return buffered output larger than tonic's default limit.
-    Ok(
-        SlurmAgentClient::new(InterceptedService::new(channel, cred))
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
-    )
+    Ok(builder)
 }
 
 #[cfg(test)]

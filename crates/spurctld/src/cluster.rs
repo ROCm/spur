@@ -6,7 +6,7 @@ mod preemption_usage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -22,7 +22,7 @@ use spur_core::accounting::{
     AccountLimits, PerUserCaps, Qos, ScopeLimitUsage, TresRecord, TresType, UserLimitUsage,
 };
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::config::{EnforcePartLimits, HealthCheck, NodeInventory, SlurmConfig};
 use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
@@ -57,6 +57,9 @@ use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
 use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
+
+mod quota_ledger;
+use quota_ledger::QuotaLedger;
 
 /// Description shown for a job parked after a launch failure it would carry to
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
@@ -152,13 +155,32 @@ pub enum SubmitError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterNodeError {
     PermissionDenied(String),
+    Deleted(String),
     Internal(String),
+}
+
+/// The spurd a removed node is kept out from, and where to reach it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeletedAgent {
+    pub agent_instance: String,
+    #[serde(default)]
+    pub comm_url: Option<String>,
+}
+
+pub(crate) fn deleted_agent_error(name: &str) -> RegisterNodeError {
+    RegisterNodeError::Deleted(format!(
+        "node {name} was deleted; restart its spurd to add it back"
+    ))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 impl std::fmt::Display for RegisterNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PermissionDenied(m) | Self::Internal(m) => f.write_str(m),
+            Self::PermissionDenied(m) | Self::Deleted(m) | Self::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -606,10 +628,20 @@ pub struct ClusterManager {
         RwLock<BTreeMap<(JobId, u64), spur_core::preemption_usage::PreemptionRelease>>,
     preemption_accounted: RwLock<HashMap<JobId, (DateTime<Utc>, u128)>>,
     nodes: RwLock<HashMap<String, Node>>,
+    node_inventory: RwLock<Option<NodeInventory>>,
+    startup_node_inventory: NodeInventory,
+    node_names_unsaved_warned: std::sync::atomic::AtomicBool,
+    node_names_mismatch_warned: std::sync::atomic::AtomicBool,
+    reconfigure_lock: parking_lot::Mutex<()>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
     /// partitions with the same name from re-appearing on restart.
     deleted_partition_names: RwLock<HashSet<String>>,
+    /// Deleted node name -> the spurd process it was deleted under. That process
+    /// stays out; a restarted spurd (new instance) registers it again.
+    deleted_nodes: RwLock<HashMap<String, DeletedAgent>>,
+    /// Removed nodes whose refused heartbeat this process already logged. Leader-local.
+    deleted_heartbeats_logged: parking_lot::Mutex<HashSet<String>>,
     /// Partition names seeded from config before WAL replay. A replayed
     /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
     /// once overridden the name is removed, so later duplicates stay
@@ -646,6 +678,12 @@ pub struct ClusterManager {
     /// Nodes `k8s remove-nodes` is taking out right now, counted so overlapping calls for one
     /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
     k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
+    /// Whether the leader's last health pass withheld every Down because too many
+    /// nodes went silent at once. Leader-local, like the not-responding flags.
+    liveness_breaker_tripped: AtomicBool,
+    /// Silent nodes the leader keeps up because their agent answered its last
+    /// probe. Leader-local, like the breaker.
+    silent_answering_nodes: AtomicU64,
     raft: RwLock<Option<SpurRaft>>,
     /// This controller's durable start counter; orders layout deliveries when a
     /// restarted leader keeps its Raft term.
@@ -679,6 +717,14 @@ pub struct ClusterManager {
     /// flag is unset (a keepalive-sending client predating the flag). Reset on
     /// leadership regain, like `interactive_last_seen`.
     pinged_this_term: RwLock<HashSet<JobId>>,
+    /// Nodes whose latest heartbeat was not a clean report: still running jobs
+    /// the controller ended, or unable to enumerate its jobs. Absent means
+    /// clean. Leader-local soft state, like `Node::last_heartbeat`.
+    stale_reporting_nodes: RwLock<HashMap<String, NodeReport>>,
+    /// When the health pass began withholding each node's recovery. Only the
+    /// health pass starts a hold, so a leadership change can reset it without
+    /// racing heartbeats.
+    recovery_holds: RwLock<HashMap<String, std::time::Instant>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -814,6 +860,10 @@ pub(crate) struct PendingJobClassification {
     /// A QOS or account limit refused a job while earlier candidates held claims on
     /// it, so a claim that never turns into a start may be what blocked it.
     pub(crate) claims_blocked: bool,
+    /// Preemptors whose victim is still stopping or whose freed node is earmarked for
+    /// them. The claim rounds keep their claims, so the room they evicted for isn't
+    /// given to another job under the same limit.
+    pub(crate) evicting: HashSet<JobId>,
 }
 
 /// Whether a QOS is holding more nodes than its group node cap allows, counting its
@@ -1010,6 +1060,7 @@ impl ClusterManager {
         if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
             external.load_block_file().map_err(anyhow::Error::msg)?;
         }
+        let startup_node_inventory = config.admission.node_inventory()?;
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -1031,8 +1082,15 @@ impl ClusterManager {
             preemption_confirmations: RwLock::new(BTreeMap::new()),
             preemption_accounted: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
+            node_inventory: RwLock::new(None),
+            startup_node_inventory,
+            node_names_unsaved_warned: std::sync::atomic::AtomicBool::new(false),
+            node_names_mismatch_warned: std::sync::atomic::AtomicBool::new(false),
+            reconfigure_lock: parking_lot::Mutex::new(()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
+            deleted_nodes: RwLock::new(HashMap::new()),
+            deleted_heartbeats_logged: parking_lot::Mutex::new(HashSet::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
@@ -1047,6 +1105,8 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
+            liveness_breaker_tripped: AtomicBool::new(false),
+            silent_answering_nodes: AtomicU64::new(0),
             raft: RwLock::new(None),
             boot_epoch: AtomicU64::new(0),
             layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
@@ -1064,6 +1124,8 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             pinged_this_term: RwLock::new(HashSet::new()),
+            stale_reporting_nodes: RwLock::new(HashMap::new()),
+            recovery_holds: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -1827,7 +1889,11 @@ impl ClusterManager {
     /// this scans it on each call.
     pub fn node_metrics(&self) -> NodeMetricsSnapshot {
         let nodes = self.nodes.read();
-        NodeMetricsSnapshot::collect(nodes.values())
+        NodeMetricsSnapshot {
+            liveness_breaker_tripped: self.liveness_breaker_tripped.load(Ordering::Relaxed),
+            silent_answering: self.silent_answering_nodes.load(Ordering::Relaxed),
+            ..NodeMetricsSnapshot::collect(nodes.values())
+        }
     }
 
     /// Aggregated per-partition metrics from the current job, node, and partition maps.
@@ -2932,7 +2998,7 @@ impl ClusterManager {
         // exclusion can apply first, so the apply's refusal is the answer that counts.
         if !resp.job_started {
             anyhow::bail!(
-                "job {} lost a concurrent reservation race or now excludes a chosen node",
+                "job {} lost a concurrent reservation race or a chosen node is no longer eligible",
                 job_id
             );
         }
@@ -3713,12 +3779,15 @@ impl ClusterManager {
     /// Whether the health system must leave `node` untouched: only a node that
     /// is up and schedulable (idle/allocated/mixed) is probed. A down node, or
     /// one already drained (by an operator or a failed check), is off-limits —
-    /// a failed check's drain is sticky until an operator resumes the node.
+    /// a failed check's drain is sticky until an operator resumes the node. So
+    /// is a not-responding one: its check could not be placed, and a pending one
+    /// would only age into a force-drain of a node the leader cannot hear.
     fn node_off_limits_for_health(&self, node: &Node) -> bool {
-        !matches!(
-            node.state,
-            NodeState::Idle | NodeState::Allocated | NodeState::Mixed
-        )
+        node.not_responding
+            || !matches!(
+                node.state,
+                NodeState::Idle | NodeState::Allocated | NodeState::Mixed
+            )
     }
 
     /// Submit one check as an exclusive whole-node job pinned to `node`. It runs
@@ -4144,6 +4213,39 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Whether a registered node's spurd reports an instance its record lacks,
+    /// as when it registered through a controller that predates the field.
+    pub(crate) fn agent_instance_unrecorded(&self, name: &str, agent_instance: &str) -> bool {
+        !agent_instance.is_empty()
+            && self
+                .nodes
+                .read()
+                .get(name)
+                .is_some_and(|node| node.agent_instance.is_none())
+    }
+
+    /// The delete record if `agent_instance` is the spurd process `name` was deleted under.
+    pub(crate) fn deleted_agent(&self, name: &str, agent_instance: &str) -> Option<DeletedAgent> {
+        if agent_instance.is_empty() {
+            return None;
+        }
+        self.deleted_nodes
+            .read()
+            .get(name)
+            .filter(|deleted| deleted.agent_instance == agent_instance)
+            .cloned()
+    }
+
+    /// True the first time this process refuses `name`'s heartbeat since it was removed.
+    pub(crate) fn first_refused_heartbeat(&self, name: &str) -> bool {
+        let mut logged = self.deleted_heartbeats_logged.lock();
+        !logged.contains(name) && logged.insert(name.to_string())
+    }
+
+    pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
+        self.deleted_agent(name, agent_instance).is_some()
+    }
+
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.
     fn node_registration_lock(&self, name: &str) -> Arc<parking_lot::Mutex<()>> {
         self.node_registration_locks
@@ -4153,8 +4255,8 @@ impl ClusterManager {
             .clone()
     }
 
-    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
-    /// node (see `sync_node_labels`); first registration never needs it.
+    /// Register an agent that reports no process instance, as older agents do.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
@@ -4170,6 +4272,42 @@ impl ClusterManager {
         capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
+        self.register_agent_node(
+            String::new(),
+            name,
+            hostname,
+            resources,
+            address,
+            port,
+            wg_pubkey,
+            version,
+            source,
+            labels,
+            capabilities,
+            caller_privileged,
+        )
+    }
+
+    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
+    /// node (see `sync_node_labels`); first registration never needs it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_agent_node(
+        &self,
+        agent_instance: String,
+        name: String,
+        hostname: String,
+        resources: ResourceSet,
+        address: String,
+        port: u16,
+        wg_pubkey: String,
+        version: String,
+        source: NodeSource,
+        labels: HashMap<String, String>,
+        capabilities: Vec<String>,
+        caller_privileged: bool,
+    ) -> Result<(), RegisterNodeError> {
+        self.check_node_inventory(&name)?;
+        self.warn_node_names_not_applied();
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
@@ -4181,15 +4319,25 @@ impl ClusterManager {
         let node_lock = self.node_registration_lock(&name);
         let _registration = node_lock.lock();
 
+        if self.is_deleted_agent(&name, &agent_instance) {
+            return Err(deleted_agent_error(&name));
+        }
+
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
         };
+        // A node removed after the pre-check must not come back as a fresh record before the list is saved.
+        if matches!(action, RegistrationAction::Register)
+            && self.node_inventory.read().is_none()
+            && self.startup_node_inventory.excludes(&name)
+        {
+            return Err(excluded_by_node_names(&name));
+        }
 
         match action {
             RegistrationAction::Skip => {
                 debug!(node = %name, "node unchanged, skipping");
-                self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(existing) = self.get_node(&name) {
                     let needs_update = existing.address.as_deref() != Some(address.as_str())
                         || existing.hostname != hostname
@@ -4198,23 +4346,27 @@ impl ClusterManager {
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
                             && existing.version.as_deref() != Some(version.as_str()))
-                        || existing.capabilities != capabilities;
+                        || existing.capabilities != capabilities
+                        || existing.agent_instance.as_deref().unwrap_or_default() != agent_instance;
                     if needs_update {
-                        self.propose(WalOperation::NodeUpdate {
-                            name: name.clone(),
-                            hostname: hostname.clone(),
-                            // Resend the raw detected report: NodeUpdate apply stores
-                            // this into detected_resources, so sending the clamped
-                            // total here would corrupt the raw inventory.
-                            resources: existing.detected_resources.clone(),
-                            address,
-                            port,
-                            wg_pubkey,
-                            version,
-                            source: source.clone(),
-                            capabilities,
-                        })
-                        .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        let response = self
+                            .propose(WalOperation::NodeUpdate {
+                                name: name.clone(),
+                                hostname: hostname.clone(),
+                                // Resend the raw detected report: NodeUpdate apply stores
+                                // this into detected_resources, so sending the clamped
+                                // total here would corrupt the raw inventory.
+                                resources: existing.detected_resources.clone(),
+                                address,
+                                port,
+                                wg_pubkey,
+                                version,
+                                source: source.clone(),
+                                capabilities,
+                                agent_instance,
+                            })
+                            .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                        reject_excluded_registration(&response, &name)?;
                         info!(node = %name, "node comm address or metadata updated");
                     }
                     if existing.source != source {
@@ -4223,20 +4375,25 @@ impl ClusterManager {
                         }
                     }
                 }
+                // After the update, so a refused relabel cannot keep the new instance unrecorded.
+                self.sync_node_labels(&name, labels, caller_privileged)?;
             }
             RegistrationAction::Update => {
-                self.propose(WalOperation::NodeUpdate {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                let response = self
+                    .propose(WalOperation::NodeUpdate {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        source: source.clone(),
+                        capabilities,
+                        agent_instance,
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -4245,26 +4402,118 @@ impl ClusterManager {
                 self.warn_partition_cap_overcommit(&name);
             }
             RegistrationAction::Register => {
-                self.propose(WalOperation::NodeRegister {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    resources,
-                    address,
-                    port,
-                    wg_pubkey,
-                    version,
-                    labels,
-                    source: source.clone(),
-                    capabilities,
-                })
-                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
-                if let Some(node) = self.nodes.write().get_mut(&name) {
+                let response = self
+                    .propose(WalOperation::NodeRegister {
+                        name: name.clone(),
+                        hostname: hostname.clone(),
+                        resources,
+                        address,
+                        port,
+                        wg_pubkey,
+                        version,
+                        labels,
+                        source: source.clone(),
+                        capabilities,
+                        agent_instance: agent_instance.clone(),
+                    })
+                    .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                reject_excluded_registration(&response, &name)?;
+                {
+                    let mut nodes = self.nodes.write();
+                    // Removal takes the same lock, so absence here is only a sanity check.
+                    let Some(node) = nodes.get_mut(&name) else {
+                        drop(nodes);
+                        if self.is_deleted_agent(&name, &agent_instance) {
+                            return Err(deleted_agent_error(&name));
+                        }
+                        return Ok(());
+                    };
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
                 }
                 info!(node = %name, "node registered");
                 self.warn_partition_cap_overcommit(&name);
             }
+        }
+        self.check_node_inventory(&name)
+    }
+
+    /// Only `scontrol reconfigure` saves node_names, so a rolling upgrade never writes
+    /// the new log entry on its own; until then this leader filters by its startup list.
+    fn warn_node_names_not_applied(&self) {
+        let Some(listed) = &self.startup_node_inventory.names else {
+            return;
+        };
+        let matches_saved = self
+            .node_inventory
+            .read()
+            .as_ref()
+            .map(|saved| saved.names.as_ref() == Some(listed));
+        let (flag, message) = match matches_saved {
+            Some(true) => return,
+            Some(false) => (
+                &self.node_names_mismatch_warned,
+                "admission.node_names loaded at startup differs from the saved list; \
+                 the saved list applies until `scontrol reconfigure`",
+            ),
+            None => (
+                &self.node_names_unsaved_warned,
+                "admission.node_names is not saved yet; run `scontrol reconfigure` to apply it",
+            ),
+        };
+        warn_once(flag, message);
+    }
+
+    fn committed_inventory_excludes(&self, name: &str) -> bool {
+        self.node_inventory
+            .read()
+            .as_ref()
+            .is_some_and(|inventory| inventory.excludes(name))
+    }
+
+    /// With a saved node_names list, registered nodes are all listed, so an unregistered name
+    /// is either excluded or not yet registered; earlier log entries stay unfenced on replay.
+    fn references_unregistered(&self, nodes: &HashMap<String, Node>, name: &str) -> bool {
+        !nodes.contains_key(name)
+            && self
+                .node_inventory
+                .read()
+                .as_ref()
+                .is_some_and(|inventory| inventory.names.is_some())
+    }
+
+    fn k0s_inventory_error<'a>(
+        &self,
+        nodes: &HashMap<String, Node>,
+        references: impl IntoIterator<Item = &'a String>,
+    ) -> Option<String> {
+        references
+            .into_iter()
+            .find(|name| self.references_unregistered(nodes, name))
+            .map(|name| format!("Kubernetes membership references node '{name}', which is not registered or not in admission.node_names"))
+    }
+
+    fn reservation_inventory_error(
+        &self,
+        nodes: &HashMap<String, Node>,
+        names: &[String],
+    ) -> Option<String> {
+        names
+            .iter()
+            .find(|name| self.references_unregistered(nodes, name))
+            .map(|name| format!("reservation names node '{name}', which is not registered or not in admission.node_names"))
+    }
+
+    pub(crate) fn check_node_inventory(&self, name: &str) -> Result<(), RegisterNodeError> {
+        let registered = self.nodes.read().contains_key(name);
+        let inventory = self.node_inventory.read();
+        let excluded = match inventory.as_ref() {
+            Some(saved) => saved.excludes(name),
+            // Until the list is saved it only gates new names; registered nodes leave via reconfigure.
+            None => !registered && self.startup_node_inventory.excludes(name),
+        };
+        if excluded {
+            return Err(excluded_by_node_names(name));
         }
         Ok(())
     }
@@ -4362,6 +4611,8 @@ impl ClusterManager {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
+            // The leader is hearing this node again, so it may take work.
+            node.not_responding = false;
             true
         } else {
             false
@@ -4391,6 +4642,69 @@ impl ClusterManager {
     #[cfg(test)]
     pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
         self.interactive_last_seen.read().get(&job_id).copied()
+    }
+
+    /// Record `node`'s latest report: `None` is clean and clears any hold. A
+    /// `Some` for an unknown node is ignored so it cannot resurrect a dropped one.
+    pub(crate) fn record_node_report(&self, node: &str, report: Option<NodeReport>) {
+        match report {
+            None => {
+                self.stale_reporting_nodes.write().remove(node);
+            }
+            Some(report) => {
+                if self.nodes.read().contains_key(node) {
+                    self.stale_reporting_nodes
+                        .write()
+                        .insert(node.to_string(), report);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports_stale_jobs(&self, node: &str) -> bool {
+        self.stale_reporting_nodes.read().contains_key(node)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_report(&self, node: &str) -> Option<NodeReport> {
+        self.stale_reporting_nodes.read().get(node).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_recovery_held(&self, node: &str) -> bool {
+        self.recovery_holds.read().contains_key(node)
+    }
+
+    /// Clear node reports and recovery holds on a leadership change: both were
+    /// built from another leadership's heartbeats and health passes.
+    pub(crate) fn reset_node_reports_and_holds(&self) {
+        self.stale_reporting_nodes.write().clear();
+        self.recovery_holds.write().clear();
+    }
+
+    /// On leadership gain, hold every Down or Error node until it reports to
+    /// this leader: a replicated heartbeat stamp says nothing about its jobs.
+    pub(crate) fn hold_down_nodes_until_reported(&self) {
+        let nodes = self.nodes.read();
+        let mut reports = self.stale_reporting_nodes.write();
+        let down = nodes
+            .values()
+            .filter(|n| matches!(n.state, NodeState::Down | NodeState::Error));
+        for node in down {
+            reports
+                .entry(node.name.clone())
+                .or_insert(NodeReport::Unknown);
+        }
+    }
+
+    fn end_recovery_hold(&self, node: &str) {
+        self.recovery_holds.write().remove(node);
+    }
+
+    fn forget_node_report(&self, node: &str) {
+        self.stale_reporting_nodes.write().remove(node);
+        self.end_recovery_hold(node);
     }
 
     /// Prune the keepalive map to the given live interactive allocations and
@@ -5089,6 +5403,8 @@ impl ClusterManager {
             reason_time,
             at: None,
         })?;
+        // The operator's call supersedes the hold; a later one starts its own clock.
+        self.end_recovery_hold(name);
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
@@ -5188,13 +5504,16 @@ impl ClusterManager {
         // both observe the same prior phase and double-count the transition.
         let _accounting = self.k0s_phase_accounting.lock();
         let from = self.k0s.read().phase;
-        self.propose(WalOperation::K0sSetPhase {
+        let response = self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
             control_plane_nodes,
             member_nodes,
             reset_requested,
         })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         if from != phase {
             let cluster = self.config().cluster_name.clone();
             self.k8s_metrics
@@ -5217,7 +5536,10 @@ impl ClusterManager {
     /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
     /// narrow it (see the `cluster_add_nodes` handler guard).
     pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        let response = self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        if let Some(error) = response.node_inventory_error {
+            anyhow::bail!(error);
+        }
         Ok(())
     }
 
@@ -5274,30 +5596,107 @@ impl ClusterManager {
         )
     }
 
-    /// Marks stale nodes Down unless `mark_down` is `Suppressed`, and recovers
-    /// nodes whose heartbeat resumed. Returns finalized jobs for cancel RPCs.
-    pub fn check_node_health(
+    #[cfg(test)]
+    pub(crate) fn check_node_health(
         &self,
         timeout_secs: u64,
         mark_down: MarkDownPolicy,
     ) -> Vec<JobFinalized> {
+        self.check_node_health_at(
+            timeout_secs,
+            mark_down,
+            Utc::now(),
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Recovery waits while [`withhold_recoveries`] holds a node, timed by the
+    /// monotonic `hold_clock` so a wall-clock step cannot cut a hold short. Staleness
+    /// is re-judged here, so a node confirmed gone that has heartbeated since is kept.
+    pub(crate) fn check_node_health_at(
+        &self,
+        timeout_secs: u64,
+        mark_down: MarkDownPolicy,
+        now: DateTime<Utc>,
+        hold_clock: std::time::Instant,
+    ) -> Vec<JobFinalized> {
         let mut actions = {
             let nodes = self.nodes.read();
             let refs: Vec<&Node> = nodes.values().collect();
-            evaluate_node_health(&refs, Utc::now(), timeout_secs)
+            evaluate_node_health(&refs, now, timeout_secs)
         };
-        if mark_down == MarkDownPolicy::Suppressed {
-            let before = actions.len();
-            actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
-            let deferred = before - actions.len();
-            if deferred > 0 {
-                info!(
-                    nodes = deferred,
-                    "deferring node DOWN during leadership grace period"
-                );
+        match &mark_down {
+            MarkDownPolicy::Allowed => {}
+            MarkDownPolicy::Suppressed => {
+                let before = actions.len();
+                actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
+                let deferred = before - actions.len();
+                if deferred > 0 {
+                    info!(
+                        nodes = deferred,
+                        "deferring node DOWN during leadership grace period"
+                    );
+                }
             }
+            MarkDownPolicy::Only(confirmed) => actions.retain(|a| match a {
+                HealthAction::MarkDown { name, .. } => confirmed.contains(name),
+                HealthAction::Recover { .. } | HealthAction::Drain { .. } => true,
+            }),
         }
+        // Outside the grace window, flag silent nodes NOT_RESPONDING so they take
+        // no new work while the leader cannot hear them, DOWN or not.
+        if !matches!(mark_down, MarkDownPolicy::Suppressed) {
+            self.refresh_not_responding(timeout_secs, now);
+        }
+        withhold_recoveries(
+            &mut actions,
+            &self.stale_reporting_nodes.read(),
+            &mut self.recovery_holds.write(),
+            recovery_hold_cap(timeout_secs, &self.config()),
+            hold_clock,
+        );
         self.apply_health_actions(actions)
+    }
+
+    /// A node with no heartbeat on record counts as not responding, so a Down
+    /// node keeps its `*` on a leader that has not heard it since.
+    fn refresh_not_responding(&self, timeout_secs: u64, now: DateTime<Utc>) {
+        let threshold = chrono::Duration::seconds(timeout_secs as i64);
+        let mut nodes = self.nodes.write();
+        for node in nodes.values_mut() {
+            node.not_responding = node.last_heartbeat.is_none_or(|hb| now - hb > threshold);
+        }
+    }
+
+    /// Clear NOT_RESPONDING on every node when leadership changes hands: only
+    /// the current leader can judge it, from the heartbeats it itself sees.
+    pub(crate) fn clear_not_responding(&self) {
+        for node in self.nodes.write().values_mut() {
+            node.not_responding = false;
+        }
+    }
+
+    pub(crate) fn set_liveness_breaker_tripped(&self, tripped: bool) {
+        self.liveness_breaker_tripped
+            .store(tripped, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_silent_answering_nodes(&self, count: usize) {
+        self.silent_answering_nodes
+            .store(count as u64, Ordering::Relaxed);
+    }
+
+    /// The stale nodes a health pass would mark Down, read before anything is
+    /// applied so they can be confirmed first.
+    pub(crate) fn stale_nodes(
+        &self,
+        timeout_secs: u64,
+        health_tick: std::time::Duration,
+        now: DateTime<Utc>,
+    ) -> StaleNodes {
+        let nodes = self.nodes.read();
+        let refs: Vec<&Node> = nodes.values().collect();
+        stale_nodes_at(&refs, now, timeout_secs, health_tick)
     }
 
     fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
@@ -5363,6 +5762,36 @@ impl ClusterManager {
                         warn!(error = %e, "failed to propose node recovery");
                     }
                 }
+                HealthAction::Drain {
+                    name,
+                    old_state,
+                    reason,
+                } => {
+                    // The NodeStateChange apply does not check old_state, so an
+                    // operator who acted since the pass would be overwritten.
+                    let unchanged = self
+                        .get_node(&name)
+                        .is_some_and(|n| !n.admin_locked && n.state == old_state);
+                    if !unchanged {
+                        info!(node = %name, "skipping hold-cap drain: node changed since the health pass");
+                        continue;
+                    }
+                    warn!(node = %name, reason = %reason, "node drained: no clean job report within the recovery hold cap");
+                    // Admin-locked so it will not auto-recover; an operator clears
+                    // it with `scontrol update state=resume` once the node is sound.
+                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                        name,
+                        old_state,
+                        new_state: NodeState::Drain,
+                        reason: Some(reason),
+                        admin_locked: true,
+                        reason_uid: Some(0),
+                        reason_time: Some(Utc::now()),
+                        at: None,
+                    }) {
+                        warn!(error = %e, "failed to propose node drain");
+                    }
+                }
             }
         }
         evicted
@@ -5424,13 +5853,22 @@ impl ClusterManager {
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
-        let jobs = self.jobs.read();
-        jobs.values().any(|j| {
-            matches!(
-                j.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.is_held_on(name)
-        })
+        !self.runs_on_node(name).is_empty()
+    }
+
+    /// `(job_id, run_attempt)` of each run that may have processes on `name`.
+    pub fn runs_on_node(&self, name: &str) -> Vec<(JobId, u32)> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.is_held_on(name)
+            })
+            .map(|j| (j.job_id, j.run_attempt))
+            .collect()
     }
 
     /// Mark a node Down because its agent is stopping (reboot, service restart).
@@ -5487,12 +5925,12 @@ impl ClusterManager {
         force: bool,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        {
-            let nodes = self.nodes.read();
-            if !nodes.contains_key(name) {
-                anyhow::bail!("node '{}' not found", name);
-            }
-        }
+        // Serialized with registration, so a register's pre-check never races this removal.
+        let node_lock = self.node_registration_lock(name);
+        let _registration = node_lock.lock();
+        let Some(node) = self.get_node(name) else {
+            anyhow::bail!("node '{}' not found", name);
+        };
         if !force && self.node_has_running_jobs(name) {
             anyhow::bail!(
                 "node '{}' has running jobs; use --force to evict them",
@@ -5504,7 +5942,10 @@ impl ClusterManager {
             name: name.to_string(),
             reason,
             at: None,
+            agent_instance: node.agent_instance.clone().unwrap_or_default(),
+            comm_url: crate::scheduler_loop::node_comm_http_url(&node),
         })?;
+        self.forget_node_report(name);
         self.k8s_metrics
             .remove_node(&self.config().cluster_name, name);
         self.run_all_finalized_side_effects(&resp);
@@ -5742,6 +6183,7 @@ impl ClusterManager {
 
         // Queue precedence offers a preemptor placement before ordinary bystanders;
         // node handoffs keep every other job, bar co-owners, off its released capacity.
+        // A hoisted preemptor also keeps its quota claim through the claim rounds.
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
@@ -5897,6 +6339,7 @@ impl ClusterManager {
                         job.allocated_nodes.len() as u64;
                 }
             }
+            let ledger = QuotaLedger::from_jobs(jobs.values());
             // Each candidate partition reshapes the request under its memory policy,
             // so the gates judge each shape and the job keeps only admitted partitions.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
@@ -5913,7 +6356,7 @@ impl ClusterManager {
                             &mut probe,
                             qos,
                             &self.association_cache,
-                            &jobs,
+                            &ledger,
                             &reuse,
                             &reserved,
                             consumed_wall,
@@ -6067,6 +6510,7 @@ impl ClusterManager {
             bb_stage_candidates,
             idle_fill_candidates,
             claims_blocked,
+            evicting: hoisted,
         }
     }
 
@@ -6516,11 +6960,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Re-read spur.conf and apply it to the running controller. Leader-only, and
-    /// the swap is in-memory here — no WAL entry carries it, so followers keep
-    /// their startup config. Per-field scope: docs/admin-guide/configuration.rst,
-    /// "Applying configuration changes" section.
+    /// Leader-only: node_names and partitions replicate through Raft; other sections swap
+    /// in memory here. Per-field scope: configuration.rst, "Applying configuration changes".
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let _reconfigure = self.reconfigure_lock.lock();
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
@@ -6596,6 +7039,29 @@ impl ClusterManager {
                 restart_only.join(", ")
             );
         }
+        let inventory = new_config
+            .admission
+            .node_inventory()
+            .map_err(|error| NodeInventoryError::Invalid(error.to_string()))?;
+        self.validate_node_inventory(&inventory)
+            .map_err(|error| NodeInventoryError::Refused(error.to_string()))?;
+        // A timed-out earlier write can still apply, so compare only after it has.
+        self.wait_for_node_inventory_writes()?;
+        // Writing only on a change keeps the new WAL op out of unrelated reloads during upgrades.
+        let unchanged = match &*self.node_inventory.read() {
+            Some(saved) => *saved == inventory,
+            None => inventory.names.is_none() && self.startup_node_inventory.names.is_none(),
+        };
+        // Saved before partitions so an apply-time refusal leaves nothing half-applied.
+        if !unchanged {
+            let response = self.propose(WalOperation::NodeInventoryUpdate { inventory })?;
+            if let Some(error) = response.node_inventory_error {
+                return Err(NodeInventoryError::Refused(error).into());
+            }
+        }
+        // The saved list now matches this leader's file, so a startup-list mismatch is stale.
+        self.node_names_mismatch_warned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -6709,6 +7175,62 @@ impl ClusterManager {
         Ok(())
     }
 
+    fn wait_for_node_inventory_writes(&self) -> anyhow::Result<()> {
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Raft is not initialized"))?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(self.propose_timeout, async {
+                    // Relies on OpenRaft 0.9 sending metrics on every core-loop pass (guarded by
+                    // tests); a read index would miss an appended but uncommitted earlier write.
+                    let mut metrics = raft.metrics();
+                    let mut metrics = raft
+                        .with_raft_state(move |_| {
+                            metrics.mark_unchanged();
+                            metrics
+                        })
+                        .await?;
+                    metrics.changed().await?;
+                    let last = metrics.borrow().last_log_index;
+                    raft.wait(None)
+                        .applied_index_at_least(last, "node inventory reload")
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("reconfigure: waiting for prior Raft writes timed out")
+                })?
+            })
+        })
+    }
+
+    fn validate_node_inventory(&self, inventory: &NodeInventory) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        let reservations = self.reservations.read();
+        let removed =
+            inventory_removals(inventory, &nodes, &jobs, &reservations, &self.k0s.read())?;
+        // Heartbeat GPU reconcile edits these counters outside Raft, so they can disagree with job
+        // holds; apply can't check them deterministically, so the leader refuses here.
+        for name in removed {
+            let node = &nodes[&name];
+            if node.alloc_resources.cpus > 0
+                || node.alloc_resources.memory_mb > 0
+                || node.alloc_resources.has_devices()
+            {
+                anyhow::bail!(
+                    "node '{name}' still has allocated resources; wait for them to be released, \
+                     or remove it with `spur node remove`"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
         if res.end_time <= res.start_time {
@@ -6732,6 +7254,9 @@ impl ClusterManager {
         let resp = self
             .propose(WalOperation::ReservationCreate { reservation: res })
             .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = resp.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         if !resp.reservation_created {
             return Err(ReservationError::already_exists(format!(
                 "reservation '{}' already exists",
@@ -6809,17 +7334,21 @@ impl ClusterManager {
         self.validate_reservation_storage_overlap(&preview, Some(name))
             .map_err(|e| ReservationError::invalid(e.to_string()))?;
 
-        self.propose(WalOperation::ReservationUpdate {
-            name: name.to_string(),
-            duration_minutes,
-            add_nodes: add_expanded,
-            remove_nodes: remove_nodes.to_vec(),
-            add_users: add_users.to_vec(),
-            remove_users: remove_users.to_vec(),
-            add_accounts: add_accounts.to_vec(),
-            remove_accounts: remove_accounts.to_vec(),
-        })
-        .map_err(|e| ReservationError::raft(e.to_string()))?;
+        let response = self
+            .propose(WalOperation::ReservationUpdate {
+                name: name.to_string(),
+                duration_minutes,
+                add_nodes: add_expanded,
+                remove_nodes: remove_nodes.to_vec(),
+                add_users: add_users.to_vec(),
+                remove_users: remove_users.to_vec(),
+                add_accounts: add_accounts.to_vec(),
+                remove_accounts: remove_accounts.to_vec(),
+            })
+            .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if let Some(error) = response.node_inventory_error {
+            return Err(ReservationError::invalid(error));
+        }
         Ok(())
     }
 
@@ -7354,10 +7883,9 @@ impl ClusterManager {
                 continue;
             }
 
-            // Eligible nodes exist but none are up. is_up() keeps a busy
-            // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
-            // is ReqNodeNotAvail (Slurm parity).
-            if eligible.iter().all(|n| !n.state.is_up()) {
+            // is_up_for_work keeps a busy `Allocated` cluster out of NodeDown; a
+            // nodelist pin to unavailable nodes is ReqNodeNotAvail (Slurm parity).
+            if eligible.iter().all(|n| !n.is_up_for_work()) {
                 job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
@@ -8935,6 +9463,15 @@ impl ClusterManager {
                 memory_adjustment,
                 at: _,
             } => {
+                // Only a saved node_names list fences placement; earlier log entries keep
+                // their original placement behavior on replay.
+                if let Some(name) = node_names
+                    .iter()
+                    .find(|name| self.references_unregistered(&nodes, name))
+                {
+                    warn!(job_id = *job_id, node = %name, "refusing a JobStart onto an unregistered node");
+                    return ClientResponse::default();
+                }
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
                 // second propose for the same job must not double-charge nodes.
                 // Not gated on job state — a legitimate JobStart can apply against
@@ -9449,11 +9986,20 @@ impl ClusterManager {
                 labels,
                 source,
                 capabilities,
+                agent_instance,
             } => {
+                if self.committed_inventory_excludes(name) {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
+                // Unconditional: replicas' keep-out records can differ after a mixed-version upgrade.
+                self.deleted_nodes.write().remove(name);
+                self.deleted_heartbeats_logged.lock().remove(name);
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
                 let mut node = Node::new(name.clone(), resources);
+                node.agent_instance = non_empty(agent_instance);
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -9513,8 +10059,14 @@ impl ClusterManager {
                 version,
                 source,
                 capabilities,
+                agent_instance,
             } => {
+                if self.committed_inventory_excludes(name) {
+                    response.node_registration_rejected = true;
+                    return response;
+                }
                 if let Some(node) = nodes.get_mut(name) {
+                    node.agent_instance = non_empty(agent_instance);
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
                     resources.backfill_stable_ids();
@@ -9559,7 +10111,11 @@ impl ClusterManager {
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.capabilities = capabilities.clone();
-                    node.last_heartbeat = Some(Utc::now());
+                    // A stamp would recover a Down or Error node at the next pass, on any
+                    // leader or after replay, before a heartbeat reports its jobs.
+                    if !matches!(node.state, NodeState::Down | NodeState::Error) {
+                        node.last_heartbeat = Some(Utc::now());
+                    }
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
                     self.apply_node_config_policy(node);
@@ -9641,7 +10197,13 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason, .. } => {
+            WalOperation::NodeRemove {
+                name,
+                reason,
+                agent_instance,
+                comm_url,
+                ..
+            } => {
                 let failure = NodeFailure {
                     node: name.clone(),
                     reason: reason.clone().unwrap_or_default(),
@@ -9675,11 +10237,41 @@ impl ClusterManager {
                     }
                 }
                 nodes.remove(name);
+                if !agent_instance.is_empty() {
+                    let deleted = DeletedAgent {
+                        agent_instance: agent_instance.clone(),
+                        comm_url: comm_url.clone(),
+                    };
+                    self.deleted_nodes.write().insert(name.clone(), deleted);
+                }
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),
                     "node removed from cluster"
                 );
+            }
+            WalOperation::NodeInventoryUpdate { inventory } => {
+                let reservations = self.reservations.read();
+                let removed = match inventory_removals(
+                    inventory,
+                    &nodes,
+                    &jobs,
+                    &reservations,
+                    &self.k0s.read(),
+                ) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        response.node_inventory_error = Some(error.to_string());
+                        return response;
+                    }
+                };
+                for name in removed {
+                    nodes.remove(&name);
+                    info!(node = %name, "node removed: absent from admission.node_names");
+                    self.k8s_metrics
+                        .remove_node(&self.config().cluster_name, &name);
+                }
+                *self.node_inventory.write() = Some(inventory.clone());
             }
             WalOperation::TokenCreate { token } => {
                 self.tokens.write().insert(token.id.clone(), token.clone());
@@ -9859,6 +10451,10 @@ impl ClusterManager {
                 self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
+                if let Some(error) = self.reservation_inventory_error(&nodes, &reservation.nodes) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 if reservations.iter().any(|r| r.name == reservation.name) {
                     warn!(
@@ -9881,6 +10477,10 @@ impl ClusterManager {
                 add_accounts,
                 remove_accounts,
             } => {
+                if let Some(error) = self.reservation_inventory_error(&nodes, add_nodes) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut reservations = self.reservations.write();
                 Self::apply_reservation_update_locked(
                     reservations.as_mut(),
@@ -9952,6 +10552,10 @@ impl ClusterManager {
                 }
             }
             WalOperation::K0sMemberNodesAdd { nodes: add } => {
+                if let Some(error) = self.k0s_inventory_error(&nodes, add.iter()) {
+                    response.node_inventory_error = Some(error);
+                    return response;
+                }
                 let mut k0s = self.k0s.write();
                 k0s.member_nodes = crate::cluster_k8s::merge_member_nodes(&k0s.member_nodes, add);
             }
@@ -9967,6 +10571,16 @@ impl ClusterManager {
                 member_nodes,
                 reset_requested,
             } => {
+                if *phase != spur_core::k0s::K0sPhase::Down {
+                    let references = control_plane_node
+                        .iter()
+                        .chain(control_plane_nodes)
+                        .chain(member_nodes);
+                    if let Some(error) = self.k0s_inventory_error(&nodes, references) {
+                        response.node_inventory_error = Some(error);
+                        return response;
+                    }
+                }
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 k0s.reset_requested = *reset_requested;
@@ -10038,6 +10652,127 @@ pub struct LayoutDelivery {
     pub error: String,
 }
 
+fn excluded_by_node_names(name: &str) -> RegisterNodeError {
+    RegisterNodeError::PermissionDenied(format!(
+        "node {name} is not allowed by admission.node_names"
+    ))
+}
+
+/// A user-fixable node_names failure in reconfigure: an invalid list or a refused removal.
+#[derive(Debug)]
+pub(crate) enum NodeInventoryError {
+    Invalid(String),
+    Refused(String),
+}
+
+impl std::fmt::Display for NodeInventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Invalid(message) | Self::Refused(message)) = self;
+        write!(f, "reconfigure: {message}")
+    }
+}
+
+impl std::error::Error for NodeInventoryError {}
+
+fn reject_excluded_registration(
+    response: &ClientResponse,
+    name: &str,
+) -> Result<(), RegisterNodeError> {
+    if response.node_registration_rejected {
+        return Err(excluded_by_node_names(name));
+    }
+    Ok(())
+}
+
+fn inventory_removals(
+    inventory: &NodeInventory,
+    nodes: &HashMap<String, Node>,
+    jobs: &HashMap<JobId, Job>,
+    reservations: &[Reservation],
+    k0s: &spur_core::k0s::K0sClusterState,
+) -> anyhow::Result<Vec<String>> {
+    let Some(names) = &inventory.names else {
+        return Ok(Vec::new());
+    };
+    let removed = unlisted_node_names(names, nodes);
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let held: HashSet<_> = jobs
+        .values()
+        .filter(|job| !job.state.is_finalized())
+        .flat_map(Job::held_nodes)
+        .collect();
+    let reserved: HashMap<_, _> = reservations
+        .iter()
+        .flat_map(|reservation| {
+            reservation
+                .nodes
+                .iter()
+                .map(move |name| (name, &reservation.name))
+        })
+        .collect();
+    for name in &removed {
+        if held.contains(name) {
+            anyhow::bail!(
+                "node '{name}' still has job allocations; drain it and wait for completion"
+            );
+        }
+        let node = &nodes[name];
+        if let Some(reservation) = reserved.get(name) {
+            anyhow::bail!(
+                "node '{name}' belongs to reservation '{reservation}'; remove that reference first"
+            );
+        }
+        let k0s_up = k0s.phase != spur_core::k0s::K0sPhase::Down;
+        if node.k0s_role.is_some() || (k0s_up && k0s.is_member(name)) {
+            use spur_core::k0s::K0sRole;
+            if !k0s_up {
+                anyhow::bail!(
+                    "node '{name}' still has a Kubernetes role; retry once the teardown finishes"
+                );
+            }
+            if k0s.member_nodes.is_empty() {
+                anyhow::bail!(
+                    "node '{name}' belongs to the managed Kubernetes cluster, which spans every \
+                     node; run `spur k8s down` first"
+                );
+            }
+            if matches!(node.k0s_role, Some(K0sRole::Controller | K0sRole::Single)) {
+                anyhow::bail!(
+                    "node '{name}' is a Kubernetes control-plane node; run `spur k8s down` first"
+                );
+            }
+            if k0s.phase == spur_core::k0s::K0sPhase::Degraded {
+                anyhow::bail!(
+                    "node '{name}' belongs to the degraded Kubernetes cluster; run `spur k8s down` first"
+                );
+            }
+            anyhow::bail!(
+                "node '{name}' belongs to the managed Kubernetes cluster; remove that membership \
+                 first with `spur k8s remove-nodes`"
+            );
+        }
+    }
+    Ok(removed)
+}
+
+fn warn_once(latch: &std::sync::atomic::AtomicBool, message: &str) {
+    if !latch.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!("{message}");
+    }
+}
+
+fn unlisted_node_names(listed: &BTreeSet<String>, nodes: &HashMap<String, Node>) -> Vec<String> {
+    let mut unlisted: Vec<_> = nodes
+        .keys()
+        .filter(|name| !listed.contains(*name))
+        .cloned()
+        .collect();
+    unlisted.sort();
+    unlisted
+}
+
 const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Snapshot data for Raft serialization.
@@ -10046,6 +10781,8 @@ const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::fro
 struct ClusterSnapshot {
     #[serde(default)]
     preemption_usage: preemption_usage::UsageLedger,
+    #[serde(default)]
+    node_inventory: Option<NodeInventory>,
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
@@ -10059,6 +10796,8 @@ struct ClusterSnapshot {
     /// partitions with the same name from re-seeding on restart.
     #[serde(default)]
     deleted_partition_names: HashSet<String>,
+    #[serde(default)]
+    deleted_nodes: HashMap<String, DeletedAgent>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     #[serde(default)]
@@ -10213,13 +10952,16 @@ impl StateMachineApply for ClusterManager {
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
         let preemption_usage = self.preemption_usage.read().clone();
+        let node_inventory = self.node_inventory.read().clone();
         let snap = ClusterSnapshot {
             preemption_usage,
+            node_inventory,
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
             partitions: Some(self.partitions.read().clone()),
             deleted_partition_names: self.deleted_partition_names.read().clone(),
+            deleted_nodes: self.deleted_nodes.read().clone(),
             steps,
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
@@ -10233,6 +10975,7 @@ impl StateMachineApply for ClusterManager {
 
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
+        *self.node_inventory.write() = snap.node_inventory;
 
         // Fold in the persisted high-water mark so evicting the high-id tail
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
@@ -10265,6 +11008,7 @@ impl StateMachineApply for ClusterManager {
 
         // Restore tombstone set first — used below to filter the config baseline.
         *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
+        *self.deleted_nodes.write() = snap.deleted_nodes;
 
         // `snap.partitions` is the leader's authoritative set, installed
         // wholesale. Only a pre-partition snapshot (`None`) falls back to the
@@ -10834,7 +11578,7 @@ struct QosBlocked {
 fn qos_block_with(
     job: &mut Job,
     qos: &Qos,
-    jobs: &HashMap<JobId, Job>,
+    ledger: &QuotaLedger<'_>,
     reuse: &ReuseView<'_>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
@@ -10843,40 +11587,11 @@ fn qos_block_with(
         return Ok(0);
     };
     let user = &job.spec.user;
-    // Idle-fill borrowed jobs (`idle_fill` stamped) are held outside every QOS
-    // quota aggregate: a borrowed job runs on capacity outside the quota, so it
-    // must not count toward the quota that gates its team's legitimate jobs —
-    // otherwise a legitimate sibling is blocked at this gate and dropped from
-    // the pending list before reclaim can ever see it (§7, D1). The exclusion
-    // keys on the stamp alone; a job reclaimable only via `idle_fill_preemptable`
-    // is inside its quota and keeps counting in full (§4.1).
-    let mut running_count = jobs
-        .values()
-        .filter(|j| {
-            j.occupies_resources()
-                && !j.idle_fill
-                && j.spec.user == *user
-                && j.spec.qos.as_deref() == Some(qos_name.as_str())
-        })
-        .count() as u32;
-    // Count only earlier-submitted jobs (lower job_id) so a later job never
-    // makes an earlier, within-limit job retroactively blocked.
-    let submitted_count = jobs
-        .values()
-        .filter(|j| {
-            j.job_id < job.job_id
-                && !j.idle_fill
-                && (j.state == JobState::Pending || j.state == JobState::Running)
-                && j.spec.user == *user
-                && j.spec.qos.as_deref() == Some(qos_name.as_str())
-        })
-        .count() as u32;
-    let mut user_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    });
-    let mut qos_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    });
+    let usage = ledger.qos(qos_name, user);
+    let mut running_count = usage.user_running_jobs();
+    let submitted_count = usage.user_submitted_before(job.job_id);
+    let mut user_running_tres = usage.user_running_tres();
+    let mut qos_running_tres = usage.scope_running_tres();
 
     let user_key = (user.clone(), qos_name.clone());
     running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
@@ -10888,12 +11603,11 @@ fn qos_block_with(
     }
 
     let already_claimed = reserved.qos_claimed_nodes.get(qos_name);
-    let qos_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
-        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    })
-    .into_iter()
-    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-    .collect();
+    let qos_occupied: HashSet<String> = usage
+        .occupied()
+        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+        .map(str::to_owned)
+        .collect();
     let (grp_node_charge, reusable_nodes) =
         grp_node_credit(job, qos.limits.grp_tres.as_ref(), &qos_occupied, reuse);
 
@@ -10950,7 +11664,7 @@ struct AccountAdmitted {
 fn account_block_with(
     job: &mut Job,
     assoc_cache: &AssociationCache,
-    jobs: &HashMap<JobId, Job>,
+    ledger: &QuotaLedger<'_>,
     reuse: &ReuseView<'_>,
     reserved: &PassReservations,
 ) -> Result<AccountAdmitted, spur_core::job::PendingReason> {
@@ -10963,37 +11677,10 @@ fn account_block_with(
     let user = &job.spec.user;
     let limits = assoc_cache.limits(user, account);
 
-    // Idle-fill borrowed jobs (`idle_fill` stamped) sit outside every quota
-    // aggregate, the association's included. The account gate runs first and
-    // returns early, so a borrowed job counted here blocks its team's legitimate
-    // job before it ever reaches the QOS gate — dropping it from the pending
-    // list where reclaim can never see it (§7, D1). The exclusion keys on the
-    // stamp alone; a job reclaimable only via `idle_fill_preemptable` is inside
-    // its quota and keeps counting in full (§4.1).
-    let mut running_count = jobs
-        .values()
-        .filter(|j| {
-            j.occupies_resources()
-                && !j.idle_fill
-                && j.spec.user == *user
-                && j.spec.account.as_deref() == Some(account)
-        })
-        .count() as u32;
-    // Count only earlier-submitted jobs (lower job_id) so a later job never
-    // makes an earlier, within-limit job retroactively blocked.
-    let submitted_count = jobs
-        .values()
-        .filter(|j| {
-            j.job_id < job.job_id
-                && !j.idle_fill
-                && (j.state == JobState::Pending || j.state == JobState::Running)
-                && j.spec.user == *user
-                && j.spec.account.as_deref() == Some(account)
-        })
-        .count() as u32;
-    let mut account_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.account.as_deref() == Some(account)
-    });
+    let usage = ledger.account(account, user);
+    let mut running_count = usage.user_running_jobs();
+    let submitted_count = usage.user_submitted_before(job.job_id);
+    let mut account_running_tres = usage.scope_running_tres();
 
     running_count += reserved
         .account_user_count
@@ -11005,12 +11692,11 @@ fn account_block_with(
     }
 
     let already_claimed = reserved.account_claimed_nodes.get(account);
-    let account_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
-        !j.idle_fill && j.spec.account.as_deref() == Some(account)
-    })
-    .into_iter()
-    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-    .collect();
+    let account_occupied: HashSet<String> = usage
+        .occupied()
+        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+        .map(str::to_owned)
+        .collect();
     let (grp_node_charge, reusable_nodes) =
         grp_node_credit(job, limits.grp_tres.as_ref(), &account_occupied, reuse);
 
@@ -11115,16 +11801,16 @@ fn quota_gate(
     job: &mut Job,
     qos: &Qos,
     assoc_cache: &AssociationCache,
-    jobs: &HashMap<JobId, Job>,
+    ledger: &QuotaLedger<'_>,
     reuse: &ReuseView<'_>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
 ) -> QuotaVerdict {
-    let account = match account_block_with(job, assoc_cache, jobs, reuse, reserved) {
+    let account = match account_block_with(job, assoc_cache, ledger, reuse, reserved) {
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
-    match qos_block_with(job, qos, jobs, reuse, reserved, consumed_wall_minutes) {
+    match qos_block_with(job, qos, ledger, reuse, reserved, consumed_wall_minutes) {
         Ok(qos_charge) => QuotaVerdict::Admitted {
             account,
             qos_charge,
@@ -11339,16 +12025,16 @@ fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a
     }
 }
 
-/// Running-TRES accumulation with the distinct-node rule applied once at the
-/// end. Node TRES is the count of distinct nodes occupied (union of
+/// Running-TRES accumulation with the distinct-node rule applied when read.
+/// Node TRES is the count of distinct nodes occupied (union of
 /// `allocated_nodes`), not summed `num_nodes` — a node packed by two jobs counts
 /// once; CPU/Memory/GPU stay additive. A running job without recorded placement
 /// falls back to its requested `num_nodes` so the limit is never under-counted.
 ///
-/// Shared by `sum_running_tres` and the per-scope/per-user aggregation in
-/// `scope_usage` so a running job's footprint is counted identically whether it
-/// feeds a group total or a single user's, and the distinct-node union is taken
-/// per aggregate rather than summed across jobs.
+/// Shared by the `QuotaLedger` the admission gates read and the per-scope/per-user
+/// aggregation in `scope_usage` so a running job's footprint is counted identically
+/// whether it feeds a group total or a single user's, and the distinct-node union is
+/// taken per aggregate rather than summed across jobs.
 #[derive(Default)]
 struct RunningTresAccumulator<'a> {
     tres: TresRecord,
@@ -11367,12 +12053,17 @@ impl<'a> RunningTresAccumulator<'a> {
         }
     }
 
-    fn finish(mut self) -> TresRecord {
-        self.tres.set(
+    fn nodes(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.distinct_nodes.iter().copied()
+    }
+
+    fn tres(&self) -> TresRecord {
+        let mut tres = self.tres.clone();
+        tres.set(
             TresType::Node,
             self.distinct_nodes.len() as u64 + self.unplaced_nodes,
         );
-        self.tres
+        tres
     }
 }
 
@@ -11393,6 +12084,7 @@ fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
         })
 }
 
+#[cfg(test)]
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut acc = RunningTresAccumulator::default();
     for j in jobs.values() {
@@ -11400,7 +12092,7 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
             acc.add(j);
         }
     }
-    acc.finish()
+    acc.tres()
 }
 
 /// The limits-versus-usage snapshot behind `scontrol show assoc_mgr`. Usage is
@@ -11523,14 +12215,14 @@ fn scope_usage(
         scope: scope.to_owned(),
         grp_running_jobs,
         grp_submitted_jobs,
-        grp_running_tres: grp_tres.finish(),
+        grp_running_tres: grp_tres.tres(),
         users: per_user
             .into_iter()
             .map(|(user, agg)| UserLimitUsage {
                 user: user.to_owned(),
                 running_jobs: agg.running_jobs,
                 submitted_jobs: agg.submitted_jobs,
-                running_tres: agg.running_tres.finish(),
+                running_tres: agg.running_tres.tres(),
                 caps: caps_for(user),
             })
             .collect(),
@@ -11891,10 +12583,25 @@ pub(crate) fn node_config_matches(
     matches_names || matches_selector
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+    /// Only these stale nodes may be marked Down this pass.
+    Only(HashSet<String>),
+}
+
+/// The nodes one health pass would mark Down, and what the silent-node limit
+/// judges them against.
+#[derive(Debug)]
+pub(crate) struct StaleNodes {
+    pub(crate) names: Vec<String>,
+    /// Stale nodes that are Suspended, which the limit leaves out of its counts.
+    pub(crate) suspended: HashSet<String>,
+    /// Nodes a heartbeat timeout could move to Down, Suspended ones excluded.
+    pub(crate) watched: usize,
+    /// Watched nodes not yet stale that have already missed a heartbeat.
+    pub(crate) recently_silent: usize,
 }
 
 /// Withholds DOWN marking for `grace` after leadership is won: a non-leader
@@ -11935,6 +12642,13 @@ pub(crate) enum HealthAction {
     Recover {
         name: String,
         old_state: NodeState,
+    },
+    /// A returning node with no clean job report within the hold cap: drained
+    /// (admin-locked) with `reason` for an operator to resume, not recovered.
+    Drain {
+        name: String,
+        old_state: NodeState,
+        reason: String,
     },
 }
 
@@ -11985,6 +12699,168 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     recovered.state = NodeState::Idle;
     recovered.update_state_from_alloc();
     recovered.state
+}
+
+/// Bounds on the silence past one heartbeat interval that counts as a missed
+/// beat. The floor is a compromise: a healthy beat can be later still (its RPC
+/// bound plus a retry), but a higher floor starts counting later at short
+/// timeouts. Past the ceiling a beat is plainly missed, however long the timeout.
+const MISSED_HEARTBEAT_MIN_SLACK_SECS: u64 = 5;
+const MISSED_HEARTBEAT_MAX_SLACK_SECS: u64 = 15;
+
+/// Seconds of silence after which a watched node that is not yet stale counts
+/// as having missed a heartbeat. Unless the ceiling applies, such a node goes
+/// stale within a tick, so a staggered mass failure trips the limit before an
+/// early node's second strike. With a timeout at or under the floor it never fires.
+pub(crate) fn missed_heartbeat_secs(timeout_secs: u64, health_tick: std::time::Duration) -> u64 {
+    let interval = spur_core::config::HEARTBEAT_INTERVAL_SECS;
+    timeout_secs.saturating_sub(health_tick.as_secs()).clamp(
+        interval + MISSED_HEARTBEAT_MIN_SLACK_SECS,
+        interval + MISSED_HEARTBEAT_MAX_SLACK_SECS,
+    )
+}
+
+/// Whether the silent-node limit watches this node: a heartbeat timeout could
+/// still move it to Down (a heartbeat is on record and it is not already Down
+/// or held in Drain), and it is not Suspended.
+fn is_watched(node: &Node) -> bool {
+    node.last_heartbeat.is_some()
+        && node.state != NodeState::Suspended
+        && node
+            .state
+            .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
+            .is_some()
+}
+
+fn missed_a_heartbeat(node: &Node, now: DateTime<Utc>, after_secs: u64) -> bool {
+    let limit = chrono::Duration::seconds(after_secs as i64);
+    node.last_heartbeat.is_some_and(|hb| now - hb > limit)
+}
+
+pub(crate) fn stale_nodes_at(
+    nodes: &[&Node],
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+    health_tick: std::time::Duration,
+) -> StaleNodes {
+    let names: Vec<String> = evaluate_node_health(nodes, now, timeout_secs)
+        .into_iter()
+        .filter_map(|action| match action {
+            HealthAction::MarkDown { name, .. } => Some(name),
+            // Only the hold pass adds Drain, after this.
+            HealthAction::Recover { .. } | HealthAction::Drain { .. } => None,
+        })
+        .collect();
+    let stale: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let is_stale = |node: &Node| stale.contains(node.name.as_str());
+    let suspended = nodes
+        .iter()
+        .filter(|node| node.state == NodeState::Suspended && is_stale(node))
+        .map(|node| node.name.clone())
+        .collect();
+    let watched: Vec<&Node> = nodes.iter().copied().filter(|n| is_watched(n)).collect();
+    let missed_after = missed_heartbeat_secs(timeout_secs, health_tick);
+    let recently_silent = watched
+        .iter()
+        .filter(|node| !is_stale(node) && missed_a_heartbeat(node, now, missed_after))
+        .count();
+    StaleNodes {
+        names,
+        suspended,
+        watched: watched.len(),
+        recently_silent,
+    }
+}
+
+const HOLD_CAP_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a node may report ended jobs before it is drained. A node still
+/// killing, cleaning up, or running an epilog gets that whole budget plus one
+/// heartbeat to carry its clean report.
+pub(crate) fn recovery_hold_cap(
+    heartbeat_timeout_secs: u64,
+    config: &spur_core::config::SlurmConfig,
+) -> std::time::Duration {
+    let budget = u64::from(config.complete_wait_floor_secs())
+        .saturating_add(spur_core::config::HEARTBEAT_INTERVAL_SECS);
+    std::time::Duration::from_secs(heartbeat_timeout_secs.max(budget))
+}
+
+/// What a node's latest heartbeat said about jobs the controller has ended. A
+/// node absent from the stale-report map reported clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeReport {
+    /// Still running jobs the controller ended or moved; these ids are reclaimed
+    /// and its recovery is held until it reports clean.
+    StaleJobs(Vec<u32>),
+    /// The heartbeat could not enumerate the node's jobs (a contended running-job
+    /// lock, or a registration before the first complete report), so a clean
+    /// recovery cannot be confirmed and recovery is held, same as stale jobs.
+    Unknown,
+}
+
+/// Withholds recovery from nodes that did not report clean, so nothing new lands
+/// beside jobs the reclaim cancel has not stopped. Past `cap` the node is drained
+/// instead, so a job that will not die does not keep it Down forever.
+pub(crate) fn withhold_recoveries(
+    actions: &mut Vec<HealthAction>,
+    reporting_stale: &HashMap<String, NodeReport>,
+    holds: &mut HashMap<String, std::time::Instant>,
+    cap: std::time::Duration,
+    now: std::time::Instant,
+) {
+    // A hold spans only consecutive passes that withhold a recovery; one that
+    // lapsed (silent, resumed, removed) starts afresh, not from its old start.
+    let previous = std::mem::take(holds);
+    for action in std::mem::take(actions) {
+        let HealthAction::Recover { name, old_state } = action else {
+            actions.push(action);
+            continue;
+        };
+        let Some(report) = reporting_stale.get(&name) else {
+            actions.push(HealthAction::Recover { name, old_state });
+            continue;
+        };
+        let started = previous.get(&name).copied();
+        let since = started.unwrap_or(now);
+        holds.insert(name.clone(), since);
+        let held_for = now.saturating_duration_since(since);
+        // Passes land on a fixed tick, so the one due exactly at the cap can run a
+        // hair early; the slack keeps the decision from slipping a whole pass.
+        if held_for + HOLD_CAP_SLACK < cap {
+            if started.is_none() {
+                info!(node = %name, report = ?report, cap_secs = cap.as_secs(), "holding node recovery until it reports a clean job list");
+            } else {
+                debug!(node = %name, report = ?report, "node recovery still held");
+            }
+            continue;
+        }
+        actions.push(HealthAction::Drain {
+            name,
+            old_state,
+            reason: drain_reason(report),
+        });
+    }
+}
+
+/// Job ids named in a `Kill task failed` reason, so `scontrol show node` stays readable.
+const DRAIN_REASON_MAX_JOB_IDS: usize = 5;
+
+pub(crate) fn drain_reason(report: &NodeReport) -> String {
+    let ids = match report {
+        NodeReport::StaleJobs(ids) => ids,
+        NodeReport::Unknown => return "Agent job list unavailable".to_string(),
+    };
+    let mut listed: Vec<String> = ids
+        .iter()
+        .take(DRAIN_REASON_MAX_JOB_IDS)
+        .map(u32::to_string)
+        .collect();
+    let more = ids.len().saturating_sub(DRAIN_REASON_MAX_JOB_IDS);
+    if more > 0 {
+        listed.push(format!("+{more} more"));
+    }
+    format!("Kill task failed (JobId={})", listed.join(","))
 }
 
 pub(crate) fn evaluate_node_health(
@@ -12406,7 +13282,15 @@ pub(crate) mod gated {
         dir: &TempDir,
         config: SlurmConfig,
     ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
-        let mut cm = ClusterManager::new(config, dir.path()).unwrap();
+        cluster_with_config_path(dir, config, None).await
+    }
+
+    pub(crate) async fn cluster_with_config_path(
+        dir: &TempDir,
+        config: SlurmConfig,
+        path: Option<std::path::PathBuf>,
+    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+        let mut cm = ClusterManager::new_with_config_path(config, dir.path(), path).unwrap();
         cm.propose_timeout = std::time::Duration::from_millis(200);
         let cm = Arc::new(cm);
         let gate = Arc::new(ApplyGate::default());
@@ -12452,7 +13336,7 @@ fn preemption_checkpoint_saved(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -12462,6 +13346,7 @@ mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    mod node_inventory;
     mod partition_limits;
 
     #[test]
@@ -12559,10 +13444,11 @@ mod tests {
             mpi: Default::default(),
             health: Default::default(),
             spurd: Default::default(),
+            salloc: Default::default(),
         }
     }
 
-    async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+    pub(crate) async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
         test_cluster_with_config(dir, test_config()).await
     }
 
@@ -13384,6 +14270,7 @@ state = "UP"
                 bb_stage_candidates: vec![],
                 idle_fill_candidates: vec![],
                 claims_blocked: false,
+                evicting: HashSet::new(),
             };
             let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
             let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
@@ -13458,11 +14345,51 @@ state = "UP"
             "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
         assert_eq!(cfg.scheduler.complete_wait_secs, 90);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_the_preempt_victim_order_live() {
+        use spur_core::partition::VictimOrderKey::*;
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n").await;
+        assert_eq!(
+            cm.config().scheduler.preempt_victim_order,
+            [LeastWork, FewestJobs, Hash]
+        );
+
+        let write = |value: &str| {
+            std::fs::write(
+                &conf_path,
+                format!("cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"),
+            )
+            .unwrap();
+        };
+        write("[\"hash\", \"fewest_jobs\"]");
+        cm.reconfigure().unwrap();
+        assert_eq!(
+            cm.config().scheduler.preempt_victim_order,
+            [Hash, FewestJobs]
+        );
+
+        write("[]");
+        cm.reconfigure().unwrap();
+        assert!(cm.config().scheduler.preempt_victim_order.is_empty());
+
+        write("[\"hash\", \"hash\"]");
+        assert!(cm.reconfigure().is_err());
+        assert!(
+            cm.config().scheduler.preempt_victim_order.is_empty(),
+            "a rejected file leaves the running list alone"
+        );
     }
 
     #[tokio::test]
@@ -13476,7 +14403,11 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.jobs_private());
 
         std::fs::write(
@@ -13485,7 +14416,11 @@ state = "UP"
              private_data = [\"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().auth.users_private());
         assert!(cm.config().auth.accounts_private());
         assert!(cm.config().auth.reservations_private());
@@ -13499,7 +14434,10 @@ state = "UP"
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"nodes\"]\n",
         )
         .unwrap();
-        cm.reconfigure()
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
             .expect_err("an unsupported category must not go live");
         assert!(
             cm.config().auth.accounts_private(),
@@ -13519,7 +14457,11 @@ state = "UP"
             "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = cm.config();
         assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
@@ -13543,7 +14485,11 @@ state = "UP"
             "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
         )
         .unwrap();
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
 
         let avail = cm.available_licenses();
         assert_eq!(
@@ -13573,7 +14519,7 @@ state = "UP"
     /// has finished its initial self-election, causing `client_write` to
     /// fail silently. This helper retries until the election completes
     /// and the mutation is applied.
-    fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+    pub(crate) fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
         for _ in 0..200 {
             if f() {
                 return;
@@ -13679,7 +14625,19 @@ state = "UP"
         assert!(cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
     }
 
-    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+    pub(crate) fn set_last_heartbeat(cm: &ClusterManager, name: &str, at: Option<DateTime<Utc>>) {
+        if let Some(node) = cm.nodes.write().get_mut(name) {
+            node.last_heartbeat = at;
+        }
+    }
+
+    pub(crate) fn set_node_state(cm: &ClusterManager, name: &str, state: NodeState) {
+        if let Some(node) = cm.nodes.write().get_mut(name) {
+            node.state = state;
+        }
+    }
+
+    pub(crate) fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         try_register_node(cm, name, cpus, mem).unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
@@ -14014,6 +14972,39 @@ state = "UP"
         assert!(
             cm.get_jobs(&JobFilter::default()).is_empty(),
             "must not probe a drained node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_leaves_a_not_responding_node_alone() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/bin/true", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+        cm.check_node_health(90, MarkDownPolicy::Only(HashSet::new()));
+        let n1 = cm.get_node("n1").unwrap();
+        assert!(n1.not_responding);
+        assert_eq!(n1.state, NodeState::Idle, "kept up, only flagged");
+
+        assert!(cm.node_off_limits_for_health(&n1));
+        cm.run_node_health_pass();
+        wait_for("health job submitted", || {
+            !cm.get_jobs(&JobFilter::default()).is_empty()
+        });
+        let targets: Vec<Option<String>> = cm
+            .get_jobs(&JobFilter::default())
+            .iter()
+            .map(|j| j.spec.nodelist.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Some("n2".to_string())],
+            "a node the leader cannot hear must not be sent a check"
         );
     }
 
@@ -15869,6 +16860,7 @@ state = "UP"
                 version: String::new(),
                 labels: HashMap::new(),
                 capabilities: Vec::new(),
+                agent_instance: String::new(),
                 source: spur_core::node::NodeSource::NativeHost,
             },
             WalOperation::JobSubmit {
@@ -15897,6 +16889,7 @@ state = "UP"
                 wg_pubkey: String::new(),
                 version: String::new(),
                 capabilities: Vec::new(),
+                agent_instance: String::new(),
                 source: spur_core::node::NodeSource::NativeHost,
             },
         ]
@@ -16841,6 +17834,7 @@ state = "UP"
             labels: HashMap::new(),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -19243,6 +20237,8 @@ state = "UP"
             name: "worker1".into(),
             reason: Some("decommissioned".into()),
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -22346,6 +23342,39 @@ state = "UP"
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_pinned_to_a_not_responding_node_reports_req_node_not_avail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // n1 stays Idle but is not responding, so it takes no new work and a
+        // job pinned to it waits with ReqNodeNotAvail, not Resources.
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.not_responding = true;
+        let nodes = vec![n1];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -26229,6 +27258,264 @@ state = "UP"
         }
     }
 
+    const H: i64 = 3600;
+
+    /// Starts one 1-cpu job in `qos` per `(node, seconds running)`, on one clock reading,
+    /// and returns their ids in order.
+    fn start_jobs_in_qos(cm: &Arc<ClusterManager>, qos: &str, jobs: &[(&str, i64)]) -> Vec<JobId> {
+        let now = Utc::now();
+        jobs.iter()
+            .enumerate()
+            .map(|(i, (node, secs))| {
+                let mut spec = basic_spec(&format!("{qos}-{i}"));
+                spec.priority = Some(100);
+                spec.qos = Some(qos.into());
+                let id = submit_and_wait(cm, spec);
+                let res = scalar_alloc(1, 1000);
+                cm.start_job(
+                    id,
+                    vec![(*node).into()],
+                    res.clone(),
+                    per_node_for(&[node], res),
+                )
+                .unwrap();
+                settle(cm, id, JobState::Running);
+                let mut all = cm.jobs.write();
+                let job = all.get_mut(&id).unwrap();
+                job.start_time = Some(now - chrono::Duration::seconds(*secs));
+                id
+            })
+            .collect()
+    }
+
+    /// Two nodes, `jobs` running in "low", and one preemption for a single-node
+    /// "high" job. Checks that exactly the jobs at the `expected` indexes start draining.
+    async fn preempt_among(
+        config: spur_core::config::SlurmConfig,
+        jobs: &[(&str, i64)],
+        expected: &[usize],
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let ids = start_jobs_in_qos(&cm, "low", jobs);
+        preempt_for_high(&cm, basic_spec("high")).await;
+        assert_draining(&cm, &ids, expected);
+    }
+
+    /// Submits `spec` in the "high" QOS and runs one preemption pass for it.
+    async fn preempt_for_high(cm: &Arc<ClusterManager>, mut spec: JobSpec) -> Job {
+        spec.priority = Some(10_000);
+        spec.qos = Some("high".into());
+        let high_id = submit_and_wait(cm, spec);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
+        high_job
+    }
+
+    fn assert_draining(cm: &ClusterManager, ids: &[JobId], expected: &[usize]) {
+        for (i, id) in ids.iter().enumerate() {
+            if expected.contains(&i) {
+                settle(cm, *id, JobState::Completing);
+            } else {
+                assert_eq!(cm.get_job(*id).unwrap().state, JobState::Running, "job {i}");
+            }
+        }
+    }
+
+    fn config_with_victim_order(
+        keys: Vec<spur_core::partition::VictimOrderKey>,
+    ) -> spur_core::config::SlurmConfig {
+        let mut config = preempting_config();
+        config.scheduler.preempt_victim_order = keys;
+        config
+    }
+
+    // Each case runs twice with the nodes swapped, so neither node name nor the hash
+    // can pass both orientations: only the key under test can.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_default_order_evicts_the_least_work() {
+        let one_on_n2 = [("n1", H), ("n1", H), ("n2", 5 * H)];
+        let one_on_n1 = [("n1", 5 * H), ("n2", H), ("n2", H)];
+        preempt_among(preempting_config(), &one_on_n2, &[0, 1]).await;
+        preempt_among(preempting_config(), &one_on_n1, &[1, 2]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fewest_jobs_first_evicts_the_node_with_fewest_jobs() {
+        use spur_core::partition::VictimOrderKey::*;
+        let config = || config_with_victim_order(vec![FewestJobs, LeastWork, Hash]);
+        preempt_among(config(), &[("n1", H), ("n1", H), ("n2", 5 * H)], &[2]).await;
+        preempt_among(config(), &[("n1", 5 * H), ("n2", H), ("n2", H)], &[0]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_default_order_evicts_the_least_work_among_equal_job_counts() {
+        preempt_among(preempting_config(), &[("n1", 10 * H), ("n2", H)], &[1]).await;
+        preempt_among(preempting_config(), &[("n1", H), ("n2", 10 * H)], &[0]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeued_job_restarts_its_run_clock() {
+        // Job 0 ran five hours on n1, was requeued and started again; job 1 has run one.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let ids = start_jobs_in_qos(&cm, "low", &[("n1", 5 * H), ("n2", H)]);
+        cm.requeue_job_by_user(ids[0], "testuser", true, false)
+            .unwrap();
+        settle(&cm, ids[0], JobState::Pending);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            ids[0],
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, ids[0], JobState::Running);
+
+        preempt_for_high(&cm, basic_spec("high")).await;
+        assert_draining(&cm, &ids, &[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_node_gpu_total_evicts_only_a_node_that_can_host_it() {
+        // n1 has 8 GPUs under an hour-old job; n2 has 1 GPU under a minute-old one.
+        // Only n1 can host `--gpus=8`, though n2's job has less work to lose.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        let gpus = |n: u64, base: u64| (0..n).map(|i| gpu_resource(i as u32, base + i)).collect();
+        register_gpu_node(&cm, "n1", gpus(8, 100));
+        register_gpu_node(&cm, "n2", gpus(1, 200));
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let start = |node: &str, sids: &[u64], secs: i64| {
+            let mut spec = basic_spec(&format!("low-{node}"));
+            spec.priority = Some(100);
+            spec.qos = Some("low".into());
+            let id = submit_and_wait(&cm, spec);
+            let mut res = ResourceAllocations::from_device_ids("gpu", sids);
+            res.cpus = 1;
+            res.memory_mb = 1000;
+            cm.start_job(
+                id,
+                vec![node.into()],
+                res.clone(),
+                per_node_for(&[node], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            cm.jobs.write().get_mut(&id).unwrap().start_time =
+                Some(Utc::now() - chrono::Duration::seconds(secs));
+            id
+        };
+        let ids = [
+            start("n1", &(100..108).collect::<Vec<_>>(), H),
+            start("n2", &[200], 60),
+        ];
+
+        let mut spec = basic_spec("high");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
+        let high = preempt_for_high(&cm, spec).await;
+        assert_draining(&cm, &ids, &[0]);
+
+        report_nodes_released(&cm, ids[0]);
+        settle(&cm, ids[0], JobState::Cancelled);
+        let classification = PendingJobClassification {
+            jobs: vec![cm.get_job(high.job_id).unwrap()],
+            reason_updates: vec![],
+            bb_stage_candidates: vec![],
+            idle_fill_candidates: vec![],
+            claims_blocked: false,
+            evicting: HashSet::new(),
+        };
+        let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
+        let placed = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+        assert!(
+            placed.contains(&high.job_id),
+            "the freed node hosts the job"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_victim_order_takes_the_lowest_named_node() {
+        let config = || config_with_victim_order(Vec::new());
+        preempt_among(config(), &[("n1", H), ("n1", H), ("n2", 5 * H)], &[0, 1]).await;
+        preempt_among(config(), &[("n1", 5 * H), ("n2", H), ("n2", H)], &[0]).await;
+    }
+
+    /// Two nodes, `jobs` running in an idle-fill preemptable QOS, and one reclaim for
+    /// an in-quota job that needs one node. Returns the nodes it freed.
+    async fn reclaim_among(
+        config: spur_core::config::SlurmConfig,
+        jobs: &[(&str, i64)],
+    ) -> HashSet<String> {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            idle_fill_preemptable: true,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "claim".into(),
+            priority: 10_000,
+            ..Default::default()
+        });
+        start_jobs_in_qos(&cm, "burst", jobs);
+
+        let mut claim = basic_spec("claim");
+        claim.qos = Some("claim".into());
+        let claim_id = submit_and_wait(&cm, claim);
+        let claimer = cm.get_job(claim_id).unwrap();
+        let freed = crate::scheduler_loop::reclaim_for(&cm, &[&claimer]).await;
+        assert!(!freed.is_empty());
+        freed.into_iter().collect()
+    }
+
+    fn node_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_follows_the_default_order() {
+        // Two short borrowed runs lose less work than one long one, so their node goes.
+        let one_on_n2 = [("n1", H), ("n1", H), ("n2", 5 * H)];
+        let one_on_n1 = [("n1", 5 * H), ("n2", H), ("n2", H)];
+        assert_eq!(
+            reclaim_among(test_config(), &one_on_n2).await,
+            node_set(&["n1"])
+        );
+        assert_eq!(
+            reclaim_among(test_config(), &one_on_n1).await,
+            node_set(&["n2"])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_takes_the_lowest_named_node_when_the_order_is_empty() {
+        let mut config = test_config();
+        config.scheduler.preempt_victim_order = Vec::new();
+        let jobs = [("n1", H), ("n1", H), ("n2", 5 * H)];
+        assert_eq!(reclaim_among(config, &jobs).await, node_set(&["n1"]));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_evicts_nobody_when_the_victim_set_is_only_partly_eligible() {
         let dir = TempDir::new().unwrap();
@@ -28147,8 +29434,11 @@ state = "UP"
         classification: &PendingJobClassification,
         unclaimed: &HashSet<JobId>,
     ) -> Vec<JobId> {
-        let (nodes, partitions, reservations) =
-            (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
+        let (nodes, partitions, reservations) = (
+            cm.nodes_off_dispatch_cooldown(&classification.jobs),
+            cm.get_partitions(),
+            cm.get_reservations(),
+        );
         let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
             fabric: None,
@@ -28291,6 +29581,267 @@ state = "UP"
         assert!(unclaimed.is_empty());
         assert_eq!(admitted(&classification), vec![waiting]);
         assert!(!admitted(&classification).contains(&fits));
+    }
+
+    /// `grp_node_cluster` with room for one more node, under preemption, where "pool"
+    /// may evict "burst".
+    async fn pool_over_burst_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = grp_node_cluster_with(dir, 2, GrpCap::Qos, preempting_config()).await;
+        let mut pool = cm.qos_cache().get("pool").expect("pool QOS inserted");
+        pool.priority = 10_000;
+        pool.preempt = vec!["burst".into()];
+        cm.qos_cache().insert(pool);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm
+    }
+
+    fn run_burst_job(cm: &ClusterManager, node: &str) -> JobId {
+        let mut spec = basic_spec("burst");
+        spec.qos = Some("burst".into());
+        spec.nodelist = Some(node.into());
+        let id = submit_and_wait(cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        id
+    }
+
+    async fn evict_for(cm: &Arc<ClusterManager>, preemptor: JobId, victim: JobId) {
+        let job = cm.get_job(preemptor).expect("preemptor submitted");
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&job],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(cm, victim, JobState::Completing);
+        assert_eq!(cm.get_job(victim).unwrap().preempted_by, Some(preemptor));
+    }
+
+    /// A preemptor pinned to n2 whose victim there is still stopping, and a sibling in
+    /// its QOS that could start on n3. Returns (cluster, victim, preemptor, sibling).
+    async fn preemptor_with_draining_victim(
+        dir: &TempDir,
+    ) -> (Arc<ClusterManager>, JobId, JobId, JobId) {
+        let cm = pool_over_burst_cluster(dir).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        evict_for(&cm, preemptor, victim).await;
+        (cm, victim, preemptor, sibling)
+    }
+
+    /// An unpinned preemptor whose victim on n2 has finished, leaving n2 earmarked for
+    /// it, and which still can't start: n2 is on dispatch cooldown, n3 runs a job it
+    /// may not evict and n4 is too small for it. Its sibling fits n4.
+    /// Returns (cluster, preemptor, sibling).
+    async fn preemptor_with_earmarked_node(dir: &TempDir) -> (Arc<ClusterManager>, JobId, JobId) {
+        let cm = pool_over_burst_cluster(dir).await;
+        register_node(&cm, "n4", 4, 128000);
+        let victim = run_burst_job(&cm, "n2");
+        run_job_on(&cm, "not-evictable", "n3");
+        let mut wide = pool_job("preemptor", 1, None);
+        wide.cpus_per_task = 8;
+        let preemptor = submit_and_wait(&cm, wide);
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        evict_for(&cm, preemptor, victim).await;
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+        cm.cool_down_node_for("n2", std::time::Duration::from_secs(3600));
+        assert!(cm
+            .preempt_freed_nodes_raw()
+            .get("n2")
+            .is_some_and(|owners| owners.contains_key(&preemptor)));
+        (cm, preemptor, sibling)
+    }
+
+    /// One pass up to its evictions. Jobs go to `try_preempt` as in the loop: admitted,
+    /// not started, with the pass's off-cooldown nodes.
+    async fn preempt_for_unstarted(cm: &Arc<ClusterManager>) -> PendingJobClassification {
+        cm.tick_preempt_freed_earmarks();
+        let (classification, unclaimed) = classify_with_trials(cm);
+        let started = dispatched(cm, &classification, &unclaimed);
+        let unstarted: Vec<&Job> = classification
+            .jobs
+            .iter()
+            .filter(|job| !started.contains(&job.job_id))
+            .collect();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.nodes_off_dispatch_cooldown(&classification.jobs),
+            &unstarted,
+            &cm.config().scheduler,
+        )
+        .await;
+        classification
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_victim_drains() {
+        let dir = TempDir::new().unwrap();
+        let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(
+            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            "the sibling must not take the room while the preemptor's victim drains"
+        );
+
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+        cm.tick_preempt_freed_earmarks();
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            dispatched(&cm, &classification, &unclaimed),
+            vec![preemptor]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_victim_runs_out_its_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let victim = run_burst_job(&cm, "n2");
+        let preemptor = submit_and_wait(&cm, pool_job("preemptor", 1, Some("n2")));
+        let sibling = submit_and_wait(&cm, pool_job("sibling", 1, None));
+        let signaled_at = Utc::now();
+        let grace = PreemptPending {
+            preemption_claim: None,
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: preemptor,
+            preempt_qos: Some("pool".into()),
+            mode: PreemptMode::Requeue,
+            run_attempt: cm.get_job(victim).unwrap().run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(cm.signal_preemption(grace, victim).unwrap());
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(
+            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            "the sibling must not take the room while the preemptor's victim is in its grace"
+        );
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_keeps_its_grp_node_claim_while_its_freed_node_is_earmarked() {
+        let dir = TempDir::new().unwrap();
+        let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
+        cm.tick_preempt_freed_earmarks();
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(
+            admitted(&classification),
+            vec![preemptor],
+            "the cap refuses {sibling}"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(dispatched(&cm, &classification, &unclaimed).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_releases_its_grp_node_claim_once_its_earmark_expires() {
+        let dir = TempDir::new().unwrap();
+        let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
+        for _ in 0..ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+            cm.tick_preempt_freed_earmarks();
+        }
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(unclaimed, HashSet::from([preemptor]));
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+    }
+
+    /// Once the preemptor leaves the queue mid-eviction, nothing keeps its claim and
+    /// the sibling takes the room while the victim is still stopping.
+    async fn assert_sibling_gets_the_room_once_the_preemptor_leaves(
+        leave: impl FnOnce(&ClusterManager, JobId),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
+        leave(&cm, preemptor);
+
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        assert_eq!(admitted(&classification), vec![sibling]);
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_preemptor_leaves_its_grp_node_room_to_its_sibling() {
+        assert_sibling_gets_the_room_once_the_preemptor_leaves(|cm, preemptor| {
+            cm.cancel_job_as_system(preemptor).unwrap();
+            settle(cm, preemptor, JobState::Cancelled);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_preemptor_leaves_its_grp_node_room_to_its_sibling() {
+        assert_sibling_gets_the_room_once_the_preemptor_leaves(|cm, preemptor| {
+            cm.hold_job(preemptor).unwrap();
+            wait_for("preemptor held", || {
+                cm.get_job(preemptor)
+                    .is_some_and(|job| job.pending_reason == PendingReason::Held)
+            });
+        })
+        .await;
+    }
+
+    /// Two jobs with room for one, each pinned behind its own burst job. Once one of
+    /// them has evicted, the other is refused by the cap and so is never offered a
+    /// victim of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_node_of_grp_node_room_evicts_one_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = pool_over_burst_cluster(&dir).await;
+        let victims = [run_burst_job(&cm, "n2"), run_burst_job(&cm, "n3")];
+        let first = submit_and_wait(&cm, pool_job("first", 1, Some("n2")));
+        let second = submit_and_wait(&cm, pool_job("second", 1, Some("n3")));
+
+        preempt_for_unstarted(&cm).await;
+        settle(&cm, victims[0], JobState::Completing);
+        assert_eq!(cm.get_job(victims[0]).unwrap().preempted_by, Some(first));
+
+        let classification = preempt_for_unstarted(&cm).await;
+        assert_eq!(
+            cm.get_job(victims[1]).unwrap().state,
+            JobState::Running,
+            "one node of room needs one eviction"
+        );
+        assert_eq!(
+            admitted(&classification),
+            vec![first],
+            "the cap refuses {second}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -28786,17 +30337,20 @@ state = "UP"
     }
 
     #[test]
-    fn sum_running_tres_counts_distinct_nodes_not_summed_num_nodes() {
+    fn ledger_scope_tres_counts_distinct_nodes_not_summed_num_nodes() {
         // Two running jobs share node n2: summed num_nodes = 4, distinct union = 3.
         let mut a = make_running_job(1, &["n1", "n2"], 1);
         a.spec.num_nodes = 2;
         let mut b = make_running_job(2, &["n2", "n3"], 1);
         b.spec.num_nodes = 2;
-        let mut jobs = HashMap::new();
-        jobs.insert(1, a);
-        jobs.insert(2, b);
+        let jobs = [a, b].map(|mut job| {
+            job.spec.qos = Some("normal".into());
+            job
+        });
 
-        let tres = sum_running_tres(&jobs, |_| true);
+        let tres = QuotaLedger::from_jobs(&jobs)
+            .qos("normal", "testuser")
+            .scope_running_tres();
         assert_eq!(
             tres.get(TresType::Node),
             3,
@@ -28805,7 +30359,7 @@ state = "UP"
     }
 
     #[test]
-    fn sum_running_tres_falls_back_to_num_nodes_when_placement_missing() {
+    fn ledger_scope_tres_falls_back_to_num_nodes_when_placement_missing() {
         // An unplaced job (num_nodes=3, no recorded placement) must not under-count via the
         // distinct-node union, so it still contributes its full requested count; the two placed
         // jobs share n2, so their contribution is deduped to {n1,n2,n3}=3 rather than summed 2+2=4.
@@ -28816,12 +30370,14 @@ state = "UP"
         b.spec.num_nodes = 2;
         let mut c = make_running_job(3, &["n2", "n3"], 1);
         c.spec.num_nodes = 2;
-        let mut jobs = HashMap::new();
-        jobs.insert(1, a);
-        jobs.insert(2, b);
-        jobs.insert(3, c);
+        let jobs = [a, b, c].map(|mut job| {
+            job.spec.qos = Some("normal".into());
+            job
+        });
 
-        let tres = sum_running_tres(&jobs, |_| true);
+        let tres = QuotaLedger::from_jobs(&jobs)
+            .qos("normal", "testuser")
+            .scope_running_tres();
         // Unplaced fallback 3 + placed distinct {n1,n2,n3}=3 = 6, not summed 3+2+2=7.
         assert_eq!(tres.get(TresType::Node), 6);
     }
@@ -35623,6 +37179,673 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_marks_down_just_the_listed_stale_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "gone", 4, 8000);
+        register_node(&cm, "kept", 4, 8000);
+        for name in ["gone", "kept"] {
+            set_last_heartbeat(&cm, name, Some(Utc::now() - chrono::Duration::seconds(200)));
+        }
+
+        let confirmed = HashSet::from(["gone".to_string()]);
+        cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        wait_for("confirmed node marked down", || {
+            cm.get_node("gone")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        assert_eq!(cm.get_node("kept").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_spares_a_listed_node_whose_heartbeat_returned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.update_heartbeat("back", 0, 8000);
+
+        let confirmed = HashSet::from(["back".to_string()]);
+        let evicted = cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        assert!(evicted.is_empty());
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Idle);
+    }
+
+    fn recover(name: &str) -> super::HealthAction {
+        super::HealthAction::Recover {
+            name: name.into(),
+            old_state: NodeState::Down,
+        }
+    }
+
+    fn reporting(names: &[&str]) -> HashMap<String, super::NodeReport> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), super::NodeReport::StaleJobs(vec![1])))
+            .collect()
+    }
+
+    fn drain(name: &str, reason: &str) -> super::HealthAction {
+        super::HealthAction::Drain {
+            name: name.into(),
+            old_state: NodeState::Down,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn a_recovery_waits_while_the_node_still_reports_ended_jobs() {
+        let now = std::time::Instant::now();
+        let reporting = reporting(&["held"]);
+        let mut holds = HashMap::new();
+        let gone = super::HealthAction::MarkDown {
+            name: "gone".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        };
+        let mut actions = vec![recover("held"), recover("clean"), gone];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &reporting,
+            &mut holds,
+            std::time::Duration::from_secs(90),
+            now,
+        );
+
+        assert_eq!(
+            actions,
+            vec![
+                recover("clean"),
+                super::HealthAction::MarkDown {
+                    name: "gone".into(),
+                    old_state: NodeState::Idle,
+                    admin_locked: false,
+                },
+            ]
+        );
+        assert_eq!(holds.get("held"), Some(&now));
+    }
+
+    #[test]
+    fn a_recovery_proceeds_once_the_node_reports_clean() {
+        let started = std::time::Instant::now();
+        let mut holds = HashMap::from([("back".to_string(), started)]);
+        let mut actions = vec![recover("back")];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &HashMap::new(),
+            &mut holds,
+            std::time::Duration::from_secs(90),
+            started + std::time::Duration::from_secs(5),
+        );
+
+        assert_eq!(actions, vec![recover("back")]);
+        assert!(holds.is_empty(), "a clean report ends the hold");
+    }
+
+    #[test]
+    fn a_node_is_drained_after_the_hold_cap_while_ended_jobs_linger() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(90);
+        let reporting = reporting(&["stuck"]);
+        let mut holds = HashMap::new();
+        let pass = |holds: &mut HashMap<String, std::time::Instant>, at| {
+            let mut actions = vec![recover("stuck")];
+            super::withhold_recoveries(&mut actions, &reporting, holds, cap, at);
+            actions
+        };
+
+        assert!(pass(&mut holds, started).is_empty());
+        assert!(
+            pass(
+                &mut holds,
+                started + cap - std::time::Duration::from_secs(1)
+            )
+            .is_empty(),
+            "the hold lasts until the cap"
+        );
+        assert_eq!(
+            pass(&mut holds, started + cap),
+            vec![drain("stuck", "Kill task failed (JobId=1)")],
+            "past the cap the node is drained, not recovered"
+        );
+    }
+
+    #[test]
+    fn a_pass_due_at_the_hold_cap_drains_even_if_it_runs_a_hair_early() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(45);
+        let reporting = reporting(&["stuck"]);
+        let mut holds = HashMap::from([("stuck".to_string(), started)]);
+        let mut actions = vec![recover("stuck")];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &reporting,
+            &mut holds,
+            cap,
+            started + cap - std::time::Duration::from_micros(180),
+        );
+
+        assert_eq!(actions, vec![drain("stuck", "Kill task failed (JobId=1)")]);
+    }
+
+    #[test]
+    fn an_unknown_report_drains_with_agent_job_list_unavailable_after_the_cap() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(45);
+        let reporting = HashMap::from([("stuck".to_string(), super::NodeReport::Unknown)]);
+        let mut holds = HashMap::from([("stuck".to_string(), started)]);
+        let mut actions = vec![recover("stuck")];
+
+        super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, started + cap);
+
+        assert_eq!(actions, vec![drain("stuck", "Agent job list unavailable")]);
+    }
+
+    #[test]
+    fn a_drain_reason_lists_up_to_five_job_ids() {
+        let reason = super::drain_reason(&super::NodeReport::StaleJobs(vec![1, 2, 3, 4, 5]));
+
+        assert_eq!(reason, "Kill task failed (JobId=1,2,3,4,5)");
+    }
+
+    #[test]
+    fn a_drain_reason_counts_the_job_ids_past_the_first_five() {
+        let reason = super::drain_reason(&super::NodeReport::StaleJobs((1..=8).collect()));
+
+        assert_eq!(reason, "Kill task failed (JobId=1,2,3,4,5,+3 more)");
+    }
+
+    #[test]
+    fn a_held_node_that_went_silent_past_the_cap_starts_a_fresh_hold_on_return() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(90);
+        let reporting = reporting(&["back"]);
+        let mut holds = HashMap::new();
+        let mut pass = |mut actions: Vec<super::HealthAction>, at| {
+            super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, at);
+            actions
+        };
+
+        assert!(pass(vec![recover("back")], started).is_empty());
+        // Silent: past the heartbeat timeout it gets no Recover action at all.
+        assert!(pass(
+            Vec::new(),
+            started + cap + std::time::Duration::from_secs(1)
+        )
+        .is_empty());
+        let returned = started + cap + std::time::Duration::from_secs(30);
+
+        assert!(
+            pass(vec![recover("back")], returned).is_empty(),
+            "a node back from silence still reporting ended jobs is held, not drained"
+        );
+        assert_eq!(holds.get("back"), Some(&returned));
+    }
+
+    fn default_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap()
+    }
+
+    #[test]
+    fn the_hold_cap_covers_the_agent_kill_and_cleanup_budget_plus_a_heartbeat() {
+        let config = default_config();
+        let timeout = config.controller.effective_heartbeat_timeout_secs();
+        let budget = u64::from(config.complete_wait_floor_secs())
+            + spur_core::config::HEARTBEAT_INTERVAL_SECS;
+        assert!(
+            budget > timeout,
+            "at defaults the agent budget is the larger"
+        );
+
+        let cap = super::recovery_hold_cap(timeout, &config);
+
+        assert_eq!(cap, std::time::Duration::from_secs(budget));
+        // 221 s kill wait, cleanup, and epilog, plus a 30 s heartbeat.
+        assert_eq!(cap, std::time::Duration::from_secs(251));
+    }
+
+    #[test]
+    fn the_hold_cap_is_the_heartbeat_timeout_when_that_is_longer() {
+        let cap = super::recovery_hold_cap(600, &default_config());
+
+        assert_eq!(cap, std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_returning_node_stays_down_until_it_stops_reporting_ended_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "back", Some(Utc::now()));
+
+        cm.record_node_report("back", Some(super::NodeReport::StaleJobs(vec![1])));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
+
+        cm.record_node_report("back", None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("recovered after a clean report", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_node_re_registering_stays_down_until_a_heartbeat_reports() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        // An upgraded agent re-registers with a new version, which replicates a
+        // NodeUpdate to every controller and replays on restart.
+        cm.register_node(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "9.9.9".into(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("update applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.version.as_deref() == Some("9.9.9"))
+        });
+
+        assert_eq!(cm.get_node("n1").unwrap().last_heartbeat, None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(
+            cm.get_node("n1").unwrap().state,
+            NodeState::Down,
+            "recovery waits for a heartbeat that reports the node's jobs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_report_holds_recovery_until_a_clean_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "back", Some(Utc::now()));
+
+        // A heartbeat that could not enumerate the node's jobs is Unknown, not
+        // clean, so recovery stays held even though no stale job was named.
+        cm.record_node_report("back", Some(super::NodeReport::Unknown));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
+
+        cm.record_node_report("back", None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("recovered after a complete clean report", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_capped_out_node_admin_locks_it_until_resume() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::Drain {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+            reason: "Kill task failed (JobId=7)".into(),
+        }]);
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.admin_locked, "a cap-out drain must not auto-recover");
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("Kill task failed (JobId=7)")
+        );
+        assert_eq!(node.reason_uid, Some(0), "system-initiated, like a DOWN");
+        assert!(node.reason_time.is_some());
+
+        // A fresh heartbeat must not lift the admin drain.
+        cm.update_heartbeat("n1", 0, 8000);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Drain);
+
+        // Only an operator resume returns it to service.
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+        wait_for("resumed to idle", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_past_the_hold_cap_drains_and_admin_locks_the_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+        let now = Utc::now();
+        set_last_heartbeat(&cm, "n1", Some(now));
+        cm.record_node_report("n1", Some(super::NodeReport::StaleJobs(vec![7])));
+        let started = std::time::Instant::now();
+        let cap = super::recovery_hold_cap(90, &cm.config());
+        // The policy a liveness sweep passes after confirming no node gone.
+        let pass = |at| {
+            cm.check_node_health_at(90, super::MarkDownPolicy::Only(HashSet::new()), now, at);
+        };
+
+        pass(started);
+        pass(started + cap - std::time::Duration::from_secs(1));
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        assert!(cm.is_recovery_held("n1"));
+
+        pass(started + cap);
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.admin_locked);
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("Kill task failed (JobId=7)")
+        );
+        assert_eq!(node.reason_uid, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cap_drain_skips_a_node_an_operator_changed_since_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+        let drain = || super::HealthAction::Drain {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+            reason: "Kill task failed (JobId=7)".into(),
+        };
+
+        cm.update_node_state("n1", NodeState::Down, Some("bad dimm".into()), Some(1000))
+            .unwrap();
+        cm.apply_health_actions(vec![drain()]);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.state_reason.as_deref(), Some("bad dimm"));
+        assert_eq!(node.reason_uid, Some(1000));
+
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+        cm.apply_health_actions(vec![drain()]);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Idle);
+        assert!(!node.admin_locked);
+    }
+
+    async fn held_down_node(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "n1", Some(Utc::now()));
+        cm.record_node_report("n1", Some(super::NodeReport::StaleJobs(vec![1])));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert!(cm.is_recovery_held("n1"));
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_resume_ends_a_recovery_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = held_down_node(&dir).await;
+
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+
+        assert!(!cm.is_recovery_held("n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_node_forgets_its_report_and_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = held_down_node(&dir).await;
+
+        cm.remove_node("n1", false, None).unwrap();
+
+        assert!(!cm.is_recovery_held("n1"));
+        assert!(!cm.reports_stale_jobs("n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_report_from_an_unknown_node_is_not_kept() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.record_node_report("ghost", Some(super::NodeReport::StaleJobs(vec![1])));
+
+        assert!(!cm.reports_stale_jobs("ghost"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_flags_a_silent_node_not_responding_and_a_heartbeat_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // Kept alive by the probe (Only with nobody confirmed), but still silent:
+        // the node is flagged and stops taking work, though its state stays up.
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.not_responding);
+        assert!(node.state.is_up() && !node.is_schedulable());
+
+        cm.update_heartbeat("n1", 0, 8000);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_window_does_not_flag_nodes_not_responding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // A just-elected leader has not heard from anyone yet; it must not flag
+        // the whole cluster not-responding during its grace window.
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_not_responding_restores_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        assert!(cm.get_node("n1").unwrap().not_responding);
+
+        cm.clear_not_responding();
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    async fn down_node_without_heartbeat(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        assert_eq!(cm.get_node("n1").unwrap().last_heartbeat, None);
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_flags_a_down_node_the_leader_has_not_heard_and_a_heartbeat_clears_it() {
+        for policy in [
+            super::MarkDownPolicy::Allowed,
+            super::MarkDownPolicy::Only(HashSet::new()),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = down_node_without_heartbeat(&dir).await;
+
+            cm.check_node_health(90, policy.clone());
+            assert!(
+                cm.get_node("n1").unwrap().not_responding,
+                "{policy:?} should flag a down node with no heartbeat"
+            );
+
+            cm.update_heartbeat("n1", 0, 8000);
+            assert!(!cm.get_node("n1").unwrap().not_responding);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_window_does_not_flag_a_down_node_with_no_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        let cm = down_node_without_heartbeat(&dir).await;
+
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_nodes_counts_only_nodes_a_timeout_would_mark_down() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["fresh", "stale", "drained", "down"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        let old = Utc::now() - chrono::Duration::seconds(200);
+        {
+            let mut nodes = cm.nodes.write();
+            nodes.get_mut("stale").unwrap().last_heartbeat = Some(old);
+            let drained = nodes.get_mut("drained").unwrap();
+            drained.state = NodeState::Drain;
+            drained.last_heartbeat = Some(old);
+            let down = nodes.get_mut("down").unwrap();
+            down.state = NodeState::Down;
+            down.last_heartbeat = None;
+        }
+
+        let stale = cm.stale_nodes(90, std::time::Duration::from_secs(30), Utc::now());
+        assert_eq!(stale.names, vec!["stale".to_string()]);
+        assert_eq!(
+            stale.watched, 2,
+            "fresh and stale are watched; a drained or down node is not"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_nodes_counts_recent_silence_and_leaves_out_suspended_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let names = [
+            "fresh",
+            "late",
+            "silent",
+            "stale",
+            "suspended-silent",
+            "suspended-stale",
+        ];
+        for name in names {
+            register_node(&cm, name, 4, 8000);
+        }
+        let ago = |secs| Some(Utc::now() - chrono::Duration::seconds(secs));
+        // Within one interval plus slack, a beat is late, not missed.
+        set_last_heartbeat(&cm, "late", ago(40));
+        set_last_heartbeat(&cm, "silent", ago(60));
+        set_last_heartbeat(&cm, "stale", ago(200));
+        set_last_heartbeat(&cm, "suspended-silent", ago(60));
+        set_last_heartbeat(&cm, "suspended-stale", ago(200));
+        set_node_state(&cm, "suspended-silent", NodeState::Suspended);
+        set_node_state(&cm, "suspended-stale", NodeState::Suspended);
+
+        let stale = cm.stale_nodes(90, std::time::Duration::from_secs(30), Utc::now());
+        let mut stale_names = stale.names.clone();
+        stale_names.sort();
+        assert_eq!(stale_names, vec!["stale", "suspended-stale"]);
+        assert_eq!(
+            stale.suspended,
+            HashSet::from(["suspended-stale".to_string()])
+        );
+        assert_eq!(stale.watched, 4);
+        assert_eq!(stale.recently_silent, 1);
+    }
+
+    #[test]
+    fn the_missed_heartbeat_threshold_follows_the_timeout_and_tick() {
+        let secs =
+            |timeout, tick| missed_heartbeat_secs(timeout, std::time::Duration::from_secs(tick));
+        assert_eq!(secs(90, 30), 45, "defaults");
+        assert_eq!(secs(45, 15), 35);
+        assert_eq!(secs(55, 15), 40);
+        assert_eq!(secs(60, 30), 35);
+        assert_eq!(secs(35, 60), 35, "a tick longer than the timeout");
+        assert_eq!(secs(300, 30), 45);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recovery_preserves_an_admin_drain_raced_against_the_health_check() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -38994,6 +41217,7 @@ state = "UP"
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         assert_eq!(
@@ -39038,6 +41262,7 @@ state = "UP"
             labels: HashMap::new(),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -39090,6 +41315,7 @@ state = "UP"
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -39142,6 +41368,7 @@ state = "UP"
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
             source: NodeSource::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -39184,11 +41411,13 @@ state = "UP"
 
         let snap = ClusterSnapshot {
             preemption_usage: Default::default(),
+            node_inventory: None,
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),
             partitions: None,
             deleted_partition_names: HashSet::new(),
+            deleted_nodes: HashMap::new(),
             steps: Vec::new(),
             license_pool: HashMap::new(),
             tokens: Vec::new(),
@@ -39416,6 +41645,8 @@ state = "UP"
             name: "n1".into(),
             reason: Some("decommission".into()),
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
         assert!(cm.get_node("n1").is_none());
     }
@@ -39433,6 +41664,8 @@ state = "UP"
             name: "n1".into(),
             reason: None,
             at: None,
+            agent_instance: String::new(),
+            comm_url: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
@@ -39502,6 +41735,293 @@ state = "UP"
         wait_for("n1 removed", || cm.get_node("n1").is_none());
 
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    fn register_agent(
+        cm: &ClusterManager,
+        name: &str,
+        instance: &str,
+    ) -> Result<(), RegisterNodeError> {
+        cm.register_agent_node(
+            instance.into(),
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn agent_register_op(name: &str, instance: &str) -> WalOperation {
+        WalOperation::NodeRegister {
+            name: name.into(),
+            hostname: name.into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
+            agent_instance: instance.into(),
+        }
+    }
+
+    fn remove_op(name: &str, instance: &str) -> WalOperation {
+        WalOperation::NodeRemove {
+            name: name.into(),
+            reason: None,
+            at: None,
+            agent_instance: instance.into(),
+            comm_url: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_node_stays_out_until_its_spurd_restarts() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_agent(&cm, "n1", "first").unwrap();
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        let err = register_agent(&cm, "n1", "first").expect_err("the deleted spurd stays out");
+        assert!(matches!(err, RegisterNodeError::Deleted(_)), "{err}");
+        assert!(cm.get_node("n1").is_none());
+
+        register_agent(&cm, "n1", "second").expect("a restarted spurd is admitted");
+        let node = cm.get_node("n1").expect("n1 is back");
+        assert_eq!(node.agent_instance.as_deref(), Some("second"));
+        assert!(
+            !cm.is_deleted_agent("n1", "first"),
+            "readmission clears the delete record"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_node_without_an_agent_instance_does_not_keep_it_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        try_register_node(&cm, "n1", 4, 8000).expect("an older agent re-registers as before");
+        assert!(cm.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_reregistration_records_the_new_agent_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_agent(&cm, "n1", "first").unwrap();
+        register_agent(&cm, "n1", "second").unwrap();
+        assert_eq!(
+            cm.get_node("n1").unwrap().agent_instance.as_deref(),
+            Some("second")
+        );
+
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+        assert!(cm.is_deleted_agent("n1", "second"));
+        assert!(!cm.is_deleted_agent("n1", "first"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replicas_apply_a_registration_whatever_their_delete_records_say() {
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (kept_out, unrecorded) = (test_cluster(&dir_a).await, test_cluster(&dir_b).await);
+        for (cm, recorded) in [(&kept_out, "first"), (&unrecorded, "")] {
+            cm.apply_operation(&agent_register_op("n1", "first"));
+            cm.apply_operation(&remove_op("n1", recorded));
+        }
+        assert!(kept_out.is_deleted_agent("n1", "first"));
+
+        for cm in [&kept_out, &unrecorded] {
+            cm.apply_operation(&agent_register_op("n1", "first"));
+            assert!(cm.get_node("n1").is_some());
+            assert!(!cm.is_deleted_agent("n1", "first"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_path_registration_records_the_new_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+        cm.register_agent_node(
+            "second".into(),
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.total_resources.cpus, 8, "took the update path");
+        assert_eq!(node.agent_instance.as_deref(), Some("second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_delete_of_a_busy_node_also_keeps_its_spurd_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        cm.remove_node("n1", true, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+        assert!(matches!(
+            register_agent(&cm, "n1", "first"),
+            Err(RegisterNodeError::Deleted(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_agent_taking_over_the_node_clears_its_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+
+        try_register_node(&cm, "n1", 4, 8000).unwrap();
+        assert_eq!(cm.get_node("n1").unwrap().agent_instance, None);
+
+        cm.remove_node("n1", false, None).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+        assert!(!cm.is_deleted_agent("n1", "first"));
+        register_agent(&cm, "n1", "first").expect("nothing was recorded against it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_records_only_the_instance_its_entry_carries() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1", ""));
+        assert!(
+            !cm.is_deleted_agent("n1", "first"),
+            "an entry from an older leader records nothing"
+        );
+
+        cm.apply_operation(&agent_register_op("n1", ""));
+        cm.apply_operation(&remove_op("n1", "second"));
+        assert!(cm.is_deleted_agent("n1", "second"));
+        assert!(
+            !cm.is_deleted_agent("n1", ""),
+            "an empty instance never matches"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_later_registration_of_the_name_clears_the_delete_record() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1", "first"));
+        assert!(cm.is_deleted_agent("n1", "first"));
+
+        cm.apply_operation(&agent_register_op("n1", ""));
+
+        assert!(cm.get_node("n1").is_some());
+        assert!(!cm.is_deleted_agent("n1", "first"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_relabel_still_records_the_new_instance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_agent(&cm, "n1", "first").unwrap();
+
+        let err = cm
+            .register_agent_node(
+                "second".into(),
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::from([("rack".to_string(), "r1".to_string())]),
+                Vec::new(),
+                false,
+            )
+            .expect_err("an unprivileged relabel is refused");
+
+        assert!(
+            matches!(err, RegisterNodeError::PermissionDenied(_)),
+            "{err}"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().agent_instance.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_record_survives_snapshot_restore() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&agent_register_op("n1", "first"));
+        cm.apply_operation(&remove_op("n1", "first"));
+        let bytes = cm.snapshot_state().unwrap();
+
+        let other_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&other_dir).await;
+        restored.apply_operation(&agent_register_op("n2", "other"));
+        restored.apply_operation(&remove_op("n2", "other"));
+        restored.restore_from_snapshot(&bytes).unwrap();
+        assert!(restored.is_deleted_agent("n1", "first"));
+        assert!(
+            !restored.is_deleted_agent("n2", "other"),
+            "restore replaces the delete records"
+        );
+
+        // Frozen snapshot from before delete records existed.
+        restored
+            .restore_from_snapshot(
+                br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{}}"#,
+            )
+            .expect("an older snapshot still restores");
+        assert!(!restored.is_deleted_agent("n1", "first"));
     }
 
     /// A stopping agent must not delete its node: the record carries the
@@ -39631,6 +42151,7 @@ state = "UP"
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 
@@ -41378,7 +43899,7 @@ mod idle_fill_aggregate_tests {
         qos_block_with(
             job,
             qos,
-            jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
@@ -41572,7 +44093,7 @@ mod idle_fill_aggregate_tests {
         account_block_with(
             job,
             assoc,
-            jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
         )
@@ -41738,7 +44259,7 @@ mod idle_fill_aggregate_tests {
         let charge = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
@@ -41759,7 +44280,7 @@ mod idle_fill_aggregate_tests {
         let charge = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
@@ -42032,7 +44553,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut bob,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
@@ -42056,7 +44577,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut cand,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
@@ -42090,7 +44611,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut cand,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&HashMap::new()),
             &PassReservations::default(),
             None,
@@ -42161,7 +44682,7 @@ mod idle_fill_aggregate_tests {
         let admitted = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )
@@ -42179,7 +44700,7 @@ mod idle_fill_aggregate_tests {
         let admitted = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &ReuseView::uncapped(&nodes),
             &PassReservations::default(),
         )

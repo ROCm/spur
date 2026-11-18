@@ -30,6 +30,17 @@ cargo build
 - Slurm compatibility is a migration bridge, not a design constraint. Only user-facing surfaces (CLI, REST API, FFI) need to stay compatible. Internals should prefer simple, modern defaults — do not inherit legacy complexity.
 - User-facing changes ship with docs. Whenever you change CLI flags, REST/gRPC API surface, config fields, or user-visible behavior, check `docs/` and update the pages that describe it; a new feature must always be documented — consider whether it warrants its own page or subsection rather than a passing mention.
 
+## Knowledge Base
+
+The knowledge base is `docs/knowledge/<area>/*.md` (cross-crate) plus each crate's `AGENTS.md` (crate-local). It is for agents and maintainers, not users; user-facing docs live in `docs/`. Update it in the same PR as the code change. CI (`scripts/check-knowledge-sync.sh`, and the KB Accuracy check on PRs labeled `kb-check`) only detects drift; it does not fix it.
+
+- **When**: you change an invariant, constant, default, state machine, protocol, persisted format, or architectural boundary that the KB describes or should describe.
+- **Where**: crate-internal facts go in that crate's `AGENTS.md`; facts spanning crates go in the matching `docs/knowledge/<area>/` file. State each fact in one place and link to it from elsewhere; do not copy it.
+- **How**: edit the existing statement in place, in present tense. Name the symbol alongside the value (e.g. `RAFT_MAX_MESSAGE_SIZE` (32 MiB)) so drift is greppable. Delete claims that are no longer true; do not add "update:" or "previously" notes.
+- **What not to add**: change history, issue/PR numbers, narration of code, or anything obvious from reading the source.
+- **Before opening a PR**: grep the KB for the symbols and values you changed, and run `scripts/check-knowledge-sync.sh`.
+- **New area**: a new `docs/knowledge/<area>/` directory must also be added to the directory list in `scripts/check-kb-accuracy.sh`, or the KB Accuracy check will not read it.
+
 ## Git Workflow
 
 PRs are squash-merged, so the **PR title is the final commit message**. Use conventional commit format for PR titles: `<type>(<scope>): <message>`
@@ -124,7 +135,7 @@ Each crate has an `AGENTS.md` with architecture, key types, state machines, test
 | Job state machine | `crates/spur-core/src/job.rs` (13 states, transition matrix) |
 | Node state machine | `crates/spur-core/src/node.rs` (9 states, event-driven) |
 | Scheduling algorithm | `crates/spur-sched/src/backfill.rs` |
-| Raft/WAL operations | `crates/spur-core/src/wal.rs` (41 variants) |
+| Raft/WAL operations | `crates/spur-core/src/wal.rs` (42 variants) |
 | User-facing docs (Sphinx) | `docs/` |
 | E2E tests (Python) | `tests/native_host/e2e/`, `tests/k8s/e2e/` |
 | Unit/component tests (Rust) | `crates/spur-tests/src/` |

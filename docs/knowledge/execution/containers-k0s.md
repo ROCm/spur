@@ -133,6 +133,21 @@ rootfs:
   `/proc/self/fd`.
 - `/run` -- tmpfs.
 
+The rootfs is the user's image, set up by root before `pivot_root`, so every
+path into it goes through open directory handles (`scratch.rs`):
+
+- `/dev`, `/proc`, `/sys`, `/tmp`, `/etc` and `/run` must be real directories;
+  a link at any of them refuses the container.
+- A bind-mount destination (`--container-mounts`, the home mount, device
+  plans, `mounts.d`) follows the image's own links as the container will see
+  them: an absolute link restarts at the rootfs and `..` stops there
+  (`open_mount_point`), so `/lib -> usr/lib` keeps working and nothing leads
+  onto the host.
+- Every mount targets the handle it was checked through, as
+  `/proc/self/fd/<n>`, so renaming or linking along the path afterwards cannot
+  redirect it. The fresh `/dev` tmpfs is reopened, checked to be a different
+  filesystem from the rootfs, and filled through that handle.
+
 ### pivot_root
 
 `pivot_into_rootfs` replaces the process's root filesystem:
@@ -152,8 +167,11 @@ the privilege dropped by the next.
 
 ### User identity
 
-`setup_shadow` appends the job user to the container's `/etc/passwd` and
+`setup_shadow` adds the job user to the container's `/etc/passwd` and
 `/etc/group` (idempotent) and creates the home directory inside the rootfs.
+Both files are rewritten and renamed into place rather than appended to, and
+a user name or home directory containing `:` or a control character is
+refused, since either would let the job write account lines of its choosing.
 
 ### DNS
 
@@ -228,7 +246,9 @@ reads this file and layers the job environment on top.
 - `/etc/spur/container.d/hooks.d/*.sh` -- shell scripts run with
   `ENROOT_ROOTFS` and `SPUR_HOOK_ENVIRON` (also `ENROOT_ENVIRON` for
   compatibility). Hooks can inject environment variables by appending
-  `KEY=VALUE` lines to `$SPUR_HOOK_ENVIRON`.
+  `KEY=VALUE` lines to `$SPUR_HOOK_ENVIRON`, a fresh root-owned file in the
+  node's temp directory (not the rootfs, where the job's user could swap it
+  for a link), removed once read.
 - `/etc/spur/container.d/environ.d/*.env` -- static `KEY=VALUE` files
   parsed and added to the environment.
 - `/etc/spur/container.d/mounts.d/*.fstab` -- fstab-style `src dst` lines,

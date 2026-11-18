@@ -123,7 +123,7 @@ All configuration is TOML at `/etc/spur/spur.conf`, parsed by
 | `[rest_api]` | Slurm-compat REST API on port 6820, off by default. |
 | `[hooks]` | Prolog/epilog/task hooks, job_submit shell/lua scripts. All paths must be absolute. |
 | `[devices]` | CDI, GRES discovery configuration. |
-| `[admission]` | Node admission mode (`open`/`token`). |
+| `[admission]` | Node admission mode (`open`/`token`), optional `node_names` list of allowed nodes (saved by `scontrol reconfigure`); unset means any node that passes the mode registers, with no name filter. |
 | `[rlimits]` | Per-step RLIMIT_MEMLOCK (`unlimited`/`inherit`/bytes). |
 | `[cgroup]` | cgroup-v2 enforcement: enabled, required, constrain_cores/ram/swap/devices, cleanup timeout, OOM group, device filter extra paths. |
 | `[mpi]` | PMIx plugin directory, tmpdir, min version, modex timeouts. |
@@ -332,7 +332,10 @@ tunnels for Raft elections.
 
 Deregister from the cluster **first** (`spur node remove <node>`), then drop
 the mesh peer (`spur net remove-peer`).  In HA, remove the peer on every
-controller.
+controller.  Disable `spurd` on the departed host: a restarted `spurd` adds
+the node back.  With `[admission] node_names`, drop the name from the list and run
+`scontrol reconfigure` instead; it deletes the node and keeps it from
+registering again.
 
 ---
 
@@ -398,6 +401,11 @@ spur version --check     # check for updates
 spur self-update          # download + replace binaries (stable)
 spur self-update --nightly
 ```
+
+`spur update` is the same binary-upgrade command. Both aliases parse arguments
+before invoking the updater: `--help` / `-h` prints help without network or install
+work, and unknown arguments fail with a usage error. Use `spur control update`
+for job or node changes.
 
 The updater downloads the tarball, verifies SHA-256, and replaces binaries
 atomically (rename to `.spur-old`, copy new, delete backups; rollback on
@@ -502,7 +510,8 @@ scraper at all controllers and let it follow the leader.
 **Node metrics** (`/metrics/nodes`): `spur_nodes`, `spur_nodes_<state>`,
 `spur_nodes_cpus`/`spur_nodes_cpus_alloc`,
 `spur_nodes_memory_bytes`/`spur_nodes_memory_alloc_bytes`,
-`spur_nodes_gpus`/`spur_nodes_gpus_alloc`.  Per-node: `spur_node_cpus`,
+`spur_nodes_gpus`/`spur_nodes_gpus_alloc`, `spur_nodes_not_responding`,
+`spur_nodes_liveness_breaker_tripped`, `spur_nodes_silent_answering`.  Per-node: `spur_node_cpus`,
 `spur_node_gpus`, `spur_node_cpu_load`, `spur_node_free_memory_bytes`.
 
 **k0s metrics** (`/metrics/k8s`): `spur_k8s_cluster_up`,
@@ -549,6 +558,11 @@ config until restarted.  Some fields are live (partitions, scheduler parameters,
 `private_data`); others require a daemon restart (metrics bind, tick interval,
 max jobs per cycle).  `spurd` reads `[cgroup]` only at startup.
 
+`admission.node_names` is saved through Raft only by `scontrol reconfigure`, and
+only when the list differs from the saved one; a removed field equals a cleared
+list.  A restart never saves it or deletes nodes.  Its Raft entry is new, so
+set the field only after every controller is upgraded.
+
 ### Snapshot recovery
 
 Raft state lives in `{state_dir}/raft/`.  Default recovery mode is **strict**:
@@ -574,7 +588,8 @@ timeout_secs = 60
 ```
 
 The controller submits each check as a real job.  Non-zero exit drains the
-node.  Resume to re-validate.
+node.  Resume to re-validate.  Only idle, allocated, and mixed nodes are
+checked: down, drained, and not-responding (`*` in `sinfo`) nodes are skipped.
 
 ### Add/remove agents
 

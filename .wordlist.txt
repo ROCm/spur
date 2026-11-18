@@ -311,6 +311,7 @@ setuid
 SHA
 shmem
 SIGCONT
+SIGINT
 SIGKILL
 SIGSTOP
 SIGTERM
@@ -351,6 +352,7 @@ StorageClass
 strigger
 subcommand
 subcommands
+subdirectory
 submitter's
 submitters
 subnet

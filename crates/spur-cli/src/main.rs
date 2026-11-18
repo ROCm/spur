@@ -34,6 +34,7 @@ mod scancel;
 mod scontrol;
 mod scrontab;
 mod sdiag;
+mod self_update;
 mod sinfo;
 mod smd;
 mod sprio;
@@ -295,18 +296,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         "self-update" | "update" => {
-            let nightly = args.iter().any(|a| a == "--nightly");
-            let channel = if nightly {
-                spur_update::check::Channel::Nightly
-            } else {
-                spur_update::check::Channel::Stable
-            };
-            runtime.block_on(spur_update::self_update_cli(
-                "ROCm/spur",
-                env!("CARGO_PKG_VERSION"),
-                &channel,
-                spur_update::SPUR_BINARIES,
-            ))
+            runtime.block_on(self_update::main_with_args(args[1..].to_vec()))
         }
         "help" | "--help" | "-h" => {
             let _ = write_usage(&mut std::io::stdout().lock());
@@ -381,7 +371,7 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         w,
-        "  self-update Download and install the latest version (--nightly)"
+        "  self-update Download and install the latest version (--nightly; alias: update)"
     )?;
     writeln!(w)?;
     writeln!(w, "Slurm-compatible aliases (also work as symlinks):")?;
@@ -419,6 +409,7 @@ mod tests {
         crate::scontrol::ScontrolArgs::command().debug_assert();
         crate::scrontab::ScrontabArgs::command().debug_assert();
         crate::sdiag::SdiagArgs::command().debug_assert();
+        crate::self_update::SelfUpdateArgs::command().debug_assert();
         crate::sinfo::SinfoArgs::command().debug_assert();
         crate::smd::SmdArgs::command().debug_assert();
         crate::sprio::SprioArgs::command().debug_assert();

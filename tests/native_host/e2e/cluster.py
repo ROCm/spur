@@ -175,6 +175,55 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
             controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
+@contextlib.contextmanager
+def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop one node's outbound traffic to every controller's client port, so its
+    agent cannot heartbeat but controllers can still reach it. Always undone on exit."""
+    node = cluster.nodes[node_index]
+    rule_args = f"-p tcp --dport {port} -j DROP"
+    node.exec(f"sudo iptables -I OUTPUT {rule_args}")
+    try:
+        yield
+    finally:
+        node.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop inbound traffic to one controller's client port from every node, so no
+    heartbeat reaches it while Raft and its calls to agents keep working.
+    Always undone on exit."""
+    controller = cluster.nodes[node_index]
+    sources = ",".join(node.host for node in cluster.nodes)
+    rule_args = f"-p tcp --dport {port} -s {sources} -j DROP"
+    controller.exec(f"sudo iptables -I INPUT {rule_args}")
+    try:
+        yield
+    finally:
+        controller.exec_allow_fail(f"sudo iptables -D INPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def isolate_controller(cluster: "SpurCluster", node_index: int):
+    """Cut one controller off from every node both ways, keeping Raft up, so it can
+    neither hear a heartbeat nor probe an agent. Always undone on exit."""
+    controller = cluster.nodes[node_index]
+    hosts = ",".join(node.host for node in cluster.nodes)
+    rules = [
+        f"INPUT -p tcp --dport {CONTROLLER_PORT} -s {hosts} -j DROP",
+        f"OUTPUT -p tcp --dport {AGENT_PORT} -d {hosts} -j DROP",
+    ]
+    added = []
+    try:
+        for rule in rules:
+            controller.exec(f"sudo iptables -I {rule}")
+            added.append(rule)
+        yield
+    finally:
+        for rule in added:
+            controller.exec_allow_fail(f"sudo iptables -D {rule}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 
@@ -674,15 +723,36 @@ class SpurCluster:
         *,
         salloc_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
+        all_nodes: bool = False,
+        tty: bool = False,
     ) -> tuple[int, str]:
         """Run salloc with *shell_body* as the allocation shell (via ``SHELL``).
 
         salloc exports allocation env vars into the shell, then cancels the job
         when the shell exits.  Returns ``(exit_code, combined_output)``.
+        Set *all_nodes* when the shell runs on an allocated node rather than
+        here (``salloc --interactive-step``), and *tty* to give salloc a
+        terminal for stdin instead of the harness's non-TTY SSH channel.
         """
+        cmd = self.salloc_command(shell_body, salloc_args=salloc_args,
+                                  extra_env=extra_env, all_nodes=all_nodes)
+        if tty:
+            cmd = f"script -qec {shlex.quote(cmd)} /dev/null"
+        return self.nodes[0].exec_with_exit(cmd)
+
+    def salloc_command(
+        self,
+        shell_body: str,
+        *,
+        salloc_args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
+        all_nodes: bool = False,
+    ) -> str:
+        """The command line :meth:`salloc_run` runs, for tests that drive it."""
         script_path = self.write_file(
             f"salloc-shell-{time.time_ns()}.sh",
             f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
+            all_nodes=all_nodes,
         )
 
         cmd_parts = self._cli_env_assignments()
@@ -692,7 +762,7 @@ class SpurCluster:
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
         cmd_parts.append("salloc")
         cmd_parts.extend(shlex.quote(a) for a in (salloc_args or ["-N", "1", "-t", "0:05"]))
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
+        return " ".join(cmd_parts)
 
     def squeue(self, args: list[str]) -> str:
         return self.cli(["squeue"] + args)
@@ -1319,11 +1389,9 @@ class SpurCluster:
             f"within {timeout}s"
         )
 
-    def restart_controller(self):
-        """Restart spurctld without touching the agents. State is recovered
-        from the Raft log on the existing state-dir. Waits for the controller
-        to answer queries again (does not require nodes to be idle, since a
-        suspended job keeps its allocation)."""
+    def restart_controller(self, *, expected_nodes: list[str] | None = None):
+        """Restart spurctld only and wait until ``expected_nodes`` (default: all)
+        are listed again; nodes need not be idle."""
         if self.ha_controller_count > 1:
             # Node 0 is hardcoded below, and sinfo would be answered by any
             # peer, so the readiness poll proves nothing under HA.
@@ -1331,8 +1399,9 @@ class SpurCluster:
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
         self._start_controller()
+        expected = set(self.node_names if expected_nodes is None else expected_nodes)
         wait_until(
-            lambda: set(self.node_names) <= self.sinfo_nodes().keys(),
+            lambda: expected <= self.sinfo_nodes().keys(),
             timeout_s=60, interval_s=2,
             desc="controller recovery after restart", tolerate=(Exception,),
         )
@@ -1383,7 +1452,7 @@ R='{rootfs}'
 mkdir -p "$R/bin" "$R/usr/bin" "$R/lib" "$R/lib64" \
   "$R/etc" "$R/dev" "$R/proc" "$R/sys" "$R/tmp" \
   "$R/run" "$R/home" "$R/mnt"
-for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent pwd grep awk; do
+for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent pwd grep awk sed seq; do
   src=$(which "$b" 2>/dev/null) || continue
   [ -f "$src" ] && cp "$src" "$R/usr/bin/"
 done
@@ -1794,6 +1863,12 @@ tar -C "$R" -czf '{local_tar}' .
     def signal_controller(self, index: int, sig: str):
         """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""
         self._pkill(self.nodes[index], f"{self.bin_dir}/spurctld", sig=sig)
+
+    def signal_agent(self, index: int, sig: str):
+        """Send *sig* (e.g. ``KILL``) to the spurd on nodes[index]."""
+        self._pkill(
+            self.nodes[index], f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root, sig=sig
+        )
 
     def _kill_mint(self):
         for node in self.nodes:

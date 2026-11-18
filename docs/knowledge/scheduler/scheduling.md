@@ -219,9 +219,86 @@ partition override > global config.
 **Reservation protection** -- a job running inside an active reservation cannot
 be preempted by a job from the same or lower partition tier.
 
-**Victim selection** -- candidates are sorted by ascending QOS priority (cheapest
-first). The scheduler proves that evicting the selected victim set would
-actually place the pending job before committing.
+### Victim selection
+
+`satisfiable_victim_set` is shared by QOS preemption and idle-fill reclaim.
+Each caller supplies a `VictimPool` after its own eligibility checks; reclaim
+also applies a strict QOS-priority ceiling for an opportunistic reclaimer.
+The search simulates freeing whole nodes. A node counts only if it is suitable
+for the pending job and every occupant is eligible in that pool. Suspended,
+completing, protected, and newly assigned jobs remain in the occupant map, so
+evicting a running neighbour cannot make their node count as empty.
+
+`NodePlacement`, `node_request`, handoff ownership, and partition caps filter
+the candidate nodes. `node_request` requires a one-node GPU-total request to
+fit entirely on that node, including memory derived from the GPU count.
+The shortfall is the requested node count (at least one) minus suitable empty
+nodes. A non-positive shortfall or too few evacuable nodes returns no set
+before constructing the search heap.
+
+```mermaid
+flowchart TD
+    pool["Caller supplies eligible victims and all node occupants"]
+    filter["Apply placement, resource, reservation, handoff and cap checks"]
+    possible{"Positive shortfall and enough evacuable nodes?"}
+    rank["Rank evacuable nodes in a heap"]
+    pick["Pick the lowest-ranked current entry; add its new victims"]
+    recount["Credit every candidate node whose occupants are all selected"]
+    enough{"Node shortfall closed?"}
+    rerank["Refresh affected ranks and gains capped by the remaining shortfall"]
+    trial["Run trial placement on suitable empty and simulated emptied nodes"]
+    fits{"Pending job starts in the trial?"}
+    selected["Return victim set to caller"]
+    none["Return no set; evict nobody from this search"]
+
+    pool --> filter --> possible
+    possible -->|No| none
+    possible -->|Yes| rank --> pick --> recount --> enough
+    enough -->|No| rerank --> pick
+    enough -->|Yes| trial --> fits
+    fits -->|No| none
+    fits -->|Yes| selected
+```
+
+The rank is lexicographic: the **highest** victim QOS priority on the node,
+then `scheduler.preempt_victim_order`, then node name, all ascending. Thus
+evacuating a node is charged for its highest-priority occupant. The
+[key list, default, and reload rules](../../../crates/spur-core/AGENTS.md#victim-ordering)
+are defined with `SchedulerConfig`; an empty list leaves QOS priority and
+node name as the ranking keys, while recounting and the placement check still
+apply.
+
+| Key | Cost of adding a pick to the current victim set |
+|---|---|
+| `least_work` | Sum of each new victim's unsuspended current-run seconds times its allocated node count, divided by credited nodes freed. |
+| `fewest_jobs` | Number of new victims divided by credited nodes freed. |
+| `hash` | Stable hash of the preemptor's job ID and candidate node name. |
+
+Credited nodes include every additional candidate node the pick empties, capped
+at the remaining shortfall. Already selected jobs add no further cost. The
+recount uses the full newly emptied count, so a two-node shortfall behind two
+four-node jobs closes after selecting either job: its cost is divided by two,
+and all four emptied nodes are available to trial placement. The search uses
+controller memory only; fair-share and accounting history do not rank victims.
+See [heap maintenance](../../../crates/spurctld/AGENTS.md#victim-search-internals)
+for the rank invalidation rules.
+
+`places_once_emptied` removes victim resource usage and partition charges from
+a cloned trial state, then calls `BackfillScheduler::for_trial()` for the
+pending job. A sufficient node count alone is not proof of placement: GPU
+totals, topology, and the other placement rules must still admit the job.
+A refused trial logs at debug level and returns no set; the search does not
+try alternative sets within that pool invocation. Picks are greedy and never
+undone, so the returned set is not guaranteed to minimize total victims or
+lost work. Selection performs no eviction; after it returns, a caller failure
+partway through eviction can leave earlier victims evicted.
+
+QOS preemption searches releasing modes (`Cancel`/`Requeue`) separately from
+`Suspend`. A set found only in the suspend pool is discarded, because
+suspension retains allocations and cannot make room for the pending job.
+Idle-fill reclaim requeues selected victims.
+
+### Capacity handoff
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching

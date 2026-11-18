@@ -106,6 +106,28 @@ An interactive shell in a container with your home directory mounted:
 
    srun --container-image ubuntu:22.04 --container-mount-home bash
 
+How the Image Is Treated
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The node agent prepares the container as root before handing it to you, so it
+never lets anything in your image lead that work onto the node itself:
+
+- A mount destination (``--container-mounts``, ``--container-mount-home``) is
+  resolved the way the container will see it: links in the image are followed
+  inside the image. With ``/lib -> usr/lib`` in the image, a mount on
+  ``/lib/modules`` lands on the image's ``/usr/lib/modules``; an absolute link
+  such as ``/data -> /scratch`` leads to the image's own ``/scratch``, never the
+  node's. ``/tmp`` and ``/etc``, where Spur writes the job's entry script and its
+  account and DNS files, are resolved the same way, so ``/tmp -> var/tmp`` works.
+- The container refuses to start when the image's ``/dev``, ``/proc``, ``/sys``
+  or ``/run`` is a link, or when ``/etc/passwd`` or ``/etc/group`` is a link or
+  anything but a regular file, such as a FIFO or a device node.
+- A user name or home directory containing ``:`` or a control character such
+  as a newline is refused, since it would corrupt the container's
+  ``/etc/passwd``.
+- The image's ``/etc/resolv.conf`` is replaced with the node's DNS settings,
+  even when the image ships it as a link.
+
 Environment Inside the Container
 --------------------------------
 
@@ -144,15 +166,37 @@ flags above apply to a step's ``srun`` and behave as follows:
 - **Step inside a containerized allocation.** When the batch job was submitted
   with ``--container-image`` (``sbatch --container-image ...``), a nested
   ``srun`` step enters that already-running container — it shares the job's
-  image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
-  used by multi-node launchers. A nested ``srun`` there can authenticate only
-  if the ``sbatch`` (or ``salloc``) was submitted with
-  ``--container-auth-socket``.
+  image, mounts, and GPU devices. Pyxis does not support ``srun`` from inside a
+  containerized ``sbatch`` script; Spur lets the step join the job's container,
+  which is what multi-node launchers rely on. Naming the job's own image on the step
+  (``srun --container-image`` with the same image, including one inherited from
+  ``SRUN_CONTAINER``) also enters it. Two references are the same image when they
+  are identical or resolve to the same squashfs file. A step cannot use a
+  different image: ``srun --container-image`` naming one fails with an error
+  rather than run in the wrong image.
+  A nested ``srun`` there can authenticate only if the ``sbatch`` (or
+  ``salloc``) was submitted with ``--container-auth-socket``.
 
-- **Step with its own image.** A standalone ``srun --container-image`` (or an
-  ``salloc`` allocation followed by ``srun --container-image``) creates a fresh
-  container for that step. Different steps in one allocation can use different
-  images and mounts.
+- **Step with its own image.** A standalone ``srun --container-image``, an
+  ``salloc`` allocation followed by ``srun --container-image``, or an
+  ``srun --container-image`` inside an ``sbatch`` script that was submitted
+  without ``--container-image``, creates a fresh container for that step.
+  Different steps in one allocation can use different images and mounts. The job's
+  cgroup limits and GPU allocation still apply to the step. A step without
+  ``--container-image`` in such a batch job keeps running on the node's own
+  root filesystem.
+
+.. note::
+
+   Breaking change: ``srun --container-image=B`` inside a script submitted with
+   ``sbatch --container-image=A`` no longer runs the step in ``A`` and exits 0
+   with the flag ignored. It now fails, so scripts that rely on that must drop
+   the step's ``--container-image`` or submit the job without one.
+
+Every container Spur starts for a job, the batch job's and each fresh step's, has
+the job's spool folder ``/var/spool/spur/job<id>`` mounted read-only at the same
+path. Spur keeps the wrappers it generates for steps with several tasks per node,
+``--label`` or ``--mpi=pmix`` there, so those steps run in either kind of container.
 
 Allocate first, then run steps from inside the allocation shell. By default a
 single step fans out one container per allocated node; ``-N`` or ``-w`` limits
@@ -194,7 +238,7 @@ the image from its containerized ``sbatch`` job:
 
 A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
-a fresh one.
+a fresh one, and fails if it names a different image.
 
 Isolating Steps From Each Other
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

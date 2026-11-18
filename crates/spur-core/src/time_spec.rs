@@ -331,7 +331,7 @@ fn parse_time_of_day(spec: &str) -> Option<NaiveTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::FixedOffset;
+    use chrono::{FixedOffset, MappedLocalTime};
 
     /// A fixed reference so every expectation is exact: 2026-07-30 09:15:00 in a
     /// zone two hours ahead of UTC. Nothing here reads the runner's clock or TZ.
@@ -438,15 +438,87 @@ mod tests {
         assert_eq!(parse("2026-08-15T06:30-04:00"), "2026-08-15T10:30:00Z");
     }
 
+    /// A zone that jumps from UTC-5 to UTC-4 at 02:00 local on 2026-03-08, as
+    /// America/New_York does, so 02:00-03:00 that day never exists. The Skipped
+    /// path needs that gap, which a FixedOffset can never produce.
+    #[derive(Clone, Copy, Debug)]
+    struct SpringForward;
+
+    impl SpringForward {
+        const STANDARD: i32 = -5 * 3_600;
+        const DAYLIGHT: i32 = -4 * 3_600;
+
+        fn gap_start() -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(2, 0, 0)
+                .unwrap()
+        }
+
+        fn offset(seconds: i32) -> FixedOffset {
+            FixedOffset::east_opt(seconds).unwrap()
+        }
+    }
+
+    impl TimeZone for SpringForward {
+        type Offset = FixedOffset;
+
+        fn from_offset(_: &FixedOffset) -> Self {
+            SpringForward
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            let gap = Self::gap_start();
+            if *local < gap {
+                MappedLocalTime::Single(Self::offset(Self::STANDARD))
+            } else if *local < gap + Duration::hours(1) {
+                MappedLocalTime::None
+            } else {
+                MappedLocalTime::Single(Self::offset(Self::DAYLIGHT))
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            let switch = Self::gap_start() - Duration::seconds(Self::STANDARD.into());
+            if *utc < switch {
+                Self::offset(Self::STANDARD)
+            } else {
+                Self::offset(Self::DAYLIGHT)
+            }
+        }
+    }
+
     #[test]
     fn a_nonexistent_local_time_is_rejected() {
-        // The Skipped path needs a real spring-forward gap, which a FixedOffset
-        // can never produce. America/New_York jumps 02:00 -> 03:00 on
-        // 2026-03-08, so 02:30 that day does not exist in the local zone.
-        use chrono_tz::America::New_York;
-        let now = New_York.with_ymd_and_hms(2026, 3, 8, 0, 0, 0).unwrap();
+        let now = SpringForward.with_ymd_and_hms(2026, 3, 8, 0, 0, 0).unwrap();
         let err = parse_time_spec("2026-03-08T02:30:00", &now).unwrap_err();
         assert!(matches!(err, TimeSpecError::Skipped(_)), "{err}");
+    }
+
+    #[test]
+    fn the_test_zone_skips_exactly_one_hour() {
+        let at = |h, m| {
+            let day = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+            SpringForward
+                .from_local_datetime(&day.and_hms_opt(h, m, 0).unwrap())
+                .single()
+                .map(|t| t.with_timezone(&Utc).to_rfc3339())
+        };
+        assert_eq!(at(1, 59).as_deref(), Some("2026-03-08T06:59:00+00:00"));
+        assert_eq!(at(2, 0), None);
+        assert_eq!(at(2, 59), None);
+        assert_eq!(at(3, 0).as_deref(), Some("2026-03-08T07:00:00+00:00"));
     }
 
     #[test]

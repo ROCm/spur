@@ -12,7 +12,7 @@
 //! `JobKeepalive`, `ValidateBlockFile`); every other RPC reports `unimplemented`
 //! so an unexpected call fails loudly instead of silently returning a default.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,8 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
+    create_step_node: Arc<Mutex<String>>,
+    create_step_command: Arc<Mutex<Vec<String>>>,
     create_step_job_shell: Arc<AtomicBool>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
@@ -51,6 +53,9 @@ pub(crate) struct StepCapture {
     update_node_names: Arc<Mutex<Vec<String>>>,
     drain_node_names: Arc<Mutex<Vec<String>>>,
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
+    deregister_node_reasons: Arc<Mutex<Vec<String>>>,
+    deregister_node_errors: Arc<Mutex<HashMap<String, tonic::Code>>>,
+    delete_partition_names: Arc<Mutex<Vec<String>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     submit_job_id: Arc<AtomicU32>,
@@ -109,6 +114,15 @@ impl StepCapture {
         self.create_step_nodelist.lock().unwrap().clone()
     }
 
+    /// Legacy single-node target of the most recent `CreateJobStep`.
+    pub(crate) fn create_step_node(&self) -> String {
+        self.create_step_node.lock().unwrap().clone()
+    }
+
+    pub(crate) fn create_step_command(&self) -> Vec<String> {
+        self.create_step_command.lock().unwrap().clone()
+    }
+
     pub(crate) fn create_step_job_shell(&self) -> bool {
         self.create_step_job_shell.load(Ordering::SeqCst)
     }
@@ -160,6 +174,21 @@ impl StepCapture {
 
     pub(crate) fn deregister_node_calls(&self) -> Vec<(String, bool)> {
         self.deregister_node_calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn deregister_node_reasons(&self) -> Vec<String> {
+        self.deregister_node_reasons.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_deregister_node_error(&self, name: &str, code: tonic::Code) {
+        self.deregister_node_errors
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), code);
+    }
+
+    pub(crate) fn delete_partition_names(&self) -> Vec<String> {
+        self.delete_partition_names.lock().unwrap().clone()
     }
 
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
@@ -245,6 +274,8 @@ mock_controller_impl! {
                 .create_step_num_nodes
                 .store(request.num_nodes, Ordering::SeqCst);
             *self.capture.create_step_nodelist.lock().unwrap() = request.nodelist;
+            *self.capture.create_step_node.lock().unwrap() = request.node;
+            *self.capture.create_step_command.lock().unwrap() = request.command;
             self.capture
                 .create_step_job_shell
                 .store(request.job_shell, Ordering::SeqCst);
@@ -420,8 +451,20 @@ mock_controller_impl! {
                 .deregister_node_calls
                 .lock()
                 .unwrap()
-                .push((request.name, request.force));
+                .push((request.name.clone(), request.force));
+            self.capture.deregister_node_reasons.lock().unwrap().push(request.reason);
+            if let Some(code) = self.capture.deregister_node_errors.lock().unwrap().get(&request.name) {
+                return Err(tonic::Status::new(*code, "mock deregister_node failure"));
+            }
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
+        }
+
+        async fn delete_partition(
+            &self,
+            request: tonic::Request<proto::DeletePartitionRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            self.capture.delete_partition_names.lock().unwrap().push(request.into_inner().name);
+            Ok(tonic::Response::new(()))
         }
 
         async fn job_keepalive(
@@ -454,7 +497,6 @@ mock_controller_impl! {
         get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
         update_partition(proto::UpdatePartitionRequest) -> ();
-        delete_partition(proto::DeletePartitionRequest) -> ();
         reconfigure(()) -> ();
         get_job_steps(proto::GetJobStepsRequest) -> proto::GetJobStepsResponse;
         ping(()) -> proto::PingResponse;

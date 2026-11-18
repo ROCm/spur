@@ -1378,6 +1378,13 @@ impl Job {
             .filter(|pending| pending.run_attempt == self.run_attempt)
     }
 
+    /// The `EndTime` every job API reports: when the job ended or, while it is
+    /// inside a preemption grace, the grace deadline.
+    pub fn reported_end_time(&self) -> Option<DateTime<Utc>> {
+        self.end_time
+            .or_else(|| self.preempt_grace().map(|pending| pending.deadline))
+    }
+
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
         self.allocated_nodes
@@ -1438,8 +1445,13 @@ impl Job {
 
     /// Compute the run time.
     pub fn run_time(&self) -> Option<chrono::Duration> {
+        self.run_time_at(Utc::now())
+    }
+
+    /// Run time as of `now`, less time spent suspended.
+    pub fn run_time_at(&self, now: DateTime<Utc>) -> Option<chrono::Duration> {
         let start = self.start_time?;
-        let end = self.end_time.unwrap_or_else(Utc::now);
+        let end = self.end_time.unwrap_or(now);
         let mut suspended = self.suspended_secs;
         if let Some(since) = self.suspended_at {
             suspended += (end - since).num_seconds().max(0);

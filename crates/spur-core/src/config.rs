@@ -127,6 +127,19 @@ pub struct SlurmConfig {
     /// direction of `[controller] agent_*`.
     #[serde(default)]
     pub spurd: SpurdConfig,
+
+    /// `salloc` behavior, read by the CLI from the submit host's `spur.conf`.
+    #[serde(default)]
+    pub salloc: SallocConfig,
+}
+
+/// Client-side `salloc` settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SallocConfig {
+    /// Start the allocation's shell as an interactive step on its first node
+    /// instead of on the submit host (Slurm `LaunchParameters=use_interactive_step`).
+    #[serde(default)]
+    pub use_interactive_step: bool,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -355,8 +368,10 @@ pub struct ControllerConfig {
     #[serde(default = "default_raft_listen_addr")]
     pub raft_listen_addr: String,
 
-    /// Seconds without a heartbeat before a node is marked Down.
-    /// Defaults to 90 when absent.
+    /// Seconds without a heartbeat before the leader checks on a node. A node
+    /// whose agent still answers is kept; one that fails two checks a health
+    /// pass apart is marked Down. Defaults to 90 when absent. Also the
+    /// shortest recovery hold before a node still reporting ended jobs is drained.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
@@ -364,6 +379,14 @@ pub struct ControllerConfig {
     /// `[controller] health_tick_secs` (default: 30).
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
+
+    /// Largest fraction of watched nodes that may be suspect in one health pass
+    /// before the leader suspects its own connectivity and marks none Down
+    /// (default: 0.5; 1.0 disables the check). Suspects fail a liveness probe or
+    /// are operator-managed past the timeout; nodes that only missed a heartbeat
+    /// count only in a pass with one of those.
+    #[serde(default = "default_max_stale_node_fraction")]
+    pub max_stale_node_fraction: f64,
 
     /// Maximum automatic requeues (excluding preemption) before a job is held
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
@@ -430,6 +453,10 @@ fn default_max_batch_requeue() -> u32 {
 
 fn default_health_tick_secs() -> u64 {
     30
+}
+
+fn default_max_stale_node_fraction() -> f64 {
+    0.5
 }
 
 fn default_terminal_job_retention_secs() -> u64 {
@@ -534,6 +561,7 @@ impl Default for ControllerConfig {
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
             health_tick_secs: default_health_tick_secs(),
+            max_stale_node_fraction: default_max_stale_node_fraction(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
@@ -555,14 +583,16 @@ impl ControllerConfig {
     }
 
     /// A warning when a shutdown drain can outlast agent heartbeats: the draining controller
-    /// answers none, yet keeps checking node health, so it marks nodes DOWN and fails their jobs.
+    /// answers none, yet keeps checking node health, so it flags nodes not responding and can
+    /// mark operator-managed nodes, which it cannot probe, DOWN.
     pub fn shutdown_grace_warning(&self) -> Option<String> {
         let timeout = self.effective_heartbeat_timeout_secs();
         if self.shutdown_grace_secs == 0 {
             return Some(format!(
                 "[controller] shutdown_grace_secs = 0 lets a shutdown drain outlast \
                  heartbeat_timeout_secs ({timeout}s); the draining controller answers no \
-                 heartbeats, so it would mark nodes DOWN and fail their jobs"
+                 heartbeats, so it would flag nodes not responding and could mark \
+                 operator-managed nodes DOWN"
             ));
         }
         // A node's last heartbeat can be one interval old at the signal, and the flush follows.
@@ -573,7 +603,7 @@ impl ControllerConfig {
         Some(format!(
             "[controller] shutdown_grace_secs ({}s) is within {margin}s of heartbeat_timeout_secs \
              ({timeout}s); the draining controller answers no heartbeats, so a full drain would \
-             mark nodes DOWN and fail their jobs",
+             flag nodes not responding and could mark operator-managed nodes DOWN",
             self.shutdown_grace_secs
         ))
     }
@@ -755,6 +785,9 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Keys ranking equal-QOS-priority victims, in precedence order; `[]` leaves node-name order.
+    #[serde(default = "default_preempt_victim_order")]
+    pub preempt_victim_order: Vec<crate::partition::VictimOrderKey>,
     /// Master switch for idle-fill scheduling. `false` (default) means no
     /// behavior change anywhere: an over-quota job never borrows spare capacity.
     #[serde(default)]
@@ -954,6 +987,9 @@ fn default_max_user_priority() -> u32 {
 fn default_idle_fill_exempt_secs() -> u32 {
     60
 }
+fn default_preempt_victim_order() -> Vec<crate::partition::VictimOrderKey> {
+    crate::partition::DEFAULT_VICTIM_ORDER.to_vec()
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -972,6 +1008,7 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            preempt_victim_order: default_preempt_victim_order(),
             idle_fill_enabled: false,
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
@@ -1883,12 +1920,72 @@ pub struct DevicesGresEntry {
 pub struct AdmissionConfig {
     #[serde(default)]
     pub mode: AdmissionMode,
+    /// The nodes allowed in the cluster; once saved, only `scontrol reconfigure` changes or clears it.
+    #[serde(default)]
+    pub node_names: Option<Vec<String>>,
+}
+
+/// Expanded `admission.node_names`; once saved through Raft it outlives controller restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct NodeInventory {
+    #[serde(default)]
+    pub names: Option<BTreeSet<String>>,
+}
+
+impl NodeInventory {
+    pub fn excludes(&self, name: &str) -> bool {
+        self.names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+    }
+}
+
+impl AdmissionConfig {
+    pub fn node_inventory(&self) -> Result<NodeInventory, ConfigError> {
+        let Some(patterns) = &self.node_names else {
+            return Ok(NodeInventory::default());
+        };
+        let invalid = |value: String| ConfigError::InvalidValue {
+            field: "admission.node_names".into(),
+            value,
+        };
+        let mut names = BTreeSet::new();
+        let mut expanded_total = 0usize;
+        for pattern in patterns {
+            let expanded = crate::hostlist::expand_bounded(pattern, 100_000, 255)
+                .map_err(|error| invalid(error.to_string()))?;
+            // Repeated wide patterns stay under the distinct-name cap but would still cost time.
+            expanded_total += expanded.len();
+            if expanded_total > 1_000_000 {
+                return Err(invalid("more than 1000000 expanded node names".into()));
+            }
+            if expanded.is_empty() {
+                return Err(invalid(
+                    "empty entries are not node names; use [] to allow no nodes".into(),
+                ));
+            }
+            for name in expanded {
+                if !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                {
+                    return Err(invalid(format!("invalid node name: {name}")));
+                }
+                names.insert(name);
+                if names.len() > 100_000 {
+                    return Err(invalid("more than 100000 node names".into()));
+                }
+            }
+        }
+        Ok(NodeInventory { names: Some(names) })
+    }
 }
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             mode: AdmissionMode::Open,
+            node_names: None,
         }
     }
 }
@@ -2529,12 +2626,22 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
-        // Zero makes every heartbeat instantly stale, so the first health pass
-        // past the grace window marks every registered node Down.
+        // Zero makes every heartbeat instantly stale, so every node would be
+        // flagged not responding and take no new work.
         if self.controller.heartbeat_timeout_secs == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "controller.heartbeat_timeout_secs".into(),
                 value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Phrased as a positive range test so NaN, which fails every
+        // comparison, is rejected along with values outside (0, 1].
+        let fraction = self.controller.max_stale_node_fraction;
+        let fraction_in_range = fraction > 0.0 && fraction <= 1.0;
+        if !fraction_in_range {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_stale_node_fraction".into(),
+                value: format!("{fraction} (must be greater than 0 and at most 1)"),
             });
         }
         // Zero would clamp every launch-failure hold to zero, restoring the tight
@@ -2780,6 +2887,18 @@ impl SlurmConfig {
                     "{inactive} (0 disables reaping; otherwise must be >= {})",
                     2 * KEEPALIVE_INTERVAL_SECS
                 ),
+            });
+        }
+        // A repeated key would be silently redundant in a precedence list.
+        let order = &self.scheduler.preempt_victim_order;
+        if let Some(dup) = order
+            .iter()
+            .enumerate()
+            .find_map(|(i, key)| order[..i].contains(key).then_some(key))
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.preempt_victim_order".into(),
+                value: format!("{} listed more than once", dup.name()),
             });
         }
         // `plugin` used to be parsed and never read, so an operator could set "munge" (or a typo)
@@ -3324,6 +3443,63 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn node_inventory_is_opt_in_and_expands_hostlists() {
+        let old: super::AdmissionConfig = serde_json::from_str(r#"{"mode":"open"}"#).unwrap();
+        assert_eq!(old.node_inventory().unwrap().names, None);
+        let config = super::SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+[admission]
+node_names = ["n[01-02]", "n01", "service-a"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.admission.node_inventory().unwrap().names.unwrap(),
+            ["n01", "n02", "service-a"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        let empty = super::SlurmConfig::load_from_str(
+            "cluster_name = 'test'\n[admission]\nnode_names = []",
+        )
+        .unwrap();
+        assert_eq!(
+            empty.admission.node_inventory().unwrap().names,
+            Some(Default::default())
+        );
+    }
+
+    #[test]
+    fn node_inventory_rejects_invalid_and_unbounded_names() {
+        for names in [
+            r#"["n[2-1]"]"#,
+            r#"[""]"#,
+            r#"["node*"]"#,
+            r#"["n[1-100001]"]"#,
+            r#"["a[1-60000]", "b[1-60000]"]"#,
+            format!("[{}]", ["'n[1-90000]'"; 12].join(",")).as_str(),
+        ] {
+            let input = format!("cluster_name = 'test'\n[admission]\nnode_names = {names}");
+            // Only the controller expands the list, so other readers of a shared file still load it.
+            let config = super::SlurmConfig::load_from_str(&input).unwrap();
+            assert!(config.admission.node_inventory().is_err(), "{names}");
+        }
+        let error = super::SlurmConfig::load_from_str(
+            "cluster_name = 'test'\n[admission]\nnode_names = ['a[1-60000]', 'b[1-60000]']",
+        )
+        .unwrap()
+        .admission
+        .node_inventory()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("more than 100000 node names"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn cgroup_cleanup_timeout_preserves_old_configs_and_accepts_overrides() {
@@ -4880,6 +5056,18 @@ max_batch_requeue = 7
     }
 
     #[test]
+    fn salloc_interactive_step_defaults_off_and_parses_when_set() {
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").expect("parse");
+        assert!(!unset.salloc.use_interactive_step);
+
+        let set = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[salloc]\nuse_interactive_step = true\n",
+        )
+        .expect("parse");
+        assert!(set.salloc.use_interactive_step);
+    }
+
+    #[test]
     fn scheduler_config_rejects_inactive_limit_below_floor() {
         let toml = r#"
 cluster_name = "test"
@@ -4907,6 +5095,48 @@ inactive_limit_secs = 20
             "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
         )
         .expect("a value at the floor must be accepted");
+    }
+
+    #[test]
+    fn preempt_victim_order_has_a_default_and_parses_a_key_list() {
+        use crate::partition::VictimOrderKey::*;
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(
+            unset.scheduler.preempt_victim_order,
+            [LeastWork, FewestJobs, Hash]
+        );
+        assert_eq!(
+            SchedulerConfig::default().preempt_victim_order,
+            unset.scheduler.preempt_victim_order
+        );
+
+        let parse = |value: &str| {
+            SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"
+            ))
+            .unwrap()
+            .scheduler
+            .preempt_victim_order
+        };
+        assert_eq!(parse("[\"hash\", \"least_work\"]"), [Hash, LeastWork]);
+        assert!(parse("[]").is_empty(), "an empty list is node-name order");
+    }
+
+    #[test]
+    fn preempt_victim_order_rejects_unknown_and_repeated_keys() {
+        for (value, needle) in [
+            ("[\"fewest_job\"]", "fewest_job"),
+            (
+                "[\"hash\", \"least_work\", \"hash\"]",
+                "preempt_victim_order",
+            ),
+        ] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+        }
     }
 
     #[test]
@@ -5752,6 +5982,33 @@ heartbeat_timeout_secs = 120
     }
 
     #[test]
+    fn controller_config_max_stale_node_fraction_defaults_and_parses() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
+
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = 1.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 1.0);
+    }
+
+    #[test]
+    fn controller_config_rejects_an_out_of_range_max_stale_node_fraction() {
+        for bad in ["0.0", "-0.5", "1.5", "nan"] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("controller.max_stale_node_fraction"),
+                "{bad}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn controller_config_rejects_a_zero_health_tick() {
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 0\n",
@@ -5799,6 +6056,7 @@ max_batch_requeue = 5
         .expect("a pre-upgrade config must still validate");
         assert_eq!(config.controller.health_tick_secs, 30);
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
     }
 
     #[test]

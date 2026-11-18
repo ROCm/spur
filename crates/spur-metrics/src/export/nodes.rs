@@ -36,6 +36,24 @@ pub fn register_nodes(registry: &mut Registry, snap: &NodeMetricsSnapshot) {
         let help = format!("Number of nodes in {} state", state.display());
         register_gauge(registry, &name, &help, snap.count_state(state));
     }
+    register_gauge(
+        registry,
+        "spur_nodes_not_responding",
+        "Number of nodes the leader is not hearing heartbeats from, in any state",
+        snap.not_responding,
+    );
+    register_gauge(
+        registry,
+        "spur_nodes_liveness_breaker_tripped",
+        "1 if the last health pass marked no node down because too many went silent at once",
+        u64::from(snap.liveness_breaker_tripped),
+    );
+    register_gauge(
+        registry,
+        "spur_nodes_silent_answering",
+        "Number of nodes kept up because their agent answers the leader though their heartbeats do not reach it",
+        snap.silent_answering,
+    );
 
     register_gauge(
         registry,
@@ -149,7 +167,27 @@ mod tests {
         let body = encode_nodes_metrics(&NodeMetricsSnapshot::default());
         assert!(body.contains("spur_nodes 0\n"));
         assert!(body.contains("spur_nodes_idle 0\n"));
+        assert!(body.contains("spur_nodes_not_responding 0\n"));
+        assert!(body.contains("spur_nodes_liveness_breaker_tripped 0\n"));
+        assert!(body.contains("spur_nodes_silent_answering 0\n"));
         assert!(body.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn export_reports_not_responding_nodes_and_a_tripped_breaker() {
+        let snap = NodeMetricsSnapshot {
+            not_responding: 3,
+            liveness_breaker_tripped: true,
+            silent_answering: 2,
+            ..Default::default()
+        };
+        let body = encode_nodes_metrics(&snap);
+        assert!(body.contains("# TYPE spur_nodes_not_responding gauge"));
+        assert!(body.contains("spur_nodes_not_responding 3\n"));
+        assert!(body.contains("# TYPE spur_nodes_liveness_breaker_tripped gauge"));
+        assert!(body.contains("spur_nodes_liveness_breaker_tripped 1\n"));
+        assert!(body.contains("# TYPE spur_nodes_silent_answering gauge"));
+        assert!(body.contains("spur_nodes_silent_answering 2\n"));
     }
 
     fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {

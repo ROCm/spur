@@ -76,6 +76,11 @@ nightly channel instead of the latest stable release:
 
    spur self-update --nightly
 
+Both aliases accept ``--help`` (or ``-h``) without checking for updates or changing
+files. Unknown options and positional arguments are rejected before an update
+starts. ``spur update`` always means a binary upgrade; use ``spur control update``
+to change a job or node.
+
 The updater downloads the release tarball, verifies it against its published SHA256
 checksum, then replaces each binary atomically: the current binary is renamed to
 ``<name>.spur-old`` as a backup, the new binary is copied into place, and the backups are
@@ -225,6 +230,9 @@ The playbook proceeds in order:
    resumed**, so it stays schedulable for the whole swap. See :ref:`upgrading-in-place`.
 4. **Verify.** Submit a real test job to confirm the upgraded cluster schedules work.
 
+Until every controller is upgraded, a node removed with ``spur node remove`` or
+``scontrol delete NodeName=`` may register again; see :ref:`keeping a removed node out <removed-node-keep-out>`.
+
 The rolling upgrade is controlled with these ``-e`` flags:
 
 .. list-table::
@@ -302,8 +310,9 @@ Two further consequences of not draining:
 - An agent unreachable over SSH is left schedulable and not upgraded. Every other mode still
   drains it, because the drain is a controller-side call that works on a host Ansible cannot
   reach. That is usually desirable — a node whose ``spurd`` is healthy but whose SSH is down
-  should keep taking work — but a genuinely dead node stays schedulable until it crosses its
-  own heartbeat timeout and is marked ``DOWN``.
+  should keep taking work — but a genuinely dead node is flagged not-responding (taking no
+  new work) once its heartbeats go stale, then marked ``DOWN`` once the leader confirms it
+  is unreachable (see :ref:`node-liveness`).
 
 .. note::
 
@@ -531,6 +540,37 @@ a cgroup-device program is a net-admin program type, so ``CAP_BPF`` alone is not
 An agent without them logs ``device filter not installed`` and runs the job with no
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
+
+Job spool folders (``/var/spool/spur/job<id>``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``spurd`` keeps each job's generated scripts and step output in a per-job spool
+folder. When ``spurd`` runs as root, that folder is now owned by root with the job's
+group and mode ``0750``, as Slurm's batch directory is, instead of belonging to the
+job's user. ``spurd`` creates every file in it through an open directory handle and
+replaces an existing file rather than rewriting it in place.
+
+**Effect on jobs:**
+
+* A job can still read its own scripts in the folder, but can no longer create,
+  rename or remove entries there. A script that wrote files next to itself
+  (``$(dirname "$0")``) must write to its work dir or ``$TMPDIR`` instead.
+* ``srun`` steps that ``spurd`` wraps in generated scripts (several tasks per node,
+  ``--label``, ``--mpi=pmix``) keep those scripts in the spool folder, not in a
+  ``.spur_step_<id>`` folder in the work dir. Such steps now also run when root cannot
+  write the work dir, for example on an NFS export with ``root_squash``. A job's
+  containers, its batch job's and any a step builds, see the spool folder mounted
+  read-only at the same path, which is how a step inside one reaches its scripts.
+* A root ``spurd`` no longer falls back to ``$TMPDIR/spur`` when it cannot create the
+  spool folder. The failure drains the node, like any other fault in the spool tree.
+
+A folder created by an older ``spurd`` for a job still running across the upgrade is
+taken over by root the next time the new agent writes to it, so no drain is needed.
+
+**Spool root ownership.** With a root ``spurd``, ``/var/spool/spur`` should be owned by
+root and not writable by group or others; ``spurd`` logs a warning at startup when it is
+not. If ``spurctld`` runs as an unprivileged user on the same node and shares that
+directory, move its state out first; see :ref:`spool root ownership <spool-root-ownership>`.
 
 Reserved step IDs aligned to Slurm
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -795,32 +835,91 @@ after the flush is lost.
 
 The default suits most sites. Keep it well below ``heartbeat_timeout_secs``: the controller
 answers no heartbeats while it drains, so a grace within about 35 seconds of that timeout
-lets a full drain mark nodes DOWN and fail their jobs. ``0`` restores the unbounded wait,
+lets a full drain flag nodes not-responding and mark operator-managed nodes, which it cannot
+probe, ``DOWN``. ``0`` restores the unbounded wait,
 which can run past that timeout too, and which a repeated ``SIGTERM`` or ``SIGINT`` does not
 end; only ``SIGKILL`` does. ``spurctld`` warns at startup in either case. Keep the grace,
 plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step that
 finishes during the drain does not end it, so raising the value mostly lengthens the
 restart. A new value takes effect at the next start.
 
+.. _node-liveness-upgrade-notes:
+
+Confirmed node ``DOWN`` and the not-responding flag
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The leader no longer marks a node ``DOWN`` as soon as its heartbeats pass
+``controller.heartbeat_timeout_secs``. It flags the node not-responding (``*`` in ``sinfo``),
+which keeps new work off it, and asks the node's agent directly. See :ref:`node-liveness`.
+
+- **A dead node goes** ``DOWN`` **one pass later.** Its agent must fail to answer on two
+  health passes at least ``controller.health_tick_secs`` apart, so ``NODE_FAIL`` and the
+  requeue of a ``--requeue`` job come about one pass later than before. Nodes managed by the
+  Kubernetes operator are not probed and keep the timeout rule.
+- **A node whose heartbeats cannot reach a controller is no longer marked** ``DOWN``. If its
+  agent answers, it stays up and flagged, keeping its running jobs, until its heartbeats
+  resume. Such an agent often cannot report job completions either, so its finished jobs can
+  stay running. The leader warns about the node every 10 minutes and the new
+  ``spur_nodes_silent_answering`` gauge counts it. ``spur_nodes_not_responding`` counts
+  every node the leader is not hearing, ``DOWN`` ones included, so alert on the new gauge.
+- **A mass silence marks no node** ``DOWN``. The suspects in a pass are the nodes that fail
+  their probe, operator-managed nodes past the heartbeat timeout, and, in a pass with
+  either of those, nodes that have missed a heartbeat. When they exceed
+  ``controller.max_stale_node_fraction`` (default ``0.5``) of the watched nodes, rounded
+  down but never below one node (so a single silent node never trips it), the leader
+  assumes the fault is its own and marks none of them ``DOWN``. A real mass failure then
+  needs ``scontrol update nodename=<nodes> state=down``. Alert on
+  ``spur_nodes_liveness_breaker_tripped``, or set the fraction to ``1`` to turn the check
+  off.
+- **Node state strings can carry the flag.** ``sinfo`` ``%t`` and ``%T`` add a trailing
+  ``*`` (``idle*``, ``down*``), ``scontrol show node`` adds ``+NOT_RESPONDING`` to
+  ``State=``, and ``spur health`` stars the node. A ``DOWN`` node the leader has not heard
+  from since shows as ``down*``, which covers every node marked ``DOWN`` for not responding.
+  Scripts that compare ``sinfo -h -o %t`` to ``down`` or ``idle`` must strip a trailing
+  ``*``.
+- **Mixed versions do not show the flag.** It is a new field in the node reply, so an
+  ``sinfo`` or ``scontrol`` from an earlier release shows no ``*`` or ``+NOT_RESPONDING`` and
+  lacks ``-d``, ``-r``, and ``-t no_respond``. A new client against an older controller
+  shows no ``*`` either, and ``sinfo -d`` and ``-t no_respond`` match no node, because an
+  older controller never sets the flag.
+
+No configuration change is needed. The flag lives only in the leader's memory, so no Raft
+entry is added and rolling back is safe; an older controller ignores
+``max_stale_node_fraction``.
+
 .. _requeued-run-upgrade-notes:
 
 Stopping a requeued job's run on a recovered node
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
-with ``--requeue`` goes back to the queue, but the job's nodes are not told to
-stop when they go Down. From this release, the controller stops that run when a
+When a node is marked Down after missing heartbeats, its jobs end ``NODE_FAIL``
+and a job submitted with ``--requeue`` goes back to the queue, but the job's
+nodes are not told to stop when they go Down. From this release, the controller stops that run when a
 node heartbeats again, even while the job is still waiting in the queue. Before,
 a node kept the run and its GPUs until the job ended or ran again, and refused
 every job placed on those GPUs in the meantime.
 
 Stopping the run on heartbeat needs both an upgraded controller and an upgraded
 agent on that node, which reports the run it holds; with either side from an
-earlier release, the old behavior stays. An upgraded agent also stops the old
-run's processes, including its ``srun`` steps, when the job is placed back on
-the same node, which an earlier agent could miss for a run without a cgroup
-(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
-when not running as root).
+earlier release, the old behavior stays. The recovery hold that keeps a returning
+node ``DOWN`` until it reports a clean job list applies to earlier agents too: one
+that still reports a job the controller ended is held, and drained at the cap if
+that job does not stop. A node drained at the cap is admin-locked, with reason
+``Kill task failed (JobId=...)`` or ``Agent job list unavailable``, and takes no work
+until an operator runs ``scontrol update nodename=<node> state=resume``, so scripts that
+watch ``sinfo -R`` or resume nodes automatically should expect these reasons. Only
+upgraded agents report ``running_jobs_incomplete`` when they cannot list their jobs
+in full, though. An earlier agent sends an empty list when its job map is busy,
+which reads as clean, so its hold can end while an ended run is still going. A job
+entry with run attempt ``0`` (an agent too old to report the run sends ``0`` for every
+job) is judged like any other: it holds the node if the controller ended the job or
+placed it on other nodes. The exception is a job back in the queue: its entry is
+neither stopped (a cancel without an attempt could hit the job's next launch) nor held
+for, so it reads as clean. An upgraded agent also stops the old run's
+processes, including its ``srun`` steps, when the job is placed back on the same node,
+which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example when not
+running as root).
 
 Before accepting a replacement attempt, the agent fences every older attempt
 it can discover in its tracked sessions, persisted session descriptors, and
@@ -1028,6 +1127,29 @@ release cannot load the snapshot. To downgrade:
    quiet cluster this can take a while; job submissions and completions
    move it along.
 #. Downgrade the controllers.
+
+.. _upgrading-node-names:
+
+Configured node list (``admission.node_names``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds the optional ``[admission] node_names`` list (see
+:ref:`configured-node-list`). Only ``scontrol reconfigure`` writes its new Raft
+log entry, ``NodeInventoryUpdate``, and only when the list in the edited file
+differs from the saved one, or when no list is saved yet and the file the
+controller started with has one. A removed field counts as no list. Every
+``scontrol reconfigure`` first waits for earlier Raft writes to apply, so on a
+heavily loaded controller it can fail with a timeout; rerun it.
+
+**Upgrade every controller before running scontrol reconfigure with a list.** A
+controller that predates ``NodeInventoryUpdate`` cannot parse it and stops
+replicating until it is upgraded, and it ignores the list in a snapshot. If the
+controllers that predate it are a majority, the entry cannot commit and every
+later write stalls. Adding ``node_names`` to the file during a rolling upgrade is
+safe only until the next ``scontrol reconfigure``, even one made for a partition
+change, so add the field after every controller is upgraded. Restarts and agent
+registrations never write it. A rollback after the entry has been written is not
+supported because older controllers cannot replay it: roll forward.
 
 See Also
 --------

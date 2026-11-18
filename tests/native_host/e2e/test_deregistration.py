@@ -177,10 +177,18 @@ class TestDownNodeFailsJobs:
     # that makes a live node's heartbeat look stale to most health ticks and
     # it never recovers. Keep well above 30s so only a truly dead agent trips it.
     HB_TIMEOUT = 60
+    # Pinned so the DOWN budget below is exact: DOWN needs two failed probes a
+    # health pass apart.
+    HEALTH_TICK = 30
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"controller": {"heartbeat_timeout_secs": self.HB_TIMEOUT}}
+        return {
+            "controller": {
+                "heartbeat_timeout_secs": self.HB_TIMEOUT,
+                "health_tick_secs": self.HEALTH_TICK,
+            }
+        }
 
     def test_down_node_fails_jobs(self, multi_node_cluster):
         cluster = multi_node_cluster
@@ -209,5 +217,7 @@ class TestDownNodeFailsJobs:
 
         _kill_agent(cluster, 0)
 
-        state = _wait_job_terminal(cluster, job_id, timeout=self.HB_TIMEOUT + 30)
+        # Timeout to stale, then two failed probes one health pass apart.
+        budget = self.HB_TIMEOUT + 2 * self.HEALTH_TICK + 30
+        state = _wait_job_terminal(cluster, job_id, timeout=budget)
         assert state == "NF", f"expected NODE_FAIL, got {state}"

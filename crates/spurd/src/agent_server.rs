@@ -288,6 +288,7 @@ async fn launch_stepd(
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
     descriptor.pty_step_id = launch_spec.pty_step_id;
+    descriptor.record_job_container(&launch_spec);
     let namespaces = launch_namespaces(config, nix::unistd::geteuid().is_root());
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
@@ -1225,6 +1226,7 @@ pub struct TrackedJob {
     has_pid_namespace: bool,
     has_user_namespace: bool,
     has_mount_namespace: bool,
+    container: crate::job_entry::JobContainer,
     _pty_master: Option<std::os::fd::OwnedFd>,
     work_dir: String,
     uid: u32,
@@ -2236,6 +2238,10 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         has_pid_namespace: descriptor.has_pid_namespace,
         has_user_namespace: descriptor.has_user_namespace,
         has_mount_namespace: descriptor.has_mount_namespace,
+        container: crate::job_entry::JobContainer::recorded(
+            owns_job && descriptor.container_rootfs_mode.is_some(),
+            &descriptor.container_image,
+        ),
         _pty_master: None,
         work_dir: descriptor.work_dir.clone(),
         uid: descriptor.uid,
@@ -2454,6 +2460,19 @@ const WORKLOAD_DEATH_POLLS: u32 = 20;
 const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const WORKLOAD_PID_POLLS: u32 = 40;
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+/// The controller marks a job Running before StartJob releases its batch
+/// workload, and gives that release up to 5s; an entry into the job waits as long.
+const BATCH_RELEASE_POLLS: u32 = 100;
+const BATCH_RELEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What the job's batch supervisor says about its workload.
+enum BatchWorkload {
+    Live(crate::stepd::StepdSnapshot),
+    /// Still held at the launch gate after every poll.
+    Gated,
+    /// No batch supervisor, an unreadable one, or a workload that has exited.
+    Unknown,
+}
 
 /// A supervisor that dies before pushing completion leaves no other record, so
 /// its tracked pid and start ticks are re-checked on this interval.
@@ -3760,27 +3779,64 @@ fn settled_outcome_belongs_to_this_invocation(
     last_launched_step_id.is_none_or(|last| last == requested_step_id)
 }
 
-/// What a step's own `--container-image` resolves to once weighed against
-/// whether its parent job already provides one to join.
+/// Where a step runs, once its own `--container-image` is weighed against the
+/// job it belongs to.
 enum StepContainerPlan {
-    /// No image requested, or requested but a live containerized parent takes
-    /// priority — the step joins the parent's namespaces instead.
-    None,
-    /// No containerized parent to join: build a fresh rootfs for this step.
+    /// Inside the job's namespaces.
+    JoinParent,
+    /// On the host, outside any container.
+    Host,
+    /// In a rootfs of its own, outside the job's namespaces.
     Fresh(spur_proto::proto::ContainerSpec),
 }
 
+/// A job that runs in a container has one rootfs for all its steps. A step
+/// naming that same image joins it; one naming another image cannot be
+/// honoured and is refused rather than run in the wrong one. A job whose image
+/// was not recorded accepts any step image and the step joins it. Any other
+/// job, including a batch job whose namespaces are only the isolation a root
+/// agent gives every batch process, lets a step with an image build its own;
+/// a step without one joins the job's namespaces when it has any.
 fn resolve_step_container_plan(
     container: Option<&spur_proto::proto::ContainerSpec>,
-    joins_parent_namespaces: bool,
-) -> StepContainerPlan {
+    parent: &crate::job_entry::JobEntry,
+    job_id: u32,
+    step_id: u32,
+) -> Result<StepContainerPlan, Status> {
+    use crate::job_entry::JobContainer;
+    let enterable = parent.is_enterable();
     let Some(c) = container.filter(|c| !c.image.is_empty()) else {
-        return StepContainerPlan::None;
+        return Ok(if enterable {
+            StepContainerPlan::JoinParent
+        } else {
+            StepContainerPlan::Host
+        });
     };
-    if joins_parent_namespaces {
-        return StepContainerPlan::None;
+    match (&parent.container, enterable) {
+        (JobContainer::Image(job_image), true) => {
+            if crate::container::same_image(job_image, &c.image, parent.uid) {
+                Ok(StepContainerPlan::JoinParent)
+            } else {
+                Err(Status::failed_precondition(format!(
+                    "--container-image {} differs from the image this job runs in ({job_image}), \
+                     and a step of a containerized job cannot use another one; drop the flag to \
+                     run the step in the job's container, or submit the job without \
+                     --container-image to give each step its own",
+                    c.image
+                )))
+            }
+        }
+        (JobContainer::Unrecorded, true) => {
+            warn!(
+                job_id,
+                step_id,
+                image = %c.image,
+                "job container image unknown; step joins the job's container"
+            );
+            Ok(StepContainerPlan::JoinParent)
+        }
+        _ => Ok(StepContainerPlan::Fresh(c.clone())),
     }
-    StepContainerPlan::Fresh(c.clone())
 }
 
 /// Everything needed to resolve an image and stage a fresh rootfs for a
@@ -3933,16 +3989,12 @@ fn stage_fresh_container_step(
             auth_socket: c.auth_socket,
         },
     )?;
-    // `executor::launch_job`'s container path execs this fixed in-container
-    // path unconditionally for every freshly-containerized step.
-    let container_script = format!("{}/tmp/spur_job_{job_id}.sh", launch.rootfs.display());
-    std::fs::write(&container_script, step_script)
-        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&container_script, std::fs::Permissions::from_mode(0o755));
-    }
+    crate::container::write_entry_script(
+        &launch.rootfs,
+        &format!("spur_job_{job_id}.sh"),
+        step_script,
+    )
+    .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
     Ok((launch, rootfs_mode))
 }
 
@@ -3986,12 +4038,13 @@ fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
 /// them and survives independently of the job it is running work for.
 fn supervised_step_script(
     job_entry: &crate::job_entry::JobEntry,
+    joins_parent_namespaces: bool,
     uid: u32,
     gid: u32,
     work_dir: &str,
     command: &[String],
 ) -> Result<String, Status> {
-    if !(job_entry.has_namespaces() && job_entry.pid > 0) {
+    if !joins_parent_namespaces {
         return build_one_shot_command_script(command);
     }
     let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid);
@@ -4026,6 +4079,7 @@ fn supervised_step_script(
 /// step does.
 fn interactive_step_script(
     job_entry: &crate::job_entry::JobEntry,
+    joins_parent_namespaces: bool,
     uid: u32,
     gid: u32,
     argv: &[String],
@@ -4036,7 +4090,14 @@ fn interactive_step_script(
     } else {
         argv
     };
-    supervised_step_script(job_entry, uid, gid, &job_entry.work_dir, command)
+    supervised_step_script(
+        job_entry,
+        joins_parent_namespaces,
+        uid,
+        gid,
+        &job_entry.work_dir,
+        command,
+    )
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -4058,7 +4119,7 @@ async fn awaited_step_response(
 
 async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> String {
     for path in crate::executor::step_output_path_candidates(job_id, step_id, stderr) {
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        if let Ok(bytes) = crate::scratch::read_spool_file(&path).await {
             return String::from_utf8_lossy(&bytes).into_owned();
         }
     }
@@ -4939,6 +5000,33 @@ impl AgentService {
     /// read held stable ids and apply fresh capacity without an RPC round-trip.
     pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
         self.allocation.clone()
+    }
+
+    /// The job's batch workload, waiting up to `polls` times while its gate holds
+    /// it. Each answer stands alone: a gate reports active with no pid until it
+    /// is released, and the supervisor only answers again once the workload runs.
+    async fn batch_workload(&self, job_id: u32, polls: u32) -> BatchWorkload {
+        let batch = self
+            .stepds
+            .lock()
+            .await
+            .get(&(job_id, spur_core::step::STEP_BATCH))
+            .cloned();
+        let Some(descriptor) = batch else {
+            return BatchWorkload::Unknown;
+        };
+        for _ in 0..polls {
+            match crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await {
+                Ok(snapshot) if is_live_workload(&snapshot) => {
+                    return BatchWorkload::Live(snapshot)
+                }
+                Ok(snapshot) if snapshot.active => {
+                    tokio::time::sleep(BATCH_RELEASE_POLL_INTERVAL).await
+                }
+                _ => return BatchWorkload::Unknown,
+            }
+        }
+        BatchWorkload::Gated
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -5826,7 +5914,7 @@ fn build_launch_plan(
     priv_drop: Option<&crate::privdrop::PrivDrop>,
     command: &[String],
 ) -> LaunchPlan {
-    if entry.has_namespaces() && entry.pid > 0 {
+    if entry.is_enterable() {
         LaunchPlan {
             program: "nsenter".to_string(),
             args: build_nsenter_argv(entry, priv_drop, command),
@@ -5909,6 +5997,7 @@ mod child_containment_tests {
 
     fn entry(namespaced: bool, cgroup: Option<&str>) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
             pid: if namespaced { 1234 } else { 0 },
             has_pid_namespace: namespaced,
             has_user_namespace: false,
@@ -5963,47 +6052,18 @@ mod child_containment_tests {
     }
 }
 
-fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
-    }
-    let _ = std::fs::remove_dir(dir);
-}
-
+/// A step's generated scripts in the job's spool folder, unlinked on drop. The
+/// folder itself is shared with the job's other steps and outlives them.
 struct StepScriptCleanup {
-    dir: std::path::PathBuf,
-    paths: Vec<std::path::PathBuf>,
-}
-
-impl StepScriptCleanup {
-    fn stage_in_rootfs(&self, rootfs: &std::path::Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-        for source in &self.paths {
-            let relative = source
-                .strip_prefix("/")
-                .map_err(|_| anyhow::anyhow!("step script path must be absolute"))?;
-            if relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                anyhow::bail!("step script path contains unsupported components");
-            }
-            let destination = rootfs.join(relative);
-            let parent = destination
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("step script has no parent directory"))?;
-            std::fs::create_dir_all(parent)?;
-            let content = std::fs::read_to_string(source)?;
-            crate::executor::write_job_scratch(&destination, &content, uid, gid)?;
-        }
-        Ok(())
-    }
+    dir: crate::scratch::ScratchDir,
+    names: Vec<String>,
 }
 
 impl Drop for StepScriptCleanup {
     fn drop(&mut self) {
-        let path_refs: Vec<&std::path::Path> =
-            self.paths.iter().map(std::path::PathBuf::as_path).collect();
-        cleanup_step_scripts(&self.dir, &path_refs);
+        for name in &self.names {
+            let _ = crate::scratch::unlink_scratch(&self.dir, name);
+        }
     }
 }
 
@@ -6852,18 +6912,12 @@ impl SlurmAgent for AgentService {
             .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
             // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
-            let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
-            std::fs::write(&container_script, &script).map_err(|e| {
-                Status::internal(format!("failed to write container script: {}", e))
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &container_script,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+            crate::container::write_entry_script(
+                &rootfs,
+                &format!("spur_job_{job_id}.sh"),
+                &script,
+            )
+            .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
 
             rootfs_path = Some(rootfs);
             container_config = Some(cfg);
@@ -7340,6 +7394,12 @@ impl SlurmAgent for AgentService {
 
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let namespaces = launch_namespaces(&launch_cfg, nix::unistd::geteuid().is_root());
+                let job_container = launch_cfg
+                    .container
+                    .as_ref()
+                    .map_or(crate::job_entry::JobContainer::None, |c| {
+                        crate::job_entry::JobContainer::Image(c.config.image.clone())
+                    });
                 // Report the real resolved paths back so the controller can
                 // surface where output actually landed (e.g. the /tmp fallback).
                 let stdout_path = result.stdout_path.clone();
@@ -7356,6 +7416,7 @@ impl SlurmAgent for AgentService {
                         has_pid_namespace: namespaces.pid,
                         has_user_namespace: namespaces.user,
                         has_mount_namespace: namespaces.mount,
+                        container: job_container,
                         _pty_master: result.pty_master,
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
@@ -8182,6 +8243,7 @@ impl SlurmAgent for AgentService {
             TrackedJob {
                 fabric_binding: fabric_binding.clone(),
                 gpu_binding: gpu_binding.clone(),
+                container: crate::job_entry::JobContainer::None,
                 job: executor::RunningJob::AllocationOnly,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: String::new(),
@@ -8500,6 +8562,7 @@ impl SlurmAgent for AgentService {
                 has_pid_namespace: tracked.has_pid_namespace,
                 has_user_namespace: tracked.has_user_namespace,
                 has_mount_namespace: tracked.has_mount_namespace,
+                container: tracked.container.clone(),
                 uid: tracked.uid,
                 gid: tracked.gid,
                 work_dir: tracked.work_dir.clone(),
@@ -8529,6 +8592,10 @@ impl SlurmAgent for AgentService {
                 "job attempt changed while admitting the step",
             ));
         }
+
+        let step_container_plan =
+            resolve_step_container_plan(req.container.as_ref(), &job_entry, job_id, step_id)?;
+        let joins_parent_namespaces = matches!(step_container_plan, StepContainerPlan::JoinParent);
 
         let job_nodelist = nodelist;
         let step_nodelist = if req.nodelist.trim().is_empty() {
@@ -8709,24 +8776,33 @@ impl SlurmAgent for AgentService {
             || step_mpi
             || step_mpirun
         {
-            let step_dir =
-                crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
-                    .map_err(|e| {
-                        Status::internal(format!("failed to create step script dir: {e}"))
-                    })?;
+            // In the job's spool folder rather than its work dir: the job picks
+            // the work dir, so a folder there is one root must never create or chown.
+            let dir = match crate::executor::create_job_spool_dir_under(
+                &self.job_spool_roots,
+                job_id,
+                req.uid,
+                req.gid,
+            ) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.drain_on_node_fault(&error, job_id);
+                    return Err(Status::internal(format!("step script dir: {error}")));
+                }
+            };
+            let owner = crate::executor::job_scratch_owner(req.uid, req.gid);
             let mut guard = StepScriptCleanup {
-                dir: step_dir.clone(),
-                paths: Vec::new(),
+                dir,
+                names: Vec::new(),
             };
 
             let (user_script_name, wrapper_name) = step_scratch_names(node_id, step_id);
-            let user_script_path = step_dir.join(user_script_name);
             let user_script = build_one_shot_command_script(&req.command)?;
-            crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
-            guard.paths.push(user_script_path.clone());
+            let user_script_path =
+                self.write_step_script(&guard.dir, &user_script_name, &user_script, owner, job_id)?;
+            guard.names.push(user_script_name);
 
-            let wrapper_path = step_dir.join(wrapper_name);
+            let wrapper_path = guard.dir.join(&wrapper_name);
             let wrapper = if step_mpirun {
                 let total_tasks = step_num_tasks.max(num_tasks);
                 let user_cmd = shlex::try_join(req.command.iter().map(String::as_str))
@@ -8777,10 +8853,9 @@ impl SlurmAgent for AgentService {
                 ))
             };
             if let Some(wrapper) = wrapper {
-                crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
-                    .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+                self.write_step_script(&guard.dir, &wrapper_name, &wrapper, owner, job_id)?;
             }
-            guard.paths.push(wrapper_path.clone());
+            guard.names.push(wrapper_name);
 
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
@@ -8870,33 +8945,22 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         let mut supervised_rootfs_mode = None;
         let mut supervised_step_cfg = if supervise_step {
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
-            let step_script =
-                supervised_step_script(&job_entry, req.uid, req.gid, &work_dir, &command)?;
-            let username = job_owner.clone();
-            let container = match resolve_step_container_plan(
-                req.container.as_ref(),
+            let step_script = supervised_step_script(
+                &job_entry,
                 joins_parent_namespaces,
-            ) {
-                StepContainerPlan::None => {
-                    if joins_parent_namespaces {
-                        if let Some(c) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
-                            warn!(
-                                job_id,
-                                step_id,
-                                image = %c.image,
-                                "step --container-image ignored: joining the parent job's \
-                                 running container instead of building a new one"
-                            );
-                        }
-                    }
-                    None
-                }
+                req.uid,
+                req.gid,
+                &work_dir,
+                &command,
+            )?;
+            let username = job_owner.clone();
+            let container = match &step_container_plan {
+                StepContainerPlan::JoinParent | StepContainerPlan::Host => None,
                 StepContainerPlan::Fresh(c) => {
                     let home_dir = env
                         .get("HOME")
@@ -8905,7 +8969,7 @@ impl SlurmAgent for AgentService {
                     let (launch, rootfs_mode) = stage_fresh_container_step(
                         &self.cluster_id,
                         self.allow_root_jobs,
-                        &c,
+                        c,
                         FreshContainerContext {
                             gpu_devices: launch_gpus.clone(),
                             device_plan: container_device_plan.clone(),
@@ -9036,24 +9100,9 @@ impl SlurmAgent for AgentService {
                 persist_cred,
             )
             .await?
-        } else if job_entry.has_namespaces() && job_entry.pid > 0 {
-            // Case 1: parent job is containerized — enter its namespaces via nsenter
-            // (srun inside sbatch/salloc --container-image).
-            //
-            // If the step asked for its own image, it is not honored here: the
-            // step joins the parent's live container. Leave a trace rather than
-            // silently dropping it.
-            if let Some(c) = req.container.as_ref() {
-                if !c.image.is_empty() {
-                    warn!(
-                        job_id,
-                        step_id,
-                        image = %c.image,
-                        "step --container-image ignored: joining the parent job's \
-                         running container instead of building a new one"
-                    );
-                }
-            }
+        } else if joins_parent_namespaces {
+            // Case 1: the step joins the job's namespaces via nsenter, whether
+            // those are a job-level container's or the batch job's own.
             // Enter the step's work_dir *inside* the container by cd-ing in a
             // shell that runs after nsenter — a host-side chdir does not
             // survive entering the container's pivoted mount namespace, and
@@ -9105,13 +9154,8 @@ impl SlurmAgent for AgentService {
                 self.cgroup.required,
             )
             .await?
-        } else if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
-            // Case 2: standalone srun --container-image with no running parent
-            // container — set up a fresh rootfs for this step.
-            let c = req
-                .container
-                .as_ref()
-                .expect("container present in this arm");
+        } else if let StepContainerPlan::Fresh(c) = &step_container_plan {
+            // Case 2: the step builds its own rootfs, outside the job's namespaces.
             let step_uid = req.uid;
             let step_gid = req.gid;
 
@@ -9212,11 +9256,9 @@ impl SlurmAgent for AgentService {
             // Multi-task and labeled commands use agent-generated wrappers. A
             // fresh container cannot see their host paths after pivot_root.
             if let Some(ref scripts) = _step_script_guard {
-                scripts
-                    .stage_in_rootfs(&rootfs, step_uid, step_gid)
-                    .map_err(|e| {
-                        Status::internal(format!("failed to stage step scripts in container: {e}"))
-                    })?;
+                container_cfg
+                    .mounts
+                    .push(crate::executor::job_spool_mount(&scripts.dir));
             }
 
             // Write the step command as a script inside the rootfs so it's
@@ -9231,22 +9273,12 @@ impl SlurmAgent for AgentService {
                 })?;
                 format!("#!/bin/bash\n{joined}\n")
             };
-            let script_in_rootfs = format!(
-                "{}/tmp/spur_step_{}_{}.sh",
-                rootfs.display(),
-                job_id,
-                step_id
-            );
-            std::fs::write(&script_in_rootfs, &step_script_content)
-                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &script_in_rootfs,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+            crate::container::write_entry_script(
+                &rootfs,
+                &format!("spur_step_{job_id}_{step_id}.sh"),
+                &step_script_content,
+            )
+            .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
 
             // Script path inside the container (after pivot_root, host paths are gone).
             let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
@@ -9342,8 +9374,8 @@ impl SlurmAgent for AgentService {
         // Backward-compatible: the response still carries the step's output by
         // reading the spool files back, which is what bounds it in memory.
         let read_back = |path: String| async move {
-            match tokio::fs::read(&path).await {
-                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            match crate::scratch::read_spool_file(std::path::Path::new(&path)).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(e) => {
                     // Don't fail the step over a read-back error, but log it so a
                     // missing response body can be correlated with a filesystem
@@ -9509,15 +9541,16 @@ impl SlurmAgent for AgentService {
                     return;
                 }
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                let mut file = match tokio::fs::File::open(&file_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("open step output file: {e}"))))
-                            .await;
-                        return;
-                    }
-                };
+                let mut file =
+                    match crate::scratch::open_spool_file(std::path::Path::new(&file_path)).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("open step output file: {e}"))))
+                                .await;
+                            return;
+                        }
+                    };
                 // Tail incrementally: seek to the last offset and read only the
                 // newly appended bytes each poll, instead of re-reading the whole
                 // file (which is O(n^2) for high-volume steps).
@@ -9770,9 +9803,13 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
-        let container_plan =
-            resolve_step_container_plan(init.container.as_ref(), parent_has_namespaces);
+        let container_plan = resolve_step_container_plan(
+            init.container.as_ref(),
+            &entry,
+            init.job_id,
+            spur_core::step::STEP_INTERACTIVE,
+        )?;
+        let joins_parent_namespaces = matches!(container_plan, StepContainerPlan::JoinParent);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
@@ -9897,24 +9934,18 @@ impl SlurmAgent for AgentService {
                 }
                 None => {
                     self.ensure_node_cleanup_ready()?;
-                    let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
+                    let script = interactive_step_script(
+                        &entry,
+                        joins_parent_namespaces,
+                        entry.uid,
+                        entry.gid,
+                        &argv,
+                    )?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
                     let mut host_identity_env: Option<HashMap<String, String>> = None;
                     let container = match &container_plan {
-                        StepContainerPlan::None => {
-                            if parent_has_namespaces {
-                                if let Some(c) =
-                                    init.container.as_ref().filter(|c| !c.image.is_empty())
-                                {
-                                    warn!(
-                                        job_id = init.job_id,
-                                        image = %c.image,
-                                        "step --container-image ignored: joining the parent job's \
-                                         running container instead of building a new one"
-                                    );
-                                }
-                            }
+                        StepContainerPlan::JoinParent | StepContainerPlan::Host => {
                             if entry.uid > 0 {
                                 if let Some(user) = nix::unistd::User::from_uid(
                                     nix::unistd::Uid::from_raw(entry.uid),
@@ -10022,7 +10053,7 @@ impl SlurmAgent for AgentService {
                         job_id: init.job_id,
                         run_attempt,
                         step_id,
-                        joins_parent_namespaces: parent_has_namespaces,
+                        joins_parent_namespaces,
                         allocation_holder: false,
                         step_limits: Default::default(),
                         script,
@@ -10470,6 +10501,22 @@ impl AgentService {
                 request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
             });
         }
+    }
+
+    fn write_step_script(
+        &self,
+        dir: &crate::scratch::ScratchDir,
+        name: &str,
+        content: &str,
+        owner: crate::scratch::ScratchOwner,
+        job_id: u32,
+    ) -> Result<std::path::PathBuf, Status> {
+        executor::write_spool_scratch(dir, name, content, owner, "write step script").map_err(
+            |error| {
+                self.drain_on_node_fault(&error, job_id);
+                Status::internal(format!("failed to write step script: {error}"))
+            },
+        )
     }
 
     /// Drops the tracked entry for `job_id` only if it's still `run_attempt` —
@@ -11528,10 +11575,29 @@ impl AgentService {
     ///
     /// Backs `exec_in_job` and `interactive_session` (attach), both reachable
     /// only after the controller's `job.state == Running` check — i.e. every
-    /// node has confirmed LaunchJob (confirm_dispatch_on_nodes) — so no retry
-    /// on a miss. Restart mid-job (empty `running`) is the one uncovered case.
+    /// node has confirmed LaunchJob (confirm_dispatch_on_nodes). The controller
+    /// releases the batch workload only after that, so an entry waits for the
+    /// release rather than being read with no process to take the job's
+    /// environment and namespaces from, and is `Unavailable` if the release
+    /// never comes. Restart mid-job (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
-        let supervised = self.supervised_state(job_id).await;
+        self.job_entry_polling(job_id, BATCH_RELEASE_POLLS).await
+    }
+
+    async fn job_entry_polling(
+        &self,
+        job_id: u32,
+        release_polls: u32,
+    ) -> Result<crate::job_entry::JobEntry, Status> {
+        let supervised = match self.batch_workload(job_id, release_polls).await {
+            BatchWorkload::Live(snapshot) => Some(snapshot),
+            BatchWorkload::Gated => {
+                return Err(Status::unavailable(format!(
+                    "job {job_id} was not released on this node"
+                )))
+            }
+            BatchWorkload::Unknown => self.supervised_state(job_id).await,
+        };
         let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
         // The supervisor creates the cgroup after spurd's launch returns, so it
         // is read live rather than from the descriptor written before the exec.
@@ -11558,6 +11624,7 @@ impl AgentService {
             has_pid_namespace: tracked.has_pid_namespace,
             has_user_namespace: tracked.has_user_namespace,
             has_mount_namespace: tracked.has_mount_namespace,
+            container: tracked.container.clone(),
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
@@ -11855,6 +11922,7 @@ impl TrackedJob {
         Self {
             job: executor::RunningJob::AllocationOnly,
             rootfs_mode: crate::container::RootfsMode::Extracted,
+            container: crate::job_entry::JobContainer::None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -14801,6 +14869,7 @@ mod tests {
 
     fn plain_job_entry() -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
             pid: 0,
             has_pid_namespace: false,
             has_user_namespace: false,
@@ -14812,35 +14881,130 @@ mod tests {
         }
     }
 
+    fn alpine() -> spur_proto::proto::ContainerSpec {
+        spur_proto::proto::ContainerSpec {
+            image: "docker://alpine".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A root agent's batch job: fresh PID and mount namespaces, no container.
+    fn batch_job_entry() -> crate::job_entry::JobEntry {
+        let mut entry = plain_job_entry();
+        entry.pid = 4242;
+        entry.has_pid_namespace = true;
+        entry.has_mount_namespace = true;
+        entry
+    }
+
+    fn containerized_job_entry() -> crate::job_entry::JobEntry {
+        let mut entry = batch_job_entry();
+        entry.container = crate::job_entry::JobContainer::Image("docker://job-image".into());
+        entry
+    }
+
+    fn plan(
+        container: Option<&spur_proto::proto::ContainerSpec>,
+        entry: &crate::job_entry::JobEntry,
+    ) -> Result<StepContainerPlan, Status> {
+        resolve_step_container_plan(container, entry, 7, 3)
+    }
+
+    fn job_image() -> spur_proto::proto::ContainerSpec {
+        spur_proto::proto::ContainerSpec {
+            image: "docker://job-image".into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn a_plain_step_with_no_container_needs_no_plan() {
+    fn a_plain_step_with_no_container_runs_on_the_host() {
         assert!(matches!(
-            resolve_step_container_plan(None, false),
-            StepContainerPlan::None
+            plan(None, &plain_job_entry()),
+            Ok(StepContainerPlan::Host)
         ));
     }
 
     #[test]
-    fn a_step_with_its_own_image_and_no_containerized_parent_builds_fresh() {
-        let container = spur_proto::proto::ContainerSpec {
-            image: "docker://alpine".into(),
-            ..Default::default()
-        };
+    fn a_step_with_its_own_image_and_no_namespaced_parent_builds_fresh() {
         assert!(matches!(
-            resolve_step_container_plan(Some(&container), false),
-            StepContainerPlan::Fresh(c) if c.image == "docker://alpine"
+            plan(Some(&alpine()), &plain_job_entry()),
+            Ok(StepContainerPlan::Fresh(c)) if c.image == "docker://alpine"
         ));
     }
 
     #[test]
-    fn a_step_s_own_image_is_ignored_when_joining_a_containerized_parent() {
-        let container = spur_proto::proto::ContainerSpec {
-            image: "docker://alpine".into(),
-            ..Default::default()
-        };
+    fn a_step_with_its_own_image_in_a_batch_job_builds_fresh_outside_its_namespaces() {
         assert!(matches!(
-            resolve_step_container_plan(Some(&container), true),
-            StepContainerPlan::None
+            plan(Some(&alpine()), &batch_job_entry()),
+            Ok(StepContainerPlan::Fresh(c)) if c.image == "docker://alpine"
+        ));
+    }
+
+    #[test]
+    fn a_step_without_an_image_in_a_batch_job_joins_its_namespaces() {
+        let entry = batch_job_entry();
+        assert!(matches!(
+            plan(None, &entry),
+            Ok(StepContainerPlan::JoinParent)
+        ));
+        let empty_image = spur_proto::proto::ContainerSpec::default();
+        assert!(matches!(
+            plan(Some(&empty_image), &entry),
+            Ok(StepContainerPlan::JoinParent)
+        ));
+    }
+
+    #[test]
+    fn a_step_without_an_image_in_a_containerized_job_joins_its_container() {
+        assert!(matches!(
+            plan(None, &containerized_job_entry()),
+            Ok(StepContainerPlan::JoinParent)
+        ));
+    }
+
+    #[test]
+    fn a_step_naming_the_jobs_own_image_joins_its_container() {
+        assert!(matches!(
+            plan(Some(&job_image()), &containerized_job_entry()),
+            Ok(StepContainerPlan::JoinParent)
+        ));
+    }
+
+    #[test]
+    fn a_step_naming_an_image_joins_a_job_whose_image_was_never_recorded() {
+        let mut entry = containerized_job_entry();
+        entry.container = crate::job_entry::JobContainer::Unrecorded;
+        assert!(matches!(
+            plan(Some(&alpine()), &entry),
+            Ok(StepContainerPlan::JoinParent)
+        ));
+    }
+
+    #[test]
+    fn a_step_naming_a_different_image_is_refused_in_a_containerized_job() {
+        let status = match plan(Some(&alpine()), &containerized_job_entry()) {
+            Err(status) => status,
+            Ok(_) => panic!("the step's image must not be dropped silently"),
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("docker://alpine"), "{status:?}");
+        assert!(
+            status.message().contains("docker://job-image"),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespaced_parent_with_no_live_pid_is_not_joined() {
+        let mut entry = batch_job_entry();
+        entry.pid = 0;
+        assert!(matches!(plan(None, &entry), Ok(StepContainerPlan::Host)));
+        let mut containerized = containerized_job_entry();
+        containerized.pid = 0;
+        assert!(matches!(
+            plan(Some(&alpine()), &containerized),
+            Ok(StepContainerPlan::Fresh(_))
         ));
     }
 
@@ -15162,6 +15326,7 @@ mod tests {
     fn a_plain_steps_script_runs_the_command_directly() {
         let script = supervised_step_script(
             &plain_job_entry(),
+            false,
             1000,
             1000,
             "/tmp",
@@ -15182,8 +15347,9 @@ mod tests {
         entry.has_mount_namespace = true;
         entry.pid = 4242;
 
-        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
-            .expect("script");
+        let script =
+            supervised_step_script(&entry, true, 1000, 1000, "/tmp", &["true".to_string()])
+                .expect("script");
 
         // Inside the script, so the supervisor itself stays out of the job's
         // namespaces and outlives it.
@@ -15204,6 +15370,7 @@ mod tests {
 
         let script = supervised_step_script(
             &entry,
+            true,
             1000,
             1000,
             "/srv/step-scratch",
@@ -15222,12 +15389,16 @@ mod tests {
     }
 
     #[test]
-    fn a_namespaced_parent_with_no_live_pid_runs_the_command_directly() {
-        let mut entry = plain_job_entry();
-        entry.has_pid_namespace = true;
-
-        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
-            .expect("script");
+    fn a_step_outside_its_parent_s_namespaces_runs_the_command_directly() {
+        let script = supervised_step_script(
+            &batch_job_entry(),
+            false,
+            1000,
+            1000,
+            "/tmp",
+            &["true".to_string()],
+        )
+        .expect("script");
 
         assert!(!script.contains("nsenter"), "{script}");
     }
@@ -15310,7 +15481,7 @@ mod tests {
 
     #[test]
     fn interactive_step_script_defaults_an_empty_argv_to_a_shell() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &[])
+        let script = interactive_step_script(&plain_job_entry(), false, 1000, 1000, &[])
             .expect("script")
             .trim()
             .to_string();
@@ -15319,10 +15490,11 @@ mod tests {
 
     #[test]
     fn interactive_step_script_honors_an_explicit_command() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &["zsh".to_string()])
-            .expect("script")
-            .trim()
-            .to_string();
+        let script =
+            interactive_step_script(&plain_job_entry(), false, 1000, 1000, &["zsh".to_string()])
+                .expect("script")
+                .trim()
+                .to_string();
         assert!(script.ends_with("zsh"), "{script}");
     }
 
@@ -16183,6 +16355,7 @@ mod tests {
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
             pid: 1234,
             has_pid_namespace: true,
             has_user_namespace: false,
@@ -16318,6 +16491,7 @@ mod tests {
     #[test]
     fn build_launch_plan_no_namespaces_spawns_directly_with_child_drop() {
         let entry = crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
             pid: 0,
             has_pid_namespace: false,
             has_user_namespace: false,
@@ -16342,6 +16516,7 @@ mod tests {
         // has_namespaces() is true but pid is 0 (no live process to enter):
         // fall back to a direct spawn rather than a broken nsenter.
         let entry = crate::job_entry::JobEntry {
+            container: crate::job_entry::JobContainer::None,
             pid: 0,
             has_pid_namespace: true,
             has_user_namespace: false,
@@ -17455,6 +17630,47 @@ mod tests {
             tracked.rootfs_mode,
             crate::container::RootfsMode::Overlay,
             "guessing Extracted would skip the unmount and leak the overlay"
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_restores_what_the_job_container_was_recorded_as() {
+        use crate::job_entry::JobContainer;
+        let session = |job_id: u32, step_id: u32| {
+            crate::stepd::StepdDescriptor::new(
+                job_id,
+                1,
+                step_id,
+                0,
+                0,
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+            )
+        };
+        let mut containerized = session(51, spur_core::step::STEP_BATCH);
+        containerized.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+        containerized.container_image = "docker://job-image".into();
+        let mut unrecorded = session(52, spur_core::step::STEP_BATCH);
+        unrecorded.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+        let plain = session(53, spur_core::step::STEP_BATCH);
+        let mut step = session(54, 2);
+        step.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+        step.container_image = "docker://step-image".into();
+
+        let running = new_running_jobs();
+        recover_stepds(&running, vec![containerized, unrecorded, plain, step]).await;
+
+        let jobs = running.lock().await;
+        assert_eq!(
+            jobs[&51].container,
+            JobContainer::Image("docker://job-image".into())
+        );
+        assert_eq!(jobs[&52].container, JobContainer::Unrecorded);
+        assert_eq!(jobs[&53].container, JobContainer::None);
+        assert_eq!(
+            jobs[&54].container,
+            JobContainer::None,
+            "a step's own container is not the job's"
         );
     }
 
@@ -18625,15 +18841,13 @@ mod tests {
         );
 
         let spool = root.path().join("spool/job42");
-        let scripts = root.path().join(".spur_step_42");
         std::fs::create_dir_all(&spool).unwrap();
-        std::fs::create_dir(&scripts).unwrap();
         let (user_script, wrapper) = step_scratch_names(0, step_id);
         let files = [
             spool.join("step3.out"),
             spool.join("step3.err"),
-            scripts.join(user_script),
-            scripts.join(wrapper),
+            spool.join(user_script),
+            spool.join(wrapper),
         ];
         for path in &files {
             std::fs::write(path, b"original step data").unwrap();
@@ -18870,34 +19084,46 @@ mod tests {
         assert_eq!(resp.stdout.trim(), "0 1 test-node n1,n2,test-node 3");
     }
 
-    #[test]
-    fn step_scripts_are_staged_at_their_container_paths() {
-        let work = tempfile::TempDir::new().unwrap();
-        let rootfs = tempfile::TempDir::new().unwrap();
-        let dir = work.path().join(".spur_step_1");
-        std::fs::create_dir(&dir).unwrap();
-        let command = dir.join("cmd_0.sh");
-        let wrapper = dir.join("wrapper_0.sh");
-        std::fs::write(&command, "#!/bin/bash\necho staged\n").unwrap();
-        std::fs::write(
-            &wrapper,
-            format!("#!/bin/bash\nbash {}\n", command.display()),
+    // The job picks its own work dir, so a step folder planted there must never
+    // be created, chmod'ed or chowned by root.
+    #[tokio::test]
+    async fn a_labeled_step_never_touches_a_step_folder_planted_in_its_work_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let (svc, job_id) = run_command_test_setup().await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let canary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(canary.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(
+            canary.path(),
+            work_dir.path().join(format!(".spur_step_{job_id}")),
         )
         .unwrap();
-        let scripts = StepScriptCleanup {
-            dir,
-            paths: vec![command.clone(), wrapper.clone()],
-        };
 
-        scripts.stage_in_rootfs(rootfs.path(), 0, 0).unwrap();
+        let resp = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["echo".into(), "labeled".into()],
+                uid: 0,
+                gid: 0,
+                job_id,
+                label: true,
+                work_dir: work_dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
 
-        for source in [&command, &wrapper] {
-            let destination = rootfs.path().join(source.strip_prefix("/").unwrap());
-            assert_eq!(
-                std::fs::read_to_string(destination).unwrap(),
-                std::fs::read_to_string(source).unwrap()
-            );
-        }
+        assert_eq!(resp.exit_code, 0, "{}", resp.stderr);
+        let mode = std::fs::metadata(canary.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the planted folder's target must be left alone"
+        );
+        assert_eq!(std::fs::read_dir(canary.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -18996,20 +19222,8 @@ mod tests {
         );
     }
 
-    /// The parent-container (nsenter) path takes precedence over setting up a
-    /// fresh container: a step whose tracked job already has live namespaces must
-    /// enter them, never call `resolve_image`. Proven by the *absence* of the
-    /// image-not-found error even though a bogus image is supplied.
-    #[tokio::test]
-    async fn run_command_enters_parent_namespaces_before_new_container() {
-        let (svc, job_id) = run_command_test_setup().await;
-        {
-            let mut jobs = svc.running.lock().await;
-            let job = jobs.get_mut(&job_id).unwrap();
-            job.has_pid_namespace = true;
-            job.has_mount_namespace = true;
-        }
-        let req = Request::new(RunCommandRequest {
+    fn run_command_with_bogus_image(job_id: u32) -> Request<RunCommandRequest> {
+        Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
             uid: 0,
             gid: 0,
@@ -19021,37 +19235,96 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        });
-        // The nsenter path was taken, not Case 2: the bogus image is never
-        // resolved. On a typical (unprivileged) test runner setns is denied, so
-        // the step comes back as a run with an nsenter trace on stderr — the
-        // observable branch — rather than the "image not found" resolution error.
-        match svc.run_command(req).await {
-            Ok(resp) => {
-                let r = resp.into_inner();
-                assert!(
-                    !r.stdout.contains("not found in [") && !r.stderr.contains("not found in ["),
-                    "namespaced job must nsenter, not resolve a new image: {r:?}"
-                );
-                assert!(
-                    r.exit_code == 0
-                        || r.stderr.to_lowercase().contains("nsenter")
-                        || r.stderr.contains("Operation not permitted")
-                        || !r.stderr.is_empty(),
-                    "expected the nsenter path (success, or an nsenter/permission \
-                     failure on an unprivileged runner), got: {r:?}"
-                );
-            }
-            Err(err) => {
-                // A spawn error (e.g. no nsenter binary) is acceptable, as long as
-                // it is not image resolution — that would mean Case 2 was entered.
-                assert!(
-                    !err.message().contains("not found in ["),
-                    "namespaced job should nsenter, not resolve a new image: {}",
-                    err.message()
-                );
-            }
+        })
+    }
+
+    /// A root agent runs every batch job in fresh PID and mount namespaces; a
+    /// step naming its own image there must build its own container, not join
+    /// those namespaces and drop the image. Proven by the step reaching image
+    /// resolution, which fails on the bogus image.
+    #[tokio::test]
+    async fn run_command_with_image_in_a_namespaced_batch_job_builds_its_own_container() {
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
         }
+        let err = svc
+            .run_command(run_command_with_bogus_image(job_id))
+            .await
+            .expect_err("the bogus image must fail to resolve, not be ignored");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("not found"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn run_command_refuses_a_different_step_image_in_a_containerized_job() {
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
+            job.container = crate::job_entry::JobContainer::Image("/images/job-image.sqsh".into());
+        }
+        let err = svc
+            .run_command(run_command_with_bogus_image(job_id))
+            .await
+            .expect_err("the step's image cannot be honoured, so it must not run");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("differs from"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn interactive_session_refuses_a_different_step_image_in_a_containerized_job() {
+        use spur_proto::proto::{interactive_input, InitSession, InteractiveInput};
+
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.uid = 1000;
+            job.gid = 1000;
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
+            job.container = crate::job_entry::JobContainer::Image("/images/job-image.sqsh".into());
+        }
+        let incoming = tonic::transport::server::TcpIncoming::bind(
+            "127.0.0.1:0".parse().expect("loopback address"),
+        )
+        .expect("bind agent fixture");
+        let address = format!("http://{}", incoming.local_addr().expect("agent address"));
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(spur_proto::agent_server(svc))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve agent fixture");
+        });
+        let mut client = spur_proto::proto::slurm_agent_client::SlurmAgentClient::connect(address)
+            .await
+            .expect("connect agent fixture");
+        let result = client
+            .interactive_session(tokio_stream::iter([InteractiveInput {
+                msg: Some(interactive_input::Msg::Init(InitSession {
+                    job_id,
+                    argv: vec!["true".into()],
+                    user: "testuser".into(),
+                    container: Some(spur_proto::proto::ContainerSpec {
+                        image: "/images/bogus.sqsh".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            }]))
+            .await;
+        server.abort();
+
+        let err = result.expect_err("the step's image cannot be honoured, so no terminal opens");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("differs from"), "{}", err.message());
     }
 
     /// Without a container_image and without namespaces, the step runs directly
@@ -21431,8 +21704,9 @@ mod tests {
             false, // allow_root_jobs
         );
 
-        assert!(
-            reporter.held_jobs().is_empty(),
+        assert_eq!(
+            reporter.held_jobs().await,
+            Some(Vec::new()),
             "reporter sees no jobs before registration"
         );
 
@@ -21454,8 +21728,8 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_jobs(),
-            vec![(77, 9)],
+            reporter.held_jobs().await,
+            Some(vec![(77, 9)]),
             "reporter's heartbeat must observe the agent-registered allocation-only job and its run"
         );
         assert_eq!(
@@ -22433,6 +22707,7 @@ mod tests {
         let tracked = TrackedJob {
             fabric_binding: None,
             gpu_binding: None,
+            container: crate::job_entry::JobContainer::None,
             job: executor::RunningJob::Managed { child },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
@@ -23882,6 +24157,7 @@ mod tests {
             let t = TrackedJob {
                 fabric_binding: None,
                 gpu_binding: None,
+                container: crate::job_entry::JobContainer::None,
                 job: executor::RunningJob::Managed { child },
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
@@ -24432,6 +24708,7 @@ mod tests {
             TrackedJob {
                 fabric_binding: None,
                 gpu_binding: None,
+                container: crate::job_entry::JobContainer::None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -24520,6 +24797,7 @@ mod tests {
             TrackedJob {
                 fabric_binding: None,
                 gpu_binding: None,
+                container: crate::job_entry::JobContainer::None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -25848,6 +26126,99 @@ mod tests {
             .await
             .expect("job_entry should succeed");
         assert_eq!(entry.cgroup_path, Some(cgroup));
+    }
+
+    /// A supervised batch job whose supervisor is still holding its workload at
+    /// the launch gate, as it is between the controller marking the job Running
+    /// and StartJob reaching this node.
+    async fn gated_batch_job(
+        svc: &AgentService,
+        job_id: u32,
+        dir: &tempfile::TempDir,
+    ) -> (crate::stepd::StepdDescriptor, tokio::net::UnixListener) {
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(None))
+            .await;
+        let socket_path = dir.path().join("runtime.sock");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            socket_path.clone(),
+            std::path::PathBuf::new(),
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        (descriptor, listener)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_entry_waits_for_the_gated_batch_workload_and_enters_it() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = gated_batch_job(&svc, 4343, &dir).await;
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            executor::RunningJob::Managed { child },
+            4343,
+            1,
+            spur_core::step::STEP_BATCH,
+        ));
+        let supervisor_descriptor = descriptor.clone();
+        let supervisor = tokio::spawn(async move {
+            crate::stepd::serve_launch_gate(&listener, &supervisor_descriptor).await;
+            let _ = crate::stepd::run_supervisor(listener, supervisor_descriptor, session).await;
+        });
+        let probe = crate::stepd::query_state(&descriptor, "probe".into())
+            .await
+            .expect("the gate answers before release");
+        assert_eq!(probe.job_pid, 0, "the workload must still be gated here");
+
+        let svc = std::sync::Arc::new(svc);
+        let entering = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.job_entry(4343).await })
+        };
+        tokio::time::sleep(BATCH_RELEASE_POLL_INTERVAL * 3).await;
+        crate::stepd::start_job(&descriptor, "release".into())
+            .await
+            .expect("release the workload");
+
+        let entry = entering
+            .await
+            .expect("join")
+            .expect("an entry made while gated must wait for the release");
+        assert_eq!(entry.pid, pid as i32);
+        supervisor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_entry_is_unavailable_when_the_batch_workload_is_never_released() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = gated_batch_job(&svc, 4344, &dir).await;
+        let gate =
+            tokio::spawn(
+                async move { crate::stepd::serve_launch_gate(&listener, &descriptor).await },
+            );
+
+        let err = svc
+            .job_entry_polling(4344, 2)
+            .await
+            .expect_err("a workload that is never released has no process to enter");
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        gate.abort();
     }
 
     #[tokio::test]

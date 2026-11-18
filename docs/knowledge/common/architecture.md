@@ -130,6 +130,7 @@ outside the WAL for performance.
 | `JobPreemptRequeue` | Atomic preempt + requeue to Pending |
 | `JobPreemptCancel` | Atomic preempt + cancel |
 | `NodeRegister` | New node joins the cluster |
+| `NodeInventoryUpdate` | Saves `admission.node_names`, deleting unlisted nodes |
 | `NodeStateChange` | Node state transition |
 | `ReservationCreate/Update/Delete` | Reservation management |
 | `PartitionCreate/Update/Delete` | Partition management |
@@ -357,14 +358,16 @@ override the exit-code-based decision.
       |
       v
   RegisterAgent RPC ---> spurctld proposes WalOperation::NodeRegister
+      |                  (refused if a saved admission.node_names excludes it)
       |
       | state: UNKNOWN -> IDLE
       v
   heartbeat_loop (periodic HeartbeatRequest)
       |
       |--- heartbeat arrives: update last_seen, resources, running jobs
-      |--- heartbeat timeout: state -> DOWN
-      |--- heartbeat recovered: state -> IDLE (unless admin-locked)
+      |--- heartbeat timeout: flagged not-responding; DOWN after two failed probes
+      |--- heartbeat recovered: state -> IDLE (unless admin-locked) once
+      |    it reports a clean job list; DRAIN at the hold cap otherwise
       |
       v
   AdminSetState(Drain) ---> DRAINING (if jobs running) or DRAIN (if idle)
@@ -383,10 +386,17 @@ status. Resource inventory and node address are not carried in heartbeats
 (they are set at registration).
 
 **Health checker:** runs on the leader at `health_tick_secs` interval.
-Nodes missing heartbeats past `heartbeat_timeout_secs` are marked DOWN.
+Nodes missing heartbeats past `heartbeat_timeout_secs` are flagged
+not-responding (no new work) and probed directly; one whose agent fails two
+probes a health pass apart is marked DOWN, unless so many nodes are silent at
+once that the leader suspects itself (`max_stale_node_fraction`).
 Running jobs on a DOWN node are evicted (cancel sent to agents, steps
 force-completed). A leadership grace period prevents false positives
-immediately after election.
+immediately after election. A returning DOWN or ERROR node stays down
+while its heartbeats report runs the controller ended, or cannot list its
+jobs; the leader cancels those runs and drains the node (admin-locked) if
+it is not clean by the hold cap, `max(heartbeat_timeout_secs, kill,
+cleanup, and epilog budget + one heartbeat interval)`.
 
 **Inventory refresh:** spurd periodically re-discovers local hardware
 (GPU topology changes from partition switches). Changes are debounced
