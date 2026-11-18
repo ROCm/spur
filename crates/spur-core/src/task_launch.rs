@@ -6,105 +6,20 @@
 //! Used by batch `launch_job` and srun step dispatch on agents.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
-
-use regex::Regex;
 
 use crate::mpi::{MPI_MPIRUN, MPI_PMIX};
+use crate::script_placement::ResolvedPlacement;
 use crate::spur_env::SpurEnv;
 use crate::step::{distribute_tasks, CpuBind, GpuBind, TaskDistribution};
-
-static STEP_LAUNCH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|[\s;&|])(?:/.*/)?(srun|mpirun|mpiexec)\b").expect("valid step-launch regex")
-});
-
-/// Placeholder for a quoted span when sanitizing a line for step-launcher detection.
-/// Must not be whitespace or a shell command separator so word adjacency is preserved.
-const QUOTED_SPAN_PLACEHOLDER: char = 'x';
-
-fn hash_starts_shell_comment(line: &str, hash_index: usize) -> bool {
-    if hash_index == 0 {
-        return true;
-    }
-    let prev = line.as_bytes()[hash_index - 1] as char;
-    matches!(prev, ' ' | '\t' | ';' | '&' | '|' | '(' | ')')
-}
-
-/// Build a sanitized copy of a shell line for step-launcher regex matching: quoted
-/// spans collapse to a single placeholder (preserving adjacency with neighbors),
-/// and `#` starts a comment only at a word boundary.
-fn sanitize_shell_line_for_step_launch(line: &str) -> String {
-    let mut sanitized = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-                sanitized.push(QUOTED_SPAN_PLACEHOLDER);
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_double = false;
-                sanitized.push(QUOTED_SPAN_PLACEHOLDER);
-            }
-            i += 1;
-            continue;
-        }
-        if c == '\'' {
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_double = true;
-            i += 1;
-            continue;
-        }
-        if c == '#' && hash_starts_shell_comment(line, i) {
-            break;
-        }
-        sanitized.push(c);
-        i += 1;
-    }
-
-    sanitized
-}
-
-/// True when a batch script delegates rank fan-out to an inner step launcher.
-pub fn batch_script_uses_step_launch(script: &str) -> bool {
-    for line in script.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let sanitized = sanitize_shell_line_for_step_launch(trimmed);
-        if STEP_LAUNCH_RE.is_match(sanitized.trim()) {
-            return true;
-        }
-    }
-    false
-}
 
 /// Whether batch `launch_job` should fan out the user script into per-rank
 /// wrappers on this node.
 ///
 /// Batch scripts normally run once per node; multi-rank MPI is the script's
 /// job via an internal `srun`. Spur additionally fans out when `--mpi=pmix`
-/// is set so direct batch launches (no inner `srun`) spawn one rank per task on
-/// the node. Standalone `srun` routed through the batch path uses `task_fanout`
+/// is set on a script that runs on every node, so a direct batch launch spawns
+/// one rank per task on the node; a batch-host script is a driver, not a rank.
+/// Standalone `srun` routed through the batch path uses `task_fanout`
 /// for the same effect with non-PMIx commands.
 ///
 /// `--mpi=mpirun` never fans out: Spur launches exactly one task (mpirun) per
@@ -113,7 +28,7 @@ pub fn use_multi_task_launch(
     tasks_per_node: u32,
     task_fanout: bool,
     mpi: &str,
-    script: &str,
+    placement: ResolvedPlacement,
 ) -> bool {
     if tasks_per_node <= 1 {
         return false;
@@ -124,7 +39,7 @@ pub fn use_multi_task_launch(
     if task_fanout {
         return true;
     }
-    mpi == MPI_PMIX && !batch_script_uses_step_launch(script)
+    mpi == MPI_PMIX && placement == ResolvedPlacement::AllNodes
 }
 
 /// How batch `launch_job` runs the user script on this node.
@@ -144,15 +59,15 @@ pub fn batch_launch(
     tasks_per_node: u32,
     task_fanout: bool,
     mpi: &str,
-    script: &str,
+    placement: ResolvedPlacement,
 ) -> BatchLaunch {
     if mpi == MPI_MPIRUN && task_fanout {
         return BatchLaunch::Mpirun;
     }
-    if use_multi_task_launch(tasks_per_node, task_fanout, mpi, script) {
+    if use_multi_task_launch(tasks_per_node, task_fanout, mpi, placement) {
         return BatchLaunch::FanOut;
     }
-    if mpi == MPI_PMIX && !batch_script_uses_step_launch(script) {
+    if mpi == MPI_PMIX && placement == ResolvedPlacement::AllNodes {
         return BatchLaunch::LoneRank;
     }
     BatchLaunch::Script
@@ -161,16 +76,14 @@ pub fn batch_launch(
 /// True when batch dispatch already ran multi-node PMIx prepare for this job.
 ///
 /// Direct `#SBATCH --mpi=pmix` on multiple nodes prepares PMIx before launch.
-/// Batch scripts with an inner `srun` skip batch prepare; their steps prepare
-/// independently. Must stay aligned with `confirm_dispatch_on_nodes`.
+/// A batch-host script drives its own steps, so it skips batch prepare; those
+/// steps prepare independently. Must stay aligned with `confirm_dispatch_on_nodes`.
 pub fn batch_dispatched_multi_node_pmix(
     job_mpi: Option<&str>,
     num_allocated_nodes: u32,
-    script: Option<&str>,
+    placement: ResolvedPlacement,
 ) -> bool {
-    job_mpi == Some(MPI_PMIX)
-        && num_allocated_nodes > 1
-        && !script.is_some_and(batch_script_uses_step_launch)
+    job_mpi == Some(MPI_PMIX) && num_allocated_nodes > 1 && placement == ResolvedPlacement::AllNodes
 }
 
 /// Whether a multi-node PMIx step needs controller-side `PreparePmix` before
@@ -179,12 +92,12 @@ pub fn step_needs_pmix_prepare(
     step_num_nodes: u32,
     job_mpi: Option<&str>,
     num_allocated_nodes: u32,
-    script: Option<&str>,
+    placement: ResolvedPlacement,
 ) -> bool {
-    step_num_nodes > 1 && !batch_dispatched_multi_node_pmix(job_mpi, num_allocated_nodes, script)
+    step_num_nodes > 1 && !batch_dispatched_multi_node_pmix(job_mpi, num_allocated_nodes, placement)
 }
 
-/// Bash body for non-primary batch nodes when the user script uses `srun`.
+/// Bash body for the non-primary nodes of a script that runs on the batch host.
 ///
 /// The batch script runs only on the first allocated node; companions hold
 /// their slice of the allocation until the controller tears them down.
@@ -937,33 +850,34 @@ mod tests {
         assert!(script.contains("taskset -c ${_CPU_MAP[$_CPU_IDX]}"));
     }
 
+    const EVERY_NODE: ResolvedPlacement = ResolvedPlacement::AllNodes;
+    const BATCH_HOST: ResolvedPlacement = ResolvedPlacement::BatchHost;
+
     #[test]
     fn use_multi_task_launch_batch_pmix_fans_out() {
-        assert!(use_multi_task_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"));
-        assert!(!use_multi_task_launch(1, false, MPI_PMIX, "/tmp/hello_mpi"));
-        assert!(!use_multi_task_launch(4, false, "none", "echo hi"));
-        assert!(use_multi_task_launch(4, true, "none", "hostname"));
-        assert!(!use_multi_task_launch(1, true, "none", "hostname"));
+        assert!(use_multi_task_launch(4, false, MPI_PMIX, EVERY_NODE));
+        assert!(!use_multi_task_launch(1, false, MPI_PMIX, EVERY_NODE));
+        assert!(!use_multi_task_launch(4, false, "none", EVERY_NODE));
+        assert!(use_multi_task_launch(4, true, "none", EVERY_NODE));
+        assert!(!use_multi_task_launch(1, true, "none", EVERY_NODE));
     }
 
     #[test]
     fn a_lone_pmix_batch_rank_is_wrapped() {
-        let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
         assert_eq!(
-            batch_launch(1, false, MPI_PMIX, direct),
+            batch_launch(1, false, MPI_PMIX, EVERY_NODE),
             BatchLaunch::LoneRank
         );
     }
 
     #[test]
     fn a_pmix_batch_driver_runs_unwrapped() {
-        let driver = "#!/bin/bash\n#SBATCH --mpi=pmix\nsrun --mpi=pmix /tmp/hello_mpi\n";
         assert_eq!(
-            batch_launch(1, false, MPI_PMIX, driver),
+            batch_launch(1, false, MPI_PMIX, BATCH_HOST),
             BatchLaunch::Script
         );
         assert_eq!(
-            batch_launch(4, false, MPI_PMIX, driver),
+            batch_launch(4, false, MPI_PMIX, BATCH_HOST),
             BatchLaunch::Script
         );
     }
@@ -971,11 +885,11 @@ mod tests {
     #[test]
     fn a_non_mpi_batch_script_runs_unwrapped() {
         assert_eq!(
-            batch_launch(1, false, "none", "hostname"),
+            batch_launch(1, false, "none", EVERY_NODE),
             BatchLaunch::Script
         );
         assert_eq!(
-            batch_launch(4, false, "none", "hostname"),
+            batch_launch(4, false, "none", EVERY_NODE),
             BatchLaunch::Script
         );
     }
@@ -983,11 +897,11 @@ mod tests {
     #[test]
     fn several_local_tasks_fan_out() {
         assert_eq!(
-            batch_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"),
+            batch_launch(4, false, MPI_PMIX, EVERY_NODE),
             BatchLaunch::FanOut
         );
         assert_eq!(
-            batch_launch(4, true, "none", "hostname"),
+            batch_launch(4, true, "none", EVERY_NODE),
             BatchLaunch::FanOut
         );
     }
@@ -995,11 +909,11 @@ mod tests {
     #[test]
     fn a_lone_standalone_srun_task_is_wrapped_only_for_pmix() {
         assert_eq!(
-            batch_launch(1, true, "none", "hostname"),
+            batch_launch(1, true, "none", EVERY_NODE),
             BatchLaunch::Script
         );
         assert_eq!(
-            batch_launch(1, true, MPI_PMIX, "/tmp/hello_mpi"),
+            batch_launch(1, true, MPI_PMIX, EVERY_NODE),
             BatchLaunch::LoneRank
         );
     }
@@ -1007,98 +921,32 @@ mod tests {
     #[test]
     fn batch_launch_mpirun_with_task_fanout() {
         assert_eq!(
-            batch_launch(4, true, MPI_MPIRUN, "/tmp/hello_mpi"),
+            batch_launch(4, true, MPI_MPIRUN, EVERY_NODE),
             BatchLaunch::Mpirun
         );
         assert_eq!(
-            batch_launch(1, true, MPI_MPIRUN, "/tmp/hello_mpi"),
+            batch_launch(1, true, MPI_MPIRUN, EVERY_NODE),
             BatchLaunch::Mpirun
         );
         // Without task_fanout, mpirun falls through to Script (batch script
         // calls mpirun directly).
         assert_eq!(
-            batch_launch(4, false, MPI_MPIRUN, "/tmp/hello_mpi"),
+            batch_launch(4, false, MPI_MPIRUN, EVERY_NODE),
             BatchLaunch::Script
         );
     }
 
     #[test]
     fn use_multi_task_launch_mpirun_never_fans_out() {
-        assert!(!use_multi_task_launch(
-            4,
-            false,
-            MPI_MPIRUN,
-            "/tmp/hello_mpi"
-        ));
-        assert!(!use_multi_task_launch(
-            4,
-            true,
-            MPI_MPIRUN,
-            "/tmp/hello_mpi"
-        ));
-        assert!(!use_multi_task_launch(
-            1,
-            false,
-            MPI_MPIRUN,
-            "/tmp/hello_mpi"
-        ));
+        assert!(!use_multi_task_launch(4, false, MPI_MPIRUN, EVERY_NODE));
+        assert!(!use_multi_task_launch(4, true, MPI_MPIRUN, EVERY_NODE));
+        assert!(!use_multi_task_launch(1, false, MPI_MPIRUN, EVERY_NODE));
     }
 
     #[test]
-    fn use_multi_task_launch_batch_pmix_skips_inner_srun() {
-        let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
-        assert!(use_multi_task_launch(2, false, MPI_PMIX, direct));
-
-        let inner_srun = "#!/bin/bash\n#SBATCH --mpi=pmix\nsrun --mpi=pmix /tmp/hello_mpi\n";
-        assert!(!use_multi_task_launch(2, false, MPI_PMIX, inner_srun));
-
-        let commented = "#!/bin/bash\n# srun should not match\n/tmp/hello_mpi\n";
-        assert!(use_multi_task_launch(2, false, MPI_PMIX, commented));
-    }
-
-    #[test]
-    fn batch_script_uses_step_launch_detects_launchers() {
-        assert!(batch_script_uses_step_launch("srun --mpi=pmix /tmp/a\n"));
-        assert!(batch_script_uses_step_launch("mpirun -np 4 /tmp/a\n"));
-        assert!(batch_script_uses_step_launch("mpiexec -n 4 /tmp/a\n"));
-        assert!(batch_script_uses_step_launch("&& srun hostname\n"));
-        assert!(!batch_script_uses_step_launch(
-            "#SBATCH --mpi=pmix\n/tmp/a\n"
-        ));
-        assert!(!batch_script_uses_step_launch("# srun hidden in comment\n"));
-    }
-
-    #[test]
-    fn batch_script_uses_step_launch_ignores_launchers_in_quotes() {
-        assert!(!batch_script_uses_step_launch(
-            "echo \"this job launches no steps, but the word srun appears in this string\"\n",
-        ));
-        assert!(!batch_script_uses_step_launch(
-            "echo \"token=use srun here\"\n"
-        ));
-        assert!(!batch_script_uses_step_launch(
-            "echo \"token=prefixsrunsuffix\"\n"
-        ));
-        assert!(!batch_script_uses_step_launch(
-            "echo 'srun is only in single quotes'\n"
-        ));
-        assert!(batch_script_uses_step_launch(
-            "echo \"quoted\"; srun -n 2 hostname\n"
-        ));
-        assert!(batch_script_uses_step_launch(
-            "srun hostname # real invocation, srun in comment ignored\n",
-        ));
-        assert!(!batch_script_uses_step_launch("echo \"x\"srun\n"));
-        assert!(!batch_script_uses_step_launch("foo|\"x\"srun\n"));
-        assert!(!batch_script_uses_step_launch("\"$VAR\"srun\n"));
-        assert!(batch_script_uses_step_launch(
-            "echo foo#bar; srun -n 2 hostname\n"
-        ));
-        assert!(!batch_script_uses_step_launch("echo ${VAR#prefix}\n"));
-        // Unclosed quotes: remainder of line is treated as quoted; not full shell parsing.
-        assert!(!batch_script_uses_step_launch(
-            "echo \"unclosed; srun -n 2 hostname\n"
-        ));
+    fn use_multi_task_launch_batch_pmix_skips_a_batch_host_driver() {
+        assert!(use_multi_task_launch(2, false, MPI_PMIX, EVERY_NODE));
+        assert!(!use_multi_task_launch(2, false, MPI_PMIX, BATCH_HOST));
     }
 
     #[test]
@@ -1106,16 +954,16 @@ mod tests {
         assert!(batch_dispatched_multi_node_pmix(
             Some(MPI_PMIX),
             2,
-            Some("#!/bin/bash\n/tmp/hello_mpi\n"),
+            EVERY_NODE
         ));
     }
 
     #[test]
-    fn batch_dispatched_multi_node_pmix_skips_inner_srun() {
+    fn batch_dispatched_multi_node_pmix_skips_a_batch_host_driver() {
         assert!(!batch_dispatched_multi_node_pmix(
             Some(MPI_PMIX),
             2,
-            Some("#!/bin/bash\nsrun --mpi=pmix /tmp/hello_mpi\n"),
+            BATCH_HOST
         ));
     }
 
@@ -1124,30 +972,23 @@ mod tests {
         assert!(!batch_dispatched_multi_node_pmix(
             Some(MPI_PMIX),
             1,
-            Some("#!/bin/bash\n/tmp/hello_mpi\n"),
+            EVERY_NODE
         ));
     }
 
     #[test]
-    fn step_needs_pmix_prepare_inner_srun_batch() {
-        let script = "#!/bin/bash\nsrun --mpi=pmix /tmp/hello_mpi\n";
-        assert!(step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, Some(script),));
+    fn step_needs_pmix_prepare_after_a_batch_host_driver() {
+        assert!(step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, BATCH_HOST));
     }
 
     #[test]
     fn step_needs_pmix_prepare_skips_after_direct_batch_pmix() {
-        let script = "#!/bin/bash\n/tmp/hello_mpi\n";
-        assert!(!step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, Some(script),));
+        assert!(!step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, EVERY_NODE));
     }
 
     #[test]
     fn step_needs_pmix_prepare_hold_allocation_without_batch_mpi() {
-        assert!(step_needs_pmix_prepare(
-            2,
-            None,
-            2,
-            Some("#!/bin/bash\nsleep 60\n")
-        ));
+        assert!(step_needs_pmix_prepare(2, None, 2, EVERY_NODE));
     }
 
     #[test]
