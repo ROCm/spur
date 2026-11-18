@@ -4845,19 +4845,72 @@ pub(crate) async fn send_signal_to_nodes(
 
 /// What a `SignalJob` reply means for the run it was meant to warn.
 #[derive(Debug, PartialEq, Eq)]
-enum SignalOutcome {
+pub(crate) enum SignalOutcome {
     Delivered,
     /// The agent holds nothing of the job, so nobody was warned.
     NoSuchJob,
+    /// The agent refused because the run lacks what the request named, e.g. a batch step.
+    Precondition(String),
+    /// An agent built before the requested target existed.
+    AgentTooOld,
+    /// The agent rejected the signal number itself.
+    Rejected(String),
     Failed(String),
 }
 
 fn signal_outcome<T>(result: Result<T, tonic::Status>) -> SignalOutcome {
-    match result {
-        Ok(_) => SignalOutcome::Delivered,
-        Err(status) if status.code() == tonic::Code::NotFound => SignalOutcome::NoSuchJob,
-        Err(status) => SignalOutcome::Failed(status.to_string()),
+    use tonic::Code;
+    let status = match result {
+        Ok(_) => return SignalOutcome::Delivered,
+        Err(status) => status,
+    };
+    match status.code() {
+        Code::NotFound => SignalOutcome::NoSuchJob,
+        Code::FailedPrecondition => SignalOutcome::Precondition(status.message().to_string()),
+        Code::Unimplemented => SignalOutcome::AgentTooOld,
+        Code::InvalidArgument => SignalOutcome::Rejected(status.message().to_string()),
+        code => SignalOutcome::Failed(format!("{code:?}: {}", status.message())),
     }
+}
+
+/// Why a node was not sent a signal at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SignalSkip {
+    KubernetesOperator,
+    NoSignalCapability,
+}
+
+/// What became of the signal on one node.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NodeSignal {
+    Skipped(SignalSkip),
+    Sent(SignalOutcome),
+}
+
+/// Ask one agent to deliver `signal`, bounded by `CANCEL_RPC_TIMEOUT` across connecting and the call.
+async fn request_signal(
+    agent_addr: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    signal: i32,
+    target: SignalTarget,
+) -> SignalOutcome {
+    let attempt = async {
+        let mut client = match crate::agent_client::connect(agent_addr.to_string()).await {
+            Ok(client) => client,
+            Err(e) => return SignalOutcome::Failed(format!("could not connect to agent: {e}")),
+        };
+        let request = AgentSignalJobRequest {
+            job_id,
+            run_attempt,
+            signal,
+            target: target as i32,
+        };
+        signal_outcome(client.signal_job(request).await)
+    };
+    tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+        .await
+        .unwrap_or_else(|_| SignalOutcome::Failed("timed out".into()))
 }
 
 /// Deliver `signals` to one agent through `SignalJob`, in order. A failed
@@ -4871,50 +4924,176 @@ async fn signal_one_agent(
     target: SignalTarget,
 ) {
     for signal in signals {
-        let attempt = async {
-            let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
-                Ok(client) => client,
-                Err(e) => {
-                    warn!(
-                        job_id,
-                        agent = %agent_addr,
-                        error = %e,
-                        "failed to connect to agent for signal"
-                    );
-                    return;
-                }
-            };
-            let request = AgentSignalJobRequest {
-                job_id,
-                run_attempt,
-                signal,
-                target: target as i32,
-            };
-            match signal_outcome(client.signal_job(request).await) {
-                SignalOutcome::Delivered => {
-                    info!(job_id, signal, ?target, agent = %agent_addr, "sent SignalJob")
-                }
-                SignalOutcome::NoSuchJob => warn!(
-                    job_id,
-                    signal,
-                    agent = %agent_addr,
-                    "agent has no such job — SignalJob delivered nothing"
-                ),
-                SignalOutcome::Failed(e) => warn!(
-                    job_id,
-                    signal,
-                    agent = %agent_addr,
-                    error = %e,
-                    "SignalJob RPC failed"
-                ),
+        match request_signal(&agent_addr, job_id, run_attempt, signal, target).await {
+            SignalOutcome::Delivered => {
+                info!(job_id, signal, ?target, agent = %agent_addr, "sent SignalJob")
             }
-        };
-        if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
-            .await
-            .is_err()
-        {
-            warn!(job_id, signal, agent = %agent_addr, "SignalJob RPC timed out");
+            SignalOutcome::NoSuchJob => warn!(
+                job_id,
+                signal,
+                agent = %agent_addr,
+                "agent has no such job — SignalJob delivered nothing"
+            ),
+            SignalOutcome::AgentTooOld => warn!(
+                job_id,
+                signal,
+                agent = %agent_addr,
+                "agent does not implement the signal target"
+            ),
+            SignalOutcome::Precondition(e)
+            | SignalOutcome::Rejected(e)
+            | SignalOutcome::Failed(e) => warn!(
+                job_id,
+                signal,
+                agent = %agent_addr,
+                error = %e,
+                "SignalJob RPC failed"
+            ),
         }
+    }
+}
+
+/// Deliver one `signal` to every `(node, target)` in `recipients` and report what
+/// each node did with it, in `recipients` order. Nodes run concurrently, each
+/// bounded by `CANCEL_RPC_TIMEOUT`. Kubernetes-operator nodes and agents without
+/// `CAP_SIGNAL_JOB` are not called.
+pub(crate) async fn signal_job_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    recipients: &[(String, SignalTarget)],
+    signal: i32,
+) -> Vec<(String, NodeSignal)> {
+    let mut set = tokio::task::JoinSet::new();
+    for (index, (name, target)) in recipients.iter().enumerate() {
+        let node = cluster.get_node(name);
+        let name = name.clone();
+        let target = *target;
+        set.spawn(async move {
+            let result = signal_node(node, job_id, run_attempt, signal, target).await;
+            (index, name, result)
+        });
+    }
+    let mut results = Vec::with_capacity(recipients.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(result) => results.push(result),
+            Err(e) => warn!(job_id, error = %e, "a SignalJob task did not complete"),
+        }
+    }
+    results.sort_by_key(|(index, _, _)| *index);
+    results
+        .into_iter()
+        .map(|(_, name, result)| {
+            if result != NodeSignal::Sent(SignalOutcome::Delivered) {
+                warn!(job_id, signal, node = %name, ?result, "signal not delivered");
+            }
+            (name, result)
+        })
+        .collect()
+}
+
+async fn signal_node(
+    node: Option<Node>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    signal: i32,
+    target: SignalTarget,
+) -> NodeSignal {
+    let Some(node) = node else {
+        return NodeSignal::Sent(SignalOutcome::Failed("node is not registered".into()));
+    };
+    if let Some(skip) = signal_skip(&node) {
+        return NodeSignal::Skipped(skip);
+    }
+    let Some(url) = node_comm_http_url(&node) else {
+        return NodeSignal::Sent(SignalOutcome::Failed("node has no comm address".into()));
+    };
+    NodeSignal::Sent(request_signal(&url, job_id, run_attempt, signal, target).await)
+}
+
+fn signal_skip(node: &Node) -> Option<SignalSkip> {
+    if matches!(node.source, NodeSource::Kubernetes { .. }) {
+        return Some(SignalSkip::KubernetesOperator);
+    }
+    (!node.supports(spur_core::node::CAP_SIGNAL_JOB)).then_some(SignalSkip::NoSignalCapability)
+}
+
+/// Whether a signal that went to `results` counts as delivered, and if not, why.
+/// One delivery is enough: the other nodes may have lost the run in the meantime.
+pub(crate) fn signal_verdict(
+    job_id: spur_core::job::JobId,
+    target: SignalTarget,
+    results: &[(String, NodeSignal)],
+) -> Result<(), tonic::Status> {
+    use tonic::Status;
+
+    let delivered = NodeSignal::Sent(SignalOutcome::Delivered);
+    if results.iter().any(|(_, result)| *result == delivered) {
+        return Ok(());
+    }
+    if results
+        .iter()
+        .all(|(_, result)| *result == NodeSignal::Skipped(SignalSkip::KubernetesOperator))
+    {
+        return Err(Status::failed_precondition(
+            "signals are not supported on Kubernetes-operator nodes",
+        ));
+    }
+    if results
+        .iter()
+        .all(|(_, result)| matches!(result, NodeSignal::Skipped(_)))
+    {
+        return Err(Status::failed_precondition(format!(
+            "no node running job {job_id} supports signals"
+        )));
+    }
+    if let Some(refusal) = results
+        .iter()
+        .find_map(|(node, result)| refusal_status(node, result, target))
+    {
+        return Err(refusal);
+    }
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|(node, result)| match result {
+            NodeSignal::Sent(SignalOutcome::Failed(error)) => Some(format!("{node}: {error}")),
+            _ => None,
+        })
+        .collect();
+    if failures.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "no node holds a run of job {job_id} to signal"
+        )));
+    }
+    Err(Status::unavailable(format!(
+        "could not deliver the signal to job {job_id}: {}",
+        failures.join("; ")
+    )))
+}
+
+/// A node's answer that no retry or other node would change: the request itself
+/// cannot be honoured, as opposed to a delivery that failed.
+fn refusal_status(node: &str, result: &NodeSignal, target: SignalTarget) -> Option<tonic::Status> {
+    use tonic::Status;
+
+    match result {
+        NodeSignal::Sent(SignalOutcome::Precondition(message)) => {
+            Some(Status::failed_precondition(message.clone()))
+        }
+        NodeSignal::Sent(SignalOutcome::Rejected(message)) => {
+            Some(Status::invalid_argument(message.clone()))
+        }
+        NodeSignal::Sent(SignalOutcome::AgentTooOld) => {
+            let wanted = match target {
+                SignalTarget::Batch => "the batch target (scancel -b)",
+                _ => "this signal target",
+            };
+            Some(Status::failed_precondition(format!(
+                "node agent on {node} is too old for {wanted}"
+            )))
+        }
+        _ => None,
     }
 }
 
@@ -8579,6 +8758,164 @@ pub(crate) mod tests {
                 signal_outcome::<()>(Err(tonic::Status::unavailable("down"))),
                 SignalOutcome::Failed(_)
             ));
+        }
+
+        #[test]
+        fn agent_signal_replies_map_to_the_outcome_the_controller_acts_on() {
+            use tonic::Status;
+            assert_eq!(
+                signal_outcome::<()>(Err(Status::failed_precondition("job 7 has no batch step"))),
+                SignalOutcome::Precondition("job 7 has no batch step".into())
+            );
+            assert_eq!(
+                signal_outcome::<()>(Err(Status::unimplemented("old"))),
+                SignalOutcome::AgentTooOld
+            );
+            assert_eq!(
+                signal_outcome::<()>(Err(Status::invalid_argument("invalid signal 40"))),
+                SignalOutcome::Rejected("invalid signal 40".into())
+            );
+        }
+
+        fn sent(node: &str, outcome: SignalOutcome) -> (String, NodeSignal) {
+            (node.into(), NodeSignal::Sent(outcome))
+        }
+
+        fn skipped(node: &str, skip: SignalSkip) -> (String, NodeSignal) {
+            (node.into(), NodeSignal::Skipped(skip))
+        }
+
+        #[test]
+        fn one_delivery_makes_the_signal_a_success() {
+            let results = [
+                sent("n1", SignalOutcome::Failed("down".into())),
+                skipped("n2", SignalSkip::NoSignalCapability),
+                sent("n3", SignalOutcome::NoSuchJob),
+                sent("n4", SignalOutcome::Delivered),
+            ];
+            assert!(signal_verdict(7, SignalTarget::Steps, &results).is_ok());
+        }
+
+        #[test]
+        fn a_signal_nobody_could_take_is_a_failed_precondition() {
+            let kubernetes = [
+                skipped("n1", SignalSkip::KubernetesOperator),
+                skipped("n2", SignalSkip::KubernetesOperator),
+            ];
+            let err = signal_verdict(7, SignalTarget::Steps, &kubernetes).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "signals are not supported on Kubernetes-operator nodes"
+            );
+
+            let mixed = [
+                skipped("n1", SignalSkip::KubernetesOperator),
+                skipped("n2", SignalSkip::NoSignalCapability),
+            ];
+            let err = signal_verdict(7, SignalTarget::Steps, &mixed).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(err.message(), "no node running job 7 supports signals");
+        }
+
+        #[test]
+        fn an_agent_refusal_outranks_a_delivery_failure_elsewhere() {
+            let results = [
+                sent("n1", SignalOutcome::Failed("timed out".into())),
+                sent(
+                    "n2",
+                    SignalOutcome::Precondition("job 7 has no batch step".into()),
+                ),
+            ];
+            let err = signal_verdict(7, SignalTarget::Batch, &results).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(err.message(), "job 7 has no batch step");
+
+            let too_old = [sent("n1", SignalOutcome::AgentTooOld)];
+            let err = signal_verdict(7, SignalTarget::Batch, &too_old).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "node agent on n1 is too old for the batch target (scancel -b)"
+            );
+
+            let rejected = [sent(
+                "n1",
+                SignalOutcome::Rejected("invalid signal 40".into()),
+            )];
+            let err = signal_verdict(7, SignalTarget::Steps, &rejected).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        #[test]
+        fn failed_deliveries_are_unavailable_and_name_each_node() {
+            let results = [
+                sent("n1", SignalOutcome::Failed("timed out".into())),
+                sent("n2", SignalOutcome::NoSuchJob),
+                sent("n3", SignalOutcome::Failed("refused".into())),
+            ];
+            let err = signal_verdict(7, SignalTarget::Steps, &results).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unavailable);
+            assert_eq!(
+                err.message(),
+                "could not deliver the signal to job 7: n1: timed out; n3: refused"
+            );
+
+            let none_hold_it = [sent("n1", SignalOutcome::NoSuchJob)];
+            let err = signal_verdict(7, SignalTarget::Steps, &none_hold_it).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn awaited_signals_report_each_node_in_order() {
+            use spur_proto::proto::SignalTarget;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (new_addr, _, new_signals) = spawn_mock_agent_recording_requests().await;
+            let (old_addr, _, old_signals) = spawn_mock_agent_recording_requests().await;
+            let (k8s_addr, _, k8s_signals) = spawn_mock_agent_recording_requests().await;
+            register_node_with_capabilities(
+                &cm,
+                "new",
+                new_addr,
+                vec![SIGNAL_JOB_CAPABILITY.into()],
+            );
+            register_node_at(&cm, "old", old_addr);
+            register_node_from(
+                &cm,
+                "k8s",
+                k8s_addr,
+                NodeSource::Kubernetes {
+                    namespace: "spur".into(),
+                },
+                vec![SIGNAL_JOB_CAPABILITY.into()],
+            );
+            let recipients =
+                ["k8s", "ghost", "new", "old"].map(|name| (name.to_string(), SignalTarget::Full));
+
+            let results = signal_job_on_nodes(&cm, 7, 3, &recipients, 10).await;
+
+            assert_eq!(
+                results,
+                [
+                    skipped("k8s", SignalSkip::KubernetesOperator),
+                    sent(
+                        "ghost",
+                        SignalOutcome::Failed("node is not registered".into())
+                    ),
+                    sent("new", SignalOutcome::Delivered),
+                    skipped("old", SignalSkip::NoSignalCapability),
+                ]
+            );
+            let seen: Vec<(i32, i32, u32)> = new_signals
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.target, r.run_attempt))
+                .collect();
+            assert_eq!(seen, [(10, SignalTarget::Full as i32, 3)]);
+            assert!(old_signals.lock().unwrap().is_empty());
+            assert!(k8s_signals.lock().unwrap().is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

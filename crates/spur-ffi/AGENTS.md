@@ -24,7 +24,7 @@ the C call into a gRPC request to the Spur controller via `spur-client` and
 ### Job management
 - `slurm_init_job_desc_msg(desc)` -- zero a `SlurmJobDescMsg` to defaults
 - `slurm_submit_batch_job(desc, job_id)` -- submit via `SlurmController::SubmitJob`
-- `slurm_kill_job(job_id, signal, flags)` -- cancel via `SlurmController::CancelJob`
+- `slurm_kill_job(job_id, signal, flags)` -- signal 0 or 9 cancels via `SlurmController::CancelJob`; any other signal goes through `SignalJob` without ending the job. `flags` picks the target (`KILL_FULL_JOB` = all steps and the batch script, else `KILL_JOB_BATCH` = batch shell only, else steps); other bits are ignored
 
 ### Query
 - `slurm_load_jobs(update_time, msg, flags)` -- list jobs via `GetJobs`

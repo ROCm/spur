@@ -35,7 +35,8 @@ use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
     batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
     build_mpi_mpirun_wrapper, build_multi_task_pmix_wrapper, build_multi_task_wrapper,
-    build_step_task_plan, slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
+    build_step_task_plan, runs_batch_companion_hold, slurm_tasks_per_node_str,
+    use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -868,6 +869,80 @@ fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
     descriptors
         .iter()
         .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
+}
+
+/// Sends one signal to each supervisor. A failed request is logged and skipped
+/// so one dead supervisor cannot keep the others from being signalled.
+async fn signal_supervisors(
+    job_id: u32,
+    descriptors: &[&crate::stepd::StepdDescriptor],
+    signal: i32,
+) {
+    for descriptor in descriptors {
+        if let Err(error) =
+            crate::stepd::signal_allocation(descriptor, uuid::Uuid::new_v4().to_string(), signal)
+                .await
+        {
+            warn!(job_id, step_id = descriptor.step_id, %error, "runtime signal request failed");
+        }
+    }
+}
+
+/// The job's own process when the agent, not a supervisor, holds it.
+fn unsupervised_job(
+    jobs: &HashMap<u32, TrackedJob>,
+    job_id: u32,
+    run_attempt: u32,
+) -> Option<&TrackedJob> {
+    jobs.get(&job_id).filter(|tracked| {
+        !tracked.job.is_allocation_only()
+            && (run_attempt == 0 || tracked.run_attempt == run_attempt)
+    })
+}
+
+/// The process that runs the user's script, given what a launch tracks as the
+/// job process. A namespaced launch tracks its wrapper (`unshare` or a
+/// container shepherd), whose only child is the script's shell.
+fn shell_pid(job_pid: u32, namespaced: bool) -> Option<u32> {
+    if namespaced {
+        namespace_init_pid(job_pid)
+    } else {
+        Some(job_pid)
+    }
+}
+
+/// The pid of a namespace wrapper's workload (PID 1 in its namespace): the
+/// wrapper forks exactly one child to become the namespace init, so its sole
+/// entry in `children` is that workload.
+fn namespace_init_pid(wrapper: u32) -> Option<u32> {
+    let content =
+        std::fs::read_to_string(format!("/proc/{wrapper}/task/{wrapper}/children")).ok()?;
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Resolves a supervised batch step's shell. The supervisor's own answer is
+/// checked against the identity it recorded at launch so a recycled pid is
+/// never signalled.
+async fn batch_shell_pid(descriptor: &crate::stepd::StepdDescriptor) -> std::io::Result<u32> {
+    let snapshot = crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await?;
+    if !is_live_workload(&snapshot) {
+        return Err(std::io::Error::other("the batch script is not running"));
+    }
+    let job_pid = snapshot.job_pid as u32;
+    let recorded = with_published_workload(descriptor);
+    let recycled = recorded.workload_start_ticks != 0
+        && (recorded.workload_pid != job_pid
+            || !crate::stepd::process_is_live(job_pid, recorded.workload_start_ticks));
+    if recycled {
+        return Err(std::io::Error::other(
+            "the batch script's process is no longer the one recorded at launch",
+        ));
+    }
+    shell_pid(job_pid, descriptor.has_pid_namespace)
+        .ok_or_else(|| std::io::Error::other("the batch shell is not running"))
 }
 
 /// Same pid/start-ticks check the crash watchdog uses. A pid of 0 means no
@@ -6711,7 +6786,7 @@ impl SlurmAgent for AgentService {
         let work_dir = spec.work_dir.clone();
 
         let allocation_holder =
-            batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout;
+            runs_batch_companion_hold(&spec.script, task_offset == 0, req.task_fanout);
         let script = if allocation_holder {
             batch_companion_hold_script().to_string()
         } else {
@@ -11067,6 +11142,9 @@ impl AgentService {
 
     /// Deliver a signal and nothing else: no launch fencing, release wait,
     /// teardown or escalation, so a warning leaves the run alive to react to it.
+    ///
+    /// A batch-only request that reaches nothing is an error, since the caller
+    /// asked for exactly that one target; `Steps` and `Full` stay best-effort.
     async fn deliver_signal(
         &self,
         job_id: u32,
@@ -11074,18 +11152,9 @@ impl AgentService {
         signal: i32,
         target: SignalTarget,
     ) -> Result<(), Status> {
-        let include_batch = match target {
-            SignalTarget::Steps => false,
-            SignalTarget::Full => true,
-            SignalTarget::Batch => {
-                return Err(Status::unimplemented(
-                    "signalling only the batch script is not supported",
-                ))
-            }
-            SignalTarget::Unspecified => {
-                return Err(Status::invalid_argument("a signal target is required"))
-            }
-        };
+        if target == SignalTarget::Unspecified {
+            return Err(Status::invalid_argument("a signal target is required"));
+        }
         let sig = nix::sys::signal::Signal::try_from(signal)
             .map_err(|_| Status::invalid_argument(format!("invalid signal {signal}")))?;
         let Some(run_attempt) = self.signal_scope(job_id, run_attempt).await? else {
@@ -11097,21 +11166,18 @@ impl AgentService {
         };
 
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        for descriptor in runtimes
+        if target == SignalTarget::Batch {
+            return self
+                .signal_batch_shell(job_id, run_attempt, sig, &runtimes)
+                .await;
+        }
+
+        let include_batch = target == SignalTarget::Full;
+        let targeted: Vec<_> = runtimes
             .iter()
             .filter(|descriptor| include_batch || descriptor.step_id != spur_core::step::STEP_BATCH)
-        {
-            if let Err(error) = crate::stepd::signal_allocation(
-                descriptor,
-                uuid::Uuid::new_v4().to_string(),
-                signal,
-            )
-            .await
-            {
-                warn!(job_id, step_id = descriptor.step_id, %error,
-                    "runtime signal request failed");
-            }
-        }
+            .collect();
+        signal_supervisors(job_id, &targeted, signal).await;
         self.signal_active_steps_for_job(job_id, run_attempt, signal)
             .await;
 
@@ -11121,10 +11187,7 @@ impl AgentService {
             return Ok(());
         }
         let jobs = self.running.lock().await;
-        let Some(tracked) = jobs.get(&job_id).filter(|tracked| {
-            !tracked.job.is_allocation_only()
-                && (run_attempt == 0 || tracked.run_attempt == run_attempt)
-        }) else {
+        let Some(tracked) = unsupervised_job(&jobs, job_id, run_attempt) else {
             return Ok(());
         };
         info!(job_id, signal, "signalling the unsupervised job");
@@ -11132,6 +11195,45 @@ impl AgentService {
             warn!(job_id, signal, %error, "failed to signal the unsupervised job");
         }
         Ok(())
+    }
+
+    /// Signals the batch script's shell and nothing else, not its children and
+    /// not a step, as `scancel --batch` does. Never escalates.
+    async fn signal_batch_shell(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        sig: nix::sys::signal::Signal,
+        runtimes: &[crate::stepd::StepdDescriptor],
+    ) -> Result<(), Status> {
+        let unavailable = |reason: String| {
+            Status::unavailable(format!(
+                "job {job_id}'s batch step could not be signalled: {reason}"
+            ))
+        };
+        let batch = runtimes
+            .iter()
+            .find(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH);
+        let shell = match batch {
+            Some(batch) => batch_shell_pid(batch)
+                .await
+                .map_err(|error| unavailable(error.to_string()))?,
+            None => {
+                let jobs = self.running.lock().await;
+                let tracked = unsupervised_job(&jobs, job_id, run_attempt).ok_or_else(|| {
+                    Status::failed_precondition(format!("job {job_id} has no batch step"))
+                })?;
+                let wrapper = tracked
+                    .job
+                    .live_pid()
+                    .ok_or_else(|| unavailable("the job process has exited".into()))?;
+                shell_pid(wrapper, tracked.has_pid_namespace)
+                    .ok_or_else(|| unavailable("the batch shell is not running".into()))?
+            }
+        };
+        info!(job_id, shell, signal = ?sig, "signalling the batch shell");
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(shell as i32), sig)
+            .map_err(|error| unavailable(error.to_string()))
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -11865,23 +11967,11 @@ impl AgentService {
             return Vec::new();
         }
         let target = if entry.has_namespaces() {
-            Self::container_workload_pid(entry.pid as u32).unwrap_or(entry.pid as u32)
+            namespace_init_pid(entry.pid as u32).unwrap_or(entry.pid as u32)
         } else {
             entry.pid as u32
         };
         Self::read_proc_environ(target)
-    }
-
-    /// Resolve a container's workload pid (PID 1 in its namespace) from the
-    /// shepherd pid: the shepherd forks exactly one child to become the namespace
-    /// init, so its sole entry in `children` is that workload.
-    fn container_workload_pid(shepherd: u32) -> Option<u32> {
-        let content =
-            std::fs::read_to_string(format!("/proc/{shepherd}/task/{shepherd}/children")).ok()?;
-        content
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok())
     }
 }
 
@@ -22404,6 +22494,7 @@ mod tests {
             cluster_kubeconfig(spur_proto::proto::ClusterKubeconfigRequest) -> spur_proto::proto::ClusterKubeconfigResponse;
             cluster_add_nodes(spur_proto::proto::ClusterAddNodesRequest) -> spur_proto::proto::ClusterAddNodesResponse;
             cluster_remove_nodes(spur_proto::proto::ClusterRemoveNodesRequest) -> spur_proto::proto::ClusterRemoveNodesResponse;
+            signal_job(spur_proto::proto::SignalJobRequest) -> ();
 
     }
 
@@ -23092,10 +23183,12 @@ mod tests {
 
     /// Serves a stepd's control socket, acknowledging every request, until it
     /// is asked to shut down; the shutdown ends the loop so the test learns
-    /// exactly which requests arrived before it, without a timeout.
+    /// exactly which requests arrived before it, without a timeout. A state
+    /// query is answered with `job_pid` and is not part of the recording.
     fn serve_recording_stepd(
         listener: tokio::net::UnixListener,
         descriptor: crate::stepd::StepdDescriptor,
+        job_pid: i32,
     ) -> tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -23114,13 +23207,29 @@ mod tests {
                     .expect("read runtime request");
                 let request: crate::stepd::StepdRequest =
                     serde_json::from_str(&line).expect("decode runtime request");
-                let acknowledgement =
-                    serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
-                        .expect("encode acknowledgement");
+                let queried = request == crate::stepd::StepdRequest::QueryState;
+                let response = if queried {
+                    crate::stepd::StepdResponse::State {
+                        job_id: descriptor.job_id,
+                        run_attempt: descriptor.run_attempt,
+                        step_id: descriptor.step_id,
+                        active: true,
+                        exit_code: None,
+                        signal: None,
+                        job_pid,
+                        cgroup_path: String::new(),
+                    }
+                } else {
+                    crate::stepd::StepdResponse::Acknowledged
+                };
+                let response = serde_json::to_string(&response).expect("encode response");
                 writer
-                    .write_all(format!("{acknowledgement}\n").as_bytes())
+                    .write_all(format!("{response}\n").as_bytes())
                     .await
-                    .expect("acknowledge runtime request");
+                    .expect("answer runtime request");
+                if queried {
+                    continue;
+                }
                 let stop = request == crate::stepd::StepdRequest::Shutdown;
                 received.push(request);
                 if stop {
@@ -23141,6 +23250,21 @@ mod tests {
         crate::stepd::StepdDescriptor,
         tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
     ) {
+        register_recording_stepd_running(svc, dir, job_id, run_attempt, step_id, 0).await
+    }
+
+    /// Like `register_recording_stepd`, for a step whose workload is `job_pid`.
+    async fn register_recording_stepd_running(
+        svc: &AgentService,
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+        job_pid: i32,
+    ) -> (
+        crate::stepd::StepdDescriptor,
+        tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) {
         let socket_path = dir.join(format!("step-{step_id}.sock"));
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
         let mut descriptor = crate::stepd::StepdDescriptor::new(
@@ -23157,7 +23281,7 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
-        let server = serve_recording_stepd(listener, descriptor.clone());
+        let server = serve_recording_stepd(listener, descriptor.clone(), job_pid);
         (descriptor, server)
     }
 
@@ -23193,6 +23317,104 @@ mod tests {
         });
         req.extensions_mut().insert(controller_identity());
         req
+    }
+
+    /// A batch script's process tree: a shell that records SIGUSR1 and keeps
+    /// running, with a `sleep` child in the same process group that SIGUSR1
+    /// would kill. Group or cgroup delivery shows up as the child dying;
+    /// delivery to the shell alone leaves it alive. A namespaced launch puts
+    /// a wrapper above the shell, as `unshare --fork` does.
+    struct BatchTree {
+        top: Option<tokio::process::Child>,
+        top_pid: u32,
+        shell_pid: u32,
+        child_pid: u32,
+        log: std::path::PathBuf,
+    }
+
+    impl BatchTree {
+        async fn spawn(dir: &std::path::Path, namespaced: bool) -> Self {
+            use tokio::io::AsyncBufReadExt;
+
+            let script = dir.join("batch.sh");
+            let log = dir.join("signals.log");
+            std::fs::write(
+                &script,
+                "trap 'echo got >> \"$1\"' USR1\nsleep 60 &\nchild=$!\necho \"$$ $child\"\n\
+                 while kill -0 $child 2>/dev/null; do wait $child; done\n",
+            )
+            .expect("write batch script");
+            let mut command = std::process::Command::new("/bin/sh");
+            if namespaced {
+                command.args(["-c", "/bin/sh \"$0\" \"$1\" & wait"]);
+            }
+            command
+                .arg(&script)
+                .arg(&log)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            let mut top = tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn batch tree");
+            let top_pid = top.id().expect("tree is running");
+            let stdout = top.stdout.take().expect("piped stdout");
+            let mut line = String::new();
+            tokio::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .await
+                .expect("read the tree's pids");
+            let mut pids = line.split_whitespace().map(|pid| pid.parse::<u32>());
+            let shell_pid = pids.next().expect("shell pid").expect("numeric shell pid");
+            let child_pid = pids.next().expect("child pid").expect("numeric child pid");
+            Self {
+                top: Some(top),
+                top_pid,
+                shell_pid,
+                child_pid,
+                log,
+            }
+        }
+
+        /// Hands the tree's top process to the agent as a legacy job's handle.
+        fn take_job(&mut self) -> executor::RunningJob {
+            executor::RunningJob::Managed {
+                child: self.top.take().expect("job not yet handed over"),
+            }
+        }
+
+        /// Whether the shell's USR1 trap ran, polled because delivery is asynchronous.
+        async fn shell_handled_usr1(&self) -> bool {
+            for _ in 0..400 {
+                if std::fs::read_to_string(&self.log).is_ok_and(|log| log.contains("got")) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            false
+        }
+
+        /// Whether the process outlives a short settle window after the signal.
+        async fn stays_running(pid: u32) -> bool {
+            for _ in 0..10 {
+                if !process_is_running(pid as i32) {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            true
+        }
+    }
+
+    impl Drop for BatchTree {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-(self.top_pid as i32)),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 
     fn sigterm_request() -> crate::stepd::StepdRequest {
@@ -23564,18 +23786,323 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_job_rejects_the_batch_target_until_it_is_supported() {
+    async fn signal_job_batch_target_reaches_only_the_batch_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
         let svc = test_agent();
-        let err = svc
+        let dir = tempfile::tempdir().expect("socket directory");
+        let tree = BatchTree::spawn(dir.path(), false).await;
+        let (batch, batch_server) = register_recording_stepd_running(
+            &svc,
+            dir.path(),
+            917,
+            1,
+            spur_core::step::STEP_BATCH,
+            tree.shell_pid as i32,
+        )
+        .await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 917, 1, 0).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(917, tracked).await;
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        svc.register_test_step(917, 4, Some(pid)).await;
+
+        svc.signal_job(signal_job_request(
+            917,
+            1,
+            nix::sys::signal::Signal::SIGUSR1,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(
+            tree.shell_handled_usr1().await,
+            "the batch shell must receive the signal"
+        );
+        assert!(
+            BatchTree::stays_running(tree.child_pid).await,
+            "the shell's child must not be signalled"
+        );
+        assert_eq!(
+            finish_recording_stepd(&batch, batch_server).await,
+            vec![],
+            "the batch target signals the shell itself, not the supervisor's allocation"
+        );
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+        let step_still_running = BatchTree::stays_running(pid).await;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            step_still_running,
+            "the batch target must leave an unsupervised step alone"
+        );
+        assert!(
+            !svc.step_cancel_requested(917, 4).await,
+            "a batch signal must not mark a step cancelled"
+        );
+        assert!(svc.running.lock().await.contains_key(&917));
+        assert!(svc
+            .stepds
+            .lock()
+            .await
+            .contains_key(&(917, spur_core::step::STEP_BATCH)));
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_signals_a_legacy_unsupervised_job_shell_only() {
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("script directory");
+        let mut tree = BatchTree::spawn(dir.path(), false).await;
+        let mut tracked = TrackedJob {
+            job: tree.take_job(),
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(921, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            921,
+            1,
+            nix::sys::signal::Signal::SIGUSR1,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(tree.shell_handled_usr1().await);
+        assert!(
+            BatchTree::stays_running(tree.child_pid).await,
+            "the shell's child is in its process group and must not be signalled"
+        );
+        assert!(
+            svc.running.lock().await.contains_key(&921),
+            "a signal does not tear the job down"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_signals_the_shell_below_a_namespace_wrapper() {
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("script directory");
+        let mut tree = BatchTree::spawn(dir.path(), true).await;
+        assert_ne!(
+            tree.top_pid, tree.shell_pid,
+            "the wrapper sits above the shell"
+        );
+        let mut tracked = TrackedJob {
+            job: tree.take_job(),
+            has_pid_namespace: true,
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(926, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            926,
+            1,
+            nix::sys::signal::Signal::SIGUSR1,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(tree.shell_handled_usr1().await);
+        assert!(
+            BatchTree::stays_running(tree.top_pid).await,
+            "the wrapper is not the script and must not be signalled"
+        );
+        assert!(BatchTree::stays_running(tree.child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_signals_a_supervised_namespaced_shell_only() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let tree = BatchTree::spawn(dir.path(), true).await;
+        let (batch, batch_server) = register_recording_stepd_running(
+            &svc,
+            dir.path(),
+            927,
+            1,
+            spur_core::step::STEP_BATCH,
+            tree.top_pid as i32,
+        )
+        .await;
+        svc.stepds
+            .lock()
+            .await
+            .get_mut(&stepd_key(&batch))
+            .expect("registered batch step")
+            .has_pid_namespace = true;
+
+        svc.signal_job(signal_job_request(
+            927,
+            1,
+            nix::sys::signal::Signal::SIGUSR1,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(tree.shell_handled_usr1().await);
+        assert!(BatchTree::stays_running(tree.top_pid).await);
+        assert!(BatchTree::stays_running(tree.child_pid).await);
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_refuses_a_process_that_is_not_the_recorded_workload() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let tree = BatchTree::spawn(dir.path(), false).await;
+        let (batch, batch_server) = register_recording_stepd_running(
+            &svc,
+            dir.path(),
+            928,
+            1,
+            spur_core::step::STEP_BATCH,
+            tree.shell_pid as i32,
+        )
+        .await;
+        let recorded_ticks =
+            crate::stepd::process_start_ticks(tree.shell_pid).expect("shell start ticks");
+        {
+            let mut stepds = svc.stepds.lock().await;
+            let descriptor = stepds.get_mut(&stepd_key(&batch)).expect("batch step");
+            descriptor.workload_pid = tree.shell_pid;
+            descriptor.workload_start_ticks = recorded_ticks + 1;
+        }
+
+        let status = svc
             .signal_job(signal_job_request(
-                917,
+                928,
+                1,
+                nix::sys::signal::Signal::SIGUSR1,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("a recycled pid must not be signalled");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_reports_a_batch_step_that_has_not_started() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 929, 1, spur_core::step::STEP_BATCH).await;
+
+        let status = svc
+            .signal_job(signal_job_request(
+                929,
+                1,
+                nix::sys::signal::Signal::SIGUSR1,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("a supervisor with no workload yet has nothing to signal");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_for_a_run_without_a_batch_step_is_failed_precondition() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 922, 1, 0).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(922, tracked).await;
+
+        let status = svc
+            .signal_job(signal_job_request(
+                922,
                 1,
                 nix::sys::signal::Signal::SIGTERM,
                 SignalTarget::Batch,
             ))
             .await
-            .expect_err("the batch target is not implemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect_err("an allocation has no batch step to signal");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "job 922 has no batch step");
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_for_a_job_this_node_does_not_hold_is_not_found() {
+        let svc = test_agent();
+
+        let status = svc
+            .signal_job(signal_job_request(
+                923,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("nothing was signalled");
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_drops_a_stale_run_attempt() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 924, 2, spur_core::step::STEP_BATCH).await;
+
+        svc.signal_job(signal_job_request(
+            924,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Batch,
+        ))
+        .await
+        .expect("a signal for a superseded run is dropped, not an error");
+
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_batch_target_reports_a_batch_supervisor_that_cannot_be_reached() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 925, 1, spur_core::step::STEP_BATCH).await;
+        finish_recording_stepd(&batch, batch_server).await;
+
+        let status = svc
+            .signal_job(signal_job_request(
+                925,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("nothing received the signal");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]

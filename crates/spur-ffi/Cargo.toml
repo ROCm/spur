@@ -14,6 +14,7 @@ spur-proto = { path = "../spur-proto" }
 spur-client = { path = "../spur-client" }
 tokio = { workspace = true }
 prost-types = { workspace = true }
+tonic = { workspace = true }
 
 [lints]
 workspace = true

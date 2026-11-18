@@ -60,6 +60,10 @@ pub(crate) struct StepCapture {
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     submit_job_id: Arc<AtomicU32>,
     cancel_job_calls: Arc<AtomicU32>,
+    cancel_job_requests: Arc<Mutex<Vec<proto::CancelJobRequest>>>,
+    signal_job_requests: Arc<Mutex<Vec<proto::SignalJobRequest>>>,
+    get_jobs_requests: Arc<Mutex<Vec<proto::GetJobsRequest>>>,
+    signal_job_error: Arc<Mutex<Option<tonic::Status>>>,
     /// `(job_id, exit_code, user)` for every `CompleteJob` the mock received.
     complete_job_calls: Arc<Mutex<Vec<(u32, i32, String)>>>,
     complete_job_error: Arc<Mutex<Option<tonic::Code>>>,
@@ -207,6 +211,26 @@ impl StepCapture {
         self.cancel_job_calls.load(Ordering::SeqCst)
     }
 
+    /// Every `CancelJob` the mock received, in call order.
+    pub(crate) fn cancel_job_requests(&self) -> Vec<proto::CancelJobRequest> {
+        self.cancel_job_requests.lock().unwrap().clone()
+    }
+
+    /// Every `GetJobs` the mock received, in call order.
+    pub(crate) fn get_jobs_requests(&self) -> Vec<proto::GetJobsRequest> {
+        self.get_jobs_requests.lock().unwrap().clone()
+    }
+
+    /// Every `SignalJob` the mock received, in call order.
+    pub(crate) fn signal_job_requests(&self) -> Vec<proto::SignalJobRequest> {
+        self.signal_job_requests.lock().unwrap().clone()
+    }
+
+    /// Make `signal_job` fail with this status after recording the request.
+    pub(crate) fn set_signal_job_error(&self, status: tonic::Status) {
+        *self.signal_job_error.lock().unwrap() = Some(status);
+    }
+
     /// Every `CompleteJob` the mock received, in call order.
     pub(crate) fn complete_job_calls(&self) -> Vec<(u32, i32, String)> {
         self.complete_job_calls.lock().unwrap().clone()
@@ -339,9 +363,29 @@ mock_controller_impl! {
 
         async fn cancel_job(
             &self,
-            _request: tonic::Request<proto::CancelJobRequest>,
+            request: tonic::Request<proto::CancelJobRequest>,
         ) -> Result<tonic::Response<()>, tonic::Status> {
             self.capture.cancel_job_calls.fetch_add(1, Ordering::SeqCst);
+            self.capture
+                .cancel_job_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn signal_job(
+            &self,
+            request: tonic::Request<proto::SignalJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            self.capture
+                .signal_job_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            if let Some(status) = self.capture.signal_job_error.lock().unwrap().clone() {
+                return Err(status);
+            }
             Ok(tonic::Response::new(()))
         }
 
@@ -407,8 +451,13 @@ mock_controller_impl! {
 
         async fn get_jobs(
             &self,
-            _request: tonic::Request<proto::GetJobsRequest>,
+            request: tonic::Request<proto::GetJobsRequest>,
         ) -> Result<tonic::Response<proto::GetJobsResponse>, tonic::Status> {
+            self.capture
+                .get_jobs_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
             Ok(tonic::Response::new(proto::GetJobsResponse::default()))
         }
 

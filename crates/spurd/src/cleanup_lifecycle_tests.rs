@@ -99,6 +99,7 @@ cleanup_controller_impl! {
         cluster_kubeconfig(spur_proto::proto::ClusterKubeconfigRequest) -> spur_proto::proto::ClusterKubeconfigResponse;
         cluster_add_nodes(spur_proto::proto::ClusterAddNodesRequest) -> spur_proto::proto::ClusterAddNodesResponse;
         cluster_remove_nodes(spur_proto::proto::ClusterRemoveNodesRequest) -> spur_proto::proto::ClusterRemoveNodesResponse;
+        signal_job(spur_proto::proto::SignalJobRequest) -> ();
         get_fabric_topology(()) -> spur_proto::proto::GetFabricTopologyResponse;
         validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
 

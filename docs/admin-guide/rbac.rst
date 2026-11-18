@@ -86,9 +86,10 @@ either setting limits a User to their own rows and the accounts they coordinate.
 These lifetime reports retain the requesting association from the first export,
 even if the job's account is subsequently changed.
 
-``CancelJob`` with no verified identity and an empty ``user`` is treated as the
-in-cluster daemon (the Kubernetes operator) and can cancel any job. A named
-unauthenticated user is still an ordinary owner check. REST cancel always
+``CancelJob`` or ``SignalJob`` with no verified identity and an empty ``user`` is
+treated as the in-cluster daemon (the Kubernetes operator) and can cancel or
+signal any job. A named unauthenticated user is still an ordinary owner
+check. REST cancel always
 requires a Bearer token, so it does not have this hole. On a native-host
 controller, do not leave gRPC reachable under ``permissive``: set
 ``mode = "required"`` so an unauthenticated empty-user cancel never reaches

@@ -700,6 +700,9 @@ service SlurmController {
   rpc ClusterAddNodes(ClusterAddNodesRequest) returns (ClusterAddNodesResponse);
   // Gracefully remove workers from a running cluster (cordon+drain, then k0s reset the node).
   rpc ClusterRemoveNodes(ClusterRemoveNodesRequest) returns (ClusterRemoveNodesResponse);
+
+  // Deliver one signal to a running job without cancelling it.
+  rpc SignalJob(SignalJobRequest) returns (google.protobuf.Empty);
 }
 
 // -- Agent service (slurmd) --
@@ -840,8 +843,17 @@ message GetJobRequest {
 
 message CancelJobRequest {
   uint32 job_id = 1;
-  int32 signal = 2;  // 0 = cancel, else signal number
+  // CancelJob always cancels; a non-zero signal is only audited. SignalJob signals without cancelling.
+  int32 signal = 2;
   string user = 3;   // For authorization
+}
+
+// Signal a running job. Unlike CancelJob, the job keeps running unless it dies of the signal.
+message SignalJobRequest {
+  uint32 job_id = 1;
+  int32 signal = 2;          // 1..=31
+  SignalTarget target = 3;   // UNSPECIFIED means STEPS
+  string user = 4;           // For authorization
 }
 
 message CompleteJobRequest {
@@ -1344,7 +1356,10 @@ message AgentCancelJobRequest {
 enum SignalTarget {
   SIGNAL_TARGET_UNSPECIFIED = 0;
   SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
-  SIGNAL_TARGET_BATCH = 2;   // the batch script only; not yet supported (agents return UNIMPLEMENTED)
+  // The batch shell process only, not its children or any step. FAILED_PRECONDITION if the
+  // run has no batch step, UNAVAILABLE if that shell cannot be signalled; agents predating
+  // batch support return UNIMPLEMENTED.
+  SIGNAL_TARGET_BATCH = 2;
   SIGNAL_TARGET_FULL = 3;    // everything in the run
 }
 

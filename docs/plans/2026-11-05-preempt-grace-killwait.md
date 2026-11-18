@@ -141,9 +141,11 @@ deadline if every controller is down at that moment.
 
 - `SignalJob` (`AgentSignalJobRequest { job_id, run_attempt, signal, target }`) delivers one signal and
   nothing else: no escalation, timer, reservation release or cgroup reaping, and it never marks steps
-  cancelled. `SignalTarget`: `STEPS` (every step except the batch script), `BATCH` (defined, rejected
-  as unimplemented), `FULL`; unspecified is rejected. Handler: `signal_job` in
-  `spurd/src/agent_server.rs`. The controller sends SIGCONT then SIGTERM as two calls per node.
+  cancelled. `SignalTarget`: `STEPS` (every step except the batch script), `BATCH` (the
+  batch script's shell process only, not its children or any step, as `scancel --batch`;
+  `FAILED_PRECONDITION` when the run has no batch step, `UNAVAILABLE` when the shell cannot be
+  signalled), `FULL`; unspecified is rejected. Handler: `signal_job` in `spurd/src/agent_server.rs`. The controller sends SIGCONT then
+  SIGTERM as two calls per node.
 - `CancelJob` stays "terminate" and gains `kill_wait_secs` (0 = the old agent default, 5 seconds).
 - Capability: agents advertise `"signal-job"` (`spur_core::node::CAP_SIGNAL_JOB`) in
   `RegisterAgentRequest.capabilities`, stored as `Node.capabilities`. A victim on any node without it
@@ -247,9 +249,7 @@ behaviour and are marked `xfail` until it is fixed (see the test inventory).
 
 ## Follow-ups
 
-- Route `scancel --signal`, `-b` and `--full` through `SignalJob` and retire the signal form of
-  `CancelJob`.
-- Grace on `spur-k8s` nodes, and `scancel --signal` there currently deleting the job's Pods.
+- Grace on `spur-k8s` nodes, and signalling a job there (`SignalJob` is refused on those nodes).
 - Honour a user `--signal` as the warning signal (Slurm's `send_user_signal`).
 - Reservation end like Slurm: end `TIMEOUT`, stop immediately and use the timeout wait.
 - Change `update_partition` from positional arguments to a patch type; it already takes several
