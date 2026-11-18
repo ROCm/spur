@@ -135,7 +135,7 @@ Each crate has an `AGENTS.md` with architecture, key types, state machines, test
 | Job state machine | `crates/spur-core/src/job.rs` (13 states, transition matrix) |
 | Node state machine | `crates/spur-core/src/node.rs` (9 states, event-driven) |
 | Scheduling algorithm | `crates/spur-sched/src/backfill.rs` |
-| Raft/WAL operations | `crates/spur-core/src/wal.rs` (42 variants) |
+| Raft/WAL operations | `crates/spur-core/src/wal.rs` (43 variants) |
 | User-facing docs (Sphinx) | `docs/` |
 | E2E tests (Python) | `tests/native_host/e2e/`, `tests/k8s/e2e/` |
 | Unit/component tests (Rust) | `crates/spur-tests/src/` |

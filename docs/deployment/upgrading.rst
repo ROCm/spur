@@ -1376,16 +1376,20 @@ This release changes how a job ends when its script runs on every node, which
 includes an ``auto`` job whose script does not call ``srun``, ``mpirun``, or
 ``mpiexec`` (see :ref:`submit-script-placement`). A copy that exits cleanly now
 releases its node while the job keeps running, and the first copy that fails ends
-the job with its exit code. No configuration change is needed, and no new Raft
-entry type is added.
+the job with its exit code. No configuration change is needed.
 
-**Upgrade every controller before relying on it.** A controller that predates
-this release still ends such a job when its first copy exits: it moves the job to
-``COMPLETING``, then after ``scheduler.complete_wait_secs`` fails it and drains the
-nodes still running a copy. It also takes the outcome from the first node alone.
-Controllers on different releases apply node completions differently, so they can
-disagree about such a job until every controller runs this release. The rolling
-playbook upgrades the leader last (see :ref:`upgrading-leader-last`).
+**Upgrade the leader last.** When a job's script runs on more than one node, each
+copy that exits while the job is still running writes a new Raft log entry,
+``JobCopyExited``. A controller that predates it
+cannot parse the entry and stops replicating until it is upgraded, so the order
+in :ref:`upgrading-leader-last` applies, and a rollback after the entry has been
+written is not supported: roll forward.
+
+Until the leader runs this release, such a job still ends when its first copy
+exits: it moves to ``COMPLETING``, then after ``scheduler.complete_wait_secs``
+fails and drains the nodes still running a copy. Its outcome is taken from the
+first node alone. Every controller applies these older entries the same way, so
+controllers on different releases never disagree about a job.
 
 See Also
 --------

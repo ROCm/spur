@@ -884,6 +884,15 @@ fn runs_per_node(job: &Job) -> bool {
         && !job.spec.interactive
 }
 
+/// A node's exit that ends only its own copy, reported as `JobCopyExited`. A
+/// lone copy ends the run either way, so it keeps the entry older controllers read.
+fn ends_copy_by_copy(job: &Job) -> bool {
+    job.allocated_nodes.len() > 1
+        && job.state == JobState::Running
+        && job.preempt_grace().is_none()
+        && runs_per_node(job)
+}
+
 /// What a run is charged to and how it runs, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
@@ -3322,7 +3331,7 @@ impl ClusterManager {
         signal: i32,
         run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
-        {
+        let copy_exit = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -3352,17 +3361,31 @@ impl ClusterManager {
                     node: node_name.to_string(),
                 });
             }
-        }
+            ends_copy_by_copy(job)
+        };
 
-        let resp = self
-            .propose(WalOperation::JobNodeComplete {
+        let node_name = node_name.to_string();
+        let report = if copy_exit {
+            WalOperation::JobCopyExited {
                 job_id,
-                node_name: node_name.to_string(),
+                node_name,
                 exit_code,
                 signal,
                 run_attempt,
                 at: None,
-            })
+            }
+        } else {
+            WalOperation::JobNodeComplete {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+                run_attempt,
+                at: None,
+            }
+        };
+        let resp = self
+            .propose(report)
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
         self.run_all_finalized_side_effects(&resp);
@@ -4861,7 +4884,7 @@ impl ClusterManager {
     /// live stable_id, so availability matching reads the held GPUs as free and
     /// churns dispatches for the job's lifetime. Correcting the per-job slice
     /// (not the aggregate blindly) keeps `alloc_resources` the exact sum of the
-    /// jobs' slices, so a later JobNodeComplete still balances.
+    /// jobs' slices, so a later node report still balances.
     ///
     /// Live-view convergence only: the WAL keeps the legacy ids, but every
     /// heartbeat re-applies the reported set, so it self-heals with no persisted
@@ -4915,7 +4938,7 @@ impl ClusterManager {
                 node.alloc_resources
                     .add(&ResourceAllocations::from_device_ids("gpu", &to_add));
             }
-            // Rewrite the job's slice so a later JobNodeComplete subtracts the
+            // Rewrite the job's slice so a later node report subtracts the
             // ids the job actually held, keeping the aggregate balanced.
             slice.devices.insert(
                 "gpu".to_string(),
@@ -9129,9 +9152,9 @@ impl ClusterManager {
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
-    /// Nodes that already reported completion via `JobNodeComplete` (which
-    /// frees a node's slice as it arrives, ahead of the whole job finishing)
-    /// are skipped so their resources aren't subtracted twice.
+    /// Nodes that already reported via `JobNodeComplete` or `JobCopyExited`
+    /// (which free a node's slice as it arrives, ahead of the whole job
+    /// finishing) are skipped so their resources aren't subtracted twice.
     fn evict_job_locked(
         job_id: JobId,
         jobs: &mut HashMap<JobId, Job>,
@@ -9848,6 +9871,14 @@ impl ClusterManager {
                 signal,
                 run_attempt,
                 ..
+            }
+            | WalOperation::JobCopyExited {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+                run_attempt,
+                ..
             } => {
                 // A node a preempting victim frees here is claimed for its
                 // preemptor in the same critical section that releases it, so no
@@ -9911,8 +9942,10 @@ impl ClusterManager {
                         }
                     }
 
+                    // Only JobCopyExited ends a per-node run node by node: an older
+                    // controller applies JobNodeComplete the old way, so this must too.
                     let per_node =
-                        !in_grace && job.state == JobState::Running && runs_per_node(job);
+                        matches!(op, WalOperation::JobCopyExited { .. }) && ends_copy_by_copy(job);
                     if per_node && (*exit_code != 0 || *signal != 0) {
                         job.first_failed_node
                             .get_or_insert_with(|| node_name.clone());
@@ -22448,6 +22481,30 @@ state = "UP"
             }
         );
         assert_eq!(cm.get_job(job_id).unwrap().exit_signal, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_leaders_node_report_ends_a_per_node_run_as_it_did_there() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "n2".into(),
+            exit_code: 3,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.state,
+            JobState::Completing,
+            "every replica must apply the same entry the same way"
+        );
+        assert_eq!(job.first_failed_node, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

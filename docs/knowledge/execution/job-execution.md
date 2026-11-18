@@ -107,7 +107,11 @@ host reports (`ended_run_stragglers`), and the batch host's exit is the job's.
 
 On `AllNodes`, each copy's exit stands on its own (`runs_per_node` in
 `cluster.rs`; salloc and native srun allocations run no script and are left
-out). A clean exit frees that node and leaves the job Running
+out). While such a job spans more than one node and is Running outside a
+preemption grace (`ends_copy_by_copy`), `node_complete` proposes the exit as
+`WalOperation::JobCopyExited`. `JobNodeComplete` keeps its
+older meaning (the first report ends the run), so every controller replays a
+log an older leader wrote the same way. A clean exit frees that node and leaves the job Running
 (`NodeCompleteResult::StillRunning`). The first failed copy is recorded in
 `Job.first_failed_node`, moves the job to Completing, has the held nodes stopped,
 and supplies the job's exit (`finalize_reported_run`). Steps can no longer target

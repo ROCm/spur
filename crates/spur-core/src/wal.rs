@@ -538,6 +538,17 @@ pub enum WalOperation {
     NodeInventoryUpdate {
         inventory: crate::config::NodeInventory,
     },
+    /// One node's copy exited in a multi-node run whose script runs on every
+    /// node. Not a `JobNodeComplete`, so a controller that predates per-node
+    /// endings stops replicating instead of ending the run the old way.
+    JobCopyExited {
+        job_id: JobId,
+        node_name: String,
+        exit_code: i32,
+        signal: i32,
+        run_attempt: u32,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 impl WalOperation {
@@ -703,6 +714,7 @@ impl WalOperation {
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
+            | Self::JobCopyExited { at, .. }
             | Self::JobPreemptRequeue { at, .. }
             | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
@@ -754,6 +766,7 @@ impl WalOperation {
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
+            | Self::JobCopyExited { at, .. }
             | Self::JobPreemptRequeue { at, .. }
             | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
@@ -1537,6 +1550,40 @@ mod tests {
                 assert_eq!(exit_code, 0);
                 assert_eq!(signal, 9);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_copy_exit_is_its_own_stamped_entry() {
+        let mut op = WalOperation::JobCopyExited {
+            job_id: 7,
+            node_name: "n2".into(),
+            exit_code: 3,
+            signal: 0,
+            run_attempt: 2,
+            at: None,
+        };
+        let now = chrono::Utc::now();
+        op.stamp_occurred_at(now);
+        assert_eq!(op.occurred_at(), Some(now));
+
+        let json = serde_json::to_value(&op).unwrap();
+        assert!(
+            json.get("JobCopyExited").is_some(),
+            "an older controller must not read it as a JobNodeComplete: {json}"
+        );
+        match serde_json::from_value(json).unwrap() {
+            WalOperation::JobCopyExited {
+                job_id,
+                node_name,
+                exit_code,
+                run_attempt,
+                ..
+            } => assert_eq!(
+                (job_id, node_name.as_str(), exit_code, run_attempt),
+                (7, "n2", 3, 2)
+            ),
             _ => panic!("wrong variant"),
         }
     }

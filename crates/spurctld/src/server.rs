@@ -12420,6 +12420,31 @@ mod tests {
         );
     }
 
+    /// A lone copy ends its run under either entry, so it keeps the one that a
+    /// controller predating `JobCopyExited` can still replicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_node_script_exit_writes_the_older_entry() {
+        use spur_core::script_placement::ResolvedPlacement;
+        use spur_core::wal::WalOperation;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").script_placement(),
+            ResolvedPlacement::AllNodes
+        );
+
+        report_node_finished(&svc, job_id, "n1").await;
+
+        let logged = logged_operations(dir.path());
+        assert!(logged.iter().any(|(_, op)| matches!(op,
+            WalOperation::JobNodeComplete { job_id: id, .. } if *id == job_id
+        )));
+        assert!(!logged
+            .iter()
+            .any(|(_, op)| matches!(op, WalOperation::JobCopyExited { .. })));
+    }
+
     /// A non-primary node finishing early leaves the others to run out the grace;
     /// a job that is not in its grace still has them stopped. The ordinary job's
     /// cancel is awaited, so a cancel wrongly sent for the first would be seen too.
