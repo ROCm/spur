@@ -1419,6 +1419,15 @@ impl Job {
             || (self.state == JobState::Pending && self.holds_a_placement())
     }
 
+    /// Whether this job still holds any of its allocation. Unlike
+    /// [`Self::occupies_resources`], a suspended run and one in its kill wait count,
+    /// because neither has released its nodes.
+    pub fn holds_allocation(&self) -> bool {
+        self.occupies_resources()
+            || (matches!(self.state, JobState::Suspended | JobState::Completing)
+                && self.holds_a_placement())
+    }
+
     /// A run the controller stopped for a time or inactivity limit that is still
     /// inside its kill wait. It still holds its allocation, so a singleton or an
     /// array throttle must keep treating it as running.

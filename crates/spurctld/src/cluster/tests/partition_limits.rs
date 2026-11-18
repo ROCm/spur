@@ -55,7 +55,7 @@ fn update_limits(
 ) -> Result<(), PartitionError> {
     cm.update_partition(
         name, None, None, None, None, None, None, None, false, None, None, None, None, None, None,
-        None, None, None, None, limits,
+        None, None, None, None, limits, None,
     )
 }
 
@@ -397,6 +397,7 @@ fn a_claim_covers_the_most_of_each_resource_among_admitted_requests() {
             charge: 1,
             admits_without_credit: true,
         },
+        partition_qos: PartitionQosAdmitted::default(),
         qos_charge,
     };
     let outcomes = [
@@ -810,6 +811,7 @@ fn limits_entry(state: Option<&str>, limits: PartitionLimitsUpdate) -> WalOperat
         is_default: None,
         preempt_exempt_time: None,
         grace_time: None,
+        qos: None,
         resource_limits: Some(limits),
     }
 }

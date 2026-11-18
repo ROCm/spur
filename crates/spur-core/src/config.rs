@@ -1307,6 +1307,10 @@ pub struct PartitionConfig {
     pub deny_qos: Vec<String>,
     #[serde(default)]
     pub allow_qos: Vec<String>,
+    /// Partition QOS: its limits (e.g. `MaxTRESPU`) bound every job in the
+    /// partition, whatever its account or job QOS.
+    #[serde(default)]
+    pub qos: Option<String>,
     #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
@@ -1343,6 +1347,15 @@ pub struct PartitionConfig {
 }
 
 impl PartitionConfig {
+    /// The partition QOS change a reconfigure applies: an absent key keeps the
+    /// runtime value, so a QOS set with `scontrol update` is not silently lifted,
+    /// and `qos = ""` clears it.
+    pub fn qos_update(&self) -> Option<Option<String>> {
+        self.qos
+            .as_ref()
+            .map(|q| Some(q.clone()).filter(|q| !q.is_empty()))
+    }
+
     /// The per-node cap map with the `max_cpus_per_node` alias folded into
     /// the `cpu` key. [`SlurmConfig::validate`] rejects setting both.
     pub fn effective_max_tres_per_node(&self) -> BTreeMap<String, u64> {
@@ -3213,6 +3226,7 @@ impl SlurmConfig {
                 deny_accounts: pc.deny_accounts.clone(),
                 deny_qos: pc.deny_qos.clone(),
                 allow_qos: pc.allow_qos.clone(),
+                qos: pc.qos.clone().filter(|q| !q.is_empty()),
                 priority_tier: pc.priority_tier,
                 preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
                     .unwrap_or(None),
