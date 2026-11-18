@@ -60,7 +60,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - ``sacct`` ``ReqMem``
      - The ``ReqMem`` format field has no value yet and renders empty.
    * - ``sacct`` row limits
-     - Slurm limits a plain ``sacct`` to jobs since midnight and has no row cap. Spur has no time default. It prints the newest 100 jobs, a number you change with ``--limit``. ``-j`` returns every requested job, as in Slurm, up to 10000 rows. A page that hides further matches prints ``sacct: warning: results truncated at N; more jobs matched`` to stderr and still exits 0.
+     - Slurm limits a plain ``sacct`` to jobs since midnight and has no row cap. Spur has no time default. It prints the newest 100 jobs, a number you change with ``--limit``. ``-j`` returns every requested job that has a record, as in Slurm, up to 10000 rows. An id with no record is left out. A page that hides further matches prints ``sacct: warning: results truncated at N; more jobs matched`` to stderr and still exits 0.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``

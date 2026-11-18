@@ -956,12 +956,13 @@ pub async fn record_txn(
     Ok(())
 }
 
-/// Rows returned when a caller asks for 0. A larger request is clamped, not rejected.
+/// Rows returned when a caller asks for 0.
 const DEFAULT_QUERY_LIMIT: u32 = 1_000;
-/// Audit queries stop here. History may return one more; both share
-/// [`spur_core::accounting::MAX_JOB_HISTORY_ROWS`].
-const MAX_QUERY_LIMIT: u32 = spur_core::accounting::MAX_JOB_HISTORY_ROWS;
+/// Audit-log cap. Separate from the sacct history cap, so changing that page
+/// size does not change `sacctmgr show txn`.
+const MAX_QUERY_LIMIT: u32 = 10_000;
 
+/// A request of 0 means [`DEFAULT_QUERY_LIMIT`]. Anything larger is clamped, not rejected.
 fn clamp_query_limit(requested: u32, max: u32) -> i64 {
     let n = if requested == 0 {
         DEFAULT_QUERY_LIMIT
@@ -975,10 +976,9 @@ fn effective_query_limit(requested: u32) -> i64 {
     clamp_query_limit(requested, MAX_QUERY_LIMIT)
 }
 
-/// History may ask for one row past the cap so `sacct` can tell a full page
-/// from one the cap cut short. The audit log keeps the tighter cap.
+/// One row past the print cap, so `sacct` can tell a full page from a cut one.
 fn history_query_limit(requested: u32) -> i64 {
-    clamp_query_limit(requested, MAX_QUERY_LIMIT.saturating_add(1))
+    clamp_query_limit(requested, spur_core::accounting::MAX_JOB_HISTORY_FETCH)
 }
 
 /// Query the `txn` audit log, newest first.
@@ -1340,12 +1340,12 @@ mod history_query_tests {
         assert_eq!(history_query_limit(0), i64::from(DEFAULT_QUERY_LIMIT));
         assert_eq!(history_query_limit(101), 101);
         assert_eq!(
-            history_query_limit(MAX_QUERY_LIMIT + 1),
-            i64::from(MAX_QUERY_LIMIT + 1)
+            history_query_limit(spur_core::accounting::MAX_JOB_HISTORY_FETCH),
+            i64::from(spur_core::accounting::MAX_JOB_HISTORY_FETCH)
         );
         assert_eq!(
             history_query_limit(1_000_000),
-            i64::from(MAX_QUERY_LIMIT + 1)
+            i64::from(spur_core::accounting::MAX_JOB_HISTORY_FETCH)
         );
     }
 }
@@ -5063,6 +5063,7 @@ mod txn_tests {
         );
         assert_eq!(effective_query_limit(1_000_000), i64::from(MAX_QUERY_LIMIT));
         assert_eq!(effective_query_limit(u32::MAX), i64::from(MAX_QUERY_LIMIT));
+        assert_eq!(effective_query_limit(u32::MAX), 10_000);
     }
 
     async fn test_pool() -> anyhow::Result<PgPool> {
