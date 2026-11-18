@@ -1350,6 +1350,28 @@ impl TickPlan {
         pinned
     }
 
+    /// Held devices of every kind this tick lost, by kind.
+    pub fn lost_devices(&self) -> spur_devices::DeviceSelection {
+        let mut by_kind: std::collections::BTreeMap<&str, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        if !self.lost_held.is_empty() {
+            let mut gpus: Vec<u64> = self.lost_held.iter().copied().collect();
+            gpus.sort_unstable();
+            by_kind.insert(spur_core::device::GPU_GRES, gpus);
+        }
+        for device in lost_held_devices(&self.plan.baseline, &self.effective, &self.held_devices) {
+            by_kind
+                .entry(&device.gres_name)
+                .or_default()
+                .push(device.stable_id);
+        }
+        by_kind
+            .into_iter()
+            .fold(spur_devices::DeviceSelection::new(), |lost, (gres, ids)| {
+                lost.with(gres, ids)
+            })
+    }
+
     /// The set to report: a held device the effective set lost is pinned.
     pub fn reported(&self) -> ResourceSet {
         match self.delta {
@@ -5208,6 +5230,47 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn lost_devices_names_a_held_nic_discovery_dropped() {
+        let old = with_devices(vec![
+            Device::new("gpu", "", 1, 0),
+            Device::new("nic", "", 0x050000, 0),
+        ]);
+        let fresh = with_devices(vec![Device::new("gpu", "", 1, 0)]);
+        let held_devices = spur_devices::DeviceSelection::new().with("nic", vec![0x050000]);
+        let tick = plan_tick_with(
+            &old,
+            &fresh,
+            &HashSet::new(),
+            &held_devices,
+            &Fences::default(),
+        );
+        assert_eq!(
+            tick.lost_devices(),
+            spur_devices::DeviceSelection::new().with("nic", vec![0x050000])
+        );
+    }
+
+    #[test]
+    fn lost_devices_names_a_held_gpu_the_fresh_scan_lost() {
+        let old = with_devices(vec![
+            Device::new("gpu", "", 1, 0),
+            Device::new("gpu", "", 2, 1),
+        ]);
+        let fresh = with_devices(vec![Device::new("gpu", "", 1, 0)]);
+        let tick = plan_tick_with(
+            &old,
+            &fresh,
+            &HashSet::from([2]),
+            &Default::default(),
+            &Fences::default(),
+        );
+        assert_eq!(
+            tick.lost_devices(),
+            spur_devices::DeviceSelection::new().with("gpu", vec![2])
+        );
     }
 
     #[test]

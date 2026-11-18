@@ -1239,23 +1239,6 @@ fn spawn_inventory_refresh(
                     }
                 }
                 reporter::RefreshAction::ReportLost => {
-                    let lost: Vec<u64> = {
-                        let ids = |set: &spur_core::resource::ResourceSet| -> Vec<u64> {
-                            set.gpus().map(|g| g.stable_id).collect()
-                        };
-                        let new_ids: std::collections::HashSet<u64> =
-                            ids(&fresh).into_iter().collect();
-                        // A surviving id on a repartitioned GPU is lost too.
-                        let layout = spur_core::gpu_identity::diff_layout(
-                            &ids(&plan.baseline),
-                            &ids(&fresh),
-                        );
-                        plan.held
-                            .iter()
-                            .copied()
-                            .filter(|&id| !layout.is_intact(id, &new_ids))
-                            .collect()
-                    };
                     // A change to a held device is not an inventory event: pin
                     // the held devices from the last-reported set so the total
                     // stays ⊇ allocated (dropping it would let the controller
@@ -1290,8 +1273,8 @@ fn spawn_inventory_refresh(
                     agent_server::rename_descriptor_gpu_ids(&stepd_state_dir, &plan.renamed);
                     agent_server::rename_tracked_gpu_ids(&running_jobs, &plan.renamed).await;
                     warn!(
-                        ?lost,
-                        "allocated device changed; pinning held gpus, converging free pool only"
+                        lost = ?tick.lost_devices(),
+                        "allocated device changed; pinning held devices, converging free pool only"
                     );
                     let commit = converge(
                         &reporter,
