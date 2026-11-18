@@ -45,9 +45,9 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
-/// The devices a dispatch names, by kind. Countable pools have nothing to
-/// inject; every other kind is kept even when the registry no longer has it,
-/// so resolving its plan fails the launch instead of running without it.
+/// The devices a dispatch names, by kind, under the controller's by-id rule.
+/// A typed key (`name:type`) or a known pool has nothing to inject; any other
+/// kind is kept even when the registry lost it, so the launch fails on it.
 fn allocated_selection(
     allocated: Option<&ResourceAllocations>,
     registry: &DeviceRegistry,
@@ -57,9 +57,11 @@ fn allocated_selection(
         return selection;
     };
     for (gres, held) in &allocated.devices {
-        // Pool keys may carry a type (`name:type`); device kinds never do.
-        let is_pool = gres.contains(':') || registry.has_countable_pool(gres);
-        if gres == "gpu" || !is_pool {
+        if gres.contains(':') {
+            continue;
+        }
+        let by_id = spur_core::device::allocates_by_id(gres, registry.has_injectable(gres));
+        if by_id || !registry.has_countable_pool(gres) {
             selection.set(gres, held.devices.iter().map(|d| d.device_id).collect());
         }
     }
@@ -17188,6 +17190,81 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&CdiCache::new(), &GresCache::from_entries(&gres));
         reg
+    }
+
+    #[test]
+    fn controller_allocations_of_every_shape_reach_the_agent_selection() {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let gres = vec![
+            GresEntry {
+                name: "nic".into(),
+                r#type: Some("pollara400".into()),
+                file: Some("/dev/infiniband/uverbs[0-1]".into()),
+                ..Default::default()
+            },
+            GresEntry {
+                name: "nic".into(),
+                count: Some(4),
+                flags: vec!["count_only".into()],
+                ..Default::default()
+            },
+            GresEntry {
+                name: "bandwidth".into(),
+                r#type: Some("lustre".into()),
+                count: Some(64),
+                flags: vec!["count_only".into()],
+                ..Default::default()
+            },
+        ];
+        let mut registry = DeviceRegistry::new();
+        registry.populate(&CdiCache::new(), &GresCache::from_entries(&gres));
+        let inventory = spur_core::resource::ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            devices: crate::reporter::devices_from_registry(&registry, None),
+            generic: crate::reporter::generic_from_registry(&registry),
+            ..Default::default()
+        };
+
+        let mut request = spur_core::resource::ResourceRequest::with_scalar(1, 0);
+        request.add_devices("nic", None, 1);
+        request.add_devices("bandwidth", Some("lustre"), 8);
+        let one =
+            spur_core::resource::build_node_allocation(&inventory, &Default::default(), &request);
+        let selected = allocated_selection(
+            Some(&crate::reporter::allocations_to_proto(&one)),
+            &registry,
+        );
+        assert_eq!(selected.of("nic"), one.device_ids("nic").as_slice());
+        assert!(selected.of("bandwidth:lustre").is_empty());
+
+        let all = spur_core::resource::build_exclusive_allocation(&inventory, 0);
+        let selected = allocated_selection(
+            Some(&crate::reporter::allocations_to_proto(&all)),
+            &registry,
+        );
+        assert_eq!(selected.of("nic").len(), 2);
+    }
+
+    #[test]
+    fn a_count_hold_of_a_kind_handed_out_by_id_selects_nothing() {
+        let registry = test_gpu_and_nic_registry();
+        let allocated = ResourceAllocations {
+            devices: [(
+                "nic:pollara400".to_string(),
+                DeviceAllocations {
+                    devices: vec![AllocatedDevice {
+                        device_id: 0,
+                        count: 1,
+                    }],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        assert!(allocated_selection(Some(&allocated), &registry).is_empty());
     }
 
     fn nic_dispatch(nic: u64) -> (JobSpec, ResourceAllocations) {

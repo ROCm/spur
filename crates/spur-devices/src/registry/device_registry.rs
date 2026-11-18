@@ -66,7 +66,7 @@ impl DeviceRegistry {
         }
 
         // CDI is filled first, so it wins over GRES naming the same device.
-        self.devices = dedup_by_device_paths(candidates);
+        self.devices = drop_shadowed_pools(dedup_by_device_paths(candidates));
         assign_device_ids(&mut self.devices);
     }
 
@@ -340,6 +340,32 @@ fn merge_targets<'a>(
 }
 
 const GRES_KIND: &str = "spur.internal/gres";
+
+/// A countable pool named like a kind handed out by id would be counted by
+/// the controller and ignored by the agent, so discovered devices win. GPUs are
+/// always handed out by id, so a count-only `gpu` pool could never be used.
+fn drop_shadowed_pools(devices: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
+    let by_id: std::collections::HashSet<String> = devices
+        .iter()
+        .filter(|e| e.is_injectable())
+        .map(|e| e.gres_name.clone())
+        .chain(std::iter::once("gpu".to_string()))
+        .collect();
+    devices
+        .into_iter()
+        .filter(|entry| {
+            let shadowed = entry.is_countable_pool() && by_id.contains(&entry.gres_name);
+            if shadowed {
+                warn!(
+                    gres = %entry.gres_name,
+                    r#type = ?entry.resource_type,
+                    "countable GRES pool shares its name with devices handed out by id; ignoring the pool"
+                );
+            }
+            !shadowed
+        })
+        .collect()
+}
 
 fn sorted_node_paths(entry: &DeviceEntry) -> Vec<&str> {
     let mut paths: Vec<&str> = entry.node_paths().collect();
@@ -804,6 +830,61 @@ mod tests {
             assert_eq!(kept.len(), 1);
             assert_eq!(kept[0].kind, "amd.com/gpu");
         }
+    }
+
+    fn count_only(name: &str, device_type: Option<&str>, count: u64) -> GresEntry {
+        GresEntry {
+            name: name.into(),
+            r#type: device_type.map(str::to_string),
+            count: Some(count),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }
+    }
+
+    fn nic_cache() -> CdiCache {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec(
+            "amd.com/nic",
+            &[
+                ("0", "/dev/infiniband/uverbs0"),
+                ("1", "/dev/infiniband/uverbs1"),
+            ],
+            ContainerEdits::default(),
+        )]);
+        cache
+    }
+
+    #[test]
+    fn a_countable_pool_named_like_discovered_devices_is_dropped() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(
+            &mut reg,
+            &nic_cache(),
+            &[
+                count_only("nic", None, 4),
+                count_only("nic", Some("pollara400"), 2),
+            ],
+        );
+        assert_eq!((reg.injectable_count(), reg.countable_count()), (2, 0));
+    }
+
+    #[test]
+    fn a_count_only_gpu_pool_is_always_dropped() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &[count_only("gpu", None, 8)]);
+        assert_eq!(reg.countable_count(), 0);
+    }
+
+    #[test]
+    fn a_countable_pool_of_another_name_stays() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(
+            &mut reg,
+            &nic_cache(),
+            &[count_only("bandwidth", Some("lustre"), 64)],
+        );
+        assert_eq!(reg.countable_count(), 1);
     }
 
     #[test]
@@ -2071,19 +2152,6 @@ mod tests {
     fn merge_targets_is_empty_when_no_node_is_discovered() {
         let configured = gres_device("/dev/dri/renderD200");
         assert!(merge_targets(&configured, &partitions()).targets.is_empty());
-    }
-
-    fn nic_cache() -> CdiCache {
-        let mut cache = CdiCache::new();
-        cache.add_specs(&[spec(
-            "amd.com/nic",
-            &[
-                ("0", "/dev/infiniband/uverbs0"),
-                ("1", "/dev/infiniband/uverbs1"),
-            ],
-            ContainerEdits::default(),
-        )]);
-        cache
     }
 
     #[test]
