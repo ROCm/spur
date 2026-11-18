@@ -73,6 +73,11 @@ An untyped request (``nic:2``) matches NICs of any type. Every step of a job
 gets all of the job's NICs on its node; ``--gres=nic`` on an ``srun`` inside an
 existing allocation does not narrow them.
 
+Once ``spurd`` has handed out NICs by device, it keeps doing so until it
+restarts. If every NIC disappears (for example ``ionic_rdma`` is unloaded), the
+node reports no NICs and jobs that request them pend; a count-only ``nic``
+entry in ``spur.conf`` does not take over. Restarting ``spurd`` re-evaluates.
+
 Job environment
 ---------------
 
@@ -135,7 +140,7 @@ Limits of RDMA gating:
   ``spurd`` runs is not picked up: restart ``spurd`` afterwards.
 * Gating compares paths under ``/dev/infiniband/``. A device node for the same
   RDMA device elsewhere is not withheld.
-* Gating does not reset a NIC's RDMA state between jobs.
+* Gating does not reset the RDMA state of a NIC between jobs.
 
 Configuring NICs by hand
 ------------------------
