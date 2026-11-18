@@ -10,6 +10,7 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
+use spur_core::script_placement::ResolvedPlacement;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -3661,7 +3662,7 @@ async fn confirm_dispatch_on_nodes(
     let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
         spec.mpi.as_deref(),
         spec.num_nodes,
-        spec.script.as_deref(),
+        ResolvedPlacement::scanned(spec.script.as_deref()),
     );
 
     let mut peer_hosts: Vec<String> = Vec::new();

@@ -32,11 +32,12 @@ use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::gpu_binding::BindingCheck;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
 use spur_core::native_exec::resolve_cgroup_budget;
+use spur_core::script_placement::ResolvedPlacement;
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
-    batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
-    build_mpi_mpirun_wrapper, build_multi_task_pmix_wrapper, build_multi_task_wrapper,
-    build_step_task_plan, slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
+    batch_companion_hold_script, batch_launch, build_mpi_mpirun_wrapper,
+    build_multi_task_pmix_wrapper, build_multi_task_wrapper, build_step_task_plan,
+    slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -6841,8 +6842,9 @@ impl SlurmAgent for AgentService {
         // collision-prone shared anchor for relative output paths.
         let work_dir = spec.work_dir.clone();
 
+        let placement = ResolvedPlacement::scanned(Some(&spec.script));
         let allocation_holder =
-            batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout;
+            placement == ResolvedPlacement::BatchHost && task_offset > 0 && !req.task_fanout;
         let script = if allocation_holder {
             batch_companion_hold_script().to_string()
         } else {
@@ -6910,7 +6912,7 @@ impl SlurmAgent for AgentService {
         }
 
         let pmix_multi_task = spec.mpi == MPI_PMIX
-            && use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+            && use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, placement);
 
         // Spur-only vars
         senv.set("SPUR_NODE_RANK", node_rank);
@@ -7059,7 +7061,7 @@ impl SlurmAgent for AgentService {
         let mut supervised_pmix = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
+        if spec.mpi == MPI_PMIX && placement == ResolvedPlacement::AllNodes {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
@@ -7094,7 +7096,7 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, placement);
         let launch_script = if shape == BatchLaunch::Mpirun {
             if spec.argv.is_empty() {
                 return Err(Status::invalid_argument(
