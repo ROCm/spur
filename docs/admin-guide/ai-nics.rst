@@ -60,9 +60,11 @@ Requesting NICs
 .. code-block:: bash
 
    sbatch --gres=gpu:8,nic:8 train.sh
-   srun --gres=nic:pollara400:2 ./ib_test
+   srun -N 1 --gres=nic:pollara400:2 ./ib_test
 
-An untyped request (``nic:2``) matches NICs of any type.
+An untyped request (``nic:2``) matches NICs of any type. Every step of a job
+gets all of the job's NICs on its node; ``--gres=nic`` on an ``srun`` inside an
+existing allocation does not narrow them.
 
 Job environment
 ---------------

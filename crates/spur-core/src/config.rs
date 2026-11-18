@@ -1882,8 +1882,8 @@ pub struct ClusterPeer {
 
 /// Device discovery and CDI configuration.
 ///
-/// `auto_detect` is AMD KFD sysfs only; other vendors need on-disk CDI specs or GRES
-/// `file` entries.
+/// `auto_detect` finds AMD GPUs (KFD) and AMD Pollara AI NICs (PCI sysfs); other
+/// devices need on-disk CDI specs or GRES `file` entries.
 ///
 /// ```toml
 /// [devices]
@@ -1903,7 +1903,7 @@ pub struct ClusterPeer {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicesConfig {
-    /// Discover GPUs from KFD when the CDI cache is empty. AMD only for now.
+    /// Discover AMD GPUs and AI NICs for every kind with no on-disk CDI spec.
     #[serde(default = "default_true_fn")]
     pub auto_detect: bool,
 
