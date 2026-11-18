@@ -3,11 +3,10 @@
 
 //! AMD Pensando Pollara AI NICs: ionic PCI functions with an RDMA device.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cdi::annotations;
 use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, GENERATED_CDI_VERSION};
@@ -30,111 +29,151 @@ fn kind_of(device: &str) -> Option<&'static str> {
 
 /// Why discovery passed over an ionic function.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Skipped {
+pub enum Skipped {
     NoRdmaDevice,
     NoUverbs { rdma_device: String },
     UnsupportedAddress,
 }
 
-/// What discovery last said about each NIC. Discovery reruns every refresh, so
-/// it logs only what changed rather than repeating itself each tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicOutcome {
+    Claimed,
+    Skipped(Skipped),
+}
+
+/// What discovery made of one ionic function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NicFunction {
+    pub bdf: String,
+    pub kind: &'static str,
+    pub outcome: NicOutcome,
+}
+
+/// Every ionic function one scan looked at, in BDF order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NicScan {
+    pub functions: Vec<NicFunction>,
+}
+
+impl NicScan {
+    pub fn retain_kinds(&mut self, kinds: &HashSet<String>) {
+        self.functions.retain(|f| kinds.contains(f.kind));
+    }
+}
+
+pub struct NicDiscovery {
+    pub specs: Vec<CdiSpec>,
+    pub scan: NicScan,
+}
+
+/// A change worth logging between two scans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicEvent {
+    Claimed(Vec<String>),
+    NoneClaimed,
+    NoRdmaOnNode(Vec<String>),
+    EthernetOnly(String),
+    NoUverbs { bdf: String, rdma_device: String },
+    UnsupportedAddress(String),
+}
+
+/// What was last said about the node's NICs. Discovery reruns every refresh,
+/// so only what changed is logged rather than repeating itself each tick.
 #[derive(Debug, Default)]
-struct NicReports {
+pub struct NicLog {
+    claimed: Vec<String>,
     skipped: BTreeMap<String, Skipped>,
-    claimed: Option<Vec<String>>,
+    warned_no_rdma: bool,
 }
 
-impl NicReports {
-    const fn new() -> Self {
-        Self {
-            skipped: BTreeMap::new(),
-            claimed: None,
+impl NicLog {
+    pub fn observe(&mut self, scan: &NicScan) -> Vec<NicEvent> {
+        let mut events = Vec::new();
+        let claimed: Vec<String> = scan
+            .functions
+            .iter()
+            .filter(|f| f.outcome == NicOutcome::Claimed)
+            .map(|f| f.bdf.clone())
+            .collect();
+        if claimed != self.claimed {
+            events.push(if claimed.is_empty() {
+                NicEvent::NoneClaimed
+            } else {
+                NicEvent::Claimed(claimed.clone())
+            });
+            self.claimed = claimed;
+        }
+
+        // Ethernet-only functions are expected; only a node where no ionic
+        // function has RDMA points at a missing ionic_rdma.
+        let no_rdma_on_node = !scan.functions.is_empty()
+            && scan
+                .functions
+                .iter()
+                .all(|f| f.outcome == NicOutcome::Skipped(Skipped::NoRdmaDevice));
+        if no_rdma_on_node && !self.warned_no_rdma {
+            events.push(NicEvent::NoRdmaOnNode(
+                scan.functions.iter().map(|f| f.bdf.clone()).collect(),
+            ));
+        }
+        self.warned_no_rdma = no_rdma_on_node;
+
+        let mut skipped = BTreeMap::new();
+        for function in &scan.functions {
+            let NicOutcome::Skipped(why) = &function.outcome else {
+                continue;
+            };
+            if self.skipped.get(&function.bdf) != Some(why) {
+                events.extend(skip_event(&function.bdf, why, no_rdma_on_node));
+            }
+            skipped.insert(function.bdf.clone(), why.clone());
+        }
+        self.skipped = skipped;
+        events
+    }
+
+    pub fn report(&mut self, scan: &NicScan) {
+        for event in self.observe(scan) {
+            log_event(&event);
         }
     }
-
-    /// Records why `bdf` was skipped; true when that differs from last time.
-    fn skip(&mut self, bdf: &str, why: Skipped) -> bool {
-        self.skipped.insert(bdf.to_owned(), why.clone()) != Some(why)
-    }
-
-    fn found(&mut self, bdf: &str) {
-        self.skipped.remove(bdf);
-    }
-
-    /// Records the claimed NICs; true when the set changed.
-    fn claim(&mut self, bdfs: Vec<String>) -> bool {
-        let changed = self.claimed.as_ref() != Some(&bdfs);
-        self.claimed = Some(bdfs);
-        changed
-    }
 }
 
-static NIC_REPORTS: Mutex<NicReports> = Mutex::new(NicReports::new());
-
-fn report_skip(bdf: &str, why: &Skipped) {
+fn skip_event(bdf: &str, why: &Skipped, no_rdma_on_node: bool) -> Option<NicEvent> {
     match why {
-        Skipped::NoRdmaDevice => {
-            warn!(%bdf, "ionic function has no RDMA device (is ionic_rdma loaded?); not scheduling it")
+        Skipped::NoRdmaDevice if no_rdma_on_node => None,
+        Skipped::NoRdmaDevice => Some(NicEvent::EthernetOnly(bdf.to_owned())),
+        Skipped::NoUverbs { rdma_device } => Some(NicEvent::NoUverbs {
+            bdf: bdf.to_owned(),
+            rdma_device: rdma_device.clone(),
+        }),
+        Skipped::UnsupportedAddress => Some(NicEvent::UnsupportedAddress(bdf.to_owned())),
+    }
+}
+
+fn log_event(event: &NicEvent) {
+    match event {
+        NicEvent::Claimed(nics) => {
+            info!(?nics, "claiming RDMA-enabled ionic functions as AI NICs")
         }
-        Skipped::NoUverbs { rdma_device } => warn!(
+        NicEvent::NoneClaimed => info!("no longer claiming any AI NIC"),
+        NicEvent::NoRdmaOnNode(functions) => warn!(
+            ?functions,
+            "no ionic function on this node has an RDMA device (is ionic_rdma loaded?); \
+             not scheduling NICs"
+        ),
+        NicEvent::EthernetOnly(bdf) => {
+            debug!(%bdf, "Ethernet-only ionic function; not scheduling it")
+        }
+        NicEvent::NoUverbs { bdf, rdma_device } => warn!(
             %bdf,
             %rdma_device,
             "AI NIC has no uverbs node (is ib_uverbs loaded?); not scheduling it"
         ),
-        Skipped::UnsupportedAddress => {
+        NicEvent::UnsupportedAddress(bdf) => {
             warn!(%bdf, "AI NIC's PCI address cannot be encoded as a device id; not scheduling it")
         }
     }
-}
-
-fn discover_nic_cdi_with(root: &Path, reports: &mut NicReports) -> Vec<CdiSpec> {
-    let sysfs = root.join("sys");
-    let rdma = rdma_devices_by_function(&sysfs);
-    let uverbs = uverbs_by_rdma_device(&sysfs);
-    let mut by_kind: BTreeMap<&str, Vec<DiscoveredNic>> = BTreeMap::new();
-    let Ok(functions) = std::fs::read_dir(sysfs.join("bus/pci/devices")) else {
-        return Vec::new();
-    };
-    for function in functions.flatten() {
-        let path = function.path();
-        let Some(kind) = pollara_kind(&path) else {
-            continue;
-        };
-        let Some(bdf) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
-            continue;
-        };
-        match discover_nic(&path, &bdf, &rdma, &uverbs) {
-            Ok(nic) => {
-                reports.found(&bdf);
-                by_kind.entry(kind).or_default().push(nic);
-            }
-            Err(why) => {
-                if reports.skip(&bdf, why.clone()) {
-                    report_skip(&bdf, &why);
-                }
-            }
-        }
-    }
-
-    let mut claimed: Vec<String> = by_kind
-        .values()
-        .flatten()
-        .map(|nic| nic.bdf.clone())
-        .collect();
-    claimed.sort();
-    let had_nics = reports.claimed.as_ref().is_some_and(|c| !c.is_empty());
-    if (had_nics || !claimed.is_empty()) && reports.claim(claimed.clone()) {
-        info!(nics = ?claimed, "claiming every RDMA-enabled ionic function as an AI NIC");
-    }
-
-    let shared = shared_edits(root);
-    by_kind
-        .into_iter()
-        .map(|(kind, mut nics)| {
-            nics.sort_by(|a, b| a.bdf.cmp(&b.bdf));
-            to_spec(kind, &nics, root, &shared)
-        })
-        .collect()
 }
 
 struct DiscoveredNic {
@@ -146,12 +185,48 @@ struct DiscoveredNic {
     numa_node: Option<u32>,
 }
 
-/// One spec per NIC kind present, devices in BDF order.
-pub(super) fn discover_nic_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
-    let mut reports = NIC_REPORTS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    discover_nic_cdi_with(root, &mut reports)
+/// One spec per NIC kind present, devices in BDF order, and what became of
+/// every ionic function.
+pub(super) fn discover_nic_cdi_from_root(root: &Path) -> NicDiscovery {
+    let sysfs = root.join("sys");
+    let rdma = rdma_devices_by_function(&sysfs);
+    let uverbs = uverbs_by_rdma_device(&sysfs);
+    let mut by_kind: BTreeMap<&str, Vec<DiscoveredNic>> = BTreeMap::new();
+    let mut scan = NicScan::default();
+    let Ok(functions) = std::fs::read_dir(sysfs.join("bus/pci/devices")) else {
+        return NicDiscovery {
+            specs: Vec::new(),
+            scan,
+        };
+    };
+    for function in functions.flatten() {
+        let path = function.path();
+        let Some(kind) = pollara_kind(&path) else {
+            continue;
+        };
+        let Some(bdf) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let outcome = match discover_nic(&path, &bdf, &rdma, &uverbs) {
+            Ok(nic) => {
+                by_kind.entry(kind).or_default().push(nic);
+                NicOutcome::Claimed
+            }
+            Err(why) => NicOutcome::Skipped(why),
+        };
+        scan.functions.push(NicFunction { bdf, kind, outcome });
+    }
+    scan.functions.sort_by(|a, b| a.bdf.cmp(&b.bdf));
+
+    let shared = shared_edits(root);
+    let specs = by_kind
+        .into_iter()
+        .map(|(kind, mut nics)| {
+            nics.sort_by(|a, b| a.bdf.cmp(&b.bdf));
+            to_spec(kind, &nics, root, &shared)
+        })
+        .collect();
+    NicDiscovery { specs, scan }
 }
 
 fn pollara_kind(function: &Path) -> Option<&'static str> {
@@ -408,47 +483,147 @@ mod tests {
             .collect()
     }
 
+    fn f(bdf: &str, outcome: NicOutcome) -> NicFunction {
+        NicFunction {
+            bdf: bdf.into(),
+            kind: "amd.com/nic",
+            outcome,
+        }
+    }
+
+    fn scan(functions: Vec<NicFunction>) -> NicScan {
+        NicScan { functions }
+    }
+
+    const A: &str = "0000:05:00.0";
+    const B: &str = "0000:85:00.0";
+
+    fn no_rdma() -> NicOutcome {
+        NicOutcome::Skipped(Skipped::NoRdmaDevice)
+    }
+
+    fn no_uverbs() -> NicOutcome {
+        NicOutcome::Skipped(Skipped::NoUverbs {
+            rdma_device: "ionic_0".into(),
+        })
+    }
+
     #[test]
-    fn a_nic_state_is_reported_once_until_it_changes() {
-        let mut reports = NicReports::default();
-        let no_uverbs = || Skipped::NoUverbs {
+    fn an_empty_first_scan_logs_nothing() {
+        assert!(NicLog::default().observe(&NicScan::default()).is_empty());
+    }
+
+    #[test]
+    fn the_claimed_set_is_reported_only_when_it_changes_and_losing_all_is_reported_once() {
+        let mut log = NicLog::default();
+        let one = scan(vec![f(A, NicOutcome::Claimed)]);
+        let two = scan(vec![f(A, NicOutcome::Claimed), f(B, NicOutcome::Claimed)]);
+        assert_eq!(log.observe(&one), [NicEvent::Claimed(vec![A.into()])]);
+        assert!(log.observe(&one).is_empty());
+        assert_eq!(
+            log.observe(&two),
+            [NicEvent::Claimed(vec![A.into(), B.into()])]
+        );
+        assert_eq!(log.observe(&NicScan::default()), [NicEvent::NoneClaimed]);
+        assert!(log.observe(&NicScan::default()).is_empty());
+    }
+
+    #[test]
+    fn a_node_whose_ionic_functions_have_no_rdma_warns_once() {
+        let mut log = NicLog::default();
+        let none = scan(vec![f(A, no_rdma()), f(B, no_rdma())]);
+        assert_eq!(
+            log.observe(&none),
+            [NicEvent::NoRdmaOnNode(vec![A.into(), B.into()])]
+        );
+        assert!(log.observe(&none).is_empty());
+        assert_eq!(
+            log.observe(&scan(vec![f(A, NicOutcome::Claimed)])),
+            [NicEvent::Claimed(vec![A.into()])]
+        );
+        assert_eq!(
+            log.observe(&scan(vec![f(A, no_rdma())])),
+            [
+                NicEvent::NoneClaimed,
+                NicEvent::NoRdmaOnNode(vec![A.into()])
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ethernet_only_function_beside_an_ai_nic_is_not_a_warning() {
+        let mut log = NicLog::default();
+        let mixed = scan(vec![f(A, NicOutcome::Claimed), f(B, no_rdma())]);
+        assert_eq!(
+            log.observe(&mixed),
+            [
+                NicEvent::Claimed(vec![A.into()]),
+                NicEvent::EthernetOnly(B.into())
+            ]
+        );
+        assert!(log.observe(&mixed).is_empty());
+    }
+
+    #[test]
+    fn a_function_that_leaves_and_returns_is_reported_again() {
+        let mut log = NicLog::default();
+        let broken = scan(vec![f(A, no_uverbs())]);
+        let event = NicEvent::NoUverbs {
+            bdf: A.into(),
             rdma_device: "ionic_0".into(),
         };
-        assert!(reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
-        assert!(!reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
-        assert!(reports.skip("0000:05:00.0", no_uverbs()));
-        reports.found("0000:05:00.0");
-        assert!(reports.skip("0000:05:00.0", Skipped::NoRdmaDevice));
+        assert_eq!(log.observe(&broken), std::slice::from_ref(&event));
+        assert!(log.observe(&NicScan::default()).is_empty());
+        assert_eq!(log.observe(&broken), [event]);
+    }
+
+    #[test]
+    fn retain_kinds_keeps_only_the_named_kinds() {
+        let mut scan = scan(vec![
+            f(A, NicOutcome::Claimed),
+            NicFunction {
+                kind: "amd.com/vnic",
+                ..f(B, NicOutcome::Claimed)
+            },
+        ]);
+        scan.retain_kinds(&HashSet::from(["amd.com/vnic".to_string()]));
+        assert_eq!(scan.functions.len(), 1);
+        assert_eq!(scan.functions[0].bdf, B);
     }
 
     #[test]
     fn discovery_records_a_nic_without_uverbs() {
         let dir = tempfile::tempdir().unwrap();
-        PciFunction::pollara("0000:05:00.0", "ionic_0", "enp5s0").write(dir.path());
-        let mut reports = NicReports::default();
-        discover_nic_cdi_with(dir.path(), &mut reports);
-        assert_eq!(
-            reports.skipped.get("0000:05:00.0"),
-            Some(&Skipped::NoUverbs {
-                rdma_device: "ionic_0".into()
-            })
-        );
+        PciFunction::pollara(A, "ionic_0", "enp5s0").write(dir.path());
+        let found = discover_nic_cdi_from_root(dir.path());
+        assert!(found.specs.is_empty());
+        assert_eq!(found.scan, scan(vec![f(A, no_uverbs())]));
     }
 
     #[test]
-    fn the_claimed_set_is_reported_only_when_it_changes() {
-        let mut reports = NicReports::default();
-        let a = "0000:05:00.0".to_string();
-        let b = "0000:85:00.0".to_string();
-        assert!(reports.claim(vec![a.clone()]));
-        assert!(!reports.claim(vec![a.clone()]));
-        assert!(reports.claim(vec![a, b]));
+    fn pollara_host_scan_claims_every_function() {
+        let host = pollara_host();
+        let found = discover_nic_cdi_from_root(host.path());
+        let claimed: Vec<(&str, &str, &NicOutcome)> = found
+            .scan
+            .functions
+            .iter()
+            .map(|f| (f.bdf.as_str(), f.kind, &f.outcome))
+            .collect();
+        assert_eq!(
+            claimed,
+            vec![
+                ("0000:05:00.0", "amd.com/nic", &NicOutcome::Claimed),
+                ("0000:05:00.1", "amd.com/vnic", &NicOutcome::Claimed),
+                ("0000:85:00.0", "amd.com/nic", &NicOutcome::Claimed),
+            ]
+        );
     }
 
     #[test]
     fn discovers_pfs_and_vfs_as_separate_kinds() {
         let host = pollara_host();
-        let specs = discover_nic_cdi_from_root(host.path());
+        let specs = discover_nic_cdi_from_root(host.path()).specs;
         let kinds: Vec<(&str, usize)> = specs
             .iter()
             .map(|s| (s.kind.as_str(), s.devices.len()))
@@ -459,7 +634,7 @@ mod tests {
     #[test]
     fn uverbs_is_mapped_through_ibdev_not_index() {
         let host = pollara_host();
-        let specs = discover_nic_cdi_from_root(host.path());
+        let specs = discover_nic_cdi_from_root(host.path()).specs;
         assert_eq!(
             device_nodes(&specs[0]),
             vec![
@@ -477,7 +652,7 @@ mod tests {
     #[test]
     fn each_nic_carries_its_identity_in_annotations() {
         let host = pollara_host();
-        let specs = discover_nic_cdi_from_root(host.path());
+        let specs = discover_nic_cdi_from_root(host.path()).specs;
         let vf = &specs[1].devices[0].annotations;
         let get = |key: &str| vf.get(key).map(String::as_str);
         assert_eq!(get(annotations::DEVICE_TYPE), Some("pollara400"));
@@ -493,7 +668,7 @@ mod tests {
     #[test]
     fn every_kind_shares_the_rdma_connection_manager() {
         let host = pollara_host();
-        let specs = discover_nic_cdi_from_root(host.path());
+        let specs = discover_nic_cdi_from_root(host.path()).specs;
         assert_eq!(specs.len(), 2);
         for spec in specs {
             let shared: Vec<&str> = spec
@@ -515,7 +690,7 @@ mod tests {
         }
         .write(dir.path());
         uverbs(dir.path(), "uverbs3", "ionic_0");
-        let specs = discover_nic_cdi_from_root(dir.path());
+        let specs = discover_nic_cdi_from_root(dir.path()).specs;
         assert_eq!(
             device_nodes(&specs[0]),
             vec![vec!["/dev/infiniband/uverbs3".to_string()]]
@@ -538,7 +713,9 @@ mod tests {
         }
         .write(dir.path());
         uverbs(dir.path(), "uverbs0", "ionic_0");
-        assert!(discover_nic_cdi_from_root(dir.path()).is_empty());
+        let found = discover_nic_cdi_from_root(dir.path());
+        assert!(found.specs.is_empty());
+        assert_eq!(found.scan, scan(vec![f(A, no_rdma())]));
     }
 
     #[test]
@@ -569,20 +746,23 @@ mod tests {
         uverbs(root, "uverbs1", "ionic_1");
         uverbs(root, "uverbs2", "mlx5_0");
         uverbs(root, "uverbs3", "ionic_3");
-        assert!(discover_nic_cdi_from_root(root).is_empty());
+        let found = discover_nic_cdi_from_root(root);
+        assert!(found.specs.is_empty());
+        assert!(found.scan.functions.is_empty());
     }
 
     #[test]
     fn a_nic_without_a_uverbs_node_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         PciFunction::pollara("0000:05:00.0", "ionic_0", "enp5s0").write(dir.path());
-        assert!(discover_nic_cdi_from_root(dir.path()).is_empty());
+        assert!(discover_nic_cdi_from_root(dir.path()).specs.is_empty());
     }
 
     #[test]
     fn host_discovery_includes_nics() {
         let host = pollara_host();
         let kinds: Vec<String> = crate::discovery::discover_all_cdi_from_root(host.path())
+            .specs
             .into_iter()
             .map(|s| s.kind)
             .collect();
@@ -592,7 +772,7 @@ mod tests {
     #[test]
     fn discovered_nics_register_as_injectable_nic_gres() {
         let host = pollara_host();
-        let specs = discover_nic_cdi_from_root(host.path());
+        let specs = discover_nic_cdi_from_root(host.path()).specs;
         let mut registry = DeviceRegistry::new();
         registry.populate(
             &CdiCache::load_with(&[], Some(&specs)),

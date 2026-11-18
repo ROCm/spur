@@ -45,11 +45,15 @@ RDMA device. These names match the AMD network device plugin for Kubernetes:
 
 Every RDMA-enabled ``ionic`` function is claimed this way, whether it sits on a
 Pollara card or on another Pensando card such as a storage NIC, and is typed
-``pollara400``. ``spurd`` logs the NICs it claims at ``info`` whenever the set
-changes. A function without an RDMA device or a ``uverbs`` node is skipped,
-with a warning when that changes. A NIC's stable id comes from its PCI
-address, so it survives reboots and driver reloads. An on-disk CDI spec of kind ``amd.com/nic`` or ``amd.com/vnic``
-replaces discovery for that kind.
+``pollara400``. ``spurd`` logs the NICs it claims at ``info`` when the set
+changes, and once when it no longer claims any. A function without a
+``uverbs`` node is skipped, with a warning when that changes. A function
+without an RDMA device is an Ethernet-only function and is skipped quietly,
+unless no ``ionic`` function on the node has one, which logs a single warning
+(is ``ionic_rdma`` loaded?). The stable id of a NIC comes from its PCI address,
+so it survives reboots and driver reloads. An on-disk CDI spec of kind
+``amd.com/nic`` or ``amd.com/vnic`` replaces discovery for that kind, and
+discovery does not log the functions of a kind it replaces.
 
 ``scontrol show node`` lists the NICs with the node's other GRES:
 
