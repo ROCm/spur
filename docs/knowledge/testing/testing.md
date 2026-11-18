@@ -225,11 +225,11 @@ with `-m gpu` without manual tags.
 
 ### 3.6. E2E test file catalog
 
-87 test files covering:
+94 test files covering:
 
 | Category | Files | Notes |
 |---|---|---|
-| **Basic job lifecycle** | `test_single_node.py`, `test_multi_node.py`, `test_sbatch_empty.py`, `test_sbatch_wait.py`, `test_time_limit.py` | Submit, run, complete, fail, custom output paths. |
+| **Basic job lifecycle** | `test_single_node.py`, `test_multi_node.py`, `test_script_placement.py`, `test_sbatch_empty.py`, `test_sbatch_wait.py`, `test_time_limit.py` | Submit, run, complete, fail, custom output paths, where a multi-node batch script runs. |
 | **Scheduling** | `test_exclusive_blocking.py`, `test_idle_fill.py`, `test_begin_time.py`, `test_partitions.py`, `test_held_job_blocks_node.py`, `test_node_labels.py`, `test_node_resource_caps.py` | Exclusive mode, backfill, deferred start, partition targeting. |
 | **Preemption** | `test_preemption.py`, `test_preemption_modes.py`, `test_preemption_grace.py`, `test_preemption_fairshare.py`, `test_preemption_handoff.py`, `test_preemption_hoist.py`, `test_preemption_multinode.py`, `test_preemption_qos_hierarchy.py`, `test_preemption_same_qos.py`, `test_preemption_satisfiability.py`, `test_preemption_exempt_precedence.py`, `test_preemption_victim_order.py` | Requeue, suspend, grace period, fair-share, multi-node; victim ordering/reload, suspended-run cost, one-node GPU-total placement. |
 | **QOS / accounting** | `test_accounting.py`, `test_burst_qos.py`, `test_qos_preemption.py`, `test_qos_walltime_policy.py`, `test_spur268_fairshare_live.py`, `test_karma_counters.py`, `test_karma_time_limit.py`, `test_srun_qos.py` | TRES tracking, QOS limits, fair-share. |
@@ -309,6 +309,7 @@ K8s E2E tests use the Python `kubernetes` client. `k8s_cluster.py` provides:
 |---|---|
 | `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node). |
 | `test_raft_ha.py` | Raft HA under K8s: leader election, pod restart recovery. |
+| `test_script_placement.py` | Script placement on K8s nodes, under a `batch-host` cluster default (overrides `cluster`): SpurJobs still run per node, and an explicit `batch-host` job is refused at submit when pinned to K8s nodes or waits with the reason otherwise. |
 
 Constants: `SPUR_JOB_GROUP = "spur.amd.com"`, `SPUR_JOB_VERSION = "v1alpha1"`,
 `SPUR_JOB_PLURAL = "spurjobs"`. The operator image defaults to
