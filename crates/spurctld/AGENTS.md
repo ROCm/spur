@@ -137,9 +137,9 @@ Raft runs even in single-node mode (self-elects instantly, same pattern as Apach
 
 ### WalOperation
 
-Durable cluster mutations are proposed as `WalOperation` enum variants. 42 variants:
+Durable cluster mutations are proposed as `WalOperation` enum variants. 43 variants:
 
-**Job lifecycle:** `JobSubmit`, `JobStart`, `JobComplete`, `JobNodeComplete`, `JobCancelSignaled`, `JobPreemptCancel`, `JobPreemptRequeue`, `JobSuspend`, `JobResume`, `JobUserRequeue`, `JobDispatchBackoff`, `JobTimeLimitSignaled`, `JobTimeLimitExpired`, `JobPreemptSignaled`, `JobStateChange`, `JobPriorityChange`, `JobStepCreate`, `JobStepComplete`, `JobEvict`, `JobLaunchFailureDetail`, `JobExcludeUpdate`, `EvictTerminalJobs`
+**Job lifecycle:** `JobSubmit`, `JobStart`, `JobComplete`, `JobNodeComplete`, `JobCopyExited`, `JobCancelSignaled`, `JobPreemptCancel`, `JobPreemptRequeue`, `JobSuspend`, `JobResume`, `JobUserRequeue`, `JobDispatchBackoff`, `JobTimeLimitSignaled`, `JobTimeLimitExpired`, `JobPreemptSignaled`, `JobStateChange`, `JobPriorityChange`, `JobStepCreate`, `JobStepComplete`, `JobEvict`, `JobLaunchFailureDetail`, `JobExcludeUpdate`, `EvictTerminalJobs`
 
 **Node management:** `NodeRegister`, `NodeUpdate`, `NodeStateChange`, `NodeLabelsUpdate`, `NodeRemove`, `NodeInventoryUpdate`, `NodeK0sAssign`, `NodeK0sClear`, `NodeK0sSetError`
 
