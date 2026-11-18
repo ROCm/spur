@@ -328,20 +328,21 @@ impl PlacementRequest {
         if state.nodes.len() > MAX_NODES || job.het_job_id.is_some() || job.het_group.is_some() {
             return None;
         }
-        let initial_entries = size.entries;
-        let initial_text = size.text;
+        let before_request = size.entries.checked_add(size.text)?;
         budget.spend(job_work(job)?)?;
         size.job(job)?;
+        let request_work = size
+            .entries
+            .checked_add(size.text)?
+            .checked_sub(before_request)?;
         if spur_core::constraints::requires_gpu_properties(&job.spec) {
             return None;
         }
-        let before_nodes = (size.entries, size.text);
         for node in state.nodes {
             budget.spend(1)?;
             size.node(node)?;
         }
-        let node_entries = size.entries.checked_sub(before_nodes.0)?;
-        let node_text = size.text.checked_sub(before_nodes.1)?;
+        let before_policy = size.entries.checked_add(size.text)?;
         for partition in state.partitions {
             budget.spend(1)?;
             size.text(&partition.name)?;
@@ -359,6 +360,10 @@ impl PlacementRequest {
             size.strings(&reservation.users)?;
             size.strings(&reservation.accounts)?;
         }
+        let policy_work = size
+            .entries
+            .checked_add(size.text)?
+            .checked_sub(before_policy)?;
         for (node, owners) in state.preemption_handoffs {
             size.text(node)?;
             size.entries(owners.len())?;
@@ -403,9 +408,13 @@ impl PlacementRequest {
         }
         budget.spend(size.entries.checked_add(size.text)?)?;
         let mut job = placement_job(job);
+        let before_hostlists = size.entries.checked_add(size.text)?;
         canonicalize_hostlists(&mut job, &mut size, budget)?;
+        let hostlist_work = size
+            .entries
+            .checked_add(size.text)?
+            .checked_sub(before_hostlists)?;
         let scope = PlacementScope::from_prepared(&job, state.nodes, budget)?;
-        let mut relevant = InputSize::default();
         let mut n = 0usize;
         let mut device_work = 0usize;
         for node in state.nodes {
@@ -414,7 +423,6 @@ impl PlacementRequest {
                 continue;
             }
             n = n.checked_add(1)?;
-            relevant.node(node)?;
             let devices = node
                 .alloc_resources
                 .devices
@@ -433,17 +441,10 @@ impl PlacementRequest {
                 .checked_add(gpu_work)?
                 .checked_add(devices.checked_mul(devices)?)?;
         }
-        let matching_work = size
-            .entries
-            .checked_sub(initial_entries)?
-            .checked_sub(node_entries)?
-            .checked_add(
-                size.text
-                    .checked_sub(initial_text)?
-                    .checked_sub(node_text)?,
-            )?
-            .checked_add(relevant.entries)?
-            .checked_add(relevant.text)?;
+        // Aggregate node and charge metadata is scanned once, not for every candidate.
+        let matching_work = request_work
+            .checked_add(policy_work)?
+            .checked_add(hostlist_work)?;
         let mut charges_by_node: HashMap<&str, usize> = HashMap::new();
         for by_node in state.partition_node_usage.values() {
             for (node, charges) in by_node {

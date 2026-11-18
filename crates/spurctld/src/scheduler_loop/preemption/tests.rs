@@ -53,11 +53,22 @@ impl Fixture {
     fn hold(&mut self, id: JobId, cpus: u32, memory: u64, gpus: &[u64], eligible: bool) {
         let mut allocation = ResourceAllocations::with_scalar(cpus, memory);
         allocation.add(&ResourceAllocations::from_device_ids("gpu", gpus));
-        self.nodes[0].alloc_resources.add(&allocation);
+        self.hold_on(0, id, allocation, eligible);
+    }
+
+    fn hold_on(
+        &mut self,
+        index: usize,
+        id: JobId,
+        allocation: ResourceAllocations,
+        eligible: bool,
+    ) {
+        let node = &mut self.nodes[index];
+        node.alloc_resources.add(&allocation);
         let mut job = Job::new(id, JobSpec::default());
         job.state = JobState::Running;
-        job.allocated_nodes = vec!["n1".into()];
-        job.per_node_alloc.insert("n1".into(), allocation);
+        job.allocated_nodes = vec![node.name.clone()];
+        job.per_node_alloc.insert(node.name.clone(), allocation);
         self.holders.push(job);
         if eligible {
             self.eligible.insert(id);
@@ -153,6 +164,125 @@ fn unresponsive_free_capacity_does_not_suppress_necessary_preemption() {
 
     f.nodes[1].not_responding = false;
     assert_eq!(selected(&f, &request(1, 0)), None);
+}
+
+#[test]
+fn unpinned_selector_keeps_its_budget_with_partition_charges() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    for count in [64, 128] {
+        for with_gpus in [false, true] {
+            let mut f = Fixture::new(4);
+            if !with_gpus {
+                f.nodes[0].total_resources.gpus.clear();
+            }
+            f.nodes[0].partitions = vec!["default".into()];
+            let template = f.nodes[0].clone();
+            f.nodes = (0..count)
+                .map(|index| {
+                    let mut node = template.clone();
+                    node.name = format!("node{index:04}");
+                    node
+                })
+                .collect();
+            for index in 0..count {
+                f.hold_on(
+                    index,
+                    index as u32 + 1,
+                    ResourceAllocations::with_scalar(4, 0),
+                    true,
+                );
+            }
+            for holder in &mut f.holders {
+                holder.effective_partition = Some("default".into());
+            }
+            f.partitions.push(spur_core::partition::Partition {
+                name: "default".into(),
+                is_default: true,
+                max_tres_per_node: [("cpu".into(), 4)].into(),
+                ..Default::default()
+            });
+            f.usage = partition_usage_from_jobs(
+                &f.holders,
+                &f.partitions,
+                now,
+                ReleaseWaits::of(&Default::default()),
+            );
+            assert_eq!(f.usage["default"].len(), count);
+            let mut incoming = request(1, 0);
+            incoming.spec.partition = Some("default".into());
+            assert_eq!(
+                selected(&f, &incoming),
+                Some(HashSet::from([1])),
+                "{count} nodes, GPU inventory: {with_gpus}"
+            );
+        }
+    }
+}
+
+#[test]
+fn topology_victims_enable_normal_scheduler_placement() {
+    for topology_mode in ["tree", "block"] {
+        let mut f = Fixture::new(4);
+        let template = f.nodes[0].clone();
+        for name in ["n2", "n3"] {
+            let mut node = template.clone();
+            node.name = name.into();
+            f.nodes.push(node);
+        }
+        f.hold_on(1, 1, ResourceAllocations::with_scalar(4, 0), false);
+        f.hold_on(2, 2, ResourceAllocations::with_scalar(1, 0), false);
+        f.hold_on(2, 3, ResourceAllocations::with_scalar(3, 0), true);
+        let topology = spur_core::topology::TopologyTree::from_blocks(
+            &["n1".into(), "n2".into(), "n3".into()],
+            2,
+        );
+        let state = ClusterState {
+            topology: Some(&topology),
+            ..f.state()
+        };
+        let mut incoming = request(1, 0);
+        incoming.spec.num_nodes = 2;
+        incoming.spec.num_tasks = 2;
+        incoming.spec.topology = Some(topology_mode.into());
+        let victims = satisfiable_victim_set(
+            &incoming,
+            &VictimPool {
+                holders: &f.holders,
+                evictable: &f.eligible,
+                priority: &f.priorities,
+                max_priority: None,
+            },
+            &state,
+            DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
+            &mut SearchBudget::default(),
+        )
+        .expect("sufficient victim set");
+        assert_eq!(victims, HashSet::from([3]));
+        let mut released = f.nodes.clone();
+        for holder in f.holders.iter().filter(|job| victims.contains(&job.job_id)) {
+            for node in &mut released {
+                if let Some(slice) = holder.per_node_alloc.get(&node.name) {
+                    node.alloc_resources.subtract(slice);
+                }
+            }
+        }
+        let projected = ClusterState {
+            nodes: &released,
+            ..state
+        };
+        let assigned = spur_sched::traits::Scheduler::schedule(
+            &mut BackfillScheduler::new(1),
+            &[incoming],
+            &projected,
+        );
+        assert_eq!(assigned.len(), 1, "{topology_mode}");
+        assert_eq!(
+            HashSet::from_iter(assigned[0].nodes.iter().map(String::as_str)),
+            HashSet::from(["n1", "n3"])
+        );
+        assert_eq!(released[1].alloc_resources.cpus, 4);
+        assert_eq!(released[2].alloc_resources.cpus, 1);
+    }
 }
 
 #[test]

@@ -73,8 +73,9 @@ For each pending job in priority order:
    (descending), then least allocated CPUs (ascending) — dropping node weight.
 
 4. **Topology reordering** -- for multi-node jobs with `--topology=tree` or
-   `block`, candidates are reordered by `TopologyTree::select_local_nodes()`
-   to prefer nodes under the same switch.
+   `block`, `TopologyTree::select_local_nodes()` prefers nodes under the same
+   switch among candidates available by the earliest sufficient start time.
+   Locality cannot promote later nodes over a set that can start sooner.
 
 5. **Additive nodelist pinning** -- if `--nodelist` names fewer nodes than
    `--nodes` requests (additive mode), listed nodes are forced to the front
@@ -277,6 +278,8 @@ with backfill, while rejecting future starts and skipping convergence. Inputs ar
 prepared through `immediate::PlacementRequest`; its bounded `PlacementScope`
 reuses name/partition/feature matching, including preferred-node fallback.
 Nonlinear charges use that scope; full-domain scan/copy/seeding work stays charged.
+Only request and global policy matching costs multiply by candidate count;
+aggregate node metadata and partition charges are not multiplied again.
 Controller victim selection owns
 the projected allocations and shares `SearchBudget` across reclaim/preemption.
 Trial timelines are reused and memory-only allocations must be seeded.
@@ -295,7 +298,7 @@ The crate is heavily unit-tested (each module has `#[cfg(test)] mod tests`).
 - Shadow reservation correctness (large job blocks overlapping smaller jobs,
   does not block non-overlapping ones, busy_until realistic durations)
 - Uneven CPU splits (block distribution), memory-per-cpu scaling
-- Topology-aware placement with additive nodelists
+- Topology locality within the earliest start window, including additive nodelists
 - Common-window convergence (multi-node future reservations respect reservation
   windows across both uniform and heterogeneous allocation paths)
 

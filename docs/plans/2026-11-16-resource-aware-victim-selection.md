@@ -58,7 +58,9 @@ products defer without allocating those placeholders.
    projection reset, and several immediate-placement trials. It avoids future
    release/convergence searches and stops on call/work exhaustion. Nonlinear
    placement/device charges use the prepared scope; validation, scans, copies,
-   and partition charge seeding still account for the full domain. Task-count
+   and partition charge seeding still account for the full domain. Aggregate
+   node metadata and partition charges are charged once per trial; only request
+   and global policy matching costs multiply by candidate count. Task-count
    calculation is now arithmetic O(nodes), replacing O(tasks) materialization.
 2. **Memory:** one snapshot and one mutable projection/workspace, with O(nodes +
    held slices + eligible jobs + charges) storage inside fixed input limits.
@@ -113,6 +115,11 @@ allocation slices rather than an ID-only occupant simulation.
   exclusions, preferred-node fallback, reservations, partition caps, typed
   charges, and handoffs. Pinned requests at 64/128/512/1,024 nodes and a
   feature-only request at 512 nodes retain progress under default budgets.
+  Unpinned requests at 64/128 nodes retain progress with capped-partition
+  charges, both with and without GPU inventory.
+- Topology victim trials and normal scheduling agree after exact slice release.
+  Locality prefers candidates within the earliest sufficient start window;
+  required additive nodes and future planning retain their timing constraints.
 - Missing/completed-node slices, stale generations, inconsistent/unknown
   ownership, reserved pending holders, same-cycle assignment accounting,
   malformed injectable GPU counts, expanded GPU type text in all four request
@@ -130,6 +137,11 @@ victim provenance and incoming completion plus spared process identity and
 unchanged request/allocation parameters. Real GPU E2E checks device visibility
 and skips explicitly when hardware is unavailable.
 
+The topology follow-up adds a three-node pytest fixture for tree/block locality
+in cancel/requeue mode. It checks that the incoming job starts across groups,
+completes successfully, and preserves both protected payload identities. These
+four cases have been collected and linted locally; live execution is pending.
+
 Both original bugs were reproduced on the base binaries through the new E2E
 scenarios: the small request evicted a spared co-resident, and the protected
 sharing request never started. Corrected binaries must pass the matrix.
@@ -139,7 +151,7 @@ workspace clippy excluding `spur-ffi` with all targets, cargo shear,
 knowledge synchronization, and pytest flake8. Live tests run serially with
 throwaway container/state ownership and bounded logs/storage, followed by cleanup.
 
-## Validation results
+## Initial validation results
 
 - Full locked Rust suite: 6,647 passed, 48 ignored, zero failures.
 - Focused selector/allocation boundary suite: 30 passed, one manual profile ignored.

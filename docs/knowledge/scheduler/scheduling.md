@@ -241,6 +241,8 @@ reused; no subset history or persistent state is added. A bounded
 `PlacementScope` reuses names/partition/features matching across holder overlap
 checks, including preferred-node fallback. Nonlinear trial charges use that
 scope; full-domain validation/copy/scan and charge-seeding costs remain charged.
+Only request and global policy matching costs multiply by candidate count;
+aggregate node metadata and partition charges are charged once per trial.
 Injectable GPU counts are validated before resource feasibility can narrow them.
 Repeated GPU placeholder type text is sized before capacity probes can expand it.
 
@@ -361,9 +363,11 @@ restrictive (candidate pool), not additive, because `num_nodes(1) <=
 len(nodelist)(4)`.
 
 **Topology-aware placement** -- for multi-node jobs with `--topology=tree` or
-`--topology=block`, the scheduler reorders candidates by switch-tree locality
-after the initial sort. Additive nodelist members are re-pinned after topology
-reordering to prevent displacement.
+`--topology=block`, the scheduler prefers switch-tree locality among nodes
+available by the earliest sufficient start time. Future nodes cannot displace
+a set that can start now, so immediate victim trials and normal placement use
+the same locality preference. Remaining candidates stay available for additive
+nodelist pinning: required nodes still force the job to wait when busy.
 
 **Future reservation convergence** -- a multi-node job's per-node earliest
 starts are independently computed, then converged to a common start. The

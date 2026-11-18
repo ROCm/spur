@@ -289,7 +289,10 @@ Topology Locality and Block Containment
 When the administrator enables block topology, automatically discovered vPods
 or administrator-declared node groups supply the existing topology model.
 ``--topology block`` and ``--topology tree`` use the configured model to prefer
-nearby nodes. These options permit allocations across blocks when needed.
+nearby nodes among candidates available by the earliest sufficient start time.
+Locality does not delay a job to wait for nearby nodes when enough candidates
+are already available. These options permit allocations across blocks when
+needed. Required nodes in an additive ``--nodelist`` still take precedence.
 
 To require all allocated GPUs inside one block, add a same-fabric constraint.
 Both jobs below use the same partition and discovered topology:

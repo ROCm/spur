@@ -1783,8 +1783,11 @@ impl BackfillScheduler {
             if let Some(topo) = &cluster.topology {
                 let wants_topo = job.spec.topology.as_deref();
                 if matches!(wants_topo, Some("tree") | Some("block")) {
+                    // Locality must not delay a placement that can start sooner.
+                    let earliest_window = node_starts[needed_nodes - 1].1;
                     let candidate_names: Vec<&str> = node_starts
                         .iter()
+                        .take_while(|(_, start)| *start <= earliest_window)
                         .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
                         .collect();
                     let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
@@ -1799,7 +1802,6 @@ impl BackfillScheduler {
                             reordered.push(node_starts.remove(pos));
                         }
                     }
-                    // Append any remaining (shouldn't happen, but safety)
                     reordered.extend(node_starts);
                     node_starts = reordered;
                 }
@@ -3992,6 +3994,72 @@ mod tests {
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
         assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn topology_prefers_locality_within_the_earliest_start_window() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+        for mode in ["tree", "block"] {
+            for delay in [0, 10] {
+                for require_busy in [false, true] {
+                    let mut sched = BackfillScheduler::new(1);
+                    let mut nodes = make_nodes(3);
+                    nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 0);
+                    if delay > 0 {
+                        nodes[2].alloc_resources = ResourceAllocations::with_scalar(64, 0);
+                    }
+                    let busy_until = HashMap::from([
+                        ("node002".into(), now + Duration::minutes(60)),
+                        ("node003".into(), now + Duration::minutes(delay)),
+                    ]);
+                    let topology = TopologyTree::from_blocks(
+                        &["node001".into(), "node002".into(), "node003".into()],
+                        2,
+                    );
+                    let partitions = vec![Partition {
+                        name: "default".into(),
+                        ..Default::default()
+                    }];
+                    let cluster = ClusterState {
+                        nodes: &nodes,
+                        partitions: &partitions,
+                        reservations: &[],
+                        topology: Some(&topology),
+                        fabric: None,
+                        busy_until: &busy_until,
+                        preemption_handoffs: &HashMap::new(),
+                        partition_node_usage: &Default::default(),
+                    };
+                    let mut job = make_job(1, 2, 1);
+                    job.spec.topology = Some(mode.into());
+                    if require_busy {
+                        job.spec.nodelist = Some("node002".into());
+                    }
+                    let assignments = sched.schedule_jobs(&[job], &cluster, now, true);
+                    if delay == 0 && !require_busy {
+                        assert_eq!(assignments.len(), 1, "{mode}");
+                        assert_eq!(
+                            HashSet::from_iter(assignments[0].nodes.iter().map(String::as_str)),
+                            HashSet::from(["node001", "node003"])
+                        );
+                        continue;
+                    }
+                    assert!(assignments.is_empty());
+                    let plan = sched.planned_job_starts();
+                    let (chosen, start) = &plan[&1];
+                    if require_busy {
+                        assert!(chosen.iter().any(|name| name == "node002"));
+                        assert_eq!(*start, now + Duration::minutes(60));
+                    } else {
+                        assert_eq!(
+                            HashSet::from_iter(chosen.iter().map(String::as_str)),
+                            HashSet::from(["node001", "node003"])
+                        );
+                        assert_eq!(*start, now + Duration::minutes(delay));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
