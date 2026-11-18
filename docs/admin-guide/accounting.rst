@@ -186,6 +186,10 @@ Show accounts
 
    sacctmgr show account
 
+The default columns leave out the account's QOS allow-list. Add it with
+``format=Account,QOS`` or ``--long``, or read it from the account row of
+``sacctmgr show association`` (see `Show associations`_).
+
 With ``private_data = ["accounts"]``, a User sees an account only when they
 coordinate it. A user who coordinates nothing is denied once the association
 cache has loaded. While the cache is still loading, the call is unavailable
