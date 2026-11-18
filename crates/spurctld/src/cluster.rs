@@ -16528,6 +16528,158 @@ state = "UP"
         assert_eq!(job_id, 500);
     }
 
+    #[test]
+    fn replay_preserves_pending_submission_time() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let at = DateTime::parse_from_rfc3339("2026-01-01T10:00:00.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut submit = WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("pending")),
+        };
+        submit.stamp_occurred_at(at);
+        let recovered = serde_json::from_slice(&serde_json::to_vec(&submit).unwrap()).unwrap();
+        cm.apply_operation(&recovered);
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.submit_time, at);
+        assert_eq!(job.eligible_time(), at);
+        assert_eq!(job.accrue_time(), at);
+        assert_eq!(job.start_time, None);
+        assert_eq!(job.end_time, None);
+    }
+
+    #[test]
+    fn replay_preserves_submission_time_when_requeued() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let submitted = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(JobSpec {
+                submitted_at: Some(submitted),
+                ..basic_spec("requeued")
+            }),
+        });
+        let mut activation =
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running);
+        activation.stamp_occurred_at(submitted + chrono::Duration::minutes(1));
+        cm.apply_operation(&activation);
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: Some(submitted + chrono::Duration::minutes(2)),
+        });
+        let pending = cm.get_job(1).unwrap();
+        assert_eq!(pending.state, JobState::Pending);
+        assert_eq!(pending.submit_time, submitted);
+        assert_eq!(pending.start_time, None);
+        assert_eq!(pending.end_time, None);
+
+        let restarted = submitted + chrono::Duration::minutes(3);
+        let mut activation =
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running);
+        activation.stamp_occurred_at(restarted);
+        cm.apply_operation(&activation);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.submit_time, submitted);
+        assert_eq!(job.start_time, Some(restarted));
+    }
+
+    #[test]
+    fn replay_preserves_job_times_through_snapshot_and_tail() {
+        let dir = TempDir::new().unwrap();
+        let live = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let submitted = DateTime::parse_from_rfc3339("2026-01-01T10:00:00.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let started = submitted + chrono::Duration::minutes(1);
+        let ended = started + chrono::Duration::minutes(10);
+        let limit = chrono::Duration::minutes(15);
+        let mut spec = basic_spec("timed");
+        spec.time_limit = Some(limit);
+        spec.submitted_at = Some(submitted);
+        let mut activation =
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running);
+        activation.stamp_occurred_at(started);
+        let prefix = [
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            },
+            activation,
+            WalOperation::JobSuspend {
+                job_id: 1,
+                at: started + chrono::Duration::minutes(2),
+                preempted_by: None,
+                preempt_qos: None,
+                by: None,
+            },
+        ];
+        for op in &prefix {
+            live.apply_operation(op);
+        }
+        let snapshot = live.snapshot_state().unwrap();
+        let tail = [
+            WalOperation::JobResume {
+                job_id: 1,
+                at: started + chrono::Duration::minutes(5),
+            },
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Completed,
+                unreported_nodes: Vec::new(),
+                cancel: None,
+                controller_initiated: false,
+                at: Some(ended),
+            },
+        ];
+        for op in &tail {
+            live.apply_operation(op);
+        }
+
+        for use_snapshot in [false, true] {
+            let replay_dir = TempDir::new().unwrap();
+            let replay = ClusterManager::new(test_config(), replay_dir.path()).unwrap();
+            if use_snapshot {
+                replay.restore_from_snapshot(&snapshot).unwrap();
+            } else {
+                for op in &prefix {
+                    let recovered =
+                        serde_json::from_slice(&serde_json::to_vec(op).unwrap()).unwrap();
+                    replay.apply_operation(&recovered);
+                }
+            }
+            let suspended = replay.get_job(1).unwrap();
+            assert_eq!(suspended.state, JobState::Suspended);
+            assert_eq!(suspended.submit_time, submitted);
+            assert_eq!(suspended.start_time, Some(started));
+            for op in &tail {
+                let recovered = serde_json::from_slice(&serde_json::to_vec(op).unwrap()).unwrap();
+                replay.apply_operation(&recovered);
+            }
+            let job = replay.get_job(1).unwrap();
+            assert_eq!(job.state, JobState::Completed);
+            assert_eq!(job.submit_time, submitted);
+            assert_eq!(job.start_time, Some(started));
+            assert_eq!(job.end_time, Some(ended));
+            assert_eq!(job.run_time(), Some(chrono::Duration::minutes(7)));
+            assert_eq!(job.run_time(), live.get_job(1).unwrap().run_time());
+            assert_eq!(
+                job.effective_deadline(started, limit),
+                started + limit + chrono::Duration::minutes(3)
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_state_change() {
         let dir = TempDir::new().unwrap();

@@ -1226,6 +1226,7 @@ mod tests {
         match op {
             WalOperation::JobSubmit { job_id, spec } => {
                 assert_eq!(job_id, 7);
+                assert_eq!(spec.submitted_at, None);
                 assert_eq!(spec.name, "fixture");
                 assert_eq!(spec.work_dir, "/home/alice");
                 assert!(!spec.pty);
@@ -1499,6 +1500,24 @@ mod tests {
             Some(at),
             "the instant must survive the log verbatim"
         );
+    }
+
+    #[test]
+    fn submission_stamp_survives_serialization_and_restamping() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07.123456789Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let mut op = WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::default(),
+        };
+        op.stamp_occurred_at(at);
+        let mut recovered: WalOperation =
+            serde_json::from_slice(&serde_json::to_vec(&op).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(recovered.occurred_at(), Some(at));
+        recovered.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(recovered.occurred_at(), Some(at));
     }
 }
 
