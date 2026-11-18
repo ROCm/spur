@@ -213,6 +213,7 @@ mod tests {
             fairshare_weight: weight,
             max_running_jobs: None,
             grp_tres: None,
+            allowed_qos: None,
         }
     }
 
@@ -633,6 +634,7 @@ mod tests {
             fairshare_weight: 100,
             max_running_jobs: None,
             grp_tres: None,
+            allowed_qos: None,
         }];
         let mut user_weights = HashMap::new();
         user_weights.insert(("alice".into(), "research".into()), 1);
@@ -685,6 +687,7 @@ mod tests {
             fairshare_weight: 100,
             max_running_jobs: None,
             grp_tres: None,
+            allowed_qos: None,
         }];
         let mut user_weights = HashMap::new();
         user_weights.insert(("alice".into(), "research".into()), 1);

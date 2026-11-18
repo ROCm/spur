@@ -44,6 +44,19 @@ keep affected finished jobs in the controller, up to 24 hours past
 ``terminal_job_retention_secs``, which can increase controller memory and
 snapshot size. See :ref:`preemption-outcome-export`.
 
+Account QOS allow-list compatibility
+------------------------------------
+
+Account QOS allow-lists (``sacctmgr add/modify account ... qos=``) add an
+``allowed_qos`` column to the ``accounts`` table, created automatically at
+startup. Upgrade every controller before setting one. An older controller
+ignores the field: ``sacctmgr`` reports the account as added or modified, but no
+list is stored.
+
+**Rollback.** An older controller leaves the column in place but does not read
+it. Users who have no ``qos=`` of their own stop inheriting the account's list
+and may again use any QOS. Lists set directly on users are unaffected.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 

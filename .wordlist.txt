@@ -345,6 +345,7 @@ SSSD
 sstat
 StatefulSet
 StatefulSets
+stderr
 stdin
 stdout
 stepd
