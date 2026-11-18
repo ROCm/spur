@@ -1330,8 +1330,9 @@ Batch scripts that run on every node
 This release changes how a job ends when its script runs on every node, which
 includes an ``auto`` job whose script does not call ``srun``, ``mpirun``, or
 ``mpiexec`` (see :ref:`submit-script-placement`). A copy that exits cleanly now
-releases its node while the job keeps running, and the first copy that fails ends
-the job with its exit code. No configuration change is needed.
+leaves the job running, its node still allocated to the job until the job ends,
+and the first copy that fails ends the job with its exit code. No configuration
+change is needed.
 
 **Upgrade the leader last.** When a job's script runs on more than one node, each
 copy that exits while the job is still running writes a new Raft log entry,

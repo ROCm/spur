@@ -176,6 +176,11 @@ Held in controller memory. Key fields beyond the spec:
 - `idle_fill`: this run uses spare capacity outside QOS quota.
 - `first_failed_node`: on a per-node run, the first node whose copy failed. It ended the
   run, so its exit is the run's. Cleared on requeue.
+- `retained_nodes`: on a per-node run, nodes whose copy exited cleanly while the run went
+  on. They reported, but stay charged until the run ends, so "reported" and "charged"
+  differ: `is_held_on`/`held_nodes` (charged) include them, `still_runs_on`/`running_nodes`
+  (not yet reported) and `released_nodes` (slice returned) do not. `clear_node_reports`
+  clears them with `node_completions`, after the caller has freed their slices.
 - `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
   and cleared on requeue. `Job::script_placement()` falls back to the `auto` text scan when
   it is unset (a run dispatched before placements were recorded), which is what agents

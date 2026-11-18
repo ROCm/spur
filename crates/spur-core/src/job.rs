@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 use crate::burst_buffer::BbStageState;
@@ -1156,6 +1156,12 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_failed_node: Option<String>,
 
+    /// Nodes whose copy of a per-node script exited cleanly while the run went
+    /// on. They reported, but keep their slice until the run ends, as `spurd`
+    /// keeps the allocation while any of the job's steps still run there.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retained_nodes: BTreeSet<String>,
+
     /// Standalone srun: native step dispatch after allocation registration.
     #[serde(default)]
     pub srun_step_dispatch: bool,
@@ -1321,6 +1327,7 @@ impl Job {
             het_group: None,
             node_completions: HashMap::new(),
             first_failed_node: None,
+            retained_nodes: BTreeSet::new(),
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
             preempt_pending: None,
@@ -1464,6 +1471,13 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
+        self.allocated_nodes.iter().any(|n| n == node)
+            && (!self.node_completions.contains_key(node) || self.retained_nodes.contains(node))
+    }
+
+    /// Whether this node has yet to report its part of the run. A node that
+    /// reported may still be charged (see `retained_nodes`).
+    pub fn still_runs_on(&self, node: &str) -> bool {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
@@ -1506,6 +1520,30 @@ impl Job {
             .filter(|node| self.node_completions.contains_key(*node))
             .cloned()
             .collect()
+    }
+
+    /// The allocated nodes still running their part of the run, in allocation order.
+    pub fn running_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.still_runs_on(node))
+            .cloned()
+            .collect()
+    }
+
+    /// The allocated nodes whose slice already went back, in allocation order.
+    pub fn released_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| !self.is_held_on(node))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget the run's node reports. Callers free every slice still charged first.
+    pub fn clear_node_reports(&mut self) {
+        self.node_completions.clear();
+        self.retained_nodes.clear();
     }
 
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
@@ -2031,6 +2069,25 @@ mod tests {
     }
 
     #[test]
+    fn a_retained_node_reported_but_is_still_charged() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        for node in ["n1", "n2"] {
+            job.node_completions
+                .insert(node.into(), NodeCompletion { code: 0, signal: 0 });
+        }
+        job.retained_nodes.insert("n2".into());
+
+        assert_eq!(job.held_nodes(), ["n2".to_string(), "n3".to_string()]);
+        assert_eq!(job.running_nodes(), ["n3".to_string()]);
+        assert_eq!(job.released_nodes(), ["n1".to_string()]);
+        assert!(job.is_held_on("n2") && !job.still_runs_on("n2"));
+
+        job.clear_node_reports();
+        assert!(job.node_completions.is_empty() && job.retained_nodes.is_empty());
+    }
+
+    #[test]
     fn finished_nodes_are_the_allocated_ones_that_reported() {
         let mut job = make_job();
         job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
@@ -2052,6 +2109,18 @@ mod tests {
 
         let back: Job = serde_json::from_value(value).unwrap();
         assert_eq!(back.first_failed_node, None);
+    }
+
+    #[test]
+    fn a_job_without_retained_nodes_still_deserializes() {
+        let mut job = make_job();
+        job.retained_nodes.insert("n1".into());
+        let mut value = serde_json::to_value(&job).unwrap();
+        assert!(value.get("retained_nodes").is_some());
+        value.as_object_mut().unwrap().remove("retained_nodes");
+
+        let back: Job = serde_json::from_value(value).unwrap();
+        assert!(back.retained_nodes.is_empty());
     }
 
     #[test]
