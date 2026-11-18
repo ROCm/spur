@@ -5,13 +5,13 @@
 
 Node 0 needs three ``/dev/infiniband/uverbs*`` nodes the test user can open. A
 node with real ones uses them. Otherwise the fixture recreates real character
-devices on node 0 as stand-ins: ones from ``STAND_IN_CANDIDATES`` that are
-already world read-write and that the test user can open, under
-``/dev/infiniband`` with their own mode, so they grant nothing new. It needs
-three distinct device numbers, plus a fourth for the GPU step test, which is
-skipped without it, and it removes exactly what it created. The first two are
-declared as ``nic`` GRES; the third stands for an HCA Spur does not manage,
-which must stay open to every job.
+devices on node 0 as stand-ins: ones from ``NIC_STAND_IN_CANDIDATES`` that are
+already world read-write, that the test user can open and that the device
+filter does not always allow, under ``/dev/infiniband`` with their own mode, so
+they grant nothing new. It needs three distinct device numbers, plus a fourth
+for the GPU step test, which is skipped without it, and it removes exactly what
+it created. The first two are declared as ``nic`` GRES; the third stands for an
+HCA Spur does not manage, which must stay open to every job.
 """
 
 import re
@@ -23,8 +23,14 @@ from cluster import parse_job_id, wait_job, wait_job_state
 
 # A job denied a stand-in is denied its source too (the device filter keys on
 # the device number), so none of these may be one a job shell needs.
-STAND_IN_CANDIDATES = ["/dev/full", "/dev/net/tun", "/dev/fuse", "/dev/vsock"]
-NEVER_STAND_IN = {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/ptmx"}
+NIC_STAND_IN_CANDIDATES = ["/dev/net/tun", "/dev/vsock", "/dev/vfio/vfio"]
+# The GPU stand-in only has to exist; the filter may allow it anyway.
+GPU_STAND_IN_CANDIDATES = ["/dev/full", "/dev/fuse", *NIC_STAND_IN_CANDIDATES]
+# The device filter's base rules and host infrastructure: every job may open
+# these, so a NIC standing on one could never be denied.
+ALWAYS_ALLOWED = {(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (5, 0), (5, 1), (5, 2)}
+ALWAYS_ALLOWED_MAJORS = {136}
+ALWAYS_ALLOWED_PATHS = {"/dev/fuse"}
 
 
 @dataclass(frozen=True)
@@ -47,15 +53,24 @@ def _parse_stat_line(line: str) -> CharDevice | None:
         return None
     if file_type != "character special file" or mode & 0o006 != 0o006:
         return None
-    if path in NEVER_STAND_IN or path.startswith("/dev/pts/"):
+    if path.startswith("/dev/pts/"):
         return None
     return CharDevice(path, mode, major, minor)
 
 
-def _stand_in_sources(node) -> list[CharDevice]:
-    """Candidates the test user can already open, one per device number."""
+def _gateable(device: CharDevice) -> bool:
+    """Whether the device filter can deny `device` to a job."""
+    return (
+        (device.major, device.minor) not in ALWAYS_ALLOWED
+        and device.major not in ALWAYS_ALLOWED_MAJORS
+        and device.path not in ALWAYS_ALLOWED_PATHS
+    )
+
+
+def _stand_in_sources(node, candidates: list[str]) -> list[CharDevice]:
+    """`candidates` the test user can already open, one per device number."""
     listed = node.exec_allow_fail(
-        f"for p in {' '.join(STAND_IN_CANDIDATES)}; do "
+        f"for p in {' '.join(candidates)}; do "
         "[ -c \"$p\" ] && : < \"$p\" 2>/dev/null "
         "&& echo \"$p $(stat -c '%F %a %t %T' \"$p\")\"; done"
     )
@@ -96,11 +111,11 @@ def standin_infiniband(unstarted_cluster):
         yield real[:3], {_device_number(node, p) for p in real[:3]}
         return
 
-    sources = _stand_in_sources(node)
+    sources = [d for d in _stand_in_sources(node, NIC_STAND_IN_CANDIDATES) if _gateable(d)]
     if len(sources) < 3:
         pytest.skip(
-            f"node 0 has {len(sources)} distinct world read-write char devices to stand "
-            "in for uverbs; need 3"
+            f"node 0 has {len(sources)} distinct world read-write char devices the "
+            "device filter can deny to stand in for uverbs; need 3"
         )
     sudo = cluster._sudo_prefix()
     if "ok" not in node.exec_allow_fail(f"{sudo}true && echo ok"):
@@ -125,7 +140,7 @@ def standin_infiniband(unstarted_cluster):
 def gpu_stand_in(unstarted_cluster, standin_infiniband):
     """A device node for a GRES GPU that shares no device number with the NICs."""
     _, used = standin_infiniband
-    for source in _stand_in_sources(unstarted_cluster.nodes[0]):
+    for source in _stand_in_sources(unstarted_cluster.nodes[0], GPU_STAND_IN_CANDIDATES):
         if (source.major, source.minor) not in used:
             return source.path
     pytest.skip("no fourth distinct world read-write char device for the GPU stand-in")
