@@ -132,6 +132,9 @@ pub struct NodeReporter {
     baseline_dir: Option<std::path::PathBuf>,
     /// Committed with `resources`: the repartitioned GPUs that set withholds.
     fences: RwLock<Fences>,
+    /// Random per process, so the controller can keep a deleted node out until spurd restarts.
+    agent_instance: String,
+    deleted_logged: std::sync::atomic::AtomicBool,
 }
 
 impl NodeReporter {
@@ -180,6 +183,8 @@ impl NodeReporter {
             timeouts,
             baseline_dir: None,
             fences: RwLock::new(Fences::default()),
+            agent_instance: uuid::Uuid::new_v4().simple().to_string(),
+            deleted_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -513,6 +518,7 @@ impl NodeReporter {
             join_token: self.join_token.clone(),
             topology: resources.topology.as_ref().map(Into::into),
             capabilities: vec![spur_core::node::CAP_SIGNAL_JOB.into()],
+            agent_instance: self.agent_instance.clone(),
         }
     }
 
@@ -609,33 +615,56 @@ impl NodeReporter {
             }
             let req = self.heartbeat_request().await;
             let (load, free_mem) = (req.cpu_load, req.free_memory_mb);
+            let result = self.send_heartbeat(req).await;
+            self.handle_heartbeat_result(result, load, free_mem).await;
+        }
+    }
 
-            match self.send_heartbeat(req).await {
-                Ok(resp) => {
-                    debug!(load, free_mem, "heartbeat sent");
-                    // The controller asks for re-registration when the layout it
-                    // expects differs from what this node reported enforcing, so
-                    // a changed spec policy is redelivered without a restart.
-                    if resp.reregister {
-                        info!("controller requested re-registration; re-registering");
-                        if let Err(e) = self.register().await {
-                            warn!(error = %e, "controller-requested re-registration failed");
-                        }
-                    }
-                }
-                Err(crate::controller_auth::ConnectAuthError::Status(status))
-                    if should_reregister(&status) =>
-                {
-                    warn!(
-                        error = %status,
-                        "controller does not recognize this node; re-registering"
-                    );
+    async fn handle_heartbeat_result(
+        &self,
+        result: Result<
+            spur_proto::proto::HeartbeatResponse,
+            crate::controller_auth::ConnectAuthError,
+        >,
+        load: u32,
+        free_mem: u64,
+    ) {
+        let deleted = matches!(
+            &result,
+            Err(crate::controller_auth::ConnectAuthError::Status(status)) if is_deleted_node(status)
+        );
+        if !deleted {
+            self.deleted_logged.store(false, Ordering::Relaxed);
+        }
+        match result {
+            Ok(resp) => {
+                debug!(load, free_mem, "heartbeat sent");
+                // Redelivers a changed spec policy, or records this process's
+                // instance, without a restart.
+                if resp.reregister {
+                    info!("controller requested re-registration; re-registering");
                     if let Err(e) = self.register().await {
-                        warn!(error = %e, "re-registration after heartbeat rejection failed");
+                        warn!(error = %e, "controller-requested re-registration failed");
                     }
                 }
-                Err(e) => warn!(error = %e, "heartbeat failed"),
             }
+            Err(crate::controller_auth::ConnectAuthError::Status(status))
+                if should_reregister(&status) =>
+            {
+                warn!(
+                    error = %status,
+                    "controller does not recognize this node; re-registering"
+                );
+                if let Err(e) = self.register().await {
+                    warn!(error = %e, "re-registration after heartbeat rejection failed");
+                }
+            }
+            Err(crate::controller_auth::ConnectAuthError::Status(status)) if deleted => {
+                if !self.deleted_logged.swap(true, Ordering::Relaxed) {
+                    warn!("{}", status.message());
+                }
+            }
+            Err(e) => warn!(error = %e, "heartbeat failed"),
         }
     }
 
@@ -673,6 +702,7 @@ impl NodeReporter {
             }),
             core_layout_fingerprint,
             spec_enforcement_error,
+            agent_instance: self.agent_instance.clone(),
         }
     }
 
@@ -727,6 +757,12 @@ fn build_running_jobs(
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+}
+
+/// The controller deleted this node while this process kept running; the
+/// heartbeat returns FailedPrecondition for nothing else.
+fn is_deleted_node(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
 }
 
 /// Whether a connect/RPC failure means the dialed endpoint is unreachable or wedged,
@@ -3030,6 +3066,76 @@ mod tests {
         );
         assert_eq!(rejecting_calls.load(Ordering::SeqCst), 1);
         assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_node_heartbeat_does_not_reregister() {
+        let (controller, calls) = controller_answering(tonic::Code::Unimplemented).await;
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{controller}"));
+        let rejected = |code| {
+            Err(crate::controller_auth::ConnectAuthError::Status(
+                tonic::Status::new(code, "stand-in"),
+            ))
+        };
+
+        reporter
+            .handle_heartbeat_result(rejected(tonic::Code::FailedPrecondition), 0, 0)
+            .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a deleted node must not re-register"
+        );
+
+        reporter
+            .handle_heartbeat_result(rejected(tonic::Code::NotFound), 0, 0)
+            .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unknown node re-registers"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_heartbeat_outcome_rearms_the_deleted_warning() {
+        let reporter = test_reporter(rset(8, 0, vec![]));
+        let deleted = || {
+            Err(crate::controller_auth::ConnectAuthError::Status(
+                tonic::Status::failed_precondition("node n1 was deleted"),
+            ))
+        };
+
+        reporter.handle_heartbeat_result(deleted(), 0, 0).await;
+        assert!(reporter.deleted_logged.load(Ordering::Relaxed));
+        reporter
+            .handle_heartbeat_result(Ok(Default::default()), 0, 0)
+            .await;
+        assert!(!reporter.deleted_logged.load(Ordering::Relaxed));
+
+        reporter.handle_heartbeat_result(deleted(), 0, 0).await;
+        let unavailable = Err(crate::controller_auth::ConnectAuthError::Status(
+            tonic::Status::unavailable("controller restarting"),
+        ));
+        reporter.handle_heartbeat_result(unavailable, 0, 0).await;
+        assert!(!reporter.deleted_logged.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn each_spurd_process_reports_its_own_instance() {
+        let reporter = test_reporter(rset(8, 0, vec![]));
+        let registration = reporter.registration_request(&rset(8, 0, vec![]));
+        let heartbeat = reporter.heartbeat_request().await;
+        assert!(!registration.agent_instance.is_empty());
+        assert_eq!(registration.agent_instance, heartbeat.agent_instance);
+
+        let restarted = test_reporter(rset(8, 0, vec![]));
+        assert_ne!(
+            restarted
+                .registration_request(&rset(8, 0, vec![]))
+                .agent_instance,
+            registration.agent_instance
+        );
     }
 
     /// A dead-fast entry can precede the wedged host; blame must still land on the

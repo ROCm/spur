@@ -41,6 +41,7 @@ fn register_gpu_node(cm: &ClusterManager) {
         labels: Default::default(),
         source: spur_core::node::NodeSource::NativeHost,
         capabilities: Vec::new(),
+        agent_instance: String::new(),
     });
 }
 
@@ -522,6 +523,8 @@ fn signaled_preemption_without_completion_unpins_its_terminal_owner_on_node_loss
                 name: "n1".into(),
                 reason: None,
                 at: Some(at),
+                agent_instance: String::new(),
+                comm_url: None,
             }
         } else {
             WalOperation::NodeStateChange {
@@ -592,6 +595,8 @@ fn remove_node(cm: &ClusterManager) {
         name: "n1".into(),
         reason: None,
         at: None,
+        agent_instance: String::new(),
+        comm_url: None,
     });
 }
 

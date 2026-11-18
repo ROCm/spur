@@ -25,6 +25,7 @@ fn register_nodes(cluster: &ClusterManager, names: &[&str]) {
             labels: Default::default(),
             source: Default::default(),
             capabilities: Vec::new(),
+            agent_instance: String::new(),
         });
     }
 }
@@ -56,6 +57,7 @@ fn inventory_registration(name: &str) -> WalOperation {
         labels: HashMap::new(),
         source: NodeSource::NativeHost,
         capabilities: Vec::new(),
+        agent_instance: String::new(),
     }
 }
 
@@ -538,6 +540,7 @@ fn committed_node_inventory_fences_late_registration_placement_and_reservation()
         version: String::new(),
         source: NodeSource::NativeHost,
         capabilities: Vec::new(),
+        agent_instance: String::new(),
     };
     assert!(cm.apply_operation(&update).node_registration_rejected);
     cm.jobs.write().insert(42, Job::new(42, JobSpec::default()));
@@ -697,6 +700,8 @@ fn removed_unlisted_node_cannot_reregister_before_the_list_is_saved() {
         name: "old".into(),
         reason: None,
         at: None,
+        agent_instance: String::new(),
+        comm_url: None,
     });
     drop(held);
     assert!(matches!(

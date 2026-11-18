@@ -417,6 +417,9 @@ pub struct Node {
     /// Optional RPCs the node's agent advertised at registration (e.g. `CAP_SIGNAL_JOB`).
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The registered spurd process; `None` for older agents, spur-k8s nodes, or via an older controller.
+    #[serde(default)]
+    pub agent_instance: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -468,6 +471,7 @@ impl Node {
             layout_seq: 0,
             layout_enforce_error: None,
             capabilities: Vec::new(),
+            agent_instance: None,
         }
     }
 
