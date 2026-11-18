@@ -6,8 +6,8 @@
 Two world-openable char devices stand in for NICs through ``[[devices.gres]]``,
 so the test runs on any node: the node reports them, the scheduler and the
 agent hand each to one job, the job gets ``SPUR_JOB_NICS``, and the cgroup
-device filter lets it open only its own. Discovery of real Pollara NICs and
-RDMA withholding are covered by unit tests, as they need the hardware.
+device filter lets it open only its own. Discovery of real Pollara NICs is
+covered by unit tests; RDMA withholding by ``test_rdma_isolation.py``.
 """
 
 import re
