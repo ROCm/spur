@@ -2417,6 +2417,7 @@ fn satisfiable_victim_set(
 /// What one node must hold for `job`: the per-node minimum, except that a one-node
 /// job needs its whole GPU total on that node.
 fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceRequest {
+    use spur_core::device::GPU_GRES;
     use spur_core::gpu_request::{resolve_gpu_demand, GpuDemand};
 
     let mut request = backfill::job_resource_request(job);
@@ -2427,10 +2428,10 @@ fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceReque
     let gpu_key = request
         .devices
         .keys()
-        .find(|key| key.gres_name == "gpu")
+        .find(|key| key.gres_name == GPU_GRES)
         .cloned();
     if let Some(key) = gpu_key {
-        request.set_devices("gpu", key.device_type.as_deref(), total);
+        request.set_devices(GPU_GRES, key.device_type.as_deref(), total);
     }
     request.memory_mb = spur_core::partition_limits::node_memory_mb(
         &job.spec,
