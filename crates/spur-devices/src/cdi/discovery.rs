@@ -519,6 +519,7 @@ fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
                 memory_mb,
                 numa_node = ?numa_node,
                 pci_bdf = ?pci_bdf,
+                card_id = ?card_id,
                 compute_partition = ?compute_partition,
                 "discovered AMD GPU via KFD topology"
             );
