@@ -5551,6 +5551,10 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
+    let script_placement = (!spec.script_placement.is_empty())
+        .then(|| spec.script_placement.parse())
+        .transpose()
+        .map_err(Status::invalid_argument)?;
 
     let job_spec = spur_core::job::JobSpec {
         submitted_at: None,
@@ -5768,6 +5772,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         submit_line: sanitize_submit_line(&spec.submit_line),
         client_keepalive: spec.client_keepalive,
         cpus_per_gpu: spec.cpus_per_gpu,
+        script_placement,
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -6053,14 +6058,27 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             .requeue_count
             .saturating_add(job.preempt_requeue_count)
             .saturating_add(job.user_requeue_count),
-        // srun and salloc synthesize a script too, so its presence alone does not
-        // mean the batch submission Slurm's flag denotes.
-        batch_flag: job.spec.script.is_some() && !job.spec.srun_job && !job.spec.interactive,
+        batch_flag: job.spec.is_batch(),
         exclusive: job.spec.exclusive,
         // Filled by annotate_jobs_with_planned_reservations: the scheduler's
         // plan lives on the cluster, not the job record.
         planned_start_time: None,
         sched_nodelist: String::new(),
+        batch_host: job
+            .allocated_nodes
+            .first()
+            .filter(|_| job.spec.is_batch())
+            .cloned()
+            .unwrap_or_default(),
+        script_placement: job
+            .spec
+            .script_placement
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        resolved_script_placement: job
+            .resolved_placement
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -8297,6 +8315,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: false,
+            resolved_placement: None,
             at: None,
             effective_partition: None,
             memory_adjustment: None,
@@ -8364,6 +8383,7 @@ mod tests {
                 srun_step_dispatch: false,
                 run_attempt,
                 idle_fill: false,
+                resolved_placement: None,
                 at: None,
                 effective_partition: None,
                 memory_adjustment: None,
@@ -8912,6 +8932,7 @@ mod tests {
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -17602,6 +17623,73 @@ mod tests {
             ..Default::default()
         }));
         assert!(!with(JobSpec::default()));
+    }
+
+    #[test]
+    fn proto_to_job_spec_carries_the_requested_script_placement() {
+        use spur_core::script_placement::ScriptPlacement;
+
+        let spec = |script_placement: &str| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            script_placement: script_placement.into(),
+            ..Default::default()
+        };
+        let stored = |value: &str| {
+            proto_to_job_spec(spec(value))
+                .expect("valid spec")
+                .script_placement
+        };
+
+        assert_eq!(stored(""), None, "unset leaves it to the cluster default");
+        assert_eq!(stored("auto"), Some(ScriptPlacement::Auto));
+        assert_eq!(stored("batch-host"), Some(ScriptPlacement::BatchHost));
+        assert_eq!(stored("all-nodes"), Some(ScriptPlacement::AllNodes));
+
+        let err = proto_to_job_spec(spec("bogus")).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("batch-host"), "{}", err.message());
+    }
+
+    #[test]
+    fn job_to_proto_reports_the_batch_host_and_both_placements() {
+        use spur_core::job::{Job, JobSpec};
+        use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
+
+        let mut job = Job::new(
+            7,
+            JobSpec {
+                script: Some("#!/bin/bash\n./train\n".into()),
+                script_placement: Some(ScriptPlacement::Auto),
+                ..Default::default()
+            },
+        );
+        let pending = job_to_proto(&job);
+        assert_eq!(pending.batch_host, "");
+        assert_eq!(pending.script_placement, "auto");
+        assert_eq!(pending.resolved_script_placement, "");
+
+        job.allocated_nodes = vec!["n2".into(), "n1".into()];
+        job.resolved_placement = Some(ResolvedPlacement::AllNodes);
+        let placed = job_to_proto(&job);
+        assert_eq!(placed.batch_host, "n2", "the first allocated node");
+        assert_eq!(placed.resolved_script_placement, "all-nodes");
+    }
+
+    #[test]
+    fn only_a_batch_job_reports_a_batch_host() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            7,
+            JobSpec {
+                script: Some("sleep infinity".into()),
+                interactive: true,
+                ..Default::default()
+            },
+        );
+        job.allocated_nodes = vec!["n1".into()];
+
+        assert_eq!(job_to_proto(&job).batch_host, "");
     }
 
     #[test]

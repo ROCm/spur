@@ -823,6 +823,10 @@ pub struct JobSpec {
     /// leave it false and stay exempt.
     #[serde(default)]
     pub client_keepalive: bool,
+
+    /// Where the batch script runs; `None` leaves it to the cluster default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_placement: Option<crate::script_placement::ScriptPlacement>,
 }
 
 impl Default for JobSpec {
@@ -905,11 +909,18 @@ impl Default for JobSpec {
             pty: false,
             submit_line: None,
             client_keepalive: false,
+            script_placement: None,
         }
     }
 }
 
 impl JobSpec {
+    /// A batch submission (sbatch, FFI, REST). srun and salloc synthesize a
+    /// script too, so its presence alone does not make one.
+    pub fn is_batch(&self) -> bool {
+        self.script.is_some() && !self.srun_job && !self.interactive
+    }
+
     /// Node count to actually allocate: `min(num_nodes, num_tasks)`, since a
     /// task never spans nodes. An explicit `--ntasks-per-node` pins the layout
     /// and skips the cap.
@@ -1117,6 +1128,11 @@ pub struct Job {
     #[serde(default)]
     pub srun_step_dispatch: bool,
 
+    /// Where this run's batch script runs, recorded at dispatch. `None` before
+    /// dispatch and for a run dispatched before placements were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_placement: Option<crate::script_placement::ResolvedPlacement>,
+
     /// Wall-clock instant the controller signalled this run for exceeding its
     /// time limit, cleared on requeue. Replicated rather than kept in the
     /// watchdog's memory for two reasons: the completion path runs inside the
@@ -1279,6 +1295,7 @@ impl Job {
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
             srun_step_dispatch: false,
+            resolved_placement: None,
             actual_stdout_path: None,
             actual_stderr_path: None,
             launch_failure_detail: None,
@@ -1432,9 +1449,12 @@ impl Job {
             .or_else(|| self.preempt_grace().map(|pending| pending.deadline))
     }
 
-    /// Where this run's batch script runs.
+    /// Where this run's batch script runs: as recorded at dispatch, else by the
+    /// `auto` rule, which is what agents that predate the record applied.
     pub fn script_placement(&self) -> crate::script_placement::ResolvedPlacement {
-        crate::script_placement::ResolvedPlacement::scanned(self.spec.script.as_deref())
+        self.resolved_placement.unwrap_or_else(|| {
+            crate::script_placement::ResolvedPlacement::scanned(self.spec.script.as_deref())
+        })
     }
 
     /// The allocated nodes still charged for this job, in allocation order.
@@ -2042,6 +2062,49 @@ mod tests {
 
         job.spec.script = Some("#!/bin/bash\n./train\n".into());
         assert_eq!(job.script_placement(), ResolvedPlacement::AllNodes);
+    }
+
+    #[test]
+    fn a_run_with_a_recorded_placement_keeps_it_whatever_its_script() {
+        use crate::script_placement::ResolvedPlacement;
+
+        let mut job = make_job();
+        job.spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
+        job.resolved_placement = Some(ResolvedPlacement::AllNodes);
+
+        assert_eq!(job.script_placement(), ResolvedPlacement::AllNodes);
+    }
+
+    #[test]
+    fn a_requested_placement_round_trips_through_the_spec() {
+        use crate::script_placement::ScriptPlacement;
+
+        let spec = JobSpec {
+            script_placement: Some(ScriptPlacement::BatchHost),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["script_placement"], "batch-host");
+        let back: JobSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.script_placement, Some(ScriptPlacement::BatchHost));
+    }
+
+    // Pre-placement JobSpec and Job must still deserialize, or spurctld crashes on replay.
+    #[test]
+    fn a_spec_and_job_without_placements_still_deserialize() {
+        let mut job = make_job();
+        job.spec.script_placement = Some(crate::script_placement::ScriptPlacement::AllNodes);
+        job.resolved_placement = Some(crate::script_placement::ResolvedPlacement::AllNodes);
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("resolved_placement");
+        value["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("script_placement");
+
+        let back: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(back.spec.script_placement, None);
+        assert_eq!(back.resolved_placement, None);
     }
 
     #[test]

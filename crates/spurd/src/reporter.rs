@@ -617,6 +617,7 @@ impl NodeReporter {
             capabilities: vec![
                 spur_core::node::CAP_SIGNAL_JOB.into(),
                 spur_core::node::CAP_STEP_RESOURCES.into(),
+                spur_core::node::CAP_SCRIPT_PLACEMENT.into(),
             ],
             agent_instance: self.agent_instance.clone(),
         }
@@ -3310,12 +3311,16 @@ mod tests {
     }
 
     #[test]
-    fn registration_request_advertises_signal_job_and_step_resources() {
+    fn registration_request_advertises_its_capabilities() {
         let reporter = test_reporter(rset(8, 0, vec![]));
         let req = reporter.registration_request(&rset(8, 0, vec![]));
         assert_eq!(
             req.capabilities,
-            vec!["signal-job".to_string(), "step-resources".to_string()]
+            vec![
+                "signal-job".to_string(),
+                "step-resources".to_string(),
+                "script-placement".to_string(),
+            ]
         );
     }
 

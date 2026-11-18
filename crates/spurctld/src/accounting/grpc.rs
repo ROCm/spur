@@ -1807,6 +1807,9 @@ fn history_job_info(r: &db::JobRecord, show_actors: bool) -> JobInfo {
         exclusive: false,
         planned_start_time: None,
         sched_nodelist: String::new(),
+        batch_host: String::new(),
+        script_placement: String::new(),
+        resolved_script_placement: String::new(),
     }
 }
 

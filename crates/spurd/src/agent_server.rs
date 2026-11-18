@@ -523,6 +523,20 @@ fn launch_step_id(pty: bool) -> spur_core::step::StepId {
     }
 }
 
+/// The placement a launch names. A controller that predates the field leaves it
+/// empty, and then the script decides, as it always has.
+fn launch_placement(requested: &str, script: &str) -> Result<ResolvedPlacement, Status> {
+    if requested.is_empty() {
+        return Ok(ResolvedPlacement::scanned(Some(script)));
+    }
+    requested.parse().map_err(Status::invalid_argument)
+}
+
+/// Whether this node only holds its slice while the batch host runs the script.
+fn holds_for_batch_host(placement: ResolvedPlacement, task_offset: u32, task_fanout: bool) -> bool {
+    placement == ResolvedPlacement::BatchHost && task_offset > 0 && !task_fanout
+}
+
 fn execution_status(err: spur_core::native_cred::CredentialError) -> Status {
     use spur_core::native_cred::CredentialStatusCode;
     match err.status_code() {
@@ -6842,9 +6856,8 @@ impl SlurmAgent for AgentService {
         // collision-prone shared anchor for relative output paths.
         let work_dir = spec.work_dir.clone();
 
-        let placement = ResolvedPlacement::scanned(Some(&spec.script));
-        let allocation_holder =
-            placement == ResolvedPlacement::BatchHost && task_offset > 0 && !req.task_fanout;
+        let placement = launch_placement(&req.script_placement, &spec.script)?;
+        let allocation_holder = holds_for_batch_host(placement, task_offset, req.task_fanout);
         let script = if allocation_holder {
             batch_companion_hold_script().to_string()
         } else {
@@ -17709,6 +17722,52 @@ mod tests {
                 "a launch that does not unshare must record no namespaces"
             );
         }
+    }
+
+    #[test]
+    fn a_launch_follows_the_controllers_placement() {
+        assert_eq!(
+            launch_placement("batch-host", "#!/bin/bash\n./runner.sh\n").unwrap(),
+            ResolvedPlacement::BatchHost
+        );
+        assert_eq!(
+            launch_placement("all-nodes", "#!/bin/bash\nsrun ./train\n").unwrap(),
+            ResolvedPlacement::AllNodes
+        );
+    }
+
+    #[test]
+    fn a_launch_from_an_older_controller_reads_the_placement_off_its_script() {
+        assert_eq!(
+            launch_placement("", "#!/bin/bash\nsrun ./train\n").unwrap(),
+            ResolvedPlacement::BatchHost
+        );
+        assert_eq!(
+            launch_placement("", "#!/bin/bash\n./train\n").unwrap(),
+            ResolvedPlacement::AllNodes
+        );
+    }
+
+    #[test]
+    fn a_launch_naming_an_unknown_placement_is_refused() {
+        let err = launch_placement("auto", "#!/bin/bash\n./train\n").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn only_the_other_nodes_of_a_batch_host_script_hold() {
+        use ResolvedPlacement::{AllNodes, BatchHost};
+
+        assert!(
+            !holds_for_batch_host(BatchHost, 0, false),
+            "the batch host runs it"
+        );
+        assert!(holds_for_batch_host(BatchHost, 4, false));
+        assert!(
+            !holds_for_batch_host(BatchHost, 4, true),
+            "an srun fan-out runs on every node"
+        );
+        assert!(!holds_for_batch_host(AllNodes, 4, false));
     }
 
     #[test]
