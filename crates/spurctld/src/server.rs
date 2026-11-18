@@ -763,7 +763,7 @@ impl ControllerService {
 
         // A node that already reported its part of a victim's grace has no
         // supervisor left to answer, which is not a lost cohort.
-        let expected_nodes = job.held_nodes();
+        let expected_nodes = job.running_nodes();
         let mut missing = Vec::new();
         let mut set = tokio::task::JoinSet::new();
         let mut handle_to_node = HashMap::new();
@@ -3346,7 +3346,7 @@ impl SlurmController for ControllerService {
         // Not allocated_nodes: a node that already reported (a victim in its grace)
         // was freed and may belong to another job now.
         let step_nodes = resolve_step_nodes(
-            &job.held_nodes(),
+            &job.running_nodes(),
             &job.finished_nodes(),
             req.num_nodes,
             &req.nodelist,
@@ -3963,10 +3963,10 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
         let node_name =
-            job.held_nodes().into_iter().next().ok_or_else(|| {
+            job.running_nodes().into_iter().next().ok_or_else(|| {
                 Status::internal(format!("job {} has no allocated nodes", job_id))
             })?;
 
@@ -4038,10 +4038,10 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
-        let held_nodes = job.held_nodes();
-        if held_nodes.is_empty() {
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
+        let running_nodes = job.running_nodes();
+        if running_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "job {} has no allocated nodes — is the allocation still active?",
                 job_id
@@ -4068,7 +4068,7 @@ impl SlurmController for ControllerService {
             req.step_id,
             step.state,
             &step.nodes,
-            &held_nodes,
+            &running_nodes,
             &job.finished_nodes(),
         )
         .map_err(Status::failed_precondition)?;
@@ -6863,7 +6863,7 @@ fn ended_run_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -
         ResolvedPlacement::AllNodes => job.first_failed_node.is_some(),
     };
     if ended {
-        job.held_nodes()
+        job.running_nodes()
     } else {
         Vec::new()
     }
@@ -12809,6 +12809,29 @@ mod tests {
         assert!(
             matches!(probe, StepdRecoveryProbe::Retained),
             "only n2 still holds the job, and it is alive"
+        );
+    }
+
+    /// A finished copy's node stays charged, but has no supervisor left either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_probe_ignores_a_node_whose_copy_finished() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let finished = spawn_probe_agent(false).await;
+        let alive = spawn_probe_agent(true).await;
+        let job_id = running_two_node_job(&svc, "./train\n", finished.port(), alive.port()).await;
+        report_node_finished(&svc, job_id, "n1").await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert!(job.is_held_on("n1"));
+
+        let probe = svc
+            .probe_stepd_recovery("n2", job_id, job.run_attempt, spur_core::step::STEP_BATCH)
+            .await
+            .expect("probe");
+
+        assert!(
+            matches!(probe, StepdRecoveryProbe::Retained),
+            "only n2 still runs the job, and it is alive"
         );
     }
 

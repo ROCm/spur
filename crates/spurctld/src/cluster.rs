@@ -5967,8 +5967,8 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node that
-    /// already reported its part of a run is free. Shared by
+    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node whose
+    /// slice already went back is free. Shared by
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
@@ -8831,6 +8831,23 @@ impl ClusterManager {
         }
     }
 
+    /// Return one node's slice of a running job to that node.
+    fn release_node_slice(job: &Job, nodes: &mut HashMap<String, Node>, node_name: &str) {
+        let Some(total) = job.allocated_resources.as_ref() else {
+            return;
+        };
+        let Some(node) = nodes.get_mut(node_name) else {
+            return;
+        };
+        let node_count = job.allocated_nodes.len().max(1) as u32;
+        let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
+            warn!(job_id = job.job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
+            ResourceAllocations::with_scalar(total.cpus / node_count, total.memory_mb / node_count as u64)
+        });
+        node.release(&slice);
+        node.update_state_from_alloc();
+    }
+
     /// Return a finished job's per-node slice to each node it held, skipping any
     /// in `already_deallocated`; pass `allocated_resources = None` if freed already.
     fn deallocate_job_slices(
@@ -9018,7 +9035,7 @@ impl ClusterManager {
         job.exit_code = Some(-1);
         job.end_time = Some(at);
         job.end_suspension(at);
-        job.node_completions.clear();
+        job.clear_node_reports();
 
         // Capture run_time before reset clears start_time.
         // run_time() excludes suspended intervals.
@@ -9076,7 +9093,7 @@ impl ClusterManager {
         job.set_pending_reason(final_reason);
         job.end_time = Some(at);
         job.preempt_pending = None;
-        job.node_completions.clear();
+        job.clear_node_reports();
         Some(JobFinalized::for_job(
             job,
             job.end_of_run_state(final_state),
@@ -9091,7 +9108,7 @@ impl ClusterManager {
         job.exit_code = None;
         job.clear_placement();
         job.first_failed_node = None;
-        job.node_completions.clear();
+        job.clear_node_reports();
         job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
@@ -9152,9 +9169,8 @@ impl ClusterManager {
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
-    /// Nodes that already reported via `JobNodeComplete` or `JobCopyExited`
-    /// (which free a node's slice as it arrives, ahead of the whole job
-    /// finishing) are skipped so their resources aren't subtracted twice.
+    /// Nodes whose slice already went back at their report (`Job::released_nodes`)
+    /// are skipped so their resources aren't subtracted twice.
     fn evict_job_locked(
         job_id: JobId,
         jobs: &mut HashMap<JobId, Job>,
@@ -9196,14 +9212,14 @@ impl ClusterManager {
             JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
             _ => {}
         }
-        let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
-        job.node_completions.clear();
+        let already_deallocated = job.released_nodes();
+        job.clear_node_reports();
 
         // A preempt victim finalized here (a node failed mid-drain or mid-grace)
         // frees its remaining healthy nodes without passing through
         // JobNodeComplete/JobComplete, so the earmark that keeps those nodes for
-        // the preemptor must be collected on this path too. Only the not-yet-
-        // reported nodes are freed now, so only those are claimable.
+        // the preemptor must be collected on this path too. Only the nodes
+        // still charged are freed now, so only those are claimable.
         let cancel_preemptor = (job.preempt_mode.as_deref() == Some("Cancel"))
             .then_some(job.preempted_by)
             .flatten();
@@ -9256,7 +9272,7 @@ impl ClusterManager {
                 matches!(
                     j.state,
                     JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.is_held_on(node_name)
+                ) && j.still_runs_on(node_name)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -9477,7 +9493,7 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
                     // Nodes that reported during a grace were freed at their report.
-                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    already_deallocated = job.released_nodes();
                     let Some(done) = Self::repend_after_preemption(
                         job,
                         *begin_time,
@@ -9558,8 +9574,7 @@ impl ClusterManager {
                             allocated_resources = job.allocated_resources.clone();
                             per_node_map = job.per_node_alloc.clone();
                             // Nodes that reported during a grace were freed at their report.
-                            already_deallocated =
-                                job.node_completions.keys().cloned().collect::<Vec<_>>();
+                            already_deallocated = job.released_nodes();
                         }
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
@@ -9672,7 +9687,7 @@ impl ClusterManager {
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
-                    job.node_completions.clear();
+                    job.clear_node_reports();
                     // Cancelled is terminal (dependents/arrays unblock); Preempted
                     // is reported to accounting via jobs_finalized.
                     if let Err(e) = job.transition(JobState::Cancelled) {
@@ -9908,40 +9923,13 @@ impl ClusterManager {
                         .filter(|_| job.state == JobState::Running);
                     let in_grace = grace.is_some();
                     let already_reported = job.node_completions.contains_key(node_name);
-                    freed_for_preemptor = if already_reported {
-                        None
-                    } else if let Some(pending) = &grace {
+                    let preemptor = if let Some(pending) = &grace {
                         Some(pending.preempted_by)
                     } else if job.preempt_mode.as_deref() == Some("Cancel") {
                         job.preempted_by
                     } else {
                         None
                     };
-                    job.node_completions.insert(
-                        node_name.clone(),
-                        spur_core::job::NodeCompletion {
-                            code: *exit_code,
-                            signal: *signal,
-                        },
-                    );
-
-                    if let Some(ref total) = job.allocated_resources {
-                        if !already_reported {
-                            let node_count = job.allocated_nodes.len().max(1) as u32;
-                            if let Some(node) = nodes.get_mut(node_name) {
-                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
-                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
-                                    ResourceAllocations::with_scalar(
-                                        total.cpus / node_count,
-                                        total.memory_mb / node_count as u64,
-                                    )
-                                });
-                                node.release(&slice);
-                                node.update_state_from_alloc();
-                            }
-                        }
-                    }
-
                     // Only JobCopyExited ends a per-node run node by node: an older
                     // controller applies JobNodeComplete the old way, so this must too.
                     let per_node =
@@ -9950,7 +9938,35 @@ impl ClusterManager {
                         job.first_failed_node
                             .get_or_insert_with(|| node_name.clone());
                     }
+                    job.node_completions.insert(
+                        node_name.clone(),
+                        spur_core::job::NodeCompletion {
+                            code: *exit_code,
+                            signal: *signal,
+                        },
+                    );
+
                     let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
+                    let released = if per_node && others_run_on && !job.all_nodes_completed() {
+                        // spurd keeps the slice while any of the job's steps run there,
+                        // so the node stays charged until the run ends.
+                        job.retained_nodes.insert(node_name.clone());
+                        Vec::new()
+                    } else {
+                        let mut released: Vec<String> = std::mem::take(&mut job.retained_nodes)
+                            .into_iter()
+                            .collect();
+                        if !already_reported {
+                            released.push(node_name.clone());
+                        }
+                        for node in &released {
+                            Self::release_node_slice(job, &mut nodes, node);
+                        }
+                        released
+                    };
+                    freed_for_preemptor = preemptor
+                        .filter(|_| !released.is_empty())
+                        .map(|preemptor| (preemptor, released));
                     // A claim carries every node's allocation; only the final report needs a copy.
                     if others_run_on && !job.all_nodes_completed() {
                         None
@@ -9960,12 +9976,8 @@ impl ClusterManager {
                     }
                 };
 
-                if let Some(preemptor) = freed_for_preemptor {
-                    self.record_preempt_freed_nodes(
-                        &jobs,
-                        std::slice::from_ref(node_name),
-                        preemptor,
-                    );
+                if let Some((preemptor, released)) = freed_for_preemptor {
+                    self.record_preempt_freed_nodes(&jobs, &released, preemptor);
                 }
 
                 if let Some(finalized) = finalized {
@@ -10103,7 +10115,7 @@ impl ClusterManager {
                     });
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
-                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    already_deallocated = job.released_nodes();
                     per_node_map = job.per_node_alloc.clone();
 
                     if let Some(pending) = grace.filter(|p| p.mode == PreemptMode::Requeue) {
@@ -10155,7 +10167,7 @@ impl ClusterManager {
                         // Suspended -> terminal: fold the final suspended interval in
                         // and clear suspended_at so it never lingers on a terminal job.
                         job.end_suspension(timestamp);
-                        job.node_completions.clear();
+                        job.clear_node_reports();
                     }
                 } else {
                     return ClientResponse::default();
@@ -22444,7 +22456,12 @@ state = "UP"
             job.end_time.is_none(),
             "nothing starts the completing clock"
         );
-        assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
+        assert_eq!(job.running_nodes(), ["n1".to_string(), "n3".to_string()]);
+        assert_eq!(
+            cpus_in_use(&cm, "n2"),
+            2,
+            "its steps may still run there, so the node stays the job's"
+        );
 
         let next = cm.node_complete(job_id, "n3", 0, 0, 0).unwrap();
         assert_eq!(next, NodeCompleteResult::StillRunning);
@@ -22456,6 +22473,9 @@ state = "UP"
                 exit_code: 0
             }
         );
+        for node in ["n1", "n2", "n3"] {
+            assert_eq!(cpus_in_use(&cm, node), 0, "{node}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22505,6 +22525,182 @@ state = "UP"
             "every replica must apply the same entry the same way"
         );
         assert_eq!(job.first_failed_node, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_copy_returns_the_finished_copies_nodes_with_its_own() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(cpus_in_use(&cm, "n3"), 2, "its copy is still being stopped");
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(job.running_nodes(), ["n3".to_string()]);
+    }
+
+    /// A one-cpu job shares `n1` with each run below, so a slice freed twice
+    /// would take that job's cpu with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_report_from_a_finished_copy_frees_its_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_per_node_run_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().running_nodes(),
+            ["n2".to_string()],
+            "a finished copy is not waited for"
+        );
+        cm.node_complete(job_id, "n2", 0, 15, 0).unwrap();
+
+        assert!(cm.get_job(job_id).unwrap().state.is_terminal());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeued_per_node_run_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_running_copys_node_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        lose_node(&cm, "n2");
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(!job.state.is_active(), "{:?}", job.state);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_finished_copys_node_does_not_end_the_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        lose_node(&cm, "n1");
+
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_hands_a_finished_copys_node_to_the_preemptor() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        signal_grace(&cm, job_id, PreemptMode::Cancel);
+
+        cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "n3 is still inside its grace"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forced_finish_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            controller_initiated: true,
+            at: None,
+        });
+
+        assert!(cm.get_job(job_id).unwrap().retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_requeue_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

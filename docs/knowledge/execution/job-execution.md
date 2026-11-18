@@ -111,11 +111,17 @@ out). While such a job spans more than one node and is Running outside a
 preemption grace (`ends_copy_by_copy`), `node_complete` proposes the exit as
 `WalOperation::JobCopyExited`. `JobNodeComplete` keeps its
 older meaning (the first report ends the run), so every controller replays a
-log an older leader wrote the same way. A clean exit frees that node and leaves the job Running
-(`NodeCompleteResult::StillRunning`). The first failed copy is recorded in
-`Job.first_failed_node`, moves the job to Completing, has the held nodes stopped,
-and supplies the job's exit (`finalize_reported_run`). Steps can no longer target
-a node that finished. Preemption grace and suspend keep their own handling.
+log an older leader wrote the same way. A clean exit leaves the job Running
+(`NodeCompleteResult::StillRunning`) but keeps the node's slice charged
+(`Job.retained_nodes`): `spurd` keeps a job's allocation until its last
+supervisor on the node exits, steps included, so a node given back at its copy's
+exit could be dispatched to while the agent still holds it. Kept slices go back
+when the run ends: the report that ends it frees them, and every other ending
+frees all but `Job::released_nodes()`. The first failed copy is recorded in
+`Job.first_failed_node`, moves the job to Completing, has the nodes still
+running stopped, and supplies the job's exit (`finalize_reported_run`). Steps can
+no longer target a node that finished. Preemption grace and suspend keep their
+own handling; a grace hands kept nodes to the preemptor with the first report.
 A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 
