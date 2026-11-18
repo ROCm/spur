@@ -296,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start virtual agent gRPC server
-    let mut virtual_agent = agent::VirtualAgent::new(client);
+    let mut virtual_agent = agent::VirtualAgent::new(client).with_controller(&args.controller_addr);
     virtual_agent.apply_auth_handshake(&bearer);
     info!(%listen_addr, "virtual agent gRPC server listening");
 

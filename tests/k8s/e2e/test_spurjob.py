@@ -9,6 +9,7 @@ from k8s_cluster import (
     cross_namespace_name,
     delete_namespace,
     ensure_namespace,
+    exec_in_pod,
     multinode_spurjob,
     read_spurjob_pod_logs,
     simple_spurjob,
@@ -82,6 +83,22 @@ class TestSpurJobLifecycle:
             )
             == 0,
         )
+
+    def test_scancel_of_a_multinode_job_releases_every_node(self, cluster):
+        job = multinode_spurjob("it-scancel", ["sleep", "600"], 2)
+        cluster.create_spurjob(job)
+        running = wait_spurjob_state(cluster, "it-scancel", "Running", timeout=90)
+        job_id = (running.get("status") or {}).get("spurJobId")
+        assert job_id is not None, "a running SpurJob has a Spur job ID"
+
+        exec_in_pod(cluster.namespace, "spurctld-0", ["spur", "scancel", str(job_id)])
+
+        # Unreported nodes are drained once complete_wait_secs (300 s) runs out.
+        wait_spurjob_state(cluster, "it-scancel", "Cancelled", timeout=90)
+        states = exec_in_pod(
+            cluster.namespace, "spurctld-0", ["spur", "nodes", "-N", "-h", "-o", "%N %t"]
+        )
+        assert "drain" not in states, f"no node may be drained:\n{states}"
 
     def test_failure_detected(self, cluster):
         job = simple_spurjob("it-fail", ["sh", "-c", "exit 42"])

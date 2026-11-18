@@ -307,7 +307,7 @@ K8s E2E tests use the Python `kubernetes` client. `k8s_cluster.py` provides:
 
 | File | What it tests |
 |---|---|
-| `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node). |
+| `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node, `scancel` releasing every node). |
 | `test_raft_ha.py` | Raft HA under K8s: leader election, pod restart recovery. |
 
 Constants: `SPUR_JOB_GROUP = "spur.amd.com"`, `SPUR_JOB_VERSION = "v1alpha1"`,

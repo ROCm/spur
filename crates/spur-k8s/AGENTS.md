@@ -85,7 +85,11 @@ Implements `SlurmAgent` gRPC trait. Key RPCs:
   volume mounts (hostPath and PVC), shared memory, security context. For
   multi-node jobs: creates a headless Service for peer DNS discovery
   (`<sanitized-node>.spur-job-<id>.<ns>.svc.cluster.local`).
-- `CancelJob` -- deletes all Pods by label + headless Service.
+- `CancelJob` -- deletes the job's unfinished Pods (by label) and its headless
+  Service, reporting each deleted Pod to spurctld as released
+  (`report_pod_released`): a deleted Pod never reaches a terminal phase, and
+  spurctld drains a node that never reports. Finished Pods are left for the job
+  controller, whose report carries their real result.
 - `ExecInJob` -- `kubectl exec` equivalent via kube-rs attach.
 - `StreamJobOutput` -- Pod log streaming.
 - Execution credential verification (Ed25519 JWKS) when native auth is
@@ -175,8 +179,11 @@ or native JWKS from spur.conf. Forged credentials are logged with peer address.
 ## Testing
 
 `test_support.rs` provides `FakeApiServer` -- a `tower::Service` that returns
-canned responses and records requests, yielding a `kube::Client` without a
-real cluster. Used by `resolve_job_tests` in `agent.rs`.
+canned responses (one default, plus optional routes by method and path) and
+records requests, yielding a `kube::Client` without a real cluster -- and
+`ControllerStub`, a spurctld on a loopback port that records the cancels and
+status reports it receives. Used by `resolve_job_tests` and `cancel_job_tests`
+in `agent.rs` and the deletion tests in `job_controller.rs`.
 
 Unit tests cover: backoff arithmetic, terminal state detection, CRD
 serialization, resource extraction, GPU vendor detection, name sanitization,

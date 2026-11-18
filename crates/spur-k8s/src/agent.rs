@@ -15,10 +15,13 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::Client;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
+use crate::controller::ControllerClient;
 use crate::crd::SpurJob;
+use crate::job_controller::report_pod_released;
 use spur_core::native_exec::resolve_cgroup_budget;
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
@@ -117,6 +120,9 @@ fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
+    /// Hears about the Pods a cancel deletes: the controller holds a job's nodes
+    /// until each reports, then drains the ones that never did.
+    ctrl_client: Option<Mutex<ControllerClient>>,
     cluster_id: String,
     cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
     hostname: String,
@@ -128,6 +134,7 @@ impl VirtualAgent {
     pub fn new(client: Client) -> Self {
         Self {
             client,
+            ctrl_client: None,
             cluster_id: String::new(),
             cred_keys: None,
             hostname: hostname::get()
@@ -136,6 +143,12 @@ impl VirtualAgent {
             auth_audience: String::new(),
             auth_epoch: 0,
         }
+    }
+
+    /// Report the Pods a cancel deletes to the controller at `addr`.
+    pub fn with_controller(mut self, addr: &str) -> Self {
+        self.ctrl_client = Some(Mutex::new(ControllerClient::new(addr)));
+        self
     }
 
     pub fn apply_auth_handshake(&mut self, bearer: &spur_core::auth::BearerAuth) {
@@ -673,15 +686,29 @@ impl SlurmAgent for VirtualAgent {
         match pods.list(&lp).await {
             Ok(pod_list) => {
                 for pod in pod_list {
-                    let name = pod.metadata.name.unwrap_or_default();
-                    match pods.delete(&name, &DeleteParams::default()).await {
-                        Ok(_) => info!(job_id, pod = %name, "deleted Pod"),
+                    // A finished Pod frees nothing, and the job controller reports its
+                    // real result, which a release report would overwrite.
+                    if pod_finished(&pod) {
+                        continue;
+                    }
+                    let name = pod.metadata.name.clone().unwrap_or_default();
+                    let released = match pods.delete(&name, &DeleteParams::default()).await {
+                        Ok(_) => {
+                            info!(job_id, pod = %name, "deleted Pod");
+                            true
+                        }
                         Err(kube::Error::Api(e)) if e.code == 404 => {
                             debug!(job_id, pod = %name, "Pod already gone");
+                            true
                         }
                         Err(e) => {
                             error!(job_id, pod = %name, error = %e, "failed to delete Pod");
+                            false
                         }
+                    };
+                    // A deleted Pod never reaches Succeeded/Failed, so nothing else reports it.
+                    if let (true, Some(ctrl_client)) = (released, &self.ctrl_client) {
+                        report_pod_released(ctrl_client, job_id, &pod).await;
                     }
                 }
             }
@@ -1104,6 +1131,14 @@ fn sanitize_k8s_name(s: &str) -> String {
 /// only resolve while they use this exact name.
 fn job_service_name(job_id: u32) -> String {
     format!("spur-job-{job_id}")
+}
+
+/// Succeeded or Failed: every container has exited and none will restart.
+fn pod_finished(pod: &Pod) -> bool {
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
 }
 
 /// The node names of a comma-separated nodelist, trimmed, empty segments dropped.
@@ -1857,6 +1892,143 @@ mod peer_dns_tests {
                 "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
                 "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancel_job_tests {
+    use super::*;
+    use crate::test_support::{list_response, ControllerStub, FakeApiServer};
+    use http::{Method, StatusCode};
+
+    const JOB_ID: u32 = 7;
+    const PODS_PATH: &str = "/api/v1/namespaces/ns/pods";
+
+    fn spur_job() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "spur.amd.com/v1alpha1",
+            "kind": "SpurJob",
+            "metadata": {
+                "name": "job",
+                "namespace": "ns",
+                "labels": { "spur.amd.com/job-id": JOB_ID.to_string() },
+            },
+            "spec": { "name": "job", "image": "busybox" },
+        })
+    }
+
+    fn pod(name: &str, node: &str, phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": name, "namespace": "ns" },
+            "spec": { "nodeName": node, "containers": [] },
+            "status": { "phase": phase },
+        })
+    }
+
+    fn api_status(code: u16, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "metadata": {},
+            "status": "Failure",
+            "message": reason,
+            "reason": reason,
+            "code": code,
+        })
+    }
+
+    /// Serves the job's SpurJob and `pods`; anything else is not found.
+    fn api_with(pods: &[serde_json::Value]) -> FakeApiServer {
+        FakeApiServer::answering(StatusCode::NOT_FOUND, &api_status(404, "NotFound"))
+            .route(
+                Method::GET,
+                "/apis/spur.amd.com/v1alpha1/spurjobs",
+                StatusCode::OK,
+                &list_response(&[spur_job()]),
+            )
+            .route(Method::GET, PODS_PATH, StatusCode::OK, &list_response(pods))
+    }
+
+    /// Cancels the job and returns the nodes reported released, sorted.
+    async fn cancel(api: &FakeApiServer) -> Vec<String> {
+        let stub = ControllerStub::default();
+        let reports = stub.reports.clone();
+        let agent =
+            VirtualAgent::new(api.client()).with_controller(&stub.serve().await.to_string());
+        agent
+            .cancel_job(Request::new(AgentCancelJobRequest {
+                job_id: JOB_ID,
+                ..Default::default()
+            }))
+            .await
+            .expect("a cancel succeeds even when a delete fails");
+        let mut nodes: Vec<String> = reports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|report| report.reporting_node.clone())
+            .collect();
+        nodes.sort();
+        nodes
+    }
+
+    fn deleted_pods(api: &FakeApiServer) -> Vec<String> {
+        let mut deleted: Vec<String> = api
+            .requests()
+            .into_iter()
+            .filter(|req| req.method == Method::DELETE)
+            .filter_map(|req| {
+                req.path
+                    .strip_prefix(&format!("{PODS_PATH}/"))
+                    .map(str::to_string)
+            })
+            .collect();
+        deleted.sort();
+        deleted
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reports_each_unfinished_pod_it_deletes() {
+        let running = pod("running", "n1", "Running");
+        let api = api_with(&[
+            running.clone(),
+            pod("done", "n2", "Succeeded"),
+            pod("gone", "n3", "Pending"),
+        ])
+        .route(
+            Method::DELETE,
+            &format!("{PODS_PATH}/running"),
+            StatusCode::OK,
+            &running,
+        );
+
+        assert_eq!(
+            cancel(&api).await,
+            ["n1", "n3"],
+            "a Pod that is already gone has released its node too"
+        );
+        assert_eq!(
+            deleted_pods(&api),
+            ["gone", "running"],
+            "a finished Pod is left for the job controller to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_the_cancel_could_not_delete_is_not_reported() {
+        let api = api_with(&[pod("stuck", "n1", "Running")]).route(
+            Method::DELETE,
+            &format!("{PODS_PATH}/stuck"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &api_status(500, "InternalError"),
+        );
+
+        assert!(
+            cancel(&api).await.is_empty(),
+            "the Pod may still hold its node"
         );
     }
 }

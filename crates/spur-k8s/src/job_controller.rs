@@ -364,7 +364,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
                 }
                 // A deleted Pod never reaches Succeeded/Failed, so the reconciler
                 // that normally reports it never runs; speak for it here instead.
-                report_pod_released(ctx, job_id, &pod).await;
+                report_pod_released(&ctx.ctrl_client, job_id, &pod).await;
             }
         }
 
@@ -378,8 +378,13 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
 }
 
 /// Tell spurctld the Pod has released its slice of the allocation, which the
-/// controller holds until every node reports. Best-effort: a duplicate is a no-op.
-async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
+/// controller holds until every node reports. Best-effort. A repeat frees nothing
+/// twice but replaces the node's recorded exit, so it suits a Pod that never finished.
+pub(crate) async fn report_pod_released(
+    ctrl_client: &Mutex<ControllerClient>,
+    job_id: u32,
+    pod: &Pod,
+) {
     let Some(reporting_node) = resolve_reporting_node(pod) else {
         warn!(job_id, "cannot resolve reporting_node for a deleted Pod");
         return;
@@ -398,8 +403,7 @@ async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
         node_token: String::new(),
         pty_step_id: None,
     };
-    let result = ctx
-        .ctrl_client
+    let result = ctrl_client
         .lock()
         .await
         .call(|mut c| async move { c.report_job_status(req).await })
@@ -1731,95 +1735,7 @@ mod tests {
         }
     }
 
-    use spur_proto::proto as pb;
-    use spur_proto::proto::slurm_controller_server::SlurmController;
-    use tonic::{Request, Response, Status};
-
-    /// Answers `cancel_job` with `reply` and records the job IDs it saw.
-    struct CancelStub {
-        reply: Option<tonic::Code>,
-        cancelled: Arc<StdMutex<Vec<u32>>>,
-    }
-
-    /// Generates the impl so `async_trait` runs after expansion. Only
-    /// `cancel_job` has behavior; the rest just have to exist.
-    macro_rules! stub_controller {
-        ($($name:ident($req:ty) -> $resp:ty;)*) => {
-            #[tonic::async_trait]
-            impl SlurmController for CancelStub {
-                async fn cancel_job(
-                    &self,
-                    request: Request<pb::CancelJobRequest>,
-                ) -> Result<Response<()>, Status> {
-                    self.cancelled.lock().unwrap().push(request.into_inner().job_id);
-                    match self.reply {
-                        None => Ok(Response::new(())),
-                        Some(code) => Err(Status::new(code, "stub")),
-                    }
-                }
-
-                $(
-                    async fn $name(&self, _: Request<$req>) -> Result<Response<$resp>, Status> {
-                        Err(Status::unimplemented(stringify!($name)))
-                    }
-                )*
-            }
-        };
-    }
-
-    stub_controller! {
-        submit_job(pb::SubmitJobRequest) -> pb::SubmitJobResponse;
-        get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
-        get_job(pb::GetJobRequest) -> pb::JobInfo;
-        complete_job(pb::CompleteJobRequest) -> ();
-        job_keepalive(pb::JobKeepaliveRequest) -> pb::JobKeepaliveResponse;
-        suspend_job(pb::SuspendJobRequest) -> ();
-        resume_job(pb::ResumeJobRequest) -> ();
-        update_job(pb::UpdateJobRequest) -> ();
-        requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
-        get_nodes(pb::GetNodesRequest) -> pb::GetNodesResponse;
-        get_node(pb::GetNodeRequest) -> pb::NodeInfo;
-        get_fabric_topology(()) -> pb::GetFabricTopologyResponse;
-        validate_block_file(pb::ValidateBlockFileRequest) -> pb::GetFabricTopologyResponse;
-        update_node(pb::UpdateNodeRequest) -> ();
-        drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
-        deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;
-        deregister_agent(pb::DeregisterAgentRequest) -> ();
-        get_partitions(pb::GetPartitionsRequest) -> pb::GetPartitionsResponse;
-        get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
-        create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
-        complete_job_step(pb::CompleteJobStepRequest) -> ();
-        create_partition(pb::CreatePartitionRequest) -> ();
-        update_partition(pb::UpdatePartitionRequest) -> ();
-        delete_partition(pb::DeletePartitionRequest) -> ();
-        reconfigure(()) -> ();
-        ping(()) -> pb::PingResponse;
-        get_job_metrics(()) -> pb::JobMetrics;
-        get_node_metrics(()) -> pb::NodeMetrics;
-        get_rpc_stats(()) -> pb::RpcStats;
-        reset_diag_stats(()) -> ();
-        get_sched_stats(()) -> pb::SchedStats;
-        get_assoc_mgr_info(pb::GetAssocMgrInfoRequest) -> pb::GetAssocMgrInfoResponse;
-        register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
-        heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
-        create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
-        list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
-        revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
-        report_job_status(pb::ReportJobStatusRequest) -> ();
-        report_stepd_recovery(pb::StepdRecoveryRequest) -> pb::StepdRecoveryResponse;
-        create_reservation(pb::CreateReservationRequest) -> ();
-        update_reservation(pb::UpdateReservationRequest) -> ();
-        delete_reservation(pb::DeleteReservationRequest) -> ();
-        list_reservations(pb::ListReservationsRequest) -> pb::ListReservationsResponse;
-        exec_in_job(pb::ExecInJobRequest) -> pb::ExecInJobResponse;
-        run_step(pb::RunStepRequest) -> pb::RunStepResponse;
-        cluster_up(pb::ClusterUpRequest) -> pb::ClusterUpResponse;
-        cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
-        cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
-        cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
-        cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
-        cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
-    }
+    use crate::test_support::ControllerStub;
 
     /// A kube client whose every request fails. The deletion path tolerates
     /// Pod and Service cleanup errors, so no API server is needed.
@@ -1833,19 +1749,12 @@ mod tests {
     async fn deletion_ctx(
         reply: Option<tonic::Code>,
     ) -> (JobControllerCtx, Arc<StdMutex<Vec<u32>>>) {
-        let cancelled = Arc::new(StdMutex::new(Vec::new()));
-        let stub = CancelStub {
-            reply,
-            cancelled: cancelled.clone(),
+        let stub = ControllerStub {
+            cancel_reply: reply,
+            ..Default::default()
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(spur_proto::controller_server(stub))
-                .serve_with_incoming(incoming),
-        );
+        let cancelled = stub.cancelled.clone();
+        let addr = stub.serve().await;
         let ctrl_client = ControllerClient::new(&addr.to_string());
         let ctx = JobControllerCtx {
             client: offline_kube_client(),
