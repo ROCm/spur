@@ -97,6 +97,20 @@ instead of printing unparseable output.
 **scancel arrays.** Array-element syntax (`123_4`) is not yet supported
 client-side; cancel by plain job ID.
 
+**scancel signals.** `-s SIG` (other than KILL/9) calls `SignalJob` and leaves
+the job running: `Steps` target by default, `Batch` with `-b` (the batch shell
+process only), `Full` with `-f` (`-f` wins over `-b`). No signal or `-s KILL`
+cancels. Signals are numbers 1-31 or their names. Kubernetes-operator nodes
+cannot be signalled. In a PID namespace the batch shell is PID 1, so `-b` only
+has an effect if the script traps the signal. A signal to the steps (the
+default) can end a step whose program traps it, because it also reaches the
+step's `nsenter`/`unshare` wrapper; with `-f` it also reaches the batch step's
+`unshare` wrapper, so the whole job can end, recorded as FAILED with that
+signal, even when the script traps it. With `container_entrypoint`,
+`-b` reaches a wrapper shell rather than the script and has no effect.
+`CancelJob` always cancels, whatever signal it carries; only `SignalJob`
+signals without cancelling.
+
 **sacct --jobs** filters are applied server-side: `GetJobHistoryRequest.job_ids`
 is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
 
@@ -133,7 +147,9 @@ via `spur-client`, blocking on a lazily-initialized tokio runtime.
 
 - `slurm_init_job_desc_msg(desc)` -- zero a `SlurmJobDescMsg`
 - `slurm_submit_batch_job(desc, job_id)` -- submit via `SubmitJob` RPC
-- `slurm_kill_job(job_id, signal, flags)` -- cancel via `CancelJob` RPC
+- `slurm_kill_job(job_id, signal, flags)` -- cancel via `CancelJob` (signal 0
+  or 9) or signal via `SignalJob`; flag mapping in
+  [spur-ffi](../../../crates/spur-ffi/AGENTS.md)
 
 **Query:**
 

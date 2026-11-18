@@ -82,6 +82,8 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "UpdateJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
         "RequeueJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
         "SuspendJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
+        // Changes no job state, so it is an update to the job rather than a delete.
+        "SignalJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
         "ResumeJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
         // Runs a command inside somebody's already-running job.
         "ExecInJob" => targeted(Create, TxnEntity::Job, LeaderOnly),

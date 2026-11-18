@@ -108,7 +108,7 @@ The controller serves two gRPC services on port 6817:
 
 ### SlurmController
 
-**Jobs:** `SubmitJob`, `GetJobs`, `GetJob`, `CancelJob`, `CompleteJob`, `SuspendJob`, `ResumeJob`, `UpdateJob`, `RequeueJob`, `JobKeepalive`, `ExecInJob`, `RunStep`
+**Jobs:** `SubmitJob`, `GetJobs`, `GetJob`, `CancelJob`, `CompleteJob`, `SuspendJob`, `ResumeJob`, `SignalJob`, `UpdateJob`, `RequeueJob`, `JobKeepalive`, `ExecInJob`, `RunStep`
 
 **Job steps:** `GetJobSteps`, `CreateJobStep`, `CompleteJobStep`
 

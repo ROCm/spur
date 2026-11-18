@@ -15,7 +15,8 @@ use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
-    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
+    batch_script_uses_step_launch, build_step_task_plan, runs_batch_companion_hold,
+    step_needs_pmix_prepare,
 };
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
@@ -1165,6 +1166,63 @@ impl ControllerService {
         job_read_scope(&self.cluster, identity).permits(owner)
     }
 
+    /// The job `job_id`, or the same NOT_FOUND a nonexistent id gets when `identity` may not
+    /// see it, so a job-control RPC never confirms the existence, state or owner of a hidden job.
+    /// Call it before any state or ownership check.
+    fn job_visible_to(
+        &self,
+        job_id: spur_core::job::JobId,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<spur_core::job::Job, Status> {
+        self.cluster
+            .get_job(job_id)
+            .filter(|job| self.caller_may_see_job(&job.spec.user, identity))
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))
+    }
+
+    /// Deliver `signal` to the processes of a running job without cancelling it.
+    async fn signal_running_job(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        user: &str,
+        job_id: spur_core::job::JobId,
+        signal: i32,
+        raw_target: i32,
+    ) -> Result<(), Status> {
+        let job = self.job_visible_to(job_id, identity)?;
+        spur_core::auth::check_job_owner(
+            user,
+            self.caller_may_cancel_unowned(identity, user),
+            &job.spec.user,
+            "signal",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
+        validate_signal_number(signal)?;
+        let target = signal_target_or_default(raw_target)?;
+        if job.state != spur_core::job::JobState::Running {
+            return Err(Status::failed_precondition(format!(
+                "job {job_id} is not running (state {})",
+                job.state.display()
+            )));
+        }
+        let recipients = signal_recipients(&job, target);
+        if recipients.is_empty() {
+            return Err(Status::failed_precondition(match target {
+                SignalTarget::Batch => format!("job {job_id}'s batch script has already exited"),
+                _ => format!("job {job_id} has no running processes to signal"),
+            }));
+        }
+        let results = crate::scheduler_loop::signal_job_on_nodes(
+            &self.cluster,
+            job_id,
+            job.run_attempt,
+            &recipients,
+            signal,
+        )
+        .await;
+        crate::scheduler_loop::signal_verdict(job_id, target, &results)
+    }
+
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
@@ -1752,6 +1810,8 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
+        self.job_visible_to(job_id, __identity.as_ref())?;
+
         let canceller = if is_daemon_caller(__identity.as_ref(), &req.user) {
             crate::cluster::Canceller::system()
         } else {
@@ -1781,6 +1841,31 @@ impl SlurmController for ControllerService {
             });
         }
 
+        Ok(Response::new(()))
+    }
+
+    async fn signal_job(&self, request: Request<SignalJobRequest>) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+
+        let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            signal_annotation(req.job_id, req.signal, req.target, &req.user),
+        );
+
+        self.signal_running_job(
+            __identity.as_ref(),
+            &req.user,
+            req.job_id,
+            req.signal,
+            req.target,
+        )
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -1897,12 +1982,8 @@ impl SlurmController for ControllerService {
             &audit,
             Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
         );
-        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
-        // precondition failure. Snapshot up-front for agent dispatch.
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        // Snapshot up-front for agent dispatch.
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
         let actor = spur_core::end_reason::Actor {
             user: req.user.clone(),
             uid: trusted_uid(__identity.as_ref()),
@@ -1939,13 +2020,9 @@ impl SlurmController for ControllerService {
             &audit,
             Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
         );
-        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
-        // precondition failure. Allocation is retained across resume, so this
-        // up-front snapshot's allocated_nodes is still valid for agent dispatch.
-        let job = self
-            .cluster
-            .get_job(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        // Allocation is retained across resume, so this up-front snapshot's
+        // allocated_nodes is still valid for agent dispatch.
+        let job = self.job_visible_to(job_id, __identity.as_ref())?;
         if let Err(e) = self.cluster.resume_job_for(
             job_id,
             &req.user,
@@ -4865,6 +4942,81 @@ async fn shutdown_signal() {
         () = terminate => {}
     }
     tracing::info!("shutdown signal received, draining");
+}
+
+fn validate_signal_number(signal: i32) -> Result<(), Status> {
+    if (1..=31).contains(&signal) {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(format!(
+        "signal {signal} is out of range (1-31)"
+    )))
+}
+
+fn signal_target_or_default(raw: i32) -> Result<SignalTarget, Status> {
+    match SignalTarget::try_from(raw) {
+        Ok(SignalTarget::Unspecified) => Ok(SignalTarget::Steps),
+        Ok(target) => Ok(target),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "unknown signal target {raw}"
+        ))),
+    }
+}
+
+fn signal_annotation(
+    job_id: spur_core::job::JobId,
+    signal: i32,
+    raw_target: i32,
+    user: &str,
+) -> Annotation {
+    let target = match SignalTarget::try_from(raw_target) {
+        Ok(SignalTarget::Batch) => "batch".to_string(),
+        Ok(SignalTarget::Full) => "full".to_string(),
+        Ok(SignalTarget::Steps | SignalTarget::Unspecified) => "steps".to_string(),
+        Err(_) => format!("unknown ({raw_target})"),
+    };
+    Annotation::new(
+        &job_id.to_string(),
+        txn::requested(&[
+            ("signal", Some(signal.into())),
+            ("target", Some(target.into())),
+        ]),
+    )
+    .asserted_actor(user)
+}
+
+/// The target to send the node at `node_index` of the allocation, or `None` when it has no
+/// batch script for a `Batch` signal. A companion node's batch step is a hold script that
+/// exits on an untrapped signal and would end that node's slice of the allocation, so it only
+/// ever gets the steps.
+fn node_signal_target(
+    job: &spur_core::job::Job,
+    node_index: usize,
+    target: SignalTarget,
+) -> Option<SignalTarget> {
+    let script = job.spec.script.as_deref().unwrap_or_default();
+    let task_fanout = job.spec.srun_job && !job.srun_step_dispatch;
+    let holds_allocation = runs_batch_companion_hold(script, node_index == 0, task_fanout);
+    match (target, holds_allocation) {
+        (SignalTarget::Batch, true) => None,
+        (SignalTarget::Full, true) => Some(SignalTarget::Steps),
+        (SignalTarget::Unspecified, _) => Some(SignalTarget::Steps),
+        (target, _) => Some(target),
+    }
+}
+
+/// The nodes still held by `job` and what to send each for `target`. Nodes that already
+/// reported have nothing left to signal.
+fn signal_recipients(
+    job: &spur_core::job::Job,
+    target: SignalTarget,
+) -> Vec<(String, SignalTarget)> {
+    job.allocated_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| job.is_held_on(node))
+        .filter_map(|(index, node)| Some((node.clone(), node_signal_target(job, index, target)?)))
+        .collect()
 }
 
 /// The in-cluster daemon: no bearer and an empty `user`, as the k8s operator sends.
@@ -8739,6 +8891,7 @@ mod tests {
 
     type CancelLog = Arc<std::sync::Mutex<Vec<AgentCancelJobRequest>>>;
     type ExecLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::ExecInJobRequest>>>;
+    type SignalLog = Arc<std::sync::Mutex<Vec<AgentSignalJobRequest>>>;
 
     struct ProbeAgent {
         active: bool,
@@ -8748,6 +8901,10 @@ mod tests {
         cancelled: Option<CancelLog>,
         /// Execs this agent was sent, for tests that assert on them.
         execs: Option<ExecLog>,
+        /// Signals this agent was sent, for tests that assert on them.
+        signals: Option<SignalLog>,
+        /// Answers every signal with this status instead of accepting it.
+        signal_failure: Option<Status>,
     }
 
     #[tonic::async_trait]
@@ -8803,9 +8960,15 @@ mod tests {
         }
         async fn signal_job(
             &self,
-            _request: Request<spur_proto::proto::AgentSignalJobRequest>,
+            request: Request<spur_proto::proto::AgentSignalJobRequest>,
         ) -> Result<Response<()>, Status> {
-            Ok(Response::new(()))
+            if let Some(signals) = &self.signals {
+                signals.lock().unwrap().push(request.into_inner());
+            }
+            match &self.signal_failure {
+                Some(status) => Err(status.clone()),
+                None => Ok(Response::new(())),
+            }
         }
         async fn cancel_job(
             &self,
@@ -8944,6 +9107,8 @@ mod tests {
             step_started: None,
             cancelled: None,
             execs: None,
+            signals: None,
+            signal_failure: None,
         })
         .await
     }
@@ -8957,9 +9122,30 @@ mod tests {
             step_started: None,
             cancelled: Some(cancelled.clone()),
             execs: None,
+            signals: None,
+            signal_failure: None,
         })
         .await;
         (addr, cancelled)
+    }
+
+    /// A probe agent that records the signals it is sent and answers each with
+    /// `failure` when given.
+    async fn spawn_signal_recording_agent(
+        failure: Option<Status>,
+    ) -> (std::net::SocketAddr, SignalLog) {
+        let signals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: None,
+            step_started: None,
+            cancelled: None,
+            execs: None,
+            signals: Some(signals.clone()),
+            signal_failure: failure,
+        })
+        .await;
+        (addr, signals)
     }
 
     /// A probe agent that records the execs it is sent.
@@ -8971,6 +9157,8 @@ mod tests {
             step_started: None,
             cancelled: None,
             execs: Some(execs.clone()),
+            signals: None,
+            signal_failure: None,
         })
         .await;
         (addr, execs)
@@ -10594,6 +10782,23 @@ mod tests {
     /// Re-point a registered node at a probe agent and wait for the change to
     /// land, so a recovery probe reaches that agent and not the old address.
     async fn point_node_at_probe_agent(svc: &ControllerService, name: &str, port: u16) {
+        point_node_at_agent(
+            svc,
+            name,
+            port,
+            spur_core::node::NodeSource::NativeHost,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    async fn point_node_at_agent(
+        svc: &ControllerService,
+        name: &str,
+        port: u16,
+        source: spur_core::node::NodeSource,
+        capabilities: Vec<String>,
+    ) {
         svc.cluster
             .register_node(
                 name.into(),
@@ -10607,9 +10812,9 @@ mod tests {
                 port,
                 String::new(),
                 String::new(),
-                spur_core::node::NodeSource::NativeHost,
+                source,
                 std::collections::HashMap::new(),
-                Vec::new(),
+                capabilities,
                 true,
             )
             .expect("point the node at its probe agent");
@@ -13081,6 +13286,941 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
+    /// Alice's jobs, one per state a job-control RPC can meet, plus an id that was never issued.
+    struct AliceJobs {
+        pending: u32,
+        running: u32,
+        suspended: u32,
+        terminal: u32,
+        missing: u32,
+    }
+
+    async fn await_job_state(svc: &ControllerService, job_id: u32, state: JobState) {
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(state) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("job {job_id} never reached {state:?}");
+    }
+
+    async fn alice_jobs_in_every_state(svc: &ControllerService) -> AliceJobs {
+        use spur_core::resource::ResourceAllocations;
+
+        let running = running_job_owned_by(svc, "alice").await;
+
+        let suspended = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: HashMap<_, _> = [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(suspended, vec!["n1".into()], res, per_node)
+            .unwrap();
+        await_job_state(svc, suspended, JobState::Running).await;
+        svc.cluster
+            .suspend_job_by(
+                suspended,
+                spur_core::end_reason::Actor {
+                    user: "alice".into(),
+                    uid: None,
+                },
+                false,
+            )
+            .unwrap();
+        await_job_state(svc, suspended, JobState::Suspended).await;
+
+        let terminal = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        svc.cluster
+            .cancel_job_for(
+                terminal,
+                crate::cluster::Canceller::user("alice", None),
+                false,
+            )
+            .unwrap();
+        await_job_state(svc, terminal, JobState::Cancelled).await;
+
+        let pending = svc
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .unwrap()
+            .job_id;
+        await_job_state(svc, pending, JobState::Pending).await;
+
+        AliceJobs {
+            pending,
+            running,
+            suspended,
+            terminal,
+            missing: 999_999,
+        }
+    }
+
+    fn as_caller<T>(inner: T, who: &spur_core::auth::Identity) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(who.clone());
+        req
+    }
+
+    async fn suspend_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = SuspendJobRequest {
+            job_id,
+            user: who.user.clone(),
+        };
+        svc.suspend_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn resume_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = ResumeJobRequest {
+            job_id,
+            user: who.user.clone(),
+        };
+        svc.resume_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn cancel_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+    ) -> Result<(), Status> {
+        let body = CancelJobRequest {
+            job_id,
+            signal: 0,
+            user: who.user.clone(),
+        };
+        svc.cancel_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn cancel_signalling_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+        signal: i32,
+    ) -> Result<(), Status> {
+        let body = CancelJobRequest {
+            job_id,
+            signal,
+            user: who.user.clone(),
+        };
+        svc.cancel_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    async fn signal_as(
+        svc: &ControllerService,
+        job_id: u32,
+        who: &spur_core::auth::Identity,
+        signal: i32,
+        target: SignalTarget,
+    ) -> Result<(), Status> {
+        let body = SignalJobRequest {
+            job_id,
+            signal,
+            target: target as i32,
+            user: who.user.clone(),
+        };
+        svc.signal_job(as_caller(body, who)).await.map(|_| ())
+    }
+
+    fn assert_not_found(result: Result<(), Status>, job_id: u32, what: &str) {
+        let err = result.expect_err(what);
+        assert_eq!(err.code(), Code::NotFound, "{what}: {err}");
+        assert_eq!(err.message(), format!("job {job_id} not found"), "{what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_answer_hidden_jobs_as_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        let cases = [
+            ("a nonexistent job", jobs.missing),
+            ("a pending job", jobs.pending),
+            ("a running job", jobs.running),
+            ("a suspended job", jobs.suspended),
+            ("a terminal job", jobs.terminal),
+        ];
+        for (what, id) in cases {
+            assert_not_found(
+                suspend_as(&svc, id, &bob).await,
+                id,
+                &format!("suspend {what}"),
+            );
+            assert_not_found(
+                resume_as(&svc, id, &bob).await,
+                id,
+                &format!("resume {what}"),
+            );
+            assert_not_found(
+                cancel_as(&svc, id, &bob).await,
+                id,
+                &format!("cancel {what}"),
+            );
+            assert_not_found(
+                signal_as(&svc, id, &bob, 10, SignalTarget::Steps).await,
+                id,
+                &format!("signal {what}"),
+            );
+            assert_not_found(
+                cancel_signalling_as(&svc, id, &bob, 10).await,
+                id,
+                &format!("cancel carrying a signal {what}"),
+            );
+        }
+
+        for (id, state) in [
+            (jobs.pending, JobState::Pending),
+            (jobs.running, JobState::Running),
+            (jobs.suspended, JobState::Suspended),
+            (jobs.terminal, JobState::Cancelled),
+        ] {
+            assert_eq!(svc.cluster.get_job(id).unwrap().state, state);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_checks_visibility_before_validating_the_signal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        for signal in [0, -1, 32, 99] {
+            assert_not_found(
+                signal_as(&svc, jobs.running, &bob, signal, SignalTarget::Steps).await,
+                jobs.running,
+                &format!("signal {signal} to a hidden job"),
+            );
+        }
+
+        let unknown_target = SignalJobRequest {
+            job_id: jobs.running,
+            signal: 10,
+            target: 99,
+            user: "bob".into(),
+        };
+        let result = svc
+            .signal_job(as_caller(unknown_target, &bob))
+            .await
+            .map(|_| ());
+        assert_not_found(result, jobs.running, "an unknown target to a hidden job");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_state_answers_for_the_owner_under_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let alice = viewer("alice", false);
+
+        let err = suspend_as(&svc, jobs.pending, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = resume_as(&svc, jobs.running, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not suspended"), "{err}");
+
+        let err = cancel_as(&svc, jobs.terminal, &alice).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("job {} is already Cancelled", jobs.terminal)
+        );
+
+        let err = signal_as(&svc, jobs.pending, &alice, 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("job {} is not running (state PENDING)", jobs.pending)
+        );
+
+        suspend_as(&svc, jobs.running, &alice).await.unwrap();
+        resume_as(&svc, jobs.suspended, &alice).await.unwrap();
+        cancel_as(&svc, jobs.pending, &alice).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_full_access_for_operators_and_daemons_under_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, jobs_private_config()).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("dave", "Operator");
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let dave = viewer("dave", false);
+
+        let err = suspend_as(&svc, jobs.pending, &dave).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = cancel_as(&svc, jobs.terminal, &dave).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        assert_not_found(
+            cancel_as(&svc, jobs.missing, &dave).await,
+            jobs.missing,
+            "an operator cancelling a nonexistent job",
+        );
+
+        suspend_as(&svc, jobs.running, &dave).await.unwrap();
+        resume_as(&svc, jobs.suspended, &dave).await.unwrap();
+
+        svc.cancel_job(Request::new(CancelJobRequest {
+            job_id: jobs.pending,
+            signal: 0,
+            user: String::new(),
+        }))
+        .await
+        .expect("the in-cluster daemon is not subject to private_data");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_control_rpcs_keep_state_and_owner_answers_without_private_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let bob = viewer("bob", false);
+
+        let err = suspend_as(&svc, jobs.pending, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("is not running"), "{err}");
+
+        let err = suspend_as(&svc, jobs.running, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = resume_as(&svc, jobs.suspended, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = cancel_as(&svc, jobs.terminal, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        let err = cancel_as(&svc, jobs.pending, &bob).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = signal_as(&svc, jobs.pending, &bob, 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        assert_not_found(
+            cancel_as(&svc, jobs.missing, &bob).await,
+            jobs.missing,
+            "a nonexistent job",
+        );
+        assert_not_found(
+            signal_as(&svc, jobs.missing, &bob, 10, SignalTarget::Steps).await,
+            jobs.missing,
+            "signalling a nonexistent job",
+        );
+    }
+
+    /// The signals an agent was sent, as `(job_id, run_attempt, signal, target)`.
+    fn signals_seen(log: &SignalLog) -> Vec<(u32, u32, i32, i32)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.job_id, r.run_attempt, r.signal, r.target))
+            .collect()
+    }
+
+    fn signal_capability() -> Vec<String> {
+        vec![spur_core::node::CAP_SIGNAL_JOB.to_string()]
+    }
+
+    /// Re-register `n1` and `n2` as native agents that take `SignalJob`.
+    async fn grant_signal_capability(
+        svc: &ControllerService,
+        n1: std::net::SocketAddr,
+        n2: std::net::SocketAddr,
+    ) {
+        for (name, addr) in [("n1", n1), ("n2", n2)] {
+            point_node_at_agent(
+                svc,
+                name,
+                addr.port(),
+                spur_core::node::NodeSource::NativeHost,
+                signal_capability(),
+            )
+            .await;
+        }
+    }
+
+    /// A two-node job of alice's whose agents record the signals they are sent.
+    async fn signalling_two_node_job(svc: &ControllerService) -> (u32, SignalLog, SignalLog) {
+        signalling_two_node_job_running(svc, "srun ./train\n").await
+    }
+
+    async fn signalling_two_node_job_running(
+        svc: &ControllerService,
+        script: &str,
+    ) -> (u32, SignalLog, SignalLog) {
+        let (n1, n1_signals) = spawn_signal_recording_agent(None).await;
+        let (n2, n2_signals) = spawn_signal_recording_agent(None).await;
+        let job_id = running_two_node_job(svc, script, n1.port(), n2.port()).await;
+        grant_signal_capability(svc, n1, n2).await;
+        (job_id, n1_signals, n2_signals)
+    }
+
+    /// A one-node running job of `owner`'s on `n1`, served by an agent that answers
+    /// signals with `failure` when given.
+    async fn signalling_job_owned_by(
+        svc: &ControllerService,
+        owner: &str,
+        failure: Option<Status>,
+    ) -> (u32, SignalLog) {
+        let job_id = running_job_owned_by(svc, owner).await;
+        let (addr, signals) = spawn_signal_recording_agent(failure).await;
+        point_node_at_agent(
+            svc,
+            "n1",
+            addr.port(),
+            spur_core::node::NodeSource::NativeHost,
+            signal_capability(),
+        )
+        .await;
+        (job_id, signals)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_reaches_every_held_node_and_leaves_the_job_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job(&svc).await;
+        let run_attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        let alice = viewer("alice", false);
+
+        signal_as(&svc, job_id, &alice, 10, SignalTarget::Full)
+            .await
+            .unwrap();
+        signal_as(&svc, job_id, &alice, 12, SignalTarget::Unspecified)
+            .await
+            .unwrap();
+
+        let full = SignalTarget::Full as i32;
+        let steps = SignalTarget::Steps as i32;
+        assert_eq!(
+            signals_seen(&n1),
+            [
+                (job_id, run_attempt, 10, full),
+                (job_id, run_attempt, 12, steps)
+            ]
+        );
+        assert_eq!(
+            signals_seen(&n2),
+            [
+                (job_id, run_attempt, 10, steps),
+                (job_id, run_attempt, 12, steps)
+            ],
+            "the companion's batch step only holds the allocation, so Full is demoted to Steps"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_goes_only_to_the_batch_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job(&svc).await;
+        let alice = viewer("alice", false);
+
+        signal_as(&svc, job_id, &alice, 10, SignalTarget::Batch)
+            .await
+            .unwrap();
+
+        let batch = SignalTarget::Batch as i32;
+        let run_attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        assert_eq!(signals_seen(&n1), [(job_id, run_attempt, 10, batch)]);
+        assert!(signals_seen(&n2).is_empty(), "n2 runs no batch script");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_reaches_every_copy_of_a_fanned_out_script() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job_running(&svc, "./train\n").await;
+        let alice = viewer("alice", false);
+
+        signal_as(&svc, job_id, &alice, 10, SignalTarget::Full)
+            .await
+            .unwrap();
+        signal_as(&svc, job_id, &alice, 12, SignalTarget::Batch)
+            .await
+            .unwrap();
+
+        let run_attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        let expected = [
+            (job_id, run_attempt, 10, SignalTarget::Full as i32),
+            (job_id, run_attempt, 12, SignalTarget::Batch as i32),
+        ];
+        assert_eq!(signals_seen(&n1), expected);
+        assert_eq!(signals_seen(&n2), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_skips_a_batch_node_that_already_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job(&svc).await;
+        // In a grace the job outlives its primary, which otherwise ends it.
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+        report_node_finished(&svc, job_id, "n1").await;
+        let alice = viewer("alice", false);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "the run-state check must not be what refuses the signal"
+        );
+
+        let err = signal_as(&svc, job_id, &alice, 10, SignalTarget::Batch)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("job {job_id}'s batch script has already exited")
+        );
+        assert!(signals_seen(&n1).is_empty() && signals_seen(&n2).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_for_the_batch_target_skips_fanned_out_copies_that_already_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, n1, n2) = signalling_two_node_job_running(&svc, "./train\n").await;
+        // In a grace the job outlives a node's exit, which otherwise ends it.
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+        report_node_finished(&svc, job_id, "n2").await;
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "n1 still runs its copy"
+        );
+
+        signal_as(
+            &svc,
+            job_id,
+            &viewer("alice", false),
+            10,
+            SignalTarget::Batch,
+        )
+        .await
+        .unwrap();
+
+        assert!(signals_seen(&n2).is_empty(), "n2's copy already exited");
+        assert_eq!(signals_seen(&n1).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_refuses_a_job_that_is_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let jobs = alice_jobs_in_every_state(&svc).await;
+        let alice = viewer("alice", false);
+
+        for (id, state) in [
+            (jobs.pending, "PENDING"),
+            (jobs.suspended, "SUSPENDED"),
+            (jobs.terminal, "CANCELLED"),
+        ] {
+            let err = signal_as(&svc, id, &alice, 10, SignalTarget::Steps)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition, "{state}");
+            assert_eq!(
+                err.message(),
+                format!("job {id} is not running (state {state})")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_rejects_an_out_of_range_signal_or_unknown_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, signals) = signalling_job_owned_by(&svc, "alice", None).await;
+        let alice = viewer("alice", false);
+
+        for signal in [0, -1, 32, 64] {
+            let err = signal_as(&svc, job_id, &alice, signal, SignalTarget::Steps)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "signal {signal}");
+        }
+        let unknown_target = SignalJobRequest {
+            job_id,
+            signal: 10,
+            target: 99,
+            user: "alice".into(),
+        };
+        let err = svc
+            .signal_job(as_caller(unknown_target, &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(signals_seen(&signals).is_empty());
+
+        for signal in [1, 31] {
+            signal_as(&svc, job_id, &alice, signal, SignalTarget::Steps)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_applies_the_ownership_rule_of_cancel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, signals) = signalling_job_owned_by(&svc, "alice", None).await;
+
+        let err = signal_as(&svc, job_id, &viewer("bob", false), 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(signals_seen(&signals).is_empty());
+
+        let root_claim = SignalJobRequest {
+            job_id,
+            signal: 10,
+            target: SignalTarget::Steps as i32,
+            user: "root".into(),
+        };
+        let err = svc.signal_job(Request::new(root_claim)).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied, "root is only a name");
+
+        signal_as(
+            &svc,
+            job_id,
+            &viewer("carol", true),
+            10,
+            SignalTarget::Steps,
+        )
+        .await
+        .expect("an operator may signal another user's job");
+        let daemon = SignalJobRequest {
+            job_id,
+            signal: 12,
+            target: SignalTarget::Steps as i32,
+            user: String::new(),
+        };
+        svc.signal_job(Request::new(daemon))
+            .await
+            .expect("the in-cluster daemon may signal any job");
+        assert_eq!(signals_seen(&signals).len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_does_not_call_kubernetes_operator_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let (addr, signals) = spawn_signal_recording_agent(None).await;
+        point_node_at_agent(
+            &svc,
+            "n1",
+            addr.port(),
+            spur_core::node::NodeSource::Kubernetes {
+                namespace: "spur".into(),
+            },
+            signal_capability(),
+        )
+        .await;
+        let alice = viewer("alice", false);
+
+        let err = signal_as(&svc, job_id, &alice, 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "signals are not supported on Kubernetes-operator nodes"
+        );
+        assert!(signals_seen(&signals).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_does_not_call_an_agent_without_the_capability() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let (addr, signals) = spawn_signal_recording_agent(None).await;
+        point_node_at_probe_agent(&svc, "n1", addr.port()).await;
+        let alice = viewer("alice", false);
+
+        let err = signal_as(&svc, job_id, &alice, 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!("no node running job {job_id} supports signals")
+        );
+        assert!(signals_seen(&signals).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_reports_what_the_agent_answered() {
+        let cases = [
+            (
+                Status::not_found("job 1 is not held by this node"),
+                SignalTarget::Steps,
+                Code::FailedPrecondition,
+                "no node holds a run of job",
+            ),
+            (
+                Status::failed_precondition("job 1 has no batch step"),
+                SignalTarget::Batch,
+                Code::FailedPrecondition,
+                "job 1 has no batch step",
+            ),
+            (
+                Status::unavailable("job 1's batch step did not accept the signal"),
+                SignalTarget::Batch,
+                Code::Unavailable,
+                "batch step did not accept the signal",
+            ),
+            (
+                Status::unimplemented("unknown signal target"),
+                SignalTarget::Batch,
+                Code::FailedPrecondition,
+                "node agent on n1 is too old for the batch target (scancel -b)",
+            ),
+            (
+                Status::invalid_argument("invalid signal 40"),
+                SignalTarget::Steps,
+                Code::InvalidArgument,
+                "invalid signal 40",
+            ),
+        ];
+        for (failure, target, code, text) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let svc = test_service(&dir).await;
+            let (job_id, signals) = signalling_job_owned_by(&svc, "alice", Some(failure)).await;
+            let alice = viewer("alice", false);
+
+            let err = signal_as(&svc, job_id, &alice, 10, target)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.code(), code, "{text}: {err}");
+            assert!(err.message().contains(text), "{text}: {err}");
+            assert_eq!(signals_seen(&signals).len(), 1, "{text}: never retried");
+            assert_eq!(
+                svc.cluster.get_job(job_id).unwrap().state,
+                JobState::Running
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_succeeds_when_one_node_delivers_and_another_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (failing, _) = spawn_signal_recording_agent(Some(Status::unavailable("down"))).await;
+        let (working, signals) = spawn_signal_recording_agent(None).await;
+        let job_id =
+            running_two_node_job(&svc, "srun ./train\n", failing.port(), working.port()).await;
+        grant_signal_capability(&svc, failing, working).await;
+        let alice = viewer("alice", false);
+
+        signal_as(&svc, job_id, &alice, 10, SignalTarget::Steps)
+            .await
+            .expect("one delivery is enough");
+
+        assert_eq!(signals_seen(&signals).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_job_is_unavailable_when_no_node_can_be_reached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        point_node_at_agent(
+            &svc,
+            "n1",
+            port,
+            spur_core::node::NodeSource::NativeHost,
+            signal_capability(),
+        )
+        .await;
+        let alice = viewer("alice", false);
+
+        let err = signal_as(&svc, job_id, &alice, 10, SignalTarget::Steps)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(err.message().contains("n1:"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_cancels_whatever_signal_it_carries() {
+        for signal in [0, 2, 9, 10, 15] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let svc = test_service(&dir).await;
+            let (job_id, signals) = signalling_job_owned_by(&svc, "alice", None).await;
+
+            cancel_signalling_as(&svc, job_id, &viewer("alice", false), signal)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                svc.cluster.get_job(job_id).unwrap().state,
+                JobState::Completing,
+                "signal {signal}"
+            );
+            assert!(signals_seen(&signals).is_empty(), "signal {signal}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_is_audited_with_the_signal_it_carries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+
+        let slot = Arc::new(crate::audit::AuditSlot::default());
+        let mut cancel = as_caller(
+            CancelJobRequest {
+                job_id,
+                signal: 2,
+                user: "alice".into(),
+            },
+            &viewer("alice", false),
+        );
+        cancel.extensions_mut().insert(slot.clone());
+        svc.cancel_job(cancel).await.unwrap();
+
+        let recorded = crate::audit::take_for_test(&slot).expect("cancel annotation");
+        assert_eq!(recorded.target, job_id.to_string());
+        assert_eq!(recorded.details, serde_json::json!({"signal": 2}));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signal_job_is_audited_with_its_signal_and_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _) = signalling_job_owned_by(&svc, "alice", None).await;
+
+        let slot = Arc::new(crate::audit::AuditSlot::default());
+        let mut signal = as_caller(
+            SignalJobRequest {
+                job_id,
+                signal: 10,
+                target: SignalTarget::Batch as i32,
+                user: "alice".into(),
+            },
+            &viewer("alice", false),
+        );
+        signal.extensions_mut().insert(slot.clone());
+        svc.signal_job(signal).await.unwrap();
+
+        let recorded = crate::audit::take_for_test(&slot).expect("signal annotation");
+        assert_eq!(recorded.action, None);
+        assert_eq!(recorded.target, job_id.to_string());
+        assert_eq!(
+            recorded.details,
+            serde_json::json!({"signal": 10, "target": "batch"})
+        );
+    }
+
+    fn job_for_targets(
+        script: Option<&str>,
+        srun_job: bool,
+        step_dispatch: bool,
+    ) -> spur_core::job::Job {
+        let spec = spur_core::job::JobSpec {
+            script: script.map(Into::into),
+            srun_job,
+            ..Default::default()
+        };
+        let mut job = spur_core::job::Job::new(1, spec);
+        job.srun_step_dispatch = step_dispatch;
+        job
+    }
+
+    #[test]
+    fn a_companion_node_is_only_ever_sent_the_steps() {
+        use SignalTarget::{Batch, Full, Steps, Unspecified};
+        let srun_based = job_for_targets(Some("srun ./train\n"), false, false);
+        let plain_script = job_for_targets(Some("./train\n"), false, false);
+        let fanned_out_srun = job_for_targets(Some("srun ./train\n"), true, false);
+
+        // (job, node index, requested, expected)
+        let cases = [
+            (&srun_based, 0, Steps, Some(Steps)),
+            (&srun_based, 0, Batch, Some(Batch)),
+            (&srun_based, 0, Full, Some(Full)),
+            (&srun_based, 1, Steps, Some(Steps)),
+            (&srun_based, 1, Batch, None),
+            (&srun_based, 1, Full, Some(Steps)),
+            (&plain_script, 0, Batch, Some(Batch)),
+            (&plain_script, 1, Steps, Some(Steps)),
+            (&plain_script, 1, Batch, Some(Batch)),
+            (&plain_script, 1, Full, Some(Full)),
+            (&fanned_out_srun, 1, Batch, Some(Batch)),
+            (&fanned_out_srun, 1, Full, Some(Full)),
+            (&srun_based, 1, Unspecified, Some(Steps)),
+        ];
+        for (job, index, requested, expected) in cases {
+            assert_eq!(
+                node_signal_target(job, index, requested),
+                expected,
+                "node {index}, {requested:?}, script {:?}, srun_job {}",
+                job.spec.script,
+                job.spec.srun_job
+            );
+        }
+    }
+
+    #[test]
+    fn an_srun_allocation_without_a_batch_script_gets_every_target_on_every_node() {
+        let allocation = job_for_targets(None, true, true);
+        for index in 0..2 {
+            assert_eq!(
+                node_signal_target(&allocation, index, SignalTarget::Batch),
+                Some(SignalTarget::Batch)
+            );
+        }
+    }
+
+    #[test]
+    fn signal_target_defaults_to_steps_and_rejects_unknown_values() {
+        assert_eq!(signal_target_or_default(0).unwrap(), SignalTarget::Steps);
+        assert_eq!(signal_target_or_default(2).unwrap(), SignalTarget::Batch);
+        assert_eq!(
+            signal_target_or_default(-1).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_step_denies_non_owner() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -13249,6 +14389,8 @@ mod tests {
             step_started: Some(started.clone()),
             cancelled: None,
             execs: None,
+            signals: None,
+            signal_failure: None,
         })
         .await;
         let replay = tokio::spawn(completed_step_output(

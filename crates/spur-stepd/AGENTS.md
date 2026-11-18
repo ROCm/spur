@@ -217,6 +217,13 @@ control socket. The supervisor translates them to the workload:
 `Shutdown` triggers `begin_teardown()` internally, sending SIGTERM via the
 same cgroup-first path.
 
+The agent's `SignalJob` batch target does not use `SignalAllocation`: it asks
+`QueryState` for `job_pid` and signals only the batch shell. `job_pid` is the
+wrapper (`unshare` or a container shepherd) on a namespaced launch, so spurd
+signals that wrapper's sole child, the shell that runs the script. What each
+target does to a job is described under "scancel signals" in
+[slurm-compatibility](../../docs/knowledge/common/slurm-compatibility.md).
+
 ## I/O management
 
 - stderr is inherited from the double-fork (lands in the spurd agent log)

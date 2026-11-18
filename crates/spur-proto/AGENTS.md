@@ -31,7 +31,7 @@ pub mod raft_proto  -- tonic::include_proto!("raft_internal")
 Central scheduler and cluster manager. Raft-replicated.
 
 - **Job lifecycle:** SubmitJob, GetJobs, GetJob, CancelJob, CompleteJob,
-  SuspendJob, ResumeJob, UpdateJob, RequeueJob, JobKeepalive
+  SuspendJob, ResumeJob, SignalJob, UpdateJob, RequeueJob, JobKeepalive
 - **Node management:** GetNodes, GetNode, UpdateNode, DrainNode,
   DeregisterNode, DeregisterAgent
 - **Partitions:** GetPartitions, CreatePartition, UpdatePartition, DeletePartition,
