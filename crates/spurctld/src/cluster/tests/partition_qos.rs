@@ -194,21 +194,24 @@ async fn another_user_is_not_charged_for_a_capped_users_jobs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_pass_cannot_admit_past_the_cap() {
+async fn one_pass_cannot_start_past_the_cap() {
     let dir = TempDir::new().unwrap();
     let cm = capped_cluster(&dir, 2).await;
-    run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
-    let a = submit_and_wait(&cm, gpu_job("alice", "acct-a", "qa"));
-    let b = submit_and_wait(&cm, gpu_job("alice", "acct-b", "qb"));
+    let exclusive = |account: &str, qos: &str| JobSpec {
+        exclusive: true,
+        ..gpu_job("alice", account, qos)
+    };
+    run_on(&cm, exclusive("acct-a", "qa"), "n1");
+    let a = submit_and_wait(&cm, exclusive("acct-a", "qa"));
+    let b = submit_and_wait(&cm, exclusive("acct-b", "qb"));
 
-    let admitted: Vec<JobId> = cm
-        .pending_jobs_and_tag_reasons()
-        .into_iter()
-        .map(|j| j.job_id)
-        .filter(|id| *id == a || *id == b)
-        .collect();
+    let pass = one_pass(&cm);
 
-    assert_eq!(admitted, vec![a], "the earlier job takes the last slot");
+    assert_eq!(
+        pass.started(),
+        vec![a],
+        "the earlier job takes the last slot"
+    );
     assert_eq!(
         cm.get_job(b).unwrap().pending_reason,
         PendingReason::QosMaxNodePerUserLimit
@@ -238,13 +241,14 @@ async fn an_undefined_partition_qos_holds_jobs_when_accounting_is_on() {
         unknown_blocks: true,
         ..Default::default()
     };
-    let mut job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
+    let job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
 
     assert_eq!(
         view.admit(
-            &mut job,
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default()
+            &job,
+            &QuotaLedger::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default()
         )
         .map(|_| ()),
         Err(PendingReason::InvalidQOS)
@@ -299,25 +303,58 @@ async fn a_job_too_big_for_the_held_node_is_held_at_the_group_node_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_jobs_in_one_pass_do_not_both_claim_the_held_node() {
+async fn jobs_that_fit_on_the_held_node_all_start_there_in_one_pass() {
     let dir = TempDir::new().unwrap();
     let cm = one_node_group_cap(&dir).await;
 
     let first = submit_and_wait(&cm, gpu_job("bob", "acct-b", "qb"));
     let second = submit_and_wait(&cm, gpu_job("carol", "acct-b", "qb"));
 
-    let kept = cm
-        .pending_jobs_and_tag_reasons()
+    let pass = one_pass(&cm);
+    assert_eq!(pass.started(), vec![first, second]);
+    assert!(pass.assignments.iter().all(|a| a.nodes == ["n1"]));
+}
+
+/// The held node has room for one of the two jobs. The other, hinted to it too, waits
+/// for it rather than start on a second node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_jobs_in_one_pass_do_not_both_start_on_the_held_nodes_room() {
+    let dir = TempDir::new().unwrap();
+    let cm = one_node_group_cap(&dir).await;
+    let half_a_node = |user: &str| JobSpec {
+        cpus_per_task: 4,
+        ..gpu_job(user, "acct-b", "qb")
+    };
+
+    let first = submit_and_wait(&cm, half_a_node("bob"));
+    let second = submit_and_wait(&cm, half_a_node("carol"));
+
+    let pass = one_pass(&cm);
+    assert_eq!(pass.admitted(), vec![first, second]);
+    assert_eq!(pass.started(), vec![first]);
+    assert_eq!(pass.assignments[0].nodes, ["n1"]);
+    assert!(pass.limits.refusals().is_empty());
+}
+
+/// `user` running on two nodes under "usercap".
+fn two_nodes_under_usercap(user: &str) -> QuotaLedger {
+    let running: Vec<Job> = ["n1", "n2"]
         .into_iter()
-        .filter(|j| j.job_id == first || j.job_id == second)
-        .count();
-    assert_eq!(kept, 1);
+        .zip(100..)
+        .map(|(node, id)| {
+            let mut job = Job::new(id, gpu_job(user, "acct-a", "qa"));
+            job.state = JobState::Running;
+            job.allocated_nodes = vec![node.to_string()];
+            job
+        })
+        .collect();
+    let mut ledger = QuotaLedger::default();
+    ledger.add_partition_qos(&running, |_| Some("usercap"));
+    ledger
 }
 
 #[test]
 fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
-    let mut at_cap = TresRecord::new();
-    at_cap.set(TresType::Node, 2);
     let view = PartitionQosView {
         by_partition: HashMap::from([(
             "gpu".to_string(),
@@ -330,17 +367,10 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
                 }),
             ),
         )]),
-        usage: HashMap::from([(
-            "usercap".to_string(),
-            PartitionQosUsage {
-                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
-                ..Default::default()
-            },
-        )]),
         defaults: vec!["gpu".to_string()],
         ..Default::default()
     };
-    let mut job = Job::new(
+    let job = Job::new(
         1,
         JobSpec {
             partition: None,
@@ -350,9 +380,10 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
 
     assert_eq!(
         view.admit(
-            &mut job,
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default()
+            &job,
+            &two_nodes_under_usercap("alice"),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default()
         )
         .map(|_| ()),
         Err(PendingReason::QosMaxNodePerUserLimit)
@@ -365,8 +396,6 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
 
 #[test]
 fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
-    let mut at_cap = TresRecord::new();
-    at_cap.set(TresType::Node, 2);
     let partitions = vec![
         Partition {
             name: "gpu".into(),
@@ -394,16 +423,10 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
                 }),
             ),
         )]),
-        usage: HashMap::from([(
-            "usercap".to_string(),
-            PartitionQosUsage {
-                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
-                ..Default::default()
-            },
-        )]),
         defaults: vec!["gpu".to_string(), "cpu".to_string()],
         ..Default::default()
     };
+    let ledger = two_nodes_under_usercap("alice");
     let mut job = Job::new(
         1,
         JobSpec {
@@ -414,21 +437,26 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
 
     let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions)
         .into_iter()
-        .map(|mut probe| {
-            assert!(view
+        .map(|probe| {
+            let partition_qos = view
                 .admit(
-                    &mut probe,
-                    &ReuseView::uncapped(&HashMap::new()),
-                    &PassReservations::default()
+                    &probe,
+                    &ledger,
+                    Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+                    &EvictionHolds::default(),
                 )
-                .is_ok());
-            let admitted = QuotaVerdict::Admitted {
-                account: AccountAdmitted {
-                    charge: 1,
-                    admits_without_credit: true,
+                .expect("the default without a QOS admits it");
+            let gate = || GateAdmitted {
+                charge: NodeCharge {
+                    nodes: 1,
+                    credited: HashSet::new(),
                 },
-                partition_qos: PartitionQosAdmitted::default(),
-                qos_charge: 1,
+                admits_without_credit: true,
+            };
+            let admitted = QuotaVerdict::Admitted {
+                account: gate(),
+                partition_qos,
+                qos: gate(),
             };
             (probe, admitted)
         })

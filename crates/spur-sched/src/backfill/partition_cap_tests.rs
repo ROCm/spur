@@ -997,6 +997,46 @@ fn each_candidate_partition_plans_its_own_memory_adjusted_request() {
     );
 }
 
+/// Records the memory adjustment of every start it is asked to admit.
+#[derive(Default)]
+struct StartShapes(Vec<Option<spur_core::partition_limits::MemoryAdjustment>>);
+
+impl StartAdmission for StartShapes {
+    fn admit(&mut self, starts: &[JobStart<'_>]) -> bool {
+        self.0.extend(starts.iter().map(|s| s.memory_adjustment));
+        true
+    }
+}
+
+/// Each partition reshapes the request differently, so the shape shows which one.
+#[test]
+fn a_start_is_asked_about_in_the_request_its_partition_reshaped() {
+    let fx = Fixture::new(
+        vec![
+            node("n1", 8, 64_000, &["big"]),
+            node("n2", 4, 64_000, &["small"]),
+        ],
+        vec![
+            per_cpu_limited("big", 2048, &[]),
+            per_cpu_limited("small", 1024, &[]),
+        ],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let mut shapes = StartShapes::default();
+    let a = fx.schedule_admitting(
+        &mut sched,
+        &[mem_per_cpu_job(1, "small,big", 2, 3072)],
+        &mut shapes,
+    );
+    assert_eq!(started(&a), [1]);
+    assert!(a[0].memory_adjustment.is_some());
+    assert_eq!(
+        shapes.0,
+        [a[0].memory_adjustment],
+        "admission sees what dispatch will run"
+    );
+}
+
 #[test]
 fn a_single_partition_memory_policy_shapes_the_allocation() {
     let fx = Fixture::new(

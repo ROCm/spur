@@ -443,10 +443,11 @@ in ``a`` and 6 CPUs in ``b``. With an association ``GrpTRES=cpu=4`` the job
 can only run in ``a``, so it runs there; ``b`` is not considered for it. With
 ``GrpTRES=cpu=3`` neither fits and the job pends with ``AssocGrpCpuLimit``.
 
-Within one scheduling pass, a job that could run in several partitions holds
-the largest of their requests against shared association and QOS limits until
-it starts, so jobs queued behind it in the same pass are never admitted past a
-limit. Once it starts, only the request of the partition it runs in is charged.
+A job that could run in several partitions is charged against shared
+association and QOS limits when it starts, with the request of the partition it
+runs in (see :ref:`limits-charged-at-start`). Until then it holds none of them,
+except while a preemption it triggered is in flight: then it holds the largest
+of the requests that fit, since it may start in any of those partitions.
 
 Jobs started by :doc:`idle-fill-scheduling` count against partition caps like
 any other running job, and an idle-fill start must fit within the cap.

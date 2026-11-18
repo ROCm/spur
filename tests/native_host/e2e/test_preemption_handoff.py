@@ -225,8 +225,8 @@ def _capped_preemptor(c):
     preemptor = _submit(c, "capped-preemptor", "capped", n1)
     _wait_epilog(c, victim, [0])
     assert f"PreemptedBy={preemptor}" in _state(c, victim, "COMPLETING")
-    # Submitted only once the eviction is under way: the pass that evicts can still
-    # admit another job under the same cap.
+    # Submitted only once the eviction is under way: eligible in the same pass, the
+    # sibling would start on its free node first and take the room.
     sibling = _submit(c, "capped-sibling", "capped", n2)
     _assert_pending_for_passes(c, [preemptor, sibling])
     assert "QOSGrpNodeLimit" in _state(c, sibling, "PENDING")
@@ -253,6 +253,27 @@ def test_sibling_gets_the_qos_room_a_draining_preemptor_gives_up(handoff_cluster
     wait_job_state(c, sibling, "R", timeout=60)
     assert f"NodeList={c.node_names[1]}" in _state(c, sibling, "RUNNING")
     _state(c, victim, "COMPLETING")
+
+
+def test_preemptor_evicts_nothing_once_a_same_pass_start_takes_its_qos_room(handoff_cluster):
+    c = handoff_cluster
+    n1, n2, _ = c.node_names
+    victim = _submit(c, "capped-victim", "victim-a", n1)
+    wait_job_state(c, victim, "R", timeout=60)
+    # A shared begin time makes both eligible in one pass; the preemptor sorts first. Only
+    # the sibling's node is free, and its start fills the one-node cap.
+    begin = f"--begin={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 8))}"
+    preemptor = _submit(c, "capped-preemptor", "capped", n1, extra=[begin])
+    sibling = _submit(c, "capped-sibling", "capped", n2, extra=[begin])
+    wait_job_state(c, sibling, "R", timeout=60)
+    # An eviction could only come from the pass that started the sibling; every later
+    # pass sees the preemptor over its cap. So a short watch after the sibling runs is enough.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        assert _preempted_by(c, victim) is None, c.scontrol("show", "job", str(victim))
+        time.sleep(1)
+    assert "QOSGrpNodeLimit" in _state(c, preemptor, "PENDING")
+    _state(c, victim, "RUNNING")
 
 
 def test_requeued_victim_node_goes_to_preemptor_over_higher_priority_bystander(handoff_cluster):

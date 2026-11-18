@@ -58,8 +58,11 @@ use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
+mod limit_admission;
+pub(crate) use limit_admission::LimitAdmission;
+use limit_admission::{Eviction, PassUsage};
 mod quota_ledger;
-use quota_ledger::QuotaLedger;
+use quota_ledger::{QuotaLedger, QuotaView};
 
 /// Description shown for a job parked after a launch failure it would carry to
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
@@ -848,22 +851,29 @@ impl RunAttribution {
     }
 }
 
-pub(crate) struct PendingJobClassification {
+pub(crate) struct PendingJobClassification<'a> {
     pub(crate) jobs: Vec<Job>,
     reason_updates: Vec<ReasonUpdate>,
-    bb_stage_candidates: Vec<JobId>,
+    bb_stage_candidates: Vec<Job>,
     /// Jobs refused solely by their QOS group node cap that may run on capacity
     /// nobody with a claim wants. They are *not* in `jobs`: they keep reporting
     /// their real reason and are appended below every in-quota job at placement
     /// time (§5.1).
     pub(crate) idle_fill_candidates: Vec<Job>,
-    /// A QOS or account limit refused a job while earlier candidates held claims on
-    /// it, so a claim that never turns into a start may be what blocked it.
-    pub(crate) claims_blocked: bool,
-    /// Preemptors whose victim is still stopping or whose freed node is earmarked for
-    /// them. The claim rounds keep their claims, so the room they evicted for isn't
-    /// given to another job under the same limit.
-    pub(crate) evicting: HashSet<JobId>,
+    /// Charges this pass's starts against QOS, account and partition QOS limits,
+    /// holding the room in-flight evictions free for their preemptors.
+    pub(crate) limits: LimitAdmission<'a>,
+}
+
+/// A classification with its reasons applied: what one pass places and lends, and
+/// what it stages once its starts are charged.
+pub(crate) struct ClassifiedPass<'a> {
+    pub(crate) jobs: Vec<Job>,
+    pub(crate) idle_fill_candidates: Vec<Job>,
+    pub(crate) limits: LimitAdmission<'a>,
+    /// Burst-buffer jobs to stage if they are still within their limits after this
+    /// pass's starts: staging holds capacity for a job that can't start yet.
+    pub(crate) stage_in: Vec<Job>,
 }
 
 /// Whether a QOS is holding more nodes than its group node cap allows, counting its
@@ -6040,22 +6050,16 @@ impl ClusterManager {
     /// alone (§5.3, D16).
     #[cfg(test)]
     pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
-        let mut trial = spur_sched::backfill::BackfillScheduler::new(
-            self.config().scheduler.max_jobs_per_cycle as usize,
-        );
-        let (classification, _) =
-            crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
-                crate::scheduler_loop::trial_placement(self, &mut trial, c)
-            });
-        self.apply_classification(classification)
+        let mut pass = self.apply_classification(self.classify_pending_jobs());
+        self.stage_in_and_report_refusals(&pass.stage_in, &mut pass.limits);
+        (pass.jobs, pass.idle_fill_candidates)
     }
 
-    /// Apply a classification's reasons, stage-in and evaluation stamps, and return
-    /// its in-quota jobs and borrow candidates.
-    pub(crate) fn apply_classification(
+    /// Apply a classification's reasons and evaluation stamps.
+    pub(crate) fn apply_classification<'a>(
         &self,
-        classification: PendingJobClassification,
-    ) -> (Vec<Job>, Vec<Job>) {
+        classification: PendingJobClassification<'a>,
+    ) -> ClassifiedPass<'a> {
         let evaluated: Vec<JobId> = classification
             .jobs
             .iter()
@@ -6064,9 +6068,29 @@ impl ClusterManager {
             .chain(classification.reason_updates.iter().map(|(id, _, _)| *id))
             .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
-        self.advance_bb_staging_for(&classification.bb_stage_candidates);
         self.mark_scheduler_evaluated(&evaluated);
-        (classification.jobs, classification.idle_fill_candidates)
+        ClassifiedPass {
+            jobs: classification.jobs,
+            idle_fill_candidates: classification.idle_fill_candidates,
+            limits: classification.limits,
+            stage_in: classification.bb_stage_candidates,
+        }
+    }
+
+    /// Starts stage-in for the candidates still within their limits after this
+    /// pass's starts, then reports the limit each job refused this pass is over.
+    pub(crate) fn stage_in_and_report_refusals(
+        &self,
+        candidates: &[Job],
+        limits: &mut LimitAdmission<'_>,
+    ) {
+        let within: Vec<JobId> = candidates
+            .iter()
+            .filter(|job| limits.may_stage_in(job))
+            .map(|job| job.job_id)
+            .collect();
+        self.advance_bb_staging_for(&within);
+        self.apply_pending_reason_updates(limits.refusals());
     }
 
     /// Record that this cycle considered these jobs, for `LastSchedEval`. Keyed
@@ -6086,16 +6110,8 @@ impl ClusterManager {
         }
     }
 
-    fn classify_pending_jobs(&self) -> PendingJobClassification {
-        self.classify_pending_jobs_with(&HashSet::new())
-    }
-
-    /// Side-effect free. Jobs in `unclaimed` stay candidates but take no QOS or
-    /// account headroom.
-    pub(crate) fn classify_pending_jobs_with(
-        &self,
-        unclaimed: &HashSet<JobId>,
-    ) -> PendingJobClassification {
+    /// Side-effect free.
+    pub(crate) fn classify_pending_jobs(&self) -> PendingJobClassification<'_> {
         let jobs = self.jobs.read();
         let now = Utc::now();
         let running_array_counts = running_array_counts(&jobs);
@@ -6183,7 +6199,7 @@ impl ClusterManager {
 
         // Queue precedence offers a preemptor placement before ordinary bystanders;
         // node handoffs keep every other job, bar co-owners, off its released capacity.
-        // A hoisted preemptor also keeps its quota claim through the claim rounds.
+        // A hoisted preemptor also holds, against the limits, the room it evicted for.
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
@@ -6286,10 +6302,11 @@ impl ClusterManager {
             .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
             .collect();
 
-        let mut claims_blocked = false;
-        {
-            let mut reserved = PassReservations::default();
-            let mut claimed_any = false;
+        let limits = {
+            let mut held = EvictionHolds::default();
+            let mut hints = PackingHints::default();
+            let mut evicting = Vec::new();
+            let mut over_limit_het: HashMap<JobId, PendingReason> = HashMap::new();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
             let partitions = self.partitions.read().clone();
@@ -6297,9 +6314,8 @@ impl ClusterManager {
                 &partitions,
                 &self.qos_cache,
                 self.config().accounting.enabled(),
-                &jobs,
             );
-            // An unplaceable job must not reserve grp-node quota it never uses.
+            // An unplaceable job pends with its structural reason, not a limit's.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 if let Some(reason) = structural_unplaceable_reason(job, &nodes, &reservations) {
                     return GateOutcome::Block(reason);
@@ -6325,10 +6341,12 @@ impl ClusterManager {
                     ),
                 )
             };
+            let no_starts_yet = HashSet::new();
             let reuse = ReuseView {
                 nodes: &nodes,
                 partitions: &partitions,
-                cap_usage,
+                cap_usage: &cap_usage,
+                filled: &no_starts_yet,
             };
             let cluster_nodes = nodes.len() as u64;
             // The borrowed-node counter, per QOS and deliberately separate from the
@@ -6345,10 +6363,14 @@ impl ClusterManager {
                         job.allocated_nodes.len() as u64;
                 }
             }
-            let ledger = QuotaLedger::from_jobs(jobs.values());
-            // Each candidate partition reshapes the request under its memory policy,
-            // so the gates judge each shape and the job keeps only admitted partitions.
-            retain_eligible(&mut candidates, &mut reason_updates, |job| {
+            let mut ledger = QuotaLedger::from_jobs(jobs.values());
+            ledger.add_partition_qos(jobs.values(), |job| {
+                partition_qos.charged_qos(job, &partitions)
+            });
+            // The gates judge each request shape its partitions give the job, and
+            // charge nothing: a job's limits are charged when it starts. Only a
+            // preemptor whose eviction is in flight holds room, so it is gated first.
+            let mut gate = |job: &mut Job| {
                 let qos = &qos_by_job[&job.job_id];
                 let consumed_wall = job
                     .spec
@@ -6357,15 +6379,15 @@ impl ClusterManager {
                     .and_then(|name| consumed_minutes(&grp_wall_usage, name));
                 let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(job, &partitions)
                     .into_iter()
-                    .map(|mut probe| {
+                    .map(|probe| {
                         let verdict = quota_gate(
-                            &mut probe,
+                            &probe,
                             qos,
                             &partition_qos,
                             &self.association_cache,
                             &ledger,
-                            &reuse,
-                            &reserved,
+                            Placement::Packing(&reuse),
+                            &held,
                             consumed_wall,
                         );
                         (probe, verdict)
@@ -6378,19 +6400,28 @@ impl ClusterManager {
                 let Some(reason) = refusal.filter(|_| claim.is_none()) else {
                     let claim = claim.unwrap_or_default();
                     claim.narrow(job);
-                    if !unclaimed.contains(&job.job_id) {
-                        reserved.reserve(job, &claim.tres, claim.qos_charge, claim.account_charge);
-                        reserved.reserve_partition_qos(
+                    hints.hint(
+                        job,
+                        claim.qos_credit,
+                        claim.account_credit,
+                        claim.partition_qos_credit,
+                    );
+                    if hoisted.contains(&job.job_id) {
+                        let eviction = Eviction::new(
                             job,
-                            &claim.tres,
-                            &partition_qos,
-                            &claim.partition_qos_charges,
+                            claim.tres,
+                            claim.qos_charge,
+                            claim.account_charge,
+                            claim.partition_qos_charges,
                         );
-                        claimed_any = true;
+                        held.hold(&eviction);
+                        evicting.push(eviction);
                     }
                     return GateOutcome::Keep;
                 };
-                claims_blocked |= claimed_any;
+                if let Some(het) = job.het_key() {
+                    over_limit_het.entry(het).or_insert_with(|| reason.clone());
+                }
                 // The ceiling is consulted here, at the moment a new borrow would
                 // be admitted, which is what keeps it one-directional: lowering it
                 // denies the next loan without disturbing runs already borrowing.
@@ -6410,28 +6441,22 @@ impl ClusterManager {
                     borrowed_by_qos.get(qos_name).copied().unwrap_or(0),
                     job.spec.num_nodes as u64,
                 );
-                let lendable = outcomes.iter().find(|(_, v)| v.only_grp_node_blocked());
-                if let Some((probe, _)) = lendable
+                let lendable = outcomes.iter().find_map(|(probe, verdict)| match verdict {
+                    QuotaVerdict::QosBlocked { partition_qos, .. }
+                        if verdict.only_grp_node_blocked() =>
+                    {
+                        Some(partition_qos.partition_of(probe))
+                    }
+                    _ => None,
+                });
+                if let Some(partition) = lendable
                     .filter(|_| idle_fill_on && within_ceiling && idle_fill_collectible(job))
                 {
-                    // The hint names nodes the account already occupies; a
-                    // borrowed job must land on spare capacity instead, and
-                    // `admits_without_credit` is what makes dropping it sound (D4).
+                    // A borrowed job gets no packing hint: it must land on spare
+                    // capacity, which `admits_without_credit` makes sound (D4).
                     let mut lent = job.clone();
-                    lent.spec.partition = probe.spec.partition.clone();
+                    lent.spec.partition = partition;
                     lent.preferred_nodes.clear();
-                    // D8: charge the account in full and the QOS in every
-                    // dimension but Node, so later jobs in this pass see the
-                    // cpu/mem/gpu this candidate would consume. The Node dimension
-                    // is deliberately 0 — that is the one aggregate a borrowed job
-                    // is outside of (D1).
-                    reserved.reserve(&lent, &job_tres(probe), 0, job.spec.num_nodes as u64);
-                    reserved.reserve_partition_qos(
-                        &lent,
-                        &job_tres(probe),
-                        &partition_qos,
-                        &HashMap::new(),
-                    );
                     *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
                         job.spec.num_nodes as u64;
                     idle_fill_candidates.push(lent);
@@ -6439,6 +6464,23 @@ impl ClusterManager {
                 // Blocked either way: the job is over quota and that stays its
                 // reported reason whether or not it gets lent a node (§5.4).
                 GateOutcome::Block(reason)
+            };
+            for evictions_first in [true, false] {
+                retain_eligible(&mut candidates, &mut reason_updates, |job| {
+                    if hoisted.contains(&job.job_id) == evictions_first {
+                        gate(job)
+                    } else {
+                        GateOutcome::Keep
+                    }
+                });
+            }
+            // One component over its limit keeps the whole heterogeneous job waiting:
+            // placement would otherwise start the others without it.
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
+                match job.het_key().and_then(|het| over_limit_het.get(&het)) {
+                    Some(reason) => GateOutcome::Block(reason.clone()),
+                    None => GateOutcome::Keep,
+                }
             });
 
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
@@ -6447,7 +6489,23 @@ impl ClusterManager {
                     None => GateOutcome::Keep,
                 }
             });
-        }
+            drop(nodes);
+            let mut limits = LimitAdmission::new(
+                self,
+                PassUsage {
+                    ledger,
+                    qos: qos_by_job,
+                    partition_qos,
+                    partitions,
+                    cap_usage,
+                    grp_wall: grp_wall_usage,
+                },
+            );
+            for eviction in evicting {
+                limits.hold(eviction);
+            }
+            limits
+        };
 
         {
             let available = self.available_licenses_with(&jobs);
@@ -6498,7 +6556,7 @@ impl ClusterManager {
                 // Capacity reserved and stage-in scheduled, so the job leaves the
                 // schedulable set and shows BurstBufferStageIn next cycle.
                 remaining = remaining.saturating_sub(req);
-                bb_stage_candidates.push(job.job_id);
+                bb_stage_candidates.push(job.clone());
                 GateOutcome::DropUntagged
             });
         }
@@ -6528,8 +6586,7 @@ impl ClusterManager {
             reason_updates,
             bb_stage_candidates,
             idle_fill_candidates,
-            claims_blocked,
-            evicting: hoisted,
+            limits,
         }
     }
 
@@ -6652,7 +6709,12 @@ impl ClusterManager {
 
     #[cfg(test)]
     fn advance_bb_staging(&self) -> Vec<JobId> {
-        let candidates = self.classify_pending_jobs().bb_stage_candidates;
+        let candidates: Vec<JobId> = self
+            .classify_pending_jobs()
+            .bb_stage_candidates
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
         self.advance_bb_staging_for(&candidates)
     }
 
@@ -11614,12 +11676,57 @@ fn structural_unplaceable_reason(
     )
 }
 
-/// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
-/// folds in headroom claimed earlier this pass so it can't over-subscribe. On
-/// success, extends `job.preferred_nodes` with any nodes credited toward the
-/// grp-node cap so placement actually lands on one of them, and returns the
-/// node count actually charged against `grp_tres` so the caller can record it
-/// (rather than the job's raw `num_nodes`) in `reserved`.
+/// Where a limit gate places a job when it charges the group node cap.
+#[derive(Clone, Copy)]
+enum Placement<'a> {
+    /// Before placement: the job is credited for packing onto nodes its scope
+    /// already occupies, where `reuse` says it could run now.
+    Packing(&'a ReuseView<'a>),
+    /// On the exact nodes the job got, in the partition its run is charged to.
+    On {
+        nodes: &'a [String],
+        partition: Option<&'a str>,
+    },
+}
+
+/// What a job costs a scope's group node cap: `nodes` new distinct nodes, plus
+/// the occupied nodes it was `credited` for packing onto (always empty for
+/// `Placement::On`, where nothing is left to steer).
+#[derive(Debug, Default)]
+struct NodeCharge {
+    nodes: u64,
+    credited: HashSet<String>,
+}
+
+/// The charge of `job` against the group node cap in `grp`, in `usage`'s scope, with no
+/// credit on the `claimed` nodes an eviction's preemptor will pack onto. Without a node
+/// cap nothing is credited, so placement may pick any node or partition.
+fn grp_node_charge(
+    job: &Job,
+    grp: Option<&TresRecord>,
+    usage: &QuotaView<'_>,
+    claimed: Option<&HashSet<String>>,
+    placement: Placement<'_>,
+) -> NodeCharge {
+    match placement {
+        Placement::Packing(_) if grp.is_none_or(|grp| grp.get(TresType::Node) == 0) => NodeCharge {
+            nodes: job.spec.num_nodes as u64,
+            credited: HashSet::new(),
+        },
+        Placement::Packing(reuse) => {
+            let occupied = usage
+                .occupied()
+                .filter(|n| !claimed.is_some_and(|claimed| claimed.contains(*n)));
+            let (nodes, credited) = new_distinct_nodes_needed(job, occupied, reuse);
+            NodeCharge { nodes, credited }
+        }
+        Placement::On { nodes, .. } => NodeCharge {
+            nodes: nodes.iter().filter(|n| !usage.occupies(n)).count() as u64,
+            credited: HashSet::new(),
+        },
+    }
+}
+
 /// A QOS gate refusal. `reason` is what the job reports; `grp_node_sole_blocker`
 /// says the group node cap was the *only* limit in the way, which is what makes
 /// the job eligible to borrow idle capacity (§6.2). Every other QOS limit —
@@ -11630,16 +11737,22 @@ struct QosBlocked {
     grp_node_sole_blocker: bool,
 }
 
+/// `Err(reason)` if the job would exceed a QOS group/per-user cap, counting the
+/// room `held` for evictions in flight. On success, returns the job's group node
+/// charge, whose `credited` nodes the caller hints to placement.
 fn qos_block_with(
-    job: &mut Job,
+    job: &Job,
     qos: &Qos,
-    ledger: &QuotaLedger<'_>,
-    reuse: &ReuseView<'_>,
-    reserved: &PassReservations,
+    ledger: &QuotaLedger,
+    placement: Placement<'_>,
+    held: &EvictionHolds,
     consumed_wall_minutes: Option<u64>,
-) -> Result<u64, QosBlocked> {
+) -> Result<GateAdmitted, QosBlocked> {
     let Some(qos_name) = job.spec.qos.as_ref() else {
-        return Ok(0);
+        return Ok(GateAdmitted {
+            charge: NodeCharge::default(),
+            admits_without_credit: true,
+        });
     };
     let user = &job.spec.user;
     let usage = ledger.qos(qos_name, user);
@@ -11649,40 +11762,43 @@ fn qos_block_with(
     let mut qos_running_tres = usage.scope_running_tres();
 
     let user_key = (user.clone(), qos_name.clone());
-    running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
-    if let Some(t) = reserved.qos_user_tres.get(&user_key) {
+    running_count += held.qos_user_count.get(&user_key).copied().unwrap_or(0);
+    if let Some(t) = held.qos_user_tres.get(&user_key) {
         user_running_tres.add(t);
     }
-    if let Some(t) = reserved.qos_grp.get(qos_name) {
+    if let Some(t) = held.qos_grp.get(qos_name) {
         qos_running_tres.add(t);
     }
 
-    let already_claimed = reserved.qos_claimed_nodes.get(qos_name);
-    let qos_occupied: HashSet<String> = usage
-        .occupied()
-        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
-        .map(str::to_owned)
-        .collect();
-    let (grp_node_charge, reusable_nodes) =
-        grp_node_credit(job, qos.limits.grp_tres.as_ref(), &qos_occupied, reuse);
-
-    match check_qos_limits_with_grp_node_charge(
+    let charge = grp_node_charge(
         job,
-        qos,
-        running_count,
-        submitted_count,
-        &user_running_tres,
-        &qos_running_tres,
-        consumed_wall_minutes,
-        grp_node_charge,
-    ) {
-        QosCheckResult::Allowed => {
-            job.preferred_nodes.extend(reusable_nodes);
-            Ok(grp_node_charge)
-        }
+        qos.limits.grp_tres.as_ref(),
+        &usage,
+        held.qos_claimed_nodes.get(qos_name),
+        placement,
+    );
+
+    let check = |grp_node_charge| {
+        check_qos_limits_with_grp_node_charge(
+            job,
+            qos,
+            running_count,
+            submitted_count,
+            &user_running_tres,
+            &qos_running_tres,
+            consumed_wall_minutes,
+            grp_node_charge,
+        )
+    };
+    match check(charge.nodes) {
+        QosCheckResult::Allowed => Ok(GateAdmitted {
+            admits_without_credit: charge.credited.is_empty()
+                || matches!(check(job.spec.num_nodes as u64), QosCheckResult::Allowed),
+            charge,
+        }),
         // The sole-blocker test is answered here, not by the caller, because only
-        // here are the gate's own aggregates in scope — including this pass's
-        // `PassReservations` adjustments. Re-deriving them elsewhere would judge a
+        // here are the gate's own aggregates in scope — including the room held
+        // for evictions in flight. Re-deriving them elsewhere would judge a
         // different cluster state than the one that produced this refusal (§6.3).
         QosCheckResult::Blocked(reason) => Err(QosBlocked {
             reason,
@@ -11694,38 +11810,37 @@ fn qos_block_with(
                 &user_running_tres,
                 &qos_running_tres,
                 consumed_wall_minutes,
-                grp_node_charge,
+                charge.nodes,
             ),
         }),
     }
 }
 
-/// `Err(reason)` if the job would exceed its (user, account) association cap (no
-/// account means unconstrained). `reserved` folds in this pass's claimed headroom.
-/// On success, extends `job.preferred_nodes` with any nodes credited toward the
-/// grp-node cap so placement actually lands on one of them, and returns the node
-/// count actually charged against `grp_tres` so the caller can record it (rather
-/// than the job's raw `num_nodes`) in `reserved`.
-/// A successful account-gate admission.
-struct AccountAdmitted {
-    /// grp-node count actually charged, which is less than the raw request when
-    /// the job packed onto nodes the account already occupies.
-    charge: u64,
+/// A successful QOS, account or partition QOS gate admission.
+#[derive(Debug)]
+struct GateAdmitted {
+    /// The group node charge, less than the raw request when the job packs onto
+    /// (or was placed on) nodes the scope already occupies.
+    charge: NodeCharge,
     /// Whether the job would still have been admitted with no packing credit at
-    /// all. Only idle-fill reads this (D4).
+    /// all. Idle-fill reads the account's and each partition QOS's (D4); packing
+    /// hints read every scope's.
     admits_without_credit: bool,
 }
 
+/// `Err(reason)` if the job would exceed its (user, account) association cap (no account
+/// means unconstrained), counting the room `held` for evictions in flight. On success,
+/// returns the job's group node charge, whose `credited` nodes the caller hints to placement.
 fn account_block_with(
-    job: &mut Job,
+    job: &Job,
     assoc_cache: &AssociationCache,
-    ledger: &QuotaLedger<'_>,
-    reuse: &ReuseView<'_>,
-    reserved: &PassReservations,
-) -> Result<AccountAdmitted, spur_core::job::PendingReason> {
+    ledger: &QuotaLedger,
+    placement: Placement<'_>,
+    held: &EvictionHolds,
+) -> Result<GateAdmitted, spur_core::job::PendingReason> {
     let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) else {
-        return Ok(AccountAdmitted {
-            charge: 0,
+        return Ok(GateAdmitted {
+            charge: NodeCharge::default(),
             admits_without_credit: true,
         });
     };
@@ -11737,23 +11852,22 @@ fn account_block_with(
     let submitted_count = usage.user_submitted_before(job.job_id);
     let mut account_running_tres = usage.scope_running_tres();
 
-    running_count += reserved
+    running_count += held
         .account_user_count
         .get(&(user.clone(), account.to_string()))
         .copied()
         .unwrap_or(0);
-    if let Some(t) = reserved.account_grp.get(account) {
+    if let Some(t) = held.account_grp.get(account) {
         account_running_tres.add(t);
     }
 
-    let already_claimed = reserved.account_claimed_nodes.get(account);
-    let account_occupied: HashSet<String> = usage
-        .occupied()
-        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
-        .map(str::to_owned)
-        .collect();
-    let (grp_node_charge, reusable_nodes) =
-        grp_node_credit(job, limits.grp_tres.as_ref(), &account_occupied, reuse);
+    let charge = grp_node_charge(
+        job,
+        limits.grp_tres.as_ref(),
+        &usage,
+        held.account_claimed_nodes.get(account),
+        placement,
+    );
 
     match check_account_limits_with_grp_node_charge(
         job,
@@ -11761,31 +11875,25 @@ fn account_block_with(
         running_count,
         submitted_count,
         &account_running_tres,
-        grp_node_charge,
+        charge.nodes,
     ) {
-        AccountCheckResult::Allowed => {
-            job.preferred_nodes.extend(reusable_nodes);
-            Ok(AccountAdmitted {
-                charge: grp_node_charge,
-                // Asked here, where the gate's own aggregates are in scope, for the
-                // same reason as the QOS sole-blocker test. A borrowed job's
-                // `preferred_nodes` hint gets cleared so it lands on spare capacity
-                // rather than packing onto a node the account already holds, and
-                // clearing it is only sound if admission never leaned on the credit
-                // (D4).
-                admits_without_credit: matches!(
-                    check_account_limits_with_grp_node_charge(
-                        job,
-                        &limits,
-                        running_count,
-                        submitted_count,
-                        &account_running_tres,
-                        job.spec.num_nodes as u64,
-                    ),
-                    AccountCheckResult::Allowed
+        AccountCheckResult::Allowed => Ok(GateAdmitted {
+            // Asked here, where the gate's own aggregates are in scope. A borrowed job
+            // gets no packing hint, so lending to it is sound only if admission never
+            // leaned on the credit (D4).
+            admits_without_credit: matches!(
+                check_account_limits_with_grp_node_charge(
+                    job,
+                    &limits,
+                    running_count,
+                    submitted_count,
+                    &account_running_tres,
+                    job.spec.num_nodes as u64,
                 ),
-            })
-        }
+                AccountCheckResult::Allowed
+            ),
+            charge,
+        }),
         AccountCheckResult::Blocked(reason) => Err(reason),
     }
 }
@@ -11825,14 +11933,14 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
 /// The association and QOS gates' verdict on one request a job could run with.
 enum QuotaVerdict {
     Admitted {
-        account: AccountAdmitted,
+        account: GateAdmitted,
         partition_qos: PartitionQosAdmitted,
-        qos_charge: u64,
+        qos: GateAdmitted,
     },
     AccountBlocked(spur_core::job::PendingReason),
     PartitionQosBlocked(spur_core::job::PendingReason),
     QosBlocked {
-        account: AccountAdmitted,
+        account: GateAdmitted,
         partition_qos: PartitionQosAdmitted,
         blocked: QosBlocked,
     },
@@ -11857,58 +11965,45 @@ impl QuotaVerdict {
             Self::QosBlocked { account, partition_qos, blocked }
                 if blocked.grp_node_sole_blocker
                     && account.admits_without_credit
-                    && partition_qos.admits_without_credit
+                    && partition_qos.admits_without_credit()
         )
     }
 }
 
-/// Running usage of one partition QOS.
-#[derive(Default)]
-struct PartitionQosUsage {
-    grp: TresRecord,
-    /// Nodes the QOS's jobs hold, which a job can pack onto without a new group node.
-    occupied: HashSet<String>,
-    user_tres: HashMap<String, TresRecord>,
-    user_jobs: HashMap<String, u32>,
+/// A successful partition-QOS admission.
+#[derive(Debug, Default)]
+struct PartitionQosAdmitted {
+    /// The candidate partitions whose QOS admits the job; `None` when all of them do.
+    partitions: Option<Vec<String>>,
+    /// Each admitting partition QOS's admission, by QOS name.
+    by_qos: HashMap<String, GateAdmitted>,
 }
 
-/// A successful partition-QOS admission.
-#[derive(Clone)]
-struct PartitionQosAdmitted {
-    /// Group node count charged per partition QOS, less than the raw request
-    /// when the job packs onto nodes that QOS already holds.
-    charges: HashMap<String, u64>,
+impl PartitionQosAdmitted {
     /// Whether every partition QOS would admit the job with no packing credit.
     /// Only idle-fill reads this, as it does for the account.
-    admits_without_credit: bool,
-}
+    fn admits_without_credit(&self) -> bool {
+        self.by_qos
+            .values()
+            .all(|admitted| admitted.admits_without_credit)
+    }
 
-impl Default for PartitionQosAdmitted {
-    fn default() -> Self {
-        Self {
-            charges: HashMap::new(),
-            admits_without_credit: true,
+    /// `job`'s partitions, less those whose QOS refused it.
+    fn partition_of(&self, job: &Job) -> Option<String> {
+        match &self.partitions {
+            Some(admitted) => Some(admitted.join(",")),
+            None => job.spec.partition.clone(),
         }
     }
 }
 
-/// One partition QOS's admission of a job.
-struct PartitionQosCharge {
-    qos: String,
-    charge: u64,
-    reusable: HashSet<String>,
-    admits_without_credit: bool,
-}
-
-/// A pass's view of partition QOSes. Usage is counted over every job charged to a
-/// partition carrying the QOS, whatever its account or job QOS, so one user's
-/// footprint adds up across accounts. Idle-fill borrowed jobs count too: the cap
-/// bounds what a user holds, borrowed or not.
+/// A pass's partition QOSes. Their usage, in the [`QuotaLedger`], is counted over
+/// every job charged to a partition carrying the QOS, whatever its account or job
+/// QOS, so one user's footprint adds up across accounts.
 #[derive(Default)]
 struct PartitionQosView {
     /// Partition name to its QOS name and record; `None` when no such QOS is defined.
     by_partition: HashMap<String, (String, Option<Qos>)>,
-    usage: HashMap<String, PartitionQosUsage>,
     /// Where a job that names no partition is placed, so it is gated there too.
     defaults: Vec<String>,
     /// An undefined partition QOS holds the partition's jobs rather than lifting the cap.
@@ -11916,12 +12011,7 @@ struct PartitionQosView {
 }
 
 impl PartitionQosView {
-    fn build(
-        partitions: &[Partition],
-        qos_cache: &QosCache,
-        unknown_blocks: bool,
-        jobs: &HashMap<JobId, Job>,
-    ) -> Self {
+    fn build(partitions: &[Partition], qos_cache: &QosCache, unknown_blocks: bool) -> Self {
         let by_partition: HashMap<String, (String, Option<Qos>)> = partitions
             .iter()
             .filter_map(|p| {
@@ -11932,46 +12022,8 @@ impl PartitionQosView {
         if by_partition.is_empty() {
             return Self::default();
         }
-
-        let mut grp: HashMap<&str, RunningTresAccumulator<'_>> = HashMap::new();
-        let mut per_user: HashMap<(&str, &str), RunningTresAccumulator<'_>> = HashMap::new();
-        let mut user_jobs: HashMap<(&str, &str), u32> = HashMap::new();
-        for job in jobs.values().filter(|j| j.holds_allocation()) {
-            let Some(partition) = crate::scheduler_loop::charged_partition(job, partitions) else {
-                continue;
-            };
-            let Some((qos, _)) = by_partition.get(&partition.name) else {
-                continue;
-            };
-            let key = (qos.as_str(), job.spec.user.as_str());
-            grp.entry(qos.as_str()).or_default().add(job);
-            per_user.entry(key).or_default().add(job);
-            *user_jobs.entry(key).or_insert(0) += 1;
-        }
-
-        let mut usage: HashMap<String, PartitionQosUsage> = HashMap::new();
-        for (qos, acc) in grp {
-            let entry = usage.entry(qos.to_string()).or_default();
-            entry.occupied = acc.nodes().map(str::to_string).collect();
-            entry.grp = acc.tres();
-        }
-        for ((qos, user), acc) in per_user {
-            usage
-                .entry(qos.to_string())
-                .or_default()
-                .user_tres
-                .insert(user.to_string(), acc.tres());
-        }
-        for ((qos, user), count) in user_jobs {
-            usage
-                .entry(qos.to_string())
-                .or_default()
-                .user_jobs
-                .insert(user.to_string(), count);
-        }
         Self {
             by_partition,
-            usage,
             defaults: partitions
                 .iter()
                 .filter(|p| p.is_default)
@@ -11993,32 +12045,40 @@ impl PartitionQosView {
         requested
     }
 
-    /// Narrows `job` to the requested partitions whose QOS admits it, and extends its
-    /// `preferred_nodes` with the nodes credited toward a group node cap; `Err` with
-    /// the first refusal when none admits it.
+    /// The partitions whose QOS admits `job`, with what each QOS charges it, counting
+    /// the room `held` for evictions in flight; `Err` with the first refusal when none
+    /// admits it. A job placed `On` its nodes is checked in the partition it got, and
+    /// in none if it got none, as it is charged.
     fn admit(
         &self,
-        job: &mut Job,
-        reuse: &ReuseView<'_>,
-        reserved: &PassReservations,
+        job: &Job,
+        ledger: &QuotaLedger,
+        placement: Placement<'_>,
+        held: &EvictionHolds,
     ) -> Result<PartitionQosAdmitted, spur_core::job::PendingReason> {
         let mut admission = PartitionQosAdmitted::default();
         if self.by_partition.is_empty() {
             return Ok(admission);
         }
-        let requested = self.candidate_names(job);
+        let candidates = match placement {
+            Placement::On {
+                partition: Some(partition),
+                ..
+            } => vec![partition.to_string()],
+            Placement::On {
+                partition: None, ..
+            } => return Ok(admission),
+            Placement::Packing(_) => self.candidate_names(job),
+        };
         let mut admitted = Vec::new();
-        let mut reusable = HashSet::new();
         let mut refusal = None;
-        for name in &requested {
-            match self.check(job, name, reuse, reserved) {
+        for name in candidates {
+            match self.check(job, &name, ledger, placement, held) {
                 Ok(charge) => {
-                    admitted.push(name.clone());
-                    let Some(charge) = charge else { continue };
-                    let entry = admission.charges.entry(charge.qos).or_insert(0);
-                    *entry = (*entry).max(charge.charge);
-                    admission.admits_without_credit &= charge.admits_without_credit;
-                    reusable.extend(charge.reusable);
+                    if let Some((qos, charge)) = charge {
+                        admission.by_qos.entry(qos).or_insert(charge);
+                    }
+                    admitted.push(name);
                 }
                 Err(reason) => {
                     refusal.get_or_insert(reason);
@@ -12029,9 +12089,8 @@ impl PartitionQosView {
             if admitted.is_empty() {
                 return Err(reason);
             }
-            job.spec.partition = Some(admitted.join(","));
+            admission.partitions = Some(admitted);
         }
-        job.preferred_nodes.extend(reusable);
         Ok(admission)
     }
 
@@ -12040,9 +12099,10 @@ impl PartitionQosView {
         &self,
         job: &Job,
         partition: &str,
-        reuse: &ReuseView<'_>,
-        reserved: &PassReservations,
-    ) -> Result<Option<PartitionQosCharge>, spur_core::job::PendingReason> {
+        ledger: &QuotaLedger,
+        placement: Placement<'_>,
+        held: &EvictionHolds,
+    ) -> Result<Option<(String, GateAdmitted)>, spur_core::job::PendingReason> {
         let Some((name, qos)) = self.by_partition.get(partition) else {
             return Ok(None);
         };
@@ -12053,67 +12113,78 @@ impl PartitionQosView {
             return Ok(None);
         };
         let user = &job.spec.user;
-        let usage = self.usage.get(name);
+        let usage = ledger.partition_qos(name, user);
         let key = (user.clone(), name.clone());
-        let mut user_tres = usage
-            .and_then(|u| u.user_tres.get(user))
-            .cloned()
-            .unwrap_or_default();
-        let mut grp = usage.map(|u| u.grp.clone()).unwrap_or_default();
-        let mut user_jobs = usage
-            .and_then(|u| u.user_jobs.get(user))
-            .copied()
-            .unwrap_or(0);
-        if let Some(t) = reserved.partition_qos_user_tres.get(&key) {
+        let mut user_tres = usage.user_running_tres();
+        let mut grp = usage.scope_running_tres();
+        let user_jobs = usage.user_running_jobs()
+            + held
+                .partition_qos_user_count
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+        if let Some(t) = held.partition_qos_user_tres.get(&key) {
             user_tres.add(t);
         }
-        if let Some(t) = reserved.partition_qos_grp.get(name) {
+        if let Some(t) = held.partition_qos_grp.get(name) {
             grp.add(t);
         }
-        user_jobs += reserved
-            .partition_qos_user_count
-            .get(&key)
-            .copied()
-            .unwrap_or(0);
         // Submit counts are not tracked per partition, so MaxSubmitJobsPU is not applied here.
         let mut enforced = qos.clone();
         enforced.limits.max_submit_jobs_per_user = None;
 
-        let already_claimed = reserved.partition_qos_claimed_nodes.get(name);
-        let occupied: HashSet<String> = usage
-            .map(|u| &u.occupied)
-            .into_iter()
-            .flatten()
-            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
-            .cloned()
-            .collect();
-        let (charge, reusable) =
-            grp_node_credit(job, enforced.limits.grp_tres.as_ref(), &occupied, reuse);
-        let check = |charge| {
+        let charge = grp_node_charge(
+            job,
+            enforced.limits.grp_tres.as_ref(),
+            &usage,
+            held.partition_qos_claimed_nodes.get(name),
+            placement,
+        );
+        let check = |grp_node_charge| {
             check_qos_limits_with_grp_node_charge(
-                job, &enforced, user_jobs, 0, &user_tres, &grp, None, charge,
+                job,
+                &enforced,
+                user_jobs,
+                0,
+                &user_tres,
+                &grp,
+                None,
+                grp_node_charge,
             )
         };
-        if let QosCheckResult::Blocked(reason) = check(charge) {
+        if let QosCheckResult::Blocked(reason) = check(charge.nodes) {
             return Err(reason);
         }
-        Ok(Some(PartitionQosCharge {
-            qos: name.clone(),
-            charge,
-            reusable,
-            admits_without_credit: matches!(
-                check(job.spec.num_nodes as u64),
-                QosCheckResult::Allowed
-            ),
-        }))
+        let admits_without_credit = charge.credited.is_empty()
+            || matches!(check(job.spec.num_nodes as u64), QosCheckResult::Allowed);
+        Ok(Some((
+            name.clone(),
+            GateAdmitted {
+                charge,
+                admits_without_credit,
+            },
+        )))
     }
 
     /// The distinct partition QOSes `job` is charged against if it runs.
     fn qos_names(&self, job: &Job) -> BTreeSet<String> {
         self.candidate_names(job)
             .iter()
-            .filter_map(|p| self.by_partition.get(p).map(|(name, _)| name.clone()))
+            .filter_map(|p| self.qos_of(p).map(str::to_string))
             .collect()
+    }
+
+    /// The QOS a job running in `partition` is charged to.
+    fn qos_of(&self, partition: &str) -> Option<&str> {
+        self.by_partition
+            .get(partition)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The QOS a run of `job` is charged to: that of the partition
+    /// [`charged_partition`](crate::scheduler_loop::charged_partition) gives it.
+    fn charged_qos(&self, job: &Job, partitions: &[Partition]) -> Option<&str> {
+        self.qos_of(&crate::scheduler_loop::charged_partition(job, partitions)?.name)
     }
 }
 
@@ -12122,28 +12193,35 @@ impl PartitionQosView {
 /// capacity has already cleared it.
 #[allow(clippy::too_many_arguments)]
 fn quota_gate(
-    job: &mut Job,
+    job: &Job,
     qos: &Qos,
     partition_qos: &PartitionQosView,
     assoc_cache: &AssociationCache,
-    ledger: &QuotaLedger<'_>,
-    reuse: &ReuseView<'_>,
-    reserved: &PassReservations,
+    ledger: &QuotaLedger,
+    placement: Placement<'_>,
+    held: &EvictionHolds,
     consumed_wall_minutes: Option<u64>,
 ) -> QuotaVerdict {
-    let account = match account_block_with(job, assoc_cache, ledger, reuse, reserved) {
+    let account = match account_block_with(job, assoc_cache, ledger, placement, held) {
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
-    let partition_qos = match partition_qos.admit(job, reuse, reserved) {
+    let partition_qos = match partition_qos.admit(job, ledger, placement, held) {
         Ok(admitted) => admitted,
         Err(reason) => return QuotaVerdict::PartitionQosBlocked(reason),
     };
-    match qos_block_with(job, qos, ledger, reuse, reserved, consumed_wall_minutes) {
-        Ok(qos_charge) => QuotaVerdict::Admitted {
+    // The job QOS sees only the partitions the job may still run in.
+    let narrowed = partition_qos.partitions.is_some().then(|| {
+        let mut narrowed = job.clone();
+        narrowed.spec.partition = partition_qos.partition_of(job);
+        narrowed
+    });
+    let job = narrowed.as_ref().unwrap_or(job);
+    match qos_block_with(job, qos, ledger, placement, held, consumed_wall_minutes) {
+        Ok(qos) => QuotaVerdict::Admitted {
             account,
             partition_qos,
-            qos_charge,
+            qos,
         },
         Err(blocked) => QuotaVerdict::QosBlocked {
             account,
@@ -12153,8 +12231,9 @@ fn quota_gate(
     }
 }
 
-/// What a job claims this pass when the gates admit some of its requests: the max of each
-/// TRES and grp-node charge among them, covering whichever partition placement picks.
+/// What the gates admitted of a job's requests: the max of each TRES and grp-node charge
+/// among them, covering whichever partition placement picks. Nothing is charged until
+/// the job starts.
 #[derive(Default)]
 struct QuotaClaim {
     tres: TresRecord,
@@ -12163,7 +12242,24 @@ struct QuotaClaim {
     /// Group node charge per partition QOS.
     partition_qos_charges: HashMap<String, u64>,
     partitions: Vec<String>,
-    preferred_nodes: HashSet<String>,
+    qos_credit: PackingCredit,
+    account_credit: PackingCredit,
+    partition_qos_credit: HashMap<String, PackingCredit>,
+}
+
+/// The occupied nodes a scope credited a job for packing onto, and whether some
+/// admitted request of the job fits the scope's limits only with that credit.
+#[derive(Default)]
+struct PackingCredit {
+    nodes: HashSet<String>,
+    needed: bool,
+}
+
+impl PackingCredit {
+    fn add(&mut self, admitted: &GateAdmitted) {
+        self.nodes.extend(admitted.charge.credited.iter().cloned());
+        self.needed |= !admitted.admits_without_credit;
+    }
 }
 
 impl QuotaClaim {
@@ -12174,17 +12270,14 @@ impl QuotaClaim {
             let QuotaVerdict::Admitted {
                 account,
                 partition_qos,
-                qos_charge,
+                qos,
             } = verdict
             else {
                 continue;
             };
-            claim.get_or_insert_with(Self::default).add(
-                probe,
-                *qos_charge,
-                account.charge,
-                partition_qos,
-            );
+            claim
+                .get_or_insert_with(Self::default)
+                .add(probe, qos, account, partition_qos);
         }
         claim
     }
@@ -12192,33 +12285,102 @@ impl QuotaClaim {
     fn add(
         &mut self,
         probe: &Job,
-        qos_charge: u64,
-        account_charge: u64,
+        qos: &GateAdmitted,
+        account: &GateAdmitted,
         partition_qos: &PartitionQosAdmitted,
     ) {
         let tres = job_tres(probe);
         for kind in tres.types() {
             self.tres.set(kind, self.tres.get(kind).max(tres.get(kind)));
         }
-        self.qos_charge = self.qos_charge.max(qos_charge);
-        self.account_charge = self.account_charge.max(account_charge);
-        for (qos, charge) in &partition_qos.charges {
-            let entry = self.partition_qos_charges.entry(qos.clone()).or_insert(0);
-            *entry = (*entry).max(*charge);
+        self.qos_charge = self.qos_charge.max(qos.charge.nodes);
+        self.account_charge = self.account_charge.max(account.charge.nodes);
+        for (name, admitted) in &partition_qos.by_qos {
+            let charge = self.partition_qos_charges.entry(name.clone()).or_insert(0);
+            *charge = (*charge).max(admitted.charge.nodes);
+            self.partition_qos_credit
+                .entry(name.clone())
+                .or_default()
+                .add(admitted);
         }
-        self.partitions
-            .extend(requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string));
-        self.preferred_nodes
-            .extend(probe.preferred_nodes.iter().cloned());
+        match &partition_qos.partitions {
+            Some(admitted) => self.partitions.extend(admitted.iter().cloned()),
+            None => self.partitions.extend(
+                requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string),
+            ),
+        }
+        self.qos_credit.add(qos);
+        self.account_credit.add(account);
     }
 
-    /// Restrict the job to the partitions whose request was admitted, and pass
-    /// on the nodes the gates credited it with.
+    /// Restrict the job to the partitions whose request was admitted.
     fn narrow(&self, job: &mut Job) {
         if !self.partitions.is_empty() {
             job.spec.partition = Some(self.partitions.join(","));
         }
-        job.preferred_nodes.clone_from(&self.preferred_nodes);
+    }
+}
+
+/// Occupied nodes already hinted to a job in a pass, per QOS, account and partition QOS.
+/// A node's spare room may fit only one more job, and a hint covering all of a job's nodes
+/// pins it there, so a later job in the scope gets that node only if it needs the credit.
+#[derive(Default)]
+struct PackingHints {
+    qos: HashMap<String, HashSet<String>>,
+    accounts: HashMap<String, HashSet<String>>,
+    partition_qos: HashMap<String, HashSet<String>>,
+}
+
+impl PackingHints {
+    /// Adds to `job.preferred_nodes` each scope's credited nodes: all of them if the
+    /// job needs that scope's credit, else those no earlier job in the scope was
+    /// hinted to. Then records all of the job's hints in each of its scopes.
+    fn hint(
+        &mut self,
+        job: &mut Job,
+        qos_credit: PackingCredit,
+        account_credit: PackingCredit,
+        partition_qos_credit: HashMap<String, PackingCredit>,
+    ) {
+        let qos = job.spec.qos.clone().filter(|q| !q.is_empty());
+        let account = account_of(job).map(str::to_owned);
+        let credited = [
+            (&self.qos, qos.as_deref(), &qos_credit),
+            (&self.accounts, account.as_deref(), &account_credit),
+        ]
+        .into_iter()
+        .chain(
+            partition_qos_credit
+                .iter()
+                .map(|(name, credit)| (&self.partition_qos, Some(name.as_str()), credit)),
+        );
+        let mut hinted = Vec::new();
+        for (scopes, scope, credit) in credited {
+            let taken = scope.and_then(|s| scopes.get(s));
+            hinted.extend(
+                credit
+                    .nodes
+                    .iter()
+                    .filter(|n| credit.needed || !taken.is_some_and(|t| t.contains(*n)))
+                    .cloned(),
+            );
+        }
+        job.preferred_nodes.extend(hinted);
+        let hold = |scopes: &mut HashMap<String, HashSet<String>>, scope: String| {
+            scopes
+                .entry(scope)
+                .or_default()
+                .extend(job.preferred_nodes.iter().cloned());
+        };
+        if let Some(qos) = qos {
+            hold(&mut self.qos, qos);
+        }
+        if let Some(account) = account {
+            hold(&mut self.accounts, account);
+        }
+        for name in partition_qos_credit.into_keys() {
+            hold(&mut self.partition_qos, name);
+        }
     }
 }
 
@@ -12384,31 +12546,45 @@ fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a
 /// Shared by the `QuotaLedger` the admission gates read and the per-scope/per-user
 /// aggregation in `scope_usage` so a running job's footprint is counted identically
 /// whether it feeds a group total or a single user's, and the distinct-node union is
-/// taken per aggregate rather than summed across jobs.
-#[derive(Default)]
-struct RunningTresAccumulator<'a> {
+/// taken per aggregate rather than summed across jobs. It owns its node names, so
+/// a ledger built from it outlives the read of the job table and can take starts.
+#[derive(Clone, Default)]
+struct RunningTresAccumulator {
     tres: TresRecord,
-    distinct_nodes: HashSet<&'a str>,
+    distinct_nodes: HashSet<String>,
     unplaced_nodes: u64,
 }
 
-impl<'a> RunningTresAccumulator<'a> {
-    fn add(&mut self, job: &'a Job) {
-        self.tres.add(&job_tres(job));
+impl RunningTresAccumulator {
+    fn add(&mut self, job: &Job) {
         if job.allocated_nodes.is_empty() {
             self.unplaced_nodes += job.spec.num_nodes as u64;
-        } else {
-            self.distinct_nodes.extend(
-                job.allocated_nodes
-                    .iter()
-                    .filter(|node| job.is_held_on(node))
-                    .map(String::as_str),
-            );
+        }
+        self.add_on(
+            job,
+            job.allocated_nodes
+                .iter()
+                .filter(|node| job.is_held_on(node)),
+        );
+    }
+
+    /// Adds `job` as running on `nodes`. An empty `nodes` counts its TRES but no
+    /// node, as for a borrowed start in the QOS whose node cap it runs outside of.
+    fn add_on<'n>(&mut self, job: &Job, nodes: impl IntoIterator<Item = &'n String>) {
+        self.tres.add(&job_tres(job));
+        for node in nodes {
+            if !self.distinct_nodes.contains(node) {
+                self.distinct_nodes.insert(node.clone());
+            }
         }
     }
 
-    fn nodes(&self) -> impl Iterator<Item = &'a str> + '_ {
-        self.distinct_nodes.iter().copied()
+    fn nodes(&self) -> impl Iterator<Item = &str> {
+        self.distinct_nodes.iter().map(String::as_str)
+    }
+
+    fn occupies(&self, node: &str) -> bool {
+        self.distinct_nodes.contains(node)
     }
 
     fn tres(&self) -> TresRecord {
@@ -12503,10 +12679,10 @@ fn queued_scopes(
 /// `running_tres` is deduped per user, so a node two of this user's jobs share
 /// counts once — the same distinct-node rule the group total uses.
 #[derive(Default)]
-struct UserAgg<'a> {
+struct UserAgg {
     running_jobs: u32,
     submitted_jobs: u32,
-    running_tres: RunningTresAccumulator<'a>,
+    running_tres: RunningTresAccumulator,
 }
 
 /// One scope's consumption from the job table, with an entry per user holding
@@ -12602,14 +12778,10 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 /// already-occupied nodes needs 0 new nodes.
 ///
 /// Uses `NodePlacement::new_ignoring_preferred_nodes`, not `NodePlacement::new`:
-/// this is called once for the account gate and once for the QOS gate on the
-/// SAME job, and the first gate to run may already have written its own
-/// credited nodes into `job.preferred_nodes` before the second one runs. If
-/// this function's own placement view honored that field, the first gate's
-/// credit would leak in as a spurious nodelist restriction on the second
-/// gate's independent reuse computation — incorrectly narrowing (or, if the
-/// first gate's credit alone already covered `num_nodes`, entirely excluding)
-/// nodes the second gate's own dimension legitimately occupies.
+/// the account gate and the QOS gate each credit the SAME job independently, and
+/// a hint the job already carries would otherwise act as a nodelist restriction
+/// on that computation — narrowing (or, if the hint alone covered `num_nodes`,
+/// entirely excluding) nodes the gate's own scope legitimately occupies.
 ///
 /// A candidate must also be genuinely schedulable (`Node::is_schedulable`)
 /// and not claimed by the managed k0s cluster (`Node::is_k0s_reserved`) to be
@@ -12629,22 +12801,15 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 /// again, so this can't wedge a job indefinitely). Exclusive jobs never reuse
 /// an already-occupied node, since they require the whole node to themselves.
 ///
-/// Known soft-cap limitation: when a job only partially reuses (charge > 0),
-/// its `preferred_nodes` bias is additive, not restrictive (see
-/// `NodePlacement`), so backfill is free to place its remaining new node(s)
-/// anywhere. If the specific occupied node credited here becomes unavailable
-/// between this admission check and actual placement — e.g. claimed by a job
-/// admitted in a later pass — the job can end up needing one more genuinely
-/// new distinct node than it was charged for. `qos_claimed_nodes`/
-/// `account_claimed_nodes` on `PassReservations` close this gap within a
-/// single pass; across passes it remains a best-effort accounting, bounded
-/// in practice by real placement being the final authority on node choice.
+/// The credit is an estimate for classification and the packing hint. A job is
+/// charged at start on the nodes it actually got, so if it lands on a fresh node
+/// instead, a wrong credit can delay it but never take its scope over the cap.
 ///
 /// Only nodes with cap room in one of the job's partitions are credited: a credit covering
 /// `num_nodes` becomes a hard nodelist and would strand the job on a full-cap node.
-fn new_distinct_nodes_needed(
+fn new_distinct_nodes_needed<'o>(
     job: &Job,
-    occupied: &HashSet<String>,
+    occupied: impl IntoIterator<Item = &'o str>,
     reuse: &ReuseView<'_>,
 ) -> (u64, HashSet<String>) {
     if job.spec.exclusive {
@@ -12653,7 +12818,7 @@ fn new_distinct_nodes_needed(
     let placement = spur_sched::node_match::NodePlacement::new_ignoring_preferred_nodes(job);
     let required = spur_sched::backfill::job_resource_request(job);
     let reusable: HashSet<String> = occupied
-        .iter()
+        .into_iter()
         .filter(|name| {
             reuse.nodes.get(*name).is_some_and(|node| {
                 placement.allows_name(&node.name)
@@ -12661,11 +12826,12 @@ fn new_distinct_nodes_needed(
                     && placement.has_features(node)
                     && node.is_schedulable()
                     && !node.is_k0s_reserved()
+                    && !reuse.filled.contains(&node.name)
                     && node.can_satisfy_request(&required)
                     && reuse.cap_has_room(job, node)
             })
         })
-        .cloned()
+        .map(str::to_owned)
         .collect();
     let reusable_count = reusable.len() as u32;
     let charge = job
@@ -12675,36 +12841,31 @@ fn new_distinct_nodes_needed(
     (charge, reusable)
 }
 
-/// Grp-node charge and credited nodes for a group with aggregate cap `grp`. Without a node
-/// cap nothing is credited, so placement may pick any node or partition.
-fn grp_node_credit(
-    job: &Job,
-    grp: Option<&TresRecord>,
-    occupied: &HashSet<String>,
-    reuse: &ReuseView<'_>,
-) -> (u64, HashSet<String>) {
-    if grp.is_none_or(|grp| grp.get(TresType::Node) == 0) {
-        return (job.spec.num_nodes as u64, HashSet::new());
-    }
-    new_distinct_nodes_needed(job, occupied, reuse)
-}
-
 /// What the grp-node gates consult to decide whether a node a group already
 /// occupies could take a pending job right now.
 struct ReuseView<'a> {
     nodes: &'a HashMap<String, Node>,
     partitions: &'a [Partition],
-    /// Partition -> node -> what its jobs hold there now, as backfill sees it.
-    cap_usage: HashMap<String, HashMap<String, spur_sched::partition_cap::TresCharge>>,
+    cap_usage: &'a CapUsage,
+    /// Nodes a start landed on earlier in the pass. `nodes` doesn't show what
+    /// that start took, so none of their room is credited.
+    filled: &'a HashSet<String>,
 }
+
+/// Partition -> node -> what its jobs hold there now, as backfill sees it.
+type CapUsage = HashMap<String, HashMap<String, spur_sched::partition_cap::TresCharge>>;
 
 impl<'a> ReuseView<'a> {
     #[cfg(test)]
     fn uncapped(nodes: &'a HashMap<String, Node>) -> Self {
+        static NONE: std::sync::LazyLock<CapUsage> = std::sync::LazyLock::new(HashMap::new);
+        static UNFILLED: std::sync::LazyLock<HashSet<String>> =
+            std::sync::LazyLock::new(HashSet::new);
         Self {
             nodes,
             partitions: &[],
-            cap_usage: HashMap::new(),
+            cap_usage: &NONE,
+            filled: &UNFILLED,
         }
     }
 
@@ -12737,21 +12898,14 @@ fn job_tres(job: &Job) -> TresRecord {
     tres
 }
 
-/// Headroom claimed by jobs already kept earlier in a single `pending_jobs()`
-/// pass, folded into the running aggregates so aggregate QOS/account caps
-/// (`grp_tres`, per-user TRES, per-user running-job counts) can't be
-/// over-subscribed within one pass — the same guarantee licenses and
-/// burst-buffer capacity already get via priority-ordered reservation.
+/// The room held for preemptors whose evictions are in flight, added to the running
+/// aggregates the QOS, account and partition QOS gates check, so no other job takes
+/// what an eviction frees before its preemptor starts.
 ///
-/// `{qos,account}_claimed_nodes` track which already-occupied nodes were
-/// credited toward a kept job's grp-node charge this pass, so a later
-/// candidate can't independently claim the same node's spare capacity too —
-/// only one job can actually land on it. Without this, two same-pass
-/// candidates can both compute a reuse credit for one node, both get
-/// admitted, and the grp-node cap is exceeded once real placement resolves
-/// which of them actually gets it.
-#[derive(Default)]
-struct PassReservations {
+/// `*_claimed_nodes` hold the occupied nodes each preemptor was hinted to pack onto:
+/// only one job can land on a node's spare capacity.
+#[derive(Clone, Default)]
+struct EvictionHolds {
     qos_grp: HashMap<String, TresRecord>,
     qos_user_tres: HashMap<(String, String), TresRecord>,
     qos_user_count: HashMap<(String, String), u32>,
@@ -12765,104 +12919,63 @@ struct PassReservations {
     partition_qos_claimed_nodes: HashMap<String, HashSet<String>>,
 }
 
-impl PassReservations {
-    /// Charge `job` against every partition QOS it could run under; a multi-partition
-    /// job is charged to each, since placement has not picked one yet. `node_charges`
-    /// holds the group node count admission charged each QOS; one not in it is
-    /// charged the raw request. Its credited nodes are spoken for, as in [`Self::reserve`].
-    fn reserve_partition_qos(
-        &mut self,
-        job: &Job,
-        tres: &TresRecord,
-        view: &PartitionQosView,
-        node_charges: &HashMap<String, u64>,
-    ) {
-        for qos in view.qos_names(job) {
-            let mut grp_tres = tres.clone();
-            grp_tres.set(
-                TresType::Node,
-                node_charges
-                    .get(&qos)
-                    .copied()
-                    .unwrap_or(job.spec.num_nodes as u64),
-            );
-            self.partition_qos_grp
-                .entry(qos.clone())
-                .or_default()
-                .add(&grp_tres);
-            self.partition_qos_claimed_nodes
-                .entry(qos.clone())
-                .or_default()
-                .extend(job.preferred_nodes.iter().cloned());
-            let key = (job.spec.user.clone(), qos);
-            self.partition_qos_user_tres
-                .entry(key.clone())
-                .or_default()
-                .add(tres);
-            *self.partition_qos_user_count.entry(key).or_insert(0) += 1;
-        }
-    }
-
-    /// Record that `job` (kept this pass) now occupies its footprint against the
-    /// QOS and account aggregates, so lower-priority jobs later in the pass see
-    /// the reduced headroom. `qos_node_charge`/`account_node_charge` are the
-    /// grp-node counts `qos_block_with`/`account_block_with` actually charged
-    /// this job (which may be less than its raw `num_nodes` when it packed onto
-    /// already-occupied nodes) — the grp aggregates' Node dimension reflects
-    /// that charge, not the raw request, so it stays consistent with what
-    /// admission actually granted. Per-user TRES keeps the raw node count,
-    /// since per-job/per-user caps always bound a job's own footprint.
-    ///
-    /// `qos_claimed_nodes`/`account_claimed_nodes` are both populated from the
-    /// job's full (possibly QOS-and-account-merged) `preferred_nodes`, not
-    /// just the calling dimension's own credited subset. This is
-    /// intentionally conservative: the node's spare capacity is a single
-    /// physical resource this job may consume regardless of which dimension
-    /// motivated crediting it, so ANY later same-pass candidate — QOS or
-    /// account — must treat it as spoken for. Splitting this per dimension
-    /// would let two same-pass candidates of different QOS/account both
-    /// claim the same shared node's same spare capacity as long as they
-    /// approached it from different dimensions, reopening the double-credit
-    /// gap this whole mechanism exists to close.
-    fn reserve(
-        &mut self,
-        job: &Job,
-        tres: &TresRecord,
-        qos_node_charge: u64,
-        account_node_charge: u64,
-    ) {
-        let user = job.spec.user.clone();
-        if let Some(qos) = job.spec.qos.as_ref().filter(|q| !q.is_empty()) {
-            let mut qos_grp_tres = tres.clone();
-            qos_grp_tres.set(TresType::Node, qos_node_charge);
+impl EvictionHolds {
+    /// Holds `eviction`'s footprint: group caps take its group node charges, per-user
+    /// TRES its raw node count. Every scope claims all its hinted nodes, since a node's
+    /// spare capacity is one resource whichever scope credited it.
+    fn hold(&mut self, eviction: &Eviction) {
+        let user = &eviction.user;
+        if let Some(qos) = &eviction.qos {
+            let mut qos_grp_tres = eviction.tres.clone();
+            qos_grp_tres.set(TresType::Node, eviction.qos_nodes);
             self.qos_grp
                 .entry(qos.clone())
                 .or_default()
                 .add(&qos_grp_tres);
             let key = (user.clone(), qos.clone());
-            self.qos_user_tres.entry(key.clone()).or_default().add(tres);
+            self.qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(&eviction.tres);
             *self.qos_user_count.entry(key).or_insert(0) += 1;
             self.qos_claimed_nodes
                 .entry(qos.clone())
                 .or_default()
-                .extend(job.preferred_nodes.iter().cloned());
+                .extend(eviction.hinted.iter().cloned());
         }
-        if let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) {
-            let account = account.to_string();
-            let mut account_grp_tres = tres.clone();
-            account_grp_tres.set(TresType::Node, account_node_charge);
+        if let Some(account) = &eviction.account {
+            let mut account_grp_tres = eviction.tres.clone();
+            account_grp_tres.set(TresType::Node, eviction.account_nodes);
             self.account_grp
                 .entry(account.clone())
                 .or_default()
                 .add(&account_grp_tres);
             *self
                 .account_user_count
-                .entry((user, account.clone()))
+                .entry((user.clone(), account.clone()))
                 .or_insert(0) += 1;
             self.account_claimed_nodes
-                .entry(account)
+                .entry(account.clone())
                 .or_default()
-                .extend(job.preferred_nodes.iter().cloned());
+                .extend(eviction.hinted.iter().cloned());
+        }
+        for (qos, nodes) in &eviction.partition_qos_nodes {
+            let mut grp_tres = eviction.tres.clone();
+            grp_tres.set(TresType::Node, *nodes);
+            self.partition_qos_grp
+                .entry(qos.clone())
+                .or_default()
+                .add(&grp_tres);
+            let key = (user.clone(), qos.clone());
+            self.partition_qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(&eviction.tres);
+            *self.partition_qos_user_count.entry(key).or_insert(0) += 1;
+            self.partition_qos_claimed_nodes
+                .entry(qos.clone())
+                .or_default()
+                .extend(eviction.hinted.iter().cloned());
         }
     }
 }
@@ -13744,6 +13857,7 @@ pub(crate) mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    mod limits_at_start;
     mod node_inventory;
     mod partition_limits;
     mod partition_qos;
@@ -14705,27 +14819,23 @@ state = "UP"
             .unwrap();
         };
         register(&native);
-        let assert_trial = |node: &str, placed: bool| {
+        let assert_placed = |node: &str, placed: bool| {
             let spec = JobSpec {
                 partition: Some("default".into()),
                 gres: vec!["gpu:1".into()],
                 nodelist: Some(node.into()),
                 constraint: Some("same(gpu.fabric_domain_id)".into()),
-                ..basic_spec("trial-fabric")
+                ..basic_spec("placed-fabric")
             };
-            let classification = PendingJobClassification {
-                jobs: vec![Job::new(1, spec)],
-                reason_updates: vec![],
-                bb_stage_candidates: vec![],
-                idle_fill_candidates: vec![],
-                claims_blocked: false,
-                evicting: HashSet::new(),
-            };
-            let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
-            let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
-            assert_eq!(actual.contains(&1), placed, "{node}");
+            let assignments = crate::scheduler_loop::place(
+                &cm,
+                &mut spur_sched::backfill::BackfillScheduler::new(10),
+                &[Job::new(1, spec)],
+                &mut spur_sched::traits::AdmitAll,
+            );
+            assert_eq!(assignments.iter().any(|a| a.job_id == 1), placed, "{node}");
         };
-        assert_trial("n0", true);
+        assert_placed("n0", true);
         for (text, warning) in [
             ("BlockName=a Nodes=n0", false),
             ("BlockName=a Nodes=n0,missing", true),
@@ -14775,8 +14885,8 @@ state = "UP"
             .unwrap()
             .issues
             .is_empty());
-        assert_trial("n0", false);
-        assert_trial("n1", true);
+        assert_placed("n0", false);
+        assert_placed("n1", true);
     }
 
     #[tokio::test]
@@ -25518,38 +25628,9 @@ state = "UP"
         settle(&cm, low_id, JobState::Cancelled);
     }
 
-    /// Exercise both real placement and its quota-classification trial with the same fixture.
+    /// One placement pass over the classified jobs, charging limits as each starts.
     fn run_one_scheduling_pass(cm: &Arc<ClusterManager>) -> Vec<spur_sched::traits::Assignment> {
-        let pending = cm.pending_jobs();
-        let nodes = cm.nodes_off_dispatch_cooldown(&pending);
-        let partitions = cm.get_partitions();
-        let reservations = cm.get_reservations();
-        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
-        let handoffs = cm.preemption_handoffs(&pending, &nodes, &reservations);
-        let state = spur_sched::traits::ClusterState {
-            nodes: &nodes,
-            partitions: &partitions,
-            reservations: &reservations,
-            topology: None,
-            fabric: None,
-            busy_until: &busy_until,
-            preemption_handoffs: &handoffs,
-            partition_node_usage: &Default::default(),
-        };
-        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(
-            cm.config().scheduler.max_jobs_per_cycle as usize,
-        );
-        let assignments = crate::scheduler_loop::claimed_assignments(
-            &mut scheduler,
-            &pending,
-            &state,
-            &HashSet::new(),
-        );
-        let classification = cm.classify_pending_jobs_with(&HashSet::new());
-        let trial =
-            crate::scheduler_loop::trial_placement(cm, &mut scheduler.for_trial(), &classification);
-        assert_eq!(trial, assignments.iter().map(|a| a.job_id).collect());
-        assignments
+        crate::scheduler_loop::test_pass(cm).assignments
     }
 
     /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
@@ -25712,7 +25793,7 @@ state = "UP"
             assert_eq!(outcome.requeued, 1);
             assert!(outcome.killed[0].idle_fill);
             cm.release_job(pinned_id).unwrap();
-            let classification = cm.classify_pending_jobs_with(&HashSet::new());
+            let classification = cm.classify_pending_jobs();
             assert!(cm.get_job(pinned_id).unwrap().idle_fill);
             assert!(classification
                 .jobs
@@ -26412,13 +26493,9 @@ state = "UP"
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
         };
+        use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
-        let assignments = crate::scheduler_loop::claimed_assignments(
-            &mut scheduler,
-            &pending,
-            &state,
-            &HashSet::new(),
-        );
+        let assignments = scheduler.schedule(&pending, &state);
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].job_id, owner);
         let released =
@@ -27897,18 +27974,14 @@ state = "UP"
 
         report_nodes_released(&cm, ids[0]);
         settle(&cm, ids[0], JobState::Cancelled);
-        let classification = PendingJobClassification {
-            jobs: vec![cm.get_job(high.job_id).unwrap()],
-            reason_updates: vec![],
-            bb_stage_candidates: vec![],
-            idle_fill_candidates: vec![],
-            claims_blocked: false,
-            evicting: HashSet::new(),
-        };
-        let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
-        let placed = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+        let placed = crate::scheduler_loop::place(
+            &cm,
+            &mut spur_sched::backfill::BackfillScheduler::new(10),
+            &[cm.get_job(high.job_id).unwrap()],
+            &mut spur_sched::traits::AdmitAll,
+        );
         assert!(
-            placed.contains(&high.job_id),
+            placed.iter().any(|a| a.job_id == high.job_id),
             "the freed node hosts the job"
         );
     }
@@ -29571,39 +29644,6 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_pass_qos_grp_node_block_tags_reason_not_none() {
-        // Two 1-node jobs, QOS grp_tres node=1, nothing running: the second is
-        // blocked only by the first's in-pass reservation. Expect QosGrpNodeLimit.
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 16000);
-        let mut grp = TresRecord::new();
-        grp.set(TresType::Node, 1);
-        cm.qos_cache().insert(Qos {
-            name: "capped".into(),
-            limits: spur_core::accounting::QosLimits {
-                grp_tres: Some(grp),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-
-        let mut s1 = basic_spec("q1");
-        s1.qos = Some("capped".into());
-        let j1 = submit_and_wait(&cm, s1);
-        let mut s2 = basic_spec("q2");
-        s2.qos = Some("capped".into());
-        let j2 = submit_and_wait(&cm, s2);
-
-        cm.refresh_pending_reasons();
-        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
-        assert_eq!(
-            cm.get_job(j2).unwrap().pending_reason,
-            PendingReason::QosGrpNodeLimit
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_admits_job_packable_onto_already_used_nodes() {
         // QOS grp node=4 is fully occupied by two running jobs on disjoint node
         // pairs, each node far below its capacity. A new job needing only 1 more
@@ -29891,53 +29931,32 @@ state = "UP"
         spec
     }
 
-    /// What the scheduler loop would dispatch for this classification.
-    fn dispatched(
-        cm: &ClusterManager,
-        classification: &PendingJobClassification,
-        unclaimed: &HashSet<JobId>,
-    ) -> Vec<JobId> {
-        let (nodes, partitions, reservations) = (
-            cm.nodes_off_dispatch_cooldown(&classification.jobs),
-            cm.get_partitions(),
-            cm.get_reservations(),
-        );
-        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
-        let state = spur_sched::traits::ClusterState {
-            fabric: None,
-            preemption_handoffs: &std::collections::HashMap::new(),
-            busy_until: &busy_until,
-            partition_node_usage: &Default::default(),
-            nodes: &nodes,
-            partitions: &partitions,
-            reservations: &reservations,
-            topology: None,
-        };
-        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
-        crate::scheduler_loop::claimed_assignments(
-            &mut scheduler,
-            &classification.jobs,
-            &state,
-            unclaimed,
+    /// Submits `spec` and runs it on `node` with the CPUs it asks for.
+    fn run_on(cm: &ClusterManager, spec: JobSpec, node: &str) -> JobId {
+        start_on(cm, submit_and_wait(cm, spec), node)
+    }
+
+    /// Starts the pending job `id` on `node` with the CPUs it asks for.
+    fn start_on(cm: &ClusterManager, id: JobId, node: &str) -> JobId {
+        let spec = cm.get_job(id).expect("job submitted").spec;
+        let res = scalar_alloc(spec.cpus_per_task * spec.num_tasks, 1000);
+        cm.start_job(
+            id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
         )
-        .into_iter()
-        .map(|a| a.job_id)
-        .collect()
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        id
     }
 
-    fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
-        let mut trial = spur_sched::backfill::BackfillScheduler::new(10);
-        crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
-        })
+    fn one_pass(cm: &ClusterManager) -> crate::scheduler_loop::TestPass<'_> {
+        crate::scheduler_loop::test_pass(cm)
     }
 
-    fn admitted(classification: &PendingJobClassification) -> Vec<JobId> {
-        classification.jobs.iter().map(|j| j.job_id).collect()
-    }
-
-    /// 1 of 3 nodes in use, yet a job that fits would pend on the grp node limit
-    /// because a higher-priority job claimed the rest and cannot be placed.
+    /// 1 of 3 nodes in use, and a job that fits starts while a higher-priority job
+    /// waits for nodes it can't have yet.
     async fn assert_waiting_job_holds_no_grp_node_quota(by: GrpCap) {
         let dir = TempDir::new().unwrap();
         let cm = grp_node_cluster_with(&dir, 3, by, test_config()).await;
@@ -29950,22 +29969,13 @@ state = "UP"
         let waiting = submit_and_wait(&cm, in_group(pool_job("waits-for-n1", 2, Some("n1,n2"))));
         let fits = submit_and_wait(&cm, in_group(pool_job("fits-now", 1, None)));
 
-        let single_pass: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let pass = one_pass(&cm);
         assert!(
-            single_pass.contains(&waiting) && !single_pass.contains(&fits),
-            "one classification still charges the waiting job's claim: {single_pass:?}"
-        );
-
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        let admitted = admitted(&classification);
-        assert!(
-            admitted.contains(&waiting),
+            pass.admitted().contains(&waiting),
             "it keeps its place and future slot"
         );
-        assert!(admitted.contains(&fits), "{admitted:?}");
-        assert_eq!(unclaimed, HashSet::from([waiting]));
-
-        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
+        assert!(pass.admitted().contains(&fits), "{:?}", pass.admitted());
+        assert_eq!(pass.started(), vec![fits]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29978,72 +29988,20 @@ state = "UP"
         assert_waiting_job_holds_no_grp_node_quota(GrpCap::Account).await;
     }
 
+    /// Cap 3 with n1 in use: however many jobs wait for n1, none holds the cap from
+    /// the job behind them that can start.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_dispatch_guard_keeps_a_placeable_job_without_a_claim_from_starting() {
+    async fn a_chain_of_waiting_jobs_holds_no_grp_node_quota() {
         let dir = TempDir::new().unwrap();
         let cm = grp_node_cluster(&dir, 3).await;
-        let waiting = submit_and_wait(&cm, pool_job("waits-for-n1", 2, Some("n1,n2")));
-        let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
-
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
-        assert!(dispatched(&cm, &classification, &HashSet::from([waiting, fits])).is_empty());
-    }
-
-    /// Cap 3 with n1 in use: each waiting job claims the rest of the cap once the
-    /// ones ahead of it are unclaimed, so each round releases exactly one.
-    async fn chain_of_waiting_jobs(
-        dir: &TempDir,
-        len: usize,
-    ) -> (
-        Arc<ClusterManager>,
-        Vec<JobId>,
-        JobId,
-        PendingJobClassification,
-        HashSet<JobId>,
-    ) {
-        let cm = grp_node_cluster(dir, 3).await;
-        let waiting: Vec<JobId> = (0..len)
+        let waiting: Vec<JobId> = (0..9)
             .map(|i| submit_and_wait(&cm, pool_job(&format!("waits-{i}"), 2, Some("n1,n2"))))
             .collect();
         let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        (cm, waiting, fits, classification, unclaimed)
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_chain_of_seven_waiting_jobs_releases_the_cap_within_one_pass() {
-        let dir = TempDir::new().unwrap();
-        let (cm, waiting, fits, classification, unclaimed) = chain_of_waiting_jobs(&dir, 7).await;
-        assert_eq!(unclaimed, waiting.iter().copied().collect());
-        assert!(!classification.claims_blocked);
-        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_chain_of_eight_waiting_jobs_still_holds_the_cap_after_the_round_bound() {
-        let dir = TempDir::new().unwrap();
-        let (_cm, waiting, fits, classification, unclaimed) = chain_of_waiting_jobs(&dir, 8).await;
-        assert_eq!(unclaimed, waiting[..7].iter().copied().collect());
-        assert!(classification.claims_blocked);
-        assert!(admitted(&classification).contains(&waiting[7]));
-        assert!(!admitted(&classification).contains(&fits));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_panicking_trial_placement_keeps_every_quota_claim() {
-        let dir = TempDir::new().unwrap();
-        let cm = grp_node_cluster(&dir, 3).await;
-        let waiting = submit_and_wait(&cm, pool_job("waits-for-n1", 2, Some("n1,n2")));
-        let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
-
-        let (classification, unclaimed) =
-            crate::scheduler_loop::classify_without_phantom_claims(&cm, |_| {
-                panic!("trial placement failed")
-            });
-        assert!(unclaimed.is_empty());
-        assert_eq!(admitted(&classification), vec![waiting]);
-        assert!(!admitted(&classification).contains(&fits));
+        let pass = one_pass(&cm);
+        assert!(waiting.iter().all(|id| pass.admitted().contains(id)));
+        assert_eq!(pass.started(), vec![fits]);
     }
 
     /// `grp_node_cluster` with room for one more node, under preemption, where "pool"
@@ -30066,17 +30024,7 @@ state = "UP"
         let mut spec = basic_spec("burst");
         spec.qos = Some("burst".into());
         spec.nodelist = Some(node.into());
-        let id = submit_and_wait(cm, spec);
-        let res = scalar_alloc(1, 1000);
-        cm.start_job(
-            id,
-            vec![node.into()],
-            res.clone(),
-            per_node_for(&[node], res),
-        )
-        .unwrap();
-        settle(cm, id, JobState::Running);
-        id
+        run_on(cm, spec, node)
     }
 
     async fn evict_for(cm: &Arc<ClusterManager>, preemptor: JobId, victim: JobId) {
@@ -30130,26 +30078,12 @@ state = "UP"
         (cm, preemptor, sibling)
     }
 
-    /// One pass up to its evictions. Jobs go to `try_preempt` as in the loop: admitted,
-    /// not started, with the pass's off-cooldown nodes.
-    async fn preempt_for_unstarted(cm: &Arc<ClusterManager>) -> PendingJobClassification {
+    /// One pass up to its evictions, as the loop runs them. Returns the jobs it admitted.
+    async fn preempt_for_unstarted(cm: &Arc<ClusterManager>) -> Vec<JobId> {
         cm.tick_preempt_freed_earmarks();
-        let (classification, unclaimed) = classify_with_trials(cm);
-        let started = dispatched(cm, &classification, &unclaimed);
-        let unstarted: Vec<&Job> = classification
-            .jobs
-            .iter()
-            .filter(|job| !started.contains(&job.job_id))
-            .collect();
-        crate::scheduler_loop::try_preempt(
-            cm,
-            &cm.get_partitions(),
-            &cm.nodes_off_dispatch_cooldown(&classification.jobs),
-            &unstarted,
-            &cm.config().scheduler,
-        )
-        .await;
-        classification
+        let mut pass = one_pass(cm);
+        crate::scheduler_loop::preempt_unstarted(cm, &mut pass).await;
+        pass.admitted()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30157,26 +30091,21 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
+        let pass = one_pass(&cm);
         assert_eq!(
-            admitted(&classification),
+            pass.admitted(),
             vec![preemptor],
             "the cap refuses {sibling}"
         );
-        assert!(unclaimed.is_empty());
         assert!(
-            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            pass.started().is_empty(),
             "the sibling must not take the room while the preemptor's victim drains"
         );
 
         report_nodes_released(&cm, victim);
         settle(&cm, victim, JobState::Cancelled);
         cm.tick_preempt_freed_earmarks();
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        assert_eq!(
-            dispatched(&cm, &classification, &unclaimed),
-            vec![preemptor]
-        );
+        assert_eq!(one_pass(&cm).started(), vec![preemptor]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30199,15 +30128,14 @@ state = "UP"
         };
         assert!(cm.signal_preemption(grace, victim).unwrap());
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
+        let pass = one_pass(&cm);
         assert_eq!(
-            admitted(&classification),
+            pass.admitted(),
             vec![preemptor],
             "the cap refuses {sibling}"
         );
-        assert!(unclaimed.is_empty());
         assert!(
-            dispatched(&cm, &classification, &unclaimed).is_empty(),
+            pass.started().is_empty(),
             "the sibling must not take the room while the preemptor's victim is in its grace"
         );
         assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
@@ -30219,14 +30147,13 @@ state = "UP"
         let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
         cm.tick_preempt_freed_earmarks();
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
+        let pass = one_pass(&cm);
         assert_eq!(
-            admitted(&classification),
+            pass.admitted(),
             vec![preemptor],
             "the cap refuses {sibling}"
         );
-        assert!(unclaimed.is_empty());
-        assert!(dispatched(&cm, &classification, &unclaimed).is_empty());
+        assert!(pass.started().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30238,9 +30165,9 @@ state = "UP"
         }
         assert!(cm.preempt_freed_nodes_raw().is_empty());
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        assert_eq!(unclaimed, HashSet::from([preemptor]));
-        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+        let pass = one_pass(&cm);
+        assert!(pass.admitted().contains(&preemptor));
+        assert_eq!(pass.started(), vec![sibling]);
     }
 
     /// Once the preemptor leaves the queue mid-eviction, nothing keeps its claim and
@@ -30252,9 +30179,9 @@ state = "UP"
         let (cm, victim, preemptor, sibling) = preemptor_with_draining_victim(&dir).await;
         leave(&cm, preemptor);
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        assert_eq!(admitted(&classification), vec![sibling]);
-        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![sibling]);
+        let pass = one_pass(&cm);
+        assert_eq!(pass.admitted(), vec![sibling]);
+        assert_eq!(pass.started(), vec![sibling]);
         assert_eq!(cm.get_job(victim).unwrap().state, JobState::Completing);
     }
 
@@ -30294,17 +30221,13 @@ state = "UP"
         settle(&cm, victims[0], JobState::Completing);
         assert_eq!(cm.get_job(victims[0]).unwrap().preempted_by, Some(first));
 
-        let classification = preempt_for_unstarted(&cm).await;
+        let admitted = preempt_for_unstarted(&cm).await;
         assert_eq!(
             cm.get_job(victims[1]).unwrap().state,
             JobState::Running,
             "one node of room needs one eviction"
         );
-        assert_eq!(
-            admitted(&classification),
-            vec![first],
-            "the cap refuses {second}"
-        );
+        assert_eq!(admitted, vec![first], "the cap refuses {second}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30320,9 +30243,13 @@ state = "UP"
         fits.time_limit = Some(chrono::Duration::minutes(5));
         let fits = submit_and_wait(&cm, fits);
 
-        let classification = cm.classify_pending_jobs();
-        assert_eq!(admitted(&classification), vec![fits]);
-        assert!(!classification.claims_blocked);
+        let admitted: Vec<JobId> = cm
+            .classify_pending_jobs()
+            .jobs
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert_eq!(admitted, vec![fits]);
         cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(never).unwrap().pending_reason,
@@ -30337,38 +30264,56 @@ state = "UP"
         let first = submit_and_wait(&cm, pool_job("first", 1, None));
         let second = submit_and_wait(&cm, pool_job("second", 1, None));
 
-        let (classification, unclaimed) = classify_with_trials(&cm);
-        let admitted: Vec<JobId> = classification.jobs.iter().map(|j| j.job_id).collect();
+        let pass = one_pass(&cm);
+        assert_eq!(pass.admitted(), vec![first, second]);
         assert_eq!(
-            admitted,
+            pass.started(),
             vec![first],
             "only one more node fits under node=2"
         );
-        assert!(unclaimed.is_empty());
-        assert!(!admitted.contains(&second));
+        assert!(pass.limits.refused(second));
+        assert_eq!(
+            cm.get_job(second).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn qos_grp_node_same_pass_candidates_do_not_double_credit_one_occupied_node() {
+    async fn qos_grp_node_jobs_credited_one_occupied_node_start_within_the_cap() {
         // Two running jobs already occupy n1 and n2 under a QOS capped at
         // grp_tres node=2 -- the cap is already fully claimed by real running
-        // jobs. Only n1 has spare capacity (n2 is modeled at zero total
-        // capacity, per this harness's convention for "no room"). Two pending
-        // 1-node jobs of the same QOS are submitted together and evaluated in
-        // the *same* classify_pending_jobs() pass: only one of them can
-        // actually pack onto n1's spare capacity, so the other must be
-        // charged for a genuinely new (3rd) distinct node and blocked. If
-        // both independently compute a reuse credit for n1 (each unaware the
-        // other already claimed it this pass), both are admitted with
-        // grp_node_charge=0 and the grp cap of 2 is silently exceeded once
-        // real placement resolves the race for n1.
+        // jobs. Both pending jobs need the credit for n1 to fit, so both are
+        // steered there. Once the first fills n1, the second must not start on
+        // idle n3.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 128000);
-        register_node(&cm, "n2", 0, 0);
+        let (id_a, id_b) = two_qos_jobs_credited_one_occupied_node(&cm, 2);
+
+        let pass = pass_starting_the_first_on_n1(&cm, id_a, id_b, true);
+        assert_eq!(pass.started(), vec![id_a]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_jobs_that_fit_without_the_credit_are_hinted_an_occupied_node_once() {
+        // As above under a cap of 3: each job fits on a fresh node too, so only
+        // the first is steered to n1, and the second takes the third node.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let (id_a, id_b) = two_qos_jobs_credited_one_occupied_node(&cm, 3);
+
+        let pass = pass_starting_the_first_on_n1(&cm, id_a, id_b, false);
+        assert_eq!(pass.started(), vec![id_a, id_b]);
+        assert_eq!(started_on(&pass, id_b), Some(vec!["n3".to_string()]));
+    }
+
+    /// Two running jobs of QOS "cvs", capped at `cap` nodes, occupy n1 and n2, and
+    /// n3 is idle. Returns two pending 1-node jobs of the same QOS, both credited
+    /// for packing onto n1, which has room for one of them.
+    fn two_qos_jobs_credited_one_occupied_node(cm: &ClusterManager, cap: u64) -> (JobId, JobId) {
+        register_node_pair_and_an_idle_n3(cm);
 
         let mut grp = TresRecord::new();
-        grp.set(TresType::Node, 2);
+        grp.set(TresType::Node, cap);
         cm.qos_cache().insert(Qos {
             name: "cvs".into(),
             limits: spur_core::accounting::QosLimits {
@@ -30390,54 +30335,62 @@ state = "UP"
 
         let mut job_a = basic_spec("pack-a");
         job_a.qos = Some("cvs".into());
-        job_a.num_nodes = 1;
-        let id_a = submit_and_wait(&cm, job_a);
+        job_a.cpus_per_task = 5;
+        let id_a = submit_and_wait(cm, job_a);
 
         let mut job_b = basic_spec("pack-b");
         job_b.qos = Some("cvs".into());
-        job_b.num_nodes = 1;
-        let id_b = submit_and_wait(&cm, job_b);
+        job_b.cpus_per_task = 5;
+        let id_b = submit_and_wait(cm, job_b);
+        (id_a, id_b)
+    }
 
-        let pending = cm.pending_jobs();
-        let a = pending.iter().find(|j| j.job_id == id_a);
-        let b = pending.iter().find(|j| j.job_id == id_b);
+    /// n1 with room for one 5-CPU job, n2 with none and an idle n3. The running
+    /// jobs inserted on n1 and n2 don't take their room in this harness.
+    fn register_node_pair_and_an_idle_n3(cm: &ClusterManager) {
+        register_node(cm, "n1", 8, 128000);
+        register_node(cm, "n2", 0, 0);
+        register_node(cm, "n3", 8, 128000);
+    }
 
-        assert!(
-            a.is_some(),
-            "the higher-priority candidate must be admitted and credited for reusing n1"
-        );
-        assert_eq!(
-            a.unwrap().preferred_nodes,
-            HashSet::from(["n1".to_string()]),
-            "the admitted job must be credited with n1 specifically"
-        );
-        assert!(
-            b.is_none(),
-            "a second same-pass candidate must not ALSO be credited for n1's \
-             already-claimed spare capacity: at most one job can actually \
-             pack onto it, so the second must be charged for a genuinely new \
-             (3rd) node and blocked at the grp cap of 2"
-        );
+    /// One pass in which the first job is hinted to n1 and takes n1's spare room, and
+    /// the second is hinted to n1 only when `second_steered`.
+    fn pass_starting_the_first_on_n1(
+        cm: &ClusterManager,
+        first: JobId,
+        second: JobId,
+        second_steered: bool,
+    ) -> crate::scheduler_loop::TestPass<'_> {
+        let pass = one_pass(cm);
+        let hint = |id: JobId| {
+            pass.pending
+                .iter()
+                .find(|j| j.job_id == id)
+                .map(|j| j.preferred_nodes.clone())
+        };
+        let n1 = HashSet::from(["n1".to_string()]);
+        assert_eq!(hint(first), Some(n1.clone()));
+        let second_hint = if second_steered { n1 } else { HashSet::new() };
+        assert_eq!(hint(second), Some(second_hint));
+        assert_eq!(started_on(&pass, first), Some(vec!["n1".to_string()]));
+        pass
+    }
 
-        cm.refresh_pending_reasons();
-        assert_eq!(
-            cm.get_job(id_b).unwrap().pending_reason,
-            PendingReason::QosGrpNodeLimit,
-            "the second job must block on the grp node cap rather than being \
-             silently admitted on a duplicate reuse credit for n1"
-        );
+    fn started_on(pass: &crate::scheduler_loop::TestPass<'_>, id: JobId) -> Option<Vec<String>> {
+        pass.assignments
+            .iter()
+            .find(|a| a.job_id == id)
+            .map(|a| a.nodes.clone())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn account_grp_node_same_pass_candidates_do_not_double_credit_one_occupied_node() {
-        // Same bug, one layer up: an account association capped at grp_tres
-        // node=2, already fully claimed by two real running jobs (only one
-        // of which has spare capacity), must not let two same-pass pending
-        // jobs both claim reuse credit for that single occupied node.
+    async fn account_grp_node_jobs_credited_one_occupied_node_start_within_the_cap() {
+        // As above for an account capped at grp_tres node=2 and filled by two
+        // running jobs: two pending jobs credited for n1's spare room must not take
+        // the account to a third node.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 128000);
-        register_node(&cm, "n2", 0, 0);
+        register_node_pair_and_an_idle_n3(&cm);
 
         let mut grp = TresRecord::new();
         grp.set(TresType::Node, 2);
@@ -30462,39 +30415,16 @@ state = "UP"
 
         let mut job_a = basic_spec("acct-pack-a");
         job_a.account = Some("research".into());
-        job_a.num_nodes = 1;
+        job_a.cpus_per_task = 5;
         let id_a = submit_and_wait(&cm, job_a);
 
         let mut job_b = basic_spec("acct-pack-b");
         job_b.account = Some("research".into());
-        job_b.num_nodes = 1;
+        job_b.cpus_per_task = 5;
         let id_b = submit_and_wait(&cm, job_b);
 
-        let pending = cm.pending_jobs();
-        let a = pending.iter().find(|j| j.job_id == id_a);
-        let b = pending.iter().find(|j| j.job_id == id_b);
-
-        assert!(
-            a.is_some(),
-            "the higher-priority candidate must be admitted and credited for reusing n1"
-        );
-        assert_eq!(
-            a.unwrap().preferred_nodes,
-            HashSet::from(["n1".to_string()]),
-        );
-        assert!(
-            b.is_none(),
-            "a second same-pass candidate must not also be credited for n1's \
-             already-claimed spare capacity"
-        );
-
-        cm.refresh_pending_reasons();
-        assert_eq!(
-            cm.get_job(id_b).unwrap().pending_reason,
-            PendingReason::AssocGrpNodeLimit,
-            "the second job must block on the grp node cap rather than being \
-             silently admitted on a duplicate reuse credit for n1"
-        );
+        let pass = pass_starting_the_first_on_n1(&cm, id_a, id_b, true);
+        assert_eq!(pass.started(), vec![id_a]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30763,39 +30693,6 @@ state = "UP"
             assignment.nodes.iter().all(|n| n != "n1"),
             "must never place on the k0s-reserved node n1: {:?}",
             assignment.nodes
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_pass_account_grp_node_block_tags_reason_not_none() {
-        // Account grp_tres node=1: the second job is blocked only by the first's
-        // in-pass reservation. Expect AssocGrpNodeLimit, not None.
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 16000);
-        let mut grp = TresRecord::new();
-        grp.set(TresType::Node, 1);
-        cm.association_cache().insert_limits(
-            "testuser",
-            "research",
-            spur_core::accounting::AccountLimits {
-                grp_tres: Some(grp),
-                ..Default::default()
-            },
-        );
-
-        let mut s1 = basic_spec("a1");
-        s1.account = Some("research".into());
-        let j1 = submit_and_wait(&cm, s1);
-        let mut s2 = basic_spec("a2");
-        s2.account = Some("research".into());
-        let j2 = submit_and_wait(&cm, s2);
-
-        cm.refresh_pending_reasons();
-        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
-        assert_eq!(
-            cm.get_job(j2).unwrap().pending_reason,
-            PendingReason::AssocGrpNodeLimit
         );
     }
 
@@ -32010,13 +31907,16 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_does_not_oversubscribe_qos_grp_node_within_one_pass() {
-        // Three pending 1-node jobs share a QOS capped at grp_tres node=2. Each
-        // fits against the empty running total, but a single pass must admit at
-        // most 2 or the QOSGrpNodeLimit is over-subscribed.
+    async fn one_pass_does_not_start_past_the_qos_grp_node_cap() {
+        // Three exclusive 1-node jobs share a QOS capped at grp_tres node=2. Each
+        // fits against the empty running total, but a single pass must start at
+        // most 2 or the QOSGrpNodeLimit is over-subscribed. The third is blocked
+        // only by this pass's starts and reports the cap, not None.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 64, 128000);
+        for n in ["n1", "n2", "n3"] {
+            register_node(&cm, n, 64, 128000);
+        }
         let mut grp = TresRecord::new();
         grp.set(TresType::Node, 2);
         cm.qos_cache().insert(Qos {
@@ -32032,27 +31932,33 @@ state = "UP"
             .map(|i| {
                 let mut s = basic_spec(&format!("b{i}"));
                 s.qos = Some("burst".into());
+                s.exclusive = true;
                 submit_and_wait(&cm, s)
             })
             .collect();
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        let pass = one_pass(&cm);
+        assert_eq!(pass.started(), ids[..2], "grp_tres node=2 allows 2");
+        let reason = PendingReason::QosGrpNodeLimit;
+        assert_eq!(pass.limits.refusals(), vec![(ids[2], reason.clone(), None)]);
         assert_eq!(
-            granted, 2,
-            "pending_jobs() returned {granted} burst jobs but grp_tres node=2 allows 2"
+            cm.get_job(ids[0]).unwrap().pending_reason,
+            PendingReason::None
         );
+        assert_eq!(cm.get_job(ids[2]).unwrap().pending_reason, reason);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_qos_grp_reserves_highest_priority_first() {
+    async fn qos_grp_cap_starts_the_high_priority_job_and_refuses_the_low_priority_one() {
         // A high-priority 2-node job and a low-priority 1-node job share a QOS
-        // capped at grp_tres node=2. The pass must keep the high-priority job
-        // (which alone fills the cap) and drop the low-priority one, not admit
-        // the small job first and starve the large one.
+        // capped at grp_tres node=2, with room to place both. The pass must start
+        // the high-priority job (which alone fills the cap) and refuse the
+        // low-priority one, not start the small job first and starve the large one.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 64, 128000);
+        for n in ["n1", "n2", "n3"] {
+            register_node(&cm, n, 64, 128000);
+        }
         let mut grp = TresRecord::new();
         grp.set(TresType::Node, 2);
         cm.qos_cache().insert(Qos {
@@ -32069,33 +31975,39 @@ state = "UP"
         big.num_nodes = 2;
         big.num_tasks = 2;
         big.priority = Some(1000);
+        big.exclusive = true;
         let big_id = submit_and_wait(&cm, big);
 
         let mut small = basic_spec("small");
         small.qos = Some("burst".into());
         small.num_nodes = 1;
         small.priority = Some(1);
+        small.exclusive = true;
         let small_id = submit_and_wait(&cm, small);
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        assert!(
-            pending.contains(&big_id),
-            "the highest-priority job must win the group reservation"
+        let pass = one_pass(&cm);
+        assert_eq!(
+            pass.started(),
+            vec![big_id],
+            "the highest-priority job must start first"
         );
-        assert!(
-            !pending.contains(&small_id),
-            "the low-priority job must not consume headroom the big job needs"
+        assert_eq!(
+            pass.limits.refusals(),
+            vec![(small_id, PendingReason::QosGrpNodeLimit, None)],
+            "the low-priority job must not consume headroom the big job used"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_does_not_oversubscribe_account_grp_node_within_one_pass() {
+    async fn one_pass_does_not_start_past_the_account_grp_node_cap() {
         // Same one-pass over-subscription guard, one layer up: an account
-        // association capped at grp_tres node=2 must not admit 3 pending 1-node
-        // jobs in a single pass.
+        // association capped at grp_tres node=2 must not start 3 exclusive 1-node
+        // jobs in a single pass, and the third reports the cap, not None.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 64, 128000);
+        for n in ["n1", "n2", "n3"] {
+            register_node(&cm, n, 64, 128000);
+        }
         let mut grp = TresRecord::new();
         grp.set(TresType::Node, 2);
         cm.association_cache().insert_limits(
@@ -32111,22 +32023,26 @@ state = "UP"
             .map(|i| {
                 let mut s = basic_spec(&format!("a{i}"));
                 s.account = Some("research".into());
+                s.exclusive = true;
                 submit_and_wait(&cm, s)
             })
             .collect();
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        let pass = one_pass(&cm);
+        assert_eq!(pass.started(), ids[..2], "grp_tres node=2 allows 2");
+        let reason = PendingReason::AssocGrpNodeLimit;
+        assert_eq!(pass.limits.refusals(), vec![(ids[2], reason.clone(), None)]);
         assert_eq!(
-            granted, 2,
-            "pending_jobs() returned {granted} account jobs but grp_tres node=2 allows 2"
+            cm.get_job(ids[0]).unwrap().pending_reason,
+            PendingReason::None
         );
+        assert_eq!(cm.get_job(ids[2]).unwrap().pending_reason, reason);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_does_not_oversubscribe_account_max_running_jobs_within_one_pass() {
+    async fn one_pass_does_not_start_past_the_account_max_running_jobs() {
         // Same guard as the QOS max_jobs_per_user test, one layer up: an account
-        // association capped at max_running_jobs=2 must not admit 3 pending jobs
+        // association capped at max_running_jobs=2 must not start 3 pending jobs
         // from one user in a single pass even though none is running yet.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -32148,19 +32064,19 @@ state = "UP"
             })
             .collect();
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        let pass = one_pass(&cm);
+        assert_eq!(pass.started(), ids[..2], "max_running_jobs=2 allows 2");
         assert_eq!(
-            granted, 2,
-            "pending_jobs() returned {granted} account jobs but max_running_jobs=2 allows 2"
+            pass.limits.refusals(),
+            vec![(ids[2], PendingReason::AssocMaxJobsLimit, None)]
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_does_not_oversubscribe_qos_max_jobs_per_user_within_one_pass() {
-        // The per-user running-job count cap is a same-pass accumulator too: three
+    async fn one_pass_does_not_start_past_the_qos_max_jobs_per_user() {
+        // The per-user running-job count cap counts this pass's starts too: three
         // pending jobs from one user under a QOS capped at max_jobs_per_user=2
-        // must not all be admitted in a single pass even though none is running yet.
+        // must not all start in a single pass even though none is running yet.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
@@ -32181,11 +32097,11 @@ state = "UP"
             })
             .collect();
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        let pass = one_pass(&cm);
+        assert_eq!(pass.started(), ids[..2], "max_jobs_per_user=2 allows 2");
         assert_eq!(
-            granted, 2,
-            "pending_jobs() returned {granted} jobs but max_jobs_per_user=2 allows 2"
+            pass.limits.refusals(),
+            vec![(ids[2], PendingReason::QoSMaxJobsPerUser, None)]
         );
     }
 
@@ -32355,7 +32271,7 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_still_enforces_the_cap_once_the_cache_is_warm() {
+    async fn one_pass_still_enforces_the_cap_once_the_cache_is_warm() {
         // The guard must not swallow the limit it protects: with the cache loaded
         // the cap applies exactly as before.
         let dir = TempDir::new().unwrap();
@@ -32363,7 +32279,12 @@ state = "UP"
         register_node(&cm, "n1", 64, 128000);
         let ids = submit_three_under_capped_qos(&cm);
 
-        assert_eq!(admitted_of(&cm, &ids), 2);
+        let pass = one_pass(&cm);
+        assert_eq!(pass.started(), ids[..2]);
+        assert_eq!(
+            pass.limits.refusals(),
+            vec![(ids[2], PendingReason::QoSMaxJobsPerUser, None)]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32396,10 +32317,15 @@ state = "UP"
             ..Default::default()
         });
 
+        let warm = one_pass(&cm);
         assert_eq!(
-            admitted_of(&cm, &ids),
-            2,
+            warm.started(),
+            ids[..2],
             "once the cache reloads the hold clears and the cap applies"
+        );
+        assert_eq!(
+            warm.limits.refusals(),
+            vec![(ids[2], PendingReason::QoSMaxJobsPerUser, None)]
         );
     }
 
@@ -32441,10 +32367,10 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_jobs_does_not_oversubscribe_qos_max_tres_per_user_within_one_pass() {
+    async fn one_pass_does_not_start_past_the_qos_max_tres_per_user() {
         // The per-user TRES cap (distinct from the group cap) also accumulates
         // within a pass: two 3-cpu jobs from one user under maxtresperuser cpu=4
-        // must not both be admitted (3+3 > 4), even with an empty running set.
+        // must not both start (3+3 > 4), even with an empty running set.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
@@ -32468,11 +32394,15 @@ state = "UP"
             })
             .collect();
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        let pass = one_pass(&cm);
         assert_eq!(
-            granted, 1,
-            "pending_jobs() returned {granted} jobs but maxtresperuser cpu=4 fits only one 3-cpu job"
+            pass.started(),
+            ids[..1],
+            "maxtresperuser cpu=4 fits only one 3-cpu job"
+        );
+        assert_eq!(
+            pass.limits.refusals(),
+            vec![(ids[1], PendingReason::QosMaxCpuPerUserLimit, None)]
         );
     }
 
@@ -44368,15 +44298,16 @@ mod idle_fill_aggregate_tests {
         Job::new(job_id, spec)
     }
 
-    fn gate(job: &mut Job, qos: &Qos, jobs: &HashMap<JobId, Job>) -> Result<u64, PendingReason> {
+    fn gate(job: &Job, qos: &Qos, jobs: &HashMap<JobId, Job>) -> Result<u64, PendingReason> {
         qos_block_with(
             job,
             qos,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default(),
             None,
         )
+        .map(|admitted| admitted.charge.nodes)
         .map_err(|blocked| blocked.reason)
     }
 
@@ -44385,9 +44316,9 @@ mod idle_fill_aggregate_tests {
         let qos = grp_node_qos("team", 1);
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         assert!(
-            gate(&mut cand, &qos, &jobs).is_ok(),
+            gate(&cand, &qos, &jobs).is_ok(),
             "a borrowed sibling must not occupy the group node quota"
         );
 
@@ -44395,9 +44326,9 @@ mod idle_fill_aggregate_tests {
         // node exclusion is what admits the legitimate job.
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         assert_eq!(
-            gate(&mut cand, &qos, &jobs),
+            gate(&cand, &qos, &jobs),
             Err(PendingReason::QosGrpNodeLimit)
         );
     }
@@ -44413,14 +44344,14 @@ mod idle_fill_aggregate_tests {
         };
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
-        let mut cand = candidate(2, "alice", "team", 1);
-        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+        let cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&cand, &qos, &jobs).is_ok());
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         assert_eq!(
-            gate(&mut cand, &qos, &jobs),
+            gate(&cand, &qos, &jobs),
             Err(PendingReason::QoSMaxJobsPerUser)
         );
     }
@@ -44436,14 +44367,14 @@ mod idle_fill_aggregate_tests {
         };
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
-        let mut cand = candidate(2, "alice", "team", 1);
-        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+        let cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&cand, &qos, &jobs).is_ok());
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         assert_eq!(
-            gate(&mut cand, &qos, &jobs),
+            gate(&cand, &qos, &jobs),
             Err(PendingReason::QosMaxSubmitJobPerUserLimit)
         );
     }
@@ -44496,9 +44427,9 @@ mod idle_fill_aggregate_tests {
         };
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "burst", &["n1"], false));
-        let mut cand = candidate(2, "alice", "burst", 1);
+        let cand = candidate(2, "alice", "burst", 1);
         assert_eq!(
-            gate(&mut cand, &qos, &jobs),
+            gate(&cand, &qos, &jobs),
             Err(PendingReason::QoSMaxJobsPerUser)
         );
     }
@@ -44559,7 +44490,7 @@ mod idle_fill_aggregate_tests {
     }
 
     fn account_gate(
-        job: &mut Job,
+        job: &Job,
         assoc: &AssociationCache,
         jobs: &HashMap<JobId, Job>,
     ) -> Result<u64, PendingReason> {
@@ -44567,10 +44498,10 @@ mod idle_fill_aggregate_tests {
             job,
             assoc,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default(),
         )
-        .map(|admitted| admitted.charge)
+        .map(|admitted| admitted.charge.nodes)
     }
 
     #[test]
@@ -44578,17 +44509,17 @@ mod idle_fill_aggregate_tests {
         let assoc = assoc_with("alice", "acct", node_cap(1));
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         assert!(
-            account_gate(&mut cand, &assoc, &jobs).is_ok(),
+            account_gate(&cand, &assoc, &jobs).is_ok(),
             "a borrowed sibling must not occupy the association node quota"
         );
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Err(PendingReason::AssocGrpNodeLimit)
         );
     }
@@ -44605,14 +44536,14 @@ mod idle_fill_aggregate_tests {
         );
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
-        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+        let cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&cand, &assoc, &jobs).is_ok());
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Err(PendingReason::AssocMaxJobsLimit)
         );
     }
@@ -44629,14 +44560,14 @@ mod idle_fill_aggregate_tests {
         );
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
-        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+        let cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&cand, &assoc, &jobs).is_ok());
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Err(PendingReason::AssocMaxSubmitJobLimit)
         );
     }
@@ -44656,9 +44587,9 @@ mod idle_fill_aggregate_tests {
         );
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Err(PendingReason::AssocMaxJobsLimit)
         );
     }
@@ -44676,9 +44607,9 @@ mod idle_fill_aggregate_tests {
         jobs.insert(3, running_in_account(3, "alice", "acct", &["n3"], false));
         jobs.insert(4, running_in_account(4, "alice", "acct", &["n4"], true));
         jobs.insert(5, running_in_account(5, "alice", "acct", &["n5"], true));
-        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        let cand = candidate_in_account(6, "alice", "acct", 2);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Ok(2),
             "3 legitimate + 2 new = 5 <= 6; the borrowed pair is outside the quota"
         );
@@ -44692,9 +44623,9 @@ mod idle_fill_aggregate_tests {
                 running_in_account(id, "alice", "acct", &[LEAF[id as usize]], false),
             );
         }
-        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        let cand = candidate_in_account(6, "alice", "acct", 2);
         assert_eq!(
-            account_gate(&mut cand, &assoc, &jobs),
+            account_gate(&cand, &assoc, &jobs),
             Err(PendingReason::AssocGrpNodeLimit)
         );
     }
@@ -44728,39 +44659,42 @@ mod idle_fill_aggregate_tests {
             1,
             running_in_account(1, "alice", "acct", &["shared"], false),
         );
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         let charge = account_block_with(
-            &mut cand,
+            &cand,
             &assoc,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&nodes),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&nodes)),
+            &EvictionHolds::default(),
         )
         .expect("within cap")
         .charge;
         assert_eq!(
-            charge, 0,
+            charge.nodes, 0,
             "packing onto a legitimate occupied node is credited"
         );
-        assert!(cand.preferred_nodes.contains("shared"));
+        assert!(charge.credited.contains("shared"));
 
         // Borrowed sibling on `shared`: the node is outside the account's
         // occupied set, so the candidate is charged a full new node and gets no
         // packing hint — consistent with the node being excluded from the aggregate.
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_account(1, "alice", "acct", &["shared"], true));
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         let charge = account_block_with(
-            &mut cand,
+            &cand,
             &assoc,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&nodes),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&nodes)),
+            &EvictionHolds::default(),
         )
         .expect("within cap")
         .charge;
-        assert_eq!(charge, 1, "a borrowed-only node grants no reuse credit");
-        assert!(!cand.preferred_nodes.contains("shared"));
+        assert_eq!(
+            charge.nodes, 1,
+            "a borrowed-only node grants no reuse credit"
+        );
+        assert!(!charge.credited.contains("shared"));
     }
 
     fn bounded(mut job: Job) -> Job {
@@ -44964,16 +44898,16 @@ mod idle_fill_aggregate_tests {
         // Alice runs one legitimate job, which binds *her* limit.
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut alice_again = candidate(2, "alice", "team", 1);
+        let alice_again = candidate(2, "alice", "team", 1);
         assert_eq!(
-            gate(&mut alice_again, &qos, &jobs),
+            gate(&alice_again, &qos, &jobs),
             Err(PendingReason::QoSMaxJobsPerUser),
             "alice's own legitimate job binds alice's per-user limit"
         );
         // Bob is unaffected by it.
-        let mut bob = candidate(3, "bob", "team", 1);
+        let bob = candidate(3, "bob", "team", 1);
         assert!(
-            gate(&mut bob, &qos, &jobs).is_ok(),
+            gate(&bob, &qos, &jobs).is_ok(),
             "alice's job must not bind bob's per-user limit"
         );
 
@@ -44981,10 +44915,10 @@ mod idle_fill_aggregate_tests {
         // effect on alice either, since a borrowed job is outside every aggregate.
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
-        let mut bob = candidate(3, "bob", "team", 1);
-        assert!(gate(&mut bob, &qos, &jobs).is_ok());
-        let mut alice_again = candidate(2, "alice", "team", 1);
-        assert!(gate(&mut alice_again, &qos, &jobs).is_ok());
+        let bob = candidate(3, "bob", "team", 1);
+        assert!(gate(&bob, &qos, &jobs).is_ok());
+        let alice_again = candidate(2, "alice", "team", 1);
+        assert!(gate(&alice_again, &qos, &jobs).is_ok());
     }
 
     #[test]
@@ -44998,20 +44932,17 @@ mod idle_fill_aggregate_tests {
 
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
-        let mut bob = candidate(2, "bob", "team", 1);
+        let bob = candidate(2, "bob", "team", 1);
         assert!(
-            gate(&mut bob, &qos, &jobs).is_ok(),
+            gate(&bob, &qos, &jobs).is_ok(),
             "alice's borrowed node must not consume the group quota bob has a claim on"
         );
 
         // Control: unstamped, alice's job does hold the group quota against bob.
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut bob = candidate(2, "bob", "team", 1);
-        assert_eq!(
-            gate(&mut bob, &qos, &jobs),
-            Err(PendingReason::QosGrpNodeLimit)
-        );
+        let bob = candidate(2, "bob", "team", 1);
+        assert_eq!(gate(&bob, &qos, &jobs), Err(PendingReason::QosGrpNodeLimit));
     }
 
     #[test]
@@ -45022,13 +44953,13 @@ mod idle_fill_aggregate_tests {
         let qos = grp_node_qos("team", 1);
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut bob = candidate(2, "bob", "team", 1);
+        let bob = candidate(2, "bob", "team", 1);
         let blocked = qos_block_with(
-            &mut bob,
+            &bob,
             &qos,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default(),
             None,
         )
         .expect_err("bob is over the shared group cap");
@@ -45046,13 +44977,13 @@ mod idle_fill_aggregate_tests {
         let qos = grp_node_qos("team", 1);
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         let blocked = qos_block_with(
-            &mut cand,
+            &cand,
             &qos,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default(),
             None,
         )
         .expect_err("over the node cap");
@@ -45080,13 +45011,13 @@ mod idle_fill_aggregate_tests {
         };
         let mut jobs = HashMap::new();
         jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
-        let mut cand = candidate(2, "alice", "team", 1);
+        let cand = candidate(2, "alice", "team", 1);
         let blocked = qos_block_with(
-            &mut cand,
+            &cand,
             &qos,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default(),
             None,
         )
         .expect_err("over both caps");
@@ -45151,16 +45082,16 @@ mod idle_fill_aggregate_tests {
             1,
             running_in_account(1, "alice", "acct", &["shared"], false),
         );
-        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let cand = candidate_in_account(2, "alice", "acct", 1);
         let admitted = account_block_with(
-            &mut cand,
+            &cand,
             &assoc,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&nodes),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&nodes)),
+            &EvictionHolds::default(),
         )
         .expect("credited admission");
-        assert_eq!(admitted.charge, 0, "packing credit applied");
+        assert_eq!(admitted.charge.nodes, 0, "packing credit applied");
         assert!(
             !admitted.admits_without_credit,
             "admission depended on the credit, so this job must not be collected"
@@ -45169,13 +45100,13 @@ mod idle_fill_aggregate_tests {
         // A cap with room to spare admits the same job at full charge, so dropping
         // the hint is safe.
         let assoc = assoc_with("alice", "acct", node_cap(4));
-        let mut cand = candidate_in_account(3, "alice", "acct", 1);
+        let cand = candidate_in_account(3, "alice", "acct", 1);
         let admitted = account_block_with(
-            &mut cand,
+            &cand,
             &assoc,
             &QuotaLedger::from_jobs(jobs.values()),
-            &ReuseView::uncapped(&nodes),
-            &PassReservations::default(),
+            Placement::Packing(&ReuseView::uncapped(&nodes)),
+            &EvictionHolds::default(),
         )
         .expect("within cap");
         assert!(

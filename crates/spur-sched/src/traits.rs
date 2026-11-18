@@ -70,11 +70,15 @@ impl ClusterState<'_> {
     }
 }
 
-/// A job backfill is about to start on `nodes`, running from `start` to `end`.
+/// A job backfill is about to start, or plans to, on `nodes` in `partition`, running
+/// from `start` to `end`. `memory_adjustment` is the partition memory policy's reshape
+/// of its request, as on its [`Assignment`].
 #[derive(Debug, Clone, Copy)]
 pub struct JobStart<'a> {
     pub job: &'a Job,
     pub nodes: &'a [String],
+    pub partition: Option<&'a str>,
+    pub memory_adjustment: Option<MemoryAdjustment>,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
 }
@@ -82,14 +86,22 @@ pub struct JobStart<'a> {
 /// Lets the caller admit or refuse each start before backfill commits it, so limits
 /// are charged on the nodes a job actually gets.
 ///
-/// Jobs are asked in placement order, each at most once per pass, and the pass
-/// returns exactly the admitted starts. A heterogeneous job is asked once, after its
-/// last component is placed, or when the pass ends if the depth limit cuts it.
+/// Jobs are asked in placement order, each at most once per pass, and the pass returns
+/// exactly the admitted starts. A heterogeneous job's components are placed one after
+/// another, at its first component's queue position. Components that must wait are each
+/// asked `may_reserve`; those that can start now are asked `admit` together after the
+/// last one, or at the end of the pass if the depth limit cuts the group.
 pub trait StartAdmission {
     /// Whether all of `starts` may start: one job, or the components of a
     /// heterogeneous job starting in this pass, which start together or not at all.
     /// Admitting is a commitment: later jobs must see the room these take.
     fn admit(&mut self, starts: &[JobStart<'_>]) -> bool;
+
+    /// Whether a job that can't start now may reserve `slot`, the future start
+    /// backfill found for it. A refused job holds no slot and releases its handoffs.
+    fn may_reserve(&mut self, _slot: &JobStart<'_>) -> bool {
+        true
+    }
 }
 
 /// Admission without limits: every placed job starts.

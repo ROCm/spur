@@ -174,13 +174,13 @@ Read RPCs are forwarded too (consistency with leader state), unless the request 
 
 **Per-cycle flow:**
 1. Cancel unsatisfiable dependency jobs
-2. Drive burst-buffer stage-in
+2. Complete the burst-buffer stage-ins in flight (`drive_bb_stage_in`)
 3. Sweep orphaned placements (held back 2x dispatch_timeout after leadership change)
 4. Purge expired reservations, enforce reservation end times, evict expired terminal jobs
 5. Run node health checks
-6. Classify pending jobs (QOS/account limits, burst-buffer, licenses, idle-fill candidates)
+6. Classify pending jobs (QOS/account limits, burst-buffer, licenses, idle-fill candidates); no QOS or account limit is charged yet
 7. Build `ClusterState` (nodes off dispatch cooldown, partitions, reservations, topology, busy_until)
-8. Run `BackfillScheduler::schedule()` in `catch_unwind` (a panic skips the cycle, not the loop)
+8. `plan_pass`: run `BackfillScheduler::schedule_with()` in `catch_unwind` (a panic skips the cycle, not the loop), with `LimitAdmission` charging QOS and account limits as each job starts, then start burst-buffer stage-in for jobs still within their limits
 9. Dispatch assignments: propose `JobStart` via Raft, fan out `LaunchJob` RPCs to agents
 10. Record cycle stats
 

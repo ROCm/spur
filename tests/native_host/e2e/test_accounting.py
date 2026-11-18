@@ -883,6 +883,64 @@ class TestQosLimitReasons:
             for job_id in submitted:
                 c.scancel(job_id)
 
+    def test_jobs_queued_for_a_busy_node_hold_no_grp_node_quota_and_the_started_job_does(
+        self, accounting_cluster
+    ):
+        """Jobs pinned to a busy node fit a grp node=1 cap but cannot start, so none of
+        them may hold it from a job behind them that can start on a free node. Once that
+        job runs it holds the cap, so none of them start when the busy node frees."""
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes: one busy, one free")
+        busy = c.node_names[0]
+
+        c.sacctmgr(["add", "qos", "name=queuecap", "grptres=node=1"])
+        time.sleep(15)
+
+        hold = c.write_file("queuecap-hold.sh", "#!/bin/bash\nsleep 900\n")
+        submitted = []
+
+        def submit(name, minutes, *flags):
+            job_id = parse_job_id(
+                c.sbatch(["-J", name, "-N", "1", "--exclusive", "-t", str(minutes), *flags, hold])
+            )
+            assert job_id is not None
+            submitted.append(job_id)
+            return job_id
+
+        try:
+            # Outside the QOS, so the cap starts empty.
+            occupied = submit("qc-hold", 30, "-w", busy)
+            wait_job_state(c, occupied, "R", timeout=60)
+
+            pinned = [submit(f"qc-pinned-{i}", 10, "-q", "queuecap", "-w", busy) for i in range(10)]
+            free = submit("qc-free", 10, "-q", "queuecap")
+            try:
+                wait_job_state(c, free, "R", timeout=90)
+            except (AssertionError, TimeoutError) as exc:
+                raise AssertionError(
+                    f"jobs queued for a busy node held grp node quota: {_reason(c, free)!r}\n"
+                    f"{c.squeue(['-t', 'all', '-o', '%i %j %t %r'])}"
+                ) from exc
+            out = c.squeue_all()
+            assert job_state(out, occupied) == "R"
+            assert all(job_state(out, j) == "PD" for j in pinned), out
+
+            c.scancel(occupied)
+            wait_job(c, occupied, timeout=60)
+            # Several scheduler passes with the busy node free.
+            time.sleep(20)
+            out = c.squeue_all()
+            assert job_state(out, free) == "R", out
+            started = [j for j in pinned if job_state(out, j) != "PD"]
+            assert not started, f"grptres=node=1 over-subscribed by pinned jobs {started}\n{out}"
+            assert _reason(c, pinned[0]) == "QOSGrpNodeLimit", (
+                f"pinned job {pinned[0]} reason: {_reason(c, pinned[0])!r}"
+            )
+        finally:
+            for job_id in submitted:
+                c.cli_allow_fail(["scancel", str(job_id)])
+
     def test_jobs_that_can_both_start_cannot_go_over_the_grp_node_cap_together(
         self, accounting_cluster
     ):
