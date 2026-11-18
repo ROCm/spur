@@ -1351,10 +1351,10 @@ impl BackfillScheduler {
                 }]) {
                     if self.report_unplaced {
                         debug!(
-                        job_id = job.job_id,
-                        nodes = ?node_names,
-                        partition = ?partition,
-                        "scheduling job"
+                            job_id = job.job_id,
+                            nodes = ?node_names,
+                            partition = ?partition,
+                            "scheduling job"
                         );
                     }
                 } else {
@@ -4035,7 +4035,8 @@ mod tests {
                     if require_busy {
                         job.spec.nodelist = Some("node002".into());
                     }
-                    let assignments = sched.schedule_jobs(&[job], &cluster, now, true);
+                    let assignments =
+                        sched.schedule_jobs(&[job], &cluster, now, true, &mut AdmitAll);
                     if delay == 0 && !require_busy {
                         assert_eq!(assignments.len(), 1, "{mode}");
                         assert_eq!(

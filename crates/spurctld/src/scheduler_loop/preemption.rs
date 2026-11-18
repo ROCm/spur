@@ -15,7 +15,8 @@ use spur_sched::immediate::{
 use spur_sched::partition_cap::{job_typed_gpu, PartitionNodeUsage, RunningCharge, TresCharge};
 use spur_sched::traits::{Assignment, ClusterState};
 
-use super::{partition_usage_from_jobs, ClusterManager, ReleaseWaits};
+use super::{node_request, partition_usage_from_jobs, ClusterManager, ReleaseWaits, VictimSearch};
+use crate::victim_order::VictimOrder;
 
 #[cfg(test)]
 mod tests;
@@ -71,10 +72,7 @@ impl Snapshot {
                 }
                 size.allocation(&live.alloc_resources)?;
             }
-            let holds = |job: &&Job| {
-                job.occupies_resources()
-                    || matches!(job.state, JobState::Suspended | JobState::Completing)
-            };
+            let holds = |job: &&Job| job.holds_allocation();
             for job in jobs.values() {
                 budget.spend(1)?;
                 if !holds(&job) {
@@ -244,6 +242,7 @@ pub(super) struct VictimPool<'a> {
     pub holders: &'a [Job],
     pub priority: &'a HashMap<JobId, i32>,
     pub max_priority: Option<i32>,
+    pub order: Option<VictimOrder<'a>>,
 }
 
 fn contains(held: &ResourceAllocations, slice: &ResourceAllocations) -> bool {
@@ -292,6 +291,54 @@ fn add_checked(held: &mut ResourceAllocations, slice: &ResourceAllocations) -> O
     }
     held.add(slice);
     Some(())
+}
+
+fn preferred_victims(
+    request: &Job,
+    ordered: &[&Job],
+    pool: &VictimPool<'_>,
+    state: &ClusterState<'_>,
+    now: DateTime<Utc>,
+    budget: &mut SearchBudget,
+) -> Option<HashSet<JobId>> {
+    let placement = spur_sched::node_match::NodePlacement::new(request);
+    let required = node_request(request);
+    let mut on_node: HashMap<&str, Vec<JobId>> = HashMap::new();
+    for job in ordered {
+        for node in &job.allocated_nodes {
+            budget.spend(node.len().checked_add(1)?)?;
+            on_node.entry(node).or_default().push(job.job_id);
+        }
+    }
+    for jobs in on_node.values_mut() {
+        jobs.sort_unstable();
+    }
+    let mut empty = 0usize;
+    let mut candidates = Vec::new();
+    for node in state.nodes {
+        budget.spend(1)?;
+        if !placement.matches_for_reservation(node, state.reservations, now)
+            || !node.total_resources.can_satisfy(&required)
+            || !state.handoff_allows(request, &node.name)
+        {
+            continue;
+        }
+        if let Some(jobs) = on_node.get(node.name.as_str()) {
+            candidates.push((node, jobs.as_slice()));
+        } else if node.can_satisfy_request(&required) {
+            empty += 1;
+        }
+    }
+    let short = (request.spec.num_nodes as usize)
+        .max(1)
+        .saturating_sub(empty)
+        .max(1);
+    if candidates.len() < short {
+        return Some(HashSet::new());
+    }
+    let (preferred, _) =
+        VictimSearch::new(&candidates, pool.priority, pool.order.as_ref()).run(short, budget)?;
+    Some(preferred)
 }
 
 pub(super) fn satisfiable_victim_set(
@@ -356,12 +403,6 @@ pub(super) fn satisfiable_victim_set(
             add_checked(held, alloc)?;
         }
     }
-    ordered.sort_by_key(|job| {
-        (
-            pool.priority.get(&job.job_id).copied().unwrap_or(0),
-            job.job_id,
-        )
-    });
     budget.spend(ordered.len().checked_mul(state.nodes.len())?)?;
     for job in &ordered {
         budget.spend(job.per_node_alloc.len().checked_mul(state.nodes.len())?)?;
@@ -393,6 +434,29 @@ pub(super) fn satisfiable_victim_set(
     if ordered.is_empty() {
         return None;
     }
+    let preferred = preferred_victims(request.job(), &ordered, pool, state, now, budget)?;
+    ordered.sort_by_cached_key(|job| {
+        let node = job
+            .allocated_nodes
+            .iter()
+            .min()
+            .map(String::as_str)
+            .unwrap_or("");
+        let key = pool.order.as_ref().map(|order| {
+            let freed = job
+                .allocated_nodes
+                .len()
+                .min(reclaimer.spec.num_nodes.max(1) as usize);
+            order.key(&order.rank(order.hash(node), &[job.job_id], freed as u32))
+        });
+        (
+            pool.priority.get(&job.job_id).copied().unwrap_or(0),
+            !preferred.contains(&job.job_id),
+            key,
+            node.to_owned(),
+            job.job_id,
+        )
+    });
     let mut nodes: Vec<Node> = state
         .nodes
         .iter()

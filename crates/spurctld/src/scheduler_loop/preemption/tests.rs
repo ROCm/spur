@@ -76,6 +76,15 @@ impl Fixture {
     }
 
     fn select(&self, request: &Job, budget: &mut SearchBudget) -> Option<HashSet<JobId>> {
+        self.select_with_order(request, budget, None)
+    }
+
+    fn select_with_order(
+        &self,
+        request: &Job,
+        budget: &mut SearchBudget,
+        order: Option<VictimOrder<'_>>,
+    ) -> Option<HashSet<JobId>> {
         let state = self.state();
         satisfiable_victim_set(
             request,
@@ -84,6 +93,7 @@ impl Fixture {
                 evictable: &self.eligible,
                 priority: &self.priorities,
                 max_priority: None,
+                order,
             },
             &state,
             DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
@@ -215,8 +225,45 @@ fn unpinned_selector_keeps_its_budget_with_partition_charges() {
                 Some(HashSet::from([1])),
                 "{count} nodes, GPU inventory: {with_gpus}"
             );
+            let facts = crate::victim_order::victim_facts(&f.holders, now);
+            let order = VictimOrder::new(
+                &spur_core::partition::DEFAULT_VICTIM_ORDER,
+                &facts,
+                incoming.job_id,
+            );
+            let selected = f
+                .select_with_order(&incoming, &mut SearchBudget::default(), Some(order))
+                .expect("configured ordering fits the default budget");
+            assert_eq!(selected.len(), 1);
+            assert!(selected.is_subset(&f.eligible));
         }
     }
+}
+
+#[test]
+fn configured_order_ranks_exact_shared_allocations() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    let mut f = Fixture::new(4);
+    f.hold(1, 2, 0, &[], true);
+    f.hold(2, 2, 0, &[], true);
+    f.holders[0].start_time = Some(now - chrono::Duration::hours(1));
+    f.holders[1].start_time = Some(now - chrono::Duration::minutes(1));
+    let incoming = request(1, 0);
+    let facts = crate::victim_order::victim_facts(&f.holders, now);
+    let order = VictimOrder::new(
+        &spur_core::partition::DEFAULT_VICTIM_ORDER,
+        &facts,
+        incoming.job_id,
+    );
+    assert_eq!(
+        f.select_with_order(&incoming, &mut SearchBudget::default(), Some(order)),
+        Some(HashSet::from([2]))
+    );
+    f.priorities.insert(2, 1);
+    assert_eq!(
+        f.select_with_order(&incoming, &mut SearchBudget::default(), Some(order)),
+        Some(HashSet::from([1]))
+    );
 }
 
 #[test]
@@ -251,6 +298,7 @@ fn topology_victims_enable_normal_scheduler_placement() {
                 evictable: &f.eligible,
                 priority: &f.priorities,
                 max_priority: None,
+                order: None,
             },
             &state,
             DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
@@ -665,6 +713,7 @@ fn victim_selection_profile() {
             evictable: &eligible,
             priority: &priorities,
             max_priority: None,
+            order: None,
         };
         let mut times = Vec::new();
         let mut count = 0usize;
@@ -841,7 +890,12 @@ fn snapshot_preserves_live_node_responsiveness() {
     cluster.apply_operation(&register);
     let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
     set_last_heartbeat(&cluster, "n1", Some(now - chrono::Duration::seconds(200)));
-    cluster.check_node_health_at(90, MarkDownPolicy::Only(HashSet::new()), now);
+    cluster.check_node_health_at(
+        90,
+        MarkDownPolicy::Only(HashSet::new()),
+        now,
+        std::time::Instant::now(),
+    );
 
     let snapshot = Snapshot::capture(&cluster, &f.state(), &[], now, &mut SearchBudget::default())
         .expect("silent snapshot");

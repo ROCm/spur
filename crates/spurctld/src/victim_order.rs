@@ -61,6 +61,7 @@ pub(crate) struct NodeRank {
 }
 
 /// How the nodes of one preemptor's victim search rank against each other.
+#[derive(Clone, Copy)]
 pub(crate) struct VictimOrder<'a> {
     keys: &'a [VictimOrderKey],
     facts: &'a HashMap<JobId, VictimFacts>,

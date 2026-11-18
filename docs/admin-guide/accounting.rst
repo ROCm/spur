@@ -1236,33 +1236,33 @@ failure moves the scheduler on to the next candidate.
 
 **Choosing among eligible victims**
 
-The guards decide who *may* be preempted; they do not decide who *is*. Preemption
-only frees whole nodes, so the scheduler adds nodes it can empty entirely until enough
-are free. A node counts only when it could host the pending job once empty, emptying
-it brings its partition back under ``max_tres_per_node``, and every job on it is an
-eligible victim; emptying it evicts every job on it, so a node shared with an
-ineligible job, or with a suspended or completing one, is never chosen. The set is
-worked out in memory first, and nothing is evicted unless the pending job would then
-start on the freed and already idle nodes under the normal placement rules. When no
-set passes, nothing is evicted. If a later eviction fails partway, the victims
-already evicted stay evicted.
+The guards decide who *may* be preempted; they do not decide who *is*. The
+scheduler subtracts selected jobs' exact held CPU, memory, and device allocations
+from a private projection. Protected, suspended, completing, and other retained
+allocations stay charged. A small request can therefore reclaim a share of a
+node without evicting its other tenants. Nothing is evicted unless immediate
+placement succeeds under the normal resource, partition, reservation, topology,
+and handoff rules. If an eviction later fails partway, victims already evicted
+stay evicted.
 
-Nodes are added to the set one at a time, cheapest first, in this order:
+The scheduler first ranks candidate nodes to choose a preferred group of
+victims. The rank is:
 
-1. The highest QOS ``priority`` among the jobs on the node, lowest first, so the
-   least important work is spent first.
+1. The highest QOS ``priority`` among eligible jobs on the node, lowest first.
 2. The keys of ``scheduler.preempt_victim_order`` (below).
 3. Node name.
 
-After each node is added, the free nodes are counted again: a multi-node job that is
-already in the set empties every node it spans, so those nodes count as free
-without being added one by one. Without that, a 2-node job waiting behind two
-4-node burst jobs could evict both, when either alone frees enough.
+A multi-node victim contributes to every candidate node it covers. The ranker
+counts nodes whose eligible holders would all be selected, up to the remaining
+node shortfall. This is a ranking estimate; protected allocations remain charged
+in the placement trials that decide whether eviction can help.
 
-Job ID and submit time are not consulted. ``preempt_victim_order`` ranks nodes that
-tie on QOS priority. It never makes a job preemptable or exempt: eligibility, QOS
-priority and ``preempt_exempt_time`` are settled first. Idle-fill reclaim (see
-:doc:`idle-fill-scheduling`) ranks its own victims the same way.
+The exact allocation search grows a prefix of jobs, ordered by QOS priority,
+then preference for the ranked group, then the configured keys, node name, and
+job ID. It checks placement after each addition and repeatedly removes victims
+whose eviction is unnecessary. Idle-fill reclaim uses the same search.
+Ordering never makes a job preemptable or exempt: eligibility and
+``preempt_exempt_time`` are settled first.
 
 .. code-block:: toml
 
@@ -1273,11 +1273,12 @@ The keys above are the default, so the line is only needed to change the order.
 Keys apply in the order listed: the first that tells two nodes apart decides, and
 later keys only break ties, with node name last. An empty list ``[]`` ranks by node
 name alone, which takes victims of equal QOS priority from the lowest-named node
-first. The recount above applies under ``[]`` too.
+first. The ranking estimate and exact allocation checks apply under ``[]`` too.
 
-``fewest_jobs`` and ``least_work`` are compared per node freed, so a wide job is
-not charged once for every node it empties: the nodes counted are those the pick
-empties, up to the nodes still needed.
+``fewest_jobs`` and ``least_work`` are compared per credited node, so a wide
+job's benefit is capped at the nodes still needed. When ordering individual
+jobs within the preferred group, the credit is its width capped by the request's
+node count.
 
 .. list-table::
    :header-rows: 1
@@ -1303,12 +1304,12 @@ empties, up to the nodes still needed.
 None of the keys reads the accounting database or fair-share; they use only what
 the controller holds in memory.
 
-The search is greedy: it never revisits an earlier pick, so the set is not always
-the cheapest one. Under ``[]``, for example, with two nodes needed, a 1-node job on
-``n1`` and a 2-node job on ``n2`` and ``n3``, both jobs are evicted although the
-2-node job alone is enough. A request whose per-node needs differ, such as a GPU
-total spread over several nodes, may find no set that passes the placement check
-even where another set of nodes would have; nothing is evicted then.
+The search is greedy and prunes unnecessary victims, but does not guarantee a
+globally cheapest set. It uses at most 128 placement trials per request and a
+shared cycle budget of 256 trials and two million work units. Input limits also
+bound snapshot size and node/victim counts. Exhaustion discards the whole set,
+even if a sufficient set was found before pruning finished; no eviction occurs
+from an incomplete search. A large request can remain pending at these limits.
 
 ``least_work`` comes first in the default because the cost of ``fewest_jobs`` grows
 with the victim's width: with one node needed, it prefers one 64-node job, 64

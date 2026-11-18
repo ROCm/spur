@@ -13,8 +13,9 @@ CPU, memory, GPU, partition, reservation, exclusivity, and handoff logic.
 
 The deterministic search first checks whether the request already fits, then
 whether removing all eligible jobs would place it. It grows a prefix ordered by
-QOS priority and job ID until placement succeeds, then repeatedly removes victims
-whose eviction is unnecessary. Only a fully checked final set may be acted on.
+QOS priority, a preferred group from the configured node-ranking policy,
+configured individual-job costs, node name, and job ID until placement succeeds.
+It then repeatedly removes victims whose eviction is unnecessary. Only a fully checked final set may be acted on.
 The search uses the existing greedy placement algorithm; it does not promise
 an exhaustive proof of impossibility or a globally minimum victim count.
 
@@ -73,8 +74,9 @@ products defer without allocating those placeholders.
    during pruning. The pending job retries on later cycles; there is no
    exponential subset enumeration or persistent accumulation between cycles.
 
-Selector timing and heap measurements compare the same prepared allocation
-fixtures against the base revision. They exclude fixture construction and
+The original selector timing and heap measurements below predate integration
+with configured victim ordering. They compare the same prepared allocation
+fixtures against the original base revision. They exclude fixture construction and
 controller eligibility/snapshot overhead, and use an unoptimized test build.
 They measure selector cost, not cluster throughput or end-to-end latency.
 Each timing case runs 256 repetitions in five sequential fresh-process runs per

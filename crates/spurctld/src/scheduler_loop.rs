@@ -2527,8 +2527,12 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
     }
 
     /// Picks nodes until `short` more are free: the victims and the nodes they empty.
-    fn run(mut self, short: usize) -> Option<(HashSet<spur_core::job::JobId>, Vec<&'a Node>)> {
-        self.pick(short)?;
+    fn run(
+        mut self,
+        short: usize,
+        budget: &mut SearchBudget,
+    ) -> Option<(HashSet<spur_core::job::JobId>, Vec<&'a Node>)> {
+        self.pick(short, budget)?;
         let emptied = (0..self.evacuable.len())
             .filter(|&i| self.taken[i])
             .map(|i| self.evacuable[i].0)
@@ -2536,27 +2540,29 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         Some((self.victims, emptied))
     }
 
-    fn pick(&mut self, mut short: usize) -> Option<()> {
+    fn pick(&mut self, mut short: usize, budget: &mut SearchBudget) -> Option<()> {
         let n = self.evacuable.len();
         let mut version = vec![0u32; n];
         let mut freed_of = vec![1u32; n];
         let mut heap = std::collections::BinaryHeap::with_capacity(n);
         let mut memo = HashMap::new();
         for i in 0..n {
-            heap.push(self.entry(i, short, 0, &mut memo, &mut freed_of));
+            heap.push(self.entry(i, short, 0, &mut memo, &mut freed_of, budget)?);
         }
         let mut wide: HashSet<usize> = (0..n).filter(|&i| freed_of[i] > 1).collect();
         while short > 0 {
+            budget.spend(1)?;
             let std::cmp::Reverse((.., i, ver)) = heap.pop()?;
             if self.taken[i] || ver != version[i] {
                 continue;
             }
-            let (freed, touched) = self.take(i);
+            let (freed, touched) = self.take(i, budget)?;
             short = short.saturating_sub(freed);
             if short == 0 || self.order.is_none() {
                 continue;
             }
             // A pick changes what nearby nodes add and free; a smaller shortfall caps wide picks.
+            budget.spend(wide.len())?;
             wide.retain(|&j| !self.taken[j] && freed_of[j] > 1);
             let mut stale: HashSet<usize> = touched.into_iter().collect();
             stale.extend(
@@ -2567,7 +2573,14 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
             memo.clear();
             for j in stale.into_iter().filter(|&j| !self.taken[j]) {
                 version[j] += 1;
-                heap.push(self.entry(j, short, version[j], &mut memo, &mut freed_of));
+                // Retired ranks must not accumulate across overlapping picks.
+                if heap.len() >= n * 2 {
+                    budget.spend(heap.len())?;
+                    heap.retain(|std::cmp::Reverse((.., index, generation))| {
+                        !self.taken[*index] && *generation == version[*index]
+                    });
+                }
+                heap.push(self.entry(j, short, version[j], &mut memo, &mut freed_of, budget)?);
                 if freed_of[j] > 1 {
                     wide.insert(j);
                 }
@@ -2583,18 +2596,33 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         version: u32,
         memo: &mut HashMap<&'a [spur_core::job::JobId], usize>,
         freed_of: &mut [u32],
-    ) -> SearchEntry<'a> {
+        budget: &mut SearchBudget,
+    ) -> Option<SearchEntry<'a>> {
         let (node, jobs) = self.evacuable[i];
+        budget.spend(jobs.len().checked_add(node.name.len())?.checked_add(1)?)?;
         #[cfg(test)]
         self.ranked.set(self.ranked.get() + 1);
-        let key = self.order.map(|order| {
-            // Nodes holding the same jobs free the same count, so one wide job is walked once.
-            let freed = *memo.entry(jobs).or_insert_with(|| self.freed_by(i, short));
+        let key = if let Some(order) = self.order {
+            let freed = if let Some(&freed) = memo.get(jobs) {
+                freed
+            } else {
+                let freed = self.freed_by(i, short, budget)?;
+                memo.insert(jobs, freed);
+                freed
+            };
             freed_of[i] = freed as u32;
             let new_jobs: Vec<_> = self.new_jobs(i).collect();
-            order.key(&order.rank(order.hash(&node.name), &new_jobs, freed as u32))
-        });
-        std::cmp::Reverse((self.costs[i], key, node.name.as_str(), i, version))
+            Some(order.key(&order.rank(order.hash(&node.name), &new_jobs, freed as u32)))
+        } else {
+            None
+        };
+        Some(std::cmp::Reverse((
+            self.costs[i],
+            key,
+            node.name.as_str(),
+            i,
+            version,
+        )))
     }
 
     fn new_jobs(&self, i: usize) -> impl Iterator<Item = spur_core::job::JobId> + '_ {
@@ -2614,7 +2642,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
 
     /// Nodes that taking `i` empties, itself included, counted up to `cap`: nodes past
     /// what the preemptor still needs free nothing it uses.
-    fn freed_by(&self, i: usize, cap: usize) -> usize {
+    fn freed_by(&self, i: usize, cap: usize, budget: &mut SearchBudget) -> Option<usize> {
         let adding: Vec<_> = self.new_jobs(i).collect();
         let mut counted = HashSet::from([i]);
         for j in adding
@@ -2624,19 +2652,30 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
             if counted.len() >= cap {
                 break;
             }
+            budget.spend(
+                self.evacuable[*j]
+                    .1
+                    .len()
+                    .checked_mul(adding.len().checked_add(1)?)?
+                    .checked_add(1)?,
+            )?;
             #[cfg(test)]
             self.walked.set(self.walked.get() + 1);
             if !self.taken[*j] && self.covered(*j, &adding) {
                 counted.insert(*j);
             }
         }
-        counted.len().min(cap)
+        Some(counted.len().min(cap))
     }
 
     /// Evicts `i`'s jobs: returns how many nodes it emptied and the untaken nodes whose
     /// rank that may change, those sharing a job with a node it left partly empty included.
-    fn take(&mut self, i: usize) -> (usize, Vec<usize>) {
+    fn take(&mut self, i: usize, budget: &mut SearchBudget) -> Option<(usize, Vec<usize>)> {
         let adding: Vec<_> = self.new_jobs(i).collect();
+        budget.spend(adding.len())?;
+        for id in &adding {
+            budget.spend(self.nodes_of_job.get(id).map_or(0, Vec::len))?;
+        }
         self.victims.extend(adding.iter().copied());
         let neighbours: HashSet<usize> = adding
             .iter()
@@ -2645,6 +2684,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         let mut freed = 0;
         let mut touched = HashSet::new();
         for j in neighbours {
+            budget.spend(self.evacuable[j].1.len().checked_add(1)?)?;
             if self.taken[j] {
                 continue;
             }
@@ -2659,11 +2699,12 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
                 .iter()
                 .filter(|id| !self.victims.contains(id))
             {
+                budget.spend(self.nodes_of_job.get(id).map_or(0, Vec::len))?;
                 touched.extend(self.nodes_of_job.get(id).into_iter().flatten().copied());
             }
         }
         touched.retain(|&j| !self.taken[j]);
-        (freed, touched.into_iter().collect())
+        Some((freed, touched.into_iter().collect()))
     }
 }
 
@@ -6311,6 +6352,7 @@ pub(crate) mod tests {
             occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
             priority: &'a HashMap<spur_core::job::JobId, i32>,
             max_priority: Option<i32>,
+            order: Option<VictimOrder<'a>>,
         }
 
         fn allocation_fixture(pool: &TestVictimPool<'_>, nodes: &[Node]) -> (Vec<Node>, Vec<Job>) {
@@ -6324,7 +6366,19 @@ pub(crate) mod tests {
                 for (index, id) in ids.iter().enumerate() {
                     let cpus = node.total_resources.cpus / ids.len() as u32
                         + u32::from((index as u32) < node.total_resources.cpus % ids.len() as u32);
-                    let allocation = spur_core::resource::ResourceAllocations::with_scalar(cpus, 0);
+                    let mut allocation =
+                        spur_core::resource::ResourceAllocations::with_scalar(cpus, 0);
+                    let gpus: Vec<_> = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .enumerate()
+                        .filter(|(gpu, _)| gpu % ids.len() == index)
+                        .map(|(_, gpu)| gpu.stable_id)
+                        .collect();
+                    allocation.add(&spur_core::resource::ResourceAllocations::from_device_ids(
+                        "gpu", &gpus,
+                    ));
                     node.alloc_resources.add(&allocation);
                     let job = holders
                         .entry(*id)
@@ -6348,6 +6402,7 @@ pub(crate) mod tests {
                 occupants: &occupants,
                 priority: &no_priorities(),
                 max_priority: None,
+                order: None,
             };
             assert_eq!(
                 victim_set_without_handoffs(&reclaimer(1, 1), &pool, &nodes, &[], Utc::now()),
@@ -6366,6 +6421,7 @@ pub(crate) mod tests {
                 occupants: &occupants,
                 priority: &no_priorities(),
                 max_priority: None,
+                order: None,
             };
             assert_eq!(
                 victim_set_without_handoffs(&reclaimer(1, 1), &pool, &nodes, &[], Utc::now()),
@@ -6401,6 +6457,7 @@ pub(crate) mod tests {
                     holders: &holders,
                     priority: pool.priority,
                     max_priority: pool.max_priority,
+                    order: pool.order,
                 },
                 &state,
                 Utc::now(),
@@ -6433,6 +6490,7 @@ pub(crate) mod tests {
                     holders: &holders,
                     priority: pool.priority,
                     max_priority: pool.max_priority,
+                    order: pool.order,
                 },
                 &state,
                 now,
@@ -6864,11 +6922,11 @@ pub(crate) mod tests {
                 .chain(priorities.iter().copied())
                 .collect();
             let facts: HashMap<_, _> = facts.iter().copied().collect();
-            let mut pending = reclaimer(needed, 1);
+            let mut pending = reclaimer(needed, 4);
             pending.job_id = preemptor;
             victim_set_without_handoffs(
                 &pending,
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &evictable,
                     occupants: &occupants,
                     priority: &priority,
@@ -7071,15 +7129,17 @@ pub(crate) mod tests {
                 .map(|(node, (_, jobs))| (node, jobs.as_slice()))
                 .collect();
             let facts = HashMap::new();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &HashSet::new(),
                 occupants: &HashMap::new(),
                 priority: &HashMap::new(),
                 max_priority: None,
                 order: Some(VictimOrder::new(keys, &facts, 1)),
             };
-            let mut search = VictimSearch::new(&evacuable, &pool);
-            search.pick(short).expect("the layout has enough nodes");
+            let mut search = VictimSearch::new(&evacuable, pool.priority, pool.order.as_ref());
+            search
+                .pick(short, &mut SearchBudget::default())
+                .expect("the layout has enough nodes");
             (search.ranked.get(), search.walked.get())
         }
 
@@ -7115,33 +7175,6 @@ pub(crate) mod tests {
                 .collect();
             let (ranked, _) = search_work(&DEFAULT_VICTIM_ORDER, &layout, 1000);
             assert_eq!(ranked, 3000);
-        }
-
-        /// Runs `f` with debug logs captured, returning its result and the log text.
-        fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let writer = buf.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .with_writer(move || CapturedLog(writer.clone()))
-                .finish();
-            let out = tracing::subscriber::with_default(subscriber, f);
-            let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-            (out, text)
-        }
-
-        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
         }
 
         /// The same greedy choice without the search's shortcuts: every node re-ranked
@@ -7239,15 +7272,17 @@ pub(crate) mod tests {
                     .collect();
                 let keys = orders[case % orders.len()];
                 let short = 1 + next(n as u64) as usize;
-                let pool = VictimPool {
+                let pool = TestVictimPool {
                     evictable: &HashSet::new(),
                     occupants: &HashMap::new(),
                     priority: &HashMap::new(),
                     max_priority: None,
                     order: Some(VictimOrder::new(keys, &facts_of, 1)),
                 };
-                let mut search = VictimSearch::new(&evacuable, &pool);
-                search.pick(short).expect("every node is evacuable");
+                let mut search = VictimSearch::new(&evacuable, pool.priority, pool.order.as_ref());
+                search
+                    .pick(short, &mut SearchBudget::default())
+                    .expect("every node is evacuable");
                 let expected = full_re_rank(&evacuable, pool.order.as_ref().unwrap(), short);
                 assert_eq!(
                     search.victims, expected,
@@ -7275,9 +7310,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn a_set_that_frees_enough_nodes_but_cannot_place_the_job_evicts_nobody() {
-            // a1 and a2 sort first and free two nodes but two GPUs; a1 + z9 would fit, but the
-            // search never revisits a pick, so nothing is evicted (a documented limit).
+        fn victim_search_continues_when_its_ranked_seed_cannot_place_the_job() {
             let gpu_node = |name: &str, count: u32| {
                 let mut n = node(name, 4);
                 n.total_resources.gpus = (0..count)
@@ -7301,7 +7334,7 @@ pub(crate) mod tests {
                     .into_iter()
                     .collect();
             let evictable: HashSet<spur_core::job::JobId> = [1, 2, 3].into_iter().collect();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &evictable,
                 occupants: &occupants,
                 priority: &no_priorities(),
@@ -7310,16 +7343,8 @@ pub(crate) mod tests {
             };
             let mut wants = reclaimer(2, 1);
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(9, None));
-            let (set, logs) = with_captured_logs(|| {
-                victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now())
-            });
-            assert_eq!(set, None);
-            assert!(
-                logs.contains("the job would not start on them")
-                    && logs.contains(&format!("job_id={}", wants.job_id))
-                    && logs.contains("victims=[1, 2]"),
-                "a refused set must say which job and victims: {logs}"
-            );
+            let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());
+            assert_eq!(set, Some(ids(&[1, 3])));
 
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
             let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());

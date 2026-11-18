@@ -29010,7 +29010,9 @@ state = "UP"
         register_node(&cm, "n2", 8, 16000);
         insert_preempting_qos_pair(&cm, "low", "high");
         let ids = start_jobs_in_qos(&cm, "low", jobs);
-        preempt_for_high(&cm, basic_spec("high")).await;
+        let mut high = basic_spec("high");
+        high.exclusive = true;
+        preempt_for_high(&cm, high).await;
         assert_draining(&cm, &ids, expected);
     }
 
@@ -29097,7 +29099,9 @@ state = "UP"
         .unwrap();
         settle(&cm, ids[0], JobState::Running);
 
-        preempt_for_high(&cm, basic_spec("high")).await;
+        let mut high = basic_spec("high");
+        high.exclusive = true;
+        preempt_for_high(&cm, high).await;
         assert_draining(&cm, &ids, &[0]);
     }
 
@@ -29187,6 +29191,7 @@ state = "UP"
 
         let mut claim = basic_spec("claim");
         claim.qos = Some("claim".into());
+        claim.exclusive = true;
         let claim_id = submit_and_wait(&cm, claim);
         let claimer = cm.get_job(claim_id).unwrap();
         let freed = crate::scheduler_loop::reclaim_for(&cm, &[&claimer]).await;

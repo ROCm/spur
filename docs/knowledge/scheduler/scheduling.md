@@ -222,8 +222,9 @@ partition override > global config.
 **Reservation protection** -- a job running inside an active reservation cannot
 be preempted by a job from the same or lower partition tier.
 
-**Victim selection** -- candidates are sorted by ascending QOS priority (cheapest
-first), then job ID. `scheduler_loop/preemption.rs` captures a coherent jobs/nodes
+### Victim selection
+
+`scheduler_loop/preemption.rs` captures a coherent jobs/nodes
 snapshot in the state machine's lock order and retains only placement/policy
 metadata (including suspension timing and live node responsiveness) and still-held
 resource slices. Both compact node copies preserve `not_responding`, so trials
@@ -231,6 +232,14 @@ reject unresponsive nodes through the same placement gate as normal scheduling.
 Protected, reserved-pending, suspended, completing, grace-period, and same-cycle
 allocations remain charged. Unaccounted occupancy is retained; missing or
 inconsistent slices grant no release credit.
+
+The node-ranking heap supplies a preferred victim group using highest eligible
+QOS priority, `scheduler.preempt_victim_order`, then node name. Its credited gain
+counts candidate nodes whose eligible holders are all selected, capped by the
+remaining shortfall; it does not release protected allocations. Exact trials
+remain the placement proof. Job ordering uses QOS priority, preferred-group
+membership, configured keys, node name, then job ID. Work facts retain suspension
+time and come from the compact held-job snapshot, without accounting queries.
 
 The selector checks unchanged and all-eligible projections, grows a sufficient
 prefix, and repeatedly removes unnecessary victims. `PlacementRequest` and

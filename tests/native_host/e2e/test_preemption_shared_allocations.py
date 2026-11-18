@@ -23,6 +23,7 @@ def cluster_config_overrides(victim_mode, ssh_nodes):
     return {
         "nodes": [{"names": name, "cpus": 4, "memory_mb": 100} for name in names],
         "scheduler": {"preempt_type": "qos_priority", "preempt_exempt_time": 0,
+                      "preempt_victim_order": [],
                       "idle_fill_enabled": True, "idle_fill_exempt_secs": 0},
         "auth": {"allow_root_jobs": True},
         "partitions": [{"name": "default", "nodes": ",".join(names), "default": True,
