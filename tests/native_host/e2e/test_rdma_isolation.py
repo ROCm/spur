@@ -4,22 +4,67 @@
 """E2E tests for RDMA device isolation on a node that hands out NICs per job.
 
 Node 0 needs three ``/dev/infiniband/uverbs*`` nodes the test user can open. A
-node with real ones uses them; otherwise the fixture creates stand-ins (new
-names for existing world-openable devices) and removes exactly those after the
-test. The first two are declared as ``nic`` GRES; the third stands for an HCA
-Spur does not manage, which must stay open to every job.
+node with real ones uses them. Otherwise the fixture recreates real character
+devices on node 0 as stand-ins: ones from ``STAND_IN_CANDIDATES`` that are
+already world read-write and that the test user can open, under
+``/dev/infiniband`` with their own mode, so they grant nothing new. It needs
+three distinct device numbers, plus a fourth for the GPU step test, which is
+skipped without it, and it removes exactly what it created. The first two are
+declared as ``nic`` GRES; the third stands for an HCA Spur does not manage,
+which must stay open to every job.
 """
 
 import re
+from dataclasses import dataclass
 
 import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
-# Stand-ins reuse the device numbers of tun, vsock and vfio: any opener could
-# already reach those, so the extra names grant nothing new.
-STAND_INS = [("uverbs0", 10, 200), ("uverbs1", 10, 121), ("uverbs2", 10, 196)]
-GPU_STAND_IN = "/dev/rfkill"
+# A job denied a stand-in is denied its source too (the device filter keys on
+# the device number), so none of these may be one a job shell needs.
+STAND_IN_CANDIDATES = ["/dev/full", "/dev/net/tun", "/dev/fuse", "/dev/vsock"]
+NEVER_STAND_IN = {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/ptmx"}
+
+
+@dataclass(frozen=True)
+class CharDevice:
+    path: str
+    mode: int
+    major: int
+    minor: int
+
+
+def _parse_stat_line(line: str) -> CharDevice | None:
+    """Parse ``<path> <%F> <%a> <%t> <%T>``; None unless a world read-write char device."""
+    tokens = line.strip().split()
+    if len(tokens) < 5:
+        return None
+    path, file_type = tokens[0], " ".join(tokens[1:-3])
+    try:
+        mode, major, minor = int(tokens[-3], 8), int(tokens[-2], 16), int(tokens[-1], 16)
+    except ValueError:
+        return None
+    if file_type != "character special file" or mode & 0o006 != 0o006:
+        return None
+    if path in NEVER_STAND_IN or path.startswith("/dev/pts/"):
+        return None
+    return CharDevice(path, mode, major, minor)
+
+
+def _stand_in_sources(node) -> list[CharDevice]:
+    """Candidates the test user can already open, one per device number."""
+    listed = node.exec_allow_fail(
+        f"for p in {' '.join(STAND_IN_CANDIDATES)}; do "
+        "[ -c \"$p\" ] && : < \"$p\" 2>/dev/null "
+        "&& echo \"$p $(stat -c '%F %a %t %T' \"$p\")\"; done"
+    )
+    sources, seen = [], set()
+    for device in filter(None, map(_parse_stat_line, listed.splitlines())):
+        if (device.major, device.minor) not in seen:
+            seen.add((device.major, device.minor))
+            sources.append(device)
+    return sources
 
 
 def _openable_uverbs(cluster) -> list[str]:
@@ -30,9 +75,15 @@ def _openable_uverbs(cluster) -> list[str]:
     return sorted(listed.split(), key=lambda p: int(re.sub(r"\D", "", p) or 0))
 
 
+def _device_number(node, path: str) -> tuple[int, int]:
+    major, minor = node.exec(f"stat -c '%t %T' {path}").split()
+    return int(major, 16), int(minor, 16)
+
+
 @pytest.fixture
 def standin_infiniband(unstarted_cluster):
-    """Three uverbs node paths on node 0: real ones, or stand-ins created here."""
+    """Three uverbs node paths on node 0 and their device numbers: real ones, or
+    stand-ins created here."""
     cluster = unstarted_cluster
     node = cluster.nodes[0]
     if node.exec_allow_fail("test -e /dev/infiniband && echo yes").strip() == "yes":
@@ -42,21 +93,42 @@ def standin_infiniband(unstarted_cluster):
                 f"node 0 has /dev/infiniband but {len(real)} openable uverbs nodes; "
                 "refusing to add stand-ins next to real devices"
             )
-        yield real[:3]
+        yield real[:3], {_device_number(node, p) for p in real[:3]}
         return
 
+    sources = _stand_in_sources(node)
+    if len(sources) < 3:
+        pytest.skip(
+            f"node 0 has {len(sources)} distinct world read-write char devices to stand "
+            "in for uverbs; need 3"
+        )
     sudo = cluster._sudo_prefix()
     if "ok" not in node.exec_allow_fail(f"{sudo}true && echo ok"):
         pytest.skip("creating stand-in RDMA nodes needs sudo on node 0")
-    paths = [f"/dev/infiniband/{name}" for name, _, _ in STAND_INS]
+    created_dir, created = False, []
     try:
         node.exec(f"{sudo}mkdir /dev/infiniband")
-        for (name, major, minor), path in zip(STAND_INS, paths):
-            node.exec(f"{sudo}mknod -m 0666 {path} c {major} {minor}")
-        yield paths
+        created_dir = True
+        for i, source in enumerate(sources[:3]):
+            path = f"/dev/infiniband/uverbs{i}"
+            node.exec(f"{sudo}mknod -m {source.mode:o} {path} c {source.major} {source.minor}")
+            created.append(path)
+        yield created, {(s.major, s.minor) for s in sources[:3]}
     finally:
-        node.exec_allow_fail(f"{sudo}rm -f {' '.join(paths)}")
-        node.exec_allow_fail(f"{sudo}rmdir /dev/infiniband")
+        if created:
+            node.exec_allow_fail(f"{sudo}rm -f {' '.join(created)}")
+        if created_dir:
+            node.exec_allow_fail(f"{sudo}rmdir /dev/infiniband")
+
+
+@pytest.fixture
+def gpu_stand_in(unstarted_cluster, standin_infiniband):
+    """A device node for a GRES GPU that shares no device number with the NICs."""
+    _, used = standin_infiniband
+    for source in _stand_in_sources(unstarted_cluster.nodes[0]):
+        if (source.major, source.minor) not in used:
+            return source.path
+    pytest.skip("no fourth distinct world read-write char device for the GPU stand-in")
 
 
 def _probe_body(paths: list[str]) -> str:
@@ -76,10 +148,10 @@ def _parse(out: str) -> dict:
     return dict(re.findall(r"^(\S+?)=(\S+)\r?$", out, re.MULTILINE))
 
 
-def _start(cluster, nics: list[str], constrain_rdma: bool, with_gpu: bool = False) -> None:
+def _start(cluster, nics: list[str], constrain_rdma: bool, gpu: str | None = None) -> None:
     gres = [{"name": "nic", "type": "standin", "file": p} for p in nics]
-    if with_gpu:
-        gres.append({"name": "gpu", "type": "standin", "file": GPU_STAND_IN})
+    if gpu:
+        gres.append({"name": "gpu", "type": "standin", "file": gpu})
     cluster.root_agent_preflight()
     cluster.start(
         {
@@ -118,7 +190,7 @@ def _assert_holds_one_nic(seen: dict, nic0: str, nic1: str, unmanaged: str) -> N
 class TestRdmaIsolation:
     def test_only_allocated_nics_are_reachable(self, unstarted_cluster, standin_infiniband):
         cluster = unstarted_cluster
-        nic0, nic1, unmanaged = standin_infiniband
+        (nic0, nic1, unmanaged), _ = standin_infiniband
         _start(cluster, [nic0, nic1], constrain_rdma=True)
         paths = [nic0, nic1, unmanaged]
 
@@ -136,18 +208,18 @@ class TestRdmaIsolation:
 
     def test_opting_out_keeps_rdma_open(self, unstarted_cluster, standin_infiniband):
         cluster = unstarted_cluster
-        nic0, nic1, unmanaged = standin_infiniband
+        (nic0, nic1, unmanaged), _ = standin_infiniband
         _start(cluster, [nic0, nic1], constrain_rdma=False)
 
         none = _probe(cluster, "rdma-open", [nic0, nic1, unmanaged], None)
         assert set(none.values()) == {"OPEN"}, none
 
     def test_a_gpu_step_inside_a_nic_job_keeps_the_jobs_rdma_gating(
-        self, unstarted_cluster, standin_infiniband
+        self, unstarted_cluster, standin_infiniband, gpu_stand_in
     ):
         cluster = unstarted_cluster
-        nic0, nic1, unmanaged = standin_infiniband
-        _start(cluster, [nic0, nic1], constrain_rdma=True, with_gpu=True)
+        (nic0, nic1, unmanaged), _ = standin_infiniband
+        _start(cluster, [nic0, nic1], constrain_rdma=True, gpu=gpu_stand_in)
         probe = cluster.write_file("rdma-step-probe.sh", _probe_script([nic0, nic1, unmanaged]))
         batch = cluster.write_file(
             "rdma-step.sh",
@@ -161,7 +233,7 @@ class TestRdmaIsolation:
 
     def test_an_interactive_allocation_step_is_gated(self, unstarted_cluster, standin_infiniband):
         cluster = unstarted_cluster
-        nic0, nic1, unmanaged = standin_infiniband
+        (nic0, nic1, unmanaged), _ = standin_infiniband
         _start(cluster, [nic0, nic1], constrain_rdma=True)
 
         code, out = cluster.salloc_run(
@@ -177,7 +249,7 @@ class TestRdmaIsolation:
         self, unstarted_cluster, standin_infiniband
     ):
         cluster = unstarted_cluster
-        nic0, nic1, unmanaged = standin_infiniband
+        (nic0, nic1, unmanaged), _ = standin_infiniband
         _start(cluster, [nic0, nic1], constrain_rdma=True)
         go = f"{cluster.remote_dir}/rdma-adopt-go"
         probe = cluster.write_file("rdma-adopt-probe.sh", _probe_script([nic0, nic1, unmanaged]))
