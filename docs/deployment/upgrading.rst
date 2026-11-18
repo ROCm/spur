@@ -1322,6 +1322,26 @@ multi-node or ``--mpi=pmix`` job. Such a job waits until enough upgraded nodes a
 free, including any node it names with ``--nodelist``. Every other job still runs
 on any node.
 
+.. _upgrading-per-node-runs:
+
+Batch scripts that run on every node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes how a job ends when its script runs on every node, which
+includes an ``auto`` job whose script does not call ``srun``, ``mpirun``, or
+``mpiexec`` (see :ref:`submit-script-placement`). A copy that exits cleanly now
+releases its node while the job keeps running, and the first copy that fails ends
+the job with its exit code. No configuration change is needed, and no new Raft
+entry type is added.
+
+**Upgrade every controller before relying on it.** A controller that predates
+this release still ends such a job when its first copy exits: it moves the job to
+``COMPLETING``, then after ``scheduler.complete_wait_secs`` fails it and drains the
+nodes still running a copy. It also takes the outcome from the first node alone.
+Controllers on different releases apply node completions differently, so they can
+disagree about such a job until every controller runs this release. The rolling
+playbook upgrades the leader last (see :ref:`upgrading-leader-last`).
+
 See Also
 --------
 

@@ -5,6 +5,7 @@
 
 import re
 import shlex
+import time
 
 import pytest
 
@@ -134,6 +135,49 @@ class TestScriptPlacement:
 
         assert wait_job(cluster, job_id, timeout=180) == "CD", cluster.debug_job(job_id)
         assert len(_marker_lines(cluster, marker)) == NODES
+
+
+class TestPerNodeLifecycle:
+    def test_a_job_keeps_running_while_its_copies_finish_at_different_times(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        cluster.require_nodes(NODES)
+        step_marker = f"{cluster.remote_dir}/late-step.ran"
+        # Only node 0 is still running when its step starts, so the step lands there.
+        script, marker = _runner(
+            cluster,
+            "staggered",
+            '[ "$SLURM_NODEID" = 0 ] || exit 0\n'
+            "sleep 15\n"
+            f"srun -N 1 -n 1 bash -c 'hostname >> {step_marker}'",
+        )
+
+        job_id = _submit(cluster, script, "--script-placement=all-nodes")
+
+        assert wait_job(cluster, job_id, timeout=180) == "CD", cluster.debug_job(job_id)
+        assert len(_marker_lines(cluster, marker)) == NODES
+        assert len(_marker_lines(cluster, step_marker)) == 1, (
+            "a step must still run after another node's copy finished"
+        )
+
+    def test_the_first_failed_copy_stops_the_others_and_decides_the_exit(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        cluster.require_nodes(NODES)
+        script, _ = _runner(
+            cluster,
+            "first-failure",
+            '[ "$SLURM_NODEID" = 0 ] || exit 3\nsleep 600',
+        )
+        started = time.time()
+
+        job_id = _submit(cluster, script, "--script-placement=all-nodes")
+
+        assert wait_job(cluster, job_id, timeout=180) == "F", cluster.debug_job(job_id)
+        assert time.time() - started < 300, "the sleeping copy must have been stopped"
+        assert _show(cluster, job_id, "ExitCode") == "3:0"
 
 
 class TestClusterDefaultPlacement:

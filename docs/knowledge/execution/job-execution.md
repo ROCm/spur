@@ -103,7 +103,15 @@ decides once per run at dispatch (`script_placement::resolve_run_placement` in
 On `BatchHost`, every node but the one at `task_offset` 0 runs
 `batch_companion_hold_script` with stdio on `/dev/null`, holding its slice for
 the steps the script launches. The controller stops those nodes when the batch
-host reports (`step_launch_stragglers`), and the batch host's exit is the job's.
+host reports (`ended_run_stragglers`), and the batch host's exit is the job's.
+
+On `AllNodes`, each copy's exit stands on its own (`runs_per_node` in
+`cluster.rs`; salloc and native srun allocations run no script and are left
+out). A clean exit frees that node and leaves the job Running
+(`NodeCompleteResult::StillRunning`). The first failed copy is recorded in
+`Job.first_failed_node`, moves the job to Completing, has the held nodes stopped,
+and supplies the job's exit (`finalize_reported_run`). Steps can no longer target
+a node that finished. Preemption grace and suspend keep their own handling.
 A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 

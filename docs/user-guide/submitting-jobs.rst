@@ -189,6 +189,16 @@ step, as in Slurm:
 
    srun --ntasks-per-node=1 ./prepare-node.sh
 
+When the script runs on every node, each copy ends on its own. A node whose
+copy exits cleanly is released while the others keep running, and the job ends
+once every copy has exited. The first copy that fails, with a non-zero exit, a
+signal, or by running out of memory, ends the job: Spur stops the other copies,
+and the job reports the failed copy's exit code. A node whose copy has finished
+cannot take ``srun`` steps, and a step aimed at it fails with "already finished
+its part of this job". Spur does not keep a node allocated for a step still
+running there when the node's copy exits, so a script that launches steps across
+the allocation should use ``batch-host``.
+
 ``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
 requested value while the job is pending and the one it runs with once it
 starts, and from then ``BatchHost=`` names the node the script runs on.

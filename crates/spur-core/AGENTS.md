@@ -174,6 +174,8 @@ Held in controller memory. Key fields beyond the spec:
 - `time_limit_signaled_at`, `cancel_signaled_at`: replicated instants for deterministic verdicts.
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
+- `first_failed_node`: on a per-node run, the first node whose copy failed. It ended the
+  run, so its exit is the run's. Cleared on requeue.
 - `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
   and cleared on requeue. `Job::script_placement()` falls back to the `auto` text scan when
   it is unset (a run dispatched before placements were recorded), which is what agents
