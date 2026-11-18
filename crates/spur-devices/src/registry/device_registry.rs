@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cdi::cache::CdiCache;
 use crate::gres::cache::CountableGresPool;
@@ -30,11 +30,11 @@ impl DeviceRegistry {
         self.devices.clear();
         let mut candidates = Vec::new();
 
-        let mut cdi_entries: Vec<DeviceEntry> = cdi_cache
+        let mut cdi_entries: Vec<(String, DeviceEntry)> = cdi_cache
             .iter()
-            .map(|(_, cached)| from_cdi(cached))
+            .map(|(name, cached)| (name.clone(), from_cdi(cached)))
             .collect();
-        cdi_entries.sort_by(cdi_sort_key);
+        sort_cdi_entries(&mut cdi_entries);
 
         let mut configured = Vec::new();
         for expanded in &gres_cache.injectable {
@@ -43,7 +43,7 @@ impl DeviceRegistry {
                 configured.push(entry);
             }
         }
-        candidates.extend(cdi_entries);
+        candidates.extend(cdi_entries.into_iter().map(|(_, entry)| entry));
         candidates.extend(configured);
 
         for pool in &gres_cache.countable {
@@ -143,7 +143,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
     DeviceEntry {
         gres_name: expanded.gres_name.clone(),
         resource_type: expanded.resource_type.clone(),
-        kind: "spur.internal/gres".into(),
+        kind: GRES_KIND.into(),
         device_id: 0,
         capability: DeviceCapability::Injectable,
         memory_mb: 0,
@@ -166,7 +166,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
     DeviceEntry {
         gres_name: pool.gres_name.clone(),
         resource_type: pool.resource_type.clone(),
-        kind: "spur.internal/gres".into(),
+        kind: GRES_KIND.into(),
         device_id: 0,
         capability: DeviceCapability::CountablePool,
         memory_mb: 0,
@@ -216,13 +216,21 @@ fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
     }
 }
 
+/// The CDI cache iterates in hash order, so the qualified name settles ties.
+fn sort_cdi_entries(entries: &mut [(String, DeviceEntry)]) {
+    entries.sort_by(|(a_name, a), (b_name, b)| cdi_sort_key(a, b).then_with(|| a_name.cmp(b_name)));
+}
+
 fn primary_device_path(entry: &DeviceEntry) -> &str {
     entry.node_paths().next().unwrap_or("")
 }
 
 /// Merges a configured entry into the discovered device whose render node it names
 /// (exact-path dedup would miss it, since a GPU also carries a `cardN` node).
-fn merge_into_discovered(configured: &DeviceEntry, discovered: &mut [DeviceEntry]) -> bool {
+fn merge_into_discovered(
+    configured: &DeviceEntry,
+    discovered: &mut [(String, DeviceEntry)],
+) -> bool {
     let paths: Vec<&str> = configured
         .device_edits
         .device_nodes
@@ -230,9 +238,9 @@ fn merge_into_discovered(configured: &DeviceEntry, discovered: &mut [DeviceEntry
         .map(|dn| dn.effective_host_path())
         .collect();
     let mut matched: Vec<&str> = Vec::new();
-    for device in discovered
+    for (_, device) in discovered
         .iter_mut()
-        .filter(|device| entry_matches_gres_name(device, &configured.gres_name))
+        .filter(|(_, device)| entry_matches_gres_name(device, &configured.gres_name))
     {
         let Some(render_node) = paths.iter().copied().find(|path| {
             path.starts_with("/dev/dri/renderD")
@@ -277,33 +285,86 @@ fn merge_into_discovered(configured: &DeviceEntry, discovered: &mut [DeviceEntry
     true
 }
 
-/// Skips a later entry when its device-node paths exactly match one already kept.
+const GRES_KIND: &str = "spur.internal/gres";
+
+fn sorted_node_paths(entry: &DeviceEntry) -> Vec<&str> {
+    let mut paths: Vec<&str> = entry.node_paths().collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+/// A CDI device standing for several others of its kind (like `all`): its nodes
+/// are exactly the union of two or more siblings' nodes.
+fn is_aggregate(entry: &DeviceEntry, candidates: &[DeviceEntry]) -> bool {
+    if entry.kind == GRES_KIND {
+        return false;
+    }
+    let nodes = sorted_node_paths(entry);
+    let mut covered: Vec<&str> = Vec::new();
+    let mut parts = 0;
+    for other in candidates.iter().filter(|o| o.kind == entry.kind) {
+        let other_nodes = sorted_node_paths(other);
+        let strict_subset = !other_nodes.is_empty()
+            && other_nodes.len() < nodes.len()
+            && other_nodes.iter().all(|p| nodes.contains(p));
+        if strict_subset {
+            parts += 1;
+            covered.extend(other_nodes);
+        }
+    }
+    covered.sort_unstable();
+    covered.dedup();
+    parts >= 2 && covered == nodes
+}
+
+/// Skips CDI aggregates, then a later entry naming a device already kept: the
+/// same node set, or for a GRES entry, a subset or superset of a kept one.
 fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
+    let aggregates: Vec<bool> = candidates
+        .iter()
+        .map(|entry| is_aggregate(entry, &candidates))
+        .collect();
     let mut seen: Vec<(Vec<String>, String)> = Vec::new();
     let mut result = Vec::new();
 
-    for entry in candidates {
-        let mut per_device_paths: Vec<String> = entry.node_paths().map(str::to_owned).collect();
-        per_device_paths.sort();
-
+    for (entry, aggregate) in candidates.into_iter().zip(aggregates) {
+        if aggregate {
+            debug!(kind = %entry.kind, paths = ?sorted_node_paths(&entry), "skipping a CDI device that aggregates others of its kind");
+            continue;
+        }
+        let per_device_paths: Vec<String> = sorted_node_paths(&entry)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         if per_device_paths.is_empty() {
             result.push(entry);
             continue;
         }
 
-        // One entry's nodes covering the other's is one device described twice
-        // (GRES names the render node, CDI adds the card); partitions that only
-        // share a card node each keep their own render node, so stay distinct.
+        // GRES names a GPU by its render node while CDI adds the card, so a GRES
+        // entry inside (or around) a kept device is that device; two CDI devices
+        // are one only when they grant exactly the same nodes.
         let is_subset = |a: &[String], b: &[String]| a.iter().all(|p| b.contains(p));
-        if let Some((_, existing_kind)) = seen
-            .iter()
-            .find(|(p, _)| is_subset(p, &per_device_paths) || is_subset(&per_device_paths, p))
-        {
+        let duplicate = seen.iter().find(|(paths, kind)| {
+            if *paths == per_device_paths {
+                return true;
+            }
+            (entry.kind == GRES_KIND || kind == GRES_KIND)
+                && (is_subset(paths, &per_device_paths) || is_subset(&per_device_paths, paths))
+        });
+        if let Some((paths, existing_kind)) = duplicate {
+            let rule = if *paths == per_device_paths {
+                "exact"
+            } else {
+                "gres-subset"
+            };
             warn!(
                 duplicate_kind = %entry.kind,
                 existing_kind = %existing_kind,
                 paths = ?per_device_paths,
-                "duplicate device (same device paths), skipping"
+                rule,
+                "device duplicates one already kept; skipping"
             );
             continue;
         }
@@ -573,6 +634,116 @@ mod tests {
                 (0x120300, "/dev/dri/renderD131"),
             ]
         );
+    }
+
+    /// A CDI entry as the registry builds it, paired with its qualified name.
+    fn cdi_entry(kind: &str, name: &str, paths: &[&str]) -> (String, DeviceEntry) {
+        let cached = crate::cdi::cache::CachedDevice {
+            qualified_name: format!("{kind}={name}"),
+            device: CdiDevice {
+                name: name.into(),
+                annotations: Default::default(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: paths.iter().map(|p| node(p)).collect(),
+                    ..Default::default()
+                }),
+            },
+            kind: kind.into(),
+            shared_edits: None,
+            source_path: String::new(),
+            priority: 0,
+        };
+        (cached.qualified_name.clone(), from_cdi(&cached))
+    }
+
+    fn sorted_then_deduped(mut entries: Vec<(String, DeviceEntry)>) -> Vec<DeviceEntry> {
+        sort_cdi_entries(&mut entries);
+        dedup_by_device_paths(entries.into_iter().map(|(_, e)| e).collect())
+    }
+
+    fn rotations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        (0..items.len())
+            .flat_map(|i| {
+                let mut forward = items.to_vec();
+                forward.rotate_left(i);
+                let mut backward = forward.clone();
+                backward.reverse();
+                [forward, backward]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_per_gpu_spec_with_an_all_device_yields_each_gpu_once_in_any_order() {
+        let mut entries: Vec<(String, DeviceEntry)> = (0..4)
+            .map(|i| {
+                cdi_entry(
+                    "example.com/gpu",
+                    &i.to_string(),
+                    &[
+                        &format!("/dev/dri/renderD{}", 128 + i),
+                        &format!("/dev/dri/card{i}"),
+                    ],
+                )
+            })
+            .collect();
+        let every: Vec<String> = entries
+            .iter()
+            .flat_map(|(_, e)| e.node_paths().map(str::to_owned).collect::<Vec<_>>())
+            .collect();
+        let every: Vec<&str> = every.iter().map(String::as_str).collect();
+        entries.push(cdi_entry("example.com/gpu", "all", &every));
+
+        for order in rotations(&entries) {
+            let kept = sorted_then_deduped(order);
+            assert_eq!(
+                kept.len(),
+                4,
+                "the aggregate must not stand in for the GPUs"
+            );
+            assert!(kept.iter().all(|e| e.node_paths().count() == 2));
+        }
+    }
+
+    #[test]
+    fn a_single_gpu_spec_with_all_keeps_the_per_gpu_device() {
+        let paths = ["/dev/dri/renderD128", "/dev/dri/card0"];
+        for order in rotations(&[
+            cdi_entry("example.com/gpu", "all", &paths),
+            cdi_entry("example.com/gpu", "0", &paths),
+        ]) {
+            let mut sorted = order;
+            sort_cdi_entries(&mut sorted);
+            assert_eq!(sorted[0].0, "example.com/gpu=0");
+            let kept = dedup_by_device_paths(sorted.into_iter().map(|(_, e)| e).collect());
+            assert_eq!(kept.len(), 1);
+        }
+    }
+
+    #[test]
+    fn cdi_devices_of_two_kinds_sharing_some_nodes_both_stay() {
+        let kept = sorted_then_deduped(vec![
+            cdi_entry(
+                "amd.com/gpu",
+                "0",
+                &["/dev/dri/renderD128", "/dev/dri/card0"],
+            ),
+            cdi_entry("other.vendor/gpu", "0", &["/dev/dri/renderD128"]),
+        ]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn an_exact_duplicate_across_kinds_keeps_the_same_kind_in_either_order() {
+        let paths = ["/dev/dri/renderD128"];
+        for order in rotations(&[
+            cdi_entry("other.vendor/gpu", "0", &paths),
+            cdi_entry("amd.com/gpu", "0", &paths),
+        ]) {
+            let kept = sorted_then_deduped(order);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].kind, "amd.com/gpu");
+        }
     }
 
     #[test]
