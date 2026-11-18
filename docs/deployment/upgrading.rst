@@ -1433,7 +1433,7 @@ Node inventory now lists every allocatable device, of every kind, in
 ``ResourceSet.devices`` (``gres_name``, ``device_type``, ``stable_id``,
 ``index``, ``topology``). GPUs are entries with ``gres_name = "gpu"``.
 
-* **Deprecated: ``ResourceSet.gpus`` and ``GpuResource``.** The gRPC API still
+* **Deprecated: ``ResourceSet.gpus``, ``GpuResource`` and ``GpuLinkType``.** The gRPC API still
   fills the GPU-only ``gpus`` list for this release, so existing clients keep
   working, but it will be removed in a future release. Read ``devices``.
   ``GpuResource.peer_gpus`` is now always empty and ``link_type`` always PCIe,
@@ -1447,9 +1447,25 @@ Node inventory now lists every allocatable device, of every kind, in
   ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
   wrote, and writes both in a shape an older ``spurd`` reads, so a rollback
   keeps withholding repartitioned GPUs.
+* **Node GRES output is aggregated.** ``Gres=`` in ``scontrol show node`` and
+  ``%G`` in ``sinfo`` print one ``name[:type]:count`` entry per name and type:
+  GPUs first in inventory order, then other device kinds by name, then
+  countable pools. ``gpu:mi300x:8`` replaces eight ``gpu:mi300x:1`` entries,
+  and a node with only countable pools no longer shows ``(null)``. Scripts that
+  count entries must read the count.
+* **Exclusive jobs take every device.** An ``--exclusive`` job is allocated
+  every device of every kind on its node, not only the GPUs. A node holding a
+  device id its inventory no longer reports offers no exclusive placement until
+  the job holding it ends.
+* **Kubernetes GPU lines.** On a Kubernetes node with
+  ``spur.amd.com/gpu-memory-mb`` set, ``scontrol show node`` prints one
+  ``GPUDevice=`` line per GPU, with only its type and VRAM known.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
-  both only fed ``peer_gpus`` and ``link_type``.
+  both only fed ``peer_gpus`` and ``link_type``. The
+  ``spur.amd.com/memory-mb``, ``spur.amd.com/links`` and
+  ``spur.amd.com/link-type`` CDI annotations are still written, so an older
+  agent reads them, but are not read.
 
 See Also
 --------

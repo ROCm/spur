@@ -469,13 +469,13 @@ All CDI annotations use the `spur.amd.com/` prefix. Key fields stored in
 | Annotation | Example | Notes |
 |---|---|---|
 | `spur.amd.com/gpu-type` | `mi300x` | PCI device_id lookup or product_name normalization |
-| `spur.amd.com/memory-mb` | `196608` | VRAM from KFD mem_banks |
+| `spur.amd.com/memory-mb` | `196608` | VRAM from KFD mem_banks; written for rollback, not read |
 | `spur.amd.com/numa-node` | `0` | From PCI device sysfs |
 | `spur.amd.com/pci-bdf` | `0000:c1:00.0` | Decoded from location_id |
 | `spur.amd.com/stable-id` | `327680` | BDF-encoded reload-invariant id |
 | `spur.amd.com/render-minor` | `128` | DRM render minor number |
-| `spur.amd.com/link-type` | `xgmi` | `pcie`, `xgmi`, or `nvlink` |
-| `spur.amd.com/links` | `-1,4,4,0` | Weight matrix (-1 = self) |
+| `spur.amd.com/link-type` | `xgmi` | `pcie`, `xgmi`, or `nvlink`; written for rollback, not read |
+| `spur.amd.com/links` | `-1,4,4,0` | Weight matrix (-1 = self); written for rollback, not read |
 | `spur.amd.com/cores` | `0-3,8,16-18` | Core affinity range notation |
 | `spur.amd.com/compute-partition` | `CPX` | Active compute partition |
 | `spur.amd.com/memory-partition` | `NPS4` | Active memory partition |
