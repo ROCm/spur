@@ -18,6 +18,40 @@ pub fn allocates_by_id(gres_name: &str, has_devices_of_name: bool) -> bool {
     gres_name == GPU_GRES || has_devices_of_name
 }
 
+/// One held device entry, as controller and agent both read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    Device(u64),
+    /// An id the node does not have: the hold cannot be honoured.
+    Unknown(u64),
+    /// Holds not tied to a device, like a pre-upgrade `{device_id: 0, count: N}`.
+    Anonymous(u64),
+}
+
+/// Reads `(device_id, count)` entries of `gres_name`. An unknown id 0 is a count
+/// hold from before the kind was handed out by id, so it holds no specific
+/// device. GPUs always were, so for them it is an unknown device.
+pub fn classify_held(
+    gres_name: &str,
+    held: impl IntoIterator<Item = (u64, u64)>,
+    known: impl Fn(u64) -> bool,
+) -> Vec<Held> {
+    let mut out = Vec::new();
+    for (id, count) in held {
+        if known(id) {
+            out.push(Held::Device(id));
+            if count > 1 {
+                out.push(Held::Anonymous(count - 1));
+            }
+        } else if id == 0 && gres_name != GPU_GRES {
+            out.push(Held::Anonymous(count));
+        } else {
+            out.push(Held::Unknown(id));
+        }
+    }
+    out
+}
+
 /// The gres a countable pool key (`name` or `name:type`) belongs to.
 pub fn pool_gres_name(key: &str) -> &str {
     key.split_once(':').map_or(key, |(name, _)| name)
@@ -216,7 +250,7 @@ pub fn devices_from_proto(
 
 #[cfg(test)]
 mod tests {
-    use super::{devices_from_proto, devices_to_proto, Device, LegacyGpu};
+    use super::{classify_held, devices_from_proto, devices_to_proto, Device, Held, LegacyGpu};
 
     #[test]
     fn legacy_gpu_writes_back_numa_and_affinity() {
@@ -269,26 +303,38 @@ mod tests {
     }
 
     #[test]
-    fn proto_devices_round_trip_the_gpu_topology() {
-        let topology = super::DeviceTopology {
-            pci_bdf: Some("0002:00:01.0".into()),
-            numa_node: Some(0),
-            pci_root: Some("pci0002:00".into()),
-            vram_bytes: Some(309_220_868_096),
-            fabric: None,
-        };
-        let devices = vec![super::Device {
-            topology: Some(topology.clone()),
-            ..super::Device::gpu(33_556_480, "mi355x", 0)
-        }];
-        let (wire, legacy) = super::devices_to_proto(&devices);
+    fn a_count_hold_on_a_known_id_is_that_device_plus_anonymous_holds() {
         assert_eq!(
-            super::devices_from_proto(wire, Vec::new())[0].topology,
-            Some(topology.clone())
+            classify_held("nic", [(0, 3)], |id| id == 0),
+            [Held::Device(0), Held::Anonymous(2)]
         );
         assert_eq!(
-            super::devices_from_proto(Vec::new(), legacy)[0].topology,
-            Some(topology)
+            classify_held("nic", [(7, 1)], |id| id == 7),
+            [Held::Device(7)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_gpu_id_zero_is_an_unknown_device() {
+        assert_eq!(
+            classify_held("gpu", [(0, 1)], |_| false),
+            [Held::Unknown(0)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_gpu_id_zero_with_a_count_is_an_unknown_device() {
+        assert_eq!(
+            classify_held("gpu", [(0, 2)], |_| false),
+            [Held::Unknown(0)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_zero_is_anonymous_and_an_unknown_nonzero_id_is_unknown() {
+        assert_eq!(
+            classify_held("nic", [(0, 2), (5, 1)], |_| false),
+            [Held::Anonymous(2), Held::Unknown(5)]
         );
     }
 
@@ -461,5 +507,29 @@ mod tests {
         });
         let json = serde_json::to_string(&nic).unwrap();
         assert_eq!(serde_json::from_str::<Device>(&json).unwrap(), nic);
+    }
+
+    #[test]
+    fn proto_devices_round_trip_the_gpu_topology() {
+        let topology = super::DeviceTopology {
+            pci_bdf: Some("0002:00:01.0".into()),
+            numa_node: Some(0),
+            pci_root: Some("pci0002:00".into()),
+            vram_bytes: Some(309_220_868_096),
+            fabric: None,
+        };
+        let devices = vec![super::Device {
+            topology: Some(topology.clone()),
+            ..super::Device::gpu(33_556_480, "mi355x", 0)
+        }];
+        let (wire, legacy) = super::devices_to_proto(&devices);
+        assert_eq!(
+            super::devices_from_proto(wire, Vec::new())[0].topology,
+            Some(topology.clone())
+        );
+        assert_eq!(
+            super::devices_from_proto(Vec::new(), legacy)[0].topology,
+            Some(topology)
+        );
     }
 }

@@ -575,15 +575,19 @@ impl ResourceSet {
     /// reported under another id, so none of this kind can be trusted free.
     fn holds(&self, allocated: &ResourceAllocations, gres_name: &str) -> Option<Holds> {
         let mut holds = Holds::default();
-        let known = |id: u64| self.devices_of(gres_name).any(|d| d.stable_id == id);
-        for held in allocated.devices.get(gres_name).into_iter().flatten() {
-            if known(held.device_id) {
-                holds.by_id.insert(held.device_id);
-                holds.untyped += held.count.saturating_sub(1);
-            } else if held.device_id == 0 && gres_name != crate::device::GPU_GRES {
-                holds.untyped += held.count;
-            } else {
-                return None;
+        let entries = allocated.devices.get(gres_name).into_iter().flatten();
+        let classified = crate::device::classify_held(
+            gres_name,
+            entries.map(|held| (held.device_id, held.count)),
+            |id| self.devices_of(gres_name).any(|d| d.stable_id == id),
+        );
+        for held in classified {
+            match held {
+                crate::device::Held::Device(id) => {
+                    holds.by_id.insert(id);
+                }
+                crate::device::Held::Anonymous(count) => holds.untyped += count,
+                crate::device::Held::Unknown(_) => return None,
             }
         }
         let typed_prefix = format!("{gres_name}:");

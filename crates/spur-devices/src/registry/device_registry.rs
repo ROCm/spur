@@ -66,9 +66,7 @@ impl DeviceRegistry {
     pub fn resolve_by_ids(&self, name: &str, device_ids: &[u64]) -> Result<Vec<&DeviceEntry>> {
         let mut resolved = Vec::new();
         for &id in device_ids {
-            let found = self.devices.iter().find(|e| {
-                e.is_injectable() && entry_matches_gres_name(e, name) && e.stable_id == id
-            });
+            let found = self.devices.iter().find(|e| is_injectable_id(e, name, id));
             match found {
                 Some(entry) => resolved.push(entry),
                 None => bail!(
@@ -112,6 +110,13 @@ impl DeviceRegistry {
         self.devices
             .iter()
             .any(|e| e.is_injectable() && e.gres_name == gres_name)
+    }
+
+    /// Whether `stable_id` resolves for injection, as `resolve_by_ids` would.
+    pub fn has_injectable_id(&self, gres_name: &str, stable_id: u64) -> bool {
+        self.devices
+            .iter()
+            .any(|e| is_injectable_id(e, gres_name, stable_id))
     }
 
     /// The registry to inject from: `pinned` ids keep `previous`'s device even
@@ -241,6 +246,12 @@ fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
 /// The CDI cache iterates in hash order, so the qualified name settles ties.
 fn sort_cdi_entries(entries: &mut [(String, DeviceEntry)]) {
     entries.sort_by(|(a_name, a), (b_name, b)| cdi_sort_key(a, b).then_with(|| a_name.cmp(b_name)));
+}
+
+fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
+    entry.is_injectable()
+        && entry_matches_gres_name(entry, gres_name)
+        && entry.stable_id == stable_id
 }
 
 fn primary_device_path(entry: &DeviceEntry) -> &str {
