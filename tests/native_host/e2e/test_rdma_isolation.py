@@ -73,7 +73,7 @@ def _probe_script(paths: list[str]) -> str:
 
 
 def _parse(out: str) -> dict:
-    return dict(re.findall(r"^(\S+?)=(\S+)$", out, re.MULTILINE))
+    return dict(re.findall(r"^(\S+?)=(\S+)\r?$", out, re.MULTILINE))
 
 
 def _start(cluster, nics: list[str], constrain_rdma: bool, with_gpu: bool = False) -> None:
