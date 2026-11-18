@@ -981,9 +981,12 @@ configured another way:
   running job holds a positional id.
 * **GPU specs under another CDI kind.** A spec under a kind other than
   ``amd.com/gpu`` (for example ``example.com/gpu``) no longer suppresses
-  ``amd.com/gpu`` discovery. For GPUs both describe, the discovered device wins
-  and the spec's mounts, hooks and environment are not applied. Move them to an
-  ``amd.com/gpu`` spec, or set ``auto_detect = false``.
+  ``amd.com/gpu`` discovery. Only a device that grants exactly the same device
+  nodes as a discovered GPU is merged with it, and then only one of the two
+  specs' mounts, hooks and environment is applied. A device that grants some
+  but not all of a discovered GPU's nodes is reported as a separate device next
+  to it. Describing discovered GPUs under another CDI kind is not supported.
+  Move such specs to an ``amd.com/gpu`` spec, or set ``auto_detect = false``.
 
 Bounded controller shutdown (``shutdown_grace_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
