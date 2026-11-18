@@ -1,4 +1,5 @@
 adminlevel
+allocatable
 allocator
 AllowedIPs
 allowlisted
@@ -212,6 +213,7 @@ oversubscription
 passwordless
 PBS
 PCI
+PCIe
 PDB
 PID
 pluggable
@@ -270,6 +272,7 @@ reinit
 ReleasePmix
 reloadable
 reparented
+repartitioned
 repo
 repo's
 reprovision
