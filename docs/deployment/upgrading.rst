@@ -1446,8 +1446,13 @@ as before:
    [cgroup]
    constrain_rdma_devices = false
 
+A job that uses NCCL or RCCL may not fail at all: when it cannot open the
+verbs device, NCCL and RCCL can silently fall back to TCP sockets, which is
+much slower. Check job logs on NIC nodes after the upgrade.
+
 Other nodes are not affected. Jobs already running when ``spurd`` is upgraded
-keep the access they started with.
+keep the access they started with, so until they end they can still reach
+NICs the scheduler now allocates to new jobs.
 
 Generic device inventory
 ~~~~~~~~~~~~~~~~~~~~~~~~

@@ -2940,9 +2940,10 @@ statistics.
        ``[[devices.gres]]`` entry with files under ``/dev/infiniband/``), a job
        can open those RDMA devices only if they are allocated to it; other
        ``/dev/infiniband/`` nodes stay open. ``false`` keeps all of
-       ``/dev/infiniband/`` open to every job. No effect
-       on other nodes, or with ``constrain_devices = false``. See
-       :doc:`ai-nics`.
+       ``/dev/infiniband/`` open to every job. The devices a job cannot open
+       are fixed when it starts. No effect
+       on other nodes, or with ``constrain_devices = false``, or when the device
+       filter cannot be installed (see ``required``). See :doc:`ai-nics`.
    * - ``extra_device_paths``
      - [string]
      - ``[]``

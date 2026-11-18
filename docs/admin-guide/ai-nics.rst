@@ -43,9 +43,12 @@ RDMA device. These names match the AMD network device plugin for Kubernetes:
      - ``vnic:pollara400``
      - SR-IOV virtual function.
 
-A function without an RDMA device or a ``uverbs`` node is skipped. A NIC's
-stable id comes from its PCI address, so it survives reboots and driver
-reloads. An on-disk CDI spec of kind ``amd.com/nic`` or ``amd.com/vnic``
+Every RDMA-enabled ``ionic`` function is claimed this way, whether it sits on a
+Pollara card or on another Pensando card such as a storage NIC, and is typed
+``pollara400``. ``spurd`` logs the NICs it claims at ``info`` whenever the set
+changes. A function without an RDMA device or a ``uverbs`` node is skipped,
+with a warning when that changes. A NIC's stable id comes from its PCI
+address, so it survives reboots and driver reloads. An on-disk CDI spec of kind ``amd.com/nic`` or ``amd.com/vnic``
 replaces discovery for that kind.
 
 ``scontrol show node`` lists the NICs with the node's other GRES:
@@ -99,7 +102,8 @@ default), a job on a NIC node can open the ``uverbs`` node of a NIC only if the
 NIC is allocated to it. Opening another job's NIC fails with ``EPERM``, and a
 job that requested no NICs reaches none of them. RDMA nodes Spur does not
 allocate stay open to every job: ``rdma_cm``, and the devices of HCAs Spur does
-not manage, such as a storage NIC. To keep all of ``/dev/infiniband/`` open to
+not manage, such as another vendor's HCA. An RDMA-enabled ``ionic`` storage NIC
+is claimed and gated like any other. To keep all of ``/dev/infiniband/`` open to
 every job instead:
 
 .. code-block:: toml
@@ -107,9 +111,27 @@ every job instead:
    [cgroup]
    constrain_rdma_devices = false
 
-A job keeps the access it started with for all of its steps, even if NICs
-appear or disappear on the node while it runs. This does not reset a NIC's RDMA
-state between jobs.
+The ``EPERM`` needs the cgroup v2 BPF device filter. If installing it fails,
+``spurd`` warns and runs the job without device isolation, unless
+``[cgroup] required = true``, which refuses the job instead.
+
+Limits of RDMA gating:
+
+* The RDMA devices a job cannot open are fixed when the job starts, from the
+  NICs the node had discovered then, and apply to all of its steps.
+* A NIC whose ``uverbs`` node appears before discovery has picked it up (about
+  two refresh intervals after ``ionic_rdma`` loads) is not withheld from jobs
+  started in that window.
+* A virtual function Spur did not hand out when a job started stays open to
+  that job for its whole run, even once a later refresh adds it and Spur
+  allocates it to another job. This covers virtual functions created after the
+  job started and those left out of a private CDI spec. Keep a private spec
+  complete, and requeue jobs that started before NICs were added.
+* Renaming or renumbering RDMA devices, or reloading ``ionic_rdma``, while
+  ``spurd`` runs is not picked up: restart ``spurd`` afterwards.
+* Gating compares paths under ``/dev/infiniband/``. A device node for the same
+  RDMA device elsewhere is not withheld.
+* Gating does not reset a NIC's RDMA state between jobs.
 
 Configuring NICs by hand
 ------------------------
