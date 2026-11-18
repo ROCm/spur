@@ -19,10 +19,6 @@ pub enum PlacementRefusal {
     Backoff(String),
 }
 
-fn is_k8s(node: &Node) -> bool {
-    matches!(node.source, NodeSource::Kubernetes { .. })
-}
-
 /// Where a run's batch script runs on `nodes`. K8s virtual agents run a Pod per
 /// node and cannot host steps, so a run on them always places on every node.
 pub fn resolve_run_placement(
@@ -35,7 +31,7 @@ pub fn resolve_run_placement(
     if !spec.is_batch() {
         return Ok(scanned);
     }
-    let resolved = if nodes.iter().any(is_k8s) {
+    let resolved = if nodes.iter().any(Node::is_kubernetes) {
         if spec.script_placement == Some(ScriptPlacement::BatchHost) && nodes.len() > 1 {
             return Err(PlacementRefusal::Hold(BATCH_HOST_K8S_UNSUPPORTED.into()));
         }
