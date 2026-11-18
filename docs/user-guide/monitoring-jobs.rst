@@ -633,6 +633,10 @@ Time arguments accept an absolute date (``YYYY-MM-DD`` or
    sacct -s PREEMPTED --format=JobID,JobName,State,ExitCode,PreemptedBy,PreemptMode,PreemptQOS
    sacct -s PR,CA     # short codes also accepted
 
+State names and short codes are case-insensitive. An unknown state in a list
+makes the command exit with an error before querying accounting. Omit ``-s``
+or use ``-s all`` to query all states.
+
 Running-Job Stats — ``sstat``
 -----------------------------
 
