@@ -562,6 +562,7 @@ async fn effective_partition_and_adjusted_request_survive_a_controller_restart()
                     memory_per_gpu_mb: None,
                     cpus_per_gpu: None,
                 }),
+                resolved_placement: None,
             },
         )
         .unwrap();

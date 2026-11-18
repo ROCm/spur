@@ -279,6 +279,9 @@ pub const CAP_STEP_RESOURCES: &str = "step-resources";
 /// the job with 1 CPU per task), so the CLI refuses those options instead.
 pub const CAP_PER_GPU_OPTIONS: &str = "per-gpu-options";
 
+/// Agent capability: the agent places a batch script by `LaunchJobRequest.script_placement`.
+pub const CAP_SCRIPT_PLACEMENT: &str = "script-placement";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 

@@ -445,6 +445,11 @@ pub struct ControllerConfig {
     /// waits indefinitely). An `srun` step holds its RPC open for the step's whole runtime.
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
+
+    /// Where a batch script runs when its job does not say (default `auto`). Read at
+    /// dispatch, so a reconfigure applies to every job that has not started yet.
+    #[serde(default)]
+    pub script_placement: crate::script_placement::ScriptPlacement,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -572,6 +577,7 @@ impl Default for ControllerConfig {
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
             shutdown_grace_secs: default_shutdown_grace_secs(),
+            script_placement: Default::default(),
         }
     }
 }
