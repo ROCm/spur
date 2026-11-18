@@ -1579,7 +1579,7 @@ pub fn refresh_block_file(resources: &mut ResourceSet, path: Option<&std::path::
 }
 
 /// Injectable registry entries of every kind as the scheduler's devices.
-fn devices_from_registry(
+pub(crate) fn devices_from_registry(
     registry: &DeviceRegistry,
     topology: Option<&spur_core::cpu_topology::CpuTopology>,
 ) -> Vec<Device> {
@@ -1643,7 +1643,7 @@ fn affinity_cpus_of(
     cpus
 }
 
-fn generic_from_registry(registry: &DeviceRegistry) -> HashMap<String, u64> {
+pub(crate) fn generic_from_registry(registry: &DeviceRegistry) -> HashMap<String, u64> {
     let mut generic = HashMap::new();
     for entry in registry.list() {
         if !entry.is_countable_pool() {
@@ -3714,6 +3714,38 @@ mod tests {
         assert_eq!(
             ledger.allocate_for_job(2, 1, 2, 0, &[7]).unwrap().cpu_ids,
             vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn a_deferred_nic_loss_keeps_reserved_pools() {
+        use spur_sched::cons_tres::{AllocError, CapacityChange, NodeAllocation};
+        let old = reserved_gpu_and_vnic_inventory(&[0x900]);
+        let mut ledger = NodeAllocation::new("n1".into(), &old);
+        reserved_pools().apply(&mut ledger);
+        ledger.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        ledger
+            .claim_devices(
+                1,
+                1,
+                &spur_core::device::DeviceSelection::new().with("vnic", vec![0x900]),
+            )
+            .unwrap();
+
+        let fresh = reserved_gpu_and_vnic_inventory(&[]);
+        let tick = plan_tick(&old, &fresh, &HashSet::new(), &Fences::default());
+        assert!(matches!(
+            apply_to_ledger(&mut ledger, &tick, &tick.reported(), &reserved_pools()),
+            CapacityChange::AllocatedDevicesLost(_)
+        ));
+        assert_eq!(
+            ledger.allocate_for_job(2, 1, 4, 0, &[]),
+            Err(AllocError::CpusUnavailable),
+            "job 1 holds one of the 4 general CPUs"
+        );
+        assert_eq!(
+            ledger.allocate_for_job(3, 1, 2, 0, &[8]).unwrap().cpu_ids,
+            vec![2, 3]
         );
     }
 

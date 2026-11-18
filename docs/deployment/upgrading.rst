@@ -1341,6 +1341,12 @@ Node inventory now lists every allocatable device, of every kind, in
 * **Kubernetes GPU lines.** On a Kubernetes node with
   ``spur.amd.com/gpu-memory-mb`` set, ``scontrol show node`` prints one
   ``GPUDevice=`` line per GPU, with only its type and VRAM known.
+* **Count-only pools named like discovered devices are ignored.** On a node
+  where Spur reports a kind by device (for example NICs it discovers), a
+  count-only ``[[devices.gres]]`` entry with the same name is ignored, with a
+  warning naming it. Remove such ``nic`` and ``vnic`` entries from
+  ``spur.conf``. A count-only ``gpu`` entry is always ignored: GPUs are only
+  scheduled by device.
 * **Per-GPU CPU placement is carried by every device.** A device's NUMA node
   and its ``cores=`` CPUs are reported on the generic ``Device`` (gRPC fields
   ``numa_node`` and ``affinity_cpus``) and still written to the legacy
