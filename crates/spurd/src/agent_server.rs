@@ -6720,6 +6720,7 @@ impl SlurmAgent for AgentService {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
         let mut persist_cred = (String::new(), String::new(), String::new());
+        let mut verified_cred = None;
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
                 spur_core::native_metrics::inc_exec_fail();
@@ -6755,28 +6756,7 @@ impl SlurmAgent for AgentService {
             cred.require_slice(hostname, cpus, memory_mb, &devices)
                 .map_err(map_exec_err)?;
             persist_cred = persist_execution_meta(&cred);
-            match self.launch_acceptance.accept(&cred) {
-                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
-                Ok(false) => {
-                    spur_core::native_metrics::inc_exec_ok();
-                    let paths = self
-                        .running
-                        .lock()
-                        .await
-                        .get(&req.job_id)
-                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
-                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
-                        .unwrap_or_default();
-                    return Ok(Response::new(LaunchJobResponse {
-                        success: true,
-                        error: String::new(),
-                        stdout_path: paths.0,
-                        stderr_path: paths.1,
-                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-                    }));
-                }
-                Err(e) => return Err(map_exec_err(e)),
-            }
+            verified_cred = Some(cred);
         }
         let job_id = req.job_id;
         // A launch names the node the controller scheduled it onto. If it does not name this host it
@@ -6808,6 +6788,40 @@ impl SlurmAgent for AgentService {
         ) {
             warn!(job_id, uid = spec.uid, "{msg}");
             return Err(Status::permission_denied(msg));
+        }
+
+        // Validated before the credential is recorded or the previous run fenced: a
+        // recorded credential's duplicate counts as launched, and a fence is final.
+        let placement = launch_placement(&req.script_placement, &spec.script)?;
+        let allocation_holder = holds_for_batch_host(placement, task_offset, req.task_fanout);
+        let script = if allocation_holder {
+            batch_companion_hold_script().to_string()
+        } else {
+            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
+        };
+        if let Some(cred) = &verified_cred {
+            match self.launch_acceptance.accept(cred) {
+                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
+                Ok(false) => {
+                    spur_core::native_metrics::inc_exec_ok();
+                    let paths = self
+                        .running
+                        .lock()
+                        .await
+                        .get(&job_id)
+                        .filter(|tracked| tracked.run_attempt == run_attempt)
+                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                        .unwrap_or_default();
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        stdout_path: paths.0,
+                        stderr_path: paths.1,
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    }));
+                }
+                Err(e) => return Err(map_exec_err(e)),
+            }
         }
 
         // Held until this run is tracked (or its half-built state is cleaned up), so a
@@ -6879,14 +6893,6 @@ impl SlurmAgent for AgentService {
         // per-job scratch directory once run_attempt is known, avoiding a
         // collision-prone shared anchor for relative output paths.
         let work_dir = spec.work_dir.clone();
-
-        let placement = launch_placement(&req.script_placement, &spec.script)?;
-        let allocation_holder = holds_for_batch_host(placement, task_offset, req.task_fanout);
-        let script = if allocation_holder {
-            batch_companion_hold_script().to_string()
-        } else {
-            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
-        };
 
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
@@ -12749,6 +12755,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_launch_with_an_unknown_placement_fences_nothing() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_BATCH, &cgroup_root).await;
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 2,
+                script_placement: "per-socket".into(),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown placement must be refused");
+
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "refused before the fence is even tried: {refused}"
+        );
+        assert_run_one_kept(&svc, spur_core::step::STEP_BATCH).await;
+    }
+
+    #[tokio::test]
     async fn an_allocation_whose_fence_fails_leaves_the_old_run_reserved() {
         let svc = test_agent_service(test_reporter()).with_supervised_launch();
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
@@ -13413,6 +13452,85 @@ mod tests {
             .expect_err("old credential must not enter the replacement");
         assert!(error.message().contains("run_attempt mismatch"), "{error}");
         assert!(svc.active_steps.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_leaves_its_credential_unrecorded() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
+
+        let mut svc = test_agent_service(test_reporter());
+        svc.cluster_id = "launch-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let script = "#!/bin/bash\ntrue\n";
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: svc.cluster_id.clone(),
+            key_id: String::new(),
+            job_id: 79,
+            step_id: 0,
+            run_attempt: 1,
+            user: "fixture".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: svc.reporter.hostname.clone(),
+                cpus: 0,
+                memory_mb: 0,
+                devices: vec![],
+            }],
+            command_digest: spur_core::native_exec::command_digest(script, &[], ""),
+            container_digest: None,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 3600,
+            credential_id: [2; 16],
+        };
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 1,
+                script_placement: "per-socket".into(),
+                execution_credential: spur_core::native_exec::sign_execution(
+                    credential.clone(),
+                    &signing,
+                    now,
+                )
+                .expect("token"),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    gid: 1000,
+                    name: "j".into(),
+                    script: script.into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown placement must be refused");
+
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(true),
+            "a retry must launch rather than read as already launched"
+        );
     }
 
     #[tokio::test]
