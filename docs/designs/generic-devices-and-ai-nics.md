@@ -26,12 +26,12 @@ pub struct Device {
 }
 ```
 
-- `ResourceSet.devices` holds the inventory. A gres is allocated by stable id
-  when it is `gpu` or the node has devices of that gres; otherwise it falls back
+- `ResourceSet.devices` holds the inventory. A `gres` is allocated by stable id
+  when it is `gpu` or the node has devices of that `gres`; otherwise it falls back
   to the countable `generic` pool.
 - Demand is a `ResourceRequest` keyed by `DeviceKey { gres_name, device_type }`,
   where an untyped key matches any type.
-- The agent carries a job's devices as a `DeviceSelection` (gres name to stable
+- The agent carries a job's devices as a `DeviceSelection` (`gres` name to stable
   ids) through launch, the ledger, supervisors and recovery.
 - GPU-only concepts (partitions and fences, fabric and GPU-property bindings,
   `--gpu-bind`) stay GPU-scoped and read GPUs through the generic view.
@@ -59,18 +59,18 @@ Every legacy field follows the same rule for this release:
 
 - **Read:** internal code reads only the new field. The legacy field is read
   only when converting persisted or older data.
-- **Write:** the legacy field is still written (proto, Raft log, snapshots,
+- **Write:** the legacy field is still written (`proto`, Raft log, snapshots,
   supervisor state), so older readers keep working and a rollback can replay
   the log.
 
 | Legacy field | Replacement |
 |---|---|
-| proto `ResourceSet.gpus` (3), `GpuResource`, `GpuLinkType` | `ResourceSet.devices` (8), `Device` |
-| proto `RegisterJobAllocationRequest.gpu_devices` (8) | `allocated` (9) |
-| proto `GpuResource.numa_node` (8), `affinity_cpus` (9) | `Device.numa_node` (6), `affinity_cpus` (7) |
+| `proto` `ResourceSet.gpus` (3), `GpuResource`, `GpuLinkType` | `ResourceSet.devices` (8), `Device` |
+| `proto` `RegisterJobAllocationRequest.gpu_devices` (8) | `allocated` (9) |
+| `proto` `GpuResource.numa_node` (8), `affinity_cpus` (9) | `Device.numa_node` (6), `affinity_cpus` (7) |
 | CDI annotations `spur.amd.com/memory-mb`, `links`, `link-type` (written, not read) | `topology.vram_bytes`; none for links |
-| serde `gpus` in `ResourceSet` (Raft log, snapshots, inventory baseline) | `devices` |
-| serde `gpu_devices` in supervisor `resources` (`descriptor.json`, `launch.json`) | `devices` |
+| `serde` `gpus` in `ResourceSet` (Raft log, snapshots, inventory baseline) | `devices` |
+| `serde` `gpu_devices` in supervisor `resources` (`descriptor.json`, `launch.json`) | `devices` |
 | top-level `gpu_devices` in `launch.json` written by agents before this release (read via `resources`) | `resources.devices` |
 | GPU entries in `inventory-fences.json` (written in the legacy `GpuResource` shape) | `Device` |
 
@@ -80,7 +80,7 @@ Every legacy field follows the same rule for this release:
    legacy shape of `inventory-fences.json`. Keep reading them. Stop writing
    `GpuResource.numa_node`/`affinity_cpus` only when no controller older than
    this release can run: those controllers place reserved cores from them.
-2. **The release after:** stop reading them and drop the serde aliases and
+2. **The release after:** stop reading them and drop the `serde` aliases and
    custom conversions, with these preconditions:
    - Every controller has taken a Raft snapshot on the previous release, so
      the log holds no entry that only has `gpus`: on every controller,
