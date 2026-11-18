@@ -1287,8 +1287,13 @@ mod tests {
         assert!(err.is_err(), "-c 0 must be a clap parse error");
     }
 
+    // Spec-building tests are all guarded: build_sbatch_job_spec rejects bad
+    // env-supplied values, such as an SBATCH_SCRIPT_PLACEMENT another test sets.
+
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_rejects_empty_file() {
+        let _env = EnvGuard::new();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("empty.sbatch");
         std::fs::write(&path, "").expect("write empty script");
@@ -1301,7 +1306,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_no_requeue_overrides_script_requeue() {
+        let _env = EnvGuard::new();
         let argv = ["sbatch", "--no-requeue", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&["--requeue".to_string()], &argv).expect("args");
         let spec =
@@ -1310,7 +1317,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_requeue_enables_requeue() {
+        let _env = EnvGuard::new();
         let argv = ["sbatch", "--requeue", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&[], &argv).expect("args");
         let spec =
@@ -1319,7 +1328,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_script_requeue_enables_requeue() {
+        let _env = EnvGuard::new();
         let argv = ["sbatch", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&["--requeue".to_string()], &argv).expect("args");
         let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
@@ -1365,7 +1376,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_records_the_submit_line() {
+        let _env = EnvGuard::new();
         // --wrap keeps the script in memory, so the test needs no fixture file.
         let argv = ["sbatch", "-w", "node1", "--exclusive", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&[], &argv).expect("args");
@@ -1419,7 +1432,9 @@ mod tests {
     /// --container-readonly is a no-op in the runtime today, so it is refused at
     /// submission rather than silently ignored.
     #[test]
+    #[serial(env_injection)]
     fn build_sbatch_job_spec_rejects_container_readonly() {
+        let _env = EnvGuard::new();
         let argv = ["sbatch", "--container-readonly", "--wrap", "hostname"].map(String::from);
         let args = resolve_sbatch_args(&[], &argv).expect("args");
         let line = crate::submitline::render(&argv);
@@ -1522,7 +1537,9 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
     fn container_auth_socket_comes_from_a_directive_and_reaches_the_job_spec() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--container-auth-socket"], &["sbatch", "--wrap=true"]);
         assert!(args.container_auth_socket);
         let spec = build_sbatch_job_spec(args, None, "sbatch").expect("build spec");
@@ -1851,28 +1868,36 @@ echo "hello world"
     // --- --cpus-per-gpu / --mem-per-gpu ---
 
     #[test]
+    #[serial(env_injection)]
     fn cpus_per_task_defaults_to_zero_when_unset() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&[], &["sbatch", "--wrap", "hostname"]);
         let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
         assert_eq!(spec.cpus_per_task, 0);
     }
 
     #[test]
+    #[serial(env_injection)]
     fn cpus_per_task_cli_flag_sets_value() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&[], &["sbatch", "-c", "4", "--wrap", "hostname"]);
         let spec = build_sbatch_job_spec(args, None, "sbatch -c 4 --wrap hostname").expect("spec");
         assert_eq!(spec.cpus_per_task, 4);
     }
 
     #[test]
+    #[serial(env_injection)]
     fn cpus_per_task_directive_sets_value() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["-c", "4"], &["sbatch", "--wrap", "hostname"]);
         let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
         assert_eq!(spec.cpus_per_task, 4);
     }
 
     #[test]
+    #[serial(env_injection)]
     fn cpus_per_gpu_with_gres_sets_spec_field_and_leaves_cpus_per_task_unset() {
+        let _env = EnvGuard::new();
         let args = parse_merged(
             &[],
             &[
@@ -1924,7 +1949,9 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
     fn mem_per_gpu_sets_spec_field() {
+        let _env = EnvGuard::new();
         let args = parse_merged(
             &[],
             &[
@@ -1969,7 +1996,9 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
     fn cpus_per_gpu_without_gpus_rejected() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&[], &["sbatch", "--cpus-per-gpu=8", "--wrap", "hostname"]);
         let err = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").unwrap_err();
         assert_eq!(err.to_string(), "--cpus-per-gpu requires a GPU request");

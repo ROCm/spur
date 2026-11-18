@@ -303,8 +303,11 @@ Test patterns:
 - **Mock controller**: `mock_controller.rs` provides an in-process gRPC server
   for testing wait loops, step dispatch, and node operations without network.
 - **Mock agent**: `mock_agent.rs` for PTY and streaming tests.
-- **Env isolation**: Tests that mutate `SPUR_*/SBATCH_*/SLURM_*` env vars use
-  `serial_test::serial(env_injection)` and `EnvGuard` to prevent races.
+- **Env isolation**: Tests that mutate `SPUR_*/SBATCH_*/SLURM_*` env vars, or
+  whose result an env var can change, use `serial_test::serial(env_injection)`
+  and `EnvGuard`. `#[serial]` does not exclude unannotated tests, so an
+  unguarded reader races the mutators. Every `build_sbatch_job_spec` test is
+  such a reader: the build rejects bad env-supplied values.
 - **Format-spec coverage**: Every registered header letter/field name is
   asserted to have a matching render arm (prevents half-registered fields).
 - **Precedence tests**: sbatch has extensive tests for CLI-over-directive,

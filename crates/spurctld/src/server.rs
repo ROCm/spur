@@ -5915,6 +5915,8 @@ fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) ->
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
+    // A reservation's nodes and placement stay provisional until the run starts.
+    let run_started = job.start_time.is_some();
     JobInfo {
         preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
             &job.preemption_usage,
@@ -6067,7 +6069,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         batch_host: job
             .allocated_nodes
             .first()
-            .filter(|_| job.spec.is_batch())
+            .filter(|_| run_started && job.spec.is_batch())
             .cloned()
             .unwrap_or_default(),
         script_placement: job
@@ -6075,10 +6077,11 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             .script_placement
             .map(|p| p.to_string())
             .unwrap_or_default(),
-        resolved_script_placement: job
-            .resolved_placement
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        resolved_script_placement: if run_started {
+            job.script_placement().to_string()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -17669,10 +17672,22 @@ mod tests {
         assert_eq!(pending.resolved_script_placement, "");
 
         job.allocated_nodes = vec!["n2".into(), "n1".into()];
-        job.resolved_placement = Some(ResolvedPlacement::AllNodes);
-        let placed = job_to_proto(&job);
-        assert_eq!(placed.batch_host, "n2", "the first allocated node");
-        assert_eq!(placed.resolved_script_placement, "all-nodes");
+        job.resolved_placement = Some(ResolvedPlacement::BatchHost);
+        let reserved = job_to_proto(&job);
+        assert_eq!(reserved.batch_host, "", "a reservation is not a start");
+        assert_eq!(reserved.resolved_script_placement, "");
+
+        job.start_time = Some(chrono::Utc::now());
+        let started = job_to_proto(&job);
+        assert_eq!(started.batch_host, "n2", "the first allocated node");
+        assert_eq!(started.resolved_script_placement, "batch-host");
+
+        job.resolved_placement = None;
+        assert_eq!(
+            job_to_proto(&job).resolved_script_placement,
+            "all-nodes",
+            "a run an older controller started follows its script"
+        );
     }
 
     #[test]
@@ -17688,6 +17703,7 @@ mod tests {
             },
         );
         job.allocated_nodes = vec!["n1".into()];
+        job.start_time = Some(chrono::Utc::now());
 
         assert_eq!(job_to_proto(&job).batch_host, "");
     }
