@@ -145,6 +145,8 @@ pub enum AllocError {
 
     /// Another job on this node already holds one of these non-GPU devices.
     DevicesUnavailable { gres: String },
+    /// A non-GPU device id is not in this node's current inventory.
+    DevicesUnknown { gres: String },
 }
 
 /// Outcome of applying a fresh inventory to a node's live allocation.
@@ -184,6 +186,8 @@ pub struct NodeAllocation {
     pub gpu_allocated: Vec<bool>,
     /// GPU info for type matching.
     pub gpus: Vec<Device>,
+    /// Non-GPU device ids in the current inventory, by gres name.
+    device_inventory: DeviceSelection,
     /// Per-job ownership, so an allocation can be released by job id and
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
@@ -208,6 +212,21 @@ fn online_cpu_ids(resources: &ResourceSet) -> Vec<u32> {
         .as_ref()
         .map(|t| t.online_cpus())
         .unwrap_or_else(|| (0..resources.cpus).collect())
+}
+
+fn non_gpu_inventory(resources: &ResourceSet) -> DeviceSelection {
+    let mut by_kind: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+    for device in resources.devices.iter().filter(|d| !d.is_gpu()) {
+        by_kind
+            .entry(&device.gres_name)
+            .or_default()
+            .push(device.stable_id);
+    }
+    by_kind
+        .into_iter()
+        .fold(DeviceSelection::new(), |selection, (gres, ids)| {
+            selection.with(gres, ids)
+        })
 }
 
 /// Real CPU ID → its position in `cpu_ids`.
@@ -241,6 +260,7 @@ impl NodeAllocation {
             allocated_memory_mb: 0,
             gpu_allocated: vec![false; num_gpus],
             gpus: resources.gpus().cloned().collect(),
+            device_inventory: non_gpu_inventory(resources),
             owners: HashMap::new(),
             launching: HashMap::new(),
             fenced: HashSet::new(),
@@ -333,6 +353,19 @@ impl NodeAllocation {
                 lost.push((*job, Vec::new()));
             }
         }
+        // A held non-GPU device missing from `fresh` would drop out of the
+        // report while its holder still uses it; the next tick re-plans it.
+        let fresh_devices = non_gpu_inventory(fresh);
+        for (job, owned) in &self.owners {
+            let gone = owned
+                .result
+                .devices
+                .iter()
+                .any(|(gres, ids)| ids.iter().any(|id| !fresh_devices.of(gres).contains(id)));
+            if gone && !lost.iter().any(|(lost_job, _)| lost_job == job) {
+                lost.push((*job, Vec::new()));
+            }
+        }
         if !lost.is_empty() {
             lost.sort_by_key(|(job, _)| *job);
             return CapacityChange::AllocatedDevicesLost(lost);
@@ -353,6 +386,7 @@ impl NodeAllocation {
         self.unavailable.clear();
         self.total_memory_mb = fresh.memory_mb;
         self.gpus = fresh.gpus().cloned().collect();
+        self.device_inventory = fresh_devices;
         self.gpu_allocated = vec![false; self.gpus.len()];
         for owned in self.owners.values() {
             for &cpu in &owned.result.cpu_ids {
@@ -459,6 +493,12 @@ impl NodeAllocation {
         if self.owner_attempt(job_id) != Some(run_attempt) {
             return Err(AllocError::Superseded);
         }
+        if let Some((gres, _)) = devices.iter().find(|(gres, ids)| {
+            let known = self.device_inventory.of(gres);
+            ids.iter().any(|id| !known.contains(id))
+        }) {
+            return Err(AllocError::DevicesUnknown { gres: gres.into() });
+        }
         for (gres, ids) in devices.iter() {
             let held_elsewhere = self
                 .owners
@@ -482,6 +522,25 @@ impl NodeAllocation {
             }
         }
         Ok(())
+    }
+
+    /// The ids of `devices` this node's inventory has.
+    pub fn known_devices(&self, devices: &DeviceSelection) -> DeviceSelection {
+        devices
+            .iter()
+            .fold(DeviceSelection::new(), |selection, (gres, ids)| {
+                let known = self.device_inventory.of(gres);
+                let kept: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| known.contains(id))
+                    .collect();
+                if kept.is_empty() {
+                    selection
+                } else {
+                    selection.with(gres, kept)
+                }
+            })
     }
 
     /// Non-GPU devices `run_attempt` of `job_id` holds.
@@ -1013,9 +1072,70 @@ mod tests {
         spur_core::device::DeviceSelection::new().with("nic", ids.to_vec())
     }
 
+    fn resources_with_devices(cpus: u32, mem: u64, devices: &[(&str, u64)]) -> ResourceSet {
+        ResourceSet {
+            cpus,
+            memory_mb: mem,
+            devices: devices
+                .iter()
+                .enumerate()
+                .map(|(index, (gres, id))| Device::new(gres, "", *id, index as u32))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn make_node_with_devices(cpus: u32, mem: u64, devices: &[(&str, u64)]) -> NodeAllocation {
+        NodeAllocation::new(
+            "node001".into(),
+            &resources_with_devices(cpus, mem, devices),
+        )
+    }
+
+    #[test]
+    fn claiming_a_device_missing_from_inventory_is_refused() {
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000)]);
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        assert_eq!(
+            node.claim_devices(1, 1, &nics(&[0x850000])),
+            Err(AllocError::DevicesUnknown { gres: "nic".into() })
+        );
+    }
+
+    #[test]
+    fn update_capacity_defers_when_a_held_non_gpu_device_leaves_the_inventory() {
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000), ("nic", 0x850000)]);
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
+        let fresh = resources_with_devices(8, 1024, &[("nic", 0x850000)]);
+        assert_eq!(
+            node.update_capacity(&fresh),
+            CapacityChange::AllocatedDevicesLost(vec![(1, vec![])])
+        );
+    }
+
+    #[test]
+    fn update_capacity_replaces_the_device_inventory() {
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000)]);
+        let fresh = resources_with_devices(8, 1024, &[("nic", 0x850000)]);
+        assert_eq!(node.update_capacity(&fresh), CapacityChange::Applied);
+        node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        assert_eq!(
+            node.claim_devices(1, 1, &nics(&[0x050000])),
+            Err(AllocError::DevicesUnknown { gres: "nic".into() })
+        );
+        assert_eq!(node.claim_devices(1, 1, &nics(&[0x850000])), Ok(()));
+    }
+
+    #[test]
+    fn known_devices_keeps_only_inventory_ids() {
+        let node = make_node_with_devices(8, 1024, &[("nic", 1)]);
+        assert_eq!(node.known_devices(&nics(&[1, 7])), nics(&[1]));
+    }
+
     #[test]
     fn a_device_claimed_by_one_job_is_unavailable_to_another() {
-        let mut node = make_node(8, 1024, 0, "");
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000), ("nic", 0x850000)]);
         node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
         node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
         node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
@@ -1029,7 +1149,11 @@ mod tests {
 
     #[test]
     fn held_devices_lists_the_non_gpu_devices_every_owner_holds() {
-        let mut node = make_node(8, 1024, 0, "");
+        let mut node = make_node_with_devices(
+            8,
+            1024,
+            &[("nic", 0x050000), ("nic", 0x850000), ("fpga", 0)],
+        );
         node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
         node.allocate_for_job(2, 1, 1, 0, &[]).unwrap();
         node.claim_devices(1, 1, &nics(&[0x850000])).unwrap();
@@ -1050,7 +1174,11 @@ mod tests {
 
     #[test]
     fn device_owners_lists_committed_holders_of_any_named_device() {
-        let mut node = make_node(8, 1024, 0, "");
+        let mut node = make_node_with_devices(
+            8,
+            1024,
+            &[("nic", 0x050000), ("nic", 0x850000), ("fpga", 0)],
+        );
         for job in 1..=3 {
             node.allocate_for_job(job, 1, 1, 0, &[]).unwrap();
         }
@@ -1073,7 +1201,7 @@ mod tests {
 
     #[test]
     fn releasing_a_job_frees_its_device_claims() {
-        let mut node = make_node(8, 1024, 0, "");
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000)]);
         node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
         node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
         assert!(node.release_job(1));
@@ -1098,7 +1226,7 @@ mod tests {
 
     #[test]
     fn a_job_reclaiming_its_own_devices_is_not_a_conflict() {
-        let mut node = make_node(8, 1024, 0, "");
+        let mut node = make_node_with_devices(8, 1024, &[("nic", 0x050000)]);
         node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
         node.claim_devices(1, 1, &nics(&[0x050000])).unwrap();
         assert!(node.claim_devices(1, 1, &nics(&[0x050000])).is_ok());

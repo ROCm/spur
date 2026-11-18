@@ -123,6 +123,9 @@ fn device_claim_status(job_id: u32, error: AllocError) -> Status {
         AllocError::DevicesUnavailable { gres } => Status::resource_exhausted(format!(
             "controller-allocated {gres} devices unavailable on this node"
         )),
+        AllocError::DevicesUnknown { gres } => Status::resource_exhausted(format!(
+            "controller-allocated {gres} devices are not in this node's inventory"
+        )),
         _ => Status::failed_precondition(format!(
             "job {job_id} lost its reservation while claiming devices"
         )),
@@ -5029,9 +5032,27 @@ impl AgentService {
             match restored {
                 Ok(gpu_ids) => {
                     let others = resources.devices.excluding("gpu");
-                    if let Err(error) =
-                        allocation.claim_devices(descriptor.job_id, descriptor.run_attempt, &others)
-                    {
+                    let mut claimed = allocation.claim_devices(
+                        descriptor.job_id,
+                        descriptor.run_attempt,
+                        &others,
+                    );
+                    if let Err(AllocError::DevicesUnknown { .. }) = claimed {
+                        let known = allocation.known_devices(&others);
+                        warn!(
+                            job_id = descriptor.job_id,
+                            recorded = ?others,
+                            kept = ?known,
+                            "some of an adopted job's devices are not in this node's inventory; \
+                             claiming the rest"
+                        );
+                        claimed = allocation.claim_devices(
+                            descriptor.job_id,
+                            descriptor.run_attempt,
+                            &known,
+                        );
+                    }
+                    if let Err(error) = claimed {
                         warn!(
                             job_id = descriptor.job_id,
                             run_attempt = descriptor.run_attempt,
@@ -8361,10 +8382,8 @@ impl SlurmAgent for AgentService {
                         Status::resource_exhausted("allocated cores unavailable on this node")
                     }
                     AllocError::ReservedCpusHeld => reserved_cpus_held_refusal(),
-
-                    AllocError::DevicesUnavailable { gres } => Status::resource_exhausted(format!(
-                        "controller-allocated {gres} devices unavailable on this node"
-                    )),
+                    error @ (AllocError::DevicesUnavailable { .. }
+                    | AllocError::DevicesUnknown { .. }) => device_claim_status(req.job_id, error),
                 })?;
             let live: std::collections::HashSet<u32> = jobs.keys().copied().collect();
             if let Err(error) = claim_devices_reclaiming_stale(
@@ -11229,10 +11248,10 @@ impl AgentService {
                     }
                 }
             }
-            Err(AllocError::DevicesUnavailable { gres }) => {
-                return Err(Status::resource_exhausted(format!(
-                    "controller-allocated {gres} devices unavailable on this node"
-                )));
+            Err(
+                error @ (AllocError::DevicesUnavailable { .. } | AllocError::DevicesUnknown { .. }),
+            ) => {
+                return Err(device_claim_status(job_id, error));
             }
             Err(AllocError::GpusUnknown) => {
                 warn!(
@@ -17267,12 +17286,65 @@ mod tests {
     }
 
     fn nic_agent() -> AgentService {
+        let registry = test_gpu_and_nic_registry();
+        let reporter = test_reporter_with_resources(ResourceSet {
+            cpus: 4,
+            memory_mb: 8192,
+            devices: crate::reporter::devices_from_registry(&registry, None),
+            ..Default::default()
+        });
         AgentService::new(
-            test_reporter(),
+            reporter,
             HooksConfig::default(),
-            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
+            Arc::new(Mutex::new(registry)),
             spur_core::config::MemlockLimit::Unlimited,
         )
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_naming_a_nic_this_node_does_not_have_is_refused() {
+        let svc = nic_agent();
+        let (spec, allocated) = nic_dispatch(5);
+        let err = svc
+            .allocate_local_for_test(8, &spec, Some(&allocated))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("not in this node's inventory"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_job_keeps_its_known_devices_when_one_left_the_inventory() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let svc = nic_agent().with_runtime_state_dir(state.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            930,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("runtime/930.1.batch.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 1,
+            memory_mb: 512,
+            devices: spur_devices::DeviceSelection::new().with("nic", vec![1, 7]),
+            cpu_ids: vec![0],
+            ..Default::default()
+        };
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor), &HashMap::new())
+            .await;
+
+        assert_eq!(
+            svc.allocation.lock().await.held_devices(),
+            spur_devices::DeviceSelection::new().with("nic", vec![1])
+        );
     }
 
     /// A committed ledger owner of `nic` that the agent no longer runs.
@@ -17347,12 +17419,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dispatch_naming_a_nic_another_job_holds_is_refused() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = nic_agent();
         let (spec, allocated) = nic_dispatch(1);
         let (_, held) = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
@@ -17374,12 +17441,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dispatched_nic_reaches_the_host_injection_plan() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = nic_agent();
         let (spec, allocated) = nic_dispatch(1);
         let (_, devices) = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
@@ -17479,14 +17541,18 @@ mod tests {
     }
 
     fn test_reporter() -> Arc<NodeReporter> {
+        test_reporter_with_resources(ResourceSet {
+            cpus: 4,
+            memory_mb: 8192,
+            ..Default::default()
+        })
+    }
+
+    fn test_reporter_with_resources(resources: ResourceSet) -> Arc<NodeReporter> {
         Arc::new(NodeReporter::new(
             "test-node".into(),
             "http://localhost:6817".into(),
-            ResourceSet {
-                cpus: 4,
-                memory_mb: 8192,
-                ..Default::default()
-            },
+            resources,
             spur_net::NodeAddress {
                 ip: "127.0.0.1".into(),
                 hostname: "test-node".into(),
