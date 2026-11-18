@@ -1543,11 +1543,22 @@ impl BackfillScheduler {
         let heterogeneous = !job.spec.exclusive
             && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
+        // Built once per node: the timing search asks for it on every probe.
+        let whole_node: HashMap<usize, ResourceRequest> = if job.spec.exclusive {
+            suitable
+                .iter()
+                .map(|&ni| (ni, cluster.nodes[ni].total_resources.as_request()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let timing_request = |ni: usize| -> std::borrow::Cow<'_, ResourceRequest> {
-            if job.spec.exclusive {
-                std::borrow::Cow::Owned(cluster.nodes[ni].total_resources.as_request())
-            } else {
-                std::borrow::Cow::Borrowed(&required)
+            if !job.spec.exclusive {
+                return std::borrow::Cow::Borrowed(&required);
+            }
+            match whole_node.get(&ni) {
+                Some(request) => std::borrow::Cow::Borrowed(request),
+                None => std::borrow::Cow::Owned(cluster.nodes[ni].total_resources.as_request()),
             }
         };
 
