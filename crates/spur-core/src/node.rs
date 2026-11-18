@@ -550,11 +550,15 @@ impl Node {
             .collect()
     }
 
+    /// A virtual node the spur-k8s operator registered, running jobs as Pods.
+    pub fn is_kubernetes(&self) -> bool {
+        matches!(self.source, NodeSource::Kubernetes { .. })
+    }
+
     /// Whether the agent places a batch script by its text because it predates
     /// `script-placement`. K8s virtual agents run every script once per node.
     pub fn reads_placement_off_script(&self) -> bool {
-        !matches!(self.source, NodeSource::Kubernetes { .. })
-            && !self.supports(CAP_SCRIPT_PLACEMENT)
+        !self.is_kubernetes() && !self.supports(CAP_SCRIPT_PLACEMENT)
     }
 
     /// Reset config-derived scheduling policy (features, weight) to defaults.

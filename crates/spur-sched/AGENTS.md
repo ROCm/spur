@@ -58,9 +58,10 @@ For each pending job in priority order:
 1. **Find suitable nodes** -- `find_suitable_nodes()` filters by partition,
    features, nodelist/exclude, reservation authorization, node state, k0s
    reservation, and whether an empty node could ever hold it
-   (`Node::can_ever_satisfy`, which includes the general CPU pool below). A job
-   whose launch an older agent would change skips agents without
-   `CAP_SCRIPT_PLACEMENT` (see `docs/knowledge/execution/job-execution.md#script-placement`).
+   (`Node::can_ever_satisfy`, which includes the general CPU pool below), then
+   drops agents that would misplace the job's batch script
+   (`without_misplacing_agents()`, see
+   `docs/knowledge/execution/job-execution.md#script-placement`).
 
 2. **Compute earliest start per node** -- `earliest_valid_start()` combines
    the timeline's resource availability with reservation conflict checks,
@@ -134,6 +135,7 @@ against candidate nodes:
 | k0s cluster exclusion | `matches()` | Nodes with a k0s role are never scheduled |
 | Schedulable state | `is_schedulable()` | Node must be Idle/Mixed and no layout block |
 | Exclusive idle check | `matches()` | `--exclusive` jobs require zero allocated resources |
+| Script placement agents | `without_misplacing_agents()` | Drops agents without `CAP_SCRIPT_PLACEMENT` that would launch the job differently; `None` when an additive `--nodelist` needs one |
 
 `eligible()` = name + partition + features + reservation (load-independent).
 `matches()` = eligible + schedulable + exclusive-idle + k0s gate (feeds the

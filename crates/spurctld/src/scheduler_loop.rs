@@ -2374,16 +2374,12 @@ fn satisfiable_victim_set(
         return None;
     }
     let required = node_request(reclaimer);
-    let needs_aware_agents = reclaimer
-        .spec
-        .needs_placement_aware_agents(state.script_placement_default);
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
     // then refuse — including reservations and the k0s gate.
     let suitable = |node: &spur_core::node::Node| {
         placement.matches_for_reservation(node, reservations, now)
-            && !(needs_aware_agents && node.reads_placement_off_script())
             && node.can_ever_satisfy(&required)
             && state.handoff_allows(reclaimer, &node.name)
     };
@@ -2394,13 +2390,18 @@ fn satisfiable_victim_set(
         })
     };
 
+    let candidates = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| suitable(node))
+        .map(|(i, _)| i)
+        .collect();
+    let candidates =
+        placement.without_misplacing_agents(nodes, candidates, state.script_placement_default)?;
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
     let mut empty: Vec<&Node> = Vec::new();
     let mut evacuable: Vec<(&Node, &[spur_core::job::JobId])> = Vec::new();
-    for node in nodes {
-        if !suitable(node) {
-            continue;
-        }
+    for node in candidates.into_iter().map(|i| &nodes[i]) {
         match pool.occupants.get(node.name.as_str()) {
             None if cap_frees(node, &[]) => empty.push(node),
             None => {}

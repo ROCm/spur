@@ -443,17 +443,12 @@ impl BackfillScheduler {
         let reservations = cluster.reservations;
         let required = job_resource_request(job);
         let placement = NodePlacement::new(job);
-        let needs_aware_agents = job
-            .spec
-            .needs_placement_aware_agents(cluster.script_placement_default);
 
         let suitable = |node: &Node| {
             if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
-            !(needs_aware_agents && node.reads_placement_off_script())
-                && node.can_ever_satisfy(&required)
-                && !handoffs.hides(job, &node.name)
+            node.can_ever_satisfy(&required) && !handoffs.hides(job, &node.name)
         };
         // An additive `--nodelist` needs every listed node, so one hidden node blocks the job.
         let listed_node_hidden = || {
@@ -470,12 +465,15 @@ impl BackfillScheduler {
             return Vec::new();
         }
 
-        nodes
+        let candidates = nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| suitable(node))
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        placement
+            .without_misplacing_agents(nodes, candidates, cluster.script_placement_default)
+            .unwrap_or_default()
     }
 
     /// Free GPUs of `gpu_type` (None = any) on node `ni` at `time`, accounting
@@ -1972,7 +1970,7 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
 mod tests {
     use super::*;
     use spur_core::job::JobSpec;
-    use spur_core::node::{NodeState, CAP_SCRIPT_PLACEMENT};
+    use spur_core::node::{NodeSource, NodeState, CAP_SCRIPT_PLACEMENT};
     use spur_core::partition::Partition;
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations};
     use spur_core::script_placement::ScriptPlacement;
@@ -4272,6 +4270,43 @@ mod tests {
             schedule_with_placement_default(&single, &nodes, ScriptPlacement::Auto).len(),
             1,
             "one node runs the script once either way"
+        );
+    }
+
+    #[test]
+    fn a_job_pinned_to_an_older_agent_waits_instead_of_dropping_the_pin() {
+        let mut nodes = make_nodes(3);
+        nodes[1].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+        nodes[2].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+        let mut pinned = runner_job(1, 2, Some(ScriptPlacement::BatchHost));
+        pinned.spec.nodelist = Some("node001".into());
+
+        assert!(schedule_with_placement_default(&pinned, &nodes, ScriptPlacement::Auto).is_empty());
+
+        nodes[0].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+        let assignments = schedule_with_placement_default(&pinned, &nodes, ScriptPlacement::Auto);
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].nodes.iter().any(|n| n == "node001"));
+    }
+
+    #[test]
+    fn a_driver_script_that_can_reach_k8s_nodes_skips_older_agents() {
+        let mut nodes = make_nodes(2);
+        nodes[0].source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        let mut driver = runner_job(1, 2, None);
+        driver.spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
+
+        assert!(
+            schedule_with_placement_default(&driver, &nodes, ScriptPlacement::Auto).is_empty(),
+            "with node001 in the run node002 would hold instead of running the script"
+        );
+
+        nodes[0].source = NodeSource::NativeHost;
+        assert_eq!(
+            schedule_with_placement_default(&driver, &nodes, ScriptPlacement::Auto).len(),
+            1
         );
     }
 

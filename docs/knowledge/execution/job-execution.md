@@ -108,8 +108,11 @@ applies the scan (`Node::reads_placement_off_script`). That changes the launch o
 on a multi-node or PMIx run (`ResolvedPlacement::launches_differently_from`): off
 the batch host a node runs the script or holds, and on it only a PMIx launch depends
 on the placement. For a job where it does (`JobSpec::needs_placement_aware_agents`,
-given `ClusterState.script_placement_default`), backfill and the victim search skip
-such nodes, and dispatch backs off a run that still lands on one.
+given `ClusterState.script_placement_default`; a K8s candidate counts, since a run
+that includes one is `AllNodes`), backfill and the victim search drop such nodes from
+the candidates (`NodePlacement::without_misplacing_agents`), and a job whose
+additive `--nodelist` names one waits. Dispatch backs off a run that still lands on
+one.
 
 ### Prolog hooks
 
