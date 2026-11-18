@@ -1445,8 +1445,8 @@ Node inventory now lists every allocatable device, of every kind, in
   ``devices``, so you can roll back to the previous release.
 * **Agent state files.** An upgraded ``spurd`` reads the
   ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
-  wrote. After a rollback, an older ``spurd`` ignores fences the newer one
-  wrote, as it would an unreadable file.
+  wrote, and writes both in a shape an older ``spurd`` reads, so a rollback
+  keeps withholding repartitioned GPUs.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``.

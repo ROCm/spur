@@ -1112,7 +1112,7 @@ pub const FENCES_FILE: &str = "inventory-fences.json";
 /// its pre-change holders still hold until they exit.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Fences {
-    #[serde(default)]
+    #[serde(default, with = "spur_core::device::legacy_gpu_serde")]
     pub anchors: std::collections::BTreeMap<u64, Vec<Device>>,
 }
 
@@ -4995,6 +4995,27 @@ mod tests {
         assert_eq!(baseline.generic.get("bandwidth:lustre"), Some(&4096));
         assert_eq!(baseline.devices[0].numa_node, Some(0));
         assert_eq!(baseline.devices[0].affinity_cpus, vec![0, 1, 64, 65]);
+    }
+
+    #[test]
+    fn fences_written_now_keep_the_shape_older_agents_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = Device {
+            topology: Some(spur_core::device::DeviceTopology {
+                vram_bytes: Some(48 << 30),
+                ..Default::default()
+            }),
+            ..Device::gpu(0x110001, "mi300x", 1)
+        };
+        let fences = Fences {
+            anchors: [(0x110000, vec![gpu])].into(),
+        };
+        assert!(save_fences(dir.path(), &fences));
+
+        let raw = std::fs::read_to_string(dir.path().join(FENCES_FILE)).unwrap();
+        assert!(raw.contains("\"gpu_type\""), "{raw}");
+        assert!(!raw.contains("\"gres_name\""), "{raw}");
+        assert_eq!(load_fences(dir.path()), fences);
     }
 
     #[test]

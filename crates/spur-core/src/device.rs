@@ -109,6 +109,31 @@ impl From<&Device> for LegacyGpu {
     }
 }
 
+/// For a persisted map of GPUs an agent of the previous release also reads: it
+/// is written in the legacy `GpuResource` shape, and `Device` reads either.
+pub mod legacy_gpu_serde {
+    use super::{Device, LegacyGpu};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<u64, Vec<Device>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let legacy: BTreeMap<u64, Vec<LegacyGpu>> = map
+            .iter()
+            .map(|(key, gpus)| (*key, gpus.iter().map(LegacyGpu::from).collect()))
+            .collect();
+        legacy.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, Vec<Device>>, D::Error> {
+        BTreeMap::<u64, Vec<Device>>::deserialize(deserializer)
+    }
+}
+
 /// The wire `devices`, plus the deprecated `gpus` list still filled for one
 /// release so readers built before `devices` keep seeing the node's GPUs.
 pub fn devices_to_proto(
@@ -249,6 +274,41 @@ mod tests {
             #[serde(default)]
             pub affinity_cpus: Vec<u32>,
         }
+    }
+
+    #[test]
+    fn gpu_maps_written_for_older_agents_decode_with_their_struct() {
+        #[derive(Serialize)]
+        struct Now {
+            #[serde(with = "super::legacy_gpu_serde")]
+            anchors: std::collections::BTreeMap<u64, Vec<Device>>,
+        }
+        #[derive(Deserialize)]
+        struct Before {
+            anchors: std::collections::BTreeMap<u64, Vec<prev::GpuResource>>,
+        }
+        let gpu = Device {
+            topology: Some(DeviceTopology {
+                vram_bytes: Some(48 << 30),
+                ..Default::default()
+            }),
+            ..Device::gpu(0x110001, "mi300x", 1)
+        };
+        let json = serde_json::to_string(&Now {
+            anchors: [(0x110000, vec![gpu])].into(),
+        })
+        .unwrap();
+        let before: Before = serde_json::from_str(&json).expect("an older agent reads it");
+        let read = &before.anchors[&0x110000][0];
+        assert_eq!(
+            (
+                read.stable_id,
+                read.gpu_type.as_str(),
+                read.device_id,
+                read.memory_mb
+            ),
+            (0x110001, "mi300x", 1, 49152)
+        );
     }
 
     const LEGACY_GPU_JSON: &str = r#"{"device_id": 2, "gpu_type": "mi300x", "memory_mb": 196608,
