@@ -90,7 +90,11 @@ decides once per run at dispatch (`script_placement::resolve_run_placement` in
 `spurctld`) and records the result in `WalOperation::JobStart.resolved_placement`:
 
 1. Any K8s virtual node in the allocation gives `AllNodes`: a Pod per node, with
-   no step support. A multi-node job that explicitly asks for `batch-host` is held.
+   no step support. A multi-node job that explicitly asks for `batch-host`
+   (`JobSpec::needs_native_nodes`) is not eligible for K8s nodes
+   (`NodePlacement::eligible`): it waits as `BadConstraints` with the reason
+   `BATCH_HOST_K8S_UNSUPPORTED` while too few other nodes exist, submit rejects a
+   `--nodelist` that leaves too few, and dispatch still holds a run that includes one.
 2. Otherwise the job's `JobSpec.script_placement`, else `[controller]
    script_placement` (default `auto`). `auto` is a text scan: `BatchHost` when
    the script itself calls `srun`, `mpirun`, or `mpiexec`. srun and salloc jobs

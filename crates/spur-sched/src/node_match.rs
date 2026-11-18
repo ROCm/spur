@@ -170,8 +170,21 @@ impl<'a> NodePlacement<'a> {
     }
 
     /// Load-independent placement identity (nodelist/exclude, partition,
-    /// features, reservation), ignoring node state and free capacity.
+    /// features, reservation, native-only placement), ignoring node state and
+    /// free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
+        self.eligible_on_any_agent(node, reservations, now)
+            && !(node.is_kubernetes() && self.job.spec.needs_native_nodes())
+    }
+
+    /// [`eligible`](Self::eligible) without the native-node requirement, so the
+    /// pending-reason classifier can ask "would K8s virtual nodes have fit?".
+    pub fn eligible_on_any_agent(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
         self.allows_name(&node.name)
             && self.in_partition(node)
             && self.has_features(node)
@@ -668,6 +681,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn an_explicit_multi_node_batch_host_job_is_not_eligible_for_k8s_nodes() {
+        let mut k8s = node("k1");
+        k8s.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        let now = Utc::now();
+
+        let runner = batch_host_runner(2, None);
+        let p = NodePlacement::new(&runner);
+        assert!(!p.eligible(&k8s, &[], now));
+        assert!(p.eligible_on_any_agent(&k8s, &[], now));
+        assert!(p.eligible(&node("n1"), &[], now));
+
+        let single = batch_host_runner(1, None);
+        assert!(NodePlacement::new(&single).eligible(&k8s, &[], now));
     }
 
     #[test]

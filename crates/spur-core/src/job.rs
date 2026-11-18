@@ -958,6 +958,14 @@ impl JobSpec {
         by_task.max(by_gpu).max(by_node)
     }
 
+    /// An explicit multi-node `batch-host` run. K8s virtual agents run every script
+    /// once per node and host no steps, so only native nodes can honor it.
+    pub fn needs_native_nodes(&self) -> bool {
+        self.is_batch()
+            && self.num_nodes > 1
+            && self.script_placement == Some(crate::script_placement::ScriptPlacement::BatchHost)
+    }
+
     /// Whether this job's nodes must honor its placement rather than read it off
     /// the script, as an agent without the `script-placement` capability does.
     /// A run that includes a K8s node runs on every node, so K8s candidates count.
@@ -2152,6 +2160,19 @@ mod tests {
             ..runner_spec(2, Some(BatchHost))
         };
         assert!(!srun.needs_placement_aware_agents(Auto, false));
+    }
+
+    #[test]
+    fn only_an_explicit_multi_node_batch_host_job_needs_native_nodes() {
+        use crate::script_placement::ScriptPlacement::{AllNodes, BatchHost};
+
+        assert!(runner_spec(2, Some(BatchHost)).needs_native_nodes());
+        assert!(!runner_spec(1, Some(BatchHost)).needs_native_nodes());
+        assert!(!runner_spec(2, Some(AllNodes)).needs_native_nodes());
+        assert!(
+            !runner_spec(2, None).needs_native_nodes(),
+            "a cluster default runs on every node of a K8s run instead"
+        );
     }
 
     #[test]
