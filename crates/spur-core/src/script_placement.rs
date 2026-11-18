@@ -3,10 +3,63 @@
 
 //! Where a batch script runs: once on the batch host, or once on every node.
 
+use std::fmt;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// The placement a job asks for, or the cluster default when it asks for none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScriptPlacement {
+    /// The batch host when the script visibly launches steps, otherwise every node.
+    #[default]
+    Auto,
+    BatchHost,
+    AllNodes,
+}
+
+impl ScriptPlacement {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::BatchHost, Self::AllNodes];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::BatchHost => "batch-host",
+            Self::AllNodes => "all-nodes",
+        }
+    }
+
+    /// Where a script with this placement runs.
+    pub fn resolve(self, script: Option<&str>) -> ResolvedPlacement {
+        match self {
+            Self::Auto => ResolvedPlacement::scanned(script),
+            Self::BatchHost => ResolvedPlacement::BatchHost,
+            Self::AllNodes => ResolvedPlacement::AllNodes,
+        }
+    }
+}
+
+impl fmt::Display for ScriptPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ScriptPlacement {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|placement| placement.as_str() == s)
+            .ok_or_else(|| {
+                format!("invalid script placement '{s}' (expected auto, batch-host, or all-nodes)")
+            })
+    }
+}
 
 /// Where a run's batch script runs, decided once per run at dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +79,33 @@ impl ResolvedPlacement {
             Self::BatchHost
         } else {
             Self::AllNodes
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BatchHost => "batch-host",
+            Self::AllNodes => "all-nodes",
+        }
+    }
+}
+
+impl fmt::Display for ResolvedPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ResolvedPlacement {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "batch-host" => Ok(Self::BatchHost),
+            "all-nodes" => Ok(Self::AllNodes),
+            _ => Err(format!(
+                "invalid resolved script placement '{s}' (expected batch-host or all-nodes)"
+            )),
         }
     }
 }
@@ -118,6 +198,65 @@ fn script_launches_steps(script: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_placement_ignores_the_script() {
+        assert_eq!(
+            ScriptPlacement::AllNodes.resolve(Some("srun ./train\n")),
+            ResolvedPlacement::AllNodes
+        );
+        assert_eq!(
+            ScriptPlacement::BatchHost.resolve(Some("./train\n")),
+            ResolvedPlacement::BatchHost
+        );
+    }
+
+    #[test]
+    fn auto_follows_the_script() {
+        assert_eq!(
+            ScriptPlacement::Auto.resolve(Some("srun ./train\n")),
+            ResolvedPlacement::BatchHost
+        );
+        assert_eq!(
+            ScriptPlacement::Auto.resolve(Some("./train\n")),
+            ResolvedPlacement::AllNodes
+        );
+    }
+
+    #[test]
+    fn the_default_placement_is_auto() {
+        assert_eq!(ScriptPlacement::default(), ScriptPlacement::Auto);
+    }
+
+    #[test]
+    fn placements_parse_from_their_names() {
+        for placement in ScriptPlacement::ALL {
+            assert_eq!(placement.as_str().parse(), Ok(placement));
+            assert_eq!(placement.to_string(), placement.as_str());
+        }
+        let err = "batchhost".parse::<ScriptPlacement>().unwrap_err();
+        assert!(err.contains("auto, batch-host, or all-nodes"), "{err}");
+    }
+
+    #[test]
+    fn a_resolved_placement_is_never_auto() {
+        assert_eq!("batch-host".parse(), Ok(ResolvedPlacement::BatchHost));
+        assert_eq!("all-nodes".parse(), Ok(ResolvedPlacement::AllNodes));
+        assert!("auto".parse::<ResolvedPlacement>().is_err());
+        assert_eq!(ResolvedPlacement::BatchHost.to_string(), "batch-host");
+    }
+
+    #[test]
+    fn placements_serialize_by_name() {
+        assert_eq!(
+            serde_json::to_string(&ScriptPlacement::BatchHost).unwrap(),
+            "\"batch-host\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ResolvedPlacement::AllNodes).unwrap(),
+            "\"all-nodes\""
+        );
+    }
 
     #[test]
     fn a_script_that_launches_steps_runs_on_the_batch_host() {
