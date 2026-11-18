@@ -107,6 +107,10 @@ impl CredentialMint {
     }
 }
 
+/// Set in the environment of every process a job container starts, so a client can
+/// tell a container from a login or compute node.
+pub const IN_CONTAINER_ENV: &str = "SPUR_IN_CONTAINER";
+
 /// `$SPUR_AUTH_SOCKET` if set, otherwise `/run/spur/<cluster>/auth.sock`.
 pub fn resolve_socket_path(cluster_name: &str) -> Result<PathBuf, MintError> {
     match std::env::var(AUTH_SOCKET_ENV) {

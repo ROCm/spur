@@ -629,11 +629,11 @@ mod tests {
     #[test]
     fn container_auth_socket_reaches_the_allocation_job_spec() {
         let args = SallocArgs::parse_from(["salloc", "--container-auth-socket"]);
-        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        let spec = spec_from(&args, "salloc").expect("build spec");
         assert!(spec.container_auth_socket);
 
         let args = SallocArgs::parse_from(["salloc"]);
-        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        let spec = spec_from(&args, "salloc").expect("build spec");
         assert!(!spec.container_auth_socket, "the socket is opt-in");
     }
 

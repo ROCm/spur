@@ -87,18 +87,24 @@ impl tonic::service::Interceptor for AuthInterceptor {
     }
 }
 
-/// A mint socket that is not there is the normal state inside a container whose
-/// job did not ask for it, so say that instead of telling the user to start the
-/// mint.
+/// Inside a job container a missing mint socket is the normal state when the job
+/// did not ask for it, so say that; elsewhere the mint itself is down.
 fn mint_failure_message(error: &MintError) -> String {
-    match error {
-        MintError::Unavailable { path } => format!(
+    let in_container = std::env::var_os(spur_core::native_mint::IN_CONTAINER_ENV).is_some();
+    mint_failure_text(error, in_container)
+}
+
+fn mint_failure_text(error: &MintError, in_container: bool) -> String {
+    match (error, in_container) {
+        (MintError::Unavailable { path }, true) => format!(
             "credential mint not available in this container ({path}): the node's auth socket \
              is mounted only when the job was submitted with --container-auth-socket, and if it \
-             was, check that spurauthd is running on the node; outside a container, start \
-             spurauthd or set SPUR_AUTH_SOCKET"
+             was, check that spurauthd is running on the node"
         ),
-        other => other.to_string(),
+        (MintError::Unavailable { path }, false) => format!(
+            "credential mint not available ({path}): start spurauthd or set SPUR_AUTH_SOCKET"
+        ),
+        (other, _) => other.to_string(),
     }
 }
 
@@ -348,11 +354,11 @@ mod tests {
         assert_eq!(err.code(), Code::Unauthenticated);
         assert!(
             err.message()
-                .contains("credential mint not available in this container"),
+                .contains("start spurauthd or set SPUR_AUTH_SOCKET"),
             "{}",
             err.message()
         );
-        assert!(err.message().contains("--container-auth-socket"));
+        assert!(!err.message().contains("container"));
     }
 
     #[test]
@@ -426,8 +432,10 @@ mod tests {
         }
     }
 
-    /// One test because `$SPUR_AUTH_SOCKET` is process-global.
+    /// One test because `$SPUR_AUTH_SOCKET` is process-global; serial because other tests
+    /// clear every `SPUR_*` variable.
     #[test]
+    #[serial_test::serial(env_injection)]
     fn ungranted_mounts_of_the_socket_are_refused_at_submission() {
         let prev = std::env::var_os("SPUR_AUTH_SOCKET");
         unsafe { std::env::set_var("SPUR_AUTH_SOCKET", "/run/spur/c1/auth.sock") };
@@ -464,15 +472,22 @@ mod tests {
     }
 
     #[test]
-    fn mint_failure_message_covers_a_granted_job_without_spurauthd() {
-        let msg = mint_failure_message(&MintError::Unavailable {
+    fn mint_failure_text_depends_on_where_the_caller_runs() {
+        let err = MintError::Unavailable {
             path: "/run/spur/c1/auth.sock".into(),
-        });
-        assert!(msg.contains("--container-auth-socket") && msg.contains("spurauthd is running"));
+        };
+        let inside = mint_failure_text(&err, true);
+        assert!(
+            inside.contains("--container-auth-socket") && inside.contains("spurauthd is running")
+        );
+        let outside = mint_failure_text(&err, false);
+        assert!(outside.contains("start spurauthd or set SPUR_AUTH_SOCKET"));
+        assert!(!outside.contains("container"));
     }
 
     /// Both env cases live in one test: `$SPUR_CONF` / `$SPUR_CLUSTER_NAME` are process-global.
     #[test]
+    #[serial_test::serial(env_injection)]
     fn native_cluster_name_requires_env_without_config() {
         let prev_conf = std::env::var("SPUR_CONF").ok();
         let prev_cluster = std::env::var(CLUSTER_ENV).ok();
