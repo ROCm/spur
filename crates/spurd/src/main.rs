@@ -560,7 +560,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize device registry (CDI cache, GRES config, and discovery).
-    let registry = init_device_registry(config.as_ref(), &BTreeSet::new());
+    let mut nic_log = spur_devices::discovery::NicLog::default();
+    let registry = init_device_registry(config.as_ref(), &BTreeSet::new(), &mut nic_log);
     let registry = Arc::new(Mutex::new(registry));
 
     // Discover local resources (CPU/memory from sysfs, GPUs from device registry)
@@ -872,6 +873,7 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
         config.clone(),
         std::path::PathBuf::from(&stepd_state_dir),
+        nic_log,
     );
 
     // `agent_service` is moved into the gRPC server below, so anything the
@@ -1051,11 +1053,16 @@ fn devices_auto_detect(config: Option<&SlurmConfig>) -> bool {
 fn init_device_registry(
     config: Option<&SlurmConfig>,
     by_id_history: &BTreeSet<String>,
+    nic_log: &mut spur_devices::discovery::NicLog,
 ) -> DeviceRegistry {
     let default_devices = spur_core::config::DevicesConfig::default();
     let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
 
-    let cdi_cache = CdiCache::load(&devices_config.cdi_spec_dirs, devices_config.auto_detect);
+    let cdi_cache = CdiCache::load(
+        &devices_config.cdi_spec_dirs,
+        devices_config.auto_detect,
+        nic_log,
+    );
 
     let gres_entries: Vec<spur_devices::GresEntry> = devices_config
         .gres
@@ -1095,6 +1102,7 @@ fn spawn_inventory_refresh(
     running_jobs: agent_server::RunningJobs,
     config: Option<SlurmConfig>,
     stepd_state_dir: std::path::PathBuf,
+    mut nic_log: spur_devices::discovery::NicLog,
 ) {
     use spur_sched::cons_tres::CapacityChange;
 
@@ -1120,7 +1128,7 @@ fn spawn_inventory_refresh(
             // Build the candidate registry locally WITHOUT swapping the shared
             // one: GPU injection must keep using the old positional mapping until
             // this tick commits. Generation is bumped off the currently-reported set.
-            let candidate = init_device_registry(config.as_ref(), &by_id_history);
+            let candidate = init_device_registry(config.as_ref(), &by_id_history, &mut nic_log);
             let mut fresh = reporter::discover_resources(&candidate);
             fresh.generation = reporter.snapshot_resources().generation + 1;
 

@@ -11,14 +11,24 @@ use std::path::Path;
 use crate::cdi::spec::CdiSpec;
 
 pub use amd_gpu::discover_gpu_cdi;
+pub use amd_nic::{NicEvent, NicFunction, NicLog, NicOutcome, NicScan, Skipped};
 
-/// Every device kind discovered on this host, one CDI spec per kind present.
-pub fn discover_all_cdi() -> Vec<CdiSpec> {
+/// One host scan: a CDI spec per kind present, and what became of every NIC.
+pub struct Discovery {
+    pub specs: Vec<CdiSpec>,
+    pub nics: NicScan,
+}
+
+pub fn discover_all_cdi() -> Discovery {
     discover_all_cdi_from_root(Path::new("/"))
 }
 
-pub(crate) fn discover_all_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
+pub(crate) fn discover_all_cdi_from_root(root: &Path) -> Discovery {
     let mut specs = amd_gpu::discover_gpu_cdi_from_root(root);
-    specs.extend(amd_nic::discover_nic_cdi_from_root(root));
-    specs
+    let nics = amd_nic::discover_nic_cdi_from_root(root);
+    specs.extend(nics.specs);
+    Discovery {
+        specs,
+        nics: nics.scan,
+    }
 }
