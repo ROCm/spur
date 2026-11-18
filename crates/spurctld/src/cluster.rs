@@ -14823,18 +14823,30 @@ state = "UP"
             .unwrap();
         };
         write("[\"hash\", \"fewest_jobs\"]");
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             cm.config().scheduler.preempt_victim_order,
             [Hash, FewestJobs]
         );
 
         write("[]");
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().scheduler.preempt_victim_order.is_empty());
 
         write("[\"hash\", \"hash\"]");
-        assert!(cm.reconfigure().is_err());
+        let reloading = cm.clone();
+        assert!(tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .is_err());
         assert!(
             cm.config().scheduler.preempt_victim_order.is_empty(),
             "a rejected file leaves the running list alone"
