@@ -31,6 +31,9 @@ On a node with a known CPU topology, a ``GPUDevice=`` line also ends with
 ``AffinityCPUs=<list>`` (the CPUs near it). Each is left out when unknown; see
 :doc:`configuration`.
 
+A Kubernetes node with ``spur.amd.com/gpu-memory-mb`` set prints a
+``GPUDevice=`` line per GPU too, with its PCI address and NUMA node unknown.
+
 ``observed`` means the attributes were read consistently. It does not mean the
 external fabric manager reports the partition as ready. Other statuses are ``incomplete`` (missing, malformed, or
 unreadable fields), ``inconsistent`` (conflicting or changing observations),

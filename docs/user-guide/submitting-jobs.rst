@@ -231,7 +231,8 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Exclude specific nodes from the allocation.
    * - ``--exclusive``
      -
-     - Do not share allocated nodes with other jobs. Default off.
+     - Do not share allocated nodes with other jobs. The job is allocated every
+       device of every kind on its nodes. Default off.
    * - ``--topology``
      -
      - Prefer locality with ``block`` or ``tree``; ``none`` skips the hint.
