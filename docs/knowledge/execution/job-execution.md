@@ -19,6 +19,8 @@ agent (`spurd`). The request carries:
   node, attempt, uid/gid, command digest, and the allocated slice. (HMAC is
   used for user-RPC credentials, not execution credentials.)
 - `peer_nodes`, `task_offset`, `pmix_plan` -- multi-node topology.
+- `script_placement` -- where this run's batch script runs (see
+  [Script placement](#script-placement)); empty from controllers that predate it.
 
 The agent validates the credential (`native_exec::verify_execution`), refuses
 root uid unless `allow_root_jobs` is set, and confirms the request targets
@@ -79,6 +81,31 @@ The user's script is wrapped depending on the launch shape:
 For `--mpi=pmix`, the per-rank wrapper is deferred to the supervisor
 (`start_supervised_pmix`) because only the PMIx server process can hand out
 each rank's bootstrap environment.
+
+### Script placement
+
+A batch script runs either on the batch host only (`ResolvedPlacement::BatchHost`,
+the first allocated node) or on every allocated node (`AllNodes`). The controller
+decides once per run at dispatch (`script_placement::resolve_run_placement` in
+`spurctld`) and records the result in `WalOperation::JobStart.resolved_placement`:
+
+1. Any K8s virtual node in the allocation gives `AllNodes`: a Pod per node, with
+   no step support. A multi-node job that explicitly asks for `batch-host` is held.
+2. Otherwise the job's `JobSpec.script_placement`, else `[controller]
+   script_placement` (default `auto`). `auto` is a text scan: `BatchHost` when
+   the script itself calls `srun`, `mpirun`, or `mpiexec`. srun and salloc jobs
+   always use the scan.
+
+On `BatchHost`, every node but the one at `task_offset` 0 runs
+`batch_companion_hold_script` with stdio on `/dev/null`, holding its slice for
+the steps the script launches. The controller stops those nodes when the batch
+host reports (`step_launch_stragglers`), and the batch host's exit is the job's.
+A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
+and prepare are skipped.
+
+Agents advertise `CAP_SCRIPT_PLACEMENT`. An agent without it ignores the field and
+applies the scan, so the controller backs off a run whose placement differs from
+the scan instead of dispatching it there.
 
 ### Prolog hooks
 

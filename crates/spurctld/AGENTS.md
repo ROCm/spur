@@ -16,6 +16,7 @@ src/
   scheduler_loop.rs        Leader-gated scheduling loop: BackfillScheduler, time-limit/completing/inactive enforcers
   victim_order.rs          In-memory victim costs, per-node-freed rank keys, stable preemptor/node hash
   scheduler_loop/preemption.rs  Coherent compact allocation snapshots and bounded resource-aware victim sets
+  script_placement.rs      Batch script placement policy: per-run resolution (K8s rule, capability check), submit check
   cluster_k8s.rs           k0s cluster reconcile loop: role assignment, WireGuard mesh, join-token lifecycle
   hooks.rs                 Sandboxed Lua job_submit hooks (mlua, text-only, memory/instruction-capped)
   auth_middleware.rs        Tower layer: single auth verification point for all gRPC+accounting RPCs
@@ -184,7 +185,7 @@ Read RPCs are forwarded too (consistency with leader state), unless the request 
 6. Classify pending jobs (QOS/account limits, burst-buffer, licenses, idle-fill candidates); no QOS or account limit is charged yet
 7. Build `ClusterState` (nodes off dispatch cooldown, partitions, reservations, topology, busy_until)
 8. `plan_pass`: run `BackfillScheduler::schedule_with()` in `catch_unwind` (a panic skips the cycle, not the loop), with `LimitAdmission` charging QOS, account and partition QOS limits as each job starts, then start burst-buffer stage-in for jobs still within their limits
-9. Dispatch assignments: propose `JobStart` via Raft, fan out `LaunchJob` RPCs to agents
+9. Dispatch assignments: resolve the run's script placement (`script_placement::resolve_run_placement`: K8s virtual nodes always `all-nodes`, else the job's request, else `[controller] script_placement`; `auto` runs the text scan), propose `JobStart` (recording it) via Raft, fan out `LaunchJob` RPCs to agents. A multi-node explicit `batch-host` run on K8s nodes is held; a placement that differs from the scan on a node without `CAP_SCRIPT_PLACEMENT` is backed off
 10. Record cycle stats
 
 **Companion tasks (spawned alongside):**

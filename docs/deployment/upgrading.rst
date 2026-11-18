@@ -1282,6 +1282,45 @@ change, so add the field after every controller is upgraded. Restarts and agent
 registrations never write it. A rollback after the entry has been written is not
 supported because older controllers cannot replay it: roll forward.
 
+.. _upgrading-script-placement:
+
+Batch script placement (``script_placement``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds ``sbatch --script-placement`` and the ``[controller]
+script_placement`` default (see :ref:`submit-script-placement`). Until a job asks for
+a placement or a default is set, every job runs its script where it did before,
+whatever release each controller, agent, and client runs. No new Raft entry type is
+added, so replication never stalls: existing entries only gain optional fields.
+
+**Upgrade every controller before using a placement**: before setting the
+``[controller]`` default, and before users get an ``sbatch`` that accepts
+``--script-placement``. A controller that predates this release ignores the new
+fields in requests, Raft log entries, and snapshots, and places the script by the
+text scan that ``auto`` uses:
+
+- A job submitted through it loses its placement, even when it only forwards the
+  request to an upgraded leader.
+- If it becomes leader before such a job starts, the script runs where the scan
+  says, so a script whose launcher is hidden in another script runs on every node.
+- If it becomes leader while a ``batch-host`` job runs, it stops the job's other
+  nodes when the script exits only if the script itself calls ``srun``,
+  ``mpirun``, or ``mpiexec``. Otherwise the job stays ``COMPLETING`` for
+  ``scheduler.complete_wait_secs`` (default 300 seconds), then ends ``FAILED``,
+  and those nodes are drained until an administrator resumes them. An
+  ``all-nodes`` job whose script calls ``srun`` has the reverse problem: the first
+  copy to finish stops the others.
+
+Jobs that used a placement during the upgrade can stay affected after it: a
+controller upgraded partway through restarts from the snapshot it wrote before its
+upgrade, which lacks their placement.
+
+**Upgrade agents before relying on a placement.** A job whose placement differs
+from the text scan does not start on nodes whose ``spurd`` predates this release.
+The controller logs a warning naming those nodes and retries the job later,
+counting each retry against ``[controller] max_batch_requeue``, so a job that keeps
+landing on such nodes is eventually held.
+
 See Also
 --------
 

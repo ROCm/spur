@@ -3,10 +3,10 @@ Submitting Batch Jobs
 
 A batch job is a shell script that Spur runs on your behalf when the requested
 resources become available. Submit it with ``spur submit`` (Slurm ``sbatch``)
-and the controller queues it, allocates nodes, and runs the script on the first
-allocated node. This page covers writing a job script, the options that control
-the allocation, job arrays and dependencies, and the environment variables your
-script sees at run time.
+and the controller queues it, allocates nodes, and runs the script on them (see
+:ref:`submit-script-placement` for which ones). This page covers writing a job
+script, the options that control the allocation, job arrays and dependencies, and
+the environment variables your script sees at run time.
 
 Script Body Sources
 -------------------
@@ -56,7 +56,7 @@ order (highest wins), matching Slurm:
 1. A command-line flag.
 2. An ``SBATCH_*`` environment variable (e.g. ``SBATCH_PARTITION``).
 3. A ``#SBATCH`` directive in the script header.
-4. The built-in default.
+4. The built-in default, or for ``--script-placement`` the cluster's default.
 
 So ``spur submit --nodes=4 train.sh`` overrides a ``#SBATCH --nodes=2`` directive
 inside ``train.sh``.
@@ -133,6 +133,70 @@ For scripting, ``--parsable`` prints only the job ID so you can capture it:
 .. code-block:: bash
 
    jobid=$(sbatch --parsable train.sh)
+
+.. _submit-script-placement:
+
+Where Your Batch Script Runs
+----------------------------
+
+A multi-node job can run its script once, on the first allocated node (the
+*batch host*), or once on every allocated node. ``--script-placement`` chooses:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Value
+     - Where the script runs
+   * - ``auto``
+     - On the batch host when the script itself calls ``srun``, ``mpirun``, or
+       ``mpiexec``; on every node otherwise. This is the default unless your
+       administrator changed it.
+   * - ``batch-host``
+     - On the batch host only, as in Slurm. The other nodes stay allocated until
+       the script exits, so ``srun``, or an ``mpirun`` that places its daemons
+       with ``srun``, can reach any of them at any time.
+   * - ``all-nodes``
+     - On every allocated node, each with its own ``SLURM_NODEID``.
+
+``auto`` reads only the script's own text. It misses a launcher one level
+down, such as one in a script the batch script runs, behind a wrapper, or in a
+variable like ``$LAUNCHER``, and then runs the whole script on every node. Set
+``batch-host`` for such scripts:
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH --nodes=8
+   #SBATCH --script-placement=batch-host
+
+   # Each test calls `mpirun --mca plm slurm ...`.
+   for test in tests/*.sh; do
+       bash "$test"
+   done
+
+The value resolves like any other option: the command line, then
+``SPUR_SCRIPT_PLACEMENT`` or ``SBATCH_SCRIPT_PLACEMENT``, then a ``#SBATCH``
+line, then the cluster default, ``[controller] script_placement`` (see
+:doc:`/admin-guide/configuration`). Real Slurm rejects an unknown ``#SBATCH``
+option, so a script that must also run on Slurm should get the value from the
+environment variable instead.
+
+To run a command on every node from a ``batch-host`` script, launch it as a
+step, as in Slurm:
+
+.. code-block:: bash
+
+   srun --ntasks-per-node=1 ./prepare-node.sh
+
+``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
+requested value while the job is pending and the one it runs with once it is
+placed, and ``BatchHost=`` names the node the script runs on.
+
+Nodes managed by the Kubernetes operator run one Pod per node and cannot run
+``srun`` steps, so a job placed on them always runs the script on every node.
+A multi-node ``--script-placement=batch-host`` job is held with a reason
+there.
 
 Common Options
 --------------
@@ -269,6 +333,11 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--licenses``
      - ``-L``
      - Request licenses. Repeatable; values accumulate.
+   * - ``--script-placement``
+     -
+     - Run the script on the batch host only (``batch-host``), on every node
+       (``all-nodes``), or let Spur decide (``auto``). See
+       :ref:`submit-script-placement`.
    * - ``--wrap``
      -
      - Wrap a command instead of using a script file.
