@@ -3345,6 +3345,7 @@ async fn register_allocation_to_agent(
         .await
         .map_err(|e| RegisterError::Failed(e.into()))?;
 
+    #[allow(deprecated)]
     let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
             job_id: params.job_id,
