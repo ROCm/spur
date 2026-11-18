@@ -138,7 +138,7 @@ mod tests {
 
         // Request "any" GPU type
         let mut req = ResourceRequest::with_scalar(64, 256_000);
-        req.add_devices("gpu", None, 4);
+        req.add_devices("gpu", Some("any"), 4);
 
         assert!(node.can_satisfy(&req));
     }
