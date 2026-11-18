@@ -656,9 +656,11 @@ How it behaves:
   onto a node the partition QOS already holds needs no new node (see
   :ref:`grptres-node-packing`).
 - A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
-  partitions whose QOS still admits it, and waits only when none does. Until it is
-  placed, it counts against every candidate partition's QOS for the rest of that
-  scheduling pass, so a later job in the same pass may wait one pass longer.
+  partitions whose QOS still admits it, and waits only when none does. It is
+  charged to the QOS of the partition it starts in, when it starts (see
+  `When limits are charged`_). If an earlier start in the same scheduling pass
+  fills that QOS, the job is refused there and runs in another of its partitions
+  from the next pass.
 - Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
   idle capacity past it: the cap bounds what a user holds, borrowed or not. A
   suspended job, and one still in its kill wait, count until each of their nodes
@@ -728,9 +730,11 @@ When limits are charged
 
 The limits that count running work (``grptres``, ``maxtresperuser``,
 ``maxjobsperuser`` and an association's ``maxrunningjobs``) are charged when a
-job starts, on the nodes it got, as in Slurm. A scheduling pass checks each start,
-in the order it places jobs, against the running jobs and the starts before it in
-the same pass, so no start goes over a cap.
+job starts, on the nodes it got, as in Slurm. This holds for the job QOS, the
+association and the partition QOS, which is charged in the partition the job
+starts in (see `Partition QOS: capping a user across accounts`_). A scheduling
+pass checks each start, in the order it places jobs, against the running jobs
+and the starts before it in the same pass, so no start goes over a cap.
 
 A waiting job holds no room. A job that cannot be placed yet, for example
 because it is pinned to a busy node, waits for a reservation or needs a node
@@ -752,9 +756,9 @@ Preemption, idle-fill reclaim and federation forwarding act only for a job that
 still fits its limits after the starts in the same pass and the evictions in
 flight.
 
-Licenses and burst-buffer capacity are not charged this way: a pass reserves them
-when it first considers a job, before placing it, so a job that is then not started
-or not staged in holds them for that pass.
+Licenses and burst-buffer capacity are not charged this way: a pass reserves
+them when it first considers a job, before placing it, so a job that is then not
+started or not staged in holds them for that pass.
 
 .. _maxwall-default:
 

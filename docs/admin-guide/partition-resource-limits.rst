@@ -413,11 +413,11 @@ How caps combine with other limits
 ----------------------------------
 
 Spur applies the job's QOS, its user and account association, the partition
-it runs in, and physical node capacity together. A job runs only if it passes
-all of them. A partition cap never loosens an association or QOS limit, and the
-other way round. This is not Slurm's hierarchy, where the first layer that
-defines a limit wins. Inheriting limits from parent accounts or the root, and
-partition QOS, are not supported.
+it runs in and that partition's :ref:`QOS <partition-qos>`, and physical node
+capacity together. A job runs only if it passes all of them. A partition cap
+never loosens an association or QOS limit, and the other way round. This is not
+Slurm's hierarchy, where the first layer that defines a limit wins. Inheriting
+limits from parent accounts or the root is not supported.
 
 Partition caps (``max_tres_per_node``) are additional constraints on top of the
 association and QOS limits. A partition's memory policy can change a job's CPU

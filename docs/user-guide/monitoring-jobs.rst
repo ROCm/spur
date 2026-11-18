@@ -816,10 +816,10 @@ per-cycle scheduling depth limit are not reported:
 ``future_slot_reserved``, or ``refused_at_start``. ``future_slot_reserved`` means
 the job can be placed and the scheduler is holding a future slot for it, reported
 with ``planned_start``. ``refused_at_start`` means the job could be placed, now or
-in a future slot, but on the nodes it was placed on it would be over a QOS or
-account limit, counting the jobs started earlier in the same cycle and the room
-held for preemptions in flight. It holds no slot and pends with that limit's
-reason, for example ``QOSGrpNodeLimit``.
+in a future slot, but on the nodes it was placed on it would be over a QOS,
+partition QOS or account limit, counting the jobs started earlier in the same
+cycle and the room held for preemptions in flight. It holds no slot and pends with
+that limit's reason, for example ``QOSGrpNodeLimit``.
 
 .. note::
 

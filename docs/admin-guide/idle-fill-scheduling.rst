@@ -115,13 +115,14 @@ Quota accounting
 
 A borrowed run is held outside **every** quota aggregate, at both the association
 and the QOS gate: node and other TRES totals, occupied-node counts, running and
-submitted job counts, and array concurrency.
+submitted job counts, and array concurrency. Only a :ref:`partition QOS
+<partition-qos>` counts it, as it counts every run in its partition.
 
 The one exception is the scheduling pass that starts it. Limits are charged when
 a job starts (see :ref:`limits-charged-at-start`), and a borrowed job is charged
 like any other start except for its QOS group node count, so the starts after it
-in that pass see what it uses. From the next pass on it is outside the aggregates
-again.
+in that pass see what it uses. From the next pass on it is outside the job QOS and
+association aggregates again.
 
 This is not cosmetic. If a borrowed job counted toward its own team's quota, it
 would block that team's *next legitimate job* at an admission gate — and a job
@@ -132,7 +133,8 @@ which is the exact failure the feature exists to prevent.
 One consequence to plan for: each borrowed job must fit its account limits when it
 starts, but because borrowed nodes then leave the aggregates, neither the QOS group
 node cap nor the association node cap bounds how much a scope may borrow in total.
-Only the amount of genuinely idle capacity does.
+Only the amount of genuinely idle capacity does, and a partition QOS, which bounds
+what a user holds in the partitions it is attached to, borrowed or not.
 
 .. note::
 
