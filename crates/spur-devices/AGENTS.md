@@ -109,7 +109,7 @@ and countable pools (count-only, no device paths).
 `DeviceRegistry` (device_registry.rs) is the unified device inventory.
 `populate()` merges CDI cache + GRES cache:
 
-1. CDI entries first (sorted by PCI BDF, stable id and primary device path, then by qualified device name)
+1. CDI entries first: entries with a PCI address, ordered by address, then stable id, then primary device path; then entries without one, by primary device path; the qualified device name breaks any remaining tie
 2. GRES injectable entries: each is first tried against the discovered CDI
    entries (`merge_into_discovered()`) by its `renderD*` node; a match
    merges the configured `type`/`cores`/`links` onto the discovered GPU
