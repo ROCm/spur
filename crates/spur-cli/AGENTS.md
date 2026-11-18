@@ -147,7 +147,8 @@ field format (`-O JobID:10,Partition`). Sorting via `-S` uses the same
 format-spec letters. Default sort: partition asc, state asc, priority desc,
 jobid asc. `--start` shows projected start times for pending jobs.
 
-**sacct** queries the accounting service (same gRPC port). Format uses
+**sacct** queries the accounting service (same gRPC port). Its state filter
+uses the same `parse_states_arg` as squeue before opening the connection. Format uses
 comma-separated field names (`--format=JobID,JobName,State`).
 
 ### Node management (sinfo, scontrol)

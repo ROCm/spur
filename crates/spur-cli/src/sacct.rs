@@ -181,7 +181,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let page = history_page(args.limit, job_ids.len());
-    let request = history_request(&args, job_ids, &page);
+    let request = history_request(&args, job_ids, &page)?;
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -247,27 +247,24 @@ fn history_request(
     args: &SacctArgs,
     job_ids: Vec<u32>,
     page: &HistoryPage,
-) -> GetJobHistoryRequest {
+) -> Result<GetJobHistoryRequest> {
     let states = args
         .state
         .as_deref()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|st| parse_acct_state(st.trim()))
-                .collect()
-        })
+        .map(crate::squeue::parse_states_arg)
+        .transpose()?
         .unwrap_or_default();
     let time_arg =
         |t: &Option<String>| t.as_deref().and_then(parse_time_arg).map(datetime_to_proto);
-    GetJobHistoryRequest {
+    Ok(GetJobHistoryRequest {
         user: args.user.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
         start_after: time_arg(&args.starttime),
         start_before: time_arg(&args.endtime),
-        states,
+        states: states.into_iter().map(|state| state as i32).collect(),
         job_ids,
         limit: page.fetch,
-    }
+    })
 }
 
 fn take_visible<T>(mut rows: Vec<T>, show: u32) -> (Vec<T>, bool) {
@@ -390,23 +387,6 @@ fn state_name(state: i32) -> String {
         .unwrap_or_else(|| "UNKNOWN".into())
 }
 
-fn parse_acct_state(s: &str) -> Option<i32> {
-    match s.to_uppercase().as_str() {
-        "CD" | "COMPLETED" => Some(3),
-        "F" | "FAILED" => Some(4),
-        "CA" | "CANCELLED" => Some(5),
-        "TO" | "TIMEOUT" => Some(6),
-        "NF" | "NODE_FAIL" => Some(7),
-        "PR" | "PREEMPTED" => Some(8),
-        "DL" | "DEADLINE" => Some(10),
-        "OOM" | "OUT_OF_MEMORY" => Some(11),
-        "RQ" | "REQUEUED" => Some(12),
-        "R" | "RUNNING" => Some(1),
-        "PD" | "PENDING" => Some(0),
-        _ => None,
-    }
-}
-
 fn format_elapsed(job: &spur_proto::proto::JobInfo) -> String {
     if let Some(ref rt) = job.run_time {
         format_duration(rt.seconds)
@@ -515,47 +495,15 @@ mod tests {
         assert_eq!(resolve_sacct_field(&j, 'l'), format_duration(3600));
     }
 
-    #[test]
-    fn parse_acct_state_maps_deadline() {
-        // Both the long form and the squeue short code resolve to the proto
-        // JobDeadline discriminant, so `sacct --state=DEADLINE` filters work.
-        assert_eq!(
-            parse_acct_state("DEADLINE"),
-            Some(JobState::JobDeadline as i32)
-        );
-        assert_eq!(parse_acct_state("DL"), Some(JobState::JobDeadline as i32));
-        assert_eq!(
-            parse_acct_state("deadline"),
-            Some(JobState::JobDeadline as i32)
-        );
-    }
-
-    #[test]
-    fn parse_acct_state_round_trips_known_states() {
-        let cases = [
-            ("COMPLETED", JobState::JobCompleted),
-            ("FAILED", JobState::JobFailed),
-            ("CANCELLED", JobState::JobCancelled),
-            ("TIMEOUT", JobState::JobTimeout),
-            ("NODE_FAIL", JobState::JobNodeFail),
-            ("PREEMPTED", JobState::JobPreempted),
-            ("DEADLINE", JobState::JobDeadline),
-            ("OUT_OF_MEMORY", JobState::JobOutOfMemory),
-            ("REQUEUED", JobState::JobRequeued),
-        ];
-        for (s, expected) in cases {
-            assert_eq!(parse_acct_state(s), Some(expected as i32), "state {s}");
+    #[tokio::test]
+    async fn unknown_state_fails_before_connecting_to_accounting() {
+        for filter in ["COMPLTED", "FAILED,COMPLTED"] {
+            let args = ["sacct", "--state", filter, "--controller", "invalid"]
+                .map(str::to_string)
+                .to_vec();
+            let error = main_with_args(args).await.unwrap_err();
+            assert!(error.to_string().contains("COMPLTED"), "{error}");
         }
-    }
-
-    #[test]
-    fn parse_acct_state_accepts_oom_and_rq_short_codes() {
-        // --state=OOM/RQ must filter, not silently drop into an unconstrained query.
-        assert_eq!(
-            parse_acct_state("OOM"),
-            Some(JobState::JobOutOfMemory as i32)
-        );
-        assert_eq!(parse_acct_state("RQ"), Some(JobState::JobRequeued as i32));
     }
 
     #[test]
@@ -778,7 +726,7 @@ mod tests {
     fn an_open_query_asks_the_server_for_the_probe_row() {
         let args = SacctArgs::try_parse_from(["sacct"]).unwrap();
         let page = history_page(args.limit, 0);
-        let req = history_request(&args, vec![], &page);
+        let req = history_request(&args, vec![], &page).unwrap();
         assert_eq!(req.limit, DEFAULT_HISTORY_ROWS + 1);
     }
 
@@ -787,7 +735,7 @@ mod tests {
         let args = SacctArgs::try_parse_from(["sacct", "-j", "30.0,30.1"]).unwrap();
         let ids = crate::job_id_arg::parse_job_ids(args.jobs.as_deref().unwrap()).unwrap();
         let page = history_page(args.limit, ids.len());
-        let req = history_request(&args, ids, &page);
+        let req = history_request(&args, ids, &page).unwrap();
         assert_eq!(req.job_ids, vec![30, 30]);
         assert_eq!(req.limit, 2);
     }
@@ -806,7 +754,7 @@ mod tests {
             "2026-07-01",
         ])
         .unwrap();
-        let req = history_request(&args, vec![], &history_page(args.limit, 0));
+        let req = history_request(&args, vec![], &history_page(args.limit, 0)).unwrap();
         assert_eq!(req.user, "alice");
         assert_eq!(req.account, "research");
         assert_eq!(req.states.len(), 2);

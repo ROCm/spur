@@ -480,9 +480,9 @@ fn default_squeue_states() -> Vec<spur_proto::proto::JobState> {
     ]
 }
 
-/// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
+/// Parse a comma-separated job state filter. Whole-string `all` means no state filter.
 /// Unknown tokens are rejected (Slurm exits with an error rather than showing all jobs).
-fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::JobState>> {
+pub(crate) fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::JobState>> {
     use spur_core::job::JobState;
 
     let trimmed = s.trim();
@@ -903,6 +903,19 @@ mod tests {
         assert_eq!(states.len(), 2);
         assert_eq!(states[0], P::JobRunning);
         assert_eq!(states[1], P::JobPending);
+    }
+
+    #[test]
+    fn parse_states_arg_accepts_accounting_states() {
+        for state in spur_core::job::JobState::ALL {
+            for value in [state.code(), state.display()] {
+                assert_eq!(parse_states_arg(value).unwrap(), vec![state.to_proto()]);
+            }
+        }
+        assert_eq!(
+            parse_states_arg("deadline,rq,oom").unwrap(),
+            vec![P::JobDeadline, P::JobRequeued, P::JobOutOfMemory]
+        );
     }
 
     #[test]
