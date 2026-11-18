@@ -385,8 +385,9 @@ The agent:
 The agent maintains a per-process cache of accepted launches keyed by
 `(job_id, step_id, run_attempt)`. An exact duplicate credential (same
 `credential_id` and `command_digest`) is accepted but does not re-launch.
-A different credential for the same attempt is rejected as
-`IdempotencyConflict`. A cancelled attempt stays rejected. The cache
+`LaunchJob` records a credential only after the request validates, so a retry
+of a refused launch is never answered as already launched. A different
+credential for the same attempt is rejected as `IdempotencyConflict`. A cancelled attempt stays rejected. The cache
 evicts expired entries and, at capacity (default 8192), evicts the
 entry with the earliest expiry.
 
