@@ -8934,7 +8934,7 @@ impl SlurmAgent for AgentService {
                 .await
                 .build_job_injection_plans(&launch_devices, req.uid, req.gid)
                 .map_err(|e| {
-                    Status::failed_precondition(format!("GPU injection plan failed: {}", e))
+                    Status::failed_precondition(format!("device injection plan failed: {}", e))
                 })?;
             let env = host_plan.env.clone();
             // Already merged into senv below with correct --gpu-bind precedence;
@@ -10304,7 +10304,7 @@ impl SlurmAgent for AgentService {
                                     .build_job_injection_plans(&job_devices, entry.uid, entry.gid)
                                     .map_err(|e| {
                                         Status::failed_precondition(format!(
-                                            "GPU injection plan failed: {e}"
+                                            "device injection plan failed: {e}"
                                         ))
                                     })?;
                                 let env = host_plan.env.clone();
