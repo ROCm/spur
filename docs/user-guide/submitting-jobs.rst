@@ -190,8 +190,8 @@ step, as in Slurm:
    srun --ntasks-per-node=1 ./prepare-node.sh
 
 ``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
-requested value while the job is pending and the one it runs with once it is
-placed, and ``BatchHost=`` names the node the script runs on.
+requested value while the job is pending and the one it runs with once it
+starts, and from then ``BatchHost=`` names the node the script runs on.
 
 Nodes managed by the Kubernetes operator run one Pod per node and cannot run
 ``srun`` steps, so a job placed on them always runs the script on every node.
