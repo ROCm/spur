@@ -87,7 +87,7 @@ def _metric_job_ids(node, port: int) -> dict[str, str] | None:
 def _install_dme(cluster: SpurCluster) -> tuple[str, str]:
     paths = tuple(
         cluster.write_file(f"hooks/{name}", (HOOKS_DIR / "dme" / name).read_text(), all_nodes=True)
-        for name in ("slurm-prolog.sh", "slurm-epilog.sh")
+        for name in ("slurm-prolog.sh", "slurm-epilog.sh", "common.sh")
     )
     return paths[0], paths[1]
 

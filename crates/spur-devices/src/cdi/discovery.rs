@@ -297,6 +297,10 @@ pub const STABLE_ID_PARTITION_MASK: u64 = 0xFF;
 /// Encode a reload-invariant device id from the PCIe BDF (domain:bus:dev.func
 /// anchor) plus a per-partition rank. The domain occupies bits 24..39, so two
 /// GPUs on different PCI domains with the same bus:dev.func no longer collide.
+///
+/// The exporter hooks in `examples/hooks/dme/common.sh` and
+/// `examples/hooks/gpu-node/common-env.sh` decode this layout from KFD
+/// topology to find render IDs; change them together with it.
 fn encode_stable_id(id: &PciIdentity) -> u64 {
     (u64::from(id.domain & 0xffff) << 24)
         | (u64::from(id.bus) << 16)

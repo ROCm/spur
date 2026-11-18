@@ -35,6 +35,8 @@ GPU:
      - the ``job_user`` metric label
    * - ``SLURM_JOB_PARTITION``
      - the ``job_partition`` metric label
+   * - ``SLURM_CLUSTER_NAME``
+     - the ``cluster_name`` metric label
    * - ``CUDA_VISIBLE_DEVICES``
      - which GPUs get those labels
 
@@ -47,7 +49,10 @@ another job.
 
 Spur's hook environment already twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION``
 into ``SLURM_JOB_ID``/``SLURM_JOB_PARTITION``, so the scripts below use those
-directly. ``SLURM_JOB_USER`` comes from ``SPUR_JOB_USER``. The render IDs come
+directly. ``SLURM_JOB_USER`` comes from ``SPUR_JOB_USER``. Spur does not pass
+the cluster name to node hooks, so ``SLURM_CLUSTER_NAME`` is written from
+``SPUR_CLUSTER_NAME`` only when ``spurd``'s own environment sets it, and is
+empty otherwise. The render IDs come
 from ``SPUR_JOB_GPUS``, which holds Spur's internal GPU ids rather than
 render IDs or GPU indices: the scripts map each id to its render ID through
 the kernel's GPU topology under ``/sys/class/kfd``.
@@ -88,6 +93,11 @@ Spur repository:
 
    sudo install -D -o root -g root -m 0755 -t /usr/share/exporter \
      examples/hooks/dme/slurm-prolog.sh examples/hooks/dme/slurm-epilog.sh
+   sudo install -o root -g root -m 0644 -t /usr/share/exporter \
+     examples/hooks/dme/common.sh
+
+Both scripts source ``common.sh`` from their own directory, so keep the three
+files together.
 
 Restart ``spurd`` after editing ``spur.conf`` — hooks are only read at agent
 startup:
@@ -117,6 +127,15 @@ Same GPU lookup as the prolog; removes the files instead of writing them:
 .. literalinclude:: ../../examples/hooks/dme/slurm-epilog.sh
    :language: bash
 
+``common.sh``
+~~~~~~~~~~~~~~
+
+Maps the GPU ids in ``SPUR_JOB_GPUS`` to render IDs. A GPU it cannot map gets
+no label, and a line on the script's stderr, which ``spurd`` logs:
+
+.. literalinclude:: ../../examples/hooks/dme/common.sh
+   :language: bash
+
 Replacing older scripts
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -124,11 +143,15 @@ Earlier versions of these scripts computed ``SPUR_JOB_GPUS`` modulo 128.
 Spur's GPU ids are not GPU indices, so that put every job's labels on GPU
 ``0``, left labels behind after jobs ended, and could show one job's labels on
 another job's GPU. After installing the scripts above, remove the files the
-old scripts left, once, while no jobs run on the node:
+old scripts left, once:
 
 .. code-block:: bash
 
-   sudo find /var/run/exporter -maxdepth 1 -type f -name '[0-9]*' -delete
+   sudo find /var/run/exporter -maxdepth 1 -type f -regextype posix-extended \
+     -regex '.*/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])' -delete
+
+The old scripts named their files 0 to 127. Render IDs start at 128, so this
+leaves the new scripts' files alone and is safe to run while jobs are running.
 
 Running the exporter container
 --------------------------------
@@ -169,7 +192,7 @@ content (values will match your job):
 
 .. code-block:: text
 
-   {"SLURM_JOB_ID":"8","SLURM_JOB_USER":"user","SLURM_JOB_PARTITION":"gpu","CUDA_VISIBLE_DEVICES":"128"}
+   {"SLURM_JOB_ID":"8","SLURM_JOB_USER":"user","SLURM_JOB_PARTITION":"gpu","SLURM_CLUSTER_NAME":"","CUDA_VISIBLE_DEVICES":"128"}
 
 Expected metric line, with the job's real ID/user/partition populated on that
 GPU's series only:
