@@ -318,10 +318,13 @@ pub struct DeviceKey {
 }
 
 impl DeviceKey {
+    /// `any` and an empty type mean no type, as `--gres=nic:any:N` asks.
     pub fn new(gres_name: &str, device_type: Option<&str>) -> Self {
         Self {
             gres_name: gres_name.to_string(),
-            device_type: device_type.map(str::to_string),
+            device_type: device_type
+                .filter(|t| !t.is_empty() && *t != "any")
+                .map(str::to_string),
         }
     }
 
@@ -1811,6 +1814,26 @@ mod device_inventory_tests {
     fn an_exclusive_request_waits_for_a_legacy_count_hold() {
         let node = nic_node(&[(0x050000, "p"), (0x850000, "p")]);
         assert!(!node.can_satisfy_with_allocated(&legacy("nic", 1), &node.as_request()));
+    }
+
+    #[test]
+    fn any_and_empty_device_types_are_untyped() {
+        assert_eq!(
+            DeviceKey::new("nic", Some("any")),
+            DeviceKey::new("nic", None)
+        );
+        assert_eq!(DeviceKey::new("nic", Some("")).generic_key(), "nic");
+    }
+
+    #[test]
+    fn an_any_typed_request_shares_devices_with_a_typed_one() {
+        let node = nic_node(&[(0x050000, "pollara400"), (0x860000, "other")]);
+        let mut req = ResourceRequest::with_scalar(1, 0);
+        req.add_devices("nic", Some("any"), 1);
+        req.add_devices("nic", Some("pollara400"), 1);
+        assert!(node.can_satisfy(&req));
+        let alloc = build_node_allocation(&node, &ResourceAllocations::default(), &req);
+        assert_eq!(alloc.devices["nic"].len(), 2);
     }
 
     fn node_with_shadowing_pools() -> ResourceSet {
