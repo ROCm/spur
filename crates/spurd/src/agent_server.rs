@@ -1597,6 +1597,58 @@ fn spawn_step_kill_escalation(
     })
 }
 
+/// The whole of a step cancel. The SIGKILL goes straight to the step's own
+/// process after the grace period whatever the supervisor does, since a step
+/// cancel keeps the job's allocation and nothing else would reclaim a step a
+/// wedged supervisor never signals. The signal goes through the supervisor,
+/// which spares a launcher and reaches the cgroup, and directly only if the
+/// supervisor cannot be reached or the step has none.
+async fn run_step_cancel(
+    context: CompletionListenerContext,
+    active_steps: ActiveSteps,
+    supervisor: Option<crate::stepd::StepdDescriptor>,
+    target: Option<StepTarget>,
+    signal: i32,
+) {
+    if let Some(target) = target {
+        spawn_step_kill_escalation(active_steps.clone(), vec![target], STEP_CANCEL_ESCALATION);
+    }
+    if let Some(descriptor) = supervisor {
+        if signal_step_through_supervisor(&context, &descriptor, signal).await {
+            return;
+        }
+    }
+    if let Some(target) = target {
+        signal_step_if_current(&active_steps, &target, signal).await;
+    }
+}
+
+/// Asks a step's supervisor to deliver `signal`, and arms its SIGKILL for a step
+/// that outlives it: a container's command is PID 1 of its namespace and
+/// ignores signals it has no handler for. `false` if the supervisor could not be
+/// reached and nothing was sent.
+async fn signal_step_through_supervisor(
+    context: &CompletionListenerContext,
+    descriptor: &crate::stepd::StepdDescriptor,
+    signal: i32,
+) -> bool {
+    let escalation = {
+        let (context, descriptor) = (context.clone(), descriptor.clone());
+        tokio::spawn(async move {
+            sigkill_stepd_after(&context, &descriptor, STEP_CANCEL_ESCALATION).await;
+        })
+    };
+    let sent =
+        crate::stepd::signal_allocation(descriptor, uuid::Uuid::new_v4().to_string(), signal).await;
+    let Err(error) = sent else {
+        return true;
+    };
+    escalation.abort();
+    warn!(job_id = descriptor.job_id, step_id = descriptor.step_id, %error,
+        "step supervisor signal failed");
+    false
+}
+
 /// Polls until the job's `running` entry clears — via the supervisor's own
 /// completion push, this poll fencing a stepd stuck before `Start`, or (on
 /// deadline) arming the force-reclaim escalation for a wedged supervisor.
@@ -5447,13 +5499,12 @@ impl AgentService {
         if !record_step_pid(&self.active_steps, step_key, pid, tracked).await {
             return;
         }
-        let term = nix::sys::signal::Signal::SIGTERM as i32;
-        if self.cancel_supervised_step(descriptor, term).await {
-            return;
-        }
-        if let Some(target) = step_target(&self.active_steps, step_key).await {
-            signal_step_if_current(&self.active_steps, &target, term).await;
-        }
+        let target = step_target(&self.active_steps, step_key).await;
+        self.spawn_step_cancel(
+            Some(descriptor.clone()),
+            target,
+            nix::sys::signal::Signal::SIGTERM as i32,
+        );
     }
 
     /// The supervisor of a step of the given attempt (0 names any).
@@ -5471,46 +5522,23 @@ impl AgentService {
             .cloned()
     }
 
-    /// Signals a supervised step through its supervisor, which spares a
-    /// launcher and reaches the cgroup, and arms a SIGKILL for a step that
-    /// outlives it: a container's command is PID 1 of its namespace and
-    /// ignores signals it has no handler for. `false` if the supervisor could
-    /// not be reached and nothing was sent.
-    ///
-    /// Both the escalation and the signal run detached, so the controller
-    /// dropping this RPC while the supervisor is slow to answer cancels neither.
-    async fn cancel_supervised_step(
+    /// Starts a step cancel on its own task, so the controller dropping the
+    /// RPC while a supervisor is slow to answer cannot cancel any part of it.
+    /// The task ends once the signal has been delivered by the supervisor or,
+    /// failing that, directly.
+    fn spawn_step_cancel(
         &self,
-        descriptor: &crate::stepd::StepdDescriptor,
+        supervisor: Option<crate::stepd::StepdDescriptor>,
+        target: Option<StepTarget>,
         signal: i32,
-    ) -> bool {
-        let context = self.completion_listener_context();
-        let escalation = {
-            let descriptor = descriptor.clone();
-            tokio::spawn(async move {
-                sigkill_stepd_after(&context, &descriptor, STEP_CANCEL_ESCALATION).await;
-            })
-        };
-        let signalled = {
-            let descriptor = descriptor.clone();
-            tokio::spawn(async move {
-                crate::stepd::signal_allocation(
-                    &descriptor,
-                    uuid::Uuid::new_v4().to_string(),
-                    signal,
-                )
-                .await
-            })
-        };
-        let error = match signalled.await {
-            Ok(Ok(())) => return true,
-            Ok(Err(error)) => error.to_string(),
-            Err(error) => error.to_string(),
-        };
-        escalation.abort();
-        warn!(job_id = descriptor.job_id, step_id = descriptor.step_id, %error,
-            "step supervisor signal failed");
-        false
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(run_step_cancel(
+            self.completion_listener_context(),
+            self.active_steps.clone(),
+            supervisor,
+            target,
+            signal,
+        ))
     }
 
     /// Launch the interactive session's own workload through `spurstepd`,
@@ -8008,22 +8036,10 @@ impl SlurmAgent for AgentService {
                 StepTarget::of(step_key, step)
             })
         };
-        if let Some(descriptor) = self
+        let supervisor = self
             .step_supervisor(req.job_id, req.step_id, req.run_attempt)
-            .await
-        {
-            if self.cancel_supervised_step(&descriptor, signal).await {
-                return Ok(Response::new(()));
-            }
-        }
-        if let Some(target) = target {
-            signal_step_if_current(&self.active_steps, &target, signal).await;
-            spawn_step_kill_escalation(
-                self.active_steps.clone(),
-                vec![target],
-                STEP_CANCEL_ESCALATION,
-            );
-        }
+            .await;
+        self.spawn_step_cancel(supervisor, target, signal);
         Ok(Response::new(()))
     }
 
@@ -27283,19 +27299,11 @@ mod tests {
             }
         });
 
-        // The controller abandons the RPC while the supervisor still sits on the signal.
-        tokio::select! {
-            _ = svc.cancel_step(Request::new(CancelStepRequest {
-                job_id: descriptor.job_id,
-                step_id: descriptor.step_id,
-                signal: 0,
-                run_attempt: 0,
-            })) => panic!("the supervisor never answered, so the cancel cannot have finished"),
-            first = requests.recv() => assert!(matches!(
-                first,
-                Some(crate::stepd::StepdRequest::SignalAllocation { signal }) if signal == SIGTERM
-            )),
-        }
+        cancel_step_promptly(&svc, descriptor.job_id, descriptor.step_id).await;
+        assert!(matches!(
+            requests.recv().await,
+            Some(crate::stepd::StepdRequest::SignalAllocation { signal }) if signal == SIGTERM
+        ));
 
         tokio::time::advance(STEP_CANCEL_ESCALATION + std::time::Duration::from_secs(1)).await;
         // Paused-time stand-in for "never arrives": it fires only once everything is idle.
@@ -27402,14 +27410,10 @@ mod tests {
             drop(writer);
         });
 
-        svc.cancel_step(Request::new(CancelStepRequest {
-            job_id: key.0,
-            step_id: key.1,
-            signal: 0,
-            run_attempt: 0,
-        }))
-        .await
-        .expect("cancel the step");
+        let target = step_target(&svc.active_steps, key).await;
+        svc.spawn_step_cancel(Some(descriptor), target, SIGTERM)
+            .await
+            .expect("cancel task");
         supervisor.await.expect("fake supervisor");
 
         // The worker runs pending traps in signal-number order, so a TERM sent
@@ -27459,17 +27463,216 @@ mod tests {
             step.pid_start_ticks = Some(recorded + 1);
         }
 
-        svc.cancel_step(Request::new(CancelStepRequest {
-            job_id: key.0,
-            step_id: key.1,
-            signal: SIGHUP,
-            run_attempt: 0,
-        }))
-        .await
-        .expect("cancel the step");
+        let target = step_target(&svc.active_steps, key).await;
+        svc.spawn_step_cancel(Some(descriptor), target, SIGHUP)
+            .await
+            .expect("cancel task");
 
         signal_step_tree(stand_in.pid, SIGUSR1, executor::TrackedProcess::Launcher);
         stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    /// How a scripted supervisor treats one control connection.
+    enum SupervisorReply {
+        /// Report the workload's pid, as the supervisor does for a state query.
+        ReportWorkload(i32),
+        /// Read the request and say nothing, keeping the connection open.
+        Hold,
+        /// Read the request and close the connection, which the caller sees as an error.
+        Fail,
+    }
+
+    /// Serves one scripted reply per connection and reports each request it read.
+    fn scripted_supervisor(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+        script: Vec<SupervisorReply>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::stepd::StepdRequest> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            for reply in script {
+                let (stream, _) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                        .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                let request = serde_json::from_str(&line).expect("decode runtime request");
+                requests_tx.send(request).expect("report the request");
+                match reply {
+                    SupervisorReply::ReportWorkload(job_pid) => {
+                        let state = serde_json::to_string(&crate::stepd::StepdResponse::State {
+                            job_id: descriptor.job_id,
+                            run_attempt: descriptor.run_attempt,
+                            step_id: descriptor.step_id,
+                            active: true,
+                            exit_code: None,
+                            signal: None,
+                            job_pid,
+                            cgroup_path: String::new(),
+                        })
+                        .expect("encode state");
+                        writer
+                            .write_all(format!("{state}\n").as_bytes())
+                            .await
+                            .expect("report the state");
+                    }
+                    SupervisorReply::Hold => held.push(writer),
+                    SupervisorReply::Fail => drop(writer),
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        requests
+    }
+
+    /// The cancel RPC answers at once, whatever the supervisor does with the
+    /// request: the controller drops it after a few seconds.
+    async fn cancel_step_promptly(svc: &AgentService, job_id: u32, step_id: u32) {
+        tokio::select! {
+            biased;
+            cancelled = svc.cancel_step(Request::new(CancelStepRequest {
+                job_id,
+                step_id,
+                signal: 0,
+                run_attempt: 0,
+            })) => {
+                cancelled.expect("cancel the step");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
+                panic!("the cancel waited on the supervisor")
+            }
+        }
+    }
+
+    /// Waits on the step's output rather than the clock, which would jump past a
+    /// death the kernel has not reported yet.
+    async fn drain_until_the_step_is_gone(stand_in: &mut LauncherStandIn) {
+        while !stand_in.line().await.is_empty() {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_returns_at_once_and_still_kills_the_step_when_the_supervisor_never_answers() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let (descriptor, listener) = step_session(state.path(), 45, 2);
+        let key = (descriptor.job_id, descriptor.step_id);
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        svc.register_test_step(key.0, key.1, None).await;
+        record_step_pid(
+            &svc.active_steps,
+            key,
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await;
+        let mut requests = scripted_supervisor(
+            listener,
+            descriptor,
+            vec![SupervisorReply::Hold, SupervisorReply::Hold],
+        );
+
+        cancel_step_promptly(&svc, key.0, key.1).await;
+        assert!(requests.recv().await.is_some());
+
+        tokio::time::advance(STEP_CANCEL_ESCALATION + std::time::Duration::from_secs(1)).await;
+        drain_until_the_step_is_gone(&mut stand_in).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_returns_at_once_and_still_signals_the_step_when_the_supervisor_then_fails() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let (descriptor, listener) = step_session(state.path(), 46, 2);
+        let key = (descriptor.job_id, descriptor.step_id);
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        svc.register_test_step(key.0, key.1, None).await;
+        record_step_pid(
+            &svc.active_steps,
+            key,
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await;
+        let mut requests = scripted_supervisor(listener, descriptor, vec![SupervisorReply::Fail]);
+
+        // The controller drops the RPC as soon as the supervisor has the request.
+        tokio::select! {
+            biased;
+            request = requests.recv() => assert!(request.is_some()),
+            cancelled = svc.cancel_step(Request::new(CancelStepRequest {
+                job_id: key.0,
+                step_id: key.1,
+                signal: 0,
+                run_attempt: 0,
+            })) => {
+                cancelled.expect("cancel the step");
+            }
+        }
+
+        assert_eq!(stand_in.line().await, "term");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_that_arrived_during_launch_escalates_without_waiting_on_the_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let (job_id, step_id) = (47, 1);
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let (descriptor, listener) = step_session(state.path(), job_id, step_id);
+        svc.register_test_step(job_id, step_id, None).await;
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&(job_id, step_id))
+            .expect("registered step")
+            .cancel_requested = true;
+        let cfg = executor::JobLaunchConfig {
+            job_id,
+            step_id,
+            joins_parent_namespaces: true,
+            ..namespace_test_config()
+        };
+        let mut requests = scripted_supervisor(
+            listener,
+            descriptor.clone(),
+            vec![
+                SupervisorReply::ReportWorkload(stand_in.pid as i32),
+                SupervisorReply::Hold,
+                SupervisorReply::Hold,
+            ],
+        );
+
+        tokio::select! {
+            biased;
+            _ = svc.track_supervised_step(&descriptor, &cfg, (job_id, step_id)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
+                panic!("the replay waited on a supervisor that never answers")
+            }
+        }
+        assert!(matches!(
+            requests.recv().await,
+            Some(crate::stepd::StepdRequest::QueryState)
+        ));
+
+        tokio::time::advance(STEP_CANCEL_ESCALATION + std::time::Duration::from_secs(1)).await;
+        drain_until_the_step_is_gone(&mut stand_in).await;
     }
 
     #[tokio::test]

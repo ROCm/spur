@@ -512,16 +512,20 @@ metrics).
   now an unhandled SIGTERM leaves the command running until the SIGKILL, so it
   ends with signal 9 rather than 15.
 - The agent signals processes itself in two places and applies the same rule
-  there. `CancelStep` on a supervised step goes through its supervisor
-  (`SignalAllocation`) and arms a SIGKILL after `STEP_CANCEL_ESCALATION`
-  (`MIN_KILL_WAIT`, 5 s), since a container's command is PID 1 and ignores
-  unhandled signals. Both run detached, so a dropped `CancelStep` RPC cannot
-  skip the SIGKILL. It is a request to the same supervisor, so a wedged one can
-  still fail to deliver it; job-level teardown (`force_kill_stepd`) bounds that
-  case. Only if the supervisor is unreachable, or the step has none, does it
-  use `signal_step_tree` with the `TrackedProcess` recorded on the `ActiveStep`
-  (a supervised step's tracked pid is the supervisor's workload pid, so it can
-  be a launcher), again with the epoch-checked SIGKILL.
+  there. `CancelStep`, and the replay of a cancel that arrived while the step
+  was launching, run as one detached task (`run_step_cancel`), so the
+  controller dropping the RPC cancels none of it. The step's own process gets a
+  SIGKILL after `STEP_CANCEL_ESCALATION` (`MIN_KILL_WAIT`, 5 s) whatever its
+  supervisor does: a container's command is PID 1 and ignores unhandled
+  signals, and a step cancel keeps the allocation, so nothing else reclaims it.
+  The signal itself goes through the supervisor (`SignalAllocation`), which is
+  also asked for a delayed SIGKILL, and only if the supervisor is unreachable,
+  or the step has none, directly with `signal_step_tree` and the
+  `TrackedProcess` recorded on the `ActiveStep` (a supervised step's tracked pid
+  is the supervisor's workload pid, so it can be a launcher). Every direct
+  signal first re-checks, under the `active_steps` lock, that the step still has
+  the same epoch, pid and process start time (`StepTarget::is_current`): the
+  entry outlives its process, so a pid the kernel has reused must not be hit.
   Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
   with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
