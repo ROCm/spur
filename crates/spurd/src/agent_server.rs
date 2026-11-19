@@ -5581,8 +5581,11 @@ impl AgentService {
 
     /// Starts a step cancel on its own task, so the controller dropping the
     /// RPC while a supervisor is slow to answer cannot cancel any part of it.
-    /// Awaiting the handle waits for the signal to be delivered; the SIGKILL
-    /// escalations it arms are tasks of their own and outlive it.
+    /// Awaiting the handle waits until the supervisor has taken the signal, was
+    /// given up on, or the direct signal was sent; with no direct target
+    /// (unknown start time) a supervisor that times out leaves nothing
+    /// delivered. The SIGKILL escalations it arms are tasks of their own and
+    /// outlive it.
     fn spawn_step_cancel(
         &self,
         supervisor: Option<crate::stepd::StepdDescriptor>,

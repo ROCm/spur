@@ -533,9 +533,11 @@ metrics).
   SIGKILL), or the step has none. Every direct signal first re-checks, under the
   `active_steps` lock, that the step still has the same epoch, pid and process
   start time (`StepTarget::is_current`): the entry outlives its process, so a
-  pid the kernel has reused must not be hit. The start time is the one the
-  supervisor published for the workload it forked; a step without one has no
-  direct signal and no direct SIGKILL.
+  pid the kernel has reused must not be hit. For a supervised step the start
+  time is the one the supervisor published for the workload it forked; for a
+  step spurd launches as its own child, spurd reads it from `/proc` itself
+  (`record_step_pid`). A step without one has no direct signal and no direct
+  SIGKILL.
   Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
   with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
