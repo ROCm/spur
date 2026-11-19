@@ -241,24 +241,14 @@ pub fn running_jobs_overlap_start(
                 continue;
             }
         }
-        let overlaps_node = job
-            .allocated_nodes
-            .iter()
-            .any(|n| node_set.contains(n.as_str()));
-        if !overlaps_node {
+        let Some(node) = job.held_node_names().find(|n| node_set.contains(n)) else {
             continue;
-        }
-        let node = job
-            .allocated_nodes
-            .iter()
-            .find(|n| node_set.contains(n.as_str()))
-            .cloned()
-            .unwrap_or_default();
+        };
         let Some(end) = running_job_end(job, Utc::now()) else {
-            return Some((job.job_id, node));
+            return Some((job.job_id, node.to_string()));
         };
         if end > start_time {
-            return Some((job.job_id, node));
+            return Some((job.job_id, node.to_string()));
         }
     }
     None
@@ -482,6 +472,25 @@ mod tests {
         let jobs = std::collections::HashMap::from([(1, job)]);
         let overlap = running_jobs_overlap_start(&jobs, &["node001".into()], start_time, None);
         assert_eq!(overlap, Some((1, "node001".into())));
+    }
+
+    #[test]
+    fn a_node_the_job_already_released_is_not_busy() {
+        let start_time = Utc::now() + Duration::hours(1);
+        let mut job = Job::new(1, JobSpec::default());
+        job.state = JobState::Completing;
+        job.allocated_nodes = vec!["node001".into(), "node002".into()];
+        job.node_completions.insert(
+            "node001".into(),
+            crate::job::NodeCompletion { code: 0, signal: 0 },
+        );
+        let jobs = std::collections::HashMap::from([(1, job)]);
+
+        let released = running_jobs_overlap_start(&jobs, &["node001".into()], start_time, None);
+        let held = running_jobs_overlap_start(&jobs, &["node002".into()], start_time, None);
+
+        assert_eq!(released, None);
+        assert_eq!(held, Some((1, "node002".into())));
     }
 
     #[test]

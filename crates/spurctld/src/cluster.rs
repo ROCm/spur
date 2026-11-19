@@ -5955,7 +5955,7 @@ impl ClusterManager {
                     matches!(
                         j.state,
                         JobState::Running | JobState::Completing | JobState::Suspended
-                    ) && j.allocated_nodes.iter().any(|n| n == name)
+                    ) && j.is_held_on(name)
                 })
                 .count() as u32;
             (node.state, count)
@@ -6478,7 +6478,7 @@ impl ClusterManager {
                 }
                 if let Some(qos) = job.spec.qos.as_deref() {
                     *borrowed_by_qos.entry(qos.to_string()).or_insert(0) +=
-                        job.allocated_nodes.len() as u64;
+                        job.held_node_names().count() as u64;
                 }
             }
             let ledger = QuotaLedger::from_jobs(jobs.values());
@@ -12621,8 +12621,8 @@ fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a
 }
 
 /// Running-TRES accumulation with the distinct-node rule applied when read.
-/// Node TRES is the count of distinct nodes occupied (union of
-/// `allocated_nodes`), not summed `num_nodes` — a node packed by two jobs counts
+/// Node TRES is the count of distinct nodes occupied (union of the nodes each job
+/// still holds), not summed `num_nodes` — a node packed by two jobs counts
 /// once; CPU/Memory/GPU stay additive. A running job without recorded placement
 /// falls back to its requested `num_nodes` so the limit is never under-counted.
 ///
@@ -12643,12 +12643,7 @@ impl<'a> RunningTresAccumulator<'a> {
         if job.allocated_nodes.is_empty() {
             self.unplaced_nodes += job.spec.num_nodes as u64;
         } else {
-            self.distinct_nodes.extend(
-                job.allocated_nodes
-                    .iter()
-                    .filter(|node| job.is_held_on(node))
-                    .map(String::as_str),
-            );
+            self.distinct_nodes.extend(job.held_node_names());
         }
     }
 
@@ -12835,7 +12830,7 @@ fn scope_usage(
 fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> HashSet<String> {
     jobs.values()
         .filter(|j| j.occupies_resources() && pred(j))
-        .flat_map(|j| j.allocated_nodes.iter().cloned())
+        .flat_map(|j| j.held_node_names().map(str::to_string))
         .collect()
 }
 
@@ -22253,6 +22248,40 @@ state = "UP"
                 exit_code: 3
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_node_its_run_already_released_waits_for_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        assert_eq!(
+            cm.drain_node("n2", None, None).unwrap(),
+            (NodeState::Drain, 0)
+        );
+        assert_eq!(
+            cm.drain_node("n3", None, None).unwrap(),
+            (NodeState::Draining, 1),
+            "its copy is still being stopped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_finished_copys_node_waits_for_the_run_to_end() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        assert_eq!(
+            cm.drain_node("n1", None, None).unwrap(),
+            (NodeState::Draining, 1)
+        );
+        cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Drain);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -47468,6 +47497,26 @@ mod idle_fill_aggregate_tests {
             !team_over_quota(cap, 0, borrowed),
             "a single borrower on a cap of 1 is within quota and must be spared"
         );
+    }
+
+    /// A node that reported its part during a grace was handed back, so it no
+    /// longer counts against the group the run is charged to.
+    #[test]
+    fn a_node_its_run_already_released_is_no_longer_occupied() {
+        let mut job = running_in_qos(1, "alice", "team", &["n1", "n2"], false);
+        job.node_completions.insert(
+            "n1".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+        let jobs = HashMap::from([(1, job)]);
+
+        assert_eq!(
+            occupied_nodes(&jobs, |_| true),
+            HashSet::from(["n2".to_string()])
+        );
+        let mut running = RunningTresAccumulator::default();
+        running.add(&jobs[&1]);
+        assert_eq!(running.tres().get(TresType::Node), 1);
     }
 
     #[test]

@@ -2753,14 +2753,10 @@ pub(crate) fn preempt_overlaps_pending_nodes(
     candidate: &spur_core::job::Job,
     nodes: &[spur_core::node::Node],
 ) -> bool {
-    if candidate.allocated_nodes.is_empty() {
+    let occupied: HashSet<&str> = candidate.held_node_names().collect();
+    if occupied.is_empty() {
         return false;
     }
-    let occupied: HashSet<&str> = candidate
-        .allocated_nodes
-        .iter()
-        .map(String::as_str)
-        .collect();
 
     if let Some(ref nodelist) = pending.spec.nodelist {
         return nodelist
@@ -6446,6 +6442,29 @@ pub(crate) mod tests {
         let released = [("n1".to_string(), 1), ("n2".to_string(), 1)];
         let left = without_released(&handoffs, &released);
         assert_eq!(left, HashMap::from([("n1".to_string(), vec![2])]));
+    }
+
+    #[test]
+    fn a_victim_does_not_occupy_a_node_it_already_released() {
+        use spur_core::job::{Job, JobSpec, JobState, NodeCompletion};
+
+        let mut candidate = Job::new(1, JobSpec::default());
+        candidate.state = JobState::Running;
+        candidate.allocated_nodes = vec!["n1".into(), "n2".into()];
+        candidate
+            .node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        let mut pending = Job::new(
+            2,
+            JobSpec {
+                nodelist: Some("n1".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(!preempt_overlaps_pending_nodes(&pending, &candidate, &[]));
+        pending.spec.nodelist = Some("n2".into());
+        assert!(preempt_overlaps_pending_nodes(&pending, &candidate, &[]));
     }
 
     mod idle_fill_reclaim_tests {

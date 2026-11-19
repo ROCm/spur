@@ -1511,8 +1511,21 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
-        self.allocated_nodes.iter().any(|n| n == node)
-            && (!self.node_completions.contains_key(node) || self.retained_nodes.contains(node))
+        self.allocated_nodes.iter().any(|n| n == node) && self.still_charges(node)
+    }
+
+    /// The allocated nodes still charged for this job, in allocation order. What
+    /// asks which nodes the job occupies now reads this, not `allocated_nodes`.
+    pub fn held_node_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.allocated_nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|node| self.still_charges(node))
+    }
+
+    /// An allocated node's slice goes back at its report, unless it is retained.
+    fn still_charges(&self, node: &str) -> bool {
+        !self.node_completions.contains_key(node) || self.retained_nodes.contains(node)
     }
 
     /// Whether this node has yet to report its part of the run. A node that
@@ -1546,11 +1559,7 @@ impl Job {
 
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
-        self.allocated_nodes
-            .iter()
-            .filter(|node| self.is_held_on(node))
-            .cloned()
-            .collect()
+        self.held_node_names().map(str::to_string).collect()
     }
 
     /// The allocated nodes that already reported, in allocation order.
@@ -1575,7 +1584,7 @@ impl Job {
     pub fn released_nodes(&self) -> Vec<String> {
         self.allocated_nodes
             .iter()
-            .filter(|node| !self.is_held_on(node))
+            .filter(|node| !self.still_charges(node))
             .cloned()
             .collect()
     }
@@ -2119,6 +2128,7 @@ mod tests {
         job.retained_nodes.insert("n2".into());
 
         assert_eq!(job.held_nodes(), ["n2".to_string(), "n3".to_string()]);
+        assert_eq!(job.held_node_names().collect::<Vec<_>>(), ["n2", "n3"]);
         assert_eq!(job.running_nodes(), ["n3".to_string()]);
         assert_eq!(job.released_nodes(), ["n1".to_string()]);
         assert!(job.is_held_on("n2") && !job.still_runs_on("n2"));

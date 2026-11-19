@@ -1629,7 +1629,8 @@ pub(crate) fn cancel_reclaim_grace(kill_wait_secs: u32) -> chrono::Duration {
 }
 
 /// Whether `node` may release its reported run (never one newer than this controller applied): the
-/// run is over, the job is active elsewhere or queued with no launch here, or unknown but ours.
+/// run is over, the job is active but no longer holds `node`, queued with no launch here, or
+/// unknown but ours.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatus) -> bool {
     let Some(job) = cluster.get_job(report.job_id) else {
         return report.job_id < cluster.peek_next_job_id();
@@ -1657,9 +1658,7 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     }
     // State and allocation commit as two WAL entries, so an empty nodelist
     // on an active job is not yet authoritative.
-    job.state.is_active()
-        && !job.allocated_nodes.is_empty()
-        && !job.allocated_nodes.iter().any(|n| n == node)
+    job.state.is_active() && !job.allocated_nodes.is_empty() && !job.is_held_on(node)
 }
 
 /// Jobs a heartbeat reported with a non-empty translated GPU set, for the
@@ -3339,8 +3338,8 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
         let step_nodes = resolve_step_nodes(
             &job.running_nodes(),
             &job.finished_nodes(),
@@ -8307,6 +8306,43 @@ mod tests {
         assert!(
             !is_reclaimable(&cluster, "n1", &report_run(50, 0)),
             "an old agent names no run, so it could be a launch after a release"
+        );
+    }
+
+    /// What an agent still holds of an active run on a node the run gave back is
+    /// reclaimable; on a node the run still charges, a finished copy's included, it is not.
+    #[tokio::test]
+    async fn is_reclaimable_follows_whether_the_active_run_still_holds_the_node() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 60, &["n1", "n2", "n3"], 1);
+        cluster.apply_operation(&WalOperation::job_state_change(
+            60,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let copy_exit = |node: &str, exit_code| WalOperation::JobCopyExited {
+            job_id: 60,
+            node_name: node.into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 1,
+            at: None,
+        };
+
+        cluster.apply_operation(&copy_exit("n1", 0));
+        assert!(!is_reclaimable(&cluster, "n1", &report_run(60, 1)));
+
+        cluster.apply_operation(&copy_exit("n2", 3));
+        assert!(is_reclaimable(&cluster, "n1", &report_run(60, 1)));
+        assert!(is_reclaimable(&cluster, "n2", &report_run(60, 1)));
+        assert!(
+            !is_reclaimable(&cluster, "n3", &report_run(60, 1)),
+            "its copy is still being stopped"
         );
     }
 
