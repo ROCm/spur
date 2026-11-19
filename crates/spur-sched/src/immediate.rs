@@ -304,8 +304,7 @@ impl PlacementScope {
         budget.spend(work)?;
         Some(
             candidate
-                .allocated_nodes
-                .iter()
+                .held_node_names()
                 .any(|node| self.nodes.contains(node)),
         )
     }

@@ -170,6 +170,10 @@ separate path for admin requeue so nothing else can resurrect a terminal job.
 
 Held in controller memory. Key fields beyond the spec:
 - `run_attempt`: monotonic epoch, bumped per dispatch. Guards stale completion reports.
+- `allocated_nodes`: the run's whole allocation, kept until the run is reset. A node that
+  reported may already be handed back (in a preemption grace, or once the run is
+  Completing), so code asking whether the job occupies a node now reads
+  `is_held_on`/`held_node_names`, never `allocated_nodes`.
 - `node_completions`: per-node exit status. `reported_outcome()` turns them into the run's
   state, exit code, and signal, decided by `first_failed_node` else the first allocated
   node; both the last report and the completing timeout's force-finish use it. An OOM
@@ -182,7 +186,7 @@ Held in controller memory. Key fields beyond the spec:
   run, so its exit is the run's. Cleared on requeue.
 - `retained_nodes`: on a per-node run, nodes whose copy exited cleanly while the run went
   on. They reported, but stay charged until the run ends, so "reported" and "charged"
-  differ: `is_held_on`/`held_nodes` (charged) include them, `still_runs_on`/`running_nodes`
+  differ: `is_held_on`/`held_node_names` (charged) include them, `still_runs_on`/`running_nodes`
   (not yet reported) and `released_nodes` (slice returned) do not. `clear_node_reports`
   clears them with `node_completions`, after the caller has freed their slices.
 - `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`

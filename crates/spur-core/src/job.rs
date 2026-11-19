@@ -1511,11 +1511,20 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
-        self.allocated_nodes.iter().any(|n| n == node) && self.is_charged(node)
+        self.allocated_nodes.iter().any(|n| n == node) && self.still_charges(node)
     }
 
-    /// Whether a node's slice is still charged, given it is one of the allocated nodes.
-    fn is_charged(&self, node: &str) -> bool {
+    /// The allocated nodes still charged for this job, in allocation order. What
+    /// asks which nodes the job occupies now reads this, not `allocated_nodes`.
+    pub fn held_node_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.allocated_nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|node| self.still_charges(node))
+    }
+
+    /// An allocated node's slice goes back at its report, unless it is retained.
+    fn still_charges(&self, node: &str) -> bool {
         !self.node_completions.contains_key(node) || self.retained_nodes.contains(node)
     }
 
@@ -1550,11 +1559,7 @@ impl Job {
 
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
-        self.allocated_nodes
-            .iter()
-            .filter(|node| self.is_charged(node))
-            .cloned()
-            .collect()
+        self.held_node_names().map(str::to_string).collect()
     }
 
     pub fn held_allocations(&self) -> impl Iterator<Item = (&String, &ResourceAllocations)> {
@@ -1565,7 +1570,7 @@ impl Job {
                 Some(nodes) => nodes.contains(node),
                 None => self.allocated_nodes.contains(node),
             };
-            allocated && self.is_charged(node)
+            allocated && self.still_charges(node)
         })
     }
 
@@ -1591,7 +1596,7 @@ impl Job {
     pub fn released_nodes(&self) -> Vec<String> {
         self.allocated_nodes
             .iter()
-            .filter(|node| !self.is_held_on(node))
+            .filter(|node| !self.still_charges(node))
             .cloned()
             .collect()
     }
@@ -1618,7 +1623,7 @@ impl Job {
     pub fn holds_a_placement(&self) -> bool {
         self.allocated_nodes
             .iter()
-            .any(|node| self.is_charged(node))
+            .any(|node| self.still_charges(node))
     }
 
     /// Drop what a reservation recorded on the job: nodes, resources, partition, and
@@ -2197,6 +2202,7 @@ mod tests {
         job.retained_nodes.insert("n2".into());
 
         assert_eq!(job.held_nodes(), ["n2".to_string(), "n3".to_string()]);
+        assert_eq!(job.held_node_names().collect::<Vec<_>>(), ["n2", "n3"]);
         assert_eq!(job.running_nodes(), ["n3".to_string()]);
         assert_eq!(job.released_nodes(), ["n1".to_string()]);
         assert!(job.is_held_on("n2") && !job.still_runs_on("n2"));

@@ -6452,6 +6452,38 @@ pub(crate) mod tests {
         assert_eq!(left, HashMap::from([("n1".to_string(), vec![2])]));
     }
 
+    #[test]
+    fn a_victim_does_not_occupy_a_node_it_already_released() {
+        use spur_core::job::{Job, JobSpec, JobState, NodeCompletion};
+
+        let mut candidate = Job::new(1, JobSpec::default());
+        candidate.state = JobState::Running;
+        candidate.allocated_nodes = vec!["n1".into(), "n2".into()];
+        candidate
+            .node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        let mut pending = Job::new(
+            2,
+            JobSpec {
+                nodelist: Some("n1".into()),
+                ..Default::default()
+            },
+        );
+
+        let nodes: Vec<_> = ["n1", "n2"]
+            .into_iter()
+            .map(|name| {
+                spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default())
+            })
+            .collect();
+
+        assert!(!preempt_overlaps_pending_nodes(
+            &pending, &candidate, &nodes
+        ));
+        pending.spec.nodelist = Some("n2".into());
+        assert!(preempt_overlaps_pending_nodes(&pending, &candidate, &nodes));
+    }
+
     mod idle_fill_reclaim_tests {
         use super::*;
         use crate::victim_order::VictimFacts;
