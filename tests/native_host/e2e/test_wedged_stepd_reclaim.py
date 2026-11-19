@@ -248,8 +248,8 @@ class TestStepCancelWithAFrozenSupervisor:
     def test_the_agent_kills_the_surviving_step_without_its_supervisor(self, cluster):
         if len(cluster.nodes) < 2:
             pytest.skip("needs two nodes: one to run the step, one to fail its launch")
-        node = cluster.nodes[0]
         go = f"{cluster.remote_dir}/step-cancel.go"
+        host_marker = f"{cluster.remote_dir}/step-cancel.host"
         step = cluster.write_file(
             "step-cancel-step.sh",
             f"#!/bin/bash\ntrap '' TERM\nsleep {_STEP_SLEEP_SECS}\n",
@@ -258,6 +258,8 @@ class TestStepCancelWithAFrozenSupervisor:
         batch = cluster.write_file(
             "step-cancel.sh",
             "#!/bin/bash\n"
+            # Written on whichever node runs the batch script, which Spur does not report.
+            f"touch '{host_marker}'\n"
             f"while [ ! -e '{go}' ]; do sleep 1; done\n"
             f"srun -N2 '{step}'\n"
             "sleep 600\n",
@@ -269,19 +271,30 @@ class TestStepCancelWithAFrozenSupervisor:
         )
         assert job_id is not None, "sbatch failed"
         frozen: set[str] = set()
+        node = cluster.nodes[0]
         try:
             wait_job_state(cluster, job_id, "R", timeout=60)
-            job_supervisors = _supervisor_pids(cluster)
-            with block_agent_port(cluster, node_index=1):
+            batch_index = wait_until(
+                lambda: [
+                    index for index, member in enumerate(cluster.nodes[:2])
+                    if member.exec_allow_fail(f"test -e '{host_marker}' && echo yes").strip()
+                ],
+                timeout_s=30, interval_s=1,
+                desc="the batch script to start on one of the job's nodes",
+            )[0]
+            node = cluster.nodes[batch_index]
+            job_supervisors = _supervisor_pids(cluster, batch_index)
+            # The other node is the one whose step launch fails, delaying the cancel.
+            with block_agent_port(cluster, node_index=1 - batch_index):
                 node.exec(f"touch '{go}'")
                 started = time.time()
                 wait_until(
                     lambda: _step_sleep_pids(node),
                     timeout_s=30, interval_s=1,
-                    desc="the srun step to start on node 0",
+                    desc=f"the srun step to start on node {batch_index}",
                 )
                 time.sleep(_PID_RECORDED_SETTLE_SECS)
-                frozen = _supervisor_pids(cluster) - job_supervisors
+                frozen = _supervisor_pids(cluster, batch_index) - job_supervisors
                 assert frozen, "the step must have a supervisor of its own"
                 for pid in frozen:
                     node.exec(f"sudo kill -STOP {pid}")
