@@ -9,7 +9,8 @@
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
 //! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`,
-//! `JobKeepalive`, `ValidateBlockFile`); every other RPC reports `unimplemented`
+//! `JobKeepalive`, `ValidateBlockFile`, `RequeueJob`, `ClusterAddNodes`,
+//! `ClusterRemoveNodes`); every other RPC reports `unimplemented`
 //! so an unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::{HashMap, HashSet};
@@ -27,6 +28,8 @@ pub(crate) const MOCK_STEP_ID: u32 = 4242;
 
 /// Exit code the mock reports from `RunStep`.
 pub(crate) const MOCK_EXIT_CODE: i32 = 7;
+
+type RpcAuthorization = (&'static str, Option<String>);
 
 /// What the mock controller actually received, shared with the test body.
 #[derive(Clone, Default)]
@@ -72,6 +75,11 @@ pub(crate) struct StepCapture {
     /// `JobKeepalive` calls still to reject as unauthenticated.
     keepalive_failures: Arc<AtomicU32>,
     block_validation_content: Arc<Mutex<Vec<String>>>,
+    /// `(rpc, authorization header)` for the RPCs a test needs to prove carry the
+    /// caller's credential; `None` when the request arrived without one.
+    authorization: Arc<Mutex<Vec<RpcAuthorization>>>,
+    requeue_requests: Arc<Mutex<Vec<proto::RequeueJobRequest>>>,
+    requeue_response: Arc<Mutex<Option<Result<proto::RequeueJobResponse, tonic::Code>>>>,
 }
 
 impl StepCapture {
@@ -220,6 +228,37 @@ impl StepCapture {
     pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
         *self.create_step_node_addr.lock().unwrap() = addr.into();
     }
+
+    /// The `authorization` header of every `rpc` call, in call order.
+    pub(crate) fn authorization_of(&self, rpc: &str) -> Vec<Option<String>> {
+        self.authorization
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == rpc)
+            .map(|(_, header)| header.clone())
+            .collect()
+    }
+
+    fn record_authorization(&self, rpc: &'static str, metadata: &tonic::metadata::MetadataMap) {
+        let header = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.authorization.lock().unwrap().push((rpc, header));
+    }
+
+    pub(crate) fn requeue_requests(&self) -> Vec<proto::RequeueJobRequest> {
+        self.requeue_requests.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_requeue_response(&self, response: proto::RequeueJobResponse) {
+        *self.requeue_response.lock().unwrap() = Some(Ok(response));
+    }
+
+    pub(crate) fn set_requeue_error(&self, code: tonic::Code) {
+        *self.requeue_response.lock().unwrap() = Some(Err(code));
+    }
 }
 
 struct MockController {
@@ -361,6 +400,53 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
+        async fn requeue_job(
+            &self,
+            request: tonic::Request<proto::RequeueJobRequest>,
+        ) -> Result<tonic::Response<proto::RequeueJobResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("requeue_job", request.metadata());
+            self.capture
+                .requeue_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            match self.capture.requeue_response.lock().unwrap().clone() {
+                Some(Err(code)) => Err(tonic::Status::new(code, "mock requeue_job failure")),
+                Some(Ok(response)) => Ok(tonic::Response::new(response)),
+                None => Ok(tonic::Response::new(proto::RequeueJobResponse {
+                    requeued: 1,
+                    skipped: Vec::new(),
+                })),
+            }
+        }
+
+        async fn cluster_add_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterAddNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterAddNodesResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("cluster_add_nodes", request.metadata());
+            Ok(tonic::Response::new(proto::ClusterAddNodesResponse {
+                accepted: true,
+                message: "mock accepted".into(),
+                nodes: Vec::new(),
+            }))
+        }
+
+        async fn cluster_remove_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterRemoveNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterRemoveNodesResponse>, tonic::Status> {
+            self.capture
+                .record_authorization("cluster_remove_nodes", request.metadata());
+            Ok(tonic::Response::new(proto::ClusterRemoveNodesResponse {
+                accepted: true,
+                message: "mock accepted".into(),
+                nodes: Vec::new(),
+            }))
+        }
+
         async fn run_step(
             &self,
             request: tonic::Request<proto::RunStepRequest>,
@@ -491,7 +577,6 @@ mock_controller_impl! {
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
-        requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
@@ -522,8 +607,6 @@ mock_controller_impl! {
         cluster_down(proto::ClusterDownRequest) -> proto::ClusterDownResponse;
         cluster_status(proto::ClusterStatusRequest) -> proto::ClusterStatusResponse;
         cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
-        cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
-        cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
     }
 }
 
@@ -570,6 +653,120 @@ pub(crate) fn lazy_client(
     ))
 }
 
+const FIXTURE_BEGIN: &str = "FIXTURE-BEGIN";
+const FIXTURE_END: &str = "FIXTURE-END";
+
+/// What a fixture child process wrote and how it ended.
+pub(crate) struct FixtureRun {
+    /// Only the lines between the fixture's begin and end markers.
+    body: String,
+    stdout: String,
+    began: bool,
+    pub(crate) stderr: String,
+    pub(crate) success: bool,
+}
+
+impl FixtureRun {
+    fn new(stdout: String, stderr: String, success: bool) -> Self {
+        let began = stdout.lines().any(|line| line == FIXTURE_BEGIN);
+        let mut lines: Vec<&str> = stdout
+            .lines()
+            .skip_while(|line| *line != FIXTURE_BEGIN)
+            .skip(1)
+            .take_while(|line| *line != FIXTURE_END)
+            .collect();
+        // The newline `fixture_end` prints ahead of its marker leaves one empty line.
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        let body = lines.iter().map(|line| format!("{line}\n")).collect();
+        Self {
+            body,
+            stdout,
+            began,
+            stderr,
+            success,
+        }
+    }
+
+    pub(crate) fn assert_success(&self) {
+        assert!(
+            self.success,
+            "fixture failed:\n{}\n{}",
+            self.body, self.stderr
+        );
+        assert!(
+            self.began,
+            "fixture never ran (misspelled fixture name?):\n{}\n{}",
+            self.stdout, self.stderr
+        );
+    }
+
+    /// Value of the `key: value` line a fixture printed with [`fixture_report`].
+    pub(crate) fn reported(&self, key: &str) -> &str {
+        let prefix = format!("FIXTURE {key}: ");
+        self.body
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("fixture reported no {key}:\n{}", self.body))
+    }
+
+    /// What the command under test printed: the fixture body minus its report lines.
+    pub(crate) fn command_stdout(&self) -> String {
+        self.body
+            .lines()
+            .filter(|line| !line.starts_with("FIXTURE "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+}
+
+/// Open a fixture's output and return the scenario [`run_fixture`] passed in.
+///
+/// The leading newline matters: libtest prints `test <name> ... ` without one on a
+/// single-CPU runner, which would otherwise prefix the first line.
+pub(crate) fn fixture_start() -> String {
+    println!("\n{FIXTURE_BEGIN}");
+    std::env::var("SPUR_TEST_SCENARIO").expect("fixture must be started through run_fixture")
+}
+
+/// Print one `key: value` line for [`FixtureRun::reported`].
+pub(crate) fn fixture_report(key: &str, value: impl std::fmt::Display) {
+    println!("FIXTURE {key}: {value}");
+}
+
+/// Close a fixture's output; everything after this line is libtest's own. The leading newline
+/// keeps command output that lacks a trailing one from gluing onto the marker.
+pub(crate) fn fixture_end() {
+    println!("\n{FIXTURE_END}");
+}
+
+/// Re-run an `#[ignore]`d fixture in a child process with a controlled credential environment:
+/// the process-global auth variables would race other tests, and an empty `$HOME` and no spur
+/// config keep the runner's `~/.spur/token` and `/etc/spur/spur.conf` out of the result.
+pub(crate) fn run_fixture(fixture: &str, scenario: &str, token: Option<&str>) -> FixtureRun {
+    let home = tempfile::TempDir::new().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", fixture, "--ignored", "--nocapture"])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
+        .env("HOME", home.path())
+        .env("SPUR_CONF", home.path().join("no-such-spur.conf"))
+        .env("SPUR_AUTH_PLUGIN", "jwt")
+        .env("SPUR_TEST_SCENARIO", scenario)
+        .current_dir(home.path());
+    if let Some(token) = token {
+        command.env("SPUR_AUTH_TOKEN", token);
+    }
+    let output = command.output().unwrap();
+    FixtureRun::new(
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.success(),
+    )
+}
+
 /// Reserve a localhost port and release it, so connecting to it is refused
 /// immediately instead of hanging until the connect timeout.
 pub(crate) async fn unreachable_addr() -> SocketAddr {
@@ -582,6 +779,22 @@ pub(crate) async fn unreachable_addr() -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_body_is_only_what_sits_between_the_markers() {
+        let stdout = "running 1 test\ntest t ... \nFIXTURE-BEGIN\nfirst\n\nlast\n\
+                      FIXTURE result: ok\n\nFIXTURE-END\nok\n";
+        let run = FixtureRun::new(stdout.into(), String::new(), true);
+        assert_eq!(run.reported("result"), "ok");
+        assert_eq!(run.command_stdout(), "first\n\nlast\n");
+        run.assert_success();
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture never ran")]
+    fn a_misspelled_fixture_name_fails_with_a_clear_message() {
+        run_fixture("mock_controller::tests::no_such_fixture", "x", None).assert_success();
+    }
 
     /// RPCs the mock does not implement must surface as `Unimplemented` rather
     /// than a default-valued success, so a test that drifts onto an unmocked
