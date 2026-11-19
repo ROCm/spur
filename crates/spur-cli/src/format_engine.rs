@@ -135,11 +135,31 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
 }
 
 /// Parse sacct/sreport-style comma-separated field names, unlike squeue/sinfo's `%`-specifiers.
+/// An unknown name is skipped. [`parse_named_format_strict`] reports it instead.
 pub fn parse_named_format(
     fmt: &str,
     name_to_spec: &dyn Fn(&str) -> Option<char>,
     header_map: &dyn Fn(char) -> &'static str,
 ) -> Vec<FormatToken> {
+    parse_named_format_inner(fmt, name_to_spec, header_map, false)
+        .expect("skipping unknown names does not fail")
+}
+
+/// [`parse_named_format`], but an unknown name is `Invalid field requested: {name}`.
+pub fn parse_named_format_strict(
+    fmt: &str,
+    name_to_spec: &dyn Fn(&str) -> Option<char>,
+    header_map: &dyn Fn(char) -> &'static str,
+) -> anyhow::Result<Vec<FormatToken>> {
+    parse_named_format_inner(fmt, name_to_spec, header_map, true)
+}
+
+fn parse_named_format_inner(
+    fmt: &str,
+    name_to_spec: &dyn Fn(&str) -> Option<char>,
+    header_map: &dyn Fn(char) -> &'static str,
+    reject_unknown: bool,
+) -> anyhow::Result<Vec<FormatToken>> {
     let mut tokens = Vec::new();
     let items: Vec<&str> = fmt.split(',').collect();
     for (i, item) in items.iter().enumerate() {
@@ -152,6 +172,9 @@ pub fn parse_named_format(
             None => (item, 0),
         };
         let Some(spec) = name_to_spec(name) else {
+            if reject_unknown {
+                anyhow::bail!("Invalid field requested: {name}");
+            }
             continue;
         };
         let abs_width = width.unsigned_abs() as usize;
@@ -166,7 +189,7 @@ pub fn parse_named_format(
             tokens.push(FormatToken::Literal(" ".to_string()));
         }
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Parse Slurm's `-O`/`--Format` grammar: a comma-separated list of fields, each
@@ -177,7 +200,7 @@ pub fn parse_named_format(
 /// Unlike [`parse_named_format`] (sacct's `Name%width` form), fields are not
 /// separated by an implicit space — Slurm relies on width padding — so callers
 /// add separators via the suffix if they want them. An unrecognized field name
-/// is an error rather than being silently dropped.
+/// is an error, as in [`parse_named_format_strict`], rather than being silently dropped.
 pub fn parse_format2(
     fmt: &str,
     name_to_spec: &dyn Fn(&str) -> Option<char>,
@@ -664,6 +687,34 @@ mod tests {
             .filter(|t| matches!(t, FormatToken::Field(_)))
             .count();
         assert_eq!(field_count, 2);
+    }
+
+    #[test]
+    fn parse_named_format_strict_names_an_unknown_field() {
+        let err = parse_named_format_strict(
+            "JobID,NotAField,Partition",
+            &test_name_to_spec,
+            &squeue_header,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Invalid field requested: NotAField"));
+    }
+
+    #[test]
+    fn parse_named_format_strict_keeps_a_width_on_a_known_field() {
+        let tokens =
+            parse_named_format_strict("JobName%20,JobID%-8", &test_name_to_spec, &squeue_header)
+                .unwrap();
+        let fields = only_fields(&tokens);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].spec, 'j');
+        assert_eq!(fields[0].width, 20);
+        assert!(fields[0].right_align);
+        assert_eq!(fields[1].spec, 'i');
+        assert_eq!(fields[1].width, 8);
+        assert!(!fields[1].right_align);
     }
 
     #[test]
