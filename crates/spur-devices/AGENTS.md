@@ -68,7 +68,12 @@ Shared edits include `/dev/kfd`, ROCm lib mounts, video/render GIDs.
 **stable_id**: BDF-derived reload-invariant device identifier. Encodes
 domain:bus:dev.func plus intra-BDF partition rank. Low 8 bits =
 partition index (STABLE_ID_PARTITION_MASK = 0xFF). Survives driver
-reloads that shift render minor numbers.
+reloads that shift render minor numbers. Bit layout (`encode_stable_id`):
+domain in bits 24..39, bus 16..23, device 11..15, function 8..10, partition
+rank 0..7. Hook env exposes these ids as `SPUR_JOB_GPUS`; the exporter hooks
+(`examples/hooks/dme/common.sh`, `examples/hooks/gpu-node/common-env.sh`)
+rebuild them from KFD `domain` and `location_id` to map each to its render
+minor, so a layout change must update those scripts too.
 
 GPU type detection: maps PCI device IDs to known SKUs (mi300x, mi350x,
 mi355x, mi210, etc.). Falls back to sysfs product_name normalization.
