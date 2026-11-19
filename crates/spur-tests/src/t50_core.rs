@@ -737,32 +737,6 @@ mod tests {
         assert!(JobSpec::default().reservation.is_none());
     }
 
-    // ── T50.73–74: strigger and scrontab types ────────────────────
-
-    #[test]
-    fn t50_73_strigger_types() {
-        let types = ["node_down", "node_up", "job_end", "job_fail", "time"];
-        assert_eq!(types.len(), 5);
-        // Ensure no duplicates
-        let mut deduped = types.to_vec();
-        deduped.sort();
-        deduped.dedup();
-        assert_eq!(deduped.len(), 5);
-    }
-
-    #[test]
-    fn t50_74_scrontab_format() {
-        let line = "0 */6 * * * sbatch /path/to/script.sh";
-        let parts: Vec<&str> = line.splitn(6, ' ').collect();
-        assert_eq!(parts.len(), 6);
-        assert_eq!(parts[0], "0"); // minute
-        assert_eq!(parts[1], "*/6"); // hour
-        assert_eq!(parts[2], "*"); // day of month
-        assert_eq!(parts[3], "*"); // month
-        assert_eq!(parts[4], "*"); // day of week
-        assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
-    }
-
     // ── T50.75: Node count single-node partition ─────────────────
 
     #[test]
@@ -884,36 +858,6 @@ address = "http://peer-a:6817"
         let cfg = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(cfg.federation.clusters.len(), 1);
         assert_eq!(cfg.federation.clusters[0].name, "peer-a");
-    }
-
-    // ── T50.86–88: PMIx env var names ────────────────────────────
-
-    #[test]
-    fn t50_86_pmix_env_var_names_correct() {
-        // Verify the canonical PMIx env var names used by OpenMPI 5+ and srun.
-        let required = ["PMIX_RANK", "PMIX_SIZE", "PMIX_NAMESPACE"];
-        for name in &required {
-            assert!(name.starts_with("PMIX_"), "expected PMIX_ prefix: {}", name);
-            assert_eq!(*name, name.to_uppercase(), "must be uppercase: {}", name);
-        }
-    }
-
-    #[test]
-    fn t50_87_pmix_namespace_format() {
-        // Namespace format: "spur.<job_id>"
-        let job_id: u32 = 42;
-        let ns = format!("spur.{}", job_id);
-        assert_eq!(ns, "spur.42");
-        assert!(ns.starts_with("spur."));
-    }
-
-    #[test]
-    fn t50_88_ompi_compat_env_vars() {
-        // OpenMPI direct bootstrap env vars mirror PMIx rank/size.
-        let ompi_vars = ["OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"];
-        for v in &ompi_vars {
-            assert!(v.starts_with("OMPI_COMM_WORLD_"));
-        }
     }
 
     // ── T50.89-91: default partition, pending reason, exec routing ──
@@ -1115,18 +1059,6 @@ address = "http://peer-a:6817"
         let assignments = sched.schedule(&[job], &cluster);
         // With num_nodes.max(1), the job should still get scheduled
         assert_eq!(assignments.len(), 1);
-    }
-
-    // ── Raw terminal mode for attach ──────────────────────────────
-
-    #[test]
-    fn t50_106_attach_raw_mode_is_nonfatal_for_pipes() {
-        // Moved to spur-cli/src/sattach.rs::tests::raw_mode_fails_on_pipe
-        // which tests the REAL RawModeGuard::enter_on_fd() with an explicit
-        // pipe fd. The old test simulated isatty() instead
-        // of calling the actual unit, and depended on the test runner env.
-        //
-        // This placeholder ensures the test ID isn't reused.
     }
 
     // ── Pending reason uses available resources ───────────────────
