@@ -324,12 +324,8 @@ mod tests {
 
         let (path, offset) = first_invalid_utf8(&bytes).expect("an invalid byte is located");
         assert_eq!(offset, at, "offset points at the flipped byte");
-        // Path is SubmitJobRequest -> spec -> script (two nested length-delimited fields).
-        assert_eq!(
-            path.len(),
-            2,
-            "path descends through spec into script: {path:?}"
-        );
+        // SubmitJobRequest.spec (field 1) -> JobSpec.script (field 20).
+        assert_eq!(path, vec![1, 20], "path descends through spec into script");
     }
 
     #[test]
