@@ -338,7 +338,7 @@ message JobSpec {
 
   // Container
   string container_image = 70;     // OCI image ref or squashfs path
-  repeated string container_mounts = 71;  // "/src:/dst:ro" bind mounts
+  repeated string container_mounts = 71;  // "/src:/dst[:ro]", "tmpfs:/dst[:size=N]", "pvc:claim:/dst"; an entry may hold a comma list
   string container_workdir = 72;   // Workdir inside container
   string container_name = 73;      // Named container (persists across jobs)
   bool container_readonly = 74;    // Read-only rootfs

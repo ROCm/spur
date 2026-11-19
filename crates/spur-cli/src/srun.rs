@@ -152,7 +152,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_image: Option<String>,
 
-    /// Container bind mounts ("/src:/dst:ro")
+    /// Container mounts, repeatable or comma-separated ("/src:/dst:ro", "tmpfs:/dst:size=1G")
     #[arg(long)]
     pub container_mounts: Vec<String>,
 
