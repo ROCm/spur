@@ -259,35 +259,40 @@ impl LeaderProxy {
         }
     }
 
-    /// An open channel to the current leader. Forwarding drives the RPC over this
-    /// with a codec (see [`PassthroughCodec`]); a typed client is not needed.
-    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
+    /// The current leader's id and an unconnected endpoint to it.
+    fn leader_endpoint(&self) -> Result<(u64, tonic::transport::Endpoint), Status> {
         let leader_id = self
             .raft
             .current_leader()
             .ok_or_else(|| Status::unavailable("no leader elected yet"))?;
+        let addr = self
+            .client_addrs
+            .get(&leader_id)
+            .ok_or_else(|| Status::unavailable("leader address unknown"))?;
+        let url = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{}", addr)
+        };
+        let endpoint = tonic::transport::Endpoint::from_shared(url)
+            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?;
+        Ok((leader_id, endpoint))
+    }
+
+    /// An open channel to the current leader, cached and shared across forwards.
+    /// Forwarding drives the RPC over this with a codec (see [`PassthroughCodec`]);
+    /// a typed client is not needed.
+    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
+        let (leader_id, endpoint) = self.leader_endpoint()?;
 
         let mut cached = self.cached_channel.lock().await;
-
         if let Some((id, ref channel)) = *cached {
             if id == leader_id {
                 return Ok(channel.clone());
             }
         }
 
-        let addr = self
-            .client_addrs
-            .get(&leader_id)
-            .ok_or_else(|| Status::unavailable("leader address unknown"))?;
-
-        let url = if addr.starts_with("http") {
-            addr.clone()
-        } else {
-            format!("http://{}", addr)
-        };
-
-        let channel = tonic::transport::Endpoint::from_shared(url)
-            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
+        let channel = endpoint
             .connect()
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
@@ -296,10 +301,15 @@ impl LeaderProxy {
         Ok(channel)
     }
 
-    /// Drop the cached channel so the next forward dials the leader afresh, used
-    /// after a forward fails in a way that suggests the connection went bad.
-    async fn invalidate(&self) {
-        *self.cached_channel.lock().await = None;
+    /// A fresh, uncached connection to the current leader, to resend a request the
+    /// leader rejected as corrupted on the hop: a new connection sidesteps the stream
+    /// path that mangled the body, and the shared channel stays up for other forwards.
+    async fn dial_leader(&self) -> Result<tonic::transport::Channel, Status> {
+        let (_, endpoint) = self.leader_endpoint()?;
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))
     }
 }
 
@@ -591,8 +601,7 @@ impl ControllerService {
                             .contains(spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE) =>
                 {
                     warn!("leader reported a corrupted forwarded body; retrying on a fresh connection");
-                    self.leader_proxy.invalidate().await;
-                    channel = self.leader_proxy.get_leader_channel().await?;
+                    channel = self.leader_proxy.dial_leader().await?;
                     attempt += 1;
                 }
                 result => return result,
