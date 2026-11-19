@@ -61,12 +61,14 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Accepted for compatibility on ``squeue``, ``sinfo``, ``sacct``, ``sstat``, ``sshare``, and ``sreport``. Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. ``sstat`` still prints ``MemAlloc`` with an ``M`` suffix whether or not the flag is passed.
    * - ``sacct`` ``ReqMem``
      - The ``ReqMem`` format field has no value yet and renders empty.
+   * - ``sacct`` row limits
+     - Slurm limits a plain ``sacct`` to jobs since midnight and has no row cap. Spur has no time default. It prints the newest 100 jobs, a number you change with ``--limit``. ``-j`` returns every requested job that has a record, as in Slurm, up to 10000 rows. An id with no record is left out. A page that hides further matches prints ``sacct: warning: results truncated at N; more jobs matched`` to stderr and still exits 0.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``
      - The ``FAIRSHARE`` column is a placeholder and does not yet reflect usage.
    * - ``sacctmgr`` ``-p``/``-P``
-     - Delimited output covers ``show account``, ``show qos``, and ``show txn``; for ``show user``, ``show association``, and ``show tres`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
+     - Delimited output covers ``show account``, ``show qos``, ``show association``, and ``show txn``; for ``show user`` and ``show tres`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
    * - ``scancel`` arrays
      - Array-element syntax (``123_4``) is not yet supported client-side; cancel by plain job id.
    * - ``scontrol show``
@@ -89,6 +91,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Supported as ``[scheduler] kill_wait_secs`` (default ``5``; Slurm's is ``30``). It is the wait between SIGTERM and SIGKILL for ``scancel``, ``scontrol requeue``, the final preemption kill, idle-fill reclaim, reservation end and other graceful stops, and it ends early once the job's processes exit. Valid ``0``-``65533``, with values below ``5`` acting as ``5``. Unlike Slurm's, it does not cover time limits (that wait is ``[scheduler] timeout_kill_wait_secs``, default ``30``, same range, which also covers the inactivity limit) and does not yet reach ``srun`` steps (see :ref:`kill wait note <kill-wait-steps-caveat>`). To get Slurm's single ``KillWait`` everywhere, set both to the same value. ``scontrol show config`` prints both values in effect, in seconds, as ``KillWait`` and ``TimeoutKillWait``. A time-limited job shows ``COMPLETING`` rather than ``RUNNING`` during the wait and still ends ``TIMEOUT``. See :ref:`kill wait upgrade notes <kill-wait-upgrade-notes>`.
    * - ``GraceTime`` (QOS and partition)
      - Supported per QOS (``sacctmgr add|modify qos ... GraceTime=<seconds>``) and applies to the preempted job's QOS, as in Slurm. A partition can also set ``GraceTime`` (``[[partitions]] grace_time`` or ``scontrol update PartitionName=... GraceTime=<seconds>``). Spur honors both together: the victim's QOS value if set (``GraceTime=0`` is a set value meaning no grace; ``cleargracetime=1`` returns the QOS to unset), else the highest value among the partitions it runs in, else ``0``. Slurm reads only the value of the active ``PreemptType`` plugin, the QOS's under ``preempt/qos`` and the partition's under ``preempt/partition_prio``. The grace is ``min(GraceTime, time left on the victim's limit)`` and covers ``cancel`` and ``requeue`` preemption. As in Slurm, the SIGCONT then SIGTERM warning goes to the job's ``srun`` steps only, not the batch script, a job in its grace is preempted at the deadline even if the preemptor no longer needs the nodes, and a job in its grace stays running while some of its nodes finish early (a finished node is freed, the others are not signalled, and an ``srun``-launching batch script ends the job when it exits). Nodes managed by the Kubernetes operator, and nodes running a ``spurd`` that predates the feature, give no grace. See :ref:`preemption grace time <qos-preempt-grace>`.
+   * - Partition ``QOS=``
+     - Supported (``[[partitions]] qos`` or ``scontrol update PartitionName=... QOS=<qos>``). Its resource and running-job limits apply to every job in the partition on top of the job QOS; its submit-count limits and ``GrpWall`` are not enforced. Slurm ignores the partition QOS when it equals the job QOS; Spur applies both checks. Earlier Spur releases accepted and ignored a partition ``qos``; on upgrade it is enforced, and a name with no defined QOS holds the partition's jobs with ``InvalidQOS``. See :ref:`partition-qos`.
 
 Accounting and QOS Mapping
 --------------------------

@@ -11,8 +11,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic-health = "0.14"
+tokio-stream = { workspace = true, features = ["net"] }
+tonic-health = { workspace = true }
 
 [lints]
 workspace = true

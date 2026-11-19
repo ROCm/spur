@@ -17,6 +17,8 @@
 #   KB_API_URL         — API endpoint (default: AMD internal LLM API)
 #   KB_MODEL           — model to use (default: Claude-Opus-4.8)
 #   KB_BASE_REF        — base ref for the diff (default: origin/main)
+#   KB_HEAD_REF        — head ref for the diff (default: HEAD). When not HEAD,
+#                        KB docs are read from this ref via git, not the tree.
 #   KB_MAX_DIFF_CHARS  — skip if diff is too large (default: 80000)
 #
 # Usage:
@@ -29,6 +31,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 BASE_REF="${KB_BASE_REF:-origin/main}"
+HEAD_REF="${KB_HEAD_REF:-HEAD}"
 MODEL="${KB_MODEL:-Claude-Opus-4.8}"
 MAX_DIFF_CHARS="${KB_MAX_DIFF_CHARS:-80000}"
 API_URL="${KB_API_URL:-https://llm-api.amd.com/Anthropic/v1/messages}"
@@ -42,7 +45,7 @@ fi
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-if ! git diff "$BASE_REF"..HEAD -- ':(glob)crates/*/src/**' ':(glob)proto/**' > "$tmpdir/diff.txt" 2>"$tmpdir/diff_err.txt"; then
+if ! git diff "$BASE_REF...$HEAD_REF" -- ':(glob)crates/*/src/**' ':(glob)proto/**' > "$tmpdir/diff.txt" 2>"$tmpdir/diff_err.txt"; then
     echo "::error::git diff failed (bad BASE_REF? missing history?)"
     cat "$tmpdir/diff_err.txt" >&2
     exit 2
@@ -58,23 +61,35 @@ if [ "$diff_chars" -gt "$MAX_DIFF_CHARS" ]; then
     exit 2
 fi
 
-changed_crates=$(git diff "$BASE_REF"..HEAD --name-only -- ':(glob)crates/*/src/**' \
+changed_crates=$(git diff "$BASE_REF...$HEAD_REF" --name-only -- ':(glob)crates/*/src/**' \
     | sed -n 's|^\(crates/[^/]*/\).*|\1|p' \
     | sort -u)
 
-: > "$tmpdir/kb.txt"
-for crate_dir in $changed_crates; do
-    agents_file="${crate_dir}AGENTS.md"
-    if [ -f "$agents_file" ]; then
-        printf '\n--- %s ---\n' "$agents_file" >> "$tmpdir/kb.txt"
-        cat "$agents_file" >> "$tmpdir/kb.txt"
+# Fork PR heads are read as blobs, never checked out.
+kb_read() {
+    if [ "$HEAD_REF" = HEAD ]; then
+        [ -f "$1" ] && cat "$1"
+    else
+        git cat-file -e "$HEAD_REF:$1" 2>/dev/null && git show "$HEAD_REF:$1"
     fi
-done
+}
 
-for doc in docs/knowledge/common/*.md docs/knowledge/scheduler/*.md docs/knowledge/execution/*.md docs/knowledge/consensus/*.md docs/knowledge/accounting/*.md docs/knowledge/networking/*.md docs/knowledge/security/*.md docs/knowledge/devices/*.md docs/knowledge/testing/*.md docs/knowledge/deployment/*.md; do
-    [ -f "$doc" ] || continue
-    printf '\n--- %s ---\n' "$doc" >> "$tmpdir/kb.txt"
-    cat "$doc" >> "$tmpdir/kb.txt"
+kb_docs() {
+    local dir
+    for dir in common scheduler execution consensus accounting networking security devices testing deployment; do
+        if [ "$HEAD_REF" = HEAD ]; then
+            printf '%s\n' docs/knowledge/$dir/*.md
+        else
+            git ls-tree --name-only "$HEAD_REF" "docs/knowledge/$dir/" | grep '\.md$' || true
+        fi
+    done
+}
+
+: > "$tmpdir/kb.txt"
+for kb_file in $(for crate_dir in $changed_crates; do echo "${crate_dir}AGENTS.md"; done; kb_docs); do
+    content=$(kb_read "$kb_file") || continue
+    printf '\n--- %s ---\n' "$kb_file" >> "$tmpdir/kb.txt"
+    printf '%s\n' "$content" >> "$tmpdir/kb.txt"
 done
 
 kb_chars=$(wc -c < "$tmpdir/kb.txt")
@@ -107,12 +122,12 @@ Rules:
 - Do NOT flag style, formatting, or wording preferences.
 - Each contradiction must cite the specific doc file, the specific claim, and the specific code change that contradicts it.
 
-CRITICAL: Your response MUST begin with exactly PASS or FAIL as the very first word on the very first line. No preamble, no analysis before the verdict, no "I'll analyze..." or "Let me check..." — just the verdict first.
+First, analyze: for each behavioral change in the diff, find any KB claim about that same code path and decide whether the change makes it false. Keep the analysis concise.
 
-If you find NO contradictions, your entire response must be exactly: PASS
-
-If you find contradictions, respond with FAIL on the first line, then list each contradiction as:
+Then, if you found contradictions, list each as:
 - [file.md:line-area] "quoted claim" — contradicted by: explanation of what the code actually does
+
+The LAST line of your response must be exactly VERDICT: PASS or VERDICT: FAIL.
 
 --- CODE DIFF ---
 {diff_text}
@@ -122,8 +137,8 @@ If you find contradictions, respond with FAIL on the first line, then list each 
 
 body = json.dumps({
     "model": model,
-    "max_tokens": 4096,
-    "system": "You are a CI checker that outputs structured verdicts. Your response MUST start with PASS or FAIL on the first line. Never add preamble.",
+    "max_tokens": 8192,
+    "system": "You are a CI checker. End your response with a final line VERDICT: PASS or VERDICT: FAIL.",
     "messages": [{"role": "user", "content": prompt}],
 }).encode()
 
@@ -163,19 +178,19 @@ print()
 print(f"=== Knowledge Base Accuracy Check (model: {served_model}) ===")
 print()
 
-verdict = result.strip().split("\n", 1)[0].strip() if result.strip() else ""
+last = result.strip().rsplit("\n", 1)[-1].strip() if result.strip() else ""
 
-if verdict == "PASS":
+if last == "VERDICT: PASS":
     print("PASS — no contradictions found")
     sys.exit(0)
-elif verdict == "FAIL":
+elif last == "VERDICT: FAIL":
     print(result)
     print()
     print("Knowledge base has claims that contradict the code changes.")
     print("Update the relevant AGENTS.md or docs/knowledge/ files.")
     sys.exit(1)
 else:
-    print(f"Unexpected LLM verdict (first line: {verdict!r}) — treating as inconclusive")
+    print(f"Unexpected LLM verdict (last line: {last!r}) — treating as inconclusive")
     print(result[:500])
     sys.exit(2)
 PYEOF

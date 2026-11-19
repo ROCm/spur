@@ -1461,7 +1461,7 @@ impl ClusterManager {
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
         // that actually governs the job. A limit the hook set is left alone.
-        let wall_caps = self.wall_caps(&spec);
+        let wall_caps = self.wall_caps(&spec, &partitions);
         apply_default_time_limit(
             &mut spec,
             &partitions,
@@ -6293,6 +6293,12 @@ impl ClusterManager {
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
             let partitions = self.partitions.read().clone();
+            let partition_qos = PartitionQosView::build(
+                &partitions,
+                &self.qos_cache,
+                self.config().accounting.enabled(),
+                &jobs,
+            );
             // An unplaceable job must not reserve grp-node quota it never uses.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 if let Some(reason) = structural_unplaceable_reason(job, &nodes, &reservations) {
@@ -6355,6 +6361,7 @@ impl ClusterManager {
                         let verdict = quota_gate(
                             &mut probe,
                             qos,
+                            &partition_qos,
                             &self.association_cache,
                             &ledger,
                             &reuse,
@@ -6373,6 +6380,12 @@ impl ClusterManager {
                     claim.narrow(job);
                     if !unclaimed.contains(&job.job_id) {
                         reserved.reserve(job, &claim.tres, claim.qos_charge, claim.account_charge);
+                        reserved.reserve_partition_qos(
+                            job,
+                            &claim.tres,
+                            &partition_qos,
+                            &claim.partition_qos_charges,
+                        );
                         claimed_any = true;
                     }
                     return GateOutcome::Keep;
@@ -6413,6 +6426,12 @@ impl ClusterManager {
                     // is deliberately 0 — that is the one aggregate a borrowed job
                     // is outside of (D1).
                     reserved.reserve(&lent, &job_tres(probe), 0, job.spec.num_nodes as u64);
+                    reserved.reserve_partition_qos(
+                        &lent,
+                        &job_tres(probe),
+                        &partition_qos,
+                        &HashMap::new(),
+                    );
                     *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
                         job.spec.num_nodes as u64;
                     idle_fill_candidates.push(lent);
@@ -6862,6 +6881,7 @@ impl ClusterManager {
         preempt_exempt_time: Option<Option<u32>>,
         grace_time: Option<Option<u32>>,
         limits: PartitionLimitsUpdate,
+        qos: Option<Option<String>>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -6923,6 +6943,7 @@ impl ClusterManager {
             preempt_exempt_time,
             grace_time,
             resource_limits,
+            qos,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         self.warn_partition_cap_overcommits_in(name);
@@ -7137,6 +7158,11 @@ impl ClusterManager {
                 resource_limits: Some(PartitionLimitsUpdate::replacing(
                     &PartitionResourceLimits::of(part),
                 )),
+                qos: new_config
+                    .partitions
+                    .iter()
+                    .find(|pc| pc.name == part.name)
+                    .and_then(spur_core::config::PartitionConfig::qos_update),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -8241,7 +8267,20 @@ impl ClusterManager {
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
-    fn wall_caps(&self, spec: &JobSpec) -> WallCaps {
+    fn wall_caps(&self, spec: &JobSpec, partitions: &[Partition]) -> WallCaps {
+        let loaded_qos = |name: &str| {
+            self.qos_cache
+                .is_loaded()
+                .then(|| self.qos_cache.get(name))
+                .flatten()
+        };
+        let partition_qos_minutes = partitions_for_defaulting(spec, partitions)
+            .into_iter()
+            .filter_map(|p| p.qos.as_deref().filter(|q| !q.is_empty()))
+            .filter_map(|name| loaded_qos(name)?.limits.max_wall_minutes)
+            .filter(|m| *m > 0)
+            .min();
+
         let qos_minutes = spec
             .qos
             .as_deref()
@@ -8262,6 +8301,7 @@ impl ClusterManager {
         WallCaps {
             qos_minutes,
             account_minutes,
+            partition_qos_minutes,
         }
     }
 
@@ -8273,6 +8313,13 @@ impl ClusterManager {
     /// accounting-disabled case (no caps) and a split cache (one cache warm).
     pub(crate) fn qos_limits_readable(&self) -> bool {
         !self.config().accounting.enabled() || self.qos_cache.is_loaded()
+    }
+
+    fn runs_under_a_partition_qos(&self, job: &Job) -> bool {
+        let partitions = self.partitions.read();
+        spur_sched::partition_cap::candidate_partitions(job, &partitions)
+            .iter()
+            .any(|p| p.qos.as_deref().is_some_and(|q| !q.is_empty()))
     }
 
     /// Whether association limits can be read right now; the association-cache
@@ -8299,6 +8346,10 @@ impl ClusterManager {
             if self.qos_cache.get(name).is_none() {
                 return Some(PendingReason::InvalidQOS);
             }
+        }
+
+        if !self.qos_limits_readable() && self.runs_under_a_partition_qos(job) {
+            return Some(PendingReason::AccountingUnavailable);
         }
 
         let has_account = job.spec.account.as_deref().is_some_and(|a| !a.is_empty());
@@ -10350,6 +10401,7 @@ impl ClusterManager {
                 preempt_exempt_time,
                 grace_time,
                 resource_limits,
+                qos,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -10413,6 +10465,9 @@ impl ClusterManager {
                         }
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
+                        }
+                        if let Some(q) = qos {
+                            part.qos.clone_from(q);
                         }
                         if let Some(limits) = resource_limits.as_ref().and_then(|u| u.merged(part))
                         {
@@ -11736,10 +11791,14 @@ fn account_block_with(
 }
 
 /// The job reshaped per request it could run with, in order, each limited to the requested
-/// partitions admitting it with that request; a job that requested none keeps its own list.
+/// partitions admitting it with that request. A job that names no partition is limited to
+/// the defaults it would be placed in; one that no requested partition admits keeps its list.
 fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
     let requested =
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
+    let unnamed = requested_partition_names(job.spec.partition.as_deref())
+        .next()
+        .is_none();
     let admitting: Vec<&Partition> = requested
         .into_iter()
         .filter(|p| p.admits(&job.spec))
@@ -11755,7 +11814,7 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
         .map(|request| {
             let mut probe = job.clone();
             probe.spec = request.spec;
-            if narrows {
+            if narrows || (unnamed && !request.partitions.is_empty()) {
                 probe.spec.partition = Some(request.partitions.join(","));
             }
             probe
@@ -11767,11 +11826,14 @@ fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
 enum QuotaVerdict {
     Admitted {
         account: AccountAdmitted,
+        partition_qos: PartitionQosAdmitted,
         qos_charge: u64,
     },
     AccountBlocked(spur_core::job::PendingReason),
+    PartitionQosBlocked(spur_core::job::PendingReason),
     QosBlocked {
         account: AccountAdmitted,
+        partition_qos: PartitionQosAdmitted,
         blocked: QosBlocked,
     },
 }
@@ -11780,26 +11842,289 @@ impl QuotaVerdict {
     fn block_reason(&self) -> Option<spur_core::job::PendingReason> {
         match self {
             Self::Admitted { .. } => None,
-            Self::AccountBlocked(reason) => Some(reason.clone()),
+            Self::AccountBlocked(reason) | Self::PartitionQosBlocked(reason) => {
+                Some(reason.clone())
+            }
             Self::QosBlocked { blocked, .. } => Some(blocked.reason.clone()),
         }
     }
 
     /// Over its QOS group node cap and nothing else, with no packing credit
-    /// needed from the account, so it may borrow idle capacity.
+    /// needed from the account or a partition QOS, so it may borrow idle capacity.
     fn only_grp_node_blocked(&self) -> bool {
         matches!(
             self,
-            Self::QosBlocked { account, blocked }
-                if blocked.grp_node_sole_blocker && account.admits_without_credit
+            Self::QosBlocked { account, partition_qos, blocked }
+                if blocked.grp_node_sole_blocker
+                    && account.admits_without_credit
+                    && partition_qos.admits_without_credit
         )
     }
 }
 
-/// Run the association gate, then the QOS gate, on `job` as it stands.
+/// Running usage of one partition QOS.
+#[derive(Default)]
+struct PartitionQosUsage {
+    grp: TresRecord,
+    /// Nodes the QOS's jobs hold, which a job can pack onto without a new group node.
+    occupied: HashSet<String>,
+    user_tres: HashMap<String, TresRecord>,
+    user_jobs: HashMap<String, u32>,
+}
+
+/// A successful partition-QOS admission.
+#[derive(Clone)]
+struct PartitionQosAdmitted {
+    /// Group node count charged per partition QOS, less than the raw request
+    /// when the job packs onto nodes that QOS already holds.
+    charges: HashMap<String, u64>,
+    /// Whether every partition QOS would admit the job with no packing credit.
+    /// Only idle-fill reads this, as it does for the account.
+    admits_without_credit: bool,
+}
+
+impl Default for PartitionQosAdmitted {
+    fn default() -> Self {
+        Self {
+            charges: HashMap::new(),
+            admits_without_credit: true,
+        }
+    }
+}
+
+/// One partition QOS's admission of a job.
+struct PartitionQosCharge {
+    qos: String,
+    charge: u64,
+    reusable: HashSet<String>,
+    admits_without_credit: bool,
+}
+
+/// A pass's view of partition QOSes. Usage is counted over every job charged to a
+/// partition carrying the QOS, whatever its account or job QOS, so one user's
+/// footprint adds up across accounts. Idle-fill borrowed jobs count too: the cap
+/// bounds what a user holds, borrowed or not.
+#[derive(Default)]
+struct PartitionQosView {
+    /// Partition name to its QOS name and record; `None` when no such QOS is defined.
+    by_partition: HashMap<String, (String, Option<Qos>)>,
+    usage: HashMap<String, PartitionQosUsage>,
+    /// Where a job that names no partition is placed, so it is gated there too.
+    defaults: Vec<String>,
+    /// An undefined partition QOS holds the partition's jobs rather than lifting the cap.
+    unknown_blocks: bool,
+}
+
+impl PartitionQosView {
+    fn build(
+        partitions: &[Partition],
+        qos_cache: &QosCache,
+        unknown_blocks: bool,
+        jobs: &HashMap<JobId, Job>,
+    ) -> Self {
+        let by_partition: HashMap<String, (String, Option<Qos>)> = partitions
+            .iter()
+            .filter_map(|p| {
+                let name = p.qos.as_deref().filter(|q| !q.is_empty())?;
+                Some((p.name.clone(), (name.to_string(), qos_cache.get(name))))
+            })
+            .collect();
+        if by_partition.is_empty() {
+            return Self::default();
+        }
+
+        let mut grp: HashMap<&str, RunningTresAccumulator<'_>> = HashMap::new();
+        let mut per_user: HashMap<(&str, &str), RunningTresAccumulator<'_>> = HashMap::new();
+        let mut user_jobs: HashMap<(&str, &str), u32> = HashMap::new();
+        for job in jobs.values().filter(|j| j.holds_allocation()) {
+            let Some(partition) = crate::scheduler_loop::charged_partition(job, partitions) else {
+                continue;
+            };
+            let Some((qos, _)) = by_partition.get(&partition.name) else {
+                continue;
+            };
+            let key = (qos.as_str(), job.spec.user.as_str());
+            grp.entry(qos.as_str()).or_default().add(job);
+            per_user.entry(key).or_default().add(job);
+            *user_jobs.entry(key).or_insert(0) += 1;
+        }
+
+        let mut usage: HashMap<String, PartitionQosUsage> = HashMap::new();
+        for (qos, acc) in grp {
+            let entry = usage.entry(qos.to_string()).or_default();
+            entry.occupied = acc.nodes().map(str::to_string).collect();
+            entry.grp = acc.tres();
+        }
+        for ((qos, user), acc) in per_user {
+            usage
+                .entry(qos.to_string())
+                .or_default()
+                .user_tres
+                .insert(user.to_string(), acc.tres());
+        }
+        for ((qos, user), count) in user_jobs {
+            usage
+                .entry(qos.to_string())
+                .or_default()
+                .user_jobs
+                .insert(user.to_string(), count);
+        }
+        Self {
+            by_partition,
+            usage,
+            defaults: partitions
+                .iter()
+                .filter(|p| p.is_default)
+                .map(|p| p.name.clone())
+                .collect(),
+            unknown_blocks,
+        }
+    }
+
+    /// The partitions `job` may be placed in: the ones it requested, or the
+    /// defaults when it requested none, as the placer resolves them.
+    fn candidate_names(&self, job: &Job) -> Vec<String> {
+        let requested: Vec<String> = requested_partition_names(job.spec.partition.as_deref())
+            .map(str::to_string)
+            .collect();
+        if requested.is_empty() {
+            return self.defaults.clone();
+        }
+        requested
+    }
+
+    /// Narrows `job` to the requested partitions whose QOS admits it, and extends its
+    /// `preferred_nodes` with the nodes credited toward a group node cap; `Err` with
+    /// the first refusal when none admits it.
+    fn admit(
+        &self,
+        job: &mut Job,
+        reuse: &ReuseView<'_>,
+        reserved: &PassReservations,
+    ) -> Result<PartitionQosAdmitted, spur_core::job::PendingReason> {
+        let mut admission = PartitionQosAdmitted::default();
+        if self.by_partition.is_empty() {
+            return Ok(admission);
+        }
+        let requested = self.candidate_names(job);
+        let mut admitted = Vec::new();
+        let mut reusable = HashSet::new();
+        let mut refusal = None;
+        for name in &requested {
+            match self.check(job, name, reuse, reserved) {
+                Ok(charge) => {
+                    admitted.push(name.clone());
+                    let Some(charge) = charge else { continue };
+                    let entry = admission.charges.entry(charge.qos).or_insert(0);
+                    *entry = (*entry).max(charge.charge);
+                    admission.admits_without_credit &= charge.admits_without_credit;
+                    reusable.extend(charge.reusable);
+                }
+                Err(reason) => {
+                    refusal.get_or_insert(reason);
+                }
+            }
+        }
+        if let Some(reason) = refusal {
+            if admitted.is_empty() {
+                return Err(reason);
+            }
+            job.spec.partition = Some(admitted.join(","));
+        }
+        job.preferred_nodes.extend(reusable);
+        Ok(admission)
+    }
+
+    /// `Ok(None)` when `partition` carries no QOS to charge.
+    fn check(
+        &self,
+        job: &Job,
+        partition: &str,
+        reuse: &ReuseView<'_>,
+        reserved: &PassReservations,
+    ) -> Result<Option<PartitionQosCharge>, spur_core::job::PendingReason> {
+        let Some((name, qos)) = self.by_partition.get(partition) else {
+            return Ok(None);
+        };
+        let Some(qos) = qos else {
+            if self.unknown_blocks {
+                return Err(spur_core::job::PendingReason::InvalidQOS);
+            }
+            return Ok(None);
+        };
+        let user = &job.spec.user;
+        let usage = self.usage.get(name);
+        let key = (user.clone(), name.clone());
+        let mut user_tres = usage
+            .and_then(|u| u.user_tres.get(user))
+            .cloned()
+            .unwrap_or_default();
+        let mut grp = usage.map(|u| u.grp.clone()).unwrap_or_default();
+        let mut user_jobs = usage
+            .and_then(|u| u.user_jobs.get(user))
+            .copied()
+            .unwrap_or(0);
+        if let Some(t) = reserved.partition_qos_user_tres.get(&key) {
+            user_tres.add(t);
+        }
+        if let Some(t) = reserved.partition_qos_grp.get(name) {
+            grp.add(t);
+        }
+        user_jobs += reserved
+            .partition_qos_user_count
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        // Submit counts are not tracked per partition, so MaxSubmitJobsPU is not applied here.
+        let mut enforced = qos.clone();
+        enforced.limits.max_submit_jobs_per_user = None;
+
+        let already_claimed = reserved.partition_qos_claimed_nodes.get(name);
+        let occupied: HashSet<String> = usage
+            .map(|u| &u.occupied)
+            .into_iter()
+            .flatten()
+            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+            .cloned()
+            .collect();
+        let (charge, reusable) =
+            grp_node_credit(job, enforced.limits.grp_tres.as_ref(), &occupied, reuse);
+        let check = |charge| {
+            check_qos_limits_with_grp_node_charge(
+                job, &enforced, user_jobs, 0, &user_tres, &grp, None, charge,
+            )
+        };
+        if let QosCheckResult::Blocked(reason) = check(charge) {
+            return Err(reason);
+        }
+        Ok(Some(PartitionQosCharge {
+            qos: name.clone(),
+            charge,
+            reusable,
+            admits_without_credit: matches!(
+                check(job.spec.num_nodes as u64),
+                QosCheckResult::Allowed
+            ),
+        }))
+    }
+
+    /// The distinct partition QOSes `job` is charged against if it runs.
+    fn qos_names(&self, job: &Job) -> BTreeSet<String> {
+        self.candidate_names(job)
+            .iter()
+            .filter_map(|p| self.by_partition.get(p).map(|(name, _)| name.clone()))
+            .collect()
+    }
+}
+
+/// Run the association gate, the partition QOS gate, then the job QOS gate, on
+/// `job` as it stands. The partition QOS goes before the job QOS so a job lent idle
+/// capacity has already cleared it.
+#[allow(clippy::too_many_arguments)]
 fn quota_gate(
     job: &mut Job,
     qos: &Qos,
+    partition_qos: &PartitionQosView,
     assoc_cache: &AssociationCache,
     ledger: &QuotaLedger<'_>,
     reuse: &ReuseView<'_>,
@@ -11810,12 +12135,21 @@ fn quota_gate(
         Ok(account) => account,
         Err(reason) => return QuotaVerdict::AccountBlocked(reason),
     };
+    let partition_qos = match partition_qos.admit(job, reuse, reserved) {
+        Ok(admitted) => admitted,
+        Err(reason) => return QuotaVerdict::PartitionQosBlocked(reason),
+    };
     match qos_block_with(job, qos, ledger, reuse, reserved, consumed_wall_minutes) {
         Ok(qos_charge) => QuotaVerdict::Admitted {
             account,
+            partition_qos,
             qos_charge,
         },
-        Err(blocked) => QuotaVerdict::QosBlocked { account, blocked },
+        Err(blocked) => QuotaVerdict::QosBlocked {
+            account,
+            partition_qos,
+            blocked,
+        },
     }
 }
 
@@ -11826,6 +12160,8 @@ struct QuotaClaim {
     tres: TresRecord,
     qos_charge: u64,
     account_charge: u64,
+    /// Group node charge per partition QOS.
+    partition_qos_charges: HashMap<String, u64>,
     partitions: Vec<String>,
     preferred_nodes: HashSet<String>,
 }
@@ -11837,25 +12173,39 @@ impl QuotaClaim {
         for (probe, verdict) in outcomes {
             let QuotaVerdict::Admitted {
                 account,
+                partition_qos,
                 qos_charge,
             } = verdict
             else {
                 continue;
             };
-            claim
-                .get_or_insert_with(Self::default)
-                .add(probe, *qos_charge, account.charge);
+            claim.get_or_insert_with(Self::default).add(
+                probe,
+                *qos_charge,
+                account.charge,
+                partition_qos,
+            );
         }
         claim
     }
 
-    fn add(&mut self, probe: &Job, qos_charge: u64, account_charge: u64) {
+    fn add(
+        &mut self,
+        probe: &Job,
+        qos_charge: u64,
+        account_charge: u64,
+        partition_qos: &PartitionQosAdmitted,
+    ) {
         let tres = job_tres(probe);
         for kind in tres.types() {
             self.tres.set(kind, self.tres.get(kind).max(tres.get(kind)));
         }
         self.qos_charge = self.qos_charge.max(qos_charge);
         self.account_charge = self.account_charge.max(account_charge);
+        for (qos, charge) in &partition_qos.charges {
+            let entry = self.partition_qos_charges.entry(qos.clone()).or_insert(0);
+            *entry = (*entry).max(*charge);
+        }
         self.partitions
             .extend(requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string));
         self.preferred_nodes
@@ -11865,7 +12215,7 @@ impl QuotaClaim {
     /// Restrict the job to the partitions whose request was admitted, and pass
     /// on the nodes the gates credited it with.
     fn narrow(&self, job: &mut Job) {
-        if job.spec.partition.is_some() && !self.partitions.is_empty() {
+        if !self.partitions.is_empty() {
             job.spec.partition = Some(self.partitions.join(","));
         }
         job.preferred_nodes.clone_from(&self.preferred_nodes);
@@ -12048,8 +12398,12 @@ impl<'a> RunningTresAccumulator<'a> {
         if job.allocated_nodes.is_empty() {
             self.unplaced_nodes += job.spec.num_nodes as u64;
         } else {
-            self.distinct_nodes
-                .extend(job.allocated_nodes.iter().map(String::as_str));
+            self.distinct_nodes.extend(
+                job.allocated_nodes
+                    .iter()
+                    .filter(|node| job.is_held_on(node))
+                    .map(String::as_str),
+            );
         }
     }
 
@@ -12405,9 +12759,50 @@ struct PassReservations {
     account_grp: HashMap<String, TresRecord>,
     account_user_count: HashMap<(String, String), u32>,
     account_claimed_nodes: HashMap<String, HashSet<String>>,
+    partition_qos_grp: HashMap<String, TresRecord>,
+    partition_qos_user_tres: HashMap<(String, String), TresRecord>,
+    partition_qos_user_count: HashMap<(String, String), u32>,
+    partition_qos_claimed_nodes: HashMap<String, HashSet<String>>,
 }
 
 impl PassReservations {
+    /// Charge `job` against every partition QOS it could run under; a multi-partition
+    /// job is charged to each, since placement has not picked one yet. `node_charges`
+    /// holds the group node count admission charged each QOS; one not in it is
+    /// charged the raw request. Its credited nodes are spoken for, as in [`Self::reserve`].
+    fn reserve_partition_qos(
+        &mut self,
+        job: &Job,
+        tres: &TresRecord,
+        view: &PartitionQosView,
+        node_charges: &HashMap<String, u64>,
+    ) {
+        for qos in view.qos_names(job) {
+            let mut grp_tres = tres.clone();
+            grp_tres.set(
+                TresType::Node,
+                node_charges
+                    .get(&qos)
+                    .copied()
+                    .unwrap_or(job.spec.num_nodes as u64),
+            );
+            self.partition_qos_grp
+                .entry(qos.clone())
+                .or_default()
+                .add(&grp_tres);
+            self.partition_qos_claimed_nodes
+                .entry(qos.clone())
+                .or_default()
+                .extend(job.preferred_nodes.iter().cloned());
+            let key = (job.spec.user.clone(), qos);
+            self.partition_qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(tres);
+            *self.partition_qos_user_count.entry(key).or_insert(0) += 1;
+        }
+    }
+
     /// Record that `job` (kept this pass) now occupies its footprint against the
     /// QOS and account aggregates, so lower-priority jobs later in the pass see
     /// the reduced headroom. `qos_node_charge`/`account_node_charge` are the
@@ -12948,6 +13343,8 @@ fn partitions_for_defaulting<'a>(
 pub(crate) struct WallCaps {
     qos_minutes: Option<u32>,
     account_minutes: Option<u32>,
+    /// The smallest partition QOS `MaxWall` among the partitions the job may run in.
+    partition_qos_minutes: Option<u32>,
 }
 
 impl WallCaps {
@@ -12960,7 +13357,7 @@ impl WallCaps {
 /// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
 /// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
 /// so the default fits every requested partition; if any requested partition
-/// resolves to no bound the governing QOS's or account's `MaxWall` supplies the
+/// resolves to no bound the governing QOS's, account's or partition QOS's `MaxWall` supplies the
 /// limit instead, and a job with neither stays unbounded (unchanged upgrade
 /// behavior).
 fn apply_default_time_limit(
@@ -13006,15 +13403,16 @@ fn apply_default_time_limit(
     }
 }
 
-/// The per-job wall ceiling as a default. A job has to satisfy the QOS's and the
-/// account's `MaxWall` both, so the smaller of the two is the limit it is really
-/// held to. That value is then kept under the requested partitions' `MaxTime`,
+/// The per-job wall ceiling as a default. A job has to satisfy the QOS's, the
+/// account's and the partition QOS's `MaxWall` all, so the smallest is the limit it
+/// is really held to. That value is then kept under the requested partitions' `MaxTime`,
 /// above which the job would pend forever on a limit it never asked for — where
 /// today it simply runs unbounded.
 fn wall_cap_default(requested: &[&Partition], caps: WallCaps) -> Option<u32> {
     let cap = [
         WallCaps::usable(caps.qos_minutes),
         WallCaps::usable(caps.account_minutes),
+        WallCaps::usable(caps.partition_qos_minutes),
     ]
     .into_iter()
     .flatten()
@@ -13348,6 +13746,7 @@ pub(crate) mod tests {
 
     mod node_inventory;
     mod partition_limits;
+    mod partition_qos;
 
     #[test]
     fn submission_size_accepts_normal_script() {
@@ -13408,6 +13807,7 @@ pub(crate) mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -13854,6 +14254,55 @@ pub(crate) mod tests {
         std::fs::write(&conf_path, format!("{base}grace_time = 0\n")).unwrap();
         cm.reconfigure().unwrap();
         assert_eq!(gpu(&cm), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_keeps_a_runtime_partition_qos_unless_the_conf_sets_one() {
+        let dir = TempDir::new().unwrap();
+        let base = "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\nnodes = \"ALL\"\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, base).await;
+        let gpu_qos = |cm: &Arc<ClusterManager>| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .qos
+        };
+        cm.update_partition(
+            "gpu",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            PartitionLimitsUpdate::default(),
+            Some(Some("usercap".into())),
+        )
+        .unwrap();
+
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm).as_deref(), Some("usercap"));
+
+        std::fs::write(&conf_path, format!("{base}qos = \"teamcap\"\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm).as_deref(), Some("teamcap"));
+
+        std::fs::write(&conf_path, format!("{base}qos = \"\"\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu_qos(&cm), None);
     }
 
     #[tokio::test]
@@ -14374,18 +14823,30 @@ state = "UP"
             .unwrap();
         };
         write("[\"hash\", \"fewest_jobs\"]");
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             cm.config().scheduler.preempt_victim_order,
             [Hash, FewestJobs]
         );
 
         write("[]");
-        cm.reconfigure().unwrap();
+        let reloading = cm.clone();
+        tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cm.config().scheduler.preempt_victim_order.is_empty());
 
         write("[\"hash\", \"hash\"]");
-        assert!(cm.reconfigure().is_err());
+        let reloading = cm.clone();
+        assert!(tokio::task::spawn_blocking(move || reloading.reconfigure())
+            .await
+            .unwrap()
+            .is_err());
         assert!(
             cm.config().scheduler.preempt_victim_order.is_empty(),
             "a rejected file leaves the running list alone"
@@ -16131,6 +16592,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -16413,6 +16875,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -39264,7 +39727,7 @@ state = "UP"
     fn qos_wall(minutes: u32) -> WallCaps {
         WallCaps {
             qos_minutes: Some(minutes),
-            account_minutes: None,
+            ..Default::default()
         }
     }
 
@@ -39330,6 +39793,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: Some(720),
             account_minutes: Some(360),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(360)));
@@ -39341,6 +39805,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: None,
             account_minutes: Some(90),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(90)));
@@ -39352,6 +39817,7 @@ state = "UP"
         let caps = WallCaps {
             qos_minutes: Some(720),
             account_minutes: Some(0),
+            partition_qos_minutes: None,
         };
         super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
@@ -39425,7 +39891,7 @@ state = "UP"
         spec.qos = Some("burst".into());
         spec.account = Some("eng".into());
 
-        let caps = cluster.wall_caps(&spec);
+        let caps = cluster.wall_caps(&spec, &[]);
         assert!(caps.qos_minutes.is_none());
         assert!(caps.account_minutes.is_none());
     }
@@ -40838,6 +41304,7 @@ state = "UP"
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -40865,6 +41332,7 @@ state = "UP"
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                qos: None,
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
@@ -40933,6 +41401,7 @@ state = "UP"
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            qos: None,
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
@@ -43228,6 +43697,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -43353,6 +43823,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -43400,6 +43871,7 @@ state = "UP"
             is_default: Some(true),
             preempt_exempt_time: None,
             grace_time: None,
+            qos: None,
             resource_limits: None,
         });
 
@@ -43469,6 +43941,7 @@ state = "UP"
                 None,
                 grace_time,
                 PartitionLimitsUpdate::default(),
+                None,
             )
         };
         update(None).unwrap();

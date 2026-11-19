@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 /// sacctmgr `-1` keyword.
 pub const INFINITE: u32 = u32::MAX;
 
+/// Rows `sacct` will print. A history query may return one more.
+pub const MAX_JOB_HISTORY_ROWS: u32 = 10_000;
+
+/// Rows `GetJobHistory` will return. One past [`MAX_JOB_HISTORY_ROWS`].
+pub const MAX_JOB_HISTORY_FETCH: u32 = MAX_JOB_HISTORY_ROWS + 1;
+
 /// Convert a stored nullable limit (`Option<i32>` from the DB) into the
 /// in-memory `Option<u32>`: SQL `NULL` (`None`) is "no limit", a literal `0`
 /// survives as `Some(0)` ("block all"), and a stray negative (predates the

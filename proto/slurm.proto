@@ -597,6 +597,8 @@ message PartitionInfo {
   optional uint64 def_mem_per_node = 50;
   optional uint64 def_mem_per_cpu = 51;
   optional uint64 def_mem_per_gpu = 52;
+  // Partition QOS whose limits bound every job in the partition; empty = none.
+  string qos = 53;
 }
 
 // ============================================================
@@ -1985,6 +1987,10 @@ message CreateAccountRequest {
   // to no-limit; any other value (including a literal 0) is stored as-is.
   optional uint32 max_running_jobs = 6;
   optional string grp_tres = 7;
+  // Comma-separated QOS names this account may use. Unset preserves the stored
+  // list; explicit empty clears it. A user with no allow-list of their own
+  // inherits this one.
+  optional string allowed_qos = 8;
 }
 
 message DeleteAccountRequest {
@@ -2014,6 +2020,8 @@ message AccountInfo {
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
   string grp_tres = 7;
+  // Comma-separated QOS names this account may use. Empty when none is set.
+  string allowed_qos = 8;
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave
@@ -2039,8 +2047,9 @@ message AddUserRequest {
   optional string grp_tres = 9;
   optional uint32 max_wall_minutes = 10;
   // Comma-separated QOS names this association may use. Unset preserves the
-  // stored allow-list; explicit empty clears it back to unrestricted.
-  // default_qos must be a member when both are set in the same request.
+  // stored allow-list; explicit empty clears it. With no list stored, the user
+  // inherits the account's allow-list. default_qos must be a member when both
+  // are set in the same request.
   optional string allowed_qos = 11;
   // Max submitted (pending + running) jobs across all users in the account.
   optional uint32 grp_submit_jobs = 12;
@@ -2099,6 +2108,9 @@ message UserInfo {
   string admin_level = 3;
   string default_account = 4;
   string default_qos = 5;
+  // Effective allow-list: the user's own list, or the direct account's when
+  // the user has none. Empty when neither is set. Writing this back as
+  // AddUserRequest.allowed_qos would store an inherited list as the user's own.
   string allowed_qos = 6;
   // Per-association limits (read-back of what `sacctmgr add/modify user` set).
   // Numeric fields use the INFINITE sentinel (4294967295) for "no limit"; a
@@ -2299,6 +2311,7 @@ message CreatePartitionRequest {
   optional uint64 def_mem_per_node = 23;
   optional uint64 def_mem_per_cpu = 24;
   optional uint64 def_mem_per_gpu = 25;
+  string qos = 26;  // partition QOS; empty = none
 }
 
 message UpdatePartitionRequest {
@@ -2349,6 +2362,7 @@ message UpdatePartitionRequest {
   optional uint64 def_mem_per_node = 33;
   optional uint64 def_mem_per_cpu = 34;
   optional uint64 def_mem_per_gpu = 35;
+  optional string qos = 36;  // partition QOS; absent = no change, empty = clear
 }
 
 message DeletePartitionRequest {

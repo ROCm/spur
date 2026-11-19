@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
 spur-sched = { path = "../spur-sched" }
 

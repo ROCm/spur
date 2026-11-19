@@ -171,6 +171,9 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS flags TEXT NOT NULL DEFAULT '';
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+-- NULL means unset, so a user with no allow-list can inherit it. An explicit
+-- clear is also NULL: the account list is the fallback, not a second "off" state.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
@@ -846,7 +849,7 @@ fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres
     push_coordinated(&mut qb, "user_name", "account", query.coordinated);
 
     qb.push(" ORDER BY submit_time DESC LIMIT ")
-        .push_bind(effective_query_limit(query.limit));
+        .push_bind(history_query_limit(query.limit));
     qb
 }
 
@@ -956,18 +959,29 @@ pub async fn record_txn(
     Ok(())
 }
 
-/// Default and hard cap on rows a single history/audit query returns, bounding
-/// DB load and response size; a larger request is clamped, not rejected.
+/// Rows returned when a caller asks for 0.
 const DEFAULT_QUERY_LIMIT: u32 = 1_000;
+/// Audit-log cap. Separate from the sacct history cap, so changing that page
+/// size does not change `sacctmgr show txn`.
 const MAX_QUERY_LIMIT: u32 = 10_000;
 
-fn effective_query_limit(requested: u32) -> i64 {
+/// A request of 0 means [`DEFAULT_QUERY_LIMIT`]. Anything larger is clamped, not rejected.
+fn clamp_query_limit(requested: u32, max: u32) -> i64 {
     let n = if requested == 0 {
         DEFAULT_QUERY_LIMIT
     } else {
-        requested.min(MAX_QUERY_LIMIT)
+        requested.min(max)
     };
     i64::from(n)
+}
+
+fn effective_query_limit(requested: u32) -> i64 {
+    clamp_query_limit(requested, MAX_QUERY_LIMIT)
+}
+
+/// One row past the print cap, so `sacct` can tell a full page from a cut one.
+fn history_query_limit(requested: u32) -> i64 {
+    clamp_query_limit(requested, spur_core::accounting::MAX_JOB_HISTORY_FETCH)
 }
 
 /// Query the `txn` audit log, newest first.
@@ -1323,6 +1337,20 @@ mod history_query_tests {
         assert!(pred < limit, "{sql}");
         assert!(sql.contains("account = ANY"), "{sql}");
     }
+
+    #[test]
+    fn history_query_limit_keeps_one_probe_row_past_the_cap() {
+        assert_eq!(history_query_limit(0), i64::from(DEFAULT_QUERY_LIMIT));
+        assert_eq!(history_query_limit(101), 101);
+        assert_eq!(
+            history_query_limit(spur_core::accounting::MAX_JOB_HISTORY_FETCH),
+            i64::from(spur_core::accounting::MAX_JOB_HISTORY_FETCH)
+        );
+        assert_eq!(
+            history_query_limit(1_000_000),
+            i64::from(spur_core::accounting::MAX_JOB_HISTORY_FETCH)
+        );
+    }
 }
 
 // A macro rather than a `const` so the EXPLAIN test can build its statement with
@@ -1597,6 +1625,7 @@ pub struct AccountUpdate<'a> {
     pub fairshare: Option<i32>,
     pub max_running_jobs: Option<Option<i32>>,
     pub grp_tres: Option<Option<&'a str>>,
+    pub allowed_qos: Option<Option<&'a str>>,
 }
 
 /// Create or update an account, writing only the fields set in `u`. `modify`
@@ -1626,6 +1655,9 @@ pub async fn upsert_account<'a>(
     }
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.allowed_qos {
+        updates.push(("allowed_qos", SqlVal::NullText(v)));
     }
     upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
@@ -1688,7 +1720,7 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres FROM accounts ORDER BY name"
+        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres, allowed_qos FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1701,6 +1733,7 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             grp_tres: r.get("grp_tres"),
+            allowed_qos: r.get("allowed_qos"),
         })
         .collect())
 }
@@ -1715,6 +1748,8 @@ pub struct AccountRecord {
     pub max_running_jobs: Option<i32>,
     /// Account resource allocation as a TRES string; None = unlimited.
     pub grp_tres: Option<String>,
+    /// QOS allow-list for the account. None means unset.
+    pub allowed_qos: Option<String>,
 }
 
 /// Update the partition-less association's columns, inserting the row if none
@@ -1904,9 +1939,10 @@ pub async fn remove_user(
 }
 
 /// List users, joining each one's own association row for `default_qos`/
-/// `allowed_qos`. `DISTINCT ON ... a.id DESC` picks the newest row if legacy
-/// duplicates exist (pre-dating the add_user upsert fix); it never touches
-/// the others.
+/// `allowed_qos`. A user with no allow-list inherits the account's
+/// (`COALESCE`); an explicit user list wins. `DISTINCT ON ... a.id DESC` picks
+/// the newest row if legacy duplicates exist (pre-dating the add_user upsert
+/// fix); it never touches the others.
 pub async fn list_users(
     pool: &PgPool,
     account: Option<&str>,
@@ -1926,11 +1962,13 @@ pub async fn list_users_visible(
         r#"
         SELECT DISTINCT ON (u.name, u.account)
             u.name, u.account, u.admin_level, u.default_account,
-            a.default_qos, a.allowed_qos,
+            a.default_qos,
+            COALESCE(a.allowed_qos, acct.allowed_qos) AS allowed_qos,
             a.max_running_jobs, a.max_submit_jobs, a.grp_submit_jobs,
             a.max_wall_min, a.max_tres_per_job, a.grp_tres,
             a.partition_name, a.fairshare_weight
         FROM users u
+        LEFT JOIN accounts acct ON acct.name = u.account
         LEFT JOIN associations a
             ON a.user_name = u.name AND a.account = u.account
                 AND (a.partition_name IS NULL OR a.partition_name = '')
@@ -1975,6 +2013,9 @@ pub struct UserRecord {
     pub admin_level: String,
     pub default_account: Option<String>,
     pub default_qos: Option<String>,
+    /// Effective allow-list: the user's own list, or the direct account's when
+    /// the user has none. Not the stored association cell, so writing it back
+    /// would pin an inherited list as the user's own.
     pub allowed_qos: Option<String>,
     pub max_running_jobs: Option<i32>,
     pub max_submit_jobs: Option<i32>,
@@ -4574,6 +4615,95 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_inherits_account_qos_unless_the_user_sets_one() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qosinherit_user_{pid}");
+        let account = format!("spur_qosinherit_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some("acct-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let inherited = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(Some("user-qos")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let own = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(own[0].allowed_qos.as_deref(), Some("user-qos"));
+
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &account,
+            UserUpdate {
+                allowed_qos: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let cleared = list_users(&pool, Some(&account), Some(&user)).await?;
+        assert_eq!(cleared[0].allowed_qos.as_deref(), Some("acct-qos"));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn add_user_never_creates_a_duplicate_association_row() -> anyhow::Result<()> {
         // Repeated add_user calls (what `sacctmgr modify user` now does)
         // must converge on one row, not accumulate duplicates.
@@ -5038,6 +5168,7 @@ mod txn_tests {
         );
         assert_eq!(effective_query_limit(1_000_000), i64::from(MAX_QUERY_LIMIT));
         assert_eq!(effective_query_limit(u32::MAX), i64::from(MAX_QUERY_LIMIT));
+        assert_eq!(effective_query_limit(u32::MAX), 10_000);
     }
 
     async fn test_pool() -> anyhow::Result<PgPool> {

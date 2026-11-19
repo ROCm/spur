@@ -10,6 +10,9 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+# Transitive HTTP/2 layer; declared only to pin a minimum version (see root
+# Cargo.toml). spur-proto owns the gRPC wire surface, so the floor lives here.
+h2 = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
@@ -17,7 +20,8 @@ tonic-prost-build = { workspace = true }
 [lints]
 workspace = true
 
-# Only referenced by the code build.rs generates into OUT_DIR, which
-# cargo-shear's source scan cannot see.
+# prost-types/tonic-prost are only referenced by the code build.rs generates
+# into OUT_DIR, which cargo-shear's source scan cannot see. h2 is not used in
+# source at all: it is a transitive version floor (see root Cargo.toml).
 [package.metadata.cargo-shear]
-ignored = ["prost-types", "tonic-prost"]
+ignored = ["prost-types", "tonic-prost", "h2"]

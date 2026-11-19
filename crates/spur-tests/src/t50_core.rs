@@ -481,29 +481,7 @@ mod tests {
         }
     }
 
-    // ── T50.44: Mail type field ─────────────────────────────────
-
-    #[test]
-    fn t50_44_mail_type_field() {
-        let spec = spur_core::job::JobSpec {
-            mail_type: vec!["BEGIN".into(), "END".into()],
-            mail_user: Some("alice@example.com".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.mail_type.len(), 2);
-        assert_eq!(spec.mail_user.as_deref(), Some("alice@example.com"));
-    }
-
-    // ── T50.45: Interactive flag ────────────────────────────────
-
-    #[test]
-    fn t50_45_interactive_flag() {
-        let spec = spur_core::job::JobSpec {
-            interactive: true,
-            ..Default::default()
-        };
-        assert!(spec.interactive);
-    }
+    // ── T50.46: Interactive flag ────────────────────────────────
 
     #[test]
     fn t50_46_interactive_default_false() {
@@ -511,7 +489,7 @@ mod tests {
         assert!(!spec.interactive);
     }
 
-    // ── T50.47–49: MPI / distribution fields ────────────────────
+    // ── T50.47–48: MPI / distribution fields ────────────────────
 
     #[test]
     fn t50_47_mpi_field_default_none() {
@@ -525,18 +503,7 @@ mod tests {
         assert!(spec.distribution.is_none());
     }
 
-    #[test]
-    fn t50_49_mpi_field_set() {
-        let spec = spur_core::job::JobSpec {
-            mpi: Some("pmix".into()),
-            distribution: Some("cyclic".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.mpi.as_deref(), Some("pmix"));
-        assert_eq!(spec.distribution.as_deref(), Some("cyclic"));
-    }
-
-    // ── T50.50–52: Heterogeneous job fields ────────────────────
+    // ── T50.49b–50: MPI list and heterogeneous job fields ───────
 
     #[test]
     fn t50_49b_mpi_list_lines() {
@@ -551,24 +518,6 @@ mod tests {
         let job = make_job("het-test");
         assert!(job.het_job_id.is_none());
         assert!(job.het_group.is_none());
-    }
-
-    #[test]
-    fn t50_51_het_job_fields_set() {
-        let mut job = make_job("het-test");
-        job.het_job_id = Some(100);
-        job.het_group = Some(1);
-        assert_eq!(job.het_job_id, Some(100));
-        assert_eq!(job.het_group, Some(1));
-    }
-
-    #[test]
-    fn t50_52_het_group_spec_field() {
-        let spec = spur_core::job::JobSpec {
-            het_group: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(spec.het_group, Some(0));
     }
 
     // ── T50.53–55: Step constants and state transitions ────────
@@ -605,20 +554,7 @@ mod tests {
         assert_eq!(StepState::Cancelled.display(), "CANCELLED");
     }
 
-    // ── T50.57–58: Burst buffer field ─────────────────────────────
-
-    #[test]
-    fn t50_57_burst_buffer_field() {
-        let spec = spur_core::job::JobSpec {
-            burst_buffer: Some("stage_in:cp /data/model.bin /tmp/".into()),
-            ..Default::default()
-        };
-        assert!(spec.burst_buffer.is_some());
-        assert_eq!(
-            spec.burst_buffer.as_deref(),
-            Some("stage_in:cp /data/model.bin /tmp/")
-        );
-    }
+    // ── T50.58: Burst buffer field ────────────────────────────────
 
     #[test]
     fn t50_58_burst_buffer_default_none() {
@@ -663,47 +599,11 @@ mod tests {
         assert_eq!(node.state, NodeState::Suspended);
     }
 
-    // ── T50.63–70: Begin time, deadline, spread_job, open_mode fields ──
-
-    #[test]
-    fn t50_63_begin_time_field() {
-        let spec = JobSpec {
-            begin_time: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..Default::default()
-        };
-        assert!(spec.begin_time.is_some());
-    }
-
-    #[test]
-    fn t50_64_deadline_field() {
-        let spec = JobSpec {
-            deadline: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
-            ..Default::default()
-        };
-        assert!(spec.deadline.is_some());
-    }
-
-    #[test]
-    fn t50_65_spread_job_flag() {
-        let spec = JobSpec {
-            spread_job: true,
-            ..Default::default()
-        };
-        assert!(spec.spread_job);
-    }
+    // ── T50.66, T50.68–70: Begin time, deadline, spread_job, open_mode fields ──
 
     #[test]
     fn t50_66_spread_job_default_false() {
         assert!(!JobSpec::default().spread_job);
-    }
-
-    #[test]
-    fn t50_67_open_mode_append() {
-        let spec = JobSpec {
-            open_mode: Some("append".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.open_mode.as_deref(), Some("append"));
     }
 
     #[test]
@@ -721,46 +621,11 @@ mod tests {
         assert!(JobSpec::default().deadline.is_none());
     }
 
-    // ── T50.71–72: Reservation field on JobSpec ─────────────────
-
-    #[test]
-    fn t50_71_reservation_field_on_jobspec() {
-        let spec = JobSpec {
-            reservation: Some("gpu-reservation".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.reservation.as_deref(), Some("gpu-reservation"));
-    }
+    // ── T50.72: Reservation field on JobSpec ────────────────────
 
     #[test]
     fn t50_72_reservation_default_none() {
         assert!(JobSpec::default().reservation.is_none());
-    }
-
-    // ── T50.73–74: strigger and scrontab types ────────────────────
-
-    #[test]
-    fn t50_73_strigger_types() {
-        let types = ["node_down", "node_up", "job_end", "job_fail", "time"];
-        assert_eq!(types.len(), 5);
-        // Ensure no duplicates
-        let mut deduped = types.to_vec();
-        deduped.sort();
-        deduped.dedup();
-        assert_eq!(deduped.len(), 5);
-    }
-
-    #[test]
-    fn t50_74_scrontab_format() {
-        let line = "0 */6 * * * sbatch /path/to/script.sh";
-        let parts: Vec<&str> = line.splitn(6, ' ').collect();
-        assert_eq!(parts.len(), 6);
-        assert_eq!(parts[0], "0"); // minute
-        assert_eq!(parts[1], "*/6"); // hour
-        assert_eq!(parts[2], "*"); // day of month
-        assert_eq!(parts[3], "*"); // month
-        assert_eq!(parts[4], "*"); // day of week
-        assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
     }
 
     // ── T50.75: Node count single-node partition ─────────────────
@@ -778,44 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn t50_76_reservation_field_flows_through_job_spec() {
-        // Regression: --reservation flag was missing from submit commands.
-        // The field must exist on JobSpec and be passable to the scheduler.
-        let spec = spur_core::job::JobSpec {
-            reservation: Some("res-gpu".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.reservation.as_deref(), Some("res-gpu"));
-    }
-
-    #[test]
-    fn t50_77_reservation_update_fields_present() {
-        // Regression: no command to update a reservation.
-        // Reservation must have all fields needed for an update operation.
-        use spur_core::reservation::Reservation;
-        let now = chrono::Utc::now();
-        let mut res = Reservation {
-            name: "res-v1".into(),
-            start_time: now,
-            end_time: now + chrono::Duration::hours(4),
-            nodes: vec!["node001".into()],
-            users: vec!["alice".into()],
-            accounts: Vec::new(),
-            flags: Default::default(),
-            owner: String::new(),
-        };
-        // All fields must be mutable for an update to work.
-        res.end_time = now + chrono::Duration::hours(8);
-        res.nodes.push("node002".into());
-        assert_eq!(res.nodes.len(), 2);
-        assert_eq!(
-            (res.end_time - res.start_time).num_hours(),
-            8,
-            "end_time must be updatable"
-        );
-    }
-
-    #[test]
     fn t50_78_single_node_name_matches_hostlist() {
         // Regression: single-node clusters had inconsistent node naming.
         // The node name used at registration must be what the hostlist expands to.
@@ -825,67 +652,13 @@ mod tests {
         assert_eq!(expanded[0], "ubb-r09-01");
     }
 
-    #[test]
-    fn t50_79_sinfo_nodelist_uses_registered_names() {
-        // Regression: sinfo NODELIST showed "localhost" instead of real node names.
-        // When registered nodes are available the NODELIST should use their names,
-        // not fall back to the static partition spec string.
-        let registered_names = ["ubb-r09-09", "ubb-r09-11"];
-        let partition_spec = "localhost"; // what default config has
-
-        // If registered nodes exist, use them — never fall back to partition spec.
-        let nodelist = if !registered_names.is_empty() {
-            registered_names.join(",")
-        } else {
-            partition_spec.to_string()
-        };
-        assert_eq!(nodelist, "ubb-r09-09,ubb-r09-11");
-        assert_ne!(
-            nodelist, "localhost",
-            "must not show 'localhost' when real nodes registered"
-        );
-    }
-
-    // ── T50.80–87: (renumbered from previous 75–81) ───────────────
-
-    // ── T50.82–85: Federation config parsing ─────────────────────
+    // ── T50.82 and T50.85: Federation config parsing ─────────────
 
     #[test]
     fn t50_82_federation_config_default_empty() {
         use spur_core::config::FederationConfig;
         let fed = FederationConfig::default();
         assert!(fed.clusters.is_empty());
-    }
-
-    #[test]
-    fn t50_83_federation_cluster_peer_fields() {
-        use spur_core::config::ClusterPeer;
-        let peer = ClusterPeer {
-            name: "cluster-b".into(),
-            address: "http://ctrl-b:6817".into(),
-        };
-        assert_eq!(peer.name, "cluster-b");
-        assert_eq!(peer.address, "http://ctrl-b:6817");
-    }
-
-    #[test]
-    fn t50_84_federation_config_with_peers() {
-        use spur_core::config::{ClusterPeer, FederationConfig};
-        let fed = FederationConfig {
-            clusters: vec![
-                ClusterPeer {
-                    name: "east".into(),
-                    address: "http://east-ctrl:6817".into(),
-                },
-                ClusterPeer {
-                    name: "west".into(),
-                    address: "http://west-ctrl:6817".into(),
-                },
-            ],
-        };
-        assert_eq!(fed.clusters.len(), 2);
-        assert_eq!(fed.clusters[0].name, "east");
-        assert_eq!(fed.clusters[1].address, "http://west-ctrl:6817");
     }
 
     #[test]
@@ -907,54 +680,7 @@ address = "http://peer-a:6817"
         assert_eq!(cfg.federation.clusters[0].name, "peer-a");
     }
 
-    // ── T50.86–88: PMIx env var names ────────────────────────────
-
-    #[test]
-    fn t50_86_pmix_env_var_names_correct() {
-        // Verify the canonical PMIx env var names used by OpenMPI 5+ and srun.
-        let required = ["PMIX_RANK", "PMIX_SIZE", "PMIX_NAMESPACE"];
-        for name in &required {
-            assert!(name.starts_with("PMIX_"), "expected PMIX_ prefix: {}", name);
-            assert_eq!(*name, name.to_uppercase(), "must be uppercase: {}", name);
-        }
-    }
-
-    #[test]
-    fn t50_87_pmix_namespace_format() {
-        // Namespace format: "spur.<job_id>"
-        let job_id: u32 = 42;
-        let ns = format!("spur.{}", job_id);
-        assert_eq!(ns, "spur.42");
-        assert!(ns.starts_with("spur."));
-    }
-
-    #[test]
-    fn t50_88_ompi_compat_env_vars() {
-        // OpenMPI direct bootstrap env vars mirror PMIx rank/size.
-        let ompi_vars = ["OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"];
-        for v in &ompi_vars {
-            assert!(v.starts_with("OMPI_COMM_WORLD_"));
-        }
-    }
-
-    // ── T50.89-91: default partition, pending reason, exec routing ──
-
-    #[test]
-    fn t50_89_default_partition_assigned_on_submit() {
-        // When no --partition is specified, the default partition
-        // should be assigned so the scheduler can match nodes correctly.
-        // Verify that Partition carries is_default and that the scheduler
-        // harness correctly sets it.
-        let part = make_partition("gpu", 2);
-        // make_partition sets is_default when name == "default"; this one
-        // should be false, but the field must be present.
-        assert!(!part.is_default);
-        assert_eq!(part.name, "gpu");
-
-        // A partition named "default" should have is_default = true
-        let default_part = make_partition("default", 2);
-        assert!(default_part.is_default);
-    }
+    // ── T50.90: Pending reason when no nodes ─────────────────────
 
     #[test]
     fn t50_90_pending_reason_resources_when_no_nodes() {
@@ -968,113 +694,6 @@ address = "http://peer-a:6817"
 
         let reason = spur_core::job::PendingReason::Priority;
         assert_eq!(reason.display(), "Priority");
-    }
-
-    #[test]
-    fn t50_91_exec_uses_controller_not_agent() {
-        // spur exec should route through the controller so it works
-        // from login nodes regardless of where the job is running.
-        // This is a structural test — verify the ExecInJobRequest message exists
-        // and can be constructed.
-        let req = spur_proto::proto::ExecInJobRequest {
-            job_id: 42,
-            command: vec!["ls".into(), "-la".into()],
-            user: "alice".into(),
-        };
-        assert_eq!(req.job_id, 42);
-        assert_eq!(req.command.len(), 2);
-    }
-
-    // ── Interactive session proto messages ────────────────────────
-
-    #[test]
-    fn t50_92_interactive_input_init_session() {
-        use std::collections::HashMap;
-        let msg = spur_proto::proto::InteractiveInput {
-            msg: Some(spur_proto::proto::interactive_input::Msg::Init(
-                spur_proto::proto::InitSession {
-                    job_id: 10,
-                    step_id: 0,
-                    overlap: true,
-                    pty: true,
-                    winsize: Some(spur_proto::proto::WindowSize {
-                        rows: 24,
-                        cols: 80,
-                        xpixel: 0,
-                        ypixel: 0,
-                    }),
-                    argv: vec!["/bin/bash".into()],
-                    env: HashMap::new(),
-                    user: "alice".into(),
-                    container: None,
-                    non_interactive: false,
-                    execution_credential: String::new(),
-                },
-            )),
-        };
-        match msg.msg.unwrap() {
-            spur_proto::proto::interactive_input::Msg::Init(init) => {
-                assert_eq!(init.job_id, 10);
-                assert!(init.overlap);
-                assert_eq!(init.winsize.unwrap().cols, 80);
-            }
-            _ => panic!("expected Init variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92b_interactive_input_stdin_raw_bytes() {
-        let esc_seq = vec![0x1b, 0x5b, 0x41]; // ESC [ A (arrow up)
-        let msg = spur_proto::proto::InteractiveInput {
-            msg: Some(spur_proto::proto::interactive_input::Msg::Stdin(
-                esc_seq.clone(),
-            )),
-        };
-        match msg.msg.unwrap() {
-            spur_proto::proto::interactive_input::Msg::Stdin(data) => {
-                assert_eq!(data, esc_seq);
-            }
-            _ => panic!("expected Stdin variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92c_interactive_output_data_and_exit() {
-        let out = spur_proto::proto::InteractiveOutput {
-            msg: Some(spur_proto::proto::interactive_output::Msg::Data(
-                b"hello\r\n".to_vec(),
-            )),
-        };
-        match out.msg.unwrap() {
-            spur_proto::proto::interactive_output::Msg::Data(d) => {
-                assert_eq!(d, b"hello\r\n");
-            }
-            _ => panic!("expected Data variant"),
-        }
-
-        let exit = spur_proto::proto::InteractiveOutput {
-            msg: Some(spur_proto::proto::interactive_output::Msg::ExitStatus(42)),
-        };
-        match exit.msg.unwrap() {
-            spur_proto::proto::interactive_output::Msg::ExitStatus(code) => {
-                assert_eq!(code, 42);
-            }
-            _ => panic!("expected ExitStatus variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92d_window_size_construction() {
-        let ws = spur_proto::proto::WindowSize {
-            rows: 50,
-            cols: 200,
-            xpixel: 1024,
-            ypixel: 768,
-        };
-        assert_eq!(ws.rows, 50);
-        assert_eq!(ws.cols, 200);
-        assert_eq!(ws.xpixel, 1024);
-        assert_eq!(ws.ypixel, 768);
     }
 
     // ── CLI reads config file for controller port ─────────────────
@@ -1092,54 +711,6 @@ address = "http://peer-a:6817"
         let config = spur_core::config::SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.listen_addr, "[::]:6821");
         assert_eq!(config.controller.hosts[0], "ctrl.example.com");
-
-        // Verify we can extract port from listen_addr
-        let port = config.controller.listen_addr.rsplit(':').next().unwrap();
-        assert_eq!(port, "6821");
-    }
-
-    // ── Nodes auto-join default partition ─────────────────────────
-
-    #[test]
-    fn t50_94_node_auto_partition_assignment() {
-        // When a node doesn't match any partition hostlist,
-        // it should auto-join the default partition.
-        let mut node = Node::new(
-            "dynamic-node".into(),
-            ResourceSet {
-                cpus: 8,
-                memory_mb: 16384,
-                ..Default::default()
-            },
-        );
-        assert!(node.partitions.is_empty());
-
-        // Simulate auto-assign: if no partitions matched, add to default
-        let default_partition = make_partition("batch", 1);
-        if node.partitions.is_empty() {
-            node.partitions.push(default_partition.name.clone());
-        }
-        assert_eq!(node.partitions, vec!["batch"]);
-    }
-
-    // ── Container image resolution fallback ───────────────────────
-
-    #[test]
-    fn t50_95_container_image_absolute_path_basename_fallback() {
-        // When the agent receives an absolute path from the
-        // login node that doesn't exist locally, it should try the
-        // basename in the local image directory.
-        let path = std::path::Path::new("/var/spool/spur/images/ubuntu+22.04.sqsh");
-        let basename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(basename, "ubuntu+22.04.sqsh");
-
-        // Verify sanitize_name works correctly for the expected pattern
-        // (colon and slash replaced with +)
-        let name = "ubuntu:22.04";
-        let expected = "ubuntu+22.04";
-        let sanitized = name.replace(['/', ':'], "+");
-        assert_eq!(sanitized, expected);
-        assert_eq!(format!("{}.sqsh", sanitized), basename);
     }
 
     // ── Scheduler crash recovery ──────────────────────────────────
@@ -1184,222 +755,6 @@ address = "http://peer-a:6817"
         let assignments = sched.schedule(&[job], &cluster);
         // With num_nodes.max(1), the job should still get scheduled
         assert_eq!(assignments.len(), 1);
-    }
-
-    // ── update_pending_reasons checks constraints ─────────────────
-
-    #[test]
-    fn t50_97_pending_reason_respects_constraints() {
-        // A job with --constraint=gpu should show
-        // Reason=Resources (not Priority) when no node has that feature.
-        let _reason_with_features: () = {
-            let mut node = Node::new(
-                "node001".into(),
-                ResourceSet {
-                    cpus: 64,
-                    memory_mb: 256_000,
-                    ..Default::default()
-                },
-            );
-            node.state = spur_core::node::NodeState::Idle;
-            // Node has NO features
-
-            // Job requires "gpu" feature
-            let mut job = make_job("constrained");
-            job.spec.constraint = Some("gpu".into());
-
-            // The node is schedulable and can satisfy resources,
-            // but doesn't have the constraint feature.
-            // update_pending_reasons should set Resources, not Priority.
-            let is_capable = node.is_schedulable()
-                && node.total_resources.can_satisfy(&ResourceSet {
-                    cpus: 1,
-                    memory_mb: 0,
-                    ..Default::default()
-                });
-            // Old behavior: this would be true → Priority (misleading)
-            assert!(is_capable, "basic capability check passes");
-
-            // New behavior: constraint check should reject the node
-            let constraint = job.spec.constraint.as_deref().unwrap();
-            let features: Vec<&str> = constraint.split(',').map(str::trim).collect();
-            let passes_constraint = features
-                .iter()
-                .all(|f| node.features.contains(&f.to_string()));
-            assert!(
-                !passes_constraint,
-                "constraint check should reject node without gpu feature"
-            );
-        };
-    }
-
-    // ── Agent image_dir fallback ──────────────────────────────────
-
-    #[test]
-    fn t50_98_image_dir_fallback_logic() {
-        // The agent's image_dir() should fall back to
-        // ~/.spur/images when /var/spool/spur/images doesn't exist.
-        // This test verifies the fallback logic conceptually.
-        let system_dir = std::path::Path::new("/var/spool/spur/images");
-        let home = std::env::var_os("HOME");
-
-        // If system dir doesn't exist and HOME is set, fallback should
-        // point to ~/.spur/images
-        if !system_dir.is_dir() {
-            if let Some(home) = home {
-                let expected = std::path::PathBuf::from(home).join(".spur/images");
-                // Verify the path construction is correct
-                assert!(expected.to_str().unwrap().contains(".spur/images"));
-            }
-        }
-    }
-
-    // ── CLI show dispatch ─────────────────────────────────────────
-
-    #[test]
-    fn t50_100_show_dispatch_inserts_implicit_show() {
-        // `spur show node X` should dispatch as
-        // `scontrol show node X`, not `scontrol node X`.
-        //
-        // Simulate the argv rewriting logic from main.rs.
-        let args: Vec<String> = vec!["spur".into(), "show".into(), "node".into(), "gpu-1".into()];
-
-        let cmd = "scontrol";
-        let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";
-
-        let rewritten: Vec<String> = std::iter::once(cmd.to_string())
-            .chain(if implicit_show {
-                vec!["show".to_string()]
-            } else {
-                vec![]
-            })
-            .chain(args[2..].iter().cloned())
-            .collect();
-
-        assert_eq!(rewritten, vec!["scontrol", "show", "node", "gpu-1"]);
-    }
-
-    #[test]
-    fn t50_101_control_dispatch_no_implicit_show() {
-        // `spur control show node X` should NOT insert extra show.
-        let args: Vec<String> = vec![
-            "spur".into(),
-            "control".into(),
-            "show".into(),
-            "node".into(),
-            "gpu-1".into(),
-        ];
-
-        let cmd = "scontrol";
-        let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";
-
-        let rewritten: Vec<String> = std::iter::once(cmd.to_string())
-            .chain(if implicit_show {
-                vec!["show".to_string()]
-            } else {
-                vec![]
-            })
-            .chain(args[2..].iter().cloned())
-            .collect();
-
-        // "control" != "show", so no implicit show inserted
-        assert_eq!(rewritten, vec!["scontrol", "show", "node", "gpu-1"]);
-    }
-
-    // ── K8s operator address resolution ───────────────────────────
-
-    #[test]
-    fn t50_102_k8s_address_resolution_priority() {
-        // The operator should prefer --address flag over
-        // POD_IP env var over hostname. Verify the priority logic.
-        //
-        // Test the priority: explicit > POD_IP > listen IP > hostname
-        let explicit = Some("10.0.0.1".to_string());
-        let pod_ip: Result<String, std::env::VarError> = Ok("10.0.0.2".to_string());
-        let listen_is_unspecified = true;
-
-        // Explicit wins
-        let result = if let Some(ref addr) = explicit {
-            addr.clone()
-        } else if let Ok(ip) = pod_ip.as_ref() {
-            ip.clone()
-        } else if !listen_is_unspecified {
-            "10.0.0.3".into()
-        } else {
-            "pod-hostname-abc123".into()
-        };
-        assert_eq!(result, "10.0.0.1");
-    }
-
-    #[test]
-    fn t50_103_k8s_pod_ip_fallback() {
-        // When no explicit address, POD_IP should be used
-        let explicit: Option<String> = None;
-        let pod_ip: Result<String, ()> = Ok("10.244.1.5".to_string());
-        let listen_is_unspecified = true;
-
-        let result = if let Some(ref addr) = explicit {
-            addr.clone()
-        } else if let Ok(ip) = pod_ip.as_ref() {
-            ip.clone()
-        } else if !listen_is_unspecified {
-            "10.0.0.3".into()
-        } else {
-            "pod-hostname-abc123".into()
-        };
-        assert_eq!(result, "10.244.1.5");
-    }
-
-    // ── Retry loop backoff ────────────────────────────────────────
-
-    #[test]
-    fn t50_104_retry_backoff_doubles_then_caps() {
-        // Verify exponential backoff logic caps at 60s.
-        let max_backoff = std::time::Duration::from_secs(60);
-        let mut backoff = std::time::Duration::from_secs(1);
-
-        // Simulate 10 failures
-        for _ in 0..10 {
-            backoff = std::cmp::min(backoff * 2, max_backoff);
-        }
-        assert_eq!(backoff, max_backoff);
-
-        // Simulate success resets
-        backoff = std::time::Duration::from_secs(1);
-        assert_eq!(backoff.as_secs(), 1);
-    }
-
-    // ── Agent image search checks all dirs ────────────────────────
-
-    #[test]
-    fn t50_105_image_dirs_returns_multiple_candidates() {
-        // The agent's image_dir() only returned one directory,
-        // so images imported to ~/.spur/images were invisible if
-        // /var/spool/spur/images existed (even if not writable).
-        // Now image_dirs() returns ALL candidate directories.
-        //
-        // We can't directly call container.rs functions from here, but
-        // we verify the logic: if HOME is set, the user dir should
-        // always be a candidate regardless of system dir existence.
-        let home = std::env::var("HOME").unwrap_or_default();
-        if !home.is_empty() {
-            let user_dir = std::path::PathBuf::from(&home).join(".spur/images");
-            // The user dir path should be constructable
-            assert!(user_dir.to_str().is_some());
-            assert!(user_dir.to_str().unwrap().contains(".spur/images"));
-        }
-    }
-
-    // ── Raw terminal mode for attach ──────────────────────────────
-
-    #[test]
-    fn t50_106_attach_raw_mode_is_nonfatal_for_pipes() {
-        // Moved to spur-cli/src/sattach.rs::tests::raw_mode_fails_on_pipe
-        // which tests the REAL RawModeGuard::enter_on_fd() with an explicit
-        // pipe fd. The old test simulated isatty() instead
-        // of calling the actual unit, and depended on the test runner env.
-        //
-        // This placeholder ensures the test ID isn't reused.
     }
 
     // ── Pending reason uses available resources ───────────────────

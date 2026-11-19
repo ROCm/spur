@@ -28,7 +28,9 @@ each builds on the one before it:
   ``sacctmgr``; the cluster already exists once the controller is running.
 - **Account** — a group that owns usage and limits (a project, team, or lab).
   Accounts form a tree: an account may have a **parent** account, and limits and
-  fairshare flow down the hierarchy.
+  fairshare flow down the hierarchy. An account may also carry a QOS allow-list;
+  a user who has no allow-list of their own uses their direct account's list.
+  The list is not inherited from parent accounts.
 - **User** — a person who submits jobs. A user is attached to one or more
   accounts.
 - **Association** — the tuple ``(cluster, account, user, partition)`` that binds
@@ -168,7 +170,7 @@ Modify an account
 
 .. code-block:: bash
 
-   sacctmgr modify account name=ml set fairshare=80
+   sacctmgr modify account ml set fairshare=80 qos=highprio,normal
 
 Delete an account
 ~~~~~~~~~~~~~~~~~~
@@ -183,6 +185,10 @@ Show accounts
 .. code-block:: bash
 
    sacctmgr show account
+
+The default columns leave out the account's QOS allow-list. Add it with
+``format=Account,QOS`` or ``--long``, or read it from the account row of
+``sacctmgr show association`` (see `Show associations`_).
 
 With ``private_data = ["accounts"]``, a User sees an account only when they
 coordinate it. A user who coordinates nothing is denied once the association
@@ -237,6 +243,12 @@ Account keys
    * - ``grptres``
      - ``""``
      - Aggregate TRES cap for the account (see `TRES`_).
+   * - ``qos``
+     - unset
+     - Comma-separated allow-list of QOS this account may use. A user in the
+       account who has no ``qos=`` of their own inherits this list, both for
+       ``sacctmgr show user`` and for job admission. Set ``qos=`` empty to clear
+       it.
 
 .. note::
 
@@ -324,7 +336,8 @@ accounts the caller coordinates (see :ref:`private-data`).
 ``show user`` also prints the per-association limits (``MaxJobs``,
 ``MaxSubmit``, ``GrpSubmit``, ``MaxWall``, ``MaxTRES``, ``GrpTRES``), so you can
 read back what ``add``/``modify user`` set. An unset limit renders as a blank
-cell.
+cell. The ``QOS`` column is the user's own allow-list, or the account's list
+when the user has none.
 
 .. code-block:: text
 
@@ -335,28 +348,38 @@ cell.
 Show associations
 ~~~~~~~~~~~~~~~~~~
 
-``show association`` lists each ``(user, account)`` association as its own row,
-an association-first view of the same data ``show user`` presents user-first.
-Filter by ``account=`` and/or ``user=``.
+``show association`` lists each account and each ``(user, account)`` association
+as its own row. ``list`` is the same command as ``show``, and ``assoc`` is
+accepted as ``association``. The account row has a blank ``User``. Filter by
+``account=`` and/or ``user=``. A ``user=`` filter omits the account row. Use
+``format=`` to select columns (for example, ``format=QOS``).
+
+With ``private_data = ["accounts"]``, a User who coordinates no account gets
+the user rows without the account rows, because account definitions are visible
+only to coordinators (see `Show accounts`_). If the controller cannot list
+accounts yet (for example, while it is still loading after a restart), the user
+rows still print, and a warning on stderr says the account rows were omitted.
 
 .. code-block:: bash
 
-   sacctmgr show association account=ml user=alice
+   sacctmgr show association account=ml
 
-The columns are ``User``, ``Account``, ``Partition``, ``Share`` (this
-``(user, account)`` association's own fairshare weight, stored on the
-association and distinct from the account's weight — changing the account's
-weight does not change it), and ``Default`` (the association's default QOS).
-``Partition`` is blank for an all-partitions association. ``Share`` is blank only
-when the controller does not report a weight (an older controller predating the
-column); a stored weight of ``0`` renders ``0``.
+The columns are ``User``, ``Account``, ``Partition``, ``Share``, ``QOS``, and
+``Default``. On a user row, ``Share`` is that association's own fairshare
+weight (distinct from the account's weight — changing the account's weight
+does not change it) and ``Default`` is the association's default QOS. On the
+account row, ``Share`` is the account's fairshare weight and ``QOS`` is the
+account allow-list. ``Partition`` is blank for an all-partitions association.
+``Share`` is blank only when the controller does not report a weight (an older
+controller predating the column); a stored weight of ``0`` renders ``0``.
 
 .. code-block:: text
 
-   User            Account              Partition       Share      Default
-   ----------------------------------------------------------------------
-   alice           ml                                   1          highprio
-   carol           ml                                   1
+   User            Account              Partition       Share      QOS                            Default
+   ---------------------------------------------------------------------------------------------------------
+                   ml                                   50         highprio,normal
+   alice           ml                                   1          highprio,normal                highprio
+   carol           ml                                   1          highprio,normal
 
 User keys
 ~~~~~~~~~
@@ -384,8 +407,9 @@ User keys
      - ``""``
      - QOS applied when the user does not request one.
    * - ``qos``
-     - ``""``
-     - Comma-separated allow-list of QOS the user may request.
+     - inherited
+     - Comma-separated allow-list of QOS the user may request. When unset, the
+       user uses the account's ``qos`` list. An explicit list replaces it.
    * - ``maxrunningjobs`` (alias ``maxjobs``)
      - unset (no limit)
      - Maximum jobs running at once for this association. See
@@ -616,6 +640,72 @@ QOS keys
      - Comma-separated QOS flags. ``DenyOnLimit`` is supported (see
        :ref:`deny-on-limit`).
 
+.. _partition-qos:
+
+Partition QOS: capping a user across accounts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job QOS counts usage per QOS, and an association counts it per account, so a
+user who submits from several accounts, each with its own team QOS, is never
+summed in one place. A partition QOS closes that gap. Attach a QOS to a partition
+and its limits apply to every job in the partition, in addition to the job's own
+QOS, with usage counted over every job running there whatever its account or job
+QOS.
+
+.. code-block:: bash
+
+   sacctmgr add qos name=usercap maxtresperuser=node=8,gres/gpu=64
+   scontrol update PartitionName=gpu QOS=usercap
+
+or in ``spur.conf``:
+
+.. code-block:: toml
+
+   [[partitions]]
+   name = "gpu"
+   nodes = "gpu[001-064]"
+   qos = "usercap"
+
+A user over the cap waits with the usual QOS reason (``QOSMaxNodePerUserLimit``,
+``QOSMaxGRESPerUser``, …); other users and other partitions are unaffected.
+``scontrol show partition`` prints the partition QOS as ``QoS=``.
+
+How it behaves:
+
+- Every resource and running-job limit of the partition QOS applies:
+  ``MaxTRESPU``, ``MaxJobsPU``, ``MaxTRESPJ``, ``GrpTRES`` and ``MaxWall``.
+  Submit-count limits (``MaxSubmitJobsPU``, ``MaxSubmitJobsPA``, ``GrpSubmit``)
+  and ``GrpWall`` on a partition QOS are not enforced.
+- The partition QOS limits are checked while scheduling, never at submit.
+  ``DenyOnLimit`` on it has no effect, and a job that can never meet its
+  ``MaxTRESPJ`` or ``MaxWall`` is accepted and pends with that limit as its reason.
+- A job that requests no wall time takes the partition QOS ``MaxWall`` as its time
+  limit, as it does a job QOS one (see :ref:`maxwall-default`).
+- ``GrpTRES=node=N`` counts distinct nodes, as for a job QOS: a job that packs
+  onto a node the partition QOS already holds needs no new node (see
+  :ref:`grptres-node-packing`).
+- A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
+  partitions whose QOS still admits it, and waits only when none does. Until it is
+  placed, it counts against every candidate partition's QOS for the rest of that
+  scheduling pass, so a later job in the same pass may wait one pass longer.
+- Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
+  idle capacity past it: the cap bounds what a user holds, borrowed or not. A
+  suspended job, and one still in its kill wait, count until each of their nodes
+  is released.
+- ``scontrol reconfigure`` keeps a partition QOS set with ``scontrol update``
+  when ``spur.conf`` has no ``qos`` key for that partition, so a reload never
+  lifts the cap. A ``qos`` value in ``spur.conf`` replaces it, and ``qos = ""``
+  clears it.
+- A partition QOS that names no defined QOS holds the partition's jobs with
+  ``InvalidQOS`` rather than silently lifting the cap. While the QOS cache is
+  still loading, the partition's jobs wait with ``AccountingUnavailable``.
+- The same QOS may be both a partition QOS and a job QOS; both checks then apply.
+- Several partitions may name the same partition QOS, and a user's usage in all of
+  them adds up against it. Naming one QOS on every partition caps a user across the
+  whole cluster.
+- A partition QOS needs accounting. With accounting disabled no QOS is defined, so
+  the partition QOS has no effect.
+
 .. _deny-on-limit:
 
 How limits are enforced at submit
@@ -671,8 +761,10 @@ report ``UNLIMITED``, and the running-job watchdog — which acts on a job's own
 limit — would have no deadline to enforce, so the cap would hold only for jobs
 that named a limit themselves.
 
-Both the QOS and the association carry ``maxwall``, and a job has to satisfy
-both, so the smaller of the two is what it inherits.
+The QOS, the association and the partition QOS (see `Partition QOS: capping a
+user across accounts`_) all carry ``maxwall``, and a job has to satisfy each, so
+the smallest is what it inherits. A job that may run in several partitions takes
+the smallest partition QOS ``maxwall`` among them.
 
 The limit is filled in at submit, so ``squeue`` and ``scontrol show job`` report
 it, and it is the job's own limit from then on: a later change to the QOS does
@@ -682,7 +774,7 @@ Precedence for a job that requests nothing, first match winning:
 
 1. The partition's ``DefaultTime``, or the chain described under
    ``default_time_limit_minutes`` in :doc:`configuration`.
-2. The smaller of the QOS and association ``maxwall``.
+2. The smallest of the QOS, association and partition QOS ``maxwall``.
 3. Otherwise the job stays unbounded.
 
 So a partition ``DefaultTime`` shorter than ``maxwall`` still wins — ``maxwall``
@@ -1312,8 +1404,9 @@ How a job's QOS is resolved
 At submit, Spur resolves the job's QOS in this order, matching Slurm:
 
 1. **Explicit** ``--qos`` on the job. The named QOS must exist **and** be
-   permitted for the association (present in the association's allow-list or its
-   default). Otherwise the job is rejected with ``QOS 'X' does not exist`` or
+   permitted for the association: present in the user's allow-list, or in the
+   account's allow-list when the user has none, or equal to the association's
+   default. Otherwise the job is rejected with ``QOS 'X' does not exist`` or
    ``QOS 'X' is not permitted for user '…' under account '…'``.
 2. Otherwise the **association's default QOS**, if it still exists. A stale
    default (deleted QOS) is ignored with a warning.
@@ -1367,8 +1460,10 @@ Associations
 
 An association is the ``(cluster, account, user, partition)`` tuple. Associations
 are created implicitly by ``sacctmgr add user`` — there is no standalone ``add
-association`` command. Inspect them through ``sacctmgr show user``, which lists
-each user's account, default account, QOS, and per-association limits.
+association`` command. ``sacctmgr show association`` lists each account and each
+user association, including share, the QOS allow-list, and default QOS.
+``sacctmgr show user`` lists each person with their account, default account,
+effective QOS, and per-association limits.
 
 Limits resolve in two layers:
 
@@ -1384,7 +1479,8 @@ Limits resolve in two layers:
   reason even when a QOS limit also applies.
 
 Associations are managed via ``add user`` and inspected via ``sacctmgr show
-user`` (see `Managing users`_).
+association`` or ``sacctmgr show user`` (see `Show associations`_ and
+`Managing users`_).
 
 How a job's account is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1553,9 +1649,9 @@ delimited output as unambiguous only when the fields you select cannot contain `
 
 .. note::
 
-   ``-p`` and ``-P`` work for ``show account``, ``show qos``, and ``show txn``.
-   For ``show user``, ``show association``, and ``show tres``, Spur does not model
-   the columns, so it refuses the flag with an error naming the entity rather than
+   ``-p`` and ``-P`` work for ``show account``, ``show qos``, ``show association``,
+   and ``show txn``. For ``show user`` and ``show tres``, Spur does not model the
+   columns, so it refuses the flag with an error naming the entity rather than
    printing padded text a script cannot parse. ``-n`` works for every entity.
 
    Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came
