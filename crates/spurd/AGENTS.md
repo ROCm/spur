@@ -493,8 +493,9 @@ metrics).
   `executor::deliver_signal` and `RunningJob::signal_workload` therefore deliver
   every signal except KILL to the cgroup's members minus the launcher's pid, or
   without a cgroup to the launcher's descendants (children of every thread, not
-  only the main one) plus the rest of its process group, instead of signalling
-  the group, which takes the launcher with it.
+  only the main one) plus, when it leads a process group (a container's waiting
+  parent does not), the rest of that group, instead of signalling the group,
+  which takes the launcher with it.
   Whether the launcher gets the signal too is per signal
   (`TrackedProcess::spares_launcher`):
   - SIGKILL reaches it first, so it cannot relay the dying workload's status as
@@ -524,13 +525,17 @@ metrics).
   supervisor does: a container's command is PID 1 and ignores unhandled
   signals, and a step cancel keeps the allocation, so nothing else reclaims it.
   The signal itself goes through the supervisor (`SignalAllocation`), which is
-  also asked for a delayed SIGKILL, and only if the supervisor is unreachable,
-  or the step has none, directly with `signal_step_tree` and the
+  also asked for a delayed SIGKILL, and directly with `signal_step_tree` and the
   `TrackedProcess` recorded on the `ActiveStep` (a supervised step's tracked pid
-  is the supervisor's workload pid, so it can be a launcher). Every direct
-  signal first re-checks, under the `active_steps` lock, that the step still has
-  the same epoch, pid and process start time (`StepTarget::is_current`): the
-  entry outlives its process, so a pid the kernel has reused must not be hit.
+  is the supervisor's workload pid, so it can be a launcher) if the supervisor
+  is unreachable, has not answered within `StepCancelTimings::supervisor_wait`
+  (shorter than the escalation, so the step still gets its SIGTERM before the
+  SIGKILL), or the step has none. Every direct signal first re-checks, under the
+  `active_steps` lock, that the step still has the same epoch, pid and process
+  start time (`StepTarget::is_current`): the entry outlives its process, so a
+  pid the kernel has reused must not be hit. The start time is the one the
+  supervisor published for the workload it forked; a step without one has no
+  direct signal and no direct SIGKILL.
   Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
   with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked

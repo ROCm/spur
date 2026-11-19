@@ -1597,24 +1597,43 @@ fn spawn_step_kill_escalation(
     })
 }
 
+/// The delays of a step cancel.
+#[derive(Clone, Copy)]
+struct StepCancelTimings {
+    /// How long the supervisor gets to take the signal before the step is
+    /// signalled directly. Shorter than `escalation`, so a slow supervisor
+    /// still leaves the step its SIGTERM before the SIGKILL.
+    supervisor_wait: std::time::Duration,
+    escalation: std::time::Duration,
+}
+
+const STEP_CANCEL_TIMINGS: StepCancelTimings = StepCancelTimings {
+    supervisor_wait: std::time::Duration::from_millis(2500),
+    escalation: STEP_CANCEL_ESCALATION,
+};
+
 /// The whole of a step cancel. The SIGKILL goes straight to the step's own
 /// process after the grace period whatever the supervisor does, since a step
 /// cancel keeps the job's allocation and nothing else would reclaim a step a
 /// wedged supervisor never signals. The signal goes through the supervisor,
-/// which spares a launcher and reaches the cgroup, and directly only if the
-/// supervisor cannot be reached or the step has none.
+/// which spares a launcher and reaches the cgroup, and directly if the
+/// supervisor cannot be reached or does not answer in time, or the step has none.
 async fn run_step_cancel(
     context: CompletionListenerContext,
     active_steps: ActiveSteps,
     supervisor: Option<crate::stepd::StepdDescriptor>,
     target: Option<StepTarget>,
     signal: i32,
+    timings: StepCancelTimings,
 ) {
     if let Some(target) = target {
-        spawn_step_kill_escalation(active_steps.clone(), vec![target], STEP_CANCEL_ESCALATION);
+        spawn_step_kill_escalation(active_steps.clone(), vec![target], timings.escalation);
     }
     if let Some(descriptor) = supervisor {
-        if signal_step_through_supervisor(&context, &descriptor, signal).await {
+        let through_supervisor =
+            signal_step_through_supervisor(&context, &descriptor, signal, timings.escalation);
+        let delivered = tokio::time::timeout(timings.supervisor_wait, through_supervisor).await;
+        if delivered.unwrap_or(false) {
             return;
         }
     }
@@ -1631,11 +1650,12 @@ async fn signal_step_through_supervisor(
     context: &CompletionListenerContext,
     descriptor: &crate::stepd::StepdDescriptor,
     signal: i32,
+    kill_after: std::time::Duration,
 ) -> bool {
     let escalation = {
         let (context, descriptor) = (context.clone(), descriptor.clone());
         tokio::spawn(async move {
-            sigkill_stepd_after(&context, &descriptor, STEP_CANCEL_ESCALATION).await;
+            sigkill_stepd_after(&context, &descriptor, kill_after).await;
         })
     };
     let sent =
@@ -3452,6 +3472,7 @@ const STEP_CANCEL_ESCALATION: std::time::Duration = MIN_KILL_WAIT;
 fn interactive_active_step(
     pid: u32,
     epoch: u64,
+    start_ticks: Option<u64>,
     cfg: &executor::JobLaunchConfig,
     is_root: bool,
 ) -> ActiveStep {
@@ -3459,7 +3480,7 @@ fn interactive_active_step(
         epoch,
         pid: Some(pid),
         tracked: executor::TrackedProcess::of_launch(cfg, is_root),
-        pid_start_ticks: crate::stepd::process_start_ticks(pid).ok(),
+        pid_start_ticks: start_ticks,
         ..Default::default()
     }
 }
@@ -3471,20 +3492,22 @@ struct StepTarget {
     pid: u32,
     epoch: u64,
     tracked: executor::TrackedProcess,
-    start_ticks: Option<u64>,
+    start_ticks: u64,
 }
 
 type ActiveSteps = Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>;
 
 impl StepTarget {
-    /// `None` while the step has no process yet.
+    /// `None` while the step has no process yet, or none whose start time was
+    /// known when it was recorded: a signal needs proof of which process it
+    /// would hit.
     fn of(key: (u32, u32), step: &ActiveStep) -> Option<Self> {
         Some(Self {
             key,
             pid: step.pid?,
             epoch: step.epoch,
             tracked: step.tracked,
-            start_ticks: step.pid_start_ticks,
+            start_ticks: step.pid_start_ticks?,
         })
     }
 
@@ -3497,15 +3520,8 @@ impl StepTarget {
             .get(&self.key)
             .is_some_and(|step| step.epoch == self.epoch && step.pid == Some(self.pid));
         tracked_here
-            && self.start_ticks.is_none_or(|ticks| {
-                crate::stepd::process_start_ticks(self.pid).is_ok_and(|now| now == ticks)
-            })
+            && crate::stepd::process_start_ticks(self.pid).is_ok_and(|now| now == self.start_ticks)
     }
-}
-
-async fn step_target(active_steps: &ActiveSteps, key: (u32, u32)) -> Option<StepTarget> {
-    let steps = active_steps.lock().await;
-    steps.get(&key).and_then(|step| StepTarget::of(key, step))
 }
 
 /// Signals the step only if `target` is still the process it was captured from,
@@ -3524,7 +3540,7 @@ async fn signal_step_if_current(
 }
 
 struct ActiveStepGuard {
-    steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    steps: ActiveSteps,
     key: (u32, u32),
     /// The epoch this guard inserted. Zero tracks nothing (a resumed terminal
     /// keyed by someone else's launch) and so never matches a live entry.
@@ -4408,30 +4424,66 @@ async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor
     None
 }
 
-/// Records the process a step is tracked by, and whether a cancel already
-/// arrived while it was launching.
+/// What recording a step's process found out.
+struct RecordedStep {
+    /// A cancel already arrived while the step was launching.
+    cancel_requested: bool,
+    /// `None` for a step nobody registered or whose process start time is unknown.
+    target: Option<StepTarget>,
+}
+
+/// [`record_step_pid_at`] for a process this agent can still read the start time
+/// of, such as its own child.
 async fn record_step_pid(
-    active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    active_steps: &ActiveSteps,
     step_key: (u32, u32),
     pid: u32,
     tracked: executor::TrackedProcess,
-) -> bool {
-    let pid_start_ticks = crate::stepd::process_start_ticks(pid).ok();
+) -> RecordedStep {
+    let start_ticks = crate::stepd::process_start_ticks(pid).ok();
+    record_step_pid_at(active_steps, step_key, pid, tracked, start_ticks).await
+}
+
+/// Records the process a step is tracked by. `start_ticks` has to come from
+/// whoever knew the process at its start: reading it here would trust a pid
+/// that may already belong to someone else.
+async fn record_step_pid_at(
+    active_steps: &ActiveSteps,
+    step_key: (u32, u32),
+    pid: u32,
+    tracked: executor::TrackedProcess,
+    start_ticks: Option<u64>,
+) -> RecordedStep {
     let mut steps = active_steps.lock().await;
     let Some(step) = steps.get_mut(&step_key) else {
-        return false;
+        return RecordedStep {
+            cancel_requested: false,
+            target: None,
+        };
     };
     step.pid = Some(pid);
     step.tracked = tracked;
-    step.pid_start_ticks = pid_start_ticks;
-    step.cancel_requested
+    step.pid_start_ticks = start_ticks;
+    RecordedStep {
+        cancel_requested: step.cancel_requested,
+        target: StepTarget::of(step_key, step),
+    }
+}
+
+/// The start time the supervisor noted for the workload it forked, which it
+/// publishes before it answers any query. Being the workload's parent it cannot
+/// have missed it or mistaken it for another process.
+fn recorded_workload_start(descriptor: &crate::stepd::StepdDescriptor, pid: u32) -> Option<u64> {
+    let published = crate::stepd::republished(descriptor)?;
+    (published.workload_pid == pid && published.workload_start_ticks != 0)
+        .then_some(published.workload_start_ticks)
 }
 
 async fn run_tokio_step_to_spool(
     mut cmd: tokio::process::Command,
     tracked: executor::TrackedProcess,
     step_files: crate::executor::StepOutputFiles,
-    active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    active_steps: &ActiveSteps,
     step_key: (u32, u32),
     cgroup: Option<&std::path::Path>,
     cgroup_required: bool,
@@ -4454,7 +4506,9 @@ async fn run_tokio_step_to_spool(
     }
 
     if let Some(pid) = child.id() {
-        let cancel_now = record_step_pid(active_steps, step_key, pid, tracked).await;
+        let cancel_now = record_step_pid(active_steps, step_key, pid, tracked)
+            .await
+            .cancel_requested;
         if cancel_now {
             signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32, tracked);
             let _ = child.kill().await;
@@ -4714,7 +4768,8 @@ async fn run_containerized_step(
                 raw_pid,
                 executor::TrackedProcess::Launcher,
             )
-            .await;
+            .await
+            .cancel_requested;
             if cancel_now {
                 // SIGKILL the whole subtree: the workload is a grandchild that
                 // is PID 1 of its namespace and would ignore SIGTERM from here.
@@ -5496,13 +5551,15 @@ impl AgentService {
             return;
         };
         let tracked = executor::TrackedProcess::of_launch(cfg, self.spurd_is_root);
-        if !record_step_pid(&self.active_steps, step_key, pid, tracked).await {
+        let start_ticks = recorded_workload_start(descriptor, pid);
+        let recorded =
+            record_step_pid_at(&self.active_steps, step_key, pid, tracked, start_ticks).await;
+        if !recorded.cancel_requested {
             return;
         }
-        let target = step_target(&self.active_steps, step_key).await;
         self.spawn_step_cancel(
             Some(descriptor.clone()),
-            target,
+            recorded.target,
             nix::sys::signal::Signal::SIGTERM as i32,
         );
     }
@@ -5524,13 +5581,23 @@ impl AgentService {
 
     /// Starts a step cancel on its own task, so the controller dropping the
     /// RPC while a supervisor is slow to answer cannot cancel any part of it.
-    /// The task ends once the signal has been delivered by the supervisor or,
-    /// failing that, directly.
+    /// Awaiting the handle waits for the signal to be delivered; the SIGKILL
+    /// escalations it arms are tasks of their own and outlive it.
     fn spawn_step_cancel(
         &self,
         supervisor: Option<crate::stepd::StepdDescriptor>,
         target: Option<StepTarget>,
         signal: i32,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_step_cancel_timed(supervisor, target, signal, STEP_CANCEL_TIMINGS)
+    }
+
+    fn spawn_step_cancel_timed(
+        &self,
+        supervisor: Option<crate::stepd::StepdDescriptor>,
+        target: Option<StepTarget>,
+        signal: i32,
+        timings: StepCancelTimings,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(run_step_cancel(
             self.completion_listener_context(),
@@ -5538,6 +5605,7 @@ impl AgentService {
             supervisor,
             target,
             signal,
+            timings,
         ))
     }
 
@@ -10404,7 +10472,13 @@ impl SlurmAgent for AgentService {
                     step_epoch = next_step_epoch();
                     self.active_steps.lock().await.insert(
                         (init.job_id, init.step_id),
-                        interactive_active_step(pid, step_epoch, &cfg, self.spurd_is_root),
+                        interactive_active_step(
+                            pid,
+                            step_epoch,
+                            recorded_workload_start(&descriptor, pid),
+                            &cfg,
+                            self.spurd_is_root,
+                        ),
                     );
                     let master = match crate::stepd::reclaim_pty_master(&custody_dir, pid).await {
                         Ok(Some(master)) => master,
@@ -12204,6 +12278,7 @@ impl AgentService {
             ActiveStep {
                 cancel_requested: false,
                 pid,
+                pid_start_ticks: pid.and_then(|pid| crate::stepd::process_start_ticks(pid).ok()),
                 run_attempt,
                 ..Default::default()
             },
@@ -20040,6 +20115,48 @@ mod tests {
         );
     }
 
+    /// A shell leading its own process group, with two `sleep`s it has started and
+    /// announced by pid, so a test can tell that they went and not merely that the
+    /// shell did.
+    async fn spawn_group_with_two_sleepers() -> (tokio::process::Child, Vec<i32>) {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 3600 & a=$!; sleep 3600 & echo $a $!; wait")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn process group");
+        let mut announcement = String::new();
+        tokio::io::BufReader::new(child.stdout.take().expect("stdout was piped"))
+            .read_line(&mut announcement)
+            .await
+            .expect("read the sleepers' pids");
+        let sleepers = announcement
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("a pid"))
+            .collect();
+        (child, sleepers)
+    }
+
+    /// Gone, dying or a zombie, polled for ~2s since a signal lands after `kill` returns.
+    async fn assert_processes_gone(pids: &[i32]) {
+        let state_of = |pid: i32| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(')')?.1.trim_start().chars().next()
+        };
+        let is_gone = |pid: i32| matches!(state_of(pid), None | Some('Z' | 'X'));
+        for &pid in pids {
+            for _ in 0..200 {
+                if is_gone(pid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(is_gone(pid), "process {pid} survived: {:?}", state_of(pid));
+        }
+    }
+
     #[tokio::test]
     async fn cancel_step_kills_registered_step_process_group() {
         use std::time::Duration;
@@ -20052,12 +20169,7 @@ mod tests {
         );
         let job_id = 1;
         let step_id = 2;
-        let mut child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("sleep 3600 & sleep 3600 & wait")
-            .process_group(0)
-            .spawn()
-            .expect("failed to spawn process group");
+        let (mut child, sleepers) = spawn_group_with_two_sleepers().await;
         let pid = child.id().expect("spawned child should have pid");
         svc.register_test_step(job_id, step_id, Some(pid)).await;
 
@@ -20070,11 +20182,13 @@ mod tests {
         .await
         .unwrap();
 
-        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        // Its exit status is not part of this: the children go first, so the
+        // shell can reap them and leave before its own TERM arrives.
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .expect("process group did not exit after CancelStep")
             .expect("wait failed");
-        assert!(!status.success());
+        assert_processes_gone(&sleepers).await;
         assert!(svc.step_cancel_requested(job_id, step_id).await);
     }
 
@@ -20082,14 +20196,8 @@ mod tests {
     async fn signal_step_tree_terminates_child_processes() {
         use std::time::Duration;
 
-        let mut child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("sleep 3600 & sleep 3600 & wait")
-            .process_group(0)
-            .spawn()
-            .expect("failed to spawn process group");
+        let (mut child, sleepers) = spawn_group_with_two_sleepers().await;
         let pid = child.id().expect("spawned child should have pid");
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         signal_step_tree(
             pid,
@@ -20097,11 +20205,11 @@ mod tests {
             executor::TrackedProcess::Workload,
         );
 
-        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .expect("process group did not exit after signal")
             .expect("wait failed");
-        assert!(!status.success());
+        assert_processes_gone(&sleepers).await;
     }
 
     // The cgroup-escape path relies on this: the wrapper's descendants hold the
@@ -26950,7 +27058,8 @@ mod tests {
                 99,
                 executor::TrackedProcess::Launcher
             )
-            .await,
+            .await
+            .cancel_requested,
             "a step nobody registered has no cancel to report"
         );
 
@@ -26963,6 +27072,7 @@ mod tests {
                 executor::TrackedProcess::Launcher
             )
             .await
+            .cancel_requested
         );
         {
             let steps = svc.active_steps.lock().await;
@@ -26985,7 +27095,63 @@ mod tests {
                 executor::TrackedProcess::Workload
             )
             .await
+            .cancel_requested
         );
+    }
+
+    #[test]
+    fn the_workload_start_time_comes_from_what_the_supervisor_published() {
+        let state = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            50,
+            1,
+            2,
+            0,
+            0,
+            store.session_dir(50, 1, 2).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert_eq!(
+            recorded_workload_start(&descriptor, 4242),
+            None,
+            "unpublished"
+        );
+
+        descriptor.workload_pid = 4242;
+        descriptor.workload_start_ticks = 9001;
+        store.publish(&descriptor).expect("publish the descriptor");
+
+        assert_eq!(recorded_workload_start(&descriptor, 4242), Some(9001));
+        assert_eq!(
+            recorded_workload_start(&descriptor, 4243),
+            None,
+            "not the process the supervisor forked"
+        );
+
+        descriptor.workload_start_ticks = 0;
+        store.publish(&descriptor).expect("republish");
+        assert_eq!(recorded_workload_start(&descriptor, 4242), None, "unknown");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_step_is_signalable_only_with_a_known_process_start_time() {
+        let svc = test_service();
+        let key = (49, 1);
+        svc.register_test_step(key.0, key.1, None).await;
+        let record = |start_ticks| {
+            record_step_pid_at(
+                &svc.active_steps,
+                key,
+                99,
+                executor::TrackedProcess::Workload,
+                start_ticks,
+            )
+        };
+
+        assert!(record(None).await.target.is_none());
+        let known = record(Some(7)).await.target.expect("a known start time");
+        assert_eq!((known.pid, known.start_ticks), (99, 7));
     }
 
     #[tokio::test]
@@ -27141,7 +27307,7 @@ mod tests {
                 pid: stand_in.pid,
                 epoch,
                 tracked: executor::TrackedProcess::Launcher,
-                start_ticks: None,
+                start_ticks: crate::stepd::process_start_ticks(stand_in.pid).expect("start time"),
             }],
             STEP_CANCEL_ESCALATION,
         );
@@ -27472,6 +27638,50 @@ mod tests {
         stand_in.assert_launcher_relays_the_worker_exit().await;
     }
 
+    #[tokio::test]
+    async fn a_step_whose_process_start_time_is_unknown_gets_no_direct_signal() {
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            48,
+            1,
+            3,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        let key = (descriptor.job_id, descriptor.step_id);
+        svc.register_test_step(key.0, key.1, None).await;
+        record_step_pid(
+            &svc.active_steps,
+            key,
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await;
+        // What a step that ended before its pid could be recorded leaves behind.
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&key)
+            .expect("registered step")
+            .pid_start_ticks = None;
+
+        let target = step_target(&svc.active_steps, key).await;
+        svc.spawn_step_cancel(Some(descriptor), target, SIGHUP)
+            .await
+            .expect("cancel task");
+
+        signal_step_tree(stand_in.pid, SIGUSR1, executor::TrackedProcess::Launcher);
+        stand_in.assert_launcher_relays_the_worker_exit().await;
+    }
+
+    async fn step_target(active_steps: &ActiveSteps, key: (u32, u32)) -> Option<StepTarget> {
+        let steps = active_steps.lock().await;
+        steps.get(&key).and_then(|step| StepTarget::of(key, step))
+    }
+
     /// How a scripted supervisor treats one control connection.
     enum SupervisorReply {
         /// Report the workload's pid, as the supervisor does for a state query.
@@ -27611,21 +27821,52 @@ mod tests {
         .await;
         let mut requests = scripted_supervisor(listener, descriptor, vec![SupervisorReply::Fail]);
 
-        // The controller drops the RPC as soon as the supervisor has the request.
-        tokio::select! {
-            biased;
-            request = requests.recv() => assert!(request.is_some()),
-            cancelled = svc.cancel_step(Request::new(CancelStepRequest {
-                job_id: key.0,
-                step_id: key.1,
-                signal: 0,
-                run_attempt: 0,
-            })) => {
-                cancelled.expect("cancel the step");
-            }
-        }
+        cancel_step_promptly(&svc, key.0, key.1).await;
+        assert!(requests.recv().await.is_some());
 
         assert_eq!(stand_in.line().await, "term");
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_slow_to_answer_does_not_cost_the_step_its_sigterm() {
+        // Without the request bound, only the wait on the supervisor can bring the TERM.
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_service();
+        let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let (descriptor, listener) = step_session(state.path(), 51, 2);
+        let key = (descriptor.job_id, descriptor.step_id);
+        svc.register_test_step(key.0, key.1, None).await;
+        let target = record_step_pid(
+            &svc.active_steps,
+            key,
+            stand_in.pid,
+            executor::TrackedProcess::Launcher,
+        )
+        .await
+        .target;
+        let mut requests =
+            scripted_supervisor(listener, descriptor.clone(), vec![SupervisorReply::Hold]);
+        // The escalation is far off: only the wait on the supervisor can bring the TERM.
+        let timings = StepCancelTimings {
+            supervisor_wait: std::time::Duration::from_millis(100),
+            escalation: std::time::Duration::from_secs(3600),
+        };
+
+        svc.spawn_step_cancel_timed(Some(descriptor), target, SIGTERM, timings)
+            .await
+            .expect("cancel task");
+
+        assert!(
+            requests.recv().await.is_some(),
+            "the supervisor was asked first"
+        );
+        assert_eq!(stand_in.line().await, "term");
+    }
+
+    #[test]
+    fn the_supervisor_is_waited_on_for_less_than_the_escalation_delay() {
+        assert!(STEP_CANCEL_TIMINGS.supervisor_wait < STEP_CANCEL_TIMINGS.escalation);
     }
 
     #[tokio::test(start_paused = true)]
@@ -27635,7 +27876,25 @@ mod tests {
         let svc = test_service();
         let mut stand_in = LauncherStandIn::spawn(TERM_IS_REPORTED).await;
         let state = tempfile::tempdir().expect("runtime socket directory");
-        let (descriptor, listener) = step_session(state.path(), job_id, step_id);
+        // The supervisor has published the workload's start time by the time it
+        // can report the pid, which is what the replay's signals are checked against.
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            step_id,
+            0,
+            0,
+            store.session_dir(job_id, 1, step_id).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "step-cancel-test".into();
+        descriptor.workload_pid = stand_in.pid;
+        descriptor.workload_start_ticks =
+            crate::stepd::process_start_ticks(stand_in.pid).expect("workload start time");
+        store.publish(&descriptor).expect("publish the descriptor");
+        let listener =
+            tokio::net::UnixListener::bind(&descriptor.socket_path).expect("bind runtime socket");
         svc.register_test_step(job_id, step_id, None).await;
         svc.active_steps
             .lock()
@@ -27725,11 +27984,11 @@ mod tests {
         let cfg = namespace_test_config();
 
         // A rootful batch-shaped launch runs under unshare, which is a launcher.
-        let rootful = interactive_active_step(77, 5, &cfg, true);
+        let rootful = interactive_active_step(77, 5, None, &cfg, true);
         assert_eq!(rootful.tracked, executor::TrackedProcess::Launcher);
         assert_eq!((rootful.pid, rootful.epoch), (Some(77), 5));
 
-        let rootless = interactive_active_step(77, 5, &cfg, false);
+        let rootless = interactive_active_step(77, 5, None, &cfg, false);
         assert_eq!(rootless.tracked, executor::TrackedProcess::Workload);
     }
 }
