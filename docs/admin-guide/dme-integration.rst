@@ -96,8 +96,10 @@ Spur repository:
    sudo install -o root -g root -m 0644 -t /usr/share/exporter \
      examples/hooks/dme/common.sh
 
-Both scripts source ``common.sh`` from their own directory, so keep the three
-files together.
+Both scripts load ``common.sh`` from ``/usr/share/exporter``: Spur runs a hook
+through a file descriptor, so a script cannot find files next to itself. To
+install the three files elsewhere, set ``SPUR_DME_HOOKS`` to their directory in
+``spurd``'s environment; hooks inherit it.
 
 Restart ``spurd`` after editing ``spur.conf`` — hooks are only read at agent
 startup:

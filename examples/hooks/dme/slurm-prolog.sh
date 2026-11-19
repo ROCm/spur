@@ -9,8 +9,9 @@
 EXPORT_DIR="/var/run/exporter"
 [ -d "${EXPORT_DIR}" ] && [ -n "${SPUR_JOB_GPUS}" ] || exit 0
 
-# shellcheck source=common.sh
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+# Spur runs hooks through a file descriptor, so a hook cannot find files next to itself.
+# shellcheck source=/dev/null
+source "${SPUR_DME_HOOKS:-/usr/share/exporter}/common.sh" || exit 0
 
 for id in $(job_render_ids); do
     printf '{"SLURM_JOB_ID":"%s","SLURM_JOB_USER":"%s","SLURM_JOB_PARTITION":"%s","SLURM_CLUSTER_NAME":"%s","CUDA_VISIBLE_DEVICES":"%s"}' \

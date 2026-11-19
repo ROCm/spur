@@ -13,6 +13,7 @@ when an exporter answers on the node.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import time
@@ -46,8 +47,11 @@ def _exporter_files(node) -> dict[str, dict]:
     sudo = _sudo(node)
     files = {}
     for name in node.exec_allow_fail(f"{sudo}ls -1 {EXPORT_DIR}").split():
-        if name.isdigit():
-            body = node.exec_allow_fail(f"{sudo}cat {EXPORT_DIR}/{name}")
+        if not name.isdigit():
+            continue
+        code, body = node.exec_with_exit(f"{sudo}cat {EXPORT_DIR}/{name}")
+        # An epilog may remove the file between the listing and the read.
+        if code == 0:
             files[name] = json.loads(body)
     return files
 
@@ -89,6 +93,7 @@ def _install_dme(cluster: SpurCluster) -> tuple[str, str]:
         cluster.write_file(f"hooks/{name}", (HOOKS_DIR / "dme" / name).read_text(), all_nodes=True)
         for name in ("slurm-prolog.sh", "slurm-epilog.sh", "common.sh")
     )
+    cluster.agent_env["SPUR_DME_HOOKS"] = os.path.dirname(paths[0])
     return paths[0], paths[1]
 
 
