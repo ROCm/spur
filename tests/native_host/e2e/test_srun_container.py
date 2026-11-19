@@ -1235,8 +1235,22 @@ class TestContainerMounts:
             (",nocolon", "nocolon"),
             (":z", "unknown flag 'z'"),
             (":size=64M", "size= only applies to a tmpfs mount"),
+            (":error", "unknown flag 'error'"),
+            (",/:/m/data", "another entry already mounts this destination"),
+            (",tmpfs:size=1G", "destination must be an absolute path"),
+            ("=ro", "destination cannot contain '='"),
+            (",tmpfs:/.spur", "/.spur is reserved"),
         ],
-        ids=["entry-without-target", "unknown-flag", "unsupported-option"],
+        ids=[
+            "entry-without-target",
+            "unknown-flag",
+            "unsupported-option",
+            "third-field-not-ro-or-rw",
+            "repeated-destination",
+            "option-in-place-of-destination",
+            "equals-in-destination",
+            "entry-script-folder",
+        ],
     )
     def test_an_unparseable_mount_is_refused_at_submit_and_named(
         self, step_container_cluster, suffix, named
@@ -1245,8 +1259,9 @@ class TestContainerMounts:
         src = _make_bind_sources(cluster, ["data"])
         bad = f"{src['data']}:/m/data{suffix}"
         script = cluster.write_file("mounts-bad.sh", "#!/bin/bash\necho RAN\n")
+        # Held, so a build that wrongly accepts the spec never launches it.
         code, out = cluster.sbatch_with_exit(
-            ["-J", "mounts-bad", "-N", "1", "-t", "2",
+            ["-H", "-J", "mounts-bad", "-N", "1", "-t", "2",
              f"--container-image={cluster.step_container_image}",
              f"--container-mounts={bad}", script]
         )
@@ -1288,14 +1303,66 @@ class TestContainerMounts:
         assert mount_line.startswith("MOUNT=tmpfs /m/cache tmpfs"), (
             f"state {state}:\n{out}\n{diag}"
         )
-        assert "size=65536k" in mount_line, mount_line
+        opts = mount_line.split()[-1].split(",")
+        assert "size=65536k" in opts, mount_line
+        assert "nosuid" in opts and "nodev" in opts, mount_line
         assert "WRITE=ok" in out, out
 
-    def test_a_read_only_bind_refuses_writes(self, step_container_cluster):
+    @pytest.mark.parametrize("kind", ["tmpfs", "bind"])
+    def test_a_mount_on_tmp_does_not_hide_the_job_script(self, step_container_cluster, kind):
+        cluster = step_container_cluster
+        mount = "tmpfs:/tmp" if kind == "tmpfs" else f"{_make_bind_sources(cluster, ['tmp'])['tmp']}:/tmp"
+        body = (
+            "echo RAN; "
+            "while read -r dev mnt fs _; do "
+            '[ "$mnt" = /tmp ] && echo "TMP=$fs"; done < /proc/mounts; '
+            "echo hi > /tmp/f && echo WRITE=ok || echo WRITE=fail"
+        )
+        state, out, diag = self._sbatch_probe(
+            cluster, f"mounts-on-tmp-{kind}", [f"--container-mounts={mount}"], body
+        )
+        assert "RAN" in out and state == "CD", f"state {state}:\n{out}\n{diag}"
+        assert ("TMP=tmpfs" if kind == "tmpfs" else "TMP=") in out, f"/tmp is not a mount:\n{out}"
+        assert "WRITE=ok" in out, out
+
+    def test_a_blank_mount_value_is_no_mounts(self, step_container_cluster):
+        state, out, diag = self._sbatch_probe(
+            step_container_cluster, "mounts-blank", ["--container-mounts="], "echo RAN"
+        )
+        assert "RAN" in out and state == "CD", f"state {state}:\n{out}\n{diag}"
+
+    def test_a_step_with_an_unparseable_mount_is_refused_before_it_runs(
+        self, step_container_cluster
+    ):
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        src = _make_bind_sources(cluster, ["data"])
+        out_path = f"{cluster.remote_dir}/mounts-step-bad.out"
+        script = cluster.write_file(
+            "mounts-step-bad.sh",
+            "#!/bin/bash\n"
+            f"{cluster.bin_dir}/srun --container-image='{img}' "
+            f"--container-mounts='{src['data']}:/m/data:z' echo STEP_RAN 2>&1\n"
+            'echo "SRUN_EXIT=$?"\n',
+        )
+        sb = cluster.sbatch(["-J", "mounts-step-bad", "-N", "1", "-t", "3", "-o", out_path, script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        state = wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        print(f"[mounts-step-bad] job={job_id} state={state}\n{out}")
+        assert "STEP_RAN" not in out, out
+        assert "SRUN_EXIT=0" not in out and "SRUN_EXIT=" in out, out
+        assert f"'{src['data']}:/m/data:z'" in out, out
+
+    @pytest.mark.parametrize("flag, writable", [(":ro", False), (":rw", True), ("", True)])
+    def test_a_bind_is_read_only_exactly_when_asked(self, step_container_cluster, flag, writable):
         cluster = step_container_cluster
         src = _make_bind_sources(cluster, ["data"])
         body = "cat /m/data/id; touch /m/data/new 2>&1 && echo WRITE=ok || echo WRITE=refused"
         state, out, diag = self._sbatch_probe(
-            cluster, "mounts-ro", [f"--container-mounts={src['data']}:/m/data:ro"], body
+            cluster, f"mounts-access{flag.replace(':', '-')}",
+            [f"--container-mounts={src['data']}:/m/data{flag}"], body,
         )
-        assert "src-data" in out and "WRITE=refused" in out, f"state {state}:\n{out}\n{diag}"
+        expected = "WRITE=ok" if writable else "WRITE=refused"
+        assert "src-data" in out and expected in out, f"state {state}:\n{out}\n{diag}"
