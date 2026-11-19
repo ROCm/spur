@@ -4525,23 +4525,25 @@ async fn run_containerized_step(
 
 /// Background deletion of orphan container rootfs dirs, started after the agent serves.
 pub struct RootfsCleanup {
-    task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    owners: SpoolOwnership,
+    pending: Vec<crate::startup_spool::PendingRootfs>,
 }
 
 impl RootfsCleanup {
     /// Starts the deletions; dropping the returned handle stops them between entries.
     pub fn spawn(self) -> RootfsCleanupHandle {
-        RootfsCleanupHandle {
-            _task: tokio::spawn(self.task),
-            stop: self.stop,
-        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(crate::startup_spool::delete_pending_rootfs(
+            self.owners,
+            self.pending,
+            stop.clone(),
+        ));
+        RootfsCleanupHandle { stop }
     }
 }
 
 /// Keeps the background deletion bounded by the agent's lifetime, however `main` exits.
 pub struct RootfsCleanupHandle {
-    _task: tokio::task::JoinHandle<()>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -5156,14 +5158,9 @@ impl AgentService {
                 worker_gate: None,
             })
             .await;
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         RootfsCleanup {
-            task: Box::pin(crate::startup_spool::delete_pending_rootfs(
-                self.spool_ownership(),
-                summary.pending_rootfs,
-                stop.clone(),
-            )),
-            stop,
+            owners: self.spool_ownership(),
+            pending: summary.pending_rootfs,
         }
     }
 
@@ -5172,17 +5169,6 @@ impl AgentService {
         paths: crate::startup_spool::ActivityPaths,
     ) -> crate::startup_spool::CleanupSummary {
         crate::startup_spool::run(self, self.job_spool_roots.clone(), paths).await
-    }
-
-    pub(crate) async fn spool_lifecycle_guard(
-        &self,
-        job_id: u32,
-    ) -> crate::job_lifecycle::KeyedLifecycleGuard<u32> {
-        self.lifecycle.acquire(job_id).await
-    }
-
-    pub(crate) async fn spool_local_owner(&self, job_id: u32) -> Option<&'static str> {
-        self.spool_ownership().local_owner(job_id).await
     }
 
     /// What decides whether a job's on-disk state is still in use, detached for work after serving.

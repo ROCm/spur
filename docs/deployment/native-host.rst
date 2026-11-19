@@ -190,11 +190,10 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   possibly on the same node, and new steps of jobs already running there fail
   until the pass ends.
 * ``spurd`` reads every process's environment, working directory and open
-  files once, before it locks any job. Without ``CAP_SYS_PTRACE`` (for example
-  in a container) these reads fail and nothing is removed; the agent logs
-  ``retained job spools: activity inventory uncertain`` with the number of
-  directories kept. A read stuck on a hung process keeps everything until the
-  next start, without blocking later launches.
+  files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
+  fail and nothing in the affected batch is removed; the agent logs
+  ``retained directories: activity inventory uncertain`` with the number of
+  directories kept.
 * Symlinks in the spool path (for example ``/var/spool`` on another disk) are
   followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
   mount point, or a tree deeper than 256 levels is logged with ``kept job
@@ -223,7 +222,8 @@ owned by the ``spurd`` user and not writable by group or others.
   a process whose working directory, root or open file is inside the rootfs
   keeps it; a process in another mount namespace (such as the container
   itself) is checked against its own mount table, and a bind mount of any part
-  of the rootfs, in any namespace, keeps it.
+  of the rootfs in the agent's or a running process's mount namespace keeps
+  it. A mount table that cannot be read keeps every directory in the batch.
 * Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
   ``merged``, or a mount on the directory itself) is unmounted first, without a
   lazy detach. If one stays mounted the directory is kept and ``kept container

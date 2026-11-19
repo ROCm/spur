@@ -557,9 +557,6 @@ Inspired by Enroot.
   (`cleanup_rootfs`) removes them; leftovers from a crash are removed by the
   startup orphan pass, which unmounts layers first (no lazy detach) and keeps a
   rootfs held as a process root or bound anywhere (per-namespace mountinfo).
-- **Overlay mode currently always falls back to extraction**: `upper` is a
-  tmpfs but `work` sits on the base filesystem, which overlayfs rejects, so
-  every rootfs is a full unsquashfs tree.
 
 ---
 

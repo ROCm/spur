@@ -1076,6 +1076,32 @@ async fn a_rootfs_subtree_bound_in_any_namespace_keeps_the_rootfs() {
 }
 
 #[tokio::test]
+async fn an_unreadable_foreign_mount_table_keeps_rootfs_unless_its_process_is_exiting() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let rootfs = fixture.rootfs("job_1");
+    let proc_root = fixture.paths().proc_root;
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(
+        proc_root.join("self/mountinfo"),
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    )
+    .unwrap();
+    let process = fixture.process(100, &["python3"], b"");
+    fs::create_dir(process.join("ns")).unwrap();
+    symlink("mnt:[2]", process.join("ns/mnt")).unwrap();
+    let summary = fixture.run_and_drain().await;
+    assert_eq!(summary.retained, 1);
+    assert!(rootfs.is_dir());
+
+    let stat = fs::read_to_string(process.join("stat")).unwrap();
+    fs::write(process.join("stat"), stat.replacen(") S ", ") Z ", 1)).unwrap();
+    fixture.run_and_drain().await;
+    assert!(!rootfs.exists());
+}
+
+#[tokio::test]
 async fn a_rootfs_replaced_during_the_controller_query_is_kept() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
@@ -1119,6 +1145,15 @@ async fn background_rootfs_deletion_stops_for_shutdown() {
     )
     .await;
     assert!(rootfs.join("usr/lib/python3/site.py").is_file());
+
+    let handle = RootfsCleanup {
+        owners: fixture.agent.spool_ownership(),
+        pending: Vec::new(),
+    }
+    .spawn();
+    let stop = handle.stop.clone();
+    drop(handle);
+    assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 #[tokio::test]
@@ -1156,14 +1191,17 @@ async fn background_rootfs_deletion_rechecks_ownership_and_identity() {
 async fn orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stays() {
     const CHILD: &str = "SPUR_ROOTFS_MOUNT_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "--propagation", "private"])
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "agent_server::cleanup_lifecycle_tests::startup_spool_tests::orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stays", "--ignored"])
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        run_in_namespaces(
+            "orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stays",
+            CHILD,
+            &[
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ],
+        );
         return;
     }
     let controller = ControllerFixture::new(true);

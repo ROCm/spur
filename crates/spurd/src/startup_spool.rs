@@ -9,6 +9,7 @@ use crate::spool_fs::{
 use nix::fcntl::OFlag;
 use spur_core::job::JobState;
 use spur_proto::proto::GetJobsResponse;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -175,6 +176,7 @@ pub(crate) async fn run(
                     .push(candidate);
                 map
             });
+    let owners = service.spool_ownership();
     let mut reported_hidden_jobs = false;
     for batch in ids.chunks(QUERY_BATCH_SIZE) {
         if Instant::now() >= deadline {
@@ -216,8 +218,8 @@ pub(crate) async fn run(
                 unconfirmed += job_candidates.len();
                 continue;
             }
-            let guard = service.spool_lifecycle_guard(job_id).await;
-            if let Some(reason) = service.spool_local_owner(job_id).await {
+            let guard = owners.guard(job_id).await;
+            if let Some(reason) = owners.local_owner(job_id).await {
                 for candidate in &job_candidates {
                     info!(job_id, path = %candidate.path.display(), reason, "retained locally owned {}", candidate.spool.kind.label());
                 }
@@ -393,28 +395,17 @@ fn clean_inactive(
             Ok(false) if Instant::now() >= deadline => Err(budget_exhausted()),
             Ok(false) if candidate.spool.kind == SpoolKind::Rootfs => {
                 let mountinfo = paths.proc_root.join("self/mountinfo");
-                let unmounted = candidate
-                    .root
-                    .unmount_beneath(&candidate.spool, &mountinfo)
-                    .and_then(|unmounted| {
-                        Ok((
-                            unmounted,
-                            candidate.root.reopen(&candidate.spool, unmounted)?,
-                        ))
-                    });
-                match unmounted {
-                    // The directory a mount hid was never inventoried under its own identity.
-                    Ok((_, spool)) if spool.identities().any(|id| inventory.held.contains(&id)) => {
-                        info!(job_id, path = %path.display(), "retained {kind}: a process holds the directory under its mount");
-                        summary.retained += 1;
-                        continue;
-                    }
-                    Ok((unmounted, spool)) => {
-                        let detached = unmounted.count;
+                match unmount_rootfs(&candidate, &inventory.held, &mountinfo) {
+                    Ok(Some((detached, spool))) => {
                         info!(job_id, path = %path.display(), detached, "queued orphan container rootfs for background deletion");
                         summary
                             .pending_rootfs
                             .push(PendingRootfs(Candidate { spool, ..candidate }));
+                        continue;
+                    }
+                    Ok(None) => {
+                        info!(job_id, path = %path.display(), "retained {kind}: a process holds the directory under its mount");
+                        summary.retained += 1;
                         continue;
                     }
                     Err(error) => Err(error),
@@ -441,6 +432,23 @@ fn clean_inactive(
         }
     }
     summary
+}
+
+/// Unmounts a confirmed orphan rootfs and reopens it; `None` when a process holds the uncovered directory.
+fn unmount_rootfs(
+    candidate: &Candidate,
+    held: &HashSet<(u64, u64)>,
+    mountinfo: &Path,
+) -> io::Result<Option<(usize, JobSpool)>> {
+    let unmounted = candidate
+        .root
+        .unmount_beneath(&candidate.spool, mountinfo)?;
+    let spool = candidate.root.reopen(&candidate.spool, unmounted)?;
+    // The directory a mount hid was never inventoried under its own identity.
+    if spool.identities().any(|id| held.contains(&id)) {
+        return Ok(None);
+    }
+    Ok(Some((unmounted.count, spool)))
 }
 
 /// Deletes confirmed orphan container rootfs dirs after the agent serves; each holds its job's lifecycle lock.
@@ -618,7 +626,7 @@ fn inspect_processes(
     deadline: Instant,
     inventory: &mut Inventory,
 ) -> io::Result<()> {
-    let own_namespace = mount_namespace(&paths.proc_root.join("self"));
+    let own_namespace = mount_namespace(&paths.proc_root.join("self"))?;
     let mut devices: HashSet<u64> = candidates
         .iter()
         .flat_map(|c| c.spool.identities().map(|(device, _)| device))
@@ -647,26 +655,28 @@ fn inspect_processes(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        // A process in another mount namespace is judged by its own mount table when it can be read.
+        // A process in another mount namespace is judged by its own mount table; an unreadable one is doubt.
         let mounts = match mount_namespace(&path) {
-            Some(namespace) if Some(&namespace) != own_namespace.as_ref() => {
+            Ok(Some(namespace)) if Some(&namespace) != own_namespace.as_ref() => {
                 match namespaces.entry(namespace) {
-                    std::collections::hash_map::Entry::Occupied(entry) => Some(&*entry.into_mut()),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        match MountTable::read(&path.join("mountinfo")) {
-                            Ok(table) if !table.mounts.is_empty() => Some(&*entry.insert(table)),
-                            _ => None,
-                        }
-                    }
+                    Entry::Occupied(entry) => Ok(&*entry.into_mut()),
+                    Entry::Vacant(entry) => match MountTable::read(&path.join("mountinfo")) {
+                        Ok(table) if !table.mounts.is_empty() => Ok(&*entry.insert(table)),
+                        Ok(_) => Err(io::Error::other("empty mount table")),
+                        Err(error) => Err(error),
+                    },
                 }
             }
-            _ => None,
+            Ok(_) => Ok(&host),
+            Err(error) => Err(error),
         };
-        let holders = HolderFilter {
-            devices: &devices,
-            mounts: mounts.unwrap_or(&host),
-        };
-        let result = inspect_process(&path, paths.supervisor_uid, candidates, &holders, inventory);
+        let result = mounts.and_then(|mounts| {
+            let holders = HolderFilter {
+                devices: &devices,
+                mounts,
+            };
+            inspect_process(&path, paths.supervisor_uid, candidates, &holders, inventory)
+        });
         match fs::read(path.join("stat")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -789,8 +799,12 @@ fn fd_mount_id(fdinfo: &Path) -> Option<u64> {
         .ok()
 }
 
-fn mount_namespace(process: &Path) -> Option<PathBuf> {
-    fs::read_link(process.join("ns/mnt")).ok()
+fn mount_namespace(process: &Path) -> io::Result<Option<PathBuf>> {
+    match fs::read_link(process.join("ns/mnt")) {
+        Ok(namespace) => Ok(Some(namespace)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn is_remote(kind: &str) -> bool {
