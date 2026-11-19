@@ -84,6 +84,19 @@ fn decode_sha256_hex(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Classify a failure to buffer the forwarded body: an over-limit body is a
+/// terminal `ResourceExhausted`, but a read failure mid-collect (e.g. a reset) is
+/// the retryable integrity `DataLoss` the follower resends once.
+fn forwarded_collect_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> tonic::Status {
+    if err.is::<http_body_util::LengthLimitError>() {
+        return tonic::Status::resource_exhausted("forwarded request body exceeded the size limit");
+    }
+    tonic::Status::data_loss(format!(
+        "{}: body could not be read",
+        spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE
+    ))
+}
+
 /// Collect a forwarded request's body once and verify it against the digests the
 /// follower supplied: the transit header (`DataLoss` on mismatch — corruption on
 /// the hop, which the follower retries) and, when present, the signed envelope
@@ -100,12 +113,7 @@ async fn verify_forwarded_body(
     let limit = spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN;
     let collected = match Limited::new(body, limit).collect().await {
         Ok(buf) => buf.to_bytes(),
-        Err(_) => {
-            return Err(tonic::Status::unauthenticated(
-                "forwarded request body exceeded the size limit or could not be read",
-            )
-            .into_http());
-        }
+        Err(err) => return Err(forwarded_collect_error(&*err).into_http()),
     };
     // Transit integrity first: a header/body mismatch is corruption on the hop,
     // not a forged identity, so it reads as DataLoss and the follower retries.
@@ -409,6 +417,30 @@ mod tests {
             .await
             .expect_err("a forged body is rejected");
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    #[test]
+    fn a_read_failure_is_a_retryable_integrity_dataloss() {
+        // A reset mid-collect must not become a terminal auth error: it maps to the
+        // integrity DataLoss the follower retries, carrying the marker send_to_leader
+        // keys on.
+        let status = forwarded_collect_error(&std::io::Error::other("stream reset"));
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status
+            .message()
+            .contains(spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE));
+    }
+
+    #[tokio::test]
+    async fn an_over_limit_forwarded_body_is_rejected_not_retried() {
+        // Over the size ceiling is terminal (ResourceExhausted, code 8) — never the
+        // retryable DataLoss, so an oversized body is not resubmitted in a loop.
+        let huge = vec![0u8; spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN + 1];
+        let req = Request::new(tonic::body::Body::new(Full::new(bytes::Bytes::from(huge))));
+        let resp = verify_forwarded_body(req, Some([0u8; 32]), None)
+            .await
+            .expect_err("an over-limit body is rejected");
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
     }
 
     use spur_core::auth::generate_token;
