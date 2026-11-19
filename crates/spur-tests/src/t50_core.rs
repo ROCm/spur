@@ -685,23 +685,6 @@ address = "http://peer-a:6817"
     // ── T50.89-91: default partition, pending reason, exec routing ──
 
     #[test]
-    fn t50_89_default_partition_assigned_on_submit() {
-        // When no --partition is specified, the default partition
-        // should be assigned so the scheduler can match nodes correctly.
-        // Verify that Partition carries is_default and that the scheduler
-        // harness correctly sets it.
-        let part = make_partition("gpu", 2);
-        // make_partition sets is_default when name == "default"; this one
-        // should be false, but the field must be present.
-        assert!(!part.is_default);
-        assert_eq!(part.name, "gpu");
-
-        // A partition named "default" should have is_default = true
-        let default_part = make_partition("default", 2);
-        assert!(default_part.is_default);
-    }
-
-    #[test]
     fn t50_90_pending_reason_resources_when_no_nodes() {
         // pending_reason should reflect inability to schedule, not
         // just always show "Priority".

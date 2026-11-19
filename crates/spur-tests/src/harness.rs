@@ -128,15 +128,3 @@ pub fn assert_transition_err(job: &mut Job, to: JobState) {
         to
     );
 }
-
-/// Parse a test script with #SBATCH directives.
-pub fn test_script(directives: &[&str], body: &str) -> String {
-    let mut script = String::from("#!/bin/bash\n");
-    for d in directives {
-        script.push_str(&format!("#SBATCH {}\n", d));
-    }
-    script.push('\n');
-    script.push_str(body);
-    script.push('\n');
-    script
-}
