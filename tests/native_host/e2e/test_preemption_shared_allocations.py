@@ -51,6 +51,7 @@ def _submit(c, label, qos, node, cpus=1, memory=0, extra=(), seconds=600, count=
     script = c.write_file(
         f"{label}.sh",
         '#!/bin/bash\n'
+        f'cat /proc/$$/cgroup > {shlex.quote(identity + ".cgroup")}\n'
         f'echo "$$ $(awk \'{{print $22}}\' /proc/$$/stat)" > {shlex.quote(identity)}\n'
         f'exec sleep {seconds}\n',
         all_nodes=True,
@@ -77,9 +78,13 @@ def _identity(c, job, path, node_index=0):
     node = c.nodes[node_index]
     recorded = node.read_file(path).strip()
     _, started = recorded.split()
+    cgroup = node.read_file(path + ".cgroup").strip().removeprefix("0::")
+    assert cgroup.startswith(f"/spur/job_{job}_"), cgroup
+    procs = shlex.quote(f"/sys/fs/cgroup{cgroup}/cgroup.procs")
     live = node.exec(
+        f'for pid in $(cat {procs}); do '
         f"awk '$2 == \"(sleep)\" && $22 == {int(started)} {{print $1, $22}}' "
-        "/proc/[0-9]*/stat 2>/dev/null"
+        '"/proc/$pid/stat" 2>/dev/null || true; done'
     ).strip()
     assert len(live.splitlines()) == 1 and live.split()[1] == started, (recorded, live)
     fields = tuple(re.search(rf"\b{key}=([^\s]+)", show).group(1)
