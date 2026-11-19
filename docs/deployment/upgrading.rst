@@ -1106,8 +1106,10 @@ while the workload ran on. Signals now go to the workload and skip the launcher.
   the waiting parent, with signal 15; it now ends at the SIGKILL, with signal 9,
   as under ``docker stop``. This applies to rootless agents too, and to an
   ``srun --container-image=`` step that creates a container of its own. A step
-  that joins its job's container (the same image as the job) is not PID 1, so an
-  untrapped SIGTERM ends it as usual.
+  joins its job's container only on the node that runs the job's own process (the
+  batch node); there it is not PID 1, so an untrapped SIGTERM ends it as usual.
+  On the job's other nodes even a step with the job's image creates its own
+  container, and its command is PID 1.
 - **The fix needs upgraded agents.** A job or ``srun`` step launched before its
   node's agent was upgraded keeps the old behavior until it ends, because its
   supervisor keeps running through the upgrade. A step launched after the upgrade

@@ -522,9 +522,13 @@ metrics).
   container (a job's, or an `srun` step's own `StepContainerPlan::Fresh`), on
   rootless agents too: the signal used to kill the waiting parent and end the
   step, but now an unhandled SIGTERM leaves the command running until the
-  SIGKILL, so it ends with signal 9 rather than 15. A step that joins its job's
-  container (`StepContainerPlan::JoinParent`) enters the PID namespace through
-  `nsenter`, is not PID 1, and ends on an unhandled SIGTERM.
+  SIGKILL, so it ends with signal 9 rather than 15. A step joins its job's
+  container (`StepContainerPlan::JoinParent`) only where the job's own process
+  runs (`JobEntry::is_enterable`, the batch node; a step naming another image is
+  refused): it enters the PID namespace through `nsenter`, is not PID 1, and
+  ends on an unhandled SIGTERM. On the job's other nodes, which hold only an
+  `AllocationOnly` placeholder, a step with an image gets `Fresh` and its
+  command is PID 1.
 - The agent signals processes itself in two places and applies the same rule
   there. `CancelStep`, and the replay of a cancel that arrived while the step
   was launching, run as one detached task (`run_step_cancel`), so the
