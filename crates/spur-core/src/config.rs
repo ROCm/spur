@@ -404,8 +404,7 @@ pub struct ControllerConfig {
     /// for another attempt. On by default: a prolog receives the job's own
     /// context, so the same failure recurs on every node, and retrying would
     /// drain one node per attempt. Turning it off restores the retry, bounded by
-    /// `max_batch_requeue`; a batch job submitted with `--requeue` gets that
-    /// retry either way. Configured in TOML as
+    /// `max_batch_requeue`. Configured in TOML as
     /// `[controller] hold_on_prolog_fail` (default: true). Slurm's equivalent is
     /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
     #[serde(default = "default_hold_on_prolog_fail")]

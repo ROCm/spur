@@ -3081,8 +3081,7 @@ async fn register_allocation_to_agent(
 ///
 /// Returns true when it applied a hold/cancel and the caller should do nothing
 /// more; false when the caller should fall back to its generic dispatch-failure
-/// backoff (no prolog failures, `hold_on_prolog_fail` disabled, or a batch job
-/// submitted with `--requeue`).
+/// backoff (no prolog failures, or `hold_on_prolog_fail` disabled).
 fn settle_prolog_failures(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
@@ -3108,11 +3107,6 @@ fn settle_prolog_failures(
             error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
         }
         return true;
-    }
-    // `--requeue` is the submitter's consent to another attempt, so the job takes
-    // the bounded retry instead of a hold nothing releases.
-    if spec.requeue {
-        return false;
     }
     let reason = launch_failure_held_reason(detail);
     if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&reason), run_attempt) {
@@ -3307,8 +3301,7 @@ fn abort_pending_pmix_dispatch(
 ///     parked the same way `scontrol hold` parks a Pending job
 ///     (`ClusterManager::hold_job_for_launch_failure`), since a
 ///     Running→Failed→Held path isn't reachable from Pending. Interactive
-///     jobs are cancelled instead, and a batch job submitted with `--requeue`
-///     takes the backoff below.
+///     jobs are cancelled instead.
 ///   - Otherwise (no prolog failure, or holding is disabled) the job stays
 ///     Pending and is backed off by
 ///     `ClusterManager::backoff_pending_job_after_dispatch_failure`, as on the
@@ -8748,7 +8741,7 @@ pub(crate) mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn a_requeueable_job_is_retried_rather_than_held() {
+        async fn a_requeueable_job_is_held_like_any_other() {
             use spur_core::job::{JobState, PendingReason};
 
             let dir = TempDir::new().unwrap();
@@ -8769,13 +8762,12 @@ pub(crate) mod tests {
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
-            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
-            assert!(job.priority > 0, "a requeueable job must not be held");
-            assert_eq!(job.requeue_count, 1);
-            assert!(
-                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
-                "the retry is the bounded dispatch-failure backoff, not an immediate one"
-            );
+            assert_eq!(job.pending_reason, PendingReason::Held);
+            assert_eq!(job.priority, 0, "--requeue must not skip the hold");
+            assert!(job
+                .state_reason()
+                .starts_with("launch failed requeued held: "));
+            assert_eq!(job.requeue_count, 0);
             assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
         }
 

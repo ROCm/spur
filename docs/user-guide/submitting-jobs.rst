@@ -198,8 +198,7 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Submit the job held; it will not start until released. Default off.
    * - ``--requeue``
      -
-     - Allow the job to be requeued after a node failure or time limit, and
-       retried on another node when a node's prolog refuses it instead of held.
+     - Allow the job to be requeued after a node failure or time limit.
        Default off. If the failed node comes back, the job's earlier run there
        is stopped (SIGTERM, then SIGKILL if it does not exit).
    * - ``--no-requeue``

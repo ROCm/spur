@@ -304,9 +304,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``true``
      - Live
      - Hold a batch job whose compute-node ``prolog`` fails instead of retrying
-       it on another node. Jobs submitted with ``--requeue`` are retried either
-       way. Slurm's equivalent is the inverse,
-       ``SchedulerParameters=nohold_on_prolog_fail``. See :ref:`prolog-failure`.
+       it on another node, with or without ``--requeue``. Slurm's equivalent is
+       the inverse, ``SchedulerParameters=nohold_on_prolog_fail``. See
+       :ref:`prolog-failure`.
    * - ``terminal_job_retention_secs``
      - integer
      - ``3600``
@@ -2994,17 +2994,18 @@ Prolog failure
 When the compute-node ``prolog`` exits non-zero, the node is drained with a
 reason naming the prolog script and its exit status (the ``stderr`` of the
 prolog goes to the node agent's log), and the job does not start there. What happens
-to the job depends on how it was submitted:
+to the job depends on ``[controller] hold_on_prolog_fail`` and the kind of job;
+``--requeue`` does not change it:
 
 - **Batch job, default.** The job stays pending at priority 0, held with the
-  reason ``launch failed requeued held: <dispatch detail>``. Nothing releases it
-  automatically: a prolog sees the job's own context, so a failure caused by the
-  job would recur on every node it tried and drain each one. ``scontrol release
-  <jobid>`` puts it back in the queue.
-- **Batch job submitted with** ``--requeue``, **or any batch job when**
-  ``[controller] hold_on_prolog_fail = false``. The job goes back to pending
-  and is retried on another eligible node after an exponential backoff capped
-  at ``max_launch_backoff_secs``. Each retry counts against
+  reason ``launch failed requeued held: <dispatch detail>``; the prefix is
+  Slurm's reason for this hold. Nothing releases it automatically: a prolog
+  sees the job's own context, so a failure caused by the job would recur on
+  every node it tried and drain each one. ``scontrol release <jobid>`` puts it
+  back in the queue.
+- **Batch job when** ``hold_on_prolog_fail = false``. The job goes back to
+  pending and is retried on another eligible node after an exponential backoff
+  capped at ``max_launch_backoff_secs``. Each retry counts against
   ``max_batch_requeue``. A job that runs out is held with ``JobHoldMaxRequeue``.
 - **Interactive** ``salloc`` **or standalone** ``srun``, **with the hold on**.
   The job is cancelled, since its client would otherwise wait on a hold
