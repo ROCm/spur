@@ -13864,11 +13864,12 @@ fn step_end_state(exit_code: i32, oom_killed: bool, cancelled: bool) -> StepStat
 const QOS_ACCOUNTING_HINT: &str =
     " (hint: accounting may not be enabled on this controller -- check controller logs)";
 
-/// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
-/// exist and be permitted for the association) → association default →
-/// cluster fallback (`accounting.default_qos`, also gated by the
-/// association's allow-list) → reject if `accounting.require_qos`, else
-/// accept with no QOS.
+/// Resolve a job's QOS at submit, in Slurm's order. An explicit `--qos` must
+/// exist and be permitted for the association. Otherwise the first permitted
+/// of: the association default, the only QOS on the association's list, and
+/// the cluster fallback (`accounting.default_qos`). When a list applies and
+/// none of them is on it the job is rejected; with no list it is rejected only
+/// under `accounting.require_qos`, else accepted with no QOS.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
@@ -13903,34 +13904,31 @@ fn apply_default_qos(
         return Ok(());
     }
 
+    let account = account.as_deref().unwrap_or_default();
     if let Some(default_qos) = default_qos {
-        if qos_cache.get(&default_qos).is_some() {
-            // Slurm refuses the job when the automatic QOS is not on the
-            // allow-list, rather than running it anyway or skipping to the
-            // cluster fallback.
-            if !qos_permitted(allowed_qos.as_ref(), &default_qos) {
-                return Err(SubmitError::invalid(format!(
-                    "default QOS '{default_qos}' is not permitted for user '{}' under account '{}'",
-                    spec.user,
-                    account.as_deref().unwrap_or_default()
-                )));
-            }
+        if qos_cache.get(&default_qos).is_none() {
+            warn!(
+                user = %spec.user, account, qos = %default_qos,
+                "association default QOS no longer exists, ignoring"
+            );
+        } else if qos_permitted(allowed_qos.as_ref(), &default_qos) {
             spec.qos = Some(default_qos);
             return Ok(());
+        } else {
+            warn!(
+                user = %spec.user, account, qos = %default_qos,
+                "association default QOS is not on its allow-list, ignoring"
+            );
         }
-        warn!(
-            user = %spec.user,
-            account = account.as_deref().unwrap_or_default(),
-            qos = %default_qos,
-            "association default QOS no longer exists, ignoring"
-        );
     }
 
-    // A configured fallback naming a nonexistent QOS is a hard error — silently
-    // ignoring it would leave the job unenforced, the gap this closes. A fallback
-    // that exists but isn't permitted for this association degrades like a stale
-    // default instead, since it reflects the association's own restriction, not
-    // a misconfiguration.
+    if let Some(only) = sole_existing_qos(allowed_qos.as_ref(), qos_cache) {
+        spec.qos = Some(only);
+        return Ok(());
+    }
+
+    // A fallback naming a nonexistent QOS is a misconfiguration, so it fails
+    // loudly rather than leaving every job without a QOS.
     let fallback = accounting.default_qos.trim();
     if !fallback.is_empty() {
         if qos_cache.get(fallback).is_none() {
@@ -13947,14 +13945,15 @@ fn apply_default_qos(
             spec.qos = Some(fallback.to_string());
             return Ok(());
         }
-        warn!(
-            user = %spec.user,
-            account = account.as_deref().unwrap_or_default(),
-            qos = %fallback,
-            "cluster default QOS not permitted for this association, ignoring"
-        );
     }
 
+    if allowed_qos.is_some() {
+        return Err(SubmitError::invalid(format!(
+            "no permitted QOS resolves for user '{}' under account '{account}': name one \
+             with --qos or give the association a default on its qos list",
+            spec.user
+        )));
+    }
     if accounting.require_qos {
         return Err(SubmitError::invalid(
             "no QOS specified and no default QOS is configured for this user/account",
@@ -13962,6 +13961,19 @@ fn apply_default_qos(
     }
 
     Ok(())
+}
+
+/// The association's only allowed QOS, when its list has exactly one that
+/// still exists.
+fn sole_existing_qos(
+    allowed_qos: Option<&HashSet<String>>,
+    qos_cache: &QosCache,
+) -> Option<String> {
+    let mut existing = allowed_qos?
+        .iter()
+        .filter(|name| qos_cache.get(name).is_some());
+    let only = existing.next()?;
+    existing.next().is_none().then(|| only.clone())
 }
 
 /// Expand a job spec into one or more submittable specs. For non-array jobs,
@@ -38866,6 +38878,7 @@ state = "UP"
             .insert_allowed_qos("testuser", "research", &["a", "b"]);
         let mut spec = basic_spec("q");
         spec.account = Some("research".into());
+        spec.qos = Some("a".into());
         let id = submit_and_wait(&cm, spec);
 
         cm.update_job(id, None, None, None, None, None, Some("b".into()), None)
@@ -41793,46 +41806,71 @@ state = "UP"
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
+    const NO_PERMITTED_QOS: &str = "no permitted QOS resolves for user 'testuser' under account \
+         'research': name one with --qos or give the association a default on its qos list";
+
     #[test]
-    fn apply_default_qos_cluster_fallback_ignored_outside_allow_list() {
-        // Association is restricted to an allow-list that omits the cluster
-        // fallback; omitting --qos must not silently grant it.
+    fn apply_default_qos_rejects_when_the_fallback_is_outside_the_allow_list() {
+        // Omitting --qos must neither grant the fallback nor run the job
+        // with no QOS at all.
         let assoc = AssociationCache::new();
         assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
         let qos = qos_cache_with(&["a", "b", "cluster-default"]);
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(
-            &mut spec,
-            &assoc,
-            &qos,
-            &acct_cfg_with("cluster-default", false),
-        )
-        .unwrap();
-        assert_eq!(spec.qos, None, "unauthorized fallback must not be assigned");
+        for require_qos in [false, true] {
+            let err = super::apply_default_qos(
+                &mut spec,
+                &assoc,
+                &qos,
+                &acct_cfg_with("cluster-default", require_qos),
+            )
+            .unwrap_err();
+            assert_eq!(err, SubmitError::invalid(NO_PERMITTED_QOS));
+            assert_eq!(spec.qos, None);
+        }
     }
 
     #[test]
-    fn apply_default_qos_cluster_fallback_outside_allow_list_with_require_qos_errors() {
+    fn apply_default_qos_rejects_an_allow_list_with_no_default_or_fallback() {
         let assoc = AssociationCache::new();
         assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
-        let qos = qos_cache_with(&["a", "b", "cluster-default"]);
+        let qos = qos_cache_with(&["a", "b"]);
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        let err = super::apply_default_qos(
-            &mut spec,
-            &assoc,
-            &qos,
-            &acct_cfg_with("cluster-default", true),
-        )
-        .unwrap_err();
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(err, SubmitError::invalid(NO_PERMITTED_QOS));
+    }
+
+    #[test]
+    fn apply_default_qos_rejects_an_empty_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &[]);
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err =
+            super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false))
+                .unwrap_err();
+        assert_eq!(err, SubmitError::invalid(NO_PERMITTED_QOS));
+    }
+
+    #[test]
+    fn apply_default_qos_uses_the_only_qos_on_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["burst", "deleted"]);
+        let qos = qos_cache_with(&["burst", "normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
         assert_eq!(
-            err,
-            SubmitError::invalid(
-                "no QOS specified and no default QOS is configured for this user/account"
-            )
+            spec.qos.as_deref(),
+            Some("burst"),
+            "the only existing allowed QOS beats the cluster fallback"
         );
     }
 
@@ -42073,7 +42111,7 @@ state = "UP"
     }
 
     #[test]
-    fn apply_default_qos_rejects_a_default_outside_the_allow_list() {
+    fn apply_default_qos_skips_a_default_outside_the_allow_list() {
         let assoc = AssociationCache::new();
         assoc.insert_allowed_qos("testuser", "research", &["burst"]);
         assoc.insert_default_qos("testuser", "research", "normal");
@@ -42081,12 +42119,8 @@ state = "UP"
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("default QOS 'normal' is not permitted"),
-            "{err}"
-        );
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("burst"));
 
         spec.qos = Some("normal".into());
         let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();

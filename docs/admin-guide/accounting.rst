@@ -104,7 +104,8 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
 ``default_qos``
    Cluster-wide fallback QOS applied at submit when a job otherwise resolves to
    no QOS. Mirrors Slurm's fallback QOS (its built-in ``normal``). Must name an
-   existing QOS.
+   existing QOS. An association with a QOS list only gets it when the list
+   includes it (see `How a job's QOS is resolved`_).
 
    :Default: ``""`` (no fallback)
 
@@ -250,18 +251,22 @@ Account keys
      - Allow-list of QOS this account may use. Unset inherits the parent's list.
        ``qos=a,b`` replaces it, for this account and anyone below who does not
        set their own. ``qos+=a`` adds a name and ``qos-=a`` removes one, keeping
-       the inherited names. ``qos=`` with nothing after it inherits again, and
-       so does removing the last name of a list set with ``qos=``. Removing
-       every name you inherited leaves no QOS allowed. A user who sets nothing
-       of their own uses this evaluated list, both in ``sacctmgr show`` and
-       when a job is admitted. A QOS name may not start with ``+`` or ``-``,
-       which mark an add or remove.
+       the inherited names. When nothing above sets a list, every QOS is
+       allowed: ``qos+=a`` then changes nothing, and ``qos-=a`` allows every
+       existing QOS except ``a``. ``qos=`` with nothing after it inherits
+       again, and so does removing the last name of a list set with ``qos=``
+       (as in Slurm, that widens access to the inherited list). Removing every
+       name you inherited leaves no QOS allowed. A user who sets nothing of
+       their own uses this evaluated list, both in ``sacctmgr show`` and when a
+       job is admitted. A QOS name may not start with ``+`` or ``-``, which
+       mark an add or remove.
    * - ``defaultqos``
      - unset (inherit)
      - QOS used when a user in this account (or a child account) does not set
        their own and does not name one on the job. The nearest account that
-       sets one wins. The job is rejected if that QOS is not on the evaluated
-       allow-list. Set ``defaultqos=`` empty to inherit again.
+       sets one wins. A write that leaves this account, or a user in it, with
+       a default that is not on its evaluated list is rejected. Set
+       ``defaultqos=`` empty to inherit again.
 
 .. note::
 
@@ -422,8 +427,8 @@ User keys
    * - ``defaultqos``
      - inherited
      - QOS applied when the user does not request one. When unset, the user
-       uses the nearest account's ``defaultqos``. A job is rejected if that
-       QOS is not on the evaluated allow-list.
+       uses the nearest account's ``defaultqos``. It must be on the user's
+       evaluated allow-list; see the note below.
    * - ``qos``
      - inherited
      - QOS the user may request. When unset, the user uses the account's
@@ -453,11 +458,14 @@ User keys
 
 .. note::
 
-   If both ``qos=`` and ``defaultqos=`` are given, the default **must** appear in
-   the allow-list, or the command is rejected. ``defaultqos`` alone (no ``qos=``
-   list) is valid. It is the QOS a job gets when it names none, and it does not
-   limit which QOS the user may name. To limit the user to it, also set
-   ``qos=`` to that name.
+   As in Slurm, an ``add`` or ``modify`` that leaves an association with a
+   default it cannot use is rejected with "these associations would not have
+   access to their default QOS". The check uses the evaluated list and the
+   inherited default, so ``modify user ... set qos=b`` fails when the account's
+   default ``a`` is not in it. Set ``defaultqos=b`` in the same command.
+   ``defaultqos`` alone, with no list anywhere above, is valid. It is the QOS a
+   job gets when it names none, and it does not limit which QOS the user may
+   name. To limit the user to it, also set ``qos=`` to that name.
 
 .. note::
 
@@ -496,6 +504,10 @@ Delete a QOS
 .. code-block:: bash
 
    sacctmgr delete qos name=highprio
+
+As in Slurm, deleting a QOS also removes it from every account and user
+``qos`` list and clears every ``defaultqos`` that names it. A list set with
+``qos=`` whose only name was the deleted QOS inherits again.
 
 Show QOS
 ~~~~~~~~
@@ -1490,12 +1502,17 @@ At submit, Spur resolves the job's QOS in this order, matching Slurm:
    exist`` or ``QOS 'X' is not permitted for user '…' under account '…'``.
 2. Otherwise the **default QOS**: the user's own, or the nearest account's
    when the user has none. It is used only when it still exists and is
-   permitted by the rule above. A default that exists but is not permitted
-   rejects the job. A stale default (deleted QOS) is ignored with a warning.
-3. Otherwise the cluster fallback **``accounting.default_qos``**. A configured
-   fallback that exists but is not permitted for the association is ignored with
-   a warning.
-4. Otherwise, if ``accounting.require_qos`` is ``true``, the job is **rejected**
+   permitted by the rule above. A default that is not permitted, or names a
+   deleted QOS, is ignored with a warning, as Slurm ignores a default that is
+   not in the association's list.
+3. Otherwise, when the association's evaluated list has exactly one QOS, that
+   QOS.
+4. Otherwise the cluster fallback **``accounting.default_qos``**, when it is
+   permitted.
+5. Otherwise, when a list applies to the association, the job is **rejected**
+   (``no permitted QOS resolves for user '…' under account '…'``). A restricted
+   association never runs a job with no QOS.
+6. Otherwise, if ``accounting.require_qos`` is ``true``, the job is **rejected**
    (``no QOS specified and no default QOS is configured for this user/account``).
    If ``require_qos`` is ``false``, the job runs with no QOS.
 

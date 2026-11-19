@@ -8,6 +8,9 @@
 //! `normal,burst` replaces the parent. `+expedite,-standby` adds and removes
 //! without forgetting the parent, so a later change above still flows down.
 //! A person is the last step, applied on top of their account.
+//!
+//! Slurm's root association always carries a list. Spur's top of the tree is
+//! "every QOS" instead, so a removal there starts from every QOS that exists.
 
 use std::collections::{HashMap, HashSet};
 
@@ -104,6 +107,10 @@ impl EffectiveQos {
     pub(crate) fn display(&self) -> String {
         self.names.join(",")
     }
+
+    pub(crate) fn permits(&self, qos: &str) -> bool {
+        !self.limited || self.names.iter().any(|name| name == qos)
+    }
 }
 
 /// Evaluated QOS list and default for one account, including what it
@@ -154,23 +161,111 @@ pub(crate) fn apply_write(current: Option<&str>, write: &QosWrite) -> Option<Str
     encode(&level)
 }
 
-pub(crate) fn evaluate_accounts(nodes: &[AccountNode<'_>]) -> HashMap<String, AccountEffect> {
+/// The stored edit with `name` dropped, which Slurm does to every
+/// association when a QOS is deleted. An exact list left empty inherits.
+pub(crate) fn strip_name(raw: Option<&str>, name: &str) -> Option<String> {
+    let level = match parse_level(raw) {
+        QosLevel::Inherit => QosLevel::Inherit,
+        QosLevel::Exact(mut names) => {
+            names.retain(|existing| existing != name);
+            QosLevel::Exact(names)
+        }
+        QosLevel::Adjust {
+            mut add,
+            mut remove,
+        } => {
+            add.retain(|existing| existing != name);
+            remove.retain(|existing| existing != name);
+            QosLevel::Adjust { add, remove }
+        }
+    };
+    encode(&level)
+}
+
+/// `universe` is every QOS that exists. It is the starting point for a
+/// removal when nothing above sets a list.
+pub(crate) fn evaluate_accounts(
+    nodes: &[AccountNode<'_>],
+    universe: &[String],
+) -> HashMap<String, AccountEffect> {
     let mut by_name: HashMap<&str, &AccountNode<'_>> = HashMap::new();
     for node in nodes {
         by_name.insert(node.name, node);
     }
     nodes
         .iter()
-        .map(|node| (node.name.to_owned(), effect_of(node.name, &by_name)))
+        .map(|node| {
+            (
+                node.name.to_owned(),
+                effect_of(node.name, &by_name, universe),
+            )
+        })
         .collect()
 }
 
 /// The user's own edit applied on top of the account's evaluated list.
-pub(crate) fn effective_user(user_raw: Option<&str>, account_qos: &EffectiveQos) -> EffectiveQos {
-    fold_qos(account_qos, &parse_level(user_raw))
+pub(crate) fn effective_user(
+    user_raw: Option<&str>,
+    account_qos: &EffectiveQos,
+    universe: &[String],
+) -> EffectiveQos {
+    fold_qos(account_qos, &parse_level(user_raw), universe)
 }
 
-fn effect_of(name: &str, by_name: &HashMap<&str, &AccountNode<'_>>) -> AccountEffect {
+/// One user's stored cells on their partition-less association.
+pub(crate) struct UserQos<'a> {
+    pub user: &'a str,
+    pub qos: Option<&'a str>,
+    pub default_qos: Option<&'a str>,
+}
+
+/// An association whose default QOS is not on its own evaluated list.
+/// `user` is `None` for the account itself.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeniedDefault<'a> {
+    pub user: Option<&'a str>,
+    pub default_qos: String,
+}
+
+/// The account (when `include_account`) and the given users under it whose
+/// default QOS they could not use. Slurm refuses a write that leaves any.
+pub(crate) fn defaults_without_access<'a>(
+    account: &AccountEffect,
+    users: &[UserQos<'a>],
+    universe: &[String],
+    include_account: bool,
+) -> Vec<DeniedDefault<'a>> {
+    let mut denied = Vec::new();
+    if include_account {
+        if let Some(default_qos) = &account.default_qos {
+            if !account.qos.permits(default_qos) {
+                denied.push(DeniedDefault {
+                    user: None,
+                    default_qos: default_qos.clone(),
+                });
+            }
+        }
+    }
+    for user in users {
+        let own_default = user.default_qos.filter(|qos| !qos.is_empty());
+        let Some(default_qos) = own_default.or(account.default_qos.as_deref()) else {
+            continue;
+        };
+        if !effective_user(user.qos, &account.qos, universe).permits(default_qos) {
+            denied.push(DeniedDefault {
+                user: Some(user.user),
+                default_qos: default_qos.to_owned(),
+            });
+        }
+    }
+    denied
+}
+
+fn effect_of(
+    name: &str,
+    by_name: &HashMap<&str, &AccountNode<'_>>,
+    universe: &[String],
+) -> AccountEffect {
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut cursor = Some(name);
@@ -189,7 +284,7 @@ fn effect_of(name: &str, by_name: &HashMap<&str, &AccountNode<'_>>) -> AccountEf
 
     let mut qos = EffectiveQos::unrestricted();
     for node in chain.iter().rev() {
-        qos = fold_qos(&qos, &parse_level(node.qos));
+        qos = fold_qos(&qos, &parse_level(node.qos), universe);
     }
     let default_qos = chain.iter().find_map(|node| {
         node.default_qos
@@ -199,16 +294,22 @@ fn effect_of(name: &str, by_name: &HashMap<&str, &AccountNode<'_>>) -> AccountEf
     AccountEffect { qos, default_qos }
 }
 
-fn fold_qos(parent: &EffectiveQos, level: &QosLevel) -> EffectiveQos {
+fn fold_qos(parent: &EffectiveQos, level: &QosLevel, universe: &[String]) -> EffectiveQos {
     match level {
         QosLevel::Inherit => parent.clone(),
         QosLevel::Exact(names) => EffectiveQos {
             limited: true,
             names: names.clone(),
         },
+        // Adding to "every QOS" changes nothing.
+        QosLevel::Adjust { remove, .. } if !parent.limited && remove.is_empty() => parent.clone(),
         QosLevel::Adjust { add, remove } => {
-            let mut names: Vec<String> = parent
-                .names
+            let base = if parent.limited {
+                &parent.names
+            } else {
+                universe
+            };
+            let mut names: Vec<String> = base
                 .iter()
                 .filter(|name| !remove.iter().any(|gone| gone == *name))
                 .cloned()
@@ -358,8 +459,15 @@ mod tests {
         }
     }
 
+    fn universe() -> Vec<String> {
+        ["normal", "burst", "expedite"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
     fn effect<'a>(nodes: &'a [AccountNode<'a>], name: &str) -> AccountEffect {
-        evaluate_accounts(nodes)
+        evaluate_accounts(nodes, &universe())
             .remove(name)
             .expect("account present")
     }
@@ -421,6 +529,117 @@ mod tests {
         let science = effect(&nodes, "science");
         assert!(!science.qos.limited);
         assert_eq!(science.qos.restriction(), None);
+        assert!(science.qos.permits("anything"));
+    }
+
+    #[test]
+    fn removing_from_an_unset_tree_keeps_every_other_qos() {
+        let nodes = [
+            node("root", None, None, None),
+            node("science", Some("root"), Some("-burst"), None),
+        ];
+        let science = effect(&nodes, "science");
+        assert_eq!(
+            science.qos.restriction().as_deref(),
+            Some("normal,expedite")
+        );
+        assert!(!science.qos.permits("burst"));
+    }
+
+    #[test]
+    fn adding_to_an_unset_tree_keeps_it_open() {
+        let nodes = [node("science", None, Some("+expedite"), None)];
+        let science = effect(&nodes, "science");
+        assert_eq!(science.qos.restriction(), None);
+    }
+
+    #[test]
+    fn a_user_removal_under_an_open_account_keeps_the_rest() {
+        let open = EffectiveQos::unrestricted();
+        let user = effective_user(Some("-burst"), &open, &universe());
+        assert_eq!(user.restriction().as_deref(), Some("normal,expedite"));
+    }
+
+    #[test]
+    fn a_child_can_add_back_what_its_parent_removed() {
+        let nodes = [
+            node("root", None, Some("-burst"), None),
+            node("physics", Some("root"), Some("+burst"), None),
+        ];
+        assert!(effect(&nodes, "physics").qos.permits("burst"));
+    }
+
+    #[test]
+    fn a_default_off_the_evaluated_list_is_denied() {
+        let nodes = [
+            node("root", None, Some("normal,burst"), Some("normal")),
+            node("physics", Some("root"), Some("-normal"), None),
+        ];
+        let physics = effect(&nodes, "physics");
+        let users = [
+            UserQos {
+                user: "alice",
+                qos: None,
+                default_qos: None,
+            },
+            UserQos {
+                user: "bob",
+                qos: Some("+normal"),
+                default_qos: None,
+            },
+            UserQos {
+                user: "carol",
+                qos: None,
+                default_qos: Some("burst"),
+            },
+        ];
+        assert_eq!(
+            defaults_without_access(&physics, &users, &universe(), true),
+            vec![
+                DeniedDefault {
+                    user: None,
+                    default_qos: "normal".into()
+                },
+                DeniedDefault {
+                    user: Some("alice"),
+                    default_qos: "normal".into()
+                },
+            ]
+        );
+        assert!(defaults_without_access(&physics, &users[1..], &universe(), false).is_empty());
+    }
+
+    #[test]
+    fn any_default_is_usable_when_no_list_applies() {
+        let nodes = [node("physics", None, None, Some("burst"))];
+        let users = [UserQos {
+            user: "alice",
+            qos: None,
+            default_qos: Some("normal"),
+        }];
+        assert!(
+            defaults_without_access(&effect(&nodes, "physics"), &users, &universe(), true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_a_qos_drops_it_from_every_form_of_edit() {
+        assert_eq!(
+            strip_name(Some("normal,burst"), "burst").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(strip_name(Some("burst"), "burst"), None);
+        assert_eq!(
+            strip_name(Some("+burst,-normal"), "burst").as_deref(),
+            Some("-normal")
+        );
+        assert_eq!(strip_name(Some("-burst"), "burst"), None);
+        assert_eq!(
+            strip_name(Some("normal"), "burst").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(strip_name(None, "burst"), None);
     }
 
     #[test]
@@ -442,13 +661,13 @@ mod tests {
         let physics = effect(&nodes, "physics");
         assert_eq!(physics.default_qos.as_deref(), Some("burst"));
 
-        let inherited = effective_user(None, &physics.qos);
+        let inherited = effective_user(None, &physics.qos, &universe());
         assert_eq!(inherited.names, vec!["normal".to_string()]);
 
-        let replaced = effective_user(Some("expedite"), &physics.qos);
+        let replaced = effective_user(Some("expedite"), &physics.qos, &universe());
         assert_eq!(replaced.names, vec!["expedite".to_string()]);
 
-        let added = effective_user(Some("+expedite"), &physics.qos);
+        let added = effective_user(Some("+expedite"), &physics.qos, &universe());
         assert_eq!(
             added.names,
             vec!["normal".to_string(), "expedite".to_string()]

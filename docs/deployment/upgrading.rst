@@ -79,15 +79,26 @@ Default QOS admission changes
   are affected. To keep the old limit, set ``qos=`` to the default on each one
   before upgrading, for example
   ``sacctmgr modify user name=alice account=physics set qos=normal``.
-- **A default QOS that is not on the allow-list is now rejected.** Before, a
+- **A default QOS that is not on the allow-list is now skipped.** Before, a
   job that named no QOS ran under the association's default even when the
-  default was missing from the ``qos=`` list. Now the job is refused with
-  ``default QOS 'X' is not permitted``. Rows whose ``Def QOS`` is not in their
-  ``QOS`` column are affected. Add the default to the list, or change the
-  default.
+  default was missing from the ``qos=`` list. Now, as in Slurm, the default is
+  ignored. The job gets the only QOS on the list, or the cluster
+  ``default_qos`` when the list includes it. Otherwise it is refused with
+  ``no permitted QOS resolves``. Rows whose ``Def QOS`` is not in their ``QOS``
+  column are affected. Add the default to the list, or change the default.
+  New writes that create such a row are refused.
+- **A job under a QOS list never runs with no QOS.** Before, a job that named
+  no QOS under an association with a ``qos=`` list but no usable default ran
+  with no QOS. Now it is refused unless the list has exactly one QOS. Give
+  those associations a ``defaultqos`` from their list.
+- **Deleting a QOS removes it from lists and defaults.** A list set with
+  ``qos=`` whose only name was the deleted QOS then inherits again, which can
+  widen what that association may use. Replace the list before deleting its
+  last QOS.
 
-**Rollback.** An older controller restores both old rules. Associations you
-gave an explicit ``qos=`` list keep it.
+**Rollback.** An older controller restores the old submit rules. Associations
+you gave an explicit ``qos=`` list keep it. Lists and defaults trimmed by a
+QOS deletion stay trimmed.
 
 Single-Host: ``spur self-update``
 ---------------------------------

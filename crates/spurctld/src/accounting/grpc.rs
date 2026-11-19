@@ -155,18 +155,17 @@ async fn qos_names_exist(pool: &PgPool, names: &[&str]) -> Result<(), Status> {
     Ok(())
 }
 
-/// Validate a QOS edit and its default before anything is written, and parse
-/// the edit. References are checked against the live DB, not `QosCache`, so a
-/// QOS created just now is accepted. Each check runs only for a field the
-/// request restated. A default is compared with the list only when both are
-/// an exact `qos=` list in the same request; submit enforces the rest.
+/// Validate the QOS names a write mentions and parse its edit. References
+/// are checked against the live DB, not `QosCache`, so a QOS created just now
+/// is accepted. Each check runs only for a field the request restated.
+/// Whether a default is usable is checked after the write, by
+/// [`check_default_qos_access`].
 async fn validated_qos_edit(
     pool: &PgPool,
     allowed_qos: Option<&str>,
     default_qos: Option<&str>,
 ) -> Result<Option<qos_level::QosWrite>, Status> {
-    let default_qos = default_qos.filter(|name| !name.is_empty());
-    if let Some(name) = default_qos {
+    if let Some(name) = default_qos.filter(|name| !name.is_empty()) {
         let exists = db::qos_exists(pool, name).await.map_err(internal)?;
         if !exists {
             return Err(Status::not_found(format!("QOS '{name}' does not exist")));
@@ -176,15 +175,51 @@ async fn validated_qos_edit(
         return Ok(None);
     };
     qos_names_exist(pool, &write.names()).await?;
-    if let (Some(name), qos_level::QosWrite::Exact(names)) = (default_qos, &write) {
-        if !names.iter().any(|listed| listed == name) {
-            return Err(Status::invalid_argument(format!(
-                "default QOS '{name}' must be included in qos={}",
-                names.join(",")
-            )));
-        }
-    }
     Ok(Some(write))
+}
+
+/// Refuse a write that leaves `account` (when `user` is `None`) or its users,
+/// or just `user` under it, unable to use their own default QOS, as Slurm
+/// does. Runs inside the write's transaction, so the evaluated lists include
+/// the write, and an error rolls it back.
+async fn check_default_qos_access(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    user: Option<&str>,
+) -> Result<(), Status> {
+    let accounts = db::list_accounts(&mut *conn).await.map_err(internal)?;
+    let universe = db::list_qos_names(&mut *conn).await.map_err(internal)?;
+    let effects = db::account_effects(&accounts, &universe);
+    let Some(effect) = effects.get(account) else {
+        return Ok(());
+    };
+    let cells = db::association_qos_cells(conn, account, user)
+        .await
+        .map_err(internal)?;
+    let users: Vec<qos_level::UserQos<'_>> = cells
+        .iter()
+        .map(|(user, qos, default_qos)| qos_level::UserQos {
+            user,
+            qos: qos.as_deref(),
+            default_qos: default_qos.as_deref(),
+        })
+        .collect();
+    let denied = qos_level::defaults_without_access(effect, &users, &universe, user.is_none());
+    if denied.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<String> = denied
+        .iter()
+        .map(|d| match d.user {
+            Some(user) => format!("DefQOS={} A={account} U={user}", d.default_qos),
+            None => format!("DefQOS={} A={account}", d.default_qos),
+        })
+        .collect();
+    Err(Status::invalid_argument(format!(
+        "these associations would not have access to their default QOS: {}. \
+         Add it to their qos list or change the default",
+        rows.join("; ")
+    )))
 }
 
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
@@ -875,6 +910,9 @@ impl SlurmAccounting for AccountingService {
         let result = db::upsert_account(&mut tx, &req.name, update)
             .await
             .map_err(internal)?;
+        if req.allowed_qos.is_some() || req.default_qos.is_some() || req.parent_account.is_some() {
+            check_default_qos_access(&mut tx, &req.name, None).await?;
+        }
         let details = txn::requested(&[
             ("description", req.description.map(Into::into)),
             ("organization", req.organization.map(Into::into)),
@@ -974,7 +1012,8 @@ impl SlurmAccounting for AccountingService {
         let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let effects = db::account_effects(&records);
+        let universe = db::list_qos_names(pool).await.map_err(internal)?;
+        let effects = db::account_effects(&records, &universe);
         let partial = allowed
             .as_ref()
             .is_some_and(|names| records.iter().any(|r| !names.iter().any(|n| n == &r.name)));
@@ -1052,6 +1091,9 @@ impl SlurmAccounting for AccountingService {
         let outcome = db::add_user(&mut tx, &req.user, &req.account, update)
             .await
             .map_err(internal)?;
+        if req.allowed_qos.is_some() || req.default_qos.is_some() {
+            check_default_qos_access(&mut tx, &req.account, Some(&req.user)).await?;
+        }
         write_txn_in_band(
             &mut tx,
             &audit,
@@ -1540,6 +1582,9 @@ impl SlurmAccounting for AccountingService {
         let req = request.into_inner();
         let mut tx = pool.begin().await.map_err(internal)?;
         db::delete_qos(&mut tx, &req.name).await.map_err(internal)?;
+        db::strip_qos_references(&mut tx, &req.name)
+            .await
+            .map_err(internal)?;
         write_txn_in_band(
             &mut tx,
             &audit,

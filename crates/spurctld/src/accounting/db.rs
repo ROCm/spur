@@ -1830,10 +1830,12 @@ pub async fn user_allowed_qos(
 }
 
 /// List all accounts.
-pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
+pub async fn list_accounts<'e>(
+    exec: impl sqlx::PgExecutor<'e>,
+) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
         "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres, allowed_qos, default_qos FROM accounts ORDER BY name"
-    ).fetch_all(pool).await?;
+    ).fetch_all(exec).await?;
 
     Ok(rows
         .iter()
@@ -2133,7 +2135,11 @@ pub async fn list_users_visible(
 
 /// Evaluated QOS list and default for every account, keyed by name. Takes the
 /// full set so a child still inherits from a parent the caller may not see.
-pub fn account_effects(records: &[AccountRecord]) -> HashMap<String, qos_level::AccountEffect> {
+/// `universe` is every QOS name, from [`list_qos_names`].
+pub fn account_effects(
+    records: &[AccountRecord],
+    universe: &[String],
+) -> HashMap<String, qos_level::AccountEffect> {
     let nodes: Vec<qos_level::AccountNode<'_>> = records
         .iter()
         .map(|account| qos_level::AccountNode {
@@ -2143,7 +2149,7 @@ pub fn account_effects(records: &[AccountRecord]) -> HashMap<String, qos_level::
             default_qos: account.default_qos.as_deref(),
         })
         .collect();
-    qos_level::evaluate_accounts(&nodes)
+    qos_level::evaluate_accounts(&nodes, universe)
 }
 
 /// Replace each user's raw QOS edit with the evaluated list, and fill in a
@@ -2154,13 +2160,15 @@ async fn apply_qos_inheritance(pool: &PgPool, users: &mut [UserRecord]) -> anyho
         return Ok(());
     }
     let accounts = list_accounts(pool).await?;
-    let effects = account_effects(&accounts);
+    let universe = list_qos_names(pool).await?;
+    let effects = account_effects(&accounts, &universe);
     let unrestricted = qos_level::EffectiveQos::unrestricted();
     for user in users.iter_mut() {
         let effect = effects.get(&user.account);
         let account_qos = effect.map_or(&unrestricted, |effect| &effect.qos);
         user.allowed_qos =
-            qos_level::effective_user(user.allowed_qos.as_deref(), account_qos).restriction();
+            qos_level::effective_user(user.allowed_qos.as_deref(), account_qos, &universe)
+                .restriction();
         if user.default_qos.is_none() {
             user.default_qos = effect.and_then(|effect| effect.default_qos.clone());
         }
@@ -2338,6 +2346,83 @@ pub async fn delete_qos(conn: &mut PgConnection, name: &str) -> anyhow::Result<(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Drop a deleted QOS from every account and user list and default, as Slurm
+/// does. Otherwise a QOS created later under the same name would silently
+/// regain every grant the old one had.
+pub async fn strip_qos_references(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
+    let accounts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, allowed_qos FROM accounts WHERE allowed_qos IS NOT NULL FOR UPDATE",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for (account, raw) in accounts {
+        if let Some(stripped) = stripped_edit(&raw, name) {
+            sqlx::query("UPDATE accounts SET allowed_qos = $1 WHERE name = $2")
+                .bind(stripped)
+                .bind(account)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+
+    let associations: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT id, allowed_qos FROM associations WHERE allowed_qos IS NOT NULL FOR UPDATE",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, raw) in associations {
+        if let Some(stripped) = stripped_edit(&raw, name) {
+            sqlx::query("UPDATE associations SET allowed_qos = $1 WHERE id = $2")
+                .bind(stripped)
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+
+    for clear in [
+        "UPDATE accounts SET default_qos = NULL WHERE default_qos = $1",
+        "UPDATE associations SET default_qos = NULL WHERE default_qos = $1",
+    ] {
+        sqlx::query(clear).bind(name).execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
+/// The new column value when `name` appears in `raw`, `None` when unchanged.
+fn stripped_edit(raw: &str, name: &str) -> Option<Option<String>> {
+    let stripped = qos_level::strip_name(Some(raw), name);
+    (stripped.as_deref() != Some(raw)).then_some(stripped)
+}
+
+/// Every QOS name. The starting point for a `qos-=` when nothing above the
+/// association sets a list.
+pub async fn list_qos_names<'e>(exec: impl sqlx::PgExecutor<'e>) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT name FROM qos ORDER BY name")
+        .fetch_all(exec)
+        .await?)
+}
+
+/// Raw `(user, allowed_qos, default_qos)` cells of the partition-less
+/// associations in `account`, or only `user`'s when given.
+pub async fn association_qos_cells(
+    conn: &mut PgConnection,
+    account: &str,
+    user: Option<&str>,
+) -> anyhow::Result<Vec<(String, Option<String>, Option<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT ON (user_name) user_name, allowed_qos, default_qos \
+         FROM associations \
+         WHERE account = $1 AND ($2::TEXT IS NULL OR user_name = $2) \
+             AND (partition_name IS NULL OR partition_name = '') \
+         ORDER BY user_name, id DESC",
+    )
+    .bind(account)
+    .bind(user)
+    .fetch_all(&mut *conn)
+    .await?)
 }
 
 pub async fn user_exists(conn: &mut PgConnection, name: &str) -> anyhow::Result<bool> {
@@ -4993,10 +5078,85 @@ mod job_history_tests {
         );
         assert_eq!(users[0].default_qos.as_deref(), Some("normal"));
 
-        let effects = account_effects(&list_accounts(&pool).await?);
+        let effects = account_effects(&list_accounts(&pool).await?, &list_qos_names(&pool).await?);
         assert_eq!(effects[&child].qos.display(), "normal,expedite");
         assert_eq!(effects[&child].default_qos.as_deref(), Some("normal"));
 
+        cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn deleting_a_qos_strips_it_from_lists_and_defaults() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qosstrip_user_{pid}");
+        let account = format!("spur_qosstrip_acct_{pid}");
+        let doomed = format!("spur_qosstrip_qos_{pid}");
+        let cleanup = || async {
+            sqlx::query("DELETE FROM associations WHERE user_name = $1")
+                .bind(&user)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM users WHERE name = $1")
+                .bind(&user)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(&account)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM qos WHERE name = $1")
+                .bind(&doomed)
+                .execute(&pool)
+                .await?;
+            anyhow::Ok(())
+        };
+        cleanup().await?;
+
+        let mut conn = pool.acquire().await?;
+        upsert_qos(&mut conn, &doomed, QosUpdate::default()).await?;
+        upsert_account(
+            &mut conn,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some(&format!("normal,{doomed}"))),
+                default_qos: Some(Some(&doomed)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &mut conn,
+            &user,
+            &account,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                allowed_qos: Some(Some(&format!("-{doomed}"))),
+                default_qos: Some(Some(&doomed)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        delete_qos(&mut conn, &doomed).await?;
+        strip_qos_references(&mut conn, &doomed).await?;
+
+        let accounts = list_accounts(&pool).await?;
+        let record = accounts
+            .iter()
+            .find(|a| a.name == account)
+            .ok_or_else(|| anyhow::anyhow!("account missing"))?;
+        assert_eq!(record.allowed_qos.as_deref(), Some("normal"));
+        assert_eq!(record.default_qos, None);
+        let cells = association_qos_cells(&mut conn, &account, Some(&user)).await?;
+        assert_eq!(cells, vec![(user.clone(), None, None)]);
+
+        drop(conn);
         cleanup().await?;
         Ok(())
     }

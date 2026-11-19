@@ -1364,6 +1364,11 @@ class TestSacctmgrQosAuthorization:
         c.sacctmgr(["add", "account", "name=staleacct"])
         c.sacctmgr(["add", "user", f"name={user}", "account=staleacct", "defaultqos=stalegoal"])
         c.sacctmgr(["delete", "qos", "name=stalegoal"])
+
+        # Like Slurm, deleting a QOS also clears the defaults that named it.
+        shown = c.sacctmgr(["show", "user", f"user={user}"])
+        row = next(ln for ln in shown.splitlines() if "staleacct" in ln)
+        assert "stalegoal" not in row, f"deleted QOS must leave the default:\n{shown}"
         time.sleep(15)
 
         script = c.write_file("qos-stale-default.sh", "#!/bin/bash\ntrue\n")
@@ -1374,17 +1379,23 @@ class TestSacctmgrQosAuthorization:
         wait_job(c, job_id, timeout=30)
 
     def test_cluster_fallback_qos_withheld_when_outside_association_allow_list(self, accounting_cluster):
-        # A restricted association omitting --qos must not silently receive
-        # the cluster-wide fallback QOS when that fallback isn't in its
-        # allow-list — closes the gap where the fallback chain bypassed
-        # per-association authorization entirely.
+        # A restricted association omitting --qos must never receive a
+        # cluster fallback that isn't on its list. As in Slurm, a list of one
+        # resolves to that QOS, and a longer list with no usable default
+        # rejects the job instead of running it with no QOS.
         c = accounting_cluster
         user = c.nodes[0].user
 
         c.sacctmgr(["add", "qos", "name=fallbackqos"])
         c.sacctmgr(["add", "qos", "name=restrictedqos"])
+        c.sacctmgr(["add", "qos", "name=restrictedqos2"])
         c.sacctmgr(["add", "account", "name=fallbackacct"])
+        c.sacctmgr(["add", "account", "name=fallbackwide"])
         c.sacctmgr(["add", "user", f"name={user}", "account=fallbackacct", "qos=restrictedqos"])
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=fallbackwide",
+             "qos=restrictedqos,restrictedqos2"]
+        )
 
         deep_merge(c.config_overrides, {"accounting": {"default_qos": "fallbackqos"}})
         c._write_config()
@@ -1395,13 +1406,42 @@ class TestSacctmgrQosAuthorization:
         job_id = parse_job_id(
             c.sbatch(["-J", "qos-fallback", "-N", "1", "-A", "fallbackacct", script])
         )
-        assert job_id is not None, "job with no --qos must still be accepted"
+        assert job_id is not None, "a list of one must resolve to that QOS"
         wait_job(c, job_id, timeout=30)
-
         show = c.scontrol("show", "job", str(job_id))
-        assert "QOS=fallbackqos" not in show, (
-            f"unauthorized cluster fallback must not be silently granted: {show!r}"
+        assert "QOS=restrictedqos" in show, f"expected the only allowed QOS: {show!r}"
+
+        out = c.cli_allow_fail(["sbatch", "-J", "qos-none", "-N", "1", "-A", "fallbackwide", script])
+        assert "no permitted QOS" in out, f"expected a rejection, got {out!r}"
+
+    def test_default_qos_must_be_on_the_associations_list(self, accounting_cluster):
+        # Slurm refuses an association write that leaves it unable to use its
+        # own default, whether the write changes the list or the default.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=deflista"])
+        c.sacctmgr(["add", "qos", "name=deflistb"])
+        c.sacctmgr(["add", "account", "name=deflist", "qos=deflista,deflistb", "defaultqos=deflista"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=deflist"])
+
+        out = c.cli_allow_fail(
+            ["sacctmgr", "modify", "user", f"name={user}", "account=deflist", "set", "qos=deflistb"]
         )
+        assert "default QOS" in out, f"a list without the inherited default must be refused: {out!r}"
+
+        out = c.cli_allow_fail(
+            ["sacctmgr", "modify", "account", "name=deflist", "set", "qos-=deflista"]
+        )
+        assert "default QOS" in out, f"removing the account default must be refused: {out!r}"
+
+        c.sacctmgr(
+            ["modify", "user", f"name={user}", "account=deflist", "set",
+             "qos=deflistb", "defaultqos=deflistb"]
+        )
+        shown = c.sacctmgr(["show", "user", f"user={user}"])
+        row = next(ln for ln in shown.splitlines() if "deflist" in ln)
+        assert "deflistb" in row and "deflista" not in row, f"expected the new list:\n{shown}"
 
     def test_update_job_qos_rejects_unauthorized_and_account_spoofing(self, accounting_cluster):
         # scontrol update job qos= must enforce the same per-association

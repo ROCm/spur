@@ -2077,7 +2077,8 @@ message CreateAccountRequest {
   optional string allowed_qos = 8;
   // Default QOS for this account and its children, used when a user has none
   // of their own. Unset preserves it; empty clears it back to the parent's.
-  // A job may use it only when it is also on the evaluated allow-list.
+  // A write that leaves this account or one of its users with a default off
+  // their evaluated allow-list is rejected.
   optional string default_qos = 9;
 }
 
@@ -2141,9 +2142,9 @@ message AddUserRequest {
   optional uint32 max_wall_minutes = 10;
   // QOS edit for this association, same forms as CreateAccountRequest.allowed_qos.
   // Unset preserves the stored edit; empty inherits from the account again.
-  // With no edit stored anywhere above the user, any QOS is allowed.
-  // default_qos must be a member of an exact qos= list when both are set in
-  // the same request.
+  // With no edit stored anywhere above the user, any QOS is allowed. The write
+  // is rejected when the user's default, own or inherited, is then off the
+  // evaluated list.
   optional string allowed_qos = 11;
   // Max submitted (pending + running) jobs across all users in the account.
   optional uint32 grp_submit_jobs = 12;
