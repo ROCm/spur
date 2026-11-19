@@ -1778,12 +1778,61 @@ pub fn deliver_signal(
     }
 }
 
-/// Signals everything under the launcher `pid`, then the launcher itself if
-/// `sig` is one it must get. Walks the tree, not the process group, so a process
-/// that left the tree is missed; teardown's SIGKILL escalation covers that.
+/// Signals everything the launcher `pid` started, then the launcher itself if
+/// `sig` is one it must get. That is what a signal to the launcher's process
+/// group used to reach, minus the launcher, plus descendants that left the group.
 pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
-    kill_descendants(pid, sig);
+    signal_pids_except(&launcher_workload_pids(pid), sig, None);
     signal_launcher(Some(pid), tracked, sig);
+}
+
+/// The launcher's descendants, deepest first, then the rest of its process group
+/// for whatever was reparented out of the tree.
+fn launcher_workload_pids(launcher: i32) -> Vec<i32> {
+    let mut pids = descendant_pids(launcher);
+    for member in process_group_members(launcher) {
+        if member != launcher && !pids.contains(&member) {
+            pids.push(member);
+        }
+    }
+    pids
+}
+
+fn descendant_pids(pid: i32) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for child in get_child_pids(pid) {
+        pids.extend(descendant_pids(child));
+        pids.push(child);
+    }
+    pids
+}
+
+/// Every process in the group `leader` leads. A process that merely belongs to
+/// a group does not own it, and its group may hold the supervisor and others.
+fn process_group_members(leader: i32) -> Vec<i32> {
+    if process_group_of(leader) != Some(leader) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| process_group_of(*pid) == Some(leader))
+        .collect()
+}
+
+/// The stat field after the state and parent pid, read past the closing paren
+/// of the command name, which may itself contain spaces.
+fn process_group_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 fn signal_launcher(launcher: Option<i32>, tracked: TrackedProcess, sig: Signal) {
@@ -1947,13 +1996,21 @@ fn kill_descendants(pid: i32, sig: Signal) {
     }
 }
 
-/// Read immediate child PIDs from /proc/<pid>/task/<pid>/children.
+/// Immediate children of `pid`. Linux lists a child under the thread that forked
+/// it, so every thread's file is read, not just the main thread's.
 fn get_child_pids(pid: i32) -> Vec<i32> {
-    let path = format!("/proc/{}/task/{}/children", pid, pid);
-    std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    threads
+        .flatten()
+        .flat_map(|thread| {
+            std::fs::read_to_string(thread.path().join("children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|child| child.parse().ok())
+                .collect::<Vec<i32>>()
+        })
         .collect()
 }
 
@@ -5290,6 +5347,206 @@ mod tests {
         assert!(
             msg.contains("failed to join cgroup"),
             "unexpected message: {msg}"
+        );
+    }
+
+    /// Set only by the tests below when they re-run this test binary as a
+    /// multithreaded workload.
+    const WORKLOAD_HELPER_ENV: &str = "SPURD_TEST_MULTITHREADED_WORKLOAD";
+
+    /// A workload whose worker thread, not its main thread, forks the helper
+    /// subprocess, which leaves the workload's process group. A no-op unless a
+    /// test below re-executes the binary to run it.
+    #[test]
+    fn multithreaded_workload_helper() {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os(WORKLOAD_HELPER_ENV).is_none() {
+            return;
+        }
+        std::thread::spawn(|| {
+            let helper = std::process::Command::new("sleep")
+                .arg("3600")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the helper");
+            println!("ready {}", helper.id());
+            // The forking thread has to outlive the helper, or the kernel hands
+            // the helper to another thread and the listing no longer depends on it.
+            loop {
+                std::thread::park();
+            }
+        });
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A stand-in process and the helper it announced, both killed when it goes
+    /// out of scope.
+    struct StandIn {
+        leader: i32,
+        helper: i32,
+        own_group: bool,
+        child: std::process::Child,
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            // The helper can sit in a group of its own, so it is killed by pid.
+            let _ = signal::kill(Pid::from_raw(self.helper), Signal::SIGKILL);
+            if self.own_group {
+                let _ = signal::killpg(Pid::from_raw(self.leader), Signal::SIGKILL);
+            } else {
+                let _ = signal::kill(Pid::from_raw(self.leader), Signal::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Starts `command` and waits for the `ready <pid>` line that names its
+    /// helper. With `own_group` it leads a process group of its own.
+    fn spawn_stand_in(mut command: std::process::Command, own_group: bool) -> StandIn {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        if own_group {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("spawn the stand-in");
+        let leader = child.id() as i32;
+        let stdout = child.stdout.take().expect("stand-in stdout");
+        let helper = std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            // The test harness leaves its own `test <name> ... ` text on the same line.
+            .find_map(|line| line.rsplit_once("ready ")?.1.parse().ok())
+            .expect("the stand-in announces its helper");
+        StandIn {
+            leader,
+            helper,
+            own_group,
+            child,
+        }
+    }
+
+    fn multithreaded_workload() -> StandIn {
+        let helper_test = module_path!()
+            .split_once("::")
+            .map(|(_, module)| format!("{module}::multithreaded_workload_helper"))
+            .expect("the tests live in a module of the crate");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args(["--exact", &helper_test, "--nocapture", "--test-threads=1"])
+            .env(WORKLOAD_HELPER_ENV, "1");
+        spawn_stand_in(command, true)
+    }
+
+    /// The process state letter, or `None` once the process is gone.
+    fn state_of(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    /// Polls for `want` for up to ~2s: a signal's effect lands after `kill` returns.
+    fn await_state(pid: i32, want: &[Option<char>]) -> Option<char> {
+        for _ in 0..200 {
+            if want.contains(&state_of(pid)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        state_of(pid)
+    }
+
+    #[test]
+    fn a_child_forked_by_a_secondary_thread_is_listed_under_its_process() {
+        let (forked_tx, forked_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let forker = std::thread::spawn(move || {
+            let mut child = std::process::Command::new("sleep")
+                .arg("3600")
+                .spawn()
+                .expect("spawn the child");
+            forked_tx.send(child.id() as i32).expect("report the child");
+            // Parked so the child stays listed under this thread.
+            let _ = done_rx.recv();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let child = forked_rx.recv().expect("the forked child");
+
+        let listed = get_child_pids(std::process::id() as i32);
+
+        done_tx.send(()).expect("release the forking thread");
+        forker.join().expect("forking thread");
+        assert!(listed.contains(&child), "{listed:?} lacks {child}");
+    }
+
+    #[test]
+    fn a_launcher_stop_reaches_a_helper_forked_by_a_worker_thread() {
+        let launcher = multithreaded_workload();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(launcher.helper, &[Some('T')]), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_term_reaches_a_helper_forked_by_a_worker_thread() {
+        let launcher = multithreaded_workload();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGTERM);
+
+        // The workload never reaps its helper, so it is a zombie once it dies.
+        assert_eq!(await_state(launcher.helper, &[Some('Z'), None]), Some('Z'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('Z'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_stop_reaches_a_process_that_only_shares_its_group() {
+        let mut command = std::process::Command::new("/bin/sh");
+        // The subshell exits at once, so the sleep it started is no longer a
+        // descendant of the launcher but is still in its group.
+        command
+            .arg("-c")
+            .arg("(sleep 3600 & echo ready $!); sleep 3600");
+        let launcher = spawn_stand_in(command, true);
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(launcher.helper, &[Some('T')]), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_that_does_not_lead_its_group_has_no_group_to_signal() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 3600 & echo ready $!; wait");
+        let launcher = spawn_stand_in(command, false);
+
+        assert!(process_group_members(launcher.leader).is_empty());
+        assert!(process_group_members(launcher.helper).is_empty());
+        // The launcher shares the group of this test binary, which is not its own.
+        assert_ne!(
+            // SAFETY: getpgid only reads the process table.
+            unsafe { libc::getpgid(launcher.leader) },
+            launcher.leader
         );
     }
 }

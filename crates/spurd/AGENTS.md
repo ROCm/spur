@@ -492,7 +492,9 @@ metrics).
   the supervisor would report the step finished while the workload still runs.
   `executor::deliver_signal` and `RunningJob::signal_workload` therefore deliver
   every signal except KILL to the cgroup's members minus the launcher's pid, or
-  without a cgroup to the launcher's descendants instead of the process group.
+  without a cgroup to the launcher's descendants (children of every thread, not
+  only the main one) plus the rest of its process group, instead of signalling
+  the group, which takes the launcher with it.
   Whether the launcher gets the signal too is per signal
   (`TrackedProcess::spares_launcher`):
   - SIGKILL reaches it first, so it cannot relay the dying workload's status as
