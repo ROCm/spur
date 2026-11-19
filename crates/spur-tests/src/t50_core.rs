@@ -481,7 +481,7 @@ mod tests {
         }
     }
 
-    // ── T50.45: Interactive flag ────────────────────────────────
+    // ── T50.46: Interactive flag ────────────────────────────────
 
     #[test]
     fn t50_46_interactive_default_false() {
@@ -489,7 +489,7 @@ mod tests {
         assert!(!spec.interactive);
     }
 
-    // ── T50.47–49: MPI / distribution fields ────────────────────
+    // ── T50.47–48: MPI / distribution fields ────────────────────
 
     #[test]
     fn t50_47_mpi_field_default_none() {
@@ -503,7 +503,7 @@ mod tests {
         assert!(spec.distribution.is_none());
     }
 
-    // ── T50.50–52: Heterogeneous job fields ────────────────────
+    // ── T50.49b–50: MPI list and heterogeneous job fields ───────
 
     #[test]
     fn t50_49b_mpi_list_lines() {
@@ -554,7 +554,7 @@ mod tests {
         assert_eq!(StepState::Cancelled.display(), "CANCELLED");
     }
 
-    // ── T50.57–58: Burst buffer field ─────────────────────────────
+    // ── T50.58: Burst buffer field ────────────────────────────────
 
     #[test]
     fn t50_58_burst_buffer_default_none() {
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(node.state, NodeState::Suspended);
     }
 
-    // ── T50.63–70: Begin time, deadline, spread_job, open_mode fields ──
+    // ── T50.66, T50.68–70: Begin time, deadline, spread_job, open_mode fields ──
 
     #[test]
     fn t50_66_spread_job_default_false() {
@@ -621,7 +621,7 @@ mod tests {
         assert!(JobSpec::default().deadline.is_none());
     }
 
-    // ── T50.71–72: Reservation field on JobSpec ─────────────────
+    // ── T50.72: Reservation field on JobSpec ────────────────────
 
     #[test]
     fn t50_72_reservation_default_none() {
@@ -652,9 +652,7 @@ mod tests {
         assert_eq!(expanded[0], "ubb-r09-01");
     }
 
-    // ── T50.80–87: (renumbered from previous 75–81) ───────────────
-
-    // ── T50.82–85: Federation config parsing ─────────────────────
+    // ── T50.82 and T50.85: Federation config parsing ─────────────
 
     #[test]
     fn t50_82_federation_config_default_empty() {
@@ -682,7 +680,7 @@ address = "http://peer-a:6817"
         assert_eq!(cfg.federation.clusters[0].name, "peer-a");
     }
 
-    // ── T50.89-91: default partition, pending reason, exec routing ──
+    // ── T50.90: Pending reason when no nodes ─────────────────────
 
     #[test]
     fn t50_90_pending_reason_resources_when_no_nodes() {

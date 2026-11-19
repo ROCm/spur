@@ -23,7 +23,7 @@ mod tests {
         assert!(!spec.hold);
     }
 
-    // ── T17.4: Job creation ──────────────────────────────────────
+    // ── T17.5–7: Job creation ────────────────────────────────────
 
     #[test]
     fn t17_5_job_submit_time_set() {

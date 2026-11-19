@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");
     }
 
-    // ── T07.18–20: Federation peer config ────────────────────────
+    // ── T07.18: Federation peer config ───────────────────────────
 
     #[test]
     fn t07_18_federation_no_peers_by_default() {
@@ -483,7 +483,7 @@ mod tests {
         assert!(fed.clusters.is_empty());
     }
 
-    // ── T07.21–23: Power management state transitions ─────────────
+    // ── T07.21–22: Power management state transitions ────────────
 
     #[test]
     fn t07_21_suspended_node_not_schedulable() {

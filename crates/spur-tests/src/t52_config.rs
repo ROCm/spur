@@ -195,7 +195,7 @@ plugin = "backfill"
         assert_eq!(config.scheduler.default_time_limit_minutes, 0);
     }
 
-    // ── T52.15–17: listen_addr from config ────────────────────────
+    // ── T52.15–16: listen_addr from config ───────────────────────
 
     #[test]
     fn t52_15_listen_addr_preserved_from_config() {
