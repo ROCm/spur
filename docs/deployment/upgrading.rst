@@ -1168,13 +1168,18 @@ Node epilog after a failed launch
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The node ``epilog`` now also runs when a launch fails after the node
-``prolog`` ran, before the agent reports the failure. Before, nothing undid
-the prolog for a job that never started, so whatever it wrote, such as the
-exporter label files in :doc:`/admin-guide/dme-integration`, stayed on the
-node. An epilog that assumes the job ran, for example one that reads the
-job's output, now also sees jobs that never started. It gets the same
-environment as the prolog, and a failure drains the node as it does after a
-normal job.
+``prolog`` ran but before the job's supervisor started, before the agent
+reports the failure. Before, nothing undid the prolog for such a job, so
+whatever it wrote, such as the exporter label files in
+:doc:`/admin-guide/dme-integration`, stayed on the node. An epilog that
+assumes the job ran, for example one that reads the job's output, now also
+sees jobs that never started. It gets the same environment as the prolog.
+The job's resources on the node stay held until it exits, even if the job is
+cancelled meanwhile; if it fails, they stay held until the controller has
+drained the node.
+
+A launch that fails after the supervisor started, and a supervisor the agent
+loses, still do not run the node ``epilog``.
 
 See Also
 --------
