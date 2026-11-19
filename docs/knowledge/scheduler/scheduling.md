@@ -229,6 +229,13 @@ snapshot in the state machine's lock order and retains only placement/policy
 metadata (including suspension timing and live node responsiveness) and still-held
 resource slices. Both compact node copies preserve `not_responding`, so trials
 reject unresponsive nodes through the same placement gate as normal scheduling.
+`placement_job` retains `cpus_per_gpu`; `placement_node` retains `core_layout`
+and `layout_blocked_cpus`. Allocation copies and trial resets preserve
+`reserved_cpus` and `layout_fingerprint`. Release credit follows the node's
+current layout, so an older-layout victim cannot release another holder's
+reserved CPU charge. Immediate trials seed blocked GPUs and refresh timeline
+CPU pools using the same rules as normal placement. Layout lists and blocked
+GPU entries count toward the input and work bounds.
 Protected, reserved-pending, suspended, completing, grace-period, and same-cycle
 allocations remain charged. Unaccounted occupancy is retained; missing or
 inconsistent slices grant no release credit.
@@ -329,34 +336,54 @@ exists. Heterogeneous job groups and GPU property/fabric-binding requests defer.
 
 #### Performance assessment
 
-The common path reduces full placement calls when local sufficient groups pass
-verification, particularly when many victims are necessary. It still scans
-candidate nodes, calculates local shortfalls and ranks groups; one full trial
-does not mean constant work or a proportional latency improvement. GPU matching
-and partition charges also affect the cost of each local resource check.
+All releases in this comparison are hypothetical; only a verified final victim
+set can authorize eviction. The eligibility gates above decide the current path.
 
-Fallback bisection reduces growth trials for large necessary prefixes, but can
-make more full calls than linear growth when an early victim alone suffices.
-Mostly one-/two-node incoming jobs therefore do not establish a performance win:
-eligible victim widths and the partition gates determine which path runs.
-Pruning and all preparation remain charged against the bounded search budget.
+```text
+Earlier linear search                 Current search
+---------------------                 --------------
+Full trial: none, then all             Direct-path gates pass?
+  |                                     | yes                | no
+Add one victim                          v                    |
+  -> full trial                       Per-node local checks  |
+Repeat until fit                      + local pruning        |
+  |                                   (sequential)           |
+Restore each selected victim            |                    |
+  -> full trial                       Rank enough groups     |
+Repeat pruning until stable             |                    |
+  |                                   One full verification  |
+Accept verified set                     | fits     | fails   |
+                                        v          v         v
+                                      Accept      Bounded fallback:
+                                                  none/all full trials
+                                                  + prefix bisection
+                                                  + full-trial pruning
+```
 
-Both paths use temporary snapshots and mutable trial state. The common path
-also uses per-node groups and node indices, trading temporary storage for fewer
-scans. Projections are reused; trial count does not multiply the number of live
-snapshots. Inline type sizes and selected container payloads exclude owned heap
-contents, spare capacity and allocator overhead, so they are not total RSS or a
-measurement of the net memory difference between algorithms.
+**CPU trade-off:** local checks reduce full placement calls when the common path
+succeeds, especially with many necessary victims. They still scan candidate
+nodes and rank groups. Bisection reduces fallback growth checks for large
+necessary prefixes, but can need more full calls than linear growth when one
+early victim suffices. Incoming node count alone does not predict the winner:
+eligible victim widths and partition policies determine which path runs.
+For a supported one-node request needing all 64 victims, the loop counts are
+130 full trials versus 130 local checks plus one full trial. Those operations
+have different costs; this is not a measured 130-fold speedup.
 
-The available mixed-workload timing evidence compares candidate/index processing
-within the implementation that already has the common path and bisection. Those
-fixtures use fallback. Their similar selection latency and process RSS do not
-establish a speedup over the original linear search, or an end-to-end scheduler
-speedup; snapshot construction and dispatch are outside that timing interval.
-Unoptimized test-process measurements are not production latency or memory
-bounds. An overall performance claim for mostly one-/two-node workloads still
-needs a direct original/current comparison with the same victim layouts and
-partition policies, including cases needing only one or two victims.
+**Memory trade-off:** selection uses temporary snapshots, per-node groups and
+indices; it adds no persisted controller allocation map or Raft record. Trial
+state is reused, so more calls do not mean more simultaneous snapshots. All
+preparation and pruning remain bounded; metadata limits and selected payload
+sizes are not total RSS limits or measurements of the net memory increase.
+
+**Performance verdict:** fewer full placement calls are established; an overall
+latency win for mostly one-/two-node workloads is not. Existing mixed-workload
+measurements compare the later candidate/index processing within the current
+algorithm, use fallback, and show similar selection latency and process RSS.
+They exclude snapshot construction and dispatch, use an unoptimized build, and
+do not compare the original linear search against the current method. A direct
+comparison still needs identical victim layouts and partition policies, including
+cases needing only one or two victims.
 
 The [worked search-cost comparisons](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-search-cost-comparisons),
 [temporary-memory calculations](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-temporary-memory-example),

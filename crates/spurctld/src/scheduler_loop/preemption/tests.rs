@@ -33,6 +33,8 @@ impl Fixture {
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::PCIe,
                     topology: None,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -65,7 +67,7 @@ impl Fixture {
         eligible: bool,
     ) {
         let node = &mut self.nodes[index];
-        node.alloc_resources.add(&allocation);
+        node.hold(&allocation);
         let mut job = Job::new(id, JobSpec::default());
         job.state = JobState::Running;
         job.allocated_nodes = vec![node.name.clone()];
@@ -134,6 +136,185 @@ fn request(cpus: u32, memory: u64) -> Job {
 
 fn selected(fixture: &Fixture, request: &Job) -> Option<HashSet<JobId>> {
     fixture.select(request, &mut SearchBudget::default())
+}
+
+fn reserved_cpu_fixture() -> Fixture {
+    use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+    let mut f = Fixture::new(12);
+    f.nodes[0].core_layout = Some(CoreLayout {
+        gpu_reserved: (0..4)
+            .map(|i| GpuReservedCpus {
+                stable_id: 1000 + u64::from(i),
+                cpus: vec![2 * i, 2 * i + 1],
+            })
+            .collect(),
+        general_cpus: vec![8, 9, 10, 11],
+        ..Default::default()
+    });
+    f.nodes[0].sync_reserved_tag();
+    f
+}
+
+fn reserved_gpu_slice(f: &Fixture, gpu: u64) -> ResourceAllocations {
+    let mut alloc = ResourceAllocations::with_scalar(2, 1);
+    alloc.add(&ResourceAllocations::from_device_ids("gpu", &[gpu]));
+    f.nodes[0]
+        .core_layout
+        .as_ref()
+        .expect("layout")
+        .stamp(&mut alloc);
+    alloc
+}
+
+#[test]
+fn per_gpu_cpu_requirement_survives_trial_preparation() {
+    let mut f = Fixture::new(8);
+    f.hold(1, 4, 1, &[], false);
+    f.hold(2, 2, 1, &[], true);
+    f.hold(3, 2, 1, &[], true);
+    let mut incoming = request(1, 1);
+    incoming.spec.gpus_per_node = Some(GpuRequest {
+        count: 1,
+        gpu_type: None,
+    });
+    incoming.spec.cpus_per_gpu = Some(4);
+    assert_eq!(selected(&f, &incoming), Some(HashSet::from([2, 3])));
+}
+
+#[test]
+fn victim_selection_frees_general_cpus_instead_of_reserved_cpus() {
+    let mut f = reserved_cpu_fixture();
+    f.hold_on(0, 1, reserved_gpu_slice(&f, 1000), true);
+    f.hold(2, 2, 1, &[], true);
+    f.hold(3, 2, 1, &[], false);
+    assert_eq!(selected(&f, &request(2, 1)), Some(HashSet::from([2])));
+}
+
+#[test]
+fn protected_gpu_holder_keeps_its_reserved_cpu_charge() {
+    let mut f = reserved_cpu_fixture();
+    f.hold_on(0, 1, reserved_gpu_slice(&f, 1000), false);
+    f.hold(2, 4, 1, &[], true);
+    assert_eq!(selected(&f, &request(4, 1)), Some(HashSet::from([2])));
+}
+
+#[test]
+fn old_layout_victim_does_not_release_another_holders_reserved_charge() {
+    let mut f = reserved_cpu_fixture();
+    let mut old = reserved_gpu_slice(&f, 1000);
+    old.layout_fingerprint ^= 1;
+    f.hold_on(0, 1, old, true);
+    f.hold_on(0, 2, reserved_gpu_slice(&f, 1001), false);
+    f.hold(3, 2, 1, &[], false);
+    assert_eq!(selected(&f, &request(2, 1)), Some(HashSet::from([1])));
+    f.nodes[0].partitions = vec!["default".into()];
+    f.partitions.push(spur_core::partition::Partition {
+        name: "default".into(),
+        def_mem_per_node: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(selected(&f, &request(2, 1)), Some(HashSet::from([1])));
+}
+
+#[test]
+fn projection_reset_restores_reserved_cpu_accounting() {
+    let mut f = reserved_cpu_fixture();
+    let slice = reserved_gpu_slice(&f, 1000);
+    f.hold_on(0, 1, slice.clone(), true);
+    let incoming = request(4, 1);
+    let mut budget = SearchBudget::default();
+    let mut projection =
+        PlacementProjection::new(&incoming, &f.state(), &mut budget, InputSize::default())
+            .expect("projection");
+    projection.release("n1", &slice);
+    projection.reset();
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    assert!(BackfillScheduler::new(1)
+        .place_releasing(&projection, now, &mut budget)
+        .expect("trial")
+        .is_some());
+}
+
+#[test]
+fn reused_trial_timelines_refresh_cpu_pools() {
+    let mut f = Fixture::new(12);
+    f.hold(1, 4, 1, &[], false);
+    let mut reserved = reserved_cpu_fixture();
+    reserved.hold(1, 4, 1, &[], false);
+    let incoming = request(2, 1);
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    let mut budget = SearchBudget::default();
+    let mut scheduler = BackfillScheduler::new(1);
+    for (fixture, fits) in [(&f, true), (&reserved, false), (&f, true)] {
+        let prepared = PlacementRequest::new(&incoming, &fixture.state(), &mut budget)
+            .expect("prepared request");
+        assert_eq!(
+            scheduler
+                .place_now(&prepared, &fixture.state(), now, &mut budget)
+                .expect("trial")
+                .is_some(),
+            fits,
+        );
+    }
+}
+
+#[test]
+fn trial_preserves_gpus_blocked_by_an_older_layout() {
+    let mut f = reserved_cpu_fixture();
+    f.nodes[0].layout_blocked_cpus = (1000..1004).map(|id| (id, 1)).collect();
+    f.hold(1, 4, 100, &[], true);
+    let mut incoming = request(1, 1);
+    incoming.spec.gpus_per_node = Some(GpuRequest {
+        count: 1,
+        gpu_type: None,
+    });
+    assert_eq!(selected(&f, &incoming), None);
+}
+
+#[test]
+fn oversized_core_layout_defers_before_trial_copying() {
+    let mut f = reserved_cpu_fixture();
+    f.nodes[0]
+        .core_layout
+        .as_mut()
+        .expect("layout")
+        .general_cpus = vec![0; spur_sched::immediate::MAX_ENTRIES + 1];
+    assert!(
+        PlacementRequest::new(&request(1, 1), &f.state(), &mut SearchBudget::default()).is_none()
+    );
+}
+
+#[test]
+fn blocked_gpu_seeding_is_bounded_outside_the_request_scope() {
+    let mut f = Fixture::new(4);
+    let mut other = f.nodes[0].clone();
+    other.name = "other".into();
+    let gpu = other.total_resources.gpus[0].clone();
+    other.total_resources.gpus = (0..128)
+        .map(|id| GpuResource {
+            device_id: id,
+            stable_id: u64::from(id),
+            ..gpu.clone()
+        })
+        .collect();
+    other.layout_blocked_cpus = (0..128).map(|id| (id, 1)).collect();
+    f.nodes.push(other);
+    let mut incoming = request(1, 1);
+    incoming.spec.nodelist = Some("n1".into());
+    let mut budget = SearchBudget {
+        work_left: 10_000,
+        ..Default::default()
+    };
+    let prepared =
+        PlacementRequest::new(&incoming, &f.state(), &mut budget).expect("bounded inputs");
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    assert!(BackfillScheduler::new(1)
+        .place_now(&prepared, &f.state(), now, &mut budget)
+        .is_none());
+    assert!(BackfillScheduler::new(1)
+        .place_now(&prepared, &f.state(), now, &mut SearchBudget::default())
+        .expect("sufficient budget")
+        .is_some());
 }
 
 #[test]

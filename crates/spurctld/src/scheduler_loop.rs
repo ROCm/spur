@@ -6605,7 +6605,7 @@ pub(crate) mod tests {
             let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
                 [("n1", vec![7])].into_iter().collect();
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &reclaimable,
                 occupants: &occupants,
                 priority: &no_priorities(),

@@ -109,8 +109,18 @@ impl InputSize {
         self.strings(inventory.generic.keys())
     }
 
-    fn node(&mut self, node: &Node) -> Option<()> {
+    pub fn node(&mut self, node: &Node) -> Option<()> {
         self.entries(6)?;
+        if let Some(layout) = &node.core_layout {
+            self.entries(layout.spec_cpus.len())?;
+            self.entries(layout.general_cpus.len())?;
+            self.entries(layout.trimmed_cpus.len())?;
+            self.entries(layout.gpu_reserved.len())?;
+            for gpu in &layout.gpu_reserved {
+                self.entries(gpu.cpus.len())?;
+            }
+        }
+        self.entries(node.layout_blocked_cpus.len())?;
         self.text(&node.name)?;
         self.strings(&node.partitions)?;
         self.strings(&node.features)?;
@@ -344,6 +354,8 @@ impl<'a> PlacementProjection<'a> {
         for (node, original) in self.nodes.iter_mut().zip(self.original.nodes) {
             node.alloc_resources.cpus = original.alloc_resources.cpus;
             node.alloc_resources.memory_mb = original.alloc_resources.memory_mb;
+            node.alloc_resources.reserved_cpus = original.alloc_resources.reserved_cpus;
+            node.alloc_resources.layout_fingerprint = original.alloc_resources.layout_fingerprint;
             node.alloc_resources
                 .devices
                 .clone_from(&original.alloc_resources.devices);
@@ -353,7 +365,7 @@ impl<'a> PlacementProjection<'a> {
 
     pub fn release(&mut self, name: &str, allocation: &ResourceAllocations) {
         if let Some(&i) = self.indices.get(name) {
-            self.nodes[i].alloc_resources.subtract(allocation);
+            self.nodes[i].release(allocation);
         }
     }
 
@@ -386,6 +398,8 @@ pub fn placement_node(node: &Node) -> Node {
     copy.k0s_role = node.k0s_role;
     copy.layout_error = node.layout_error.clone();
     copy.layout_enforce_error = node.layout_enforce_error.clone();
+    copy.core_layout = node.core_layout.clone();
+    copy.layout_blocked_cpus = node.layout_blocked_cpus.clone();
     copy
 }
 
@@ -506,10 +520,6 @@ impl PlacementRequest {
         let mut device_work = 0usize;
         for node in state.nodes {
             budget.spend(1)?;
-            if !scope.nodes.contains(&node.name) {
-                continue;
-            }
-            n = n.checked_add(1)?;
             let devices = node
                 .alloc_resources
                 .devices
@@ -517,6 +527,15 @@ impl PlacementRequest {
                 .map(Vec::len)
                 .sum::<usize>();
             let gpus = node.total_resources.gpus.len();
+            device_work = device_work.checked_add(
+                node.layout_blocked_cpus
+                    .len()
+                    .checked_mul(gpus.checked_add(devices)?.checked_add(1)?)?,
+            )?;
+            if !scope.nodes.contains(&node.name) {
+                continue;
+            }
+            n = n.checked_add(1)?;
             let gpu_work = gpus
                 .checked_mul(gpus)?
                 .checked_mul(if job.spec.gpus.is_some() {
@@ -594,6 +613,7 @@ pub fn placement_job(job: &Job) -> Job {
         num_tasks: s.num_tasks,
         tasks_per_node: s.tasks_per_node,
         cpus_per_task: s.cpus_per_task,
+        cpus_per_gpu: s.cpus_per_gpu,
         memory_per_node_mb: s.memory_per_node_mb,
         memory_per_cpu_mb: s.memory_per_cpu_mb,
         memory_per_gpu_mb: s.memory_per_gpu_mb,
@@ -631,6 +651,8 @@ pub fn consumable_allocation(alloc: &ResourceAllocations) -> ResourceAllocations
         memory_mb: alloc.memory_mb,
         devices: alloc.devices.clone(),
         generation: alloc.generation,
+        reserved_cpus: alloc.reserved_cpus,
+        layout_fingerprint: alloc.layout_fingerprint,
         ..Default::default()
     }
 }
@@ -650,6 +672,8 @@ pub fn consumable_inventory(inventory: &ResourceSet) -> ResourceSet {
                 link_type: gpu.link_type,
                 stable_id: gpu.stable_id,
                 topology: None,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect(),
         generic: inventory.generic.clone(),

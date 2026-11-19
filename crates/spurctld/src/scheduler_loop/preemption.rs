@@ -42,17 +42,8 @@ impl Snapshot {
             let mut size = InputSize::default();
             for node in state.nodes {
                 budget.spend(1)?;
-                size.entries(6)?;
                 let live = live_nodes.get(&node.name)?;
-                size.text(&node.name)?;
-                size.strings(&live.partitions)?;
-                size.strings(&live.features)?;
-                size.strings(
-                    [&live.layout_error, &live.layout_enforce_error]
-                        .into_iter()
-                        .flatten(),
-                )?;
-                size.inventory(&live.total_resources)?;
+                size.node(live)?;
                 size.inventory(&node.total_resources)?;
                 let current = &live.total_resources;
                 let observed = &node.total_resources;
@@ -70,7 +61,6 @@ impl Snapshot {
                 {
                     return None;
                 }
-                size.allocation(&live.alloc_resources)?;
             }
             let holds = |job: &&Job| job.holds_allocation();
             for job in jobs.values() {
@@ -241,6 +231,9 @@ fn held_allocation_work(job: &Job) -> Option<usize> {
 
 fn contains(held: &ResourceAllocations, slice: &ResourceAllocations) -> bool {
     held.cpus >= slice.cpus
+        && held.reserved_cpus >= slice.reserved_cpus
+        && held.cpus.saturating_sub(held.reserved_cpus)
+            >= slice.cpus.saturating_sub(slice.reserved_cpus)
         && held.memory_mb >= slice.memory_mb
         && slice.devices.iter().all(|(name, devices)| {
             devices.iter().all(|device| {
@@ -265,6 +258,9 @@ fn allocation_merge_work(held: &ResourceAllocations, slice: &ResourceAllocations
 
 fn add_checked(held: &mut ResourceAllocations, slice: &ResourceAllocations) -> Option<()> {
     held.cpus.checked_add(slice.cpus)?;
+    let reserved = held
+        .reserved_cpus
+        .checked_add(slice.reserved_under(held.layout_fingerprint))?;
     held.memory_mb.checked_add(slice.memory_mb)?;
     for (name, devices) in &slice.devices {
         for (index, device) in devices.iter().enumerate() {
@@ -284,7 +280,16 @@ fn add_checked(held: &mut ResourceAllocations, slice: &ResourceAllocations) -> O
         }
     }
     held.add(slice);
+    held.reserved_cpus = reserved;
     Some(())
+}
+
+fn subtract_charged(held: &mut ResourceAllocations, slice: &ResourceAllocations) {
+    let reserved = held
+        .reserved_cpus
+        .saturating_sub(slice.reserved_under(held.layout_fingerprint));
+    held.subtract(slice);
+    held.reserved_cpus = reserved;
 }
 
 fn preferred_victims(
@@ -446,9 +451,12 @@ fn direct_victims(
         );
         let admissible: Vec<_> = holding.iter().filter(|p| p.admits(&job.spec)).collect();
         let mut occupied = consumable_allocation(&node.alloc_resources);
+        let pools = node.cpu_pools();
         let fits = |occupied: &ResourceAllocations, used: &HashMap<&str, TresCharge>| {
             node.total_resources
                 .can_satisfy_with_allocated(occupied, required)
+                && pools
+                    .is_none_or(|p| p.admits(occupied, required.cpus, required.gpus.len() as u32))
                 && (holding.is_empty()
                     || admissible.iter().any(|partition| {
                         spur_sched::partition_cap::partition_cap_ok(
@@ -472,7 +480,7 @@ fn direct_victims(
         let mut chosen = Vec::new();
         for victim in victims {
             budget.spend(work)?;
-            occupied.subtract(victim.per_node_alloc.get(&node.name)?);
+            subtract_charged(&mut occupied, victim.per_node_alloc.get(&node.name)?);
             adjust(victim.job_id, &mut used, true, budget)?;
             chosen.push(*victim);
             if fits(&occupied, &used) {
@@ -489,7 +497,7 @@ fn direct_victims(
             add_checked(&mut occupied, slice)?;
             adjust(victim.job_id, &mut used, false, budget)?;
             if !fits(&occupied, &used) {
-                occupied.subtract(slice);
+                subtract_charged(&mut occupied, slice);
                 adjust(victim.job_id, &mut used, true, budget)?;
                 necessary.push(victim.job_id);
             }
@@ -574,7 +582,12 @@ fn select_victims(
     let mut known: HashMap<&str, ResourceAllocations> = HashMap::new();
     for holder in pool.holders {
         for (node, alloc) in holder.held_allocations() {
-            let held = known.entry(node).or_default();
+            let held = known.entry(node).or_insert_with(|| ResourceAllocations {
+                layout_fingerprint: node_index
+                    .get(node.as_str())
+                    .map_or(0, |node| node.alloc_resources.layout_fingerprint),
+                ..Default::default()
+            });
             budget.spend(allocation_merge_work(held, alloc)?)?;
             add_checked(held, alloc)?;
         }

@@ -282,6 +282,9 @@ impl BackfillScheduler {
             if !node.alloc_resources.is_empty() {
                 self.timelines[index].reserve(now, until, node.alloc_resources.clone());
             }
+            if let Some(blocked) = node.layout_blocked_alloc() {
+                self.timelines[index].reserve(now, until, blocked);
+            }
         }
         self.seed_partition_usage(cluster, now);
         let Some(job) = job_in_eligible_partitions(&request.job, cluster.partitions) else {
@@ -542,9 +545,7 @@ impl BackfillScheduler {
         let max_check = floor + chrono::Duration::days(365);
         if self.immediate {
             let allocated = self.timelines[ni].accumulated_at(floor);
-            let fits = self.timelines[ni]
-                .total
-                .can_satisfy_with_allocated(&allocated, request)
+            let fits = self.timelines[ni].admits(&allocated, request)
                 && cap.is_none_or(|cap| self.timelines[ni].cap_admits(cap, floor, duration))
                 && Self::reservation_blocker(res_check, floor, duration).is_none();
             return if fits { floor } else { max_check };
