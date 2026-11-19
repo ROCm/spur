@@ -1802,14 +1802,10 @@ pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signa
 const STOP_SETTLE_BUDGET: Duration = Duration::from_secs(1);
 const STOP_SETTLE_POLL: Duration = Duration::from_millis(1);
 
-/// Stops the launcher's workload, and returns only once nothing it was
-/// responsible for can still be running. A stop signal sent to one pid only
-/// queues the stop, and a process in the middle of `fork()` publishes its child
-/// after any scan and runs on, so each round waits for every process signalled
-/// so far to really stop, which a process does only once its fork has returned,
-/// and then looks again for children it published. A launcher with nothing behind
-/// it is stopped too, or it would fork a running workload into a suspended job;
-/// otherwise it is spared, since `nsenter` mirrors its child's stop itself.
+/// Stops the launcher's workload and returns once it is really stopped. A
+/// per-pid stop only queues, and a process inside `fork()` publishes its child
+/// after any scan, so it rescans until nothing new turns up. The launcher is
+/// stopped only when nothing is behind it: `nsenter` mirrors its child's stop.
 fn stop_to_fixpoint(
     launcher: i32,
     collect: impl Fn() -> Vec<i32>,
@@ -1817,31 +1813,41 @@ fn stop_to_fixpoint(
     budget: Duration,
 ) {
     let deadline = Instant::now() + budget;
-    let mut stopped = Vec::new();
+    let mut attempted = Vec::new();
+    // Only a pid the signal reached can be waited for: one it was refused
+    // (another user's) never stops, and would use up the whole budget.
+    let mut reached = Vec::new();
     let mut round = collect();
     if round.is_empty() {
         round.push(launcher);
     }
     loop {
-        for pid in &round {
-            let _ = signal::kill(Pid::from_raw(*pid), Signal::SIGSTOP);
+        for pid in round {
+            if signal::kill(Pid::from_raw(pid), Signal::SIGSTOP).is_ok() {
+                reached.push(pid);
+            }
+            attempted.push(pid);
         }
-        stopped.append(&mut round);
-        if !wait_until_settled(&stopped, &is_settled, deadline) {
-            warn!(
-                launcher,
-                "processes did not stop in time, stopping what is found now"
-            );
-            signal_pids_except(&collect(), Signal::SIGSTOP, Some(launcher));
-            return;
+        if wait_until_settled(&reached, &is_settled, deadline) {
+            round = collect()
+                .into_iter()
+                .filter(|pid| *pid != launcher && !attempted.contains(pid))
+                .collect();
+            if round.is_empty() {
+                return;
+            }
+            if Instant::now() < deadline {
+                continue;
+            }
         }
-        round = collect()
-            .into_iter()
-            .filter(|pid| *pid != launcher && !stopped.contains(pid))
-            .collect();
-        if round.is_empty() {
-            return;
-        }
+        let unsettled: Vec<_> = reached.iter().filter(|pid| !is_settled(**pid)).collect();
+        warn!(
+            launcher,
+            ?unsettled,
+            "stop did not settle in time, stopping what is found now"
+        );
+        signal_pids_except(&collect(), Signal::SIGSTOP, Some(launcher));
+        return;
     }
 }
 
@@ -5819,13 +5825,33 @@ mod tests {
 
     #[test]
     fn a_stop_that_is_never_confirmed_still_stops_what_the_last_look_finds_and_returns() {
-        let sleeper = Spawned::new("sleep", &["3600"]);
-        let pid = sleeper.pid();
+        let launcher = Spawned::new("sleep", &["3600"]);
+        let late = Spawned::new("sleep", &["3600"]);
+        let looks = std::cell::Cell::new(0);
+        // Nothing behind the launcher at first, a process there on the last look.
+        let collect = || {
+            looks.set(looks.get() + 1);
+            match looks.get() {
+                1 => Vec::new(),
+                _ => vec![late.pid()],
+            }
+        };
         let never_settled = |_| false;
 
-        stop_to_fixpoint(pid, Vec::new, never_settled, Duration::ZERO);
+        stop_to_fixpoint(launcher.pid(), collect, never_settled, Duration::ZERO);
 
-        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+        assert_eq!(await_state(late.pid(), &[Some('T')]), Some('T'));
+        assert_eq!(await_state(launcher.pid(), &[Some('T')]), Some('T'));
+        assert_eq!(looks.get(), 2);
+    }
+
+    #[test]
+    fn a_pid_the_stop_cannot_reach_is_not_waited_for() {
+        // No such process, so the signal fails as it does for another user's.
+        let unreachable = i32::MAX;
+        let never_settled = |_| false;
+
+        stop_to_fixpoint(1, || vec![unreachable], never_settled, UNBOUNDED);
     }
 
     #[test]
@@ -5887,7 +5913,7 @@ mod tests {
         let Some(go) = std::env::var_os(WIDE_FORK_GO_ENV) else {
             return;
         };
-        for _ in 0..WIDE_FORK_MAPPINGS {
+        'mapping: for _ in 0..WIDE_FORK_MAPPINGS {
             // A guard page between the writable ones keeps the kernel from
             // merging them back into one area.
             for prot in [libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE] {
@@ -5902,7 +5928,11 @@ mod tests {
                         0,
                     )
                 };
-                assert_ne!(page, libc::MAP_FAILED, "map a page");
+                // Past the kernel's limit the fork is merely faster, which only
+                // weakens the test.
+                if page == libc::MAP_FAILED {
+                    break 'mapping;
+                }
                 if prot != libc::PROT_NONE {
                     // SAFETY: the page was just mapped writable.
                     unsafe { page.cast::<u8>().write(1) };
@@ -6012,23 +6042,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
 
-        /// The helper's children as the stop left them: read at once, because a
-        /// child that is stopped later is not one the stop reached.
-        fn assert_forked_child_is_stopped(&self) {
-            let children = get_child_pids(self.helper);
-            if children.is_empty() {
-                // Only to tell a fork the stop missed from one that never began.
-                let late = (0..200).find_map(|_| {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    Some(get_child_pids(self.helper)).filter(|late| !late.is_empty())
-                });
-                panic!("no forked child when the stop returned; it was published later: {late:?}");
-            }
-            let states: Vec<_> = children.iter().map(|child| state_of(*child)).collect();
-            assert!(
-                states.iter().all(|state| *state == Some('T')),
-                "children {children:?} are {states:?} when the stop returned"
-            );
+        /// Whether a child shows up at all within a fork's time, which tells a
+        /// stop that was too late for the fork to publish its child from one that
+        /// beat the fork, which then never starts.
+        fn child_published_late(&self) -> bool {
+            (0..30).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                !get_child_pids(self.helper).is_empty()
+            })
         }
     }
 
@@ -6039,25 +6060,49 @@ mod tests {
         }
     }
 
+    const WIDE_FORK_ATTEMPTS: usize = 10;
+
+    /// Stops a launcher tree while a process in it is inside `fork()`, and checks
+    /// the child that fork publishes is stopped by the time the stop returns. A
+    /// stop that lands before the fork begins publishes no child and proves
+    /// nothing, so it is retried; only a child seen stopped passes.
+    fn stop_through_a_fork_in_flight(behind_launcher: bool) -> WideFork {
+        for _ in 0..WIDE_FORK_ATTEMPTS {
+            let mut fork = WideFork::spawn(behind_launcher);
+            fork.wait_until_forking();
+
+            signal_launcher_tree(fork.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+            // Read at once: a child that stops later is not one the stop reached.
+            let children = get_child_pids(fork.helper);
+            let states: Vec<_> = children.iter().map(|child| state_of(*child)).collect();
+            if children.is_empty() {
+                assert!(
+                    !fork.child_published_late(),
+                    "the fork published its child after the stop returned"
+                );
+                continue;
+            }
+            assert!(
+                states.iter().all(|state| *state == Some('T')),
+                "children {children:?} are {states:?} when the stop returned"
+            );
+            return fork;
+        }
+        panic!("the stop never landed inside the fork in {WIDE_FORK_ATTEMPTS} attempts");
+    }
+
     #[test]
     fn a_stop_during_the_launchers_own_fork_stops_the_child_that_fork_publishes() {
-        let mut launcher = WideFork::spawn(false);
-        launcher.wait_until_forking();
+        let launcher = stop_through_a_fork_in_flight(false);
 
-        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
-
-        launcher.assert_forked_child_is_stopped();
         assert_eq!(state_of(launcher.leader), Some('T'));
     }
 
     #[test]
     fn a_stop_during_the_workloads_fork_stops_the_child_that_fork_publishes() {
-        let mut launcher = WideFork::spawn(true);
-        launcher.wait_until_forking();
+        let launcher = stop_through_a_fork_in_flight(true);
 
-        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
-
-        launcher.assert_forked_child_is_stopped();
         assert_eq!(state_of(launcher.helper), Some('T'));
         assert_ne!(
             state_of(launcher.leader),
