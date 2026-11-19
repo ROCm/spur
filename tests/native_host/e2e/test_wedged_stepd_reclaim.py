@@ -192,8 +192,9 @@ class TestWedgedInteractiveStepdReclaim:
 
 
 # The controller's dial budget to the unreachable node. A step's launch there fails exactly
-# this long after it starts, which is what delays the step cancel.
-_DIAL_BUDGET_SECS = 30
+# this long after it starts, which is what delays the step cancel. It dwarfs the few seconds
+# the test needs to freeze the supervisor, so the ordering holds with room to spare.
+_DIAL_BUDGET_SECS = 60
 # The agent SIGKILLs a cancelled step this long after the cancel (STEP_CANCEL_ESCALATION).
 _STEP_ESCALATION_SECS = 5
 # Time for the agent to have recorded the step's pid with its supervisor before that is frozen.
@@ -208,7 +209,7 @@ def _step_sleep_pids(node) -> list[str]:
     processes inside a job's pid namespace."""
     return node.exec_allow_fail(
         "for p in $(pgrep -x sleep); do "
-        "tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null "
+        "tr '\\0' ' ' 2>/dev/null < /proc/$p/cmdline "
         f"| grep -qE 'sleep {_STEP_SLEEP_SECS}( |$)' && echo $p; done"
     ).split()
 
@@ -276,7 +277,7 @@ class TestStepCancelWithAFrozenSupervisor:
                 started = time.time()
                 wait_until(
                     lambda: _step_sleep_pids(node),
-                    timeout_s=_DIAL_BUDGET_SECS // 2, interval_s=1,
+                    timeout_s=30, interval_s=1,
                     desc="the srun step to start on node 0",
                 )
                 time.sleep(_PID_RECORDED_SETTLE_SECS)

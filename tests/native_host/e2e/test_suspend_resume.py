@@ -398,7 +398,10 @@ _STOP_SETTLE_SECS = 3
 
 
 def _tick_count(node, path):
-    return int(node.exec_allow_fail(f"wc -l < '{path}' 2>/dev/null || echo 0").strip() or 0)
+    """Lines in the ticks file, 0 until it exists. The redirect is inside the group so the
+    shell's own error for a missing file stays out of the captured output."""
+    out = node.exec_allow_fail(f"{{ wc -l < '{path}'; }} 2>/dev/null || echo 0")
+    return int(out.strip() or 0)
 
 
 class TestSuspendWithoutCgroup:
@@ -420,8 +423,9 @@ class TestSuspendWithoutCgroup:
 
     def test_suspend_stops_and_resume_restarts_a_helper_a_worker_thread_started(self, cluster):
         node = cluster.nodes[0]
-        if not node.exec_allow_fail("command -v python3").strip():
-            pytest.skip("node 0 has no python3 to run the multithreaded workload")
+        assert node.exec_allow_fail("command -v python3").strip(), (
+            "node 0 has no python3, which the multithreaded workload needs"
+        )
         ticks = f"{cluster.remote_dir}/thread-ticks.txt"
         stop = f"{cluster.remote_dir}/thread-ticks.stop"
         program = cluster.write_file("thread-workload.py", _THREADED_WORKLOAD, executable=False)
