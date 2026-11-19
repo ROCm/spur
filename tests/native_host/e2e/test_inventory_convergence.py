@@ -447,12 +447,16 @@ def _find_descriptor_paths(cluster, job_id: int) -> list[str]:
 def _rewrite_descriptor_gpu_devices(
     cluster, path: str, gpu_devices: list[int]
 ) -> list[int]:
-    """Rewrite a descriptor's resources.gpu_devices to *gpu_devices* in place,
-    atomically. Returns the previous value so a test can assert it changed."""
+    """Rewrite a descriptor's GPUs to *gpu_devices* in the shape a pre-upgrade
+    agent wrote, in place, atomically. Returns the previous value so a test can
+    assert it changed."""
     raw = cluster.nodes[0].read_file(path)
     doc = json.loads(raw)
-    previous = list(doc["resources"].get("gpu_devices", []))
-    doc["resources"]["gpu_devices"] = gpu_devices
+    resources = doc["resources"]
+    previous = list(resources.get("gpu_devices", []))
+    # The agent reads `devices` first; older agents never wrote its GPUs.
+    resources.get("devices", {}).pop("gpu", None)
+    resources["gpu_devices"] = gpu_devices
     tmp = f"{path}.forge.tmp"
     cluster.nodes[0].write_file(tmp, json.dumps(doc), mode=0o644)
     cluster.nodes[0].exec(f"mv -f '{tmp}' '{path}'")
