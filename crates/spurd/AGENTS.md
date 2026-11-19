@@ -507,8 +507,13 @@ metrics).
   - SIGSTOP skips it: `nsenter` mirrors its child's stop itself, and a second,
     external stop can leave it stopped for good. Only while nothing is behind it
     yet (a stop right after launch, before it forks) does it get the stop too, or
-    it would fork a running workload into a suspended job; the workload that
-    appears before the stop lands is stopped as well.
+    it would fork a running workload into a suspended job. A per-pid stop only
+    queues, and a process inside `fork()` publishes its child after any scan, so
+    `stop_to_fixpoint` waits until everything it stopped is really stopped (every
+    thread in `T`/`t`, a zombie, or gone) and rescans until a rescan finds
+    nothing new. The wait is bounded by `STOP_SETTLE_BUDGET` (1 s); on expiry it
+    stops what a last scan finds and warns. The cgroup path of `deliver_signal`
+    delivers per pid without this wait.
   - Every other signal skips it.
 
   The launcher exits on its own once the workload does, relaying its status. On

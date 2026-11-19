@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -1782,21 +1783,93 @@ pub fn deliver_signal(
 /// `sig` is one it must get. That is what a signal to the launcher's process
 /// group used to reach, minus the launcher, plus descendants that left the group.
 pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
-    let workload = launcher_workload_pids(pid);
-    signal_pids_except(&workload, sig, None);
-    if sig == Signal::SIGSTOP && workload.is_empty() {
-        stop_launcher_and_its_late_workload(pid, || launcher_workload_pids(pid));
+    if sig == Signal::SIGSTOP {
+        stop_to_fixpoint(
+            pid,
+            || launcher_workload_pids(pid),
+            is_stopped_or_gone,
+            STOP_SETTLE_BUDGET,
+        );
+        return;
     }
+    signal_pids_except(&launcher_workload_pids(pid), sig, None);
     signal_launcher(Some(pid), tracked, sig);
 }
 
-/// A stop that finds nothing behind the launcher would otherwise be lost, and
-/// the launcher would fork a running workload into a suspended job. A launcher
-/// that has not forked yet mirrors nothing, so it is stopped itself; stopped, it
-/// forks no more, so what the second look finds is all there will be.
-fn stop_launcher_and_its_late_workload(launcher: i32, workload: impl FnOnce() -> Vec<i32>) {
-    let _ = signal::kill(Pid::from_raw(launcher), Signal::SIGSTOP);
-    signal_pids_except(&workload(), Signal::SIGSTOP, Some(launcher));
+/// How long a stop waits for what it signalled to be stopped. A process that
+/// cannot stop (uninterruptible sleep) must not hold up a caller on the async
+/// runtime; a stop normally settles within a millisecond.
+const STOP_SETTLE_BUDGET: Duration = Duration::from_secs(1);
+const STOP_SETTLE_POLL: Duration = Duration::from_millis(1);
+
+/// Stops the launcher's workload, and returns only once nothing it was
+/// responsible for can still be running. A stop signal sent to one pid only
+/// queues the stop, and a process in the middle of `fork()` publishes its child
+/// after any scan and runs on, so each round waits for every process signalled
+/// so far to really stop, which a process does only once its fork has returned,
+/// and then looks again for children it published. A launcher with nothing behind
+/// it is stopped too, or it would fork a running workload into a suspended job;
+/// otherwise it is spared, since `nsenter` mirrors its child's stop itself.
+fn stop_to_fixpoint(
+    launcher: i32,
+    collect: impl Fn() -> Vec<i32>,
+    is_settled: impl Fn(i32) -> bool,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    let mut stopped = Vec::new();
+    let mut round = collect();
+    if round.is_empty() {
+        round.push(launcher);
+    }
+    loop {
+        for pid in &round {
+            let _ = signal::kill(Pid::from_raw(*pid), Signal::SIGSTOP);
+        }
+        stopped.append(&mut round);
+        if !wait_until_settled(&stopped, &is_settled, deadline) {
+            warn!(
+                launcher,
+                "processes did not stop in time, stopping what is found now"
+            );
+            signal_pids_except(&collect(), Signal::SIGSTOP, Some(launcher));
+            return;
+        }
+        round = collect()
+            .into_iter()
+            .filter(|pid| *pid != launcher && !stopped.contains(pid))
+            .collect();
+        if round.is_empty() {
+            return;
+        }
+    }
+}
+
+fn wait_until_settled(pids: &[i32], is_settled: &impl Fn(i32) -> bool, deadline: Instant) -> bool {
+    loop {
+        if pids.iter().all(|pid| is_settled(*pid)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(STOP_SETTLE_POLL);
+    }
+}
+
+/// Whether every thread of `pid` is stopped (by a signal or a tracer), a
+/// zombie, or gone. A group stop reaches the threads one by one, and a thread
+/// still running may be in a `fork()`.
+fn is_stopped_or_gone(pid: i32) -> bool {
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return true;
+    };
+    threads.flatten().all(|thread| {
+        let state = std::fs::read_to_string(thread.path().join("stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next());
+        matches!(state, None | Some('T' | 't' | 'Z' | 'X'))
+    })
 }
 
 /// The launcher's descendants, deepest first, then the rest of its process group
@@ -5652,6 +5725,34 @@ mod tests {
         assert!(launcher.line().starts_with("forked "));
     }
 
+    /// A child process killed and reaped when it goes out of scope.
+    struct Spawned(std::process::Child);
+
+    impl Spawned {
+        fn new(program: &str, args: &[&str]) -> Self {
+            Self(
+                std::process::Command::new(program)
+                    .args(args)
+                    .spawn()
+                    .expect("spawn the process"),
+            )
+        }
+
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Long enough that only a settled stop, never the budget, ends a test.
+    const UNBOUNDED: Duration = Duration::from_secs(3600);
+
     #[test]
     fn a_stop_also_reaches_a_workload_that_appeared_while_the_launcher_was_being_stopped() {
         let mut launcher = UnforkedLauncher::spawn();
@@ -5662,12 +5763,97 @@ mod tests {
             .strip_prefix("forked ")
             .and_then(|pid| pid.parse().ok())
             .expect("the launcher forks its workload");
-
         // The workload was not there when the launcher was first looked at.
-        stop_launcher_and_its_late_workload(pid, || vec![forked]);
+        let looks = std::cell::Cell::new(0);
+        let collect = || {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                Vec::new()
+            } else {
+                vec![forked]
+            }
+        };
+
+        stop_to_fixpoint(pid, collect, is_stopped_or_gone, UNBOUNDED);
+
+        assert_eq!(state_of(pid), Some('T'));
+        assert_eq!(state_of(forked), Some('T'));
+        assert_eq!(
+            looks.get(),
+            3,
+            "looks again once the new workload is stopped"
+        );
+    }
+
+    #[test]
+    fn a_stop_keeps_looking_until_a_look_finds_nothing_new() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let child: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+        let grandchild = Spawned::new("sleep", &["3600"]);
+        let looks = std::cell::Cell::new(0);
+        let collect = || {
+            looks.set(looks.get() + 1);
+            match looks.get() {
+                1 => vec![child],
+                _ => vec![child, grandchild.pid()],
+            }
+        };
+
+        stop_to_fixpoint(pid, collect, is_stopped_or_gone, UNBOUNDED);
+
+        assert_eq!(state_of(child), Some('T'));
+        assert_eq!(state_of(grandchild.pid()), Some('T'));
+        assert_ne!(
+            state_of(pid),
+            Some('T'),
+            "a launcher with a workload is spared"
+        );
+        assert_eq!(looks.get(), 3);
+    }
+
+    #[test]
+    fn a_stop_that_is_never_confirmed_still_stops_what_the_last_look_finds_and_returns() {
+        let sleeper = Spawned::new("sleep", &["3600"]);
+        let pid = sleeper.pid();
+        let never_settled = |_| false;
+
+        stop_to_fixpoint(pid, Vec::new, never_settled, Duration::ZERO);
 
         assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
-        assert_eq!(await_state(forked, &[Some('T')]), Some('T'));
+    }
+
+    #[test]
+    fn a_launcher_that_has_already_exited_does_not_hold_up_a_stop() {
+        let exited = Spawned::new("true", &[]);
+        let pid = exited.pid();
+        // Left unreaped, so it stays a zombie the stop has to treat as stopped.
+        assert_eq!(await_state(pid, &[Some('Z')]), Some('Z'));
+
+        stop_to_fixpoint(pid, Vec::new, is_stopped_or_gone, UNBOUNDED);
+    }
+
+    #[test]
+    fn a_process_is_settled_when_stopped_a_zombie_or_gone_but_not_while_running() {
+        let mut sleeper = Spawned::new("sleep", &["3600"]);
+        let pid = sleeper.pid();
+        assert!(!is_stopped_or_gone(pid));
+
+        signal::kill(Pid::from_raw(pid), Signal::SIGSTOP).expect("stop");
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+        assert!(is_stopped_or_gone(pid));
+
+        signal::kill(Pid::from_raw(pid), Signal::SIGKILL).expect("kill");
+        assert_eq!(await_state(pid, &[Some('Z')]), Some('Z'));
+        assert!(is_stopped_or_gone(pid));
+
+        sleeper.0.wait().expect("reap");
+        assert!(is_stopped_or_gone(pid));
     }
 
     #[test]
@@ -5685,6 +5871,199 @@ mod tests {
 
         assert_eq!(await_state(forked, &[Some('T')]), Some('T'));
         assert_ne!(state_of(pid), Some('T'), "a launcher that mirrors stops");
+    }
+
+    /// Names the file whose appearance tells [`widened_fork_helper`] to fork.
+    const WIDE_FORK_GO_ENV: &str = "SPURD_TEST_WIDE_FORK_GO";
+
+    /// Maps and touches this many page pairs, so a fork copies tens of thousands
+    /// of areas and stays inside the kernel for long enough to be signalled there.
+    const WIDE_FORK_MAPPINGS: usize = 30_000;
+
+    /// Forks a child that never exits, once told to, from a process whose fork is
+    /// slow. A no-op unless a test below re-executes the binary to run it.
+    #[test]
+    fn widened_fork_helper() {
+        let Some(go) = std::env::var_os(WIDE_FORK_GO_ENV) else {
+            return;
+        };
+        for _ in 0..WIDE_FORK_MAPPINGS {
+            // A guard page between the writable ones keeps the kernel from
+            // merging them back into one area.
+            for prot in [libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE] {
+                // SAFETY: an anonymous private mapping of one page, never unmapped.
+                let page = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        prot,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(page, libc::MAP_FAILED, "map a page");
+                if prot != libc::PROT_NONE {
+                    // SAFETY: the page was just mapped writable.
+                    unsafe { page.cast::<u8>().write(1) };
+                }
+            }
+        }
+        println!("ready {}", std::process::id());
+        while !Path::new(&go).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        println!("forking");
+        let started = std::time::Instant::now();
+        // SAFETY: the child only calls pause, which is async-signal-safe.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            loop {
+                // SAFETY: pause has no preconditions.
+                unsafe { libc::pause() };
+            }
+        }
+        println!("forked {child} after {:?}", started.elapsed());
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A process whose `fork()` is in flight, optionally behind a shell that
+    /// plays the launcher. Everything it started is killed when it goes out of
+    /// scope.
+    struct WideFork {
+        leader: i32,
+        helper: i32,
+        go: PathBuf,
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl WideFork {
+        /// With `behind_launcher` the forking process is a child of the leader
+        /// shell, otherwise it is the leader.
+        fn spawn(behind_launcher: bool) -> Self {
+            use std::os::unix::process::CommandExt;
+            let helper_test = module_path!()
+                .split_once("::")
+                .map(|(_, module)| format!("{module}::widened_fork_helper"))
+                .expect("the tests live in a module of the crate");
+            let helper_args = ["--exact", &helper_test, "--nocapture", "--test-threads=1"];
+            let exe = std::env::current_exe().expect("this test binary");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let go = dir.path().join("go");
+            let mut command = if behind_launcher {
+                let mut shell = std::process::Command::new("/bin/sh");
+                shell
+                    .arg("-c")
+                    .arg("\"$0\" \"$@\" & while :; do sleep 0.05; done")
+                    .arg(&exe)
+                    .args(helper_args);
+                shell
+            } else {
+                let mut helper = std::process::Command::new(&exe);
+                helper.args(helper_args);
+                helper
+            };
+            let mut child = command
+                .env(WIDE_FORK_GO_ENV, &go)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the forking process");
+            let output = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+            let mut spawned = Self {
+                leader: child.id() as i32,
+                helper: 0,
+                go,
+                child,
+                output,
+                _dir: dir,
+            };
+            // The harness leaves its own `test <name> ... ` text on the same line.
+            let ready = spawned.line_containing("ready ");
+            spawned.helper = ready
+                .rsplit_once("ready ")
+                .and_then(|(_, pid)| pid.trim().parse().ok())
+                .expect("the helper announces its pid");
+            spawned
+        }
+
+        fn line_containing(&mut self, marker: &str) -> String {
+            use std::io::BufRead;
+            loop {
+                let mut line = String::new();
+                let read = self.output.read_line(&mut line).expect("read the helper");
+                assert_ne!(read, 0, "the helper exited before printing {marker:?}");
+                if line.contains(marker) {
+                    return line;
+                }
+            }
+        }
+
+        /// Returns once the helper has been told to fork and has had a moment to
+        /// enter the call, which takes it far longer than that to leave.
+        fn wait_until_forking(&mut self) {
+            std::fs::write(&self.go, b"").expect("tell the helper to fork");
+            self.line_containing("forking");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        /// The helper's children as the stop left them: read at once, because a
+        /// child that is stopped later is not one the stop reached.
+        fn assert_forked_child_is_stopped(&self) {
+            let children = get_child_pids(self.helper);
+            if children.is_empty() {
+                // Only to tell a fork the stop missed from one that never began.
+                let late = (0..200).find_map(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    Some(get_child_pids(self.helper)).filter(|late| !late.is_empty())
+                });
+                panic!("no forked child when the stop returned; it was published later: {late:?}");
+            }
+            let states: Vec<_> = children.iter().map(|child| state_of(*child)).collect();
+            assert!(
+                states.iter().all(|state| *state == Some('T')),
+                "children {children:?} are {states:?} when the stop returned"
+            );
+        }
+    }
+
+    impl Drop for WideFork {
+        fn drop(&mut self) {
+            let _ = signal::killpg(Pid::from_raw(self.leader), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn a_stop_during_the_launchers_own_fork_stops_the_child_that_fork_publishes() {
+        let mut launcher = WideFork::spawn(false);
+        launcher.wait_until_forking();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        launcher.assert_forked_child_is_stopped();
+        assert_eq!(state_of(launcher.leader), Some('T'));
+    }
+
+    #[test]
+    fn a_stop_during_the_workloads_fork_stops_the_child_that_fork_publishes() {
+        let mut launcher = WideFork::spawn(true);
+        launcher.wait_until_forking();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        launcher.assert_forked_child_is_stopped();
+        assert_eq!(state_of(launcher.helper), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
     }
 
     #[test]
