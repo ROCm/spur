@@ -194,8 +194,9 @@ cleanly leaves the job running, and the job ends once every copy has exited.
 Until then, a node whose copy has finished stays allocated to the job, as in
 Slurm, so a step still running there keeps its resources. The first copy that
 fails, with a non-zero exit, a signal, or by running out of memory, ends the
-job: Spur stops the other copies, and the job reports the failed copy's exit
-code. A node whose copy has finished cannot take new ``srun`` steps, and a step
+job: Spur stops the other copies, and the job takes the failed copy's state and
+exit code, even if a copy being stopped then runs out of memory. A node whose
+copy has finished cannot take new ``srun`` steps, and a step
 aimed at it fails with "already finished its part of this job".
 
 ``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
