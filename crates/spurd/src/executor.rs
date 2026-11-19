@@ -1782,8 +1782,21 @@ pub fn deliver_signal(
 /// `sig` is one it must get. That is what a signal to the launcher's process
 /// group used to reach, minus the launcher, plus descendants that left the group.
 pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
-    signal_pids_except(&launcher_workload_pids(pid), sig, None);
+    let workload = launcher_workload_pids(pid);
+    signal_pids_except(&workload, sig, None);
+    if sig == Signal::SIGSTOP && workload.is_empty() && tracked == TrackedProcess::Launcher {
+        stop_launcher_and_its_late_workload(pid, || launcher_workload_pids(pid));
+    }
     signal_launcher(Some(pid), tracked, sig);
+}
+
+/// A stop that finds nothing behind the launcher would otherwise be lost, and
+/// the launcher would fork a running workload into a suspended job. A launcher
+/// that has not forked yet mirrors nothing, so it is stopped itself; stopped, it
+/// forks no more, so what the second look finds is all there will be.
+fn stop_launcher_and_its_late_workload(launcher: i32, workload: impl FnOnce() -> Vec<i32>) {
+    let _ = signal::kill(Pid::from_raw(launcher), Signal::SIGSTOP);
+    signal_pids_except(&workload(), Signal::SIGSTOP, Some(launcher));
 }
 
 /// The launcher's descendants, deepest first, then the rest of its process group
@@ -5532,6 +5545,118 @@ mod tests {
             Some('T'),
             "the launcher is spared"
         );
+    }
+
+    /// A launcher that has not forked its workload yet: it reports in, then forks
+    /// once it reads a line from its stdin.
+    struct UnforkedLauncher {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl UnforkedLauncher {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                // Not `wait`: it returns when the worker stops, which a launcher does not.
+                .arg("echo ready; read go; sleep 3600 & echo forked $!; while :; do sleep 0.05; done")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the launcher");
+            let stdin = child.stdin.take().expect("launcher stdin");
+            let output = std::io::BufReader::new(child.stdout.take().expect("launcher stdout"));
+            let mut launcher = Self {
+                child,
+                stdin,
+                output,
+            };
+            assert_eq!(launcher.line(), "ready");
+            launcher
+        }
+
+        fn pid(&self) -> i32 {
+            self.child.id() as i32
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .expect("read launcher output");
+            line.trim().to_string()
+        }
+
+        fn fork_now(&mut self) {
+            use std::io::Write;
+            writeln!(self.stdin, "go").expect("tell the launcher to fork");
+        }
+    }
+
+    impl Drop for UnforkedLauncher {
+        fn drop(&mut self) {
+            let _ = signal::killpg(Pid::from_raw(self.pid()), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn a_stop_before_the_launcher_forks_stops_the_launcher_until_it_is_resumed() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGSTOP);
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+
+        // It cannot read this while stopped, so it forks nothing until resumed.
+        launcher.fork_now();
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGCONT);
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the resumed launcher forks its workload");
+        assert_ne!(state_of(forked), Some('T'), "the workload runs");
+        assert_ne!(state_of(pid), Some('T'), "the launcher runs");
+    }
+
+    #[test]
+    fn a_stop_also_reaches_a_workload_that_appeared_while_the_launcher_was_being_stopped() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+
+        // The workload was not there when the launcher was first looked at.
+        stop_launcher_and_its_late_workload(pid, || vec![forked]);
+
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+        assert_eq!(await_state(forked, &[Some('T')]), Some('T'));
+    }
+
+    #[test]
+    fn a_stop_with_a_workload_behind_the_launcher_spares_the_launcher() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(forked, &[Some('T')]), Some('T'));
+        assert_ne!(state_of(pid), Some('T'), "a launcher that mirrors stops");
     }
 
     #[test]

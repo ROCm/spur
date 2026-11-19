@@ -504,7 +504,10 @@ metrics).
     goes first, so an `nsenter` that has not yet read the child's stop report
     never reads it.
   - SIGSTOP skips it: `nsenter` mirrors its child's stop itself, and a second,
-    external stop can leave it stopped for good.
+    external stop can leave it stopped for good. Only while nothing is behind it
+    yet (a stop right after launch, before it forks) does it get the stop too, or
+    it would fork a running workload into a suspended job; the workload that
+    appears before the stop lands is stopped as well.
   - Every other signal skips it.
 
   The launcher exits on its own once the workload does, relaying its status. On
