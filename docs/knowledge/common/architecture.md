@@ -350,9 +350,12 @@ Terminal states are persisted via `WalOperation::JobComplete`. The
 `JobNodeComplete` WAL entry tracks per-node completion; when all allocated
 nodes report, the job transitions to its final state. A multi-node job whose
 script runs on every node reports through `JobCopyExited` instead (see
-[job execution](../execution/job-execution.md)). An `exit_code` of 0
-yields COMPLETED; non-zero yields FAILED. Timeout, cancel, and node-fail
-override the exit-code-based decision.
+[job execution](../execution/job-execution.md)). A node's first report is its
+exit: `ClusterManager::node_complete` proposes nothing for a repeat, but answers
+it with where the run stands, so a reporter retrying the follow-up (stopping the
+other nodes) still gets it. An `exit_code` of 0 yields COMPLETED; non-zero
+yields FAILED. Timeout, cancel, and node-fail override the exit-code-based
+decision.
 
 ## 8. Node lifecycle
 

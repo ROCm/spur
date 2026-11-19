@@ -3361,6 +3361,22 @@ impl ClusterManager {
                     node: node_name.to_string(),
                 });
             }
+            // A node's first report is its exit. A repeat is still answered, since
+            // it may be retrying what the first set off, such as stopping the rest.
+            if let Some(first) = job.node_completions.get(node_name) {
+                if (first.code, first.signal) != (exit_code, signal) {
+                    warn!(
+                        job_id,
+                        node = %node_name,
+                        exit_code,
+                        signal,
+                        first_exit_code = first.code,
+                        first_signal = first.signal,
+                        "ignoring a repeat completion report that contradicts the node's first"
+                    );
+                }
+                return Ok(Self::report_outcome(job));
+            }
             ends_copy_by_copy(job)
         };
 
@@ -3397,20 +3413,22 @@ impl ClusterManager {
         }
 
         let jobs = self.jobs.read();
-        let Some(job) = jobs.get(&job_id) else {
-            return Ok(NodeCompleteResult::Completing);
-        };
-        if job.state.is_terminal() {
-            return Ok(NodeCompleteResult::AlreadyTerminal);
-        }
-        if job.state == JobState::Running && job.preempt_grace().is_some() {
-            return Ok(NodeCompleteResult::InGrace);
-        }
-        if job.state == JobState::Running {
-            return Ok(NodeCompleteResult::StillRunning);
-        }
+        Ok(jobs
+            .get(&job_id)
+            .map_or(NodeCompleteResult::Completing, Self::report_outcome))
+    }
 
-        Ok(NodeCompleteResult::Completing)
+    /// Where a run stands once a node has reported, for the reporter's follow-up.
+    fn report_outcome(job: &Job) -> NodeCompleteResult {
+        if job.state.is_terminal() {
+            NodeCompleteResult::AlreadyTerminal
+        } else if job.state == JobState::Running && job.preempt_grace().is_some() {
+            NodeCompleteResult::InGrace
+        } else if job.state == JobState::Running {
+            NodeCompleteResult::StillRunning
+        } else {
+            NodeCompleteResult::Completing
+        }
     }
 
     /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
@@ -9923,6 +9941,11 @@ impl ClusterManager {
                         .filter(|_| job.state == JobState::Running);
                     let in_grace = grace.is_some();
                     let already_reported = job.node_completions.contains_key(node_name);
+                    // A repeat proposed before the first report applied. Only JobCopyExited
+                    // may drop it: an older controller still lets a JobNodeComplete overwrite.
+                    if already_reported && matches!(op, WalOperation::JobCopyExited { .. }) {
+                        return ClientResponse::default();
+                    }
                     let preemptor = if let Some(pending) = &grace {
                         Some(pending.preempted_by)
                     } else if job.preempt_mode.as_deref() == Some("Cancel") {
@@ -22560,6 +22583,116 @@ state = "UP"
 
         assert_eq!(cpus_in_use(&cm, "n1"), 1);
         assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_report_cannot_erase_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        let repeat = cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+        assert_eq!(
+            repeat,
+            NodeCompleteResult::Completing,
+            "the reporter still stops the other copies"
+        );
+
+        cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+        let done = cm.node_complete(job_id, "n3", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+    }
+
+    /// Both were proposed while the run was still Running, before either applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_copy_exit_cannot_erase_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        let copy_exit = |exit_code| WalOperation::JobCopyExited {
+            job_id,
+            node_name: "n2".into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        };
+
+        cm.apply_operation(&copy_exit(3));
+        cm.apply_operation(&copy_exit(0));
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.node_completions["n2"].code, 3);
+        assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_failure_from_a_finished_copy_does_not_end_the_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        let repeat = cm.node_complete(job_id, "n1", 3, 0, 0).unwrap();
+
+        assert_eq!(repeat, NodeCompleteResult::StillRunning);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.first_failed_node, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_report_cannot_rewrite_the_batch_hosts_exit() {
+        use spur_core::script_placement::ResolvedPlacement;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.jobs.write().get_mut(&job_id).unwrap().resolved_placement =
+            Some(ResolvedPlacement::BatchHost);
+        cm.node_complete(job_id, "n1", 3, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        let done = cm.node_complete(job_id, "n2", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+    }
+
+    /// The leader drops repeats now, but an older one wrote them, and every
+    /// replica must replay a JobNodeComplete as it applied there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_leaders_repeat_report_replays_as_it_did_there() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        let node_report = |exit_code| WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "n1".into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        };
+
+        cm.apply_operation(&node_report(3));
+        take_over_node(&cm, "n1");
+        cm.apply_operation(&node_report(0));
+
+        assert_eq!(cm.get_job(job_id).unwrap().node_completions["n1"].code, 0);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "its slice went back once");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
