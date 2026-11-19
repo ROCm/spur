@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use spur_core::native_mint::{mint_blocking, resolve_socket_path};
+use spur_core::native_mint::{mint_blocking, resolve_socket_path, MintError};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -71,7 +71,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                     params.epoch,
                     params.timeout,
                 )
-                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                .map_err(|e| Status::unauthenticated(mint_failure_message(&e)))?;
                 let value = MetadataValue::try_from(format!("Bearer {token}")).map_err(|_| {
                     Status::unauthenticated("minted credential is not valid metadata")
                 })?;
@@ -85,6 +85,52 @@ impl tonic::service::Interceptor for AuthInterceptor {
         }
         Ok(request)
     }
+}
+
+/// Inside a job container a missing mint socket is the normal state when the job
+/// did not ask for it, so say that; elsewhere the mint itself is down.
+fn mint_failure_message(error: &MintError) -> String {
+    let in_container = std::env::var_os(spur_core::native_mint::IN_CONTAINER_ENV).is_some();
+    mint_failure_text(error, in_container)
+}
+
+fn mint_failure_text(error: &MintError, in_container: bool) -> String {
+    match (error, in_container) {
+        (MintError::Unavailable { path }, true) => format!(
+            "credential mint not available in this container ({path}): the node's auth socket \
+             is mounted only when the job was submitted with --container-auth-socket, and if it \
+             was, check that spurauthd is running on the node"
+        ),
+        (MintError::Unavailable { path }, false) => format!(
+            "credential mint not available ({path}): start spurauthd or set SPUR_AUTH_SOCKET"
+        ),
+        (other, _) => other.to_string(),
+    }
+}
+
+/// Refuse at submission a `--container-mounts` source that would bind the node's
+/// mint socket into a container that was not granted it. The check is lexical and
+/// uses this host's socket path, so the agent keeps its own check against the
+/// resolved paths on the compute node as a backstop.
+pub fn refuse_ungranted_socket_mounts(mounts: &[String], granted: bool) -> anyhow::Result<()> {
+    if granted || mounts.is_empty() {
+        return Ok(());
+    }
+    let cluster = native_cluster_name().unwrap_or_default();
+    let Ok(socket) = resolve_socket_path(&cluster) else {
+        return Ok(());
+    };
+    for m in mounts {
+        let source = m.split(':').next().unwrap_or_default();
+        if spur_core::native_mint::mount_source_exposes_socket(source, &socket) {
+            anyhow::bail!(
+                "--container-mounts entry '{m}' would expose the credential socket {}, which \
+                 --container-auth-socket makes available; drop the mount or pass the flag",
+                socket.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read the caller's JWT: `$SPUR_AUTH_TOKEN`, else `~/.spur/token`.
@@ -306,6 +352,13 @@ mod tests {
         };
         let err = i.call(Request::new(())).unwrap_err();
         assert_eq!(err.code(), Code::Unauthenticated);
+        assert!(
+            err.message()
+                .contains("start spurauthd or set SPUR_AUTH_SOCKET"),
+            "{}",
+            err.message()
+        );
+        assert!(!err.message().contains("container"));
     }
 
     #[test]
@@ -379,8 +432,62 @@ mod tests {
         }
     }
 
+    /// One test because `$SPUR_AUTH_SOCKET` is process-global; serial because other tests
+    /// clear every `SPUR_*` variable.
+    #[test]
+    #[serial_test::serial(env_injection)]
+    fn ungranted_mounts_of_the_socket_are_refused_at_submission() {
+        let prev = std::env::var_os("SPUR_AUTH_SOCKET");
+        unsafe { std::env::set_var("SPUR_AUTH_SOCKET", "/run/spur/c1/auth.sock") };
+        let mounts = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let refused = refuse_ungranted_socket_mounts(&mounts(&["/run/spur:/run/spur"]), false);
+        let socket_ro =
+            refuse_ungranted_socket_mounts(&mounts(&["/run/spur/c1/auth.sock:/s:ro"]), false);
+        let granted = refuse_ungranted_socket_mounts(&mounts(&["/run/spur:/run/spur"]), true);
+        let unrelated = refuse_ungranted_socket_mounts(&mounts(&["/data:/data"]), false);
+        let sbatch = crate::sbatch::build_sbatch_job_spec(
+            <crate::sbatch::SbatchArgs as clap::Parser>::parse_from([
+                "sbatch",
+                "--container-image=img.sqsh",
+                "--container-mounts=/run/spur:/run/spur",
+                "--wrap=true",
+            ]),
+            None,
+            "sbatch",
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SPUR_AUTH_SOCKET", v),
+                None => std::env::remove_var("SPUR_AUTH_SOCKET"),
+            }
+        }
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("--container-auth-socket"));
+        assert!(socket_ro.is_err());
+        assert!(granted.is_ok(), "the flag allows the mount");
+        assert!(unrelated.is_ok());
+        assert!(sbatch.is_err(), "sbatch refuses it before submitting");
+    }
+
+    #[test]
+    fn mint_failure_text_depends_on_where_the_caller_runs() {
+        let err = MintError::Unavailable {
+            path: "/run/spur/c1/auth.sock".into(),
+        };
+        let inside = mint_failure_text(&err, true);
+        assert!(
+            inside.contains("--container-auth-socket") && inside.contains("spurauthd is running")
+        );
+        let outside = mint_failure_text(&err, false);
+        assert!(outside.contains("start spurauthd or set SPUR_AUTH_SOCKET"));
+        assert!(!outside.contains("container"));
+    }
+
     /// Both env cases live in one test: `$SPUR_CONF` / `$SPUR_CLUSTER_NAME` are process-global.
     #[test]
+    #[serial_test::serial(env_injection)]
     fn native_cluster_name_requires_env_without_config() {
         let prev_conf = std::env::var("SPUR_CONF").ok();
         let prev_cluster = std::env::var(CLUSTER_ENV).ok();

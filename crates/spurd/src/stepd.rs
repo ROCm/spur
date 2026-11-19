@@ -4285,6 +4285,7 @@ mod tests {
                 gid: 1000,
                 username: "spur".into(),
                 home_dir: "/home/spur".into(),
+                withheld_socket: None,
                 device_plan: None,
             },
             rootfs: PathBuf::from("/tmp/rootfs"),

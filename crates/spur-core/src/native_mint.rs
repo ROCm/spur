@@ -107,12 +107,39 @@ impl CredentialMint {
     }
 }
 
+/// Set in the environment of every process a job container starts, so a client can
+/// tell a container from a login or compute node.
+pub const IN_CONTAINER_ENV: &str = "SPUR_IN_CONTAINER";
+
 /// `$SPUR_AUTH_SOCKET` if set, otherwise `/run/spur/<cluster>/auth.sock`.
 pub fn resolve_socket_path(cluster_name: &str) -> Result<PathBuf, MintError> {
     match std::env::var(AUTH_SOCKET_ENV) {
         Ok(p) if !p.trim().is_empty() => Ok(PathBuf::from(p.trim())),
         _ => default_socket_path(cluster_name),
     }
+}
+
+/// Whether binding `source` into a container would expose `socket`: the source
+/// is the socket itself or a directory that contains it. Purely lexical (`.` and
+/// `..` are folded, symlinks are not followed), for checks that run where the
+/// source may not exist, such as at job submission. A relative source never
+/// matches.
+pub fn mount_source_exposes_socket(source: &str, socket: &Path) -> bool {
+    let src = Path::new(source);
+    if !src.is_absolute() {
+        return false;
+    }
+    let mut norm = PathBuf::from("/");
+    for part in src.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::Normal(p) => norm.push(p),
+            _ => {}
+        }
+    }
+    socket.starts_with(norm)
 }
 
 pub fn default_socket_path(cluster_name: &str) -> Result<PathBuf, MintError> {
@@ -569,6 +596,31 @@ pub fn open_minted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_source_exposes_the_socket_and_its_parents_only() {
+        let sock = Path::new("/run/spur/c1/auth.sock");
+        for hit in [
+            "/run/spur/c1/auth.sock",
+            "/run/spur/c1",
+            "/run/spur",
+            "/run",
+            "/",
+            "/run/spur/c1/../c1",
+            "/run/spur/./c1/",
+        ] {
+            assert!(mount_source_exposes_socket(hit, sock), "{hit}");
+        }
+        for miss in [
+            "/run/spur/c2",
+            "/run/spurx",
+            "/data",
+            "run/spur",
+            "/run/spur/c1/auth.sock/x",
+        ] {
+            assert!(!mount_source_exposes_socket(miss, sock), "{miss}");
+        }
+    }
     use crate::native_jwks::HmacKeySet;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;

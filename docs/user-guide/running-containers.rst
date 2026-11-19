@@ -71,6 +71,26 @@ runs inside the container.
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
      - Map the job user to root inside the container.
+   * - ``--container-auth-socket``
+     - On ``srun``, ``sbatch`` and ``salloc``. Mount the node's credential mint
+       socket into the container so that a nested ``srun`` inside it can
+       authenticate. Off by default: without it nothing in the container can
+       mint a credential, and a nested ``srun`` fails with "credential mint not
+       available in this container". With it, anything in the container can
+       act on the cluster as you. On ``salloc`` it applies to every
+       ``srun --container-image`` step of the allocation. A
+       ``--container-mounts`` entry that would bind the socket in without the
+       flag, either the socket itself or a directory that contains it such as
+       ``/run/spur``, is rejected. It has no effect on a step that enters its
+       job's running container. Only meaningful under ``[auth] plugin =
+       "spur"``, and it does not hide a token file in a mounted home directory.
+
+.. warning::
+
+   Breaking change: a container no longer gets the credential mint socket by
+   default. Workflows that run ``srun`` (or any other Spur command) from inside
+   a container must now pass ``--container-auth-socket`` on the job or step
+   that starts the container.
 
 A GPU training job with a read-only data mount:
 
@@ -154,6 +174,8 @@ flags above apply to a step's ``srun`` and behave as follows:
   are identical or resolve to the same squashfs file. A step cannot use a
   different image: ``srun --container-image`` naming one fails with an error
   rather than run in the wrong image.
+  A nested ``srun`` there can authenticate only if the ``sbatch`` (or
+  ``salloc``) was submitted with ``--container-auth-socket``.
 
 - **Step with its own image.** A standalone ``srun --container-image``, an
   ``salloc`` allocation followed by ``srun --container-image``, or an
