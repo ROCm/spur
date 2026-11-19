@@ -119,8 +119,9 @@ exit could be dispatched to while the agent still holds it. Kept slices go back
 when the run ends: the report that ends it frees them, and every other ending
 frees all but `Job::released_nodes()`. The first failed copy is recorded in
 `Job.first_failed_node`, moves the job to Completing, has the nodes still
-running stopped, and supplies the job's exit and signal (`Job::reported_outcome`,
-which the completing timeout's force-finish reads too). The apply
+running stopped, and supplies the job's state, exit, and signal, which a copy
+OOM-killed while being stopped cannot change (`Job::reported_outcome`, which the
+completing timeout's force-finish reads too). The apply
 drops a repeat `JobCopyExited`, one proposed before the first applied, so it
 cannot overwrite that failure; a repeat `JobNodeComplete` still overwrites, as
 on older controllers. Steps can no longer target a node that finished.

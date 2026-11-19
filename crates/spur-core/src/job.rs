@@ -1394,8 +1394,14 @@ impl Job {
         // spurd flags an OOM kill with a sentinel bit in the signal; strip it so
         // the stored signal is the real SIGKILL and the state says OUT_OF_MEMORY.
         let signal = raw_signal & !OOM_SIGNAL_FLAG;
-        let (state, reason) =
-            self.completion_verdict(derived_state, exit_code, signal, self.reported_oom());
+        // A recorded first failure decides alone, OOM included. Without one any
+        // node's OOM counts, as on older controllers, whose logs must replay alike.
+        let oom = if self.first_failed_node.is_some() {
+            raw_signal & OOM_SIGNAL_FLAG != 0
+        } else {
+            self.reported_oom()
+        };
+        let (state, reason) = self.completion_verdict(derived_state, exit_code, signal, oom);
         ReportedOutcome {
             state,
             exit_code,
@@ -2202,6 +2208,69 @@ mod tests {
 
         assert_eq!(outcome.state, JobState::OutOfMemory);
         assert_eq!(outcome.signal, 9);
+    }
+
+    fn oom_kill() -> NodeCompletion {
+        NodeCompletion {
+            code: 0,
+            signal: 9 | OOM_SIGNAL_FLAG,
+        }
+    }
+
+    #[test]
+    fn a_later_oom_kill_cannot_override_the_first_failure() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.first_failed_node = Some("n2".into());
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 3, signal: 0 });
+        job.node_completions.insert("n3".into(), oom_kill());
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!(
+            (outcome.state, outcome.exit_code, outcome.signal),
+            (JobState::Failed, 3, 0)
+        );
+    }
+
+    #[test]
+    fn a_first_failure_that_was_an_oom_kill_ends_the_run_as_one() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.first_failed_node = Some("n2".into());
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions.insert("n2".into(), oom_kill());
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!((outcome.state, outcome.signal), (JobState::OutOfMemory, 9));
+    }
+
+    /// Older controllers apply this rule to every log they write, so a run
+    /// without a recorded first failure must keep it.
+    #[test]
+    fn without_a_recorded_first_failure_any_nodes_oom_kill_counts() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        job.node_completions.insert("n2".into(), oom_kill());
+
+        assert_eq!(job.reported_outcome().state, JobState::OutOfMemory);
     }
 
     #[test]

@@ -22255,6 +22255,27 @@ state = "UP"
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_kill_of_a_stopped_copy_cannot_override_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+        cm.node_complete(job_id, "n3", 0, 9 | spur_core::job::OOM_SIGNAL_FLAG, 0)
+            .unwrap();
+
+        let done = cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Failed);
+    }
+
     /// Both were proposed while the run was still Running, before either applied.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_repeat_copy_exit_cannot_erase_the_first_failure() {
