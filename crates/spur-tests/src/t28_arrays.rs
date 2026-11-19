@@ -74,25 +74,6 @@ mod tests {
         assert_eq!(job.resolved_stdout(), "/tmp/output_%A_%a.log");
     }
 
-    // ── T28.5: Array job IDs ─────────────────────────────────────
-
-    #[test]
-    fn t28_5_array_job_id_tracking() {
-        let mut job = Job::new(
-            200,
-            JobSpec {
-                name: "array".into(),
-                user: "test".into(),
-                ..Default::default()
-            },
-        );
-        job.spec.array_job_id = Some(200);
-        job.spec.array_task_id = Some(42);
-
-        assert_eq!(job.spec.array_job_id, Some(200));
-        assert_eq!(job.spec.array_task_id, Some(42));
-    }
-
     // ── T28.6: Array tasks are independent jobs ──────────────────
 
     #[test]
@@ -155,21 +136,6 @@ mod tests {
         let spec = parse_array_spec("0-20:5%2").unwrap();
         assert_eq!(spec.task_ids, vec![0, 5, 10, 15, 20]);
         assert_eq!(spec.max_concurrent, 2);
-    }
-
-    #[test]
-    fn t28_10_array_max_concurrent_stored_on_spec() {
-        let mut job = Job::new(
-            300,
-            JobSpec {
-                name: "array_conc".into(),
-                user: "test".into(),
-                array_spec: Some("0-99%5".into()),
-                ..Default::default()
-            },
-        );
-        job.spec.array_max_concurrent = Some(5);
-        assert_eq!(job.spec.array_max_concurrent, Some(5));
     }
 
     // ── T28.11+: dependencies against an array parent ─────────────

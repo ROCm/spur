@@ -195,7 +195,7 @@ plugin = "backfill"
         assert_eq!(config.scheduler.default_time_limit_minutes, 0);
     }
 
-    // ── T52.15–17: listen_addr from config ────────────────────────
+    // ── T52.15–16: listen_addr from config ───────────────────────
 
     #[test]
     fn t52_15_listen_addr_preserved_from_config() {
@@ -227,24 +227,6 @@ state_dir = "/tmp/spur"
             config.controller.listen_addr.contains(':'),
             "default listen_addr '{}' must be a host:port address",
             config.controller.listen_addr
-        );
-    }
-
-    #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
-    fn t52_17_cli_listen_overrides_config() {
-        // When --listen CLI arg is provided it wins; when absent, config value is used.
-        let config_addr = "[::]:6821";
-
-        let with_cli = Some("[::]:6822".to_string());
-        let final_addr = with_cli.unwrap_or_else(|| config_addr.to_string());
-        assert_eq!(final_addr, "[::]:6822", "CLI --listen must override config");
-
-        let no_cli: Option<String> = None;
-        let final_addr = no_cli.unwrap_or_else(|| config_addr.to_string());
-        assert_eq!(
-            final_addr, "[::]:6821",
-            "config listen_addr used when --listen absent"
         );
     }
 }

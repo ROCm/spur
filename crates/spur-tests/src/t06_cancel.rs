@@ -86,22 +86,4 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::Held);
         assert_eq!(job.priority, 0);
     }
-
-    // ── T06.5: Held jobs not in schedulable pending ──────────────
-
-    #[test]
-    fn t06_5_held_not_schedulable() {
-        let mut held = make_job("held");
-        held.pending_reason = PendingReason::Held;
-        held.priority = 0;
-        let normal = make_job("normal");
-
-        let jobs = [held.clone(), normal.clone()];
-        let schedulable: Vec<_> = jobs
-            .iter()
-            .filter(|j| j.state == JobState::Pending && j.pending_reason != PendingReason::Held)
-            .collect();
-        assert_eq!(schedulable.len(), 1);
-        assert_eq!(schedulable[0].spec.name, "normal");
-    }
 }
