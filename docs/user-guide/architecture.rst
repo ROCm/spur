@@ -23,6 +23,12 @@ High availability is built in through Raft log replication (openraft) and is
 always on: even a single-node deployment runs a one-member Raft cluster. In a
 multi-controller cluster, the leader handles all writes and non-leaders forward
 requests to it automatically, so clients can talk to any controller.
+A non-leader stops a connection attempt to the leader after 5 seconds and
+sends HTTP/2 pings on an open connection, so a forward to a leader that has
+moved (for example a restarted Pod with a new IP) fails in seconds with an
+error that the client can retry, instead of hanging. The non-leader logs each
+failed forward at ``warn`` level with the leader's node id and address, and the
+next forward connects again.
 
 ``spurd`` — Node agent
 ~~~~~~~~~~~~~~~~~~~~~~~
