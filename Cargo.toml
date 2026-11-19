@@ -33,6 +33,7 @@ repository = "https://github.com/ROCm/spur"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 backon = { version = "1", features = ["tokio-sleep"] }
+tokio-stream = "0.1"
 
 # gRPC + protobuf
 tonic = "0.14"
@@ -40,6 +41,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
+tonic-health = "0.14"
 # HTTP/2 layer under hyper/tonic. Floored at >=0.4.20: earlier 0.4.x releases
 # predate DATA-frame and send-buffer fixes this project relies on under heavy
 # concurrent streaming. Not used directly; the floor just keeps the resolver
@@ -50,6 +52,7 @@ h2 = "0.4.20"
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace"] }
+http = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -72,6 +75,9 @@ schemars = "1"
 
 # Unix
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket", "term", "time"] }
+hostname = "0.4.2"
+whoami = "2.1.1"
+libloading = "0.9.0"
 
 # Embedded Lua for the job_submit hook (vendored: no system Lua needed)
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
@@ -107,6 +113,8 @@ base64 = "0.23"
 rand = "0.10"
 subtle = "2"
 serial_test = "4"
+shlex = "2"
+tempfile = "3"
 
 [workspace.lints.clippy]
 unnecessary_unwrap = "warn"

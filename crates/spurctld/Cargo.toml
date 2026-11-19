@@ -30,10 +30,10 @@ anyhow = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-hostname = "0.4.2"
+hostname = { workspace = true }
 openraft = { workspace = true }
 axum = { workspace = true }
-http = "1"
+http = { workspace = true }
 http-body-util = "0.1"
 bytes = { workspace = true }
 tower = { workspace = true }
@@ -43,9 +43,9 @@ nix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
+tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { workspace = true, features = ["net"] }
 serde_urlencoded = "0.7"
 
 [lints]
