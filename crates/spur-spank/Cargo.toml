@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 tracing = { workspace = true }
 anyhow = { workspace = true }
-libloading = "0.9.0"
+libloading = { workspace = true }
 thiserror.workspace = true
 
 [lints]
