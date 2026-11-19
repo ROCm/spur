@@ -3223,7 +3223,7 @@ submitting host on each invocation.
      - Agent restart
    * - ``epilog``
      - ``Epilog``
-     - compute node, at job termination — and right after a launch that fails once the ``prolog`` has run, before the failure is reported
+     - compute node, at job termination — and when a launch fails after the ``prolog`` ran but before the job's supervisor started, before the failure is reported
      - Agent restart
    * - ``prolog_slurmctld``
      - ``PrologSlurmctld``
