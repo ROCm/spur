@@ -5626,6 +5626,31 @@ mod tests {
     }
 
     #[test]
+    fn a_cgroup_holding_only_the_launcher_does_not_lose_a_stop_or_the_resume() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.procs"), format!("{pid}\n"))
+            .expect("seed cgroup.procs");
+        let job = RunningJob::Forked {
+            pid,
+            _pidfd: None,
+            reaped: false,
+        };
+        let deliver = |sig| {
+            deliver_signal(Some(cgroup.path()), &job, TrackedProcess::Launcher, sig)
+                .expect("deliver the signal")
+        };
+
+        deliver(Signal::SIGSTOP);
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+
+        launcher.fork_now();
+        deliver(Signal::SIGCONT);
+        assert!(launcher.line().starts_with("forked "));
+    }
+
+    #[test]
     fn a_stop_also_reaches_a_workload_that_appeared_while_the_launcher_was_being_stopped() {
         let mut launcher = UnforkedLauncher::spawn();
         let pid = launcher.pid();
