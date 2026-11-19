@@ -209,3 +209,58 @@ def test_reclaim_only_releases_the_shortfall(accounting_cluster, victim_mode):
     _victims(c, [a], incoming, "requeue")
     assert (_identity(c, protected, path), _identity(c, b, spared_path)) == before
     _finish(c, incoming)
+
+
+@pytest.mark.parametrize("incoming_nodes", [1, 2])
+def test_multinode_protected_tenant_does_not_hide_shared_capacity(
+        accounting_cluster, victim_mode, incoming_nodes):
+    c = accounting_cluster
+    if len(c.node_names) < 2:
+        pytest.skip("requires two compute nodes")
+    _qos(c, victim_mode)
+    nodes = c.node_names[:2]
+    protected, protected_path = _run(
+        c, "protected-wide", "shared-protected", ",".join(nodes), cpus=2, count=2,
+    )
+    spared = [(protected, protected_path, 0, _identity(c, protected, protected_path))]
+    victims = []
+    for index, node in enumerate(nodes):
+        chosen, chosen_path = _run(c, f"candidate-{index}", "shared-low", node)
+        neighbor, neighbor_path = _run(c, f"neighbor-{index}", "shared-low", node)
+        spared.append((neighbor, neighbor_path, index,
+                       _identity(c, neighbor, neighbor_path, index)))
+        if index < incoming_nodes:
+            victims.append(chosen)
+        else:
+            spared.append((chosen, chosen_path, index,
+                           _identity(c, chosen, chosen_path, index)))
+    incoming, _ = _submit(c, "incoming", "shared-high", ",".join(nodes[:incoming_nodes]),
+                          count=incoming_nodes, seconds=20)
+    wait_job_state(c, incoming, "R", timeout=60)
+    _victims(c, victims, incoming, victim_mode)
+    for job, path, index, identity in spared:
+        assert _identity(c, job, path, index) == identity
+    _finish(c, incoming)
+
+
+def test_multinode_victim_releases_its_slices_once(accounting_cluster, victim_mode):
+    c = accounting_cluster
+    if len(c.node_names) < 2:
+        pytest.skip("requires two compute nodes")
+    _qos(c, victim_mode)
+    nodes = c.node_names[:2]
+    spared = []
+    for index, node in enumerate(nodes):
+        job, path = _run(c, f"protected-{index}", "shared-protected", node, cpus=2)
+        spared.append((job, path, index, _identity(c, job, path, index)))
+    victim, _ = _run(c, "wide-victim", "shared-low", ",".join(nodes), count=2)
+    for index, node in enumerate(nodes):
+        job, path = _run(c, f"neighbor-{index}", "shared-low", node)
+        spared.append((job, path, index, _identity(c, job, path, index)))
+    incoming, _ = _submit(c, "incoming", "shared-high", ",".join(nodes),
+                          count=2, seconds=20)
+    wait_job_state(c, incoming, "R", timeout=60)
+    _victims(c, [victim], incoming, victim_mode)
+    for job, path, index, identity in spared:
+        assert _identity(c, job, path, index) == identity
+    _finish(c, incoming)

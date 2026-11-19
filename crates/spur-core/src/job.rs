@@ -1436,9 +1436,21 @@ impl Job {
     pub fn held_nodes(&self) -> Vec<String> {
         self.allocated_nodes
             .iter()
-            .filter(|node| self.is_held_on(node))
+            .filter(|node| !self.node_completions.contains_key(*node))
             .cloned()
             .collect()
+    }
+
+    pub fn held_allocations(&self) -> impl Iterator<Item = (&String, &ResourceAllocations)> {
+        let nodes = (self.allocated_nodes.len() > 2)
+            .then(|| self.allocated_nodes.iter().collect::<HashSet<_>>());
+        self.per_node_alloc.iter().filter(move |(node, _)| {
+            let allocated = match &nodes {
+                Some(nodes) => nodes.contains(node),
+                None => self.allocated_nodes.contains(node),
+            };
+            allocated && !self.node_completions.contains_key(*node)
+        })
     }
 
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
@@ -1457,7 +1469,7 @@ impl Job {
     pub fn holds_a_placement(&self) -> bool {
         self.allocated_nodes
             .iter()
-            .any(|node| self.is_held_on(node))
+            .any(|node| !self.node_completions.contains_key(node))
     }
 
     /// Whether this job currently occupies node/TRES capacity: either Running,
@@ -1967,6 +1979,52 @@ mod tests {
             .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
 
         assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
+    }
+
+    #[test]
+    fn held_allocations_exclude_completed_and_unassigned_nodes_without_duplicates() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n3".into(), "n2".into(), "n1".into(), "n3".into()];
+        job.node_completions
+            .insert("n2".into(), NodeCompletion::default());
+        for (name, cpus) in [("n1", 1), ("n2", 2), ("n3", 3), ("other", 4)] {
+            job.per_node_alloc
+                .insert(name.into(), ResourceAllocations::with_scalar(cpus, 0));
+        }
+        let allocations: HashMap<_, _> = job
+            .held_allocations()
+            .map(|(node, slice)| (node.as_str(), slice.cpus))
+            .collect();
+        assert_eq!(allocations, [("n1", 1), ("n3", 3)].into());
+        assert_eq!(job.held_allocations().count(), 2);
+        assert_eq!(job.held_nodes(), ["n3", "n1", "n3"]);
+        assert!(job.holds_a_placement());
+        for name in ["n1", "n3"] {
+            job.node_completions
+                .insert(name.into(), NodeCompletion::default());
+        }
+        assert!(!job.holds_a_placement());
+        assert!(job.held_nodes().is_empty());
+        assert_eq!(job.held_allocations().count(), 0);
+    }
+
+    #[test]
+    fn small_held_allocations_exclude_completed_and_unassigned_nodes() {
+        for names in [vec!["n1"], vec!["n1", "n2"]] {
+            let mut job = make_job();
+            job.allocated_nodes = names.into_iter().map(String::from).collect();
+            for name in ["n1", "n2", "other"] {
+                job.per_node_alloc
+                    .insert(name.into(), ResourceAllocations::with_scalar(1, 0));
+            }
+            job.node_completions
+                .insert("n2".into(), NodeCompletion::default());
+            let held: Vec<_> = job
+                .held_allocations()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert_eq!(held, ["n1"]);
+        }
     }
 
     #[test]

@@ -74,20 +74,14 @@ impl Snapshot {
             }
             let holds = |job: &&Job| job.holds_allocation();
             for job in jobs.values() {
-                budget.spend(1)?;
+                budget.spend(job.allocated_nodes.len().checked_add(1)?)?;
                 if !holds(&job) {
                     continue;
                 }
                 budget.spend(job_work(job)?)?;
                 size.job(job)?;
                 size.strings(&job.allocated_nodes)?;
-                budget.spend(
-                    job.allocated_nodes.len().checked_mul(
-                        job.allocated_nodes
-                            .len()
-                            .checked_add(job.per_node_alloc.len())?,
-                    )?,
-                )?;
+                budget.spend(held_allocation_work(job)?)?;
                 size.strings(
                     [&job.effective_partition, &job.preempt_mode]
                         .into_iter()
@@ -143,11 +137,7 @@ impl Snapshot {
                             requeue_hold_secs: grace.requeue_hold_secs,
                         });
                 copy.allocated_nodes = job.held_nodes();
-                for (node, alloc) in job
-                    .per_node_alloc
-                    .iter()
-                    .filter(|(node, _)| job.is_held_on(node))
-                {
+                for (node, alloc) in job.held_allocations() {
                     copy.per_node_alloc
                         .insert(node.clone(), consumable_allocation(alloc));
                 }
@@ -159,19 +149,24 @@ impl Snapshot {
                 now,
                 ReleaseWaits::of(&cluster.config().scheduler),
             );
+            budget.spend(state.nodes.len())?;
+            let node_index: HashMap<_, _> = state
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.name.as_str(), index))
+                .collect();
             for assignment in assigned {
-                budget.spend(
-                    holders
-                        .len()
-                        .checked_add(assignment.nodes.len().checked_mul(assignment.nodes.len())?)?,
-                )?;
+                budget.spend(holders.len().checked_add(assignment.nodes.len())?)?;
                 let job = jobs.get(&assignment.job_id)?;
                 if let Some(holder) = holders.iter().find(|job| job.job_id == assignment.job_id) {
+                    budget.spend(held_allocation_work(holder)?)?;
+                    let held_nodes: HashSet<_> = holder.allocated_nodes.iter().collect();
                     if !matches!(holder.state, JobState::Pending | JobState::Running)
                         || holder.allocated_nodes.len() != assignment.nodes.len()
                         || holder.effective_partition != assignment.partition
                         || assignment.nodes.iter().any(|node| {
-                            !holder.allocated_nodes.contains(node)
+                            !held_nodes.contains(node)
                                 || holder.per_node_alloc.get(node)
                                     != assignment.per_node_alloc.get(node)
                         })
@@ -185,7 +180,7 @@ impl Snapshot {
                 }
                 let typed_gpu = job_typed_gpu(job);
                 for node in &assignment.nodes {
-                    let index = nodes.iter().position(|n| n.name == *node)?;
+                    let index = *node_index.get(node.as_str())?;
                     let alloc = assignment.per_node_alloc.get(node)?;
                     let held = &mut nodes[index].alloc_resources;
                     budget.spend(allocation_merge_work(held, alloc)?)?;
@@ -232,6 +227,16 @@ pub(super) struct VictimPool<'a> {
     pub priority: &'a HashMap<JobId, i32>,
     pub max_priority: Option<i32>,
     pub order: Option<VictimOrder<'a>>,
+}
+
+fn held_allocation_work(job: &Job) -> Option<usize> {
+    job.allocated_nodes
+        .iter()
+        .chain(job.per_node_alloc.keys())
+        .try_fold(0usize, |work, name| {
+            work.checked_add(name.len().checked_add(1)?)
+        })?
+        .checked_mul(2)
 }
 
 fn contains(held: &ResourceAllocations, slice: &ResourceAllocations) -> bool {
@@ -515,7 +520,14 @@ pub(super) fn satisfiable_victim_set(
     now: DateTime<Utc>,
     budget: &mut SearchBudget,
 ) -> Result<Option<HashSet<JobId>>, SelectionDeferred> {
-    select_victims(reclaimer, pool, state, now, budget).ok_or(SelectionDeferred)
+    let selected = select_victims(reclaimer, pool, state, now, budget).ok_or(SelectionDeferred)?;
+    if selected
+        .as_ref()
+        .is_some_and(|victims| victims.len() > MAX_VICTIMS)
+    {
+        return Err(SelectionDeferred);
+    }
+    Ok(selected)
 }
 
 fn select_victims(
@@ -525,28 +537,15 @@ fn select_victims(
     now: DateTime<Utc>,
     budget: &mut SearchBudget,
 ) -> Option<Option<HashSet<JobId>>> {
-    if pool.evictable.len() > MAX_VICTIMS {
-        return None;
-    }
     let mut ordered = Vec::new();
-    ordered.try_reserve_exact(pool.evictable.len()).ok()?;
     let mut size = InputSize::default();
     for holder in pool.holders {
         budget.spend(1)?;
         budget.spend(job_work(holder)?)?;
         size.job(holder)?;
         size.strings(&holder.allocated_nodes)?;
-        budget.spend(
-            holder
-                .allocated_nodes
-                .len()
-                .checked_mul(holder.per_node_alloc.len())?,
-        )?;
-        for (node, alloc) in holder
-            .per_node_alloc
-            .iter()
-            .filter(|(n, _)| holder.is_held_on(n))
-        {
+        budget.spend(held_allocation_work(holder)?)?;
+        for (node, alloc) in &holder.per_node_alloc {
             budget.spend(1)?;
             size.text(node)?;
             size.allocation(alloc)?;
@@ -561,9 +560,8 @@ fn select_victims(
                 .iter()
                 .all(|n| holder.per_node_alloc.contains_key(n))
         {
-            if ordered.len() == MAX_VICTIMS {
-                return None;
-            }
+            size.entries(1)?;
+            ordered.try_reserve(1).ok()?;
             ordered.push(holder);
         }
     }
@@ -575,11 +573,7 @@ fn select_victims(
         .collect();
     let mut known: HashMap<&str, ResourceAllocations> = HashMap::new();
     for holder in pool.holders {
-        for (node, alloc) in holder
-            .per_node_alloc
-            .iter()
-            .filter(|(n, _)| holder.is_held_on(n))
-        {
+        for (node, alloc) in holder.held_allocations() {
             let held = known.entry(node).or_default();
             budget.spend(allocation_merge_work(held, alloc)?)?;
             add_checked(held, alloc)?;
@@ -609,6 +603,11 @@ fn select_victims(
     if ordered.is_empty() {
         return Some(None);
     }
+    budget.spend(
+        ordered
+            .len()
+            .checked_mul(ordered.len().checked_ilog2().unwrap_or(0) as usize + 1)?,
+    )?;
     ordered.sort_by_cached_key(|job| {
         let node = job
             .allocated_nodes

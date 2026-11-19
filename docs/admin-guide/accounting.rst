@@ -1311,8 +1311,9 @@ that prunes unnecessary victims. Neither path guarantees a globally cheapest set
 
 Reclaim and QOS preemption have separate budgets, each allowing 2064 placement
 trials and two million work units per cycle. Input limits bound copied metadata,
-4096 nodes, and 1024 eligible victims; unusually large metadata can reach its own
-limit before the node count. Exhaustion evicts nothing and logs a deferred-selection
+4096 nodes, and 1024 selected victims. A larger eligible pool can still yield a
+small sufficient set within the work and metadata limits; unusually large
+metadata can reach its own limit before the node count. Exhaustion evicts nothing and logs a deferred-selection
 warning, distinct from finding that no eligible victims can help. Complex requests
 can remain pending at these limits. Reclaim skips the allocation snapshot when
 there are no eligible borrowed jobs.

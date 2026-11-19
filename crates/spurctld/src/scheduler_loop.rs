@@ -1418,11 +1418,7 @@ fn partition_usage_from_jobs<'a>(
             .max(now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS));
         let typed_gpu = job_typed_gpu(job);
         let by_node = usage.entry(partition.name.clone()).or_default();
-        let held = job
-            .per_node_alloc
-            .iter()
-            .filter(|(node, _)| job.is_held_on(node));
-        for (node, alloc) in held {
+        for (node, alloc) in job.held_allocations() {
             by_node
                 .entry(node.clone())
                 .or_default()

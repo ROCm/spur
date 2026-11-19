@@ -258,13 +258,20 @@ name/partition/feature matching for overlap checks, including preferred-node
 fallback. Injectable GPU counts and expanded placeholder type text are bounded
 before allocation.
 
-`MAX_NODES` (4096) and `MAX_VICTIMS` (1024) bound the node and eligible-victim
-domains. `InputSize` counts entries and text, with `MAX_ENTRIES` (327680, 64 per
+`MAX_NODES` (4096) bounds the node domain; `MAX_VICTIMS` (1024) bounds the final
+selected set, not the eligible candidate pool. Candidate scanning and sorting
+consume the work budget, and candidate references count toward copied metadata.
+`InputSize` counts entries and text, with `MAX_ENTRIES` (327680, 64 per
 node/victim allowance) and `MAX_TEXT` (5 MiB, 1024 bytes per node/victim allowance).
 These are aggregate metadata limits, not an RSS estimate or a guarantee for every
 possible node description. `MAX_HOSTS` (8192) and `MAX_NAME` (255 bytes) bound
 hostlist expansion. A 4096-node, eight-GPU fixture exercises capture and selection
 under the default limits.
+
+Held-allocation traversal uses temporary membership sets for jobs wider than two
+nodes, avoiding repeated long node-list scans. Snapshot construction, ownership validation, and partition
+charges retain only allocated nodes without completion reports. No additional
+persisted allocation index is introduced.
 
 Each reclaim and QOS-preemption pass has its own `SearchBudget` with `MAX_TRIALS`
 (2064, `2 * MAX_VICTIMS + 16`) placement calls and `MAX_WORK` (2000000) work units.

@@ -29,7 +29,7 @@ victim because it retains the allocation.
 | Structure | Lifetime and purpose | Storage bound |
 | --- | --- | --- |
 | `preemption::Snapshot` | One reclaim/preemption pass; compact nodes, held job slices, and partition usage captured under jobs-then-nodes read locks | Input sizing precedes cloning; no scripts, environment, execution history, CPU binding, or GPU topology metadata |
-| `VictimPool` | Borrowed references to holders plus eligible IDs and QOS rank | At most 1,024 eligible victims |
+| `VictimPool` | Borrowed references to holders plus eligible IDs and QOS rank | Candidate processing obeys work/metadata limits; at most 1,024 victims in the final set |
 | `PlacementRequest` | Compact, canonicalized request; resource and placement sizing for immediate trials | Bounded hostlist expansion, GPU demand, and repeated GPU type text before allocation |
 | `PlacementScope` | Prepared set of nodes matching names, exclusions, preferred-node fallback, partitions, and static features; reused across holder overlap checks | At most 4,096 names; no per-victim hostlist expansion |
 | `SearchBudget` | One reclaim or QOS-preemption pass; independent budgets | `MAX_TRIALS` (2064) calls and `MAX_WORK` (2000000) charged work units |
@@ -73,11 +73,34 @@ products defer without allocating those placeholders.
    logs the affected job, including when pruning cannot complete. The pending job retries on later cycles; there is no
    exponential subset enumeration or persistent accumulation between cycles.
 
-The current regressions count placement calls rather than measuring wall-clock
-performance: requests requiring 60, 64 and 1024 co-resident victims use one full
+Deterministic regressions check that requests requiring 60, 64 and 1024 co-resident victims use one full
 placement verification. A 4096-node fixture with eight GPUs per node fits capture
-and selection within default limits. These checks do not measure RSS, production
-throughput or end-to-end latency.
+and selection within default limits. A separate 1024-node protected holder fixture
+captures live allocation records and verifies selection both before and after a
+node completes. Pools with 1025 eligible jobs select one sufficient victim through
+both direct selection and fallback; a final set exceeding 1024 still defers.
+
+The ignored `mixed_workload_profile_*` tests measure the production selector with
+128 shared GPU nodes, protected tenants, and 310 eligible jobs, mostly one-/two-node
+jobs with occasional eight-/sixteen-node jobs. Three alternating before/after
+runs of 64 selections each gave these median-of-run-median timings in an
+unoptimized build, comparing revision `24b74b1b` with bounded candidate processing
+and indexed held-allocation traversal:
+
+| Incoming nodes | Before (ms) | After (ms) |
+| --- | --- | --- |
+| 1 | 22.07 | 21.99 |
+| 2 | 25.71 | 25.70 |
+| 8 | 26.85 | 26.35 |
+| 16 | 26.57 | 26.55 |
+
+Each selection used 11 full placement checks and chose one eligible job. The
+multi-node-victim fallback remains in use. Whole-process peak RSS was 29.0–30.0
+MiB before and 29.6–30.1 MiB after, including fixtures and the test harness.
+These measurements exclude snapshot construction and real job dispatch, and do
+not establish a general speedup or a worst-case memory bound. Separate complete
+test processes peaked at about 56 MiB for the wide-holder regression and 145 MiB
+for the 4096-node fixture; those figures include controller state and fixtures.
 
 ## Required coverage and validation
 

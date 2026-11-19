@@ -182,7 +182,7 @@ fn unresponsive_free_capacity_does_not_suppress_necessary_preemption() {
 #[test]
 fn unpinned_selector_keeps_its_budget_with_partition_charges() {
     let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
-    for count in [64, 128] {
+    for count in [64, 128, 1025] {
         for with_gpus in [false, true] {
             let mut f = Fixture::new(4);
             if !with_gpus {
@@ -632,15 +632,75 @@ fn a_cycle_budget_is_shared_across_requests() {
 }
 
 #[test]
-fn oversized_node_or_victim_domains_defer() {
+fn irrelevant_eligible_ids_do_not_block_a_sufficient_victim() {
     let mut f = Fixture::new(4);
     f.hold(1, 4, 0, &[], true);
     f.eligible.extend(1..=MAX_VICTIMS as u32 + 1);
-    assert_eq!(selected(&f, &request(1, 0)), None);
-    f.eligible = HashSet::from([1]);
+    assert_eq!(selected(&f, &request(1, 0)), Some(HashSet::from([1])));
+}
+
+#[test]
+fn oversized_node_domain_defers() {
+    let mut f = Fixture::new(4);
+    f.hold(1, 4, 0, &[], true);
     let mut job = request(1, 0);
     job.spec.num_nodes = MAX_NODES as u32 + 1;
     assert_eq!(selected(&f, &job), None);
+}
+
+#[test]
+fn large_candidate_pool_selects_only_the_shortfall() {
+    for fallback in [false, true] {
+        let mut f = Fixture::new(MAX_VICTIMS as u32 + 2);
+        f.hold(10_000, 1, 0, &[], false);
+        for id in 1..=MAX_VICTIMS as u32 + 1 {
+            f.hold(id, 1, 0, &[], true);
+            f.priorities.insert(id, 1);
+        }
+        let cheapest = MAX_VICTIMS as u32 + 1;
+        f.priorities.insert(cheapest, 0);
+        if fallback {
+            f.nodes[0].partitions = vec!["default".into()];
+            f.partitions.push(spur_core::partition::Partition {
+                name: "default".into(),
+                is_default: true,
+                max_mem_per_node: Some(100),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            selected(&f, &request(1, 0)),
+            Some(HashSet::from([cheapest]))
+        );
+        assert_eq!(f.nodes[0].alloc_resources.cpus, MAX_VICTIMS as u32 + 2);
+        assert!(f.holders.iter().all(|job| job.state == JobState::Running));
+    }
+}
+
+#[test]
+fn selected_victim_limit_still_defers_without_eviction() {
+    let count = MAX_VICTIMS as u32 + 1;
+    let mut f = Fixture::new(count);
+    for id in 1..=count {
+        f.hold(id, 1, 0, &[], true);
+    }
+    assert_eq!(
+        satisfiable_victim_set(
+            &request(count, 0),
+            &VictimPool {
+                evictable: &f.eligible,
+                holders: &f.holders,
+                priority: &f.priorities,
+                max_priority: None,
+                order: None,
+            },
+            &f.state(),
+            DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
+            &mut SearchBudget::default(),
+        ),
+        Err(SelectionDeferred)
+    );
+    assert_eq!(f.nodes[0].alloc_resources.cpus, count);
 }
 
 #[test]
@@ -737,6 +797,114 @@ fn victim_selection_profile() {
             times[128], times[243]
         );
     }
+}
+
+fn profile_mixed_workload(needed: u32) {
+    let mut f = Fixture::new(4);
+    let template = f.nodes[0].clone();
+    f.nodes = (0..128)
+        .map(|i| {
+            let mut node = template.clone();
+            node.name = format!("node{i:04}");
+            node
+        })
+        .collect();
+    for i in 0..f.nodes.len() {
+        f.hold_on(
+            i,
+            10_000 + i as u32,
+            ResourceAllocations::with_scalar(1, 20),
+            false,
+        );
+        for slot in 0..2 {
+            let mut slice = ResourceAllocations::with_scalar(1, 20);
+            slice.add(&ResourceAllocations::from_device_ids("gpu", &[1000 + slot]));
+            f.hold_on(i, 1 + i as u32 * 2 + slot as u32, slice, true);
+        }
+    }
+    let mut first = 0;
+    while first < f.nodes.len() {
+        let width = match first % 64 {
+            48 => 16,
+            24 | 40 => 8,
+            n if n % 4 == 2 => 2,
+            _ => 1,
+        };
+        let id = 1_000 + first as u32;
+        let mut job = Job::new(
+            id,
+            JobSpec {
+                num_nodes: width as u32,
+                ..Default::default()
+            },
+        );
+        job.state = JobState::Running;
+        for index in first..first + width {
+            let mut slice = ResourceAllocations::with_scalar(1, 20);
+            slice.add(&ResourceAllocations::from_device_ids("gpu", &[1002]));
+            f.nodes[index].alloc_resources.add(&slice);
+            let name = f.nodes[index].name.clone();
+            job.allocated_nodes.push(name.clone());
+            job.per_node_alloc.insert(name, slice);
+        }
+        f.holders.push(job);
+        f.eligible.insert(id);
+        first += width;
+    }
+    let mut incoming = request(1, 20);
+    incoming.spec.num_nodes = needed;
+    incoming.spec.num_tasks = needed;
+    incoming.spec.gpus_per_node = Some(GpuRequest::new(1, None));
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    let facts = crate::victim_order::victim_facts(&f.holders, now);
+    let order = VictimOrder::new(
+        &spur_core::partition::DEFAULT_VICTIM_ORDER,
+        &facts,
+        incoming.job_id,
+    );
+    let mut times = Vec::new();
+    let mut calls = Vec::new();
+    let mut work = Vec::new();
+    let mut victims = 0;
+    for _ in 0..64 {
+        let mut budget = SearchBudget::default();
+        let start = std::time::Instant::now();
+        let chosen = f
+            .select_with_order(&incoming, &mut budget, Some(order))
+            .expect("mixed workload makes progress");
+        times.push(start.elapsed().as_micros());
+        victims = chosen.len();
+        assert!(chosen.is_subset(&f.eligible));
+        calls.push(SearchBudget::default().calls_left - budget.calls_left);
+        work.push(SearchBudget::default().work_left - budget.work_left);
+    }
+    times.sort_unstable();
+    eprintln!("MIXED nodes=128 incoming={needed} candidates={} median_us={} p95_us={} victims={victims} max_calls={} max_work={}",
+        f.eligible.len(), times[32], times[60], calls.iter().max().expect("calls"), work.iter().max().expect("work"));
+}
+
+#[test]
+#[ignore = "manual mixed-workload timing and process memory profile"]
+fn mixed_workload_profile_one_node() {
+    profile_mixed_workload(1);
+}
+
+#[test]
+#[ignore = "manual mixed-workload timing and process memory profile"]
+fn mixed_workload_profile_two_nodes() {
+    profile_mixed_workload(2);
+}
+
+#[test]
+#[ignore = "manual mixed-workload timing and process memory profile"]
+fn mixed_workload_profile_eight_nodes() {
+    profile_mixed_workload(8);
+}
+
+#[test]
+#[ignore = "manual mixed-workload timing and process memory profile"]
+fn mixed_workload_profile_sixteen_nodes() {
+    profile_mixed_workload(16);
 }
 
 #[test]
@@ -1317,7 +1485,7 @@ fn full_gpu_cluster_fits_snapshot_and_selection_limits() {
             i,
             i as u32 + 1,
             ResourceAllocations::with_scalar(8, 0),
-            i < MAX_VICTIMS,
+            true,
         );
     }
     assert_eq!(
@@ -1363,6 +1531,137 @@ fn selection_deferral_is_distinct_from_insufficient_capacity() {
         ),
         Err(SelectionDeferred)
     );
+}
+
+#[test]
+fn wide_protected_holder_preserves_budget_and_completed_node_accounting() {
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+
+    let dir = tempfile::TempDir::new().expect("state directory");
+    let cluster = ClusterManager::new(
+        spur_core::config::SlurmConfig::load_from_str(
+            r#"cluster_name = "test"
+[controller]
+hostname = "test"
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+max_tres_per_node = { cpu = 2 }
+"#,
+        )
+        .expect("config"),
+        dir.path(),
+    )
+    .expect("cluster");
+    let apply = |value: serde_json::Value| {
+        cluster.apply_operation(&serde_json::from_value::<WalOperation>(value).expect("operation"));
+    };
+    let mut f = Fixture::new(2);
+    let template = f.nodes[0].clone();
+    f.nodes = (0..1024)
+        .map(|i| {
+            let mut node = template.clone();
+            node.name = format!("node{i:04}");
+            node.partitions = vec!["default".into()];
+            apply(serde_json::json!({"NodeRegister": {
+                "name": node.name, "resources": node.total_resources, "address": ""
+            }}));
+            node
+        })
+        .collect();
+    f.partitions.push(spur_core::partition::Partition {
+        name: "default".into(),
+        is_default: true,
+        max_tres_per_node: [("cpu".into(), 2)].into(),
+        ..Default::default()
+    });
+    let slice = ResourceAllocations::with_scalar(1, 0);
+    let wide_nodes: Vec<_> = f.nodes.iter().map(|node| node.name.clone()).collect();
+    let wide_alloc: HashMap<_, _> = wide_nodes
+        .iter()
+        .map(|name| (name.clone(), slice.clone()))
+        .collect();
+    for (id, nodes, allocations) in [
+        (1, wide_nodes.clone(), wide_alloc.clone()),
+        (
+            2,
+            vec!["node0000".into()],
+            [("node0000".into(), slice.clone())].into(),
+        ),
+    ] {
+        let spec = JobSpec {
+            num_nodes: nodes.len() as u32,
+            ..Default::default()
+        };
+        apply(serde_json::json!({"JobSubmit": {"job_id": id, "spec": spec}}));
+        apply(serde_json::json!({"JobStart": {
+            "job_id": id, "nodes": nodes,
+            "resources": ResourceAllocations::with_scalar(nodes.len() as u32, 0),
+            "per_node_alloc": allocations, "effective_partition": "default"
+        }}));
+        apply(serde_json::json!({"JobStateChange": {
+            "job_id": id, "old_state": "PENDING", "new_state": "RUNNING"
+        }}));
+    }
+    let assignment = Assignment {
+        job_id: 1,
+        nodes: wide_nodes,
+        per_node_alloc: wide_alloc,
+        partition: Some("default".into()),
+        memory_adjustment: None,
+    };
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    let mut incoming = request(1, 0);
+    incoming.spec.nodelist = Some("node0000".into());
+    for completed in [false, true] {
+        if completed {
+            apply(serde_json::json!({"JobNodeComplete": {
+                "job_id": 1, "node_name": "node0001", "exit_code": 0, "signal": 0
+            }}));
+        }
+        let assigned = if completed {
+            &[][..]
+        } else {
+            std::slice::from_ref(&assignment)
+        };
+        let mut budget = SearchBudget::default();
+        let snapshot = Snapshot::capture(&cluster, &f.state(), assigned, now, &mut budget)
+            .expect("wide holder snapshot fits the default budget");
+        let wide = snapshot
+            .holders
+            .iter()
+            .find(|job| job.job_id == 1)
+            .expect("protected job");
+        assert_eq!(wide.allocated_nodes.len(), 1024 - usize::from(completed));
+        assert_eq!(wide.per_node_alloc.contains_key("node0001"), !completed);
+        assert_eq!(
+            snapshot.nodes[1].alloc_resources.cpus,
+            u32::from(!completed)
+        );
+        assert_eq!(
+            snapshot.usage["default"].contains_key("node0001"),
+            !completed
+        );
+        assert_eq!(
+            satisfiable_victim_set(
+                &incoming,
+                &VictimPool {
+                    evictable: &HashSet::from([2]),
+                    holders: &snapshot.holders,
+                    priority: &HashMap::new(),
+                    max_priority: None,
+                    order: None,
+                },
+                &snapshot.state(&f.state()),
+                now,
+                &mut budget,
+            ),
+            Ok(Some(HashSet::from([2])))
+        );
+        assert_eq!(snapshot.nodes[0].alloc_resources.cpus, 2);
+    }
 }
 
 #[tokio::test]
