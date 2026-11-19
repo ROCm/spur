@@ -8,6 +8,7 @@ use crate::spool_fs::{
 };
 use nix::fcntl::OFlag;
 use spur_core::job::JobState;
+use spur_proto::proto::GetJobsResponse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -121,38 +122,24 @@ pub(crate) async fn run(
                 break;
             }
         };
-        let mut states = HashMap::<u32, bool>::new();
-        for job in response.jobs {
-            let terminal =
-                JobState::from_proto_i32(job.state).is_some_and(|state| state.is_terminal());
-            // Conflicting duplicate records cannot establish terminality.
-            states
-                .entry(job.job_id)
-                .and_modify(|known| *known &= terminal)
-                .or_insert(terminal);
-        }
-        if response.authoritative
-            && !response.unrestricted_visibility
-            && !reported_hidden_jobs
-            && batch.iter().any(|id| !states.contains_key(id))
-        {
-            reported_hidden_jobs = true;
-            info!("retaining job spools the controller does not show: private job data hides other users' jobs from this node");
+        let confirmed = controller_confirmed(&response, batch);
+        if response.authoritative && !response.unrestricted_visibility && !reported_hidden_jobs {
+            let reported: HashSet<_> = response.jobs.iter().map(|job| job.job_id).collect();
+            if batch.iter().any(|id| !reported.contains(id)) {
+                reported_hidden_jobs = true;
+                info!("retaining job spools the controller does not show: private job data hides other users' jobs from this node");
+            }
         }
         let mut guards = Vec::new();
         let mut eligible = Vec::new();
+        let mut unconfirmed = 0;
         for &job_id in batch {
             let job_candidates = candidates.remove(&job_id).unwrap_or_default();
-            // Ids at or above the controller's issue high-water mark are not confirmed absent.
-            let absent_confirmed =
-                response.unrestricted_visibility && job_id < response.next_job_id;
-            let controller_allows =
-                response.authoritative && states.get(&job_id).copied().unwrap_or(absent_confirmed);
-            if !controller_allows {
+            if !confirmed.contains(&job_id) {
                 for candidate in &job_candidates {
-                    info!(job_id, path = %candidate.path.display(), "retained job spool: controller has not confirmed terminality or absence");
+                    debug!(job_id, path = %candidate.path.display(), "retained job spool: controller has not confirmed terminality or absence");
                 }
-                summary.retained += job_candidates.len();
+                unconfirmed += job_candidates.len();
                 continue;
             }
             let guard = service.spool_lifecycle_guard(job_id).await;
@@ -165,6 +152,13 @@ pub(crate) async fn run(
             }
             guards.push(guard);
             eligible.extend(job_candidates);
+        }
+        if unconfirmed > 0 {
+            info!(
+                count = unconfirmed,
+                "retained job spools: controller has not confirmed terminality or absence"
+            );
+            summary.retained += unconfirmed;
         }
         if eligible.is_empty() {
             continue;
@@ -211,11 +205,40 @@ fn retain_remaining(
     reason: &str,
     summary: &mut CleanupSummary,
 ) {
+    let count = candidates.values().map(Vec::len).sum::<usize>();
     for candidate in candidates.values().flatten() {
-        warn!(job_id = candidate.spool.job_id, path = %candidate.path.display(), reason,
-            "retained job spool");
-        summary.retained += 1;
+        debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), reason, "retained job spool");
     }
+    if count > 0 {
+        warn!(count, reason, "retained remaining job spools");
+    }
+    summary.retained += count;
+}
+
+/// Ids in `batch` the controller reports terminal, or with full visibility has issued and no longer keeps.
+pub(crate) fn controller_confirmed(response: &GetJobsResponse, batch: &[u32]) -> HashSet<u32> {
+    if !response.authoritative {
+        return HashSet::new();
+    }
+    let mut terminal = HashMap::<u32, bool>::new();
+    for job in &response.jobs {
+        let done = JobState::from_proto_i32(job.state).is_some_and(|state| state.is_terminal());
+        // Conflicting duplicate records cannot establish terminality.
+        terminal
+            .entry(job.job_id)
+            .and_modify(|known| *known &= done)
+            .or_insert(done);
+    }
+    batch
+        .iter()
+        .copied()
+        .filter(|id| {
+            terminal
+                .get(id)
+                .copied()
+                .unwrap_or(response.unrestricted_visibility && *id < response.next_job_id)
+        })
+        .collect()
 }
 
 fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
@@ -230,12 +253,12 @@ fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
                 continue;
             }
         };
-        let spools = match root.identity().and_then(|identity| {
-            if !roots.insert(identity) {
-                return Ok(Vec::new());
-            }
-            root.candidates()
-        }) {
+        let spools = match root.identity() {
+            Ok(identity) if !roots.insert(identity) => continue,
+            Ok(_) => root.candidates(),
+            Err(error) => Err(error),
+        };
+        let spools = match spools {
             Ok(spools) => spools,
             Err(error) => {
                 warn!(root = %path.display(), %error, "skipped unreadable spool inventory");
@@ -257,18 +280,20 @@ fn clean_inactive(
     deadline: Instant,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
-    let inventory = activity_inventory(&candidates, paths, deadline);
+    let inventory = match activity_inventory(&candidates, paths, deadline) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            for candidate in &candidates {
+                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained job spool: activity inventory uncertain");
+            }
+            warn!(count = candidates.len(), %error, "retained job spools: activity inventory uncertain");
+            summary.retained += candidates.len();
+            return summary;
+        }
+    };
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
         let path = &candidate.path;
-        let inventory = match &inventory {
-            Err(error) => {
-                warn!(job_id, path = %path.display(), %error, "retained job spool: activity inventory uncertain");
-                summary.retained += 1;
-                continue;
-            }
-            Ok(inventory) => inventory,
-        };
         let held = if inventory.protected.contains(&job_id) {
             Ok(true)
         } else {
@@ -614,12 +639,7 @@ fn inspect_process(
         .filter(|s| !s.is_empty())
         .collect();
     if is_supervisor(path, supervisor_uid, &comm, &args)? {
-        let id = args
-            .get(2)
-            .and_then(|s| std::str::from_utf8(s).ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|id| *id > 0);
-        let Some(id) = id else {
+        let Some(id) = crate::stepd::job_id_from_argv(&args) else {
             return Err(io::Error::other("unidentified live supervisor"));
         };
         inventory.protected.insert(id);

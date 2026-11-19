@@ -20,59 +20,54 @@ pub use proto::*;
 mod compatibility_tests {
     use prost::Message;
 
-    #[test]
-    fn old_get_jobs_responses_do_not_establish_authority() {
-        for wire in [
-            &b""[..],
-            &b"\x10\x01"[..],
-            &b"\x0a\x04\x08\x01\x38\x05\x10\x01"[..],
-        ] {
-            let response = super::GetJobsResponse::decode(wire).expect("legacy job response");
-            assert!(!response.authoritative);
-            assert_eq!(response.next_job_id, 0);
-        }
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyGetJobsRequest {
+        #[prost(uint32, repeated, tag = "5")]
+        job_ids: Vec<u32>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyGetJobsResponse {
+        #[prost(message, repeated, tag = "1")]
+        jobs: Vec<super::JobInfo>,
     }
 
     #[test]
-    fn get_jobs_authority_fields_preserve_old_wire_formats() {
-        #[derive(Clone, PartialEq, Message)]
-        struct LegacyGetJobsRequest {
-            #[prost(uint32, repeated, tag = "5")]
-            job_ids: Vec<u32>,
-        }
-
-        #[derive(Clone, PartialEq, Message)]
-        struct LegacyGetJobsResponse {
-            #[prost(message, repeated, tag = "1")]
-            jobs: Vec<super::JobInfo>,
-            #[prost(bool, tag = "2")]
-            unrestricted_visibility: bool,
-        }
-
-        let request =
-            super::GetJobsRequest::decode(&b"\x2a\x02\x01\x02"[..]).expect("legacy job request");
+    fn get_jobs_authority_fields_stay_compatible_with_old_peers() {
+        let legacy_request = LegacyGetJobsRequest {
+            job_ids: vec![1, 2],
+        };
+        let request = super::GetJobsRequest::decode(legacy_request.encode_to_vec().as_slice())
+            .expect("new controller reads old query");
         assert!(!request.require_authoritative);
         let strict = super::GetJobsRequest {
             require_authoritative: true,
             ..request
         };
-        let legacy_request = LegacyGetJobsRequest::decode(strict.encode_to_vec().as_slice())
+        let decoded = LegacyGetJobsRequest::decode(strict.encode_to_vec().as_slice())
             .expect("old controller reads new query");
-        assert_eq!(legacy_request.job_ids, [1, 2]);
+        assert_eq!(decoded, legacy_request);
 
-        let legacy_wire = b"\x0a\x04\x08\x01\x38\x05\x10\x01";
-        let mut response = super::GetJobsResponse::decode(legacy_wire.as_slice())
-            .expect("legacy terminal job response");
-        assert_eq!(response.jobs[0].state, super::JobState::JobCancelled as i32);
-        assert!(response.unrestricted_visibility);
+        let legacy_response = LegacyGetJobsResponse {
+            jobs: vec![super::JobInfo {
+                job_id: 1,
+                state: super::JobState::JobCancelled as i32,
+                ..Default::default()
+            }],
+        };
+        let mut response =
+            super::GetJobsResponse::decode(legacy_response.encode_to_vec().as_slice())
+                .expect("new agent reads old response");
+        assert!(!response.authoritative);
+        assert!(!response.unrestricted_visibility);
+        assert_eq!(response.next_job_id, 0);
+        assert_eq!(response.jobs, legacy_response.jobs);
         response.authoritative = true;
+        response.unrestricted_visibility = true;
         response.next_job_id = 7;
-        let legacy_response = LegacyGetJobsResponse::decode(response.encode_to_vec().as_slice())
-            .expect("old client reads new response");
-        assert_eq!(
-            legacy_response,
-            LegacyGetJobsResponse::decode(legacy_wire.as_slice()).expect("legacy response")
-        );
+        let decoded = LegacyGetJobsResponse::decode(response.encode_to_vec().as_slice())
+            .expect("old agent reads new response");
+        assert_eq!(decoded, legacy_response);
     }
 }
 

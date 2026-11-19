@@ -6,6 +6,58 @@ use crate::startup_spool::{ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+/// Re-runs one ignored test under `unshare`; a child that ran no test fails too.
+fn run_in_namespaces(test: &str, marker: &str, unshare: &[&str]) {
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let output = std::process::Command::new("unshare")
+        .args(unshare)
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("{module}::{test}"), "--ignored"])
+        .env(marker, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn controller_confirms_only_terminal_or_issued_and_gone_ids() {
+    use spur_proto::proto::{GetJobsResponse, JobInfo, JobState};
+    let job = |job_id, state: JobState| JobInfo {
+        job_id,
+        state: state as i32,
+        ..Default::default()
+    };
+    let mut response = GetJobsResponse {
+        jobs: vec![
+            job(1, JobState::JobCompleted),
+            job(2, JobState::JobRunning),
+            job(3, JobState::JobCompleted),
+            job(3, JobState::JobPending),
+            job(9, JobState::JobCompleted),
+        ],
+        authoritative: true,
+        unrestricted_visibility: true,
+        next_job_id: 6,
+    };
+    let batch = [1, 2, 3, 4, 5, 6];
+    let confirmed = |response: &GetJobsResponse| {
+        let mut ids: Vec<_> = crate::startup_spool::controller_confirmed(response, &batch)
+            .into_iter()
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(confirmed(&response), [1, 4, 5]);
+    response.unrestricted_visibility = false;
+    assert_eq!(confirmed(&response), [1]);
+    response.authoritative = false;
+    assert!(confirmed(&response).is_empty());
+}
+
 struct SpoolFixture {
     directory: tempfile::TempDir,
     agent: AgentService,
@@ -716,13 +768,11 @@ async fn startup_spool_excludes_launch_even_if_the_startup_future_is_cancelled()
 async fn startup_spool_keeps_bind_mounts_and_their_targets_untouched() {
     const CHILD: &str = "SPUR_SPOOL_MOUNT_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount"])
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "agent_server::cleanup_lifecycle_tests::startup_spool_tests::startup_spool_keeps_bind_mounts_and_their_targets_untouched", "--ignored"])
-            .env(CHILD, "1")
-            .status().unwrap();
-        assert!(status.success());
+        run_in_namespaces(
+            "startup_spool_keeps_bind_mounts_and_their_targets_untouched",
+            CHILD,
+            &["--user", "--map-root-user", "--mount"],
+        );
         return;
     }
     let controller = ControllerFixture::new(true);

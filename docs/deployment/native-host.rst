@@ -166,9 +166,10 @@ The two daemons are configured with command-line flags. The most common are belo
 Orphan job spool cleanup
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
-Each job keeps its script and step output in ``/var/spool/spur/job<id>``, or in
-``/tmp/spur/job<id>`` (``$TMPDIR/spur`` if set) when the first cannot be
-created. The directory is removed when the job finishes. Directories left
+Each job keeps its script and step output in ``/var/spool/spur/job<id>``. A
+``spurd`` not running as root falls back to ``/tmp/spur/job<id>``
+(``$TMPDIR/spur`` if set) when the first cannot be created. The directory is
+removed when the job finishes. Directories left
 behind by a crash or a lost job are removed once, each time ``spurd`` starts,
 before it accepts work:
 
@@ -189,8 +190,8 @@ before it accepts work:
   in that window is refused and placed elsewhere.
 * ``spurd`` reads every process's environment, working directory and open
   files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
-  fail and nothing is removed; each retained directory logs ``activity
-  inventory uncertain``.
+  fail and nothing is removed; the agent logs ``retained job spools: activity
+  inventory uncertain`` with the number of directories kept.
 * Symlinks in the spool path (for example ``/var/spool`` on another disk) are
   followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
   mount point, or a tree deeper than 256 levels is logged with ``kept job
@@ -205,9 +206,12 @@ before it accepts work:
   agent from another cluster on the same host could remove the first agent's
   leftover directories.
 
-Routine decisions are logged as ``retained job spool: <reason>`` or ``deleted
-orphan job spool``; the pass ends with ``startup job spool cleanup finished
-deleted=<n> retained=<n> errors=<n>``.
+Directories kept because the controller did not confirm them, the activity
+inventory was uncertain or the time ran out are logged once per reason with a
+count (each path at debug level). Directories still in use log ``retained job
+spool: <reason>``; removals log ``deleted orphan job spool``. The pass ends
+with ``startup job spool cleanup finished deleted=<n> retained=<n>
+errors=<n>``.
 
 Quick Start: Two-Node Cluster
 -----------------------------

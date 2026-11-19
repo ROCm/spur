@@ -315,12 +315,7 @@ async fn launch_stepd(
     claim_session_provisionally(&store, &mut descriptor, &launch_path, state_dir)?;
     let executable = resolve_stepd_executable();
     info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
-    let spawn_args = vec![
-        state_dir.to_path_buf(),
-        std::path::PathBuf::from(config.job_id.to_string()),
-        std::path::PathBuf::from(run_attempt.to_string()),
-        launch_path,
-    ];
+    let spawn_args = crate::stepd::process_args(state_dir, config.job_id, run_attempt, launch_path);
     let spawn_executable = executable.clone();
     let pid =
         tokio::task::spawn_blocking(move || spawn_stepd_process(&spawn_executable, &spawn_args))
@@ -1300,6 +1295,24 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+/// A large spool can take up to a minute to remove, so this stays off the async workers.
+async fn remove_job_files(
+    job_id: u32,
+    rootfs_mode: crate::container::RootfsMode,
+    cgroups: Vec<std::path::PathBuf>,
+) {
+    let removal = tokio::task::spawn_blocking(move || {
+        crate::container::cleanup_rootfs(&crate::container::job_rootfs_base(job_id), &rootfs_mode);
+        crate::executor::cleanup_job_spool(job_id);
+        for cgroup in &cgroups {
+            crate::executor::cleanup_cgroup(cgroup);
+        }
+    });
+    if let Err(error) = removal.await {
+        warn!(job_id, %error, "job file cleanup failed");
+    }
+}
+
 /// Release what a finished run owned, once the monitor has dropped it from
 /// `running`. Skipped if the id is tracked again: it is all keyed by job id.
 async fn teardown_completed_job(
@@ -1322,21 +1335,15 @@ async fn teardown_completed_job(
         return;
     }
 
-    crate::container::cleanup_rootfs(
-        &crate::container::job_rootfs_base(job_id),
-        &completed.rootfs_mode,
-    );
-    crate::executor::cleanup_job_spool(job_id);
-    if let Some(ref cgroup) = completed.cgroup {
-        crate::executor::cleanup_cgroup(cgroup);
-    }
+    let mut cgroups: Vec<_> = completed.cgroup.iter().cloned().collect();
     // The node above whatever was recorded: an allocation's is a step's leaf,
     // and nothing else removes the job's own. Derived from identity because the
     // recorded path is a leaf in one shape and absent in another.
-    crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+    cgroups.push(crate::executor::expected_cgroup_path(
         job_id,
         completed.run_attempt,
     ));
+    remove_job_files(job_id, completed.rootfs_mode.clone(), cgroups).await;
     allocation.lock().await.release_job(job_id);
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
@@ -7551,14 +7558,8 @@ impl SlurmAgent for AgentService {
                         // job_id, so a re-dispatch of that id reuses them: tearing
                         // any of them down now would destroy the live run.
                         if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(
-                                &crate::container::job_rootfs_base(job_id),
-                                &rootfs_mode,
-                            );
-                            crate::executor::cleanup_job_spool(job_id);
-                            if let Some(ref cg) = cgroup {
-                                crate::executor::cleanup_cgroup(cg);
-                            }
+                            remove_job_files(job_id, rootfs_mode, cgroup.into_iter().collect())
+                                .await;
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {

@@ -2481,7 +2481,7 @@ fn spool_dir_error(
 }
 
 /// Remove a job's spool directory (best-effort), mirroring Slurm purging its
-/// batchdir after completion. Tries both candidate roots since the fallback
+/// batchdir after completion. Tries every candidate root since the fallback
 /// location isn't recorded.
 pub fn cleanup_job_spool(job_id: JobId) {
     for base in default_job_spool_candidates() {
