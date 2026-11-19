@@ -119,9 +119,12 @@ exit could be dispatched to while the agent still holds it. Kept slices go back
 when the run ends: the report that ends it frees them, and every other ending
 frees all but `Job::released_nodes()`. The first failed copy is recorded in
 `Job.first_failed_node`, moves the job to Completing, has the nodes still
-running stopped, and supplies the job's exit (`finalize_reported_run`). Steps can
-no longer target a node that finished. Preemption grace and suspend keep their
-own handling; a grace hands kept nodes to the preemptor with the first report.
+running stopped, and supplies the job's exit (`finalize_reported_run`). The apply
+drops a repeat `JobCopyExited`, one proposed before the first applied, so it
+cannot overwrite that failure; a repeat `JobNodeComplete` still overwrites, as
+on older controllers. Steps can no longer target a node that finished.
+Preemption grace and suspend keep their own handling; a grace hands kept nodes
+to the preemptor with the first report.
 A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 
