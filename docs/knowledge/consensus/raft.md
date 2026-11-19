@@ -43,7 +43,7 @@ serde enum.  Every cluster state change is one variant.
 | `JobSubmit` | Insert a new job with its full `JobSpec` |
 | `JobStateChange` | Transition a job between states (Pending, Running, etc.); carries optional `pending_reason`, `begin_time` (backoff hold), `expected_run_attempt` (stale-activation guard) |
 | `JobStart` | Record node allocation at dispatch; carries `per_node_alloc`, `run_attempt`, `idle_fill` stamp, `srun_step_dispatch` flag |
-| `JobComplete` | Finalize a job with exit code and terminal `JobState` |
+| `JobComplete` | Finalize a job with exit code and terminal `JobState`; a completing-timeout force-finish also carries the deciding node's `signal` (absent leaves `exit_signal` as it was) |
 | `JobNodeComplete` | Per-node completion report with exit code, signal, and `run_attempt` guard |
 | `JobCopyExited` | Same fields; one node's exit from a Running multi-node run whose script runs on every node, which ends node by node (see [job execution](../execution/job-execution.md)) |
 | `JobTimeLimitSignaled` | Legacy (`#[cfg(test)]` only); records wall-clock signal for replay compat |

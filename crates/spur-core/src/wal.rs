@@ -115,6 +115,10 @@ pub enum WalOperation {
         /// turn such a completion into the preemption outcome.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         controller_initiated: bool,
+        /// The exit signal a force-finish read from the deciding node's report.
+        /// Absent leaves the job's signal as it is, as older controllers do.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -560,6 +564,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         }
     }
@@ -574,6 +579,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: true,
+            signal: None,
             at: None,
         }
     }
@@ -586,6 +592,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: Some(cancel),
             controller_initiated: false,
+            signal: None,
             at: None,
         }
     }
@@ -1612,6 +1619,7 @@ mod tests {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         };
         op.stamp_occurred_at(at);
@@ -2478,6 +2486,28 @@ mod suspend_wal_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_job_complete_written_before_its_signal_existed_carries_none() {
+        let old = r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(op, WalOperation::JobComplete { signal: None, .. }));
+    }
+
+    #[test]
+    fn a_job_complete_with_a_signal_has_a_frozen_wire_form() {
+        let frozen = r#"{"JobComplete":{"job_id":5,"exit_code":0,"state":"FAILED","signal":9}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                exit_code: 0,
+                signal: Some(9),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
     }
 
     #[test]
