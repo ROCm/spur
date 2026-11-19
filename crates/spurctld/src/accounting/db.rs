@@ -1794,24 +1794,28 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
 }
 
 /// The stored QOS edit, not the evaluated list. No row and a NULL column
-/// are both "inherit".
+/// are both "inherit". The row stays locked until the caller's transaction
+/// ends, so a `qos+=` applied on top of it cannot lose a concurrent edit.
 pub async fn account_allowed_qos(
     conn: &mut PgConnection,
     name: &str,
 ) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query("SELECT allowed_qos FROM accounts WHERE name = $1")
+    let row = sqlx::query("SELECT allowed_qos FROM accounts WHERE name = $1 FOR UPDATE")
         .bind(name)
         .fetch_optional(&mut *conn)
         .await?;
     Ok(row.and_then(|row| row.get("allowed_qos")))
 }
 
-/// The user's own stored QOS edit on the partition-less association.
+/// The user's own stored QOS edit on the partition-less association. Takes
+/// the user lock `add_user` takes, so a `qos+=` applied on top of the result
+/// cannot lose a concurrent edit, even when the row does not exist yet.
 pub async fn user_allowed_qos(
     conn: &mut PgConnection,
     user: &str,
     account: &str,
 ) -> anyhow::Result<Option<String>> {
+    lock_user(conn, user).await?;
     let row = sqlx::query(
         "SELECT allowed_qos FROM associations \
          WHERE user_name = $1 AND account = $2 \
@@ -1926,6 +1930,17 @@ pub struct UserUpdate<'a> {
     pub max_wall_min: Option<Option<i32>>,
 }
 
+/// Per-user advisory lock serializing writes to one user's rows. It is
+/// transaction-scoped, so it needs the caller's transaction to hold it, and
+/// Postgres lets one transaction take it again without blocking itself.
+async fn lock_user(conn: &mut PgConnection, user: &str) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(user)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Add or modify a user-account association, writing only the fields set in `u`
 /// (partial patch). `is_default`: `Some(true)` makes this the default (demoting the
 /// user's others), `Some(false)` clears it, `None` preserves it but still defaults a
@@ -1936,14 +1951,10 @@ pub async fn add_user<'a>(
     account: &'a str,
     u: UserUpdate<'a>,
 ) -> anyhow::Result<Upserted> {
-    // Per-user advisory lock so concurrent modifies of two different accounts
-    // for the same user serialize — otherwise both could win the demote race
-    // below and end up default. Cheap: add_user is admin-path. The lock is
-    // transaction-scoped, so it needs the caller's transaction to hold it.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-        .bind(user)
-        .execute(&mut *conn)
-        .await?;
+    // Concurrent modifies of two different accounts for the same user must
+    // serialize, otherwise both could win the demote race below and end up
+    // default.
+    lock_user(conn, user).await?;
 
     // Clear the default on the user's other rows *before* the upsert sets it
     // here, so the `one_default_account_per_user` unique index never sees two
@@ -4987,6 +4998,59 @@ mod job_history_tests {
         assert_eq!(effects[&child].default_qos.as_deref(), Some("normal"));
 
         cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn reading_a_qos_edit_locks_it_until_the_write_commits() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qoslock_user_{pid}");
+        let account = format!("spur_qoslock_acct_{pid}");
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                allowed_qos: Some(Some("normal")),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let mut editor = pool.begin().await?;
+        assert_eq!(
+            account_allowed_qos(&mut editor, &account).await?.as_deref(),
+            Some("normal")
+        );
+        assert_eq!(user_allowed_qos(&mut editor, &user, &account).await?, None);
+
+        let mut other = pool.begin().await?;
+        let account_row = sqlx::query("SELECT 1 FROM accounts WHERE name = $1 FOR UPDATE NOWAIT")
+            .bind(&account)
+            .execute(&mut *other)
+            .await;
+        assert!(account_row.is_err(), "account row must stay locked");
+        other.rollback().await?;
+
+        let user_lock: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(&user)
+                .fetch_one(&pool)
+                .await?;
+        assert!(!user_lock, "user lock must stay held");
+
+        editor.rollback().await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

@@ -58,9 +58,10 @@ account as added or modified, but no list is stored. On a user, it rejects a
 **Rollback.** An older controller leaves the columns in place but does not read
 them. Users who have no ``qos=`` of their own stop inheriting the account's
 list, including anything that account inherited from its parent, and may again
-use any QOS. Exact lists set directly on users are unaffected. A user whose
-stored value is an add/remove edit (``+name``) is read as a literal QOS name,
-so that user can use no QOS until the edit is replaced with ``qos=``.
+use any QOS. Exact lists set directly on users are unaffected. A stored
+add/remove edit (``+name``) is read as a literal QOS name, so a user it applies
+to can use only their default QOS, if they have one, until the edit is
+replaced with ``qos=``.
 
 Default QOS admission changes
 -----------------------------

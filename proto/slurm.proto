@@ -2109,7 +2109,8 @@ message AccountInfo {
   uint32 max_running_jobs = 6;
   string grp_tres = 7;
   // Evaluated QOS names this account may use, including what it inherits.
-  // Empty when no list is set from here up to the top.
+  // Empty both when no list is set from here up to the top (any QOS) and when
+  // qos-= removed every inherited name (no QOS).
   string allowed_qos = 8;
   // Evaluated default QOS: this account's own, or the nearest parent's.
   // Empty when none is set.
@@ -2204,7 +2205,8 @@ message UserInfo {
   // none. Empty when neither is set.
   string default_qos = 5;
   // Effective allow-list: the user's edit on top of the account chain. Empty
-  // when no list is set anywhere above them. Writing this back as
+  // both when no list is set anywhere above them (any QOS) and when qos-=
+  // removed every name (no QOS). Writing this back as
   // AddUserRequest.allowed_qos would store an inherited list as the user's own.
   string allowed_qos = 6;
   // Per-association limits (read-back of what `sacctmgr add/modify user` set).

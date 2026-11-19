@@ -554,7 +554,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_running_jobs: Some(max_jobs),
                     grp_tres: Some(grp_tres),
                     allowed_qos: qos.clone(),
-                    default_qos,
+                    default_qos: default_qos.clone(),
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -569,6 +569,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             );
             if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
                 println!("  QOS        = {q}");
+            }
+            if let Some(q) = default_qos.as_deref().filter(|q| !q.is_empty()) {
+                println!("  DefQOS     = {q}");
             }
             println!(" Account added.");
             Ok(())
