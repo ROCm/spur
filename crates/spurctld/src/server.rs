@@ -3587,6 +3587,10 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
+        if let Some(c) = req.container.as_mut() {
+            c.mounts = container_mounts_for(&c.image, std::mem::take(&mut c.mounts))?;
+        }
+
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {} is not running (state: {:?})",
@@ -5868,11 +5872,22 @@ fn finish_failed_step(
     }))
 }
 
+/// Mounts without an image are never applied, so they are kept as given rather
+/// than failing a job that does not use them.
+fn container_mounts_for(image: &str, mounts: Vec<String>) -> Result<Vec<String>, Status> {
+    if image.is_empty() {
+        return Ok(mounts);
+    }
+    spur_core::container_mount::normalize(&mounts)
+        .map_err(|e| Status::invalid_argument(format!("--container-mounts: {e}")))
+}
+
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let mut gres = spec.gres;
     for lic in &spec.licenses {
         gres.push(format!("license:{}", lic));
     }
+    let container_mounts = container_mounts_for(&spec.container_image, spec.container_mounts)?;
 
     let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
@@ -6038,8 +6053,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.container_image)
         },
-        container_mounts: spur_core::container_mount::normalize(&spec.container_mounts)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?,
+        container_mounts,
         container_workdir: if spec.container_workdir.is_empty() {
             None
         } else {
@@ -19404,6 +19418,7 @@ mod tests {
     #[test]
     fn proto_to_job_spec_stores_a_comma_mount_list_as_separate_mounts() {
         let spec = spur_proto::proto::JobSpec {
+            container_image: "img.sqsh".into(),
             container_mounts: vec!["/data:/data,/models:/models:ro".into(), "tmpfs:/c".into()],
             ..Default::default()
         };
@@ -19417,16 +19432,59 @@ mod tests {
     #[test]
     fn proto_to_job_spec_rejects_a_mount_it_cannot_parse_and_names_it() {
         let spec = spur_proto::proto::JobSpec {
+            container_image: "img.sqsh".into(),
             container_mounts: vec!["/data:/data,/scratch".into()],
             ..Default::default()
         };
         let status = proto_to_job_spec(spec).unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
-            status.message().contains("'/scratch'"),
+            status.message().starts_with("--container-mounts: ")
+                && status.message().contains("'/scratch'"),
             "{}",
             status.message()
         );
+    }
+
+    #[test]
+    fn proto_to_job_spec_leaves_the_mounts_of_a_job_without_an_image_alone() {
+        let spec = spur_proto::proto::JobSpec {
+            container_mounts: vec!["/data:/data,/scratch".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_to_job_spec(spec).unwrap().container_mounts,
+            vec!["/data:/data,/scratch"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_refuses_a_bad_mount_before_the_step_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let steps_before = svc.cluster.get_steps(job_id).len();
+
+        let err = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                user: "ubuntu".into(),
+                container: Some(ContainerSpec {
+                    image: "img.sqsh".into(),
+                    mounts: vec!["/a:/a,/b:/b:z".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a step mount that does not parse must be refused");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("'/b:/b:z'"), "{}", err.message());
+        assert_eq!(svc.cluster.get_steps(job_id).len(), steps_before);
     }
 
     #[test]

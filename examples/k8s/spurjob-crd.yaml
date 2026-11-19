@@ -186,8 +186,9 @@ spec:
                 type: array
               volumes:
                 default: []
-                description: 'Volume mounts: "/src:/dst:ro" for hostPath or "pvc:claim-name:/dst"
-                  for PVCs.'
+                description: 'Volume mounts in the --container-mounts forms: "/src:/dst[:ro]"
+                  for hostPath, "tmpfs:/dst[:size=64M]" for memory, "pvc:claim-name:/dst"
+                  for PVCs; an entry may hold a comma list.'
                 items:
                   type: string
                 type: array

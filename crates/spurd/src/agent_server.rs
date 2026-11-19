@@ -3892,11 +3892,11 @@ struct ContainerLaunchRequest {
     auth_socket: bool,
 }
 
-/// The controller reads a failed-precondition launch as the agent refusing the job,
-/// as it does for an image the node cannot resolve.
+/// Failed precondition, as for an image the node cannot resolve: for a batch job the
+/// controller reads it as the agent refusing the job, not as a node fault.
 fn container_mounts(values: &[String]) -> Result<Vec<crate::container::BindMount>, Status> {
     crate::container::parse_mounts(values)
-        .map_err(|e| Status::failed_precondition(format!("{e:#}")))
+        .map_err(|e| Status::failed_precondition(format!("--container-mounts: {e:#}")))
 }
 
 fn build_container_launch(
@@ -7452,7 +7452,6 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
-            // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
             crate::container::write_entry_script(
                 &rootfs,
                 &format!("spur_job_{job_id}.sh"),
@@ -7465,7 +7464,7 @@ impl SlurmAgent for AgentService {
 
             // The launch_script passed to executor is the user's script
             // (used as fallback for non-container path; for container path,
-            // the executor reads from rootfs/tmp/ directly).
+            // the executor runs the copy written into the rootfs above).
             (script, rootfs_mode)
         } else {
             (script, crate::container::RootfsMode::Extracted)
@@ -9984,15 +9983,10 @@ impl SlurmAgent for AgentService {
                 })?;
                 format!("#!/bin/bash\n{joined}\n")
             };
-            crate::container::write_entry_script(
-                &rootfs,
-                &format!("spur_step_{job_id}_{step_id}.sh"),
-                &step_script_content,
-            )
-            .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
-
-            // Script path inside the container (after pivot_root, host paths are gone).
-            let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
+            let script_name = format!("spur_step_{job_id}_{step_id}.sh");
+            crate::container::write_entry_script(&rootfs, &script_name, &step_script_content)
+                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
+            let script_in_container = crate::container::entry_script_path(&script_name);
 
             // Run the container step. The guard kills the child before
             // removing the rootfs — preventing a live-process vs rm-rf race
@@ -21116,6 +21110,66 @@ mod tests {
             }),
             ..Default::default()
         })
+    }
+
+    fn assert_refused_naming_mount(err: Status, spec: &str) {
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("--container-mounts")
+                && err.message().contains(&format!("'{spec}'")),
+            "{}",
+            err.message()
+        );
+    }
+
+    // The mounts are checked before the image, so the bogus image never decides the code.
+    #[tokio::test]
+    async fn a_step_with_a_mount_the_node_cannot_apply_is_refused_and_names_it() {
+        for supervised in [false, true] {
+            let (svc, job_id) = run_command_test_setup().await;
+            let svc = if supervised {
+                svc.with_supervised_launch()
+            } else {
+                svc
+            };
+            let mut req = run_command_with_bogus_image(job_id);
+            req.get_mut().container.as_mut().unwrap().mounts = vec!["/a:/a,pvc:claim:/data".into()];
+            let err = svc
+                .run_command(req)
+                .await
+                .expect_err("a pvc mount on a native node must be refused");
+            assert_refused_naming_mount(err, "pvc:claim:/data");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_job_with_a_mount_the_node_cannot_apply_is_refused_and_names_it() {
+        let svc = test_agent_service(test_reporter());
+        let err = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 81,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    container_image: "/nonexistent/bogus-job-image.sqsh".into(),
+                    container_mounts: vec!["pvc:claim:/data:ro".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a pvc mount on a native node must be refused");
+        assert_refused_naming_mount(err, "pvc:claim:/data:ro");
     }
 
     /// A root agent runs every batch job in fresh PID and mount namespaces; a

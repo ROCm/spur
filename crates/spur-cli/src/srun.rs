@@ -2807,6 +2807,12 @@ mod tests {
     }
 
     #[test]
+    fn a_comma_mount_list_stays_one_value() {
+        let (args, _) = parse_srun(&["srun", "--container-mounts=/a:/a,/b:/b", "true"]);
+        assert_eq!(args.container_mounts, vec!["/a:/a,/b:/b"]);
+    }
+
+    #[test]
     fn step_warns_on_input() {
         let args =
             SrunArgs::try_parse_from(["srun", "--input", "in.txt", "hostname"]).expect("parse");

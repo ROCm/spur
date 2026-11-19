@@ -1529,7 +1529,7 @@ message StepResources {
 // fields. An empty `image` means no container.
 message ContainerSpec {
   string image = 1;                 // OCI image ref or squashfs path
-  repeated string mounts = 2;       // "/src:/dst:ro" bind mounts
+  repeated string mounts = 2;       // Same forms as JobSpec.container_mounts
   string workdir = 3;               // Working directory inside the container
   string name = 4;                  // Named container (persists across jobs)
   bool readonly = 5;                // Read-only rootfs

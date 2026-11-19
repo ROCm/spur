@@ -2549,10 +2549,9 @@ pub(crate) fn write_spool_scratch(
 pub(crate) fn job_spool_mount(dir: &ScratchDir) -> crate::container::BindMount {
     let path = dir.path().display().to_string();
     crate::container::BindMount {
-        source: path.clone(),
+        source: crate::container::MountFrom::Host(path.clone()),
         target: path,
         readonly: true,
-        kind: crate::container::MountKind::Bind,
     }
 }
 
@@ -2754,18 +2753,16 @@ async fn launch_container_job(
                 "/bin/sh"
             };
             let c_shell = CString::new(shell).unwrap();
+            let script = crate::container::entry_script_path(&format!("spur_job_{job_id}.sh"));
             let exec_args: Vec<CString> = if let Some(ref ep) = entrypoint {
-                let cmd = format!("{} && {} /tmp/spur_job_{}.sh", ep, shell, job_id);
+                let cmd = format!("{} && {} {}", ep, shell, script);
                 vec![
                     c_shell.clone(),
                     CString::new("-c").unwrap(),
                     CString::new(cmd).unwrap(),
                 ]
             } else {
-                vec![
-                    c_shell.clone(),
-                    CString::new(format!("/tmp/spur_job_{}.sh", job_id)).unwrap(),
-                ]
+                vec![c_shell.clone(), CString::new(script).unwrap()]
             };
             let exec_arg_refs: Vec<&std::ffi::CStr> =
                 exec_args.iter().map(|s| s.as_c_str()).collect();
@@ -4365,7 +4362,10 @@ mod tests {
         let mount = job_spool_mount(&dir);
 
         let folder = root.path().display().to_string();
-        assert_eq!(mount.source, folder);
+        assert_eq!(
+            mount.source,
+            crate::container::MountFrom::Host(folder.clone())
+        );
         assert_eq!(
             mount.target, folder,
             "generated wrappers name their scripts by host path"

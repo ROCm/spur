@@ -132,20 +132,26 @@ fn container_dir() -> PathBuf {
 /// A parsed `--container-mounts` entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindMount {
-    pub source: String,
+    pub source: MountFrom,
     pub target: String,
     pub readonly: bool,
-    #[serde(default)]
-    pub kind: MountKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MountKind {
-    #[default]
-    Bind,
-    Tmpfs {
-        size_bytes: Option<u64>,
-    },
+/// Untagged, so a host path serializes as the bare string it did before tmpfs existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountFrom {
+    Host(String),
+    Tmpfs { size_bytes: Option<u64> },
+}
+
+impl std::fmt::Display for BindMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            MountFrom::Host(path) => write!(f, "{path}:{}", self.target),
+            MountFrom::Tmpfs { .. } => write!(f, "tmpfs:{}", self.target),
+        }
+    }
 }
 
 /// Container configuration for a job.
@@ -226,14 +232,17 @@ pub fn maybe_bind_auth_socket(
         );
     }
     let displayed = path.display().to_string();
-    if config.mounts.iter().any(|m| m.source == displayed) {
+    if config
+        .mounts
+        .iter()
+        .any(|m| matches!(&m.source, MountFrom::Host(p) if *p == displayed))
+    {
         return Ok(());
     }
     config.mounts.push(BindMount {
-        source: displayed.clone(),
+        source: MountFrom::Host(displayed.clone()),
         target: displayed,
         readonly: false,
-        kind: MountKind::Bind,
     });
     Ok(())
 }
@@ -247,8 +256,10 @@ fn withhold_auth_socket(config: &mut ContainerConfig, cluster_id: &str) -> anyho
     let sources = config
         .mounts
         .iter()
-        .filter(|m| m.kind == MountKind::Bind)
-        .map(|m| m.source.as_str())
+        .filter_map(|m| match &m.source {
+            MountFrom::Host(path) => Some(path.as_str()),
+            MountFrom::Tmpfs { .. } => None,
+        })
         .chain(home);
     for source in sources {
         let real = std::fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
@@ -545,22 +556,18 @@ pub fn parse_mounts(values: &[String]) -> anyhow::Result<Vec<BindMount>> {
     use spur_core::container_mount::{parse_list, MountSource};
     parse_list(values)?
         .into_iter()
-        .map(|m| {
-            let (source, kind) = match m.source {
-                MountSource::Path(path) => (path, MountKind::Bind),
-                MountSource::Tmpfs { size_bytes } => {
-                    ("tmpfs".to_string(), MountKind::Tmpfs { size_bytes })
+        .map(|(spec, m)| {
+            let source = match m.source {
+                MountSource::Path(path) => MountFrom::Host(path),
+                MountSource::Tmpfs { size_bytes } => MountFrom::Tmpfs { size_bytes },
+                MountSource::Pvc(_) => {
+                    bail!("invalid mount '{spec}': pvc mounts need the Kubernetes agent")
                 }
-                MountSource::Pvc(claim) => bail!(
-                    "invalid mount spec 'pvc:{claim}:{}': pvc mounts need the Kubernetes agent",
-                    m.target
-                ),
             };
             Ok(BindMount {
                 source,
                 target: m.target,
                 readonly: m.readonly,
-                kind,
             })
         })
         .collect()
@@ -894,23 +901,18 @@ pub fn mount_user_binds(
     withheld: Option<&Path>,
 ) -> anyhow::Result<()> {
     for m in mounts {
-        match m.kind {
-            MountKind::Bind => {
-                let source = Path::new(&m.source);
+        match &m.source {
+            MountFrom::Host(path) => {
+                let source = Path::new(path);
                 if !source.exists() {
-                    bail!(
-                        "user mount {}:{}: source {} does not exist on this node",
-                        m.source,
-                        m.target,
-                        m.source
-                    );
+                    bail!("user mount {m}: source {path} does not exist on this node");
                 }
                 bind_mount_withholding(rootfs, source, &m.target, m.readonly, withheld)
-                    .with_context(|| format!("user mount {}:{}", m.source, m.target))?;
+                    .with_context(|| format!("user mount {m}"))?;
             }
-            MountKind::Tmpfs { size_bytes } => {
-                tmpfs_mount(rootfs, &m.target, size_bytes, m.readonly)
-                    .with_context(|| format!("user mount tmpfs:{}", m.target))?;
+            MountFrom::Tmpfs { size_bytes } => {
+                tmpfs_mount(rootfs, &m.target, *size_bytes, m.readonly)
+                    .with_context(|| format!("user mount {m}"))?;
             }
         }
     }
@@ -1024,23 +1026,31 @@ nameserver 8.8.8.8\n";
     filtered.join("\n") + "\n"
 }
 
-/// Write a fresh container's entry script into its rootfs's `/tmp`, still
-/// reachable after pivot_root. The rootfs comes from a user's image, or a named
-/// container shared across jobs, so its links resolve inside it, never on the node.
+/// Write a fresh container's entry script into its rootfs, at [`entry_script_path`].
+/// The rootfs comes from a user's image, or a named container shared across jobs,
+/// so its links resolve inside it, never on the node.
 pub(crate) fn write_entry_script(
     rootfs: &Path,
     name: &str,
     content: &str,
 ) -> std::io::Result<PathBuf> {
     let root = crate::scratch::ScratchDir::open(rootfs)?;
-    let tmp = crate::scratch::open_dir_in_root(&root, Path::new("tmp"), 0o1777)?;
+    let dir = crate::scratch::open_dir_in_root(
+        &root,
+        Path::new(spur_core::container_mount::ENTRY_SCRIPT_DIR),
+        0o755,
+    )?;
     crate::scratch::write_scratch(
-        &tmp,
+        &dir,
         name,
         content.as_bytes(),
         crate::scratch::ScratchOwner::Daemon,
         0o755,
     )
+}
+
+pub(crate) fn entry_script_path(name: &str) -> String {
+    format!("{}/{name}", spur_core::container_mount::ENTRY_SCRIPT_DIR)
 }
 
 /// The image is the user's, so a link at resolv.conf is replaced, not written through.
@@ -1522,15 +1532,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_entry_script_lands_in_the_rootfs_tmp() {
+    fn an_entry_script_lands_where_the_container_runs_it() {
         use std::os::unix::fs::PermissionsExt;
         let rootfs = tempfile::tempdir().unwrap();
-        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
 
         let path = write_entry_script(rootfs.path(), "spur_job_7.sh", "#!/bin/bash\ntrue\n")
             .expect("write entry script");
 
-        assert_eq!(path, rootfs.path().join("tmp/spur_job_7.sh"));
+        let inside = entry_script_path("spur_job_7.sh");
+        assert_eq!(path, rootfs.path().join(inside.trim_start_matches('/')));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "#!/bin/bash\ntrue\n"
@@ -1540,11 +1550,23 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_script_behind_a_linked_tmp_stays_inside_the_image() {
+    fn a_mount_on_tmp_cannot_hide_the_entry_script() {
+        let mounts = parse_mounts(&["tmpfs:/tmp".into()]).unwrap();
+        assert!(!Path::new(&entry_script_path("spur_job_7.sh")).starts_with(&mounts[0].target));
+    }
+
+    #[test]
+    fn an_entry_script_behind_a_linked_folder_stays_inside_the_image() {
         let rootfs = tempfile::tempdir().unwrap();
         // Not a tempdir: one under /tmp would resolve back through this very link.
         let elsewhere = Path::new("/spur-test-not-on-this-node");
-        std::os::unix::fs::symlink(elsewhere, rootfs.path().join("tmp")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere,
+            rootfs
+                .path()
+                .join(spur_core::container_mount::ENTRY_SCRIPT_DIR.trim_start_matches('/')),
+        )
+        .unwrap();
 
         write_entry_script(rootfs.path(), "spur_job_7.sh", "x").expect("write entry script");
 
@@ -1559,28 +1581,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_image_whose_tmp_links_to_var_tmp_still_gets_its_entry_script() {
-        let rootfs = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(rootfs.path().join("var/tmp")).unwrap();
-        std::os::unix::fs::symlink("var/tmp", rootfs.path().join("tmp")).unwrap();
-
-        write_entry_script(rootfs.path(), "spur_job_7.sh", "x").expect("write entry script");
-
-        let staged = rootfs.path().join("var/tmp/spur_job_7.sh");
-        assert_eq!(std::fs::read_to_string(staged).unwrap(), "x");
-    }
-
-    // A named container's /tmp outlives the job that wrote to it, so anyone
-    // who ran in it can leave a link at the next script's name.
+    // A named container outlives the job that wrote to it, so anyone who ran in
+    // it as root can leave a link at the next script's name.
     #[test]
     fn an_entry_script_replaces_a_link_planted_at_its_name() {
         let rootfs = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         let target = host.path().join("profile.sh");
         std::fs::write(&target, "ORIGINAL").unwrap();
-        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
-        std::os::unix::fs::symlink(&target, rootfs.path().join("tmp/spur_job_7.sh")).unwrap();
+        let planted = rootfs
+            .path()
+            .join(entry_script_path("spur_job_7.sh").trim_start_matches('/'));
+        std::fs::create_dir(planted.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
 
         let path = write_entry_script(rootfs.path(), "spur_job_7.sh", "#!/bin/bash\n")
             .expect("write entry script");
@@ -1700,8 +1713,8 @@ mod tests {
     fn auth_socket_is_bound_for_a_non_root_container_that_asked_for_it() {
         let mounts = auth_socket_mounts(1000, true);
         assert_eq!(mounts.len(), 1);
-        assert!(mounts[0].source.ends_with("auth.sock"));
-        assert_eq!(mounts[0].source, mounts[0].target);
+        assert!(mounts[0].target.ends_with("auth.sock"));
+        assert_eq!(mounts[0].source, MountFrom::Host(mounts[0].target.clone()));
     }
 
     /// Run `f` with `$SPUR_AUTH_SOCKET` pointing at `socket`, which need not exist.
@@ -1737,7 +1750,7 @@ mod tests {
         std::fs::write(&socket, b"").unwrap();
         let exposing = |cfg: &mut ContainerConfig| {
             cfg.mounts.push(BindMount {
-                source: dir.path().display().to_string(),
+                source: MountFrom::Host(dir.path().display().to_string()),
                 target: "/mnt".into(),
                 readonly: false,
             });
@@ -1777,7 +1790,7 @@ mod tests {
         let socket = tmp.path().join("run/spur/c/auth.sock");
         let mut cfg = test_config(1000);
         cfg.mounts.push(BindMount {
-            source: real_run.join("spur").display().to_string(),
+            source: MountFrom::Host(real_run.join("spur").display().to_string()),
             target: "/mnt".into(),
             readonly: false,
         });
@@ -1817,7 +1830,7 @@ mod tests {
             let src = source(dir).display().to_string();
             let mut cfg = test_config(1000);
             cfg.mounts = vec![BindMount {
-                source: src.clone(),
+                source: MountFrom::Host(src.clone()),
                 target: src,
                 readonly: true,
             }];
@@ -1900,7 +1913,7 @@ mod tests {
             let link = dir.join("link");
             std::os::unix::fs::symlink(&benign, &link).unwrap();
             cfg.mounts = vec![BindMount {
-                source: link.display().to_string(),
+                source: MountFrom::Host(link.display().to_string()),
                 target: "/data".into(),
                 readonly: false,
             }];
@@ -1943,14 +1956,15 @@ mod tests {
         let parsed = mounts(&["/data:/data,/scratch:/scratch:ro,/models:/models"]).unwrap();
         let summary: Vec<_> = parsed
             .iter()
-            .map(|m| (m.source.as_str(), m.target.as_str(), m.readonly, &m.kind))
+            .map(|m| (&m.source, m.target.as_str(), m.readonly))
             .collect();
+        let host = |p: &str| MountFrom::Host(p.into());
         assert_eq!(
             summary,
             vec![
-                ("/data", "/data", false, &MountKind::Bind),
-                ("/scratch", "/scratch", true, &MountKind::Bind),
-                ("/models", "/models", false, &MountKind::Bind),
+                (&host("/data"), "/data", false),
+                (&host("/scratch"), "/scratch", true),
+                (&host("/models"), "/models", false),
             ]
         );
     }
@@ -1960,8 +1974,8 @@ mod tests {
         let parsed = mounts(&["tmpfs:/cache:size=64M"]).unwrap();
         assert_eq!(parsed[0].target, "/cache");
         assert_eq!(
-            parsed[0].kind,
-            MountKind::Tmpfs {
+            parsed[0].source,
+            MountFrom::Tmpfs {
                 size_bytes: Some(64 << 20)
             }
         );
@@ -1974,10 +1988,13 @@ mod tests {
         for (values, named) in [
             (&["/a:/a,/b:/b,nocolon"][..], "nocolon"),
             (&["/a:/a", "/src:/dst:z"][..], "/src:/dst:z"),
-            (&["pvc:claim:/data"][..], "pvc:claim:/data"),
+            (&["pvc:claim:/data:ro"][..], "pvc:claim:/data:ro"),
         ] {
             let err = format!("{:#}", mounts(values).unwrap_err());
-            assert!(err.contains(named), "{values:?} gave: {err}");
+            assert!(
+                err.contains(&format!("'{named}'")),
+                "{values:?} gave: {err}"
+            );
         }
     }
 
@@ -1986,14 +2003,13 @@ mod tests {
         let rootfs = tempfile::tempdir().unwrap();
         let missing = rootfs.path().join("no-such-dir");
         let user_mounts = vec![BindMount {
-            source: missing.display().to_string(),
+            source: MountFrom::Host(missing.display().to_string()),
             target: "/data".into(),
             readonly: false,
-            kind: MountKind::Bind,
         }];
         let err = format!(
             "{:#}",
-            mount_user_binds(rootfs.path(), &user_mounts).unwrap_err()
+            mount_user_binds(rootfs.path(), &user_mounts, None).unwrap_err()
         );
         assert!(
             err.contains(&format!("{}:/data", missing.display())),
@@ -2003,11 +2019,16 @@ mod tests {
     }
 
     #[test]
-    fn a_config_written_before_tmpfs_support_reads_as_bind() {
+    fn a_bind_mount_keeps_the_serialized_shape_it_had_before_tmpfs() {
         let old = r#"{"source":"/data","target":"/data","readonly":true}"#;
         let m: BindMount = serde_json::from_str(old).unwrap();
-        assert_eq!(m.kind, MountKind::Bind);
-        assert!(m.readonly);
+        assert_eq!(m.source, MountFrom::Host("/data".into()));
+        assert_eq!(serde_json::to_string(&m).unwrap(), old);
+
+        let tmpfs = mounts(&["tmpfs:/c:size=4096"]).unwrap().remove(0);
+        let back: BindMount =
+            serde_json::from_str(&serde_json::to_string(&tmpfs).unwrap()).unwrap();
+        assert_eq!(back.source, tmpfs.source);
     }
 
     // --- Image resolution ---
@@ -2787,10 +2808,9 @@ mod tests {
         std::fs::write(rootfs.path().join("etc/resolv.conf"), sentinel).unwrap();
 
         let user_mounts = vec![BindMount {
-            source: "/dev/null".into(),
+            source: MountFrom::Host("/dev/null".into()),
             target: "/etc/resolv.conf".into(),
             readonly: false,
-            kind: MountKind::Bind,
         }];
         mount_dns(rootfs.path(), &user_mounts).unwrap();
 

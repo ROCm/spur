@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `--container-mounts` grammar, shared by the controller and both agents.
-//!
-//! One value holds one or more comma-separated mounts:
-//!
-//! - `<src>:<dst>[:ro|:rw]` bind-mounts an absolute host path
-//! - `tmpfs:<dst>[:size=<n>[K|M|G]][:ro|:rw]` mounts an empty in-memory filesystem
-//! - `pvc:<claim>:<dst>[:ro|:rw]` mounts a PersistentVolumeClaim (Kubernetes agent only)
+
+use std::path::Path;
 
 use thiserror::Error;
+
+/// Where the native agent puts a container's entry script; a user mount here would hide it.
+pub const ENTRY_SCRIPT_DIR: &str = "/.spur";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSource {
@@ -26,16 +25,17 @@ pub struct MountSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid mount spec '{spec}': {reason}")]
+#[error("invalid mount '{spec}': {reason}")]
 pub struct MountSpecError {
     pub spec: String,
     pub reason: String,
 }
 
 /// Splits every value on commas, so a list and a repeated flag mean the same.
+/// A blank value is no mounts, so `--container-mounts=$UNSET` keeps working.
 pub fn split(values: &[String]) -> Result<Vec<String>, MountSpecError> {
     let mut specs = Vec::new();
-    for value in values {
+    for value in values.iter().filter(|v| !v.trim().is_empty()) {
         for entry in value.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
@@ -47,21 +47,36 @@ pub fn split(values: &[String]) -> Result<Vec<String>, MountSpecError> {
     Ok(specs)
 }
 
-pub fn parse_list(values: &[String]) -> Result<Vec<MountSpec>, MountSpecError> {
-    split(values)?.iter().map(|spec| parse(spec)).collect()
+/// Each entry with the spec it was parsed from, so an agent refusing one can quote it.
+pub fn parse_list(values: &[String]) -> Result<Vec<(String, MountSpec)>, MountSpecError> {
+    let mut mounts: Vec<(String, MountSpec)> = Vec::new();
+    for spec in split(values)? {
+        let mount = parse(&spec)?;
+        let target = mount.target.trim_end_matches('/');
+        if mounts
+            .iter()
+            .any(|(_, m)| m.target.trim_end_matches('/') == target)
+        {
+            return Err(invalid(
+                &spec,
+                "another entry already mounts this destination",
+            ));
+        }
+        mounts.push((spec, mount));
+    }
+    Ok(mounts)
 }
 
 /// The split list, each entry checked, in the form the agents receive.
 pub fn normalize(values: &[String]) -> Result<Vec<String>, MountSpecError> {
-    let specs = split(values)?;
-    for spec in &specs {
-        parse(spec)?;
-    }
-    Ok(specs)
+    Ok(parse_list(values)?
+        .into_iter()
+        .map(|(spec, _)| spec)
+        .collect())
 }
 
 pub fn parse(spec: &str) -> Result<MountSpec, MountSpecError> {
-    let parts: Vec<&str> = spec.split(':').collect();
+    let parts: Vec<&str> = spec.split(':').map(str::trim).collect();
     if parts.iter().any(|p| p.is_empty()) {
         return Err(invalid(spec, "empty field"));
     }
@@ -75,6 +90,7 @@ pub fn parse(spec: &str) -> Result<MountSpec, MountSpecError> {
         [_, _, ..] => return Err(invalid(spec, "source must be an absolute path")),
         _ => return Err(invalid(spec, "expected <src>:<dst>[:ro]")),
     };
+    check_target(spec, target)?;
     let mut mount = MountSpec {
         source,
         target: target.to_string(),
@@ -82,6 +98,26 @@ pub fn parse(spec: &str) -> Result<MountSpec, MountSpecError> {
     };
     apply_flags(spec, &mut mount, flags)?;
     Ok(mount)
+}
+
+fn check_target(spec: &str, target: &str) -> Result<(), MountSpecError> {
+    if !target.starts_with('/') {
+        return Err(invalid(spec, "destination must be an absolute path"));
+    }
+    if target.contains('=') {
+        return Err(invalid(spec, "destination cannot contain '='"));
+    }
+    let target = target.trim_end_matches('/');
+    if target.is_empty() {
+        return Err(invalid(spec, "cannot mount over the container root"));
+    }
+    if Path::new(target).starts_with(ENTRY_SCRIPT_DIR) {
+        return Err(invalid(
+            spec,
+            &format!("{ENTRY_SCRIPT_DIR} is reserved for the job's entry script"),
+        ));
+    }
+    Ok(())
 }
 
 fn apply_flags(spec: &str, mount: &mut MountSpec, flags: &[&str]) -> Result<(), MountSpecError> {
@@ -154,11 +190,15 @@ mod tests {
         }
     }
 
+    fn mounts(values: &[&str]) -> Result<Vec<MountSpec>, MountSpecError> {
+        let values: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        Ok(parse_list(&values)?.into_iter().map(|(_, m)| m).collect())
+    }
+
     #[test]
     fn a_comma_list_is_one_mount_per_entry() {
-        let mounts = parse_list(&["/data:/data,/scratch:/scratch,/models:/models:ro".into()]);
         assert_eq!(
-            mounts.unwrap(),
+            mounts(&["/data:/data,/scratch:/scratch,/models:/models:ro"]).unwrap(),
             vec![
                 path("/data", "/data", false),
                 path("/scratch", "/scratch", false),
@@ -169,10 +209,26 @@ mod tests {
 
     #[test]
     fn two_listed_mounts_are_not_one_mount_onto_a_comma_named_target() {
-        let mounts = parse_list(&["/a:/b,/c:/d".into()]).unwrap();
         assert_eq!(
-            mounts,
+            mounts(&["/a:/b,/c:/d"]).unwrap(),
             vec![path("/a", "/b", false), path("/c", "/d", false)]
+        );
+    }
+
+    #[test]
+    fn a_blank_value_is_no_mounts() {
+        assert_eq!(normalize(&["".into()]).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            normalize(&[" ".into(), "/a:/a".into()]).unwrap(),
+            vec!["/a:/a"]
+        );
+    }
+
+    #[test]
+    fn spaces_around_fields_are_ignored() {
+        assert_eq!(
+            mounts(&["/a : /b : ro"]).unwrap(),
+            vec![path("/a", "/b", true)]
         );
     }
 
@@ -184,19 +240,52 @@ mod tests {
 
     #[test]
     fn every_rejection_names_the_offending_spec() {
-        for (values, named) in [
-            (vec!["/a:/a,".to_string()], "/a:/a,"),
-            (vec!["/a:/a,nocolon".to_string()], "nocolon"),
-            (vec!["/src:/dst:z".to_string()], "/src:/dst:z"),
-            (vec!["/src:/dst:ro:rw".to_string()], "/src:/dst:ro:rw"),
-            (vec!["relative:/dst".to_string()], "relative:/dst"),
-            (vec!["/src::ro".to_string()], "/src::ro"),
-            (vec!["pvc:claim".to_string()], "pvc:claim"),
-            (vec!["".to_string()], "''"),
+        for (value, named) in [
+            ("/a:/a,", "/a:/a,"),
+            ("/a:/a,,/b:/b", "/a:/a,,/b:/b"),
+            ("/a:/a,nocolon", "nocolon"),
+            ("/src:/dst:z", "/src:/dst:z"),
+            ("/src:/dst:ro:rw", "/src:/dst:ro:rw"),
+            ("relative:/dst", "relative:/dst"),
+            ("/src::ro", "/src::ro"),
+            ("pvc:claim", "pvc:claim"),
         ] {
-            let err = normalize(&values).unwrap_err().to_string();
-            assert!(err.contains(named), "{values:?} gave: {err}");
+            let err = normalize(&[value.to_string()]).unwrap_err().to_string();
+            assert!(err.contains(&format!("'{named}'")), "{value} gave: {err}");
         }
+    }
+
+    #[test]
+    fn a_destination_must_be_an_absolute_path_below_the_root_without_an_option() {
+        for spec in [
+            "tmpfs:size=1G",
+            "/src:ro",
+            "pvc:claim:ro",
+            "/src:relative",
+            "/src:/",
+            "tmpfs://",
+            "tmpfs:/size=1G",
+            "/src:/dst=ro",
+        ] {
+            assert!(parse(spec).is_err(), "{spec} should be rejected");
+        }
+    }
+
+    #[test]
+    fn the_entry_script_folder_cannot_be_mounted_over() {
+        for spec in ["tmpfs:/.spur", "/src:/.spur/", "/src:/.spur/x"] {
+            let err = parse(spec).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{spec} gave: {err}");
+        }
+        assert!(parse("/src:/.spurx").is_ok());
+    }
+
+    #[test]
+    fn two_entries_cannot_share_a_destination() {
+        let err = normalize(&["/a:/data,tmpfs:/data/".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'tmpfs:/data/'"), "{err}");
     }
 
     #[test]

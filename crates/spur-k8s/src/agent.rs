@@ -1034,11 +1034,12 @@ impl VirtualAgent {
 /// Map `--container-mounts` onto pod volumes; an entry that does not parse refuses the launch.
 fn parse_mounts(mounts: &[String]) -> Result<(Vec<Volume>, Vec<VolumeMount>), Status> {
     use spur_core::container_mount::{parse_list, MountSource};
-    let specs = parse_list(mounts).map_err(|e| Status::failed_precondition(e.to_string()))?;
+    let specs = parse_list(mounts)
+        .map_err(|e| Status::failed_precondition(format!("--container-mounts: {e}")))?;
     let mut volumes = Vec::new();
     let mut volume_mounts = Vec::new();
 
-    for (i, m) in specs.into_iter().enumerate() {
+    for (i, (_, m)) in specs.into_iter().enumerate() {
         let volume = match m.source {
             MountSource::Path(path) => Volume {
                 name: format!("hostpath-{i}"),
@@ -1540,6 +1541,10 @@ mod tests {
         assert!(vols[0].host_path.is_none());
         assert_eq!(vmounts[0].name, vols[0].name);
         assert_eq!(vmounts[0].mount_path, "/cache");
+        assert_eq!(vmounts[0].read_only, Some(false));
+
+        let (_, vmounts) = parse_mounts(&["tmpfs:/cache:ro".to_string()]).unwrap();
+        assert_eq!(vmounts[0].read_only, Some(true));
     }
 
     // --- GPU vendor detection ---

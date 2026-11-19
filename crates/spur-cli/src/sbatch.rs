@@ -1690,6 +1690,16 @@ echo "hello world"
         assert_eq!(args.container_mounts, vec!["/a:/a", "/b:/b"]);
     }
 
+    // The controller splits the list; the CLI must hand it over whole.
+    #[test]
+    fn a_comma_mount_list_stays_one_value_from_both_sources() {
+        let args = parse_merged(
+            &["--container-mounts=/a:/a,/b:/b"],
+            &["sbatch", "--container-mounts", "/c:/c,tmpfs:/d"],
+        );
+        assert_eq!(args.container_mounts, vec!["/a:/a,/b:/b", "/c:/c,tmpfs:/d"]);
+    }
+
     #[test]
     fn test_repeated_gres_flag_replaces() {
         let args = parse_merged(&[], &["sbatch", "--gres=gpu:2", "--gres=gpu:5"]);
