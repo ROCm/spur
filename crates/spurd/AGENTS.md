@@ -518,17 +518,21 @@ metrics).
 
   The launcher exits on its own once the workload does, relaying its status. On
   a rootful node the batch shell is PID 1 of its namespace, so it reacts only to
-  a signal it traps. The same holds for a container's command, on rootless
-  agents too: the signal used to kill the waiting parent and end the step, but
-  now an unhandled SIGTERM leaves the command running until the SIGKILL, so it
-  ends with signal 9 rather than 15.
+  a signal it traps. The same holds for the command of a freshly created
+  container (a job's, or an `srun` step's own `StepContainerPlan::Fresh`), on
+  rootless agents too: the signal used to kill the waiting parent and end the
+  step, but now an unhandled SIGTERM leaves the command running until the
+  SIGKILL, so it ends with signal 9 rather than 15. A step that joins its job's
+  container (`StepContainerPlan::JoinParent`) enters the PID namespace through
+  `nsenter`, is not PID 1, and ends on an unhandled SIGTERM.
 - The agent signals processes itself in two places and applies the same rule
   there. `CancelStep`, and the replay of a cancel that arrived while the step
   was launching, run as one detached task (`run_step_cancel`), so the
   controller dropping the RPC cancels none of it. The step's own process gets a
   SIGKILL after `STEP_CANCEL_ESCALATION` (`MIN_KILL_WAIT`, 5 s) whatever its
-  supervisor does: a container's command is PID 1 and ignores unhandled
-  signals, and a step cancel keeps the allocation, so nothing else reclaims it.
+  supervisor does: the command of a freshly created container is PID 1 and
+  ignores unhandled signals, and a step cancel keeps the allocation, so nothing
+  else reclaims it.
   The signal itself goes through the supervisor (`SignalAllocation`), which is
   also asked for a delayed SIGKILL, and directly with `signal_step_tree` and the
   `TrackedProcess` recorded on the `ActiveStep` (a supervised step's tracked pid

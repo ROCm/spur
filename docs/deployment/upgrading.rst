@@ -1100,12 +1100,14 @@ while the workload ran on. Signals now go to the workload and skip the launcher.
   now runs through its grace, and while its job is still running a stop waits up
   to the kill wait before the SIGKILL. Expect longer ``COMPLETING`` times, and a
   preemptor that starts later.
-- **A container command without a SIGTERM handler runs until the SIGKILL.** It is
-  PID 1 of its PID namespace, so it ignores a signal it has no handler for. It
-  used to end when SIGTERM killed the waiting parent, with signal 15; it now ends
-  at the SIGKILL, with signal 9, as under ``docker stop``. This applies to
-  rootless agents too, and to every ``srun --container-image=`` step, because the
-  command is ``exec``'d.
+- **A container command without a SIGTERM handler runs until the SIGKILL.** In a
+  container that is created fresh, the command is PID 1 of its PID namespace, so
+  it ignores a signal it has no handler for. It used to end when SIGTERM killed
+  the waiting parent, with signal 15; it now ends at the SIGKILL, with signal 9,
+  as under ``docker stop``. This applies to rootless agents too, and to an
+  ``srun --container-image=`` step that creates a container of its own. A step
+  that joins its job's container (the same image as the job) is not PID 1, so an
+  untrapped SIGTERM ends it as usual.
 - **The fix needs upgraded agents.** A job or ``srun`` step launched before its
   node's agent was upgraded keeps the old behavior until it ends, because its
   supervisor keeps running through the upgrade. A step launched after the upgrade

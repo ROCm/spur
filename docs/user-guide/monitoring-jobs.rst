@@ -884,9 +884,11 @@ the job is preempted immediately.
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
   The wait does not reach ``srun`` steps once the batch script exits
   (:ref:`kill wait note <kill-wait-steps-caveat>`).
-* **In a container, install a SIGTERM handler.** Your command runs as PID 1 of
-  the container, which sees SIGTERM only if it installs a handler. Without one it
-  runs until the SIGKILL.
+* **In a container, install a SIGTERM handler.** When a job or step creates its
+  container, your command runs as PID 1 of it, which sees SIGTERM only if it
+  installs a handler. Without one it runs until the SIGKILL. A step that joins
+  its job's container (``srun --container-image=`` with the job's own image) is
+  not PID 1, and an untrapped SIGTERM ends it.
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
@@ -1520,8 +1522,9 @@ time limit, where earlier releases gave it 2 seconds.
    batch script keeps running, for example because it traps SIGTERM and keeps
    running after the ``srun`` client exits.
 
-   In a container, your command runs as PID 1 and sees SIGTERM only if it
-   installs a handler. Otherwise it runs until the SIGKILL.
+   In a container that a job or step creates, your command runs as PID 1 and
+   sees SIGTERM only if it installs a handler. Otherwise it runs until the
+   SIGKILL. A step that joins its job's container is not PID 1.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
