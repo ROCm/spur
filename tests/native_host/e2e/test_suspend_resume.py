@@ -11,7 +11,9 @@ dispatch. Each test cancels its job in a finally block.
 
 import time
 
-from cluster import parse_job_id, job_state
+import pytest
+
+from cluster import job_state, parse_job_id, wait_job, wait_until
 
 
 def _wait_state(cluster, job_id, want, timeout=30):
@@ -370,3 +372,95 @@ def _parse_hms(s):
     else:
         h, m, sec = parts[0], parts[1], parts[2]
     return days * 86400 + h * 3600 + m * 60 + sec
+
+
+# A workload whose worker thread, not its main thread, starts a ticking helper process.
+# Linux lists a child under the thread that forked it, so a signal delivered by walking the
+# job's descendants through the main thread's children file never finds the helper.
+_THREADED_WORKLOAD = """\
+import subprocess
+import sys
+import threading
+
+ticks, stop = sys.argv[1], sys.argv[2]
+helper = (
+    "while [ ! -e '%s' ]; do echo tick >> '%s'; sleep 1; done" % (stop, ticks)
+)
+worker = threading.Thread(target=lambda: subprocess.run(["/bin/sh", "-c", helper]))
+worker.start()
+worker.join()
+"""
+
+# The helper ticks once a second, so a window this long holds several ticks if it is running.
+_TICK_WINDOW_SECS = 6
+# Time for a stop to land and the helper's in-flight tick to finish.
+_STOP_SETTLE_SECS = 3
+
+
+def _tick_count(node, path):
+    return int(node.exec_allow_fail(f"wc -l < '{path}' 2>/dev/null || echo 0").strip() or 0)
+
+
+class TestSuspendWithoutCgroup:
+    """Suspend and resume reach a helper started by a worker thread of the workload when
+    the node has no job cgroup to list the job's processes from.
+
+    Run as a regular user spurd the job is its own process group, and as root it runs
+    behind an ``unshare`` launcher that a stop must not take with it, so the job's
+    processes are found by walking its descendants instead.
+    """
+
+    @pytest.fixture(params=[False, True], ids=["user-spurd", "root-spurd"])
+    def agent_as_root(self, request):
+        return request.param
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"auth": {"allow_root_jobs": True}, "cgroup": {"enabled": False}}
+
+    def test_suspend_stops_and_resume_restarts_a_helper_a_worker_thread_started(self, cluster):
+        node = cluster.nodes[0]
+        if not node.exec_allow_fail("command -v python3").strip():
+            pytest.skip("node 0 has no python3 to run the multithreaded workload")
+        ticks = f"{cluster.remote_dir}/thread-ticks.txt"
+        stop = f"{cluster.remote_dir}/thread-ticks.stop"
+        program = cluster.write_file("thread-workload.py", _THREADED_WORKLOAD, executable=False)
+        script = cluster.write_file(
+            "thread-suspend.sh",
+            f"#!/bin/bash\nexec python3 '{program}' '{ticks}' '{stop}'\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "thread-suspend", "-N", "1", "-w", cluster.node_names[0], script])
+        )
+        assert job_id is not None, "sbatch failed"
+        try:
+            assert _wait_state(cluster, job_id, "R", timeout=60), "job never reached RUNNING"
+            wait_until(
+                lambda: _tick_count(node, ticks) >= 3, timeout_s=30, interval_s=1,
+                desc="the helper started by the worker thread to tick",
+            )
+
+            cluster.scontrol("suspend", str(job_id))
+            assert _wait_state(cluster, job_id, "S"), "job did not reach SUSPENDED"
+            time.sleep(_STOP_SETTLE_SECS)
+            while_stopped = _tick_count(node, ticks)
+            time.sleep(_TICK_WINDOW_SECS)
+            assert _tick_count(node, ticks) == while_stopped, (
+                "the helper kept ticking while its job was suspended"
+            )
+
+            cluster.scontrol("resume", str(job_id))
+            assert _wait_state(cluster, job_id, "R"), "job did not return to RUNNING"
+            wait_until(
+                lambda: _tick_count(node, ticks) > while_stopped, timeout_s=30, interval_s=1,
+                desc="the helper to tick again after the resume",
+            )
+
+            node.exec(f"touch '{stop}'")
+            assert wait_job(cluster, job_id, timeout=60) == "CD", (
+                "the job must finish cleanly once the helper is told to stop\n"
+                f"{cluster.debug_job(job_id)}"
+            )
+        finally:
+            node.exec_allow_fail(f"touch '{stop}'")
+            _cleanup(cluster, job_id)
