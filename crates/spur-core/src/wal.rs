@@ -150,6 +150,12 @@ pub enum WalOperation {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+        /// Killed for running out of memory, by its own limit or by the job's.
+        #[serde(default)]
+        oom_killed: bool,
+        /// The client gave up on the step before it ran.
+        #[serde(default)]
+        cancelled: bool,
     },
     /// Record a job step at creation so `run_step` survives controller restart.
     JobStepCreate {
@@ -815,6 +821,28 @@ mod job_state_change_wal_tests {
     }
 
     #[test]
+    fn job_step_complete_without_oom_killed_still_replays() {
+        let old = r#"{"JobStepComplete":{"job_id":7,"step_id":2,"exit_code":137}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobStepComplete {
+                job_id: 7,
+                step_id: 2,
+                exit_code: 137,
+                oom_killed: false,
+                cancelled: false
+            }
+        ));
+    }
+
+    #[test]
+    fn out_of_memory_step_state_has_a_frozen_wire_name() {
+        let json = serde_json::to_string(&crate::step::StepState::OutOfMemory).unwrap();
+        assert_eq!(json, "\"OutOfMemory\"");
+    }
+
+    #[test]
     fn job_exclude_update_has_a_frozen_wire_form() {
         let op = WalOperation::JobExcludeUpdate {
             job_id: 7,
@@ -1307,6 +1335,7 @@ mod tests {
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1536),
             memory_per_gpu_mb: None,
+            cpus_per_gpu: None,
         };
         let op = WalOperation::JobStart {
             job_id: 9,

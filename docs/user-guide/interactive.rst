@@ -181,23 +181,45 @@ job already holds:
    * - Flag
      - What the step gets on each of its nodes
    * - ``--cpus-per-task`` / ``-c``
-     - A CPU-time cap (``cpu.max``) of ``-c`` times its tasks on that node. The
-       step keeps the job's cpuset; it is not pinned to cores of its own.
-   * - ``--mem``
+     - ``-c`` times its tasks on that node, held for the step. A step with GPUs
+       of its own is pinned to that many of the job's cores, its GPUs' reserved
+       cores first, then cores near its GPUs (``[cgroup] constrain_cores``);
+       pinned steps never share a core. When too few of the job's cores are
+       free near its GPUs, it still holds the count but falls back to running
+       on the job's cpuset by count, not specific cores. A CPU-time cap
+       (``cpu.max``) is added only with ``[cgroup] cpu_quota``, as for jobs.
+       The thread-count variables (``OMP_NUM_THREADS``, ``MKL_NUM_THREADS``,
+       ``OPENBLAS_NUM_THREADS``, ``VECLIB_MAXIMUM_THREADS``,
+       ``NUMEXPR_NUM_THREADS``) follow the step's own CPU count on that node
+       instead of the job's.
+   * - ``--cpus-per-gpu``
+     - That many CPUs for each of the step's GPUs on the node, held and pinned like
+       ``-c``. Needs a GPU request on the step; not with ``-c``. The
+       thread-count variables above follow this resolved CPU count too.
+   * - ``--mem``, ``--mem-per-cpu``, ``--mem-per-gpu``
      - A memory cap, sized like a job's (``memory.max``/``memory.high``, and
-       ``memory.swap.max`` when swap is constrained). With ``oom_kill_job`` on,
-       going over it kills that step only; the job and its other steps keep running.
+       ``memory.swap.max`` when swap is constrained): per node, per step CPU, or
+       per step GPU; at most one. It is held for the step. With ``oom_kill_job``
+       on, going over it kills that step only (it ends ``OUT_OF_MEMORY``) and
+       prints::
+
+          srun: error: Detected an oom_kill event in StepId=<job>.<step>. Some of the step tasks have been OOM Killed.
+
+       the job and its other steps keep running.
    * - ``--gpus-per-node``, ``--gres=gpu:N``, ``--gpus-per-task``, ``--gpus``
      - That many of the job's GPUs, kept from every other step that also asked
        for GPUs, and a device filter of the step's own that denies the rest.
        ``--gpus`` must split evenly across the step's nodes. ``0`` means no GPU
-       at all. A step cannot ask for a GPU type: it takes from GPUs its job holds.
+       at all. A type (``--gpus-per-node=mi300x:1``) takes only the job's GPUs of
+       that type; a type the job holds none of is refused, naming the types it holds.
 
 Only flags typed on the command line count. The values an allocation exports
 into its shell (``SPUR_CPUS_PER_TASK``, ``SPUR_MEM_PER_NODE``,
 ``SPUR_GPUS_PER_NODE``, and their ``SLURM_*`` twins) stay shared, so a plain
 ``srun`` keeps behaving as before. A step that types none of these flags shares
-everything, exactly as above.
+everything, exactly as above. A typed step that gives no CPU flag of its own
+takes the job's ``-c`` (or ``--cpus-per-gpu`` when it asks for GPUs), as Slurm
+does, which also sizes ``--mem-per-cpu``.
 
 .. code-block:: bash
 
@@ -208,19 +230,69 @@ everything, exactly as above.
    done
    wait
 
-A step that asks for GPUs when not enough of the job's are free fails at once
-with ``ResourceExhausted``; it does not wait for another step to finish.
+What a step holds — CPUs, memory and GPUs — is kept from the job's other typed
+steps until it ends, including across an ``spurd`` restart. A step whose share is
+not free right now waits for one to end, printing Slurm's own messages while it
+retries with a 1-second backoff that doubles up to a 10-second cap. Each delay
+is randomly lengthened or shortened by up to 25% so parallel waiters don't
+retry in lockstep::
+
+   srun: Job <id> step creation temporarily disabled, retrying (Requested nodes are busy)
+   srun: Job <id> step creation still disabled, retrying (Requested nodes are busy)
+
+The first line prints once; the second at most every 60 seconds. ``srun``
+keeps retrying until the step fits or the job ends. A waiting step is closed
+``CANCELLED`` if ``srun`` is interrupted (Ctrl-C) or terminated (``SIGTERM``,
+``SIGHUP``) while it waits; ``srun`` then exits with 128 plus the signal
+number. A ``SIGKILL`` cannot be caught, so a step left waiting that way stays
+``RUNNING`` until the job itself ends. A request larger than the job's whole
+share on a node is refused at once, without waiting.
+
+A multi-node step waits as a whole: it starts only once every node has
+claimed its share, and a node that is busy makes the whole step wait, not
+just that one node. A node that loses its claim before launch (its ``spurd``
+restarted, or the claim expired) fails the step at once instead of leaving
+the other nodes running. The claim's lifetime is sized from the step's own
+``dispatch_timeout_secs`` rather than a fixed value, so a slow node does not
+expire a fast node's claim early.
+
+``srun --overlap`` runs a step that holds nothing: it is limited by the flags it
+types like any other step, but takes the first GPUs of the job whether other steps
+hold them or not, and never waits, as in Slurm.
 
 Inside a step with GPUs of its own, the GPU runtimes can open no other GPU, so
 they number the step's GPUs from ``0``. ``ROCR_VISIBLE_DEVICES``,
-``CUDA_VISIBLE_DEVICES``, ``GPU_DEVICE_ORDINAL`` and ``SPUR_JOB_GPUS`` follow that
-numbering there.
+``CUDA_VISIBLE_DEVICES`` and ``GPU_DEVICE_ORDINAL`` follow that numbering there.
+``SPUR_JOB_GPUS`` keeps the node's GPU ids, as Slurm's ``SLURM_JOB_GPUS`` does, so
+a script can still tell which physical GPUs the step holds; ``SPUR_LOCAL_GPUS``
+lists the same GPUs as the runtimes number them (``0,1,...``).
 
 The node refuses a step whose share it cannot enforce rather than run it with the
 job's: ``spurd`` must run as root with ``[cgroup] enabled``, a memory cap also
 needs ``constrain_ram_space`` or ``constrain_swap``, and GPUs need
-``constrain_devices`` (see :doc:`/admin-guide/configuration`). ``--pty`` steps
-ignore these flags and warn.
+``constrain_devices`` (see :doc:`/admin-guide/configuration`). A ``--pty`` step
+always shares the whole job, so there is nothing to carve out: typed resource
+flags are ignored with a warning, and the step runs on the job's CPUs, memory
+and GPUs:
+
+.. code-block:: text
+
+   srun: warning: a --pty step runs with its job's CPUs, memory and GPUs; -c/--mem*/--cpus-per-gpu/--gres/--gpus* are ignored
+
+``srun --jobid <id>`` (interactive attach) also always shares the whole job,
+but refuses typed resource flags instead of ignoring them:
+
+.. code-block:: text
+
+   Error: srun --jobid attach shares the job's resources; drop -c/--mem*/--cpus-per-gpu/--gpus*/--gres
+
+``srun`` also checks the controller's capabilities before sending a typed
+step, and refuses client-side against a controller that predates this
+release's step resources rather than let it silently ignore the carve-out:
+
+.. code-block:: text
+
+   Error: the controller does not support step resources (-c/--mem*/--cpus-per-gpu/--gpus* on a step); upgrade spurctld or run the step without them
 
 .. note::
 
@@ -228,16 +300,18 @@ ignore these flags and warn.
    infrastructure devices; a non-GPU device allocated to the job is not part of
    its filter. The filter governs opening a device: it does not stop two
    cooperating processes in different steps from handing an already-open
-   descriptor to each other over a Unix socket. A node agent that predates step
-   shares ignores these flags, so upgrade the nodes before relying on them; a job
-   started before its node was upgraded cannot give a step GPUs of its own.
+   descriptor to each other over a Unix socket. The controller refuses a typed
+   step on a node whose ``spurd`` predates step shares, with "upgrade spurd on
+   <node>"; a job started before its node was upgraded cannot give a step
+   GPUs of its own.
 
 The ``-N``/``-n`` defaults of 1 apply when ``srun`` submits a **new** job, not
 when it runs as a step inside ``salloc``/``sbatch``. Common options: ``--nodes``/
-``-N``, ``--ntasks``/``-n``, ``--cpus-per-task``/``-c``, ``--mem``, ``--time``/
-``-t``, ``--gres``, ``--gpus``/``-G``, ``--partition``/``-p``, ``--constraint``/
-``-C``, ``--nodelist``/``-w``, ``--exclude``/``-x``, ``--reservation``, and
-``--exclusive``.
+``-N``, ``--ntasks``/``-n``, ``--cpus-per-task``/``-c``, ``--cpus-per-gpu``,
+``--mem``, ``--mem-per-cpu``, ``--mem-per-gpu``, ``--time``/``-t``, ``--gres``,
+``--gpus``/``-G``, typed GPU requests (``--gpus-per-node``, ``--gpus-per-task``),
+``--partition``/``-p``, ``--constraint``/``-C``, ``--nodelist``/``-w``,
+``--exclude``/``-x``, ``--reservation``, and ``--exclusive``.
 
 Examples:
 

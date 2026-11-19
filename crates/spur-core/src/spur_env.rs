@@ -48,12 +48,16 @@ impl SpurEnv {
     }
 
     /// Consume into the final `HashMap` for process spawning.
+    ///
+    /// Drops `SPUR_LOCAL_GPUS` too: it numbers only the GPU fence of the launch that
+    /// set it, so a nested launch must not inherit it in place of its own.
     pub fn into_map(self) -> HashMap<String, String> {
         self.vars
             .into_iter()
             .filter(|(k, _)| {
                 let u = k.to_ascii_uppercase();
-                !u.contains("EXECUTION_CREDENTIAL")
+                u != "SPUR_LOCAL_GPUS"
+                    && !u.contains("EXECUTION_CREDENTIAL")
                     && u != "SPUR_JOB_CREDENTIAL"
                     && u != "SLURM_JOB_CREDENTIAL"
                     && u != "SPUR_STEP_CREDENTIAL"
@@ -104,6 +108,16 @@ impl SpurEnv {
         senv.set_with_slurm_twin("SPUR_LOCALID", local_rank);
         senv.set_with_slurm_twin("SPUR_PROCID", procid);
     }
+
+    /// `--cpus-per-gpu` and `--mem-per-gpu` as the job asked, for Slurm scripts.
+    pub fn set_per_gpu(senv: &mut SpurEnv, spec: &spur_proto::proto::JobSpec) {
+        if let Some(cpus) = spec.cpus_per_gpu {
+            senv.set_with_slurm_twin("SPUR_CPUS_PER_GPU", cpus);
+        }
+        if spec.memory_per_gpu_mb > 0 {
+            senv.set_with_slurm_twin("SPUR_MEM_PER_GPU", spec.memory_per_gpu_mb);
+        }
+    }
 }
 
 impl Default for SpurEnv {
@@ -124,6 +138,25 @@ mod tests {
         assert_eq!(map.get("SPUR_JOB_ID").unwrap(), "42");
         assert_eq!(map.get("SLURM_JOB_ID").unwrap(), "42");
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn into_map_drops_a_local_gpu_numbering_inherited_from_a_fenced_parent() {
+        let inherited = HashMap::from([("SPUR_LOCAL_GPUS".to_string(), "0,1".to_string())]);
+        let own = HashMap::from([("SPUR_JOB_GPUS".to_string(), "5,6,7".to_string())]);
+        let launch = || {
+            let mut env = SpurEnv::new();
+            env.extend(&inherited);
+            env.extend(&own);
+            env.into_map()
+        };
+
+        assert!(!launch().contains_key("SPUR_LOCAL_GPUS"));
+
+        let mut fenced = launch();
+        crate::task_launch::localize_gpu_selectors(&mut fenced);
+        assert_eq!(fenced["SPUR_LOCAL_GPUS"], "0,1,2");
+        assert_eq!(fenced["SPUR_JOB_GPUS"], "5,6,7");
     }
 
     #[test]
@@ -242,6 +275,34 @@ mod tests {
             assert!(!map.contains_key(key), "should not set {key}");
         }
         assert_eq!(map["SPUR_PROCID"], "10");
+    }
+
+    #[test]
+    fn set_per_gpu_is_set_only_for_jobs_that_ask() {
+        let mut per_gpu = spur_proto::proto::JobSpec {
+            cpus_per_gpu: Some(8),
+            memory_per_gpu_mb: 4096,
+            ..Default::default()
+        };
+        let mut senv = SpurEnv::new();
+        SpurEnv::set_per_gpu(&mut senv, &per_gpu);
+        let env = senv.into_map();
+        assert_eq!(env.get("SPUR_CPUS_PER_GPU").map(String::as_str), Some("8"));
+        assert_eq!(env.get("SLURM_CPUS_PER_GPU").map(String::as_str), Some("8"));
+        assert_eq!(
+            env.get("SPUR_MEM_PER_GPU").map(String::as_str),
+            Some("4096")
+        );
+        assert_eq!(
+            env.get("SLURM_MEM_PER_GPU").map(String::as_str),
+            Some("4096")
+        );
+
+        per_gpu.cpus_per_gpu = None;
+        per_gpu.memory_per_gpu_mb = 0;
+        let mut senv = SpurEnv::new();
+        SpurEnv::set_per_gpu(&mut senv, &per_gpu);
+        assert!(senv.into_map().keys().all(|k| !k.contains("PER_GPU")));
     }
 
     #[test]

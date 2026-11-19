@@ -33,6 +33,8 @@ pub fn job_to_json(job: &Job) -> serde_json::Value {
         "node_count": job.spec.num_nodes,
         "tasks": job.spec.num_tasks,
         "cpus_per_task": job.spec.cpus_per_task,
+        "cpus_per_gpu": job.spec.cpus_per_gpu,
+        "memory_per_gpu": job.spec.memory_per_gpu_mb,
         "nodes": if job.allocated_nodes.is_empty() {
             String::new()
         } else {
@@ -65,6 +67,7 @@ pub fn node_to_json(
             node.reason_time.map(|t| t.to_rfc3339()),
         ),
     };
+    let sct = node.socket_core_thread();
     serde_json::json!({
         "name": node.name,
         "state": state,
@@ -81,6 +84,15 @@ pub fn node_to_json(
         "cpu_load": node.cpu_load,
         "architecture": node.arch,
         "operating_system": node.os,
+        "sockets": sct.map(|s| s.sockets),
+        "cores": sct.map(|s| s.cores_per_socket),
+        "threads": sct.map(|s| s.threads_per_core),
+        "gpu_cpus": node.gpu_cpus().iter().map(|g| serde_json::json!({
+            "stable_id": g.stable_id,
+            "reserved_cpus": spur_core::cpu_topology::format_cpu_list(&g.reserved),
+            "affinity_cpus": spur_core::cpu_topology::format_cpu_list(&g.affinity),
+        })).collect::<Vec<_>>(),
+        "capabilities": node.capabilities,
         "planned_job_id": planned.map(|(id, _)| id),
         "planned_start": planned.map(|(_, start)| start.timestamp()),
     })
@@ -107,6 +119,7 @@ pub fn partition_to_json(part: &Partition) -> serde_json::Value {
         "def_mem_per_node": part.def_mem_per_node,
         "def_mem_per_cpu": part.def_mem_per_cpu,
         "def_mem_per_gpu": part.def_mem_per_gpu,
+        "def_cpu_per_gpu": part.def_cpu_per_gpu,
     })
 }
 
@@ -215,6 +228,44 @@ mod tests {
     }
 
     #[test]
+    fn node_to_json_reports_socket_core_thread_gpu_cpus_and_capabilities() {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let mut node = Node::new("n1".into(), Default::default());
+        let json = node_to_json(&node, None);
+        assert!(
+            json["sockets"].is_null(),
+            "unknown without a topology: {json}"
+        );
+        assert_eq!(json["gpu_cpus"], serde_json::json!([]));
+        assert_eq!(json["capabilities"], serde_json::json!([]));
+
+        let records: Vec<CpuRecord> = (0..8)
+            .map(|cpu| CpuRecord {
+                cpu,
+                socket: cpu / 4,
+                core_id: cpu % 4,
+                numa_node: None,
+            })
+            .collect();
+        node.detected_resources.topology = Some(CpuTopology::from_cpus(&records));
+        node.capabilities = vec!["signal-job".into()];
+        let json = node_to_json(&node, None);
+        assert_eq!(
+            (
+                json["sockets"].clone(),
+                json["cores"].clone(),
+                json["threads"].clone()
+            ),
+            (
+                serde_json::json!(2),
+                serde_json::json!(4),
+                serde_json::json!(1)
+            )
+        );
+        assert_eq!(json["capabilities"], serde_json::json!(["signal-job"]));
+    }
+
+    #[test]
     fn partition_to_json_includes_access_control_fields() {
         let part = Partition {
             name: "gpu".into(),
@@ -260,6 +311,7 @@ mod tests {
             max_tres_per_node: [("cpu".to_string(), 64), ("gres/gpu".to_string(), 0)].into(),
             max_mem_per_cpu: Some(2048),
             def_mem_per_node: Some(4096),
+            def_cpu_per_gpu: Some(8),
             ..Default::default()
         };
         let json = partition_to_json(&part);
@@ -270,11 +322,33 @@ mod tests {
         );
         assert_eq!(json["max_mem_per_cpu"], 2048);
         assert_eq!(json["def_mem_per_node"], 4096);
+        assert_eq!(json["def_cpu_per_gpu"], 8);
         assert!(json["max_mem_per_node"].is_null());
 
         let plain = partition_to_json(&Partition::default());
         assert!(plain["max_cpus_per_node"].is_null());
+        assert!(plain["def_cpu_per_gpu"].is_null());
         assert_eq!(plain["max_tres_per_node"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn job_to_json_reports_per_gpu_fields_or_null_when_unset() {
+        let plain = Job::new(1, spur_core::job::JobSpec::default());
+        let json = job_to_json(&plain);
+        assert!(json["cpus_per_gpu"].is_null());
+        assert!(json["memory_per_gpu"].is_null());
+
+        let typed = Job::new(
+            2,
+            spur_core::job::JobSpec {
+                cpus_per_gpu: Some(8),
+                memory_per_gpu_mb: Some(16384),
+                ..Default::default()
+            },
+        );
+        let json = job_to_json(&typed);
+        assert_eq!(json["cpus_per_gpu"], 8);
+        assert_eq!(json["memory_per_gpu"], 16384);
     }
 
     #[test]

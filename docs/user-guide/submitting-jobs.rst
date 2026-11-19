@@ -45,6 +45,8 @@ best-effort basis (``-N`` to ``--job-name``, ``-l walltime=`` to ``--time``,
 ``-l nodes=N:ppn=M`` to ``--nodes``/``--ntasks-per-node``, plus ``-o``, ``-e``,
 ``-A``, and ``-l mem=``).
 
+.. _submit-option-precedence:
+
 Option Precedence
 -----------------
 
@@ -58,6 +60,36 @@ order (highest wins), matching Slurm:
 
 So ``spur submit --nodes=4 train.sh`` overrides a ``#SBATCH --nodes=2`` directive
 inside ``train.sh``.
+
+Two option groups conflict by *source* rather than per flag, matching Slurm:
+``-c``/``--cpus-per-task`` vs. ``--cpus-per-gpu``, and ``--mem`` vs.
+``--mem-per-cpu`` vs. ``--mem-per-gpu``. A command-line flag or a ``#SBATCH``
+directive counts as **explicit**; an ``SPUR_*``/``SBATCH_*`` environment
+variable counts as **env**. ``--cpus-per-gpu`` and ``--mem-per-gpu`` are the
+exception: for ``sbatch`` they read only
+``SBATCH_CPUS_PER_GPU``/``SBATCH_MEM_PER_GPU`` (``salloc`` reads its own
+``SALLOC_CPUS_PER_GPU``/``SALLOC_MEM_PER_GPU``), not an ``SPUR_*`` twin —
+spurd exports that twin into every running job, and reading it back would
+make a nested ``sbatch``/``salloc`` inherit the enclosing job's per-GPU
+sizing. Within a group, two explicit values (or two env values) are
+rejected; one explicit and one env value is not an error — the env value is
+silently dropped and the explicit one is used:
+
+.. code-block:: console
+
+   $ sbatch --cpus-per-gpu=8 -c 2 --gres=gpu:1 train.sh
+   error: --cpus-per-gpu cannot be combined with --cpus-per-task (-c)
+
+   $ sbatch --mem=4G --mem-per-cpu=1G train.sh
+   error: --mem, --mem-per-cpu, and --mem-per-gpu are mutually exclusive
+
+``--cpus-per-gpu`` and ``--mem-per-gpu`` also require the job to request GPUs
+(``--gpus``, ``--gpus-per-node``, ``--gpus-per-task``, or ``--gres=gpu:...``);
+without one they are rejected before the job reaches the controller. If
+neither ``-c`` nor ``--cpus-per-gpu`` survives this rule, a GPU job may still
+get a default CPUs-per-GPU count from the partition's (or ``[scheduler]``'s)
+``def_cpu_per_gpu``. ``--cpus-per-gpu=0`` (from the CLI, ``SBATCH_CPUS_PER_GPU``,
+or the equivalent ``srun``/``salloc`` env variable) is rejected, matching Slurm.
 
 A Sample Batch Script
 ---------------------
@@ -138,13 +170,24 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Tasks to launch per node.
    * - ``--cpus-per-task``
      - ``-c``
-     - CPUs per task. Default ``1``.
+     - CPUs per task. When not given on a GPU job, the partition's (or
+       ``[scheduler]``'s) ``def_cpu_per_gpu`` sets CPUs per GPU instead — it
+       does not set ``-c`` itself. See :ref:`submit-option-precedence`.
    * - ``--mem``
      -
      - Memory per node. ``512G`` and ``4096M`` use suffixes; a bare ``4096`` means MB.
    * - ``--mem-per-cpu``
      -
      - Memory per allocated CPU instead of per node.
+   * - ``--cpus-per-gpu``
+     -
+     - CPUs per allocated GPU instead of per task. Needs a GPU request;
+       conflicts with ``-c`` by source. See :ref:`submit-option-precedence`.
+   * - ``--mem-per-gpu``
+     -
+     - Memory per allocated GPU instead of per node or per CPU. Needs a GPU
+       request; conflicts with ``--mem``/``--mem-per-cpu`` by source. See
+       :ref:`submit-option-precedence`.
    * - ``--gres``
      -
      - Generic resources, e.g. ``gpu:4`` or ``gpu:mi300x:8``. See
@@ -419,7 +462,11 @@ works unchanged. The most useful are below.
    * - ``SPUR_NODELIST``
      - The allocated node list.
    * - ``SPUR_CPUS_ON_NODE``
-     - CPUs available on the current node.
+     - CPUs allocated on the current node.
+   * - ``SPUR_LOCAL_GPUS``
+     - Set only inside a step that holds its own GPU share: the step's GPUs
+       renumbered from ``0`` to match what the GPU runtime sees there.
+       ``SPUR_JOB_GPUS`` keeps the node's own ids in every case.
    * - ``SPUR_PROCID``
      - The task's global rank (twin ``SLURM_PROCID``).
    * - ``SPUR_LOCALID``

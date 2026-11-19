@@ -16,9 +16,37 @@ use clap::ArgMatches;
 use std::fmt::Display;
 use std::str::FromStr;
 
+/// Guards env reads against a concurrent `EnvGuard` mutation without self-deadlocking,
+/// so cross-field conflict checks can't turn a race into a hard error.
+#[cfg(test)]
+#[allow(dead_code)] // held only for its Drop side effect (releasing the mutex)
+enum EnvLock {
+    Reentrant,
+    Guard(std::sync::MutexGuard<'static, ()>),
+}
+
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static ENV_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn with_env_lock() -> EnvLock {
+    if ENV_LOCK_HELD.with(std::cell::Cell::get) {
+        EnvLock::Reentrant
+    } else {
+        EnvLock::Guard(ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 /// Return the first variable in `names` that is set and non-empty, together
 /// with the variable name that supplied it (used for error messages).
 fn first_set<'a>(names: &[&'a str]) -> Option<(&'a str, String)> {
+    #[cfg(test)]
+    let _guard = with_env_lock();
     names.iter().find_map(|&name| match std::env::var(name) {
         Ok(v) if !v.is_empty() => Some((name, v)),
         _ => None,
@@ -40,6 +68,8 @@ pub fn env_first(names: &[&str]) -> Option<String> {
 /// ignores (leaves unset) any other value. Returns `None` when no listed
 /// variable is present or every present value is unrecognized.
 pub fn env_flag(names: &[&str]) -> Option<bool> {
+    #[cfg(test)]
+    let _guard = with_env_lock();
     for name in names {
         let Ok(val) = std::env::var(name) else {
             continue;
@@ -112,10 +142,11 @@ pub fn apply_flag(matches: &ArgMatches, id: &str, names: &[&str], target: &mut b
     }
 }
 
-/// Parse the first set variable in `names`. The error names the specific
-/// variable that supplied the bad value so a misconfigured `SLURM_NNODES=abc`
-/// is easy to diagnose.
-fn parse_first_num<T>(names: &[&str]) -> Result<Option<T>>
+/// Parse the first set variable in `names`, paired with the variable name
+/// that supplied it (needed by callers that validate the parsed value, e.g.
+/// rejecting zero). The error names that variable so a misconfigured
+/// `SLURM_NNODES=abc` is easy to diagnose.
+fn parse_first_num_named<'a, T>(names: &[&'a str]) -> Result<Option<(&'a str, T)>>
 where
     T: FromStr,
     T::Err: Display,
@@ -126,9 +157,20 @@ where
             // parse instead of erroring.
             v.trim()
                 .parse()
+                .map(|parsed| (name, parsed))
                 .map_err(|e| anyhow!("invalid value {:?} for {}: {}", v, name, e))
         })
         .transpose()
+}
+
+/// Parse the first set variable in `names`. See `parse_first_num_named` for
+/// the error format.
+fn parse_first_num<T>(names: &[&str]) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    Ok(parse_first_num_named(names)?.map(|(_, v)| v))
 }
 
 /// Apply a numeric env default to a flag carrying a clap default value.
@@ -167,6 +209,29 @@ where
     Ok(())
 }
 
+/// Like `apply_num_opt`, but rejects a resolved value of zero, naming the
+/// variable that supplied it. `FromStr` has no notion of range, so this
+/// mirrors clap's CLI-side `value_parser!(u32).range(1..)` for the env path.
+pub fn apply_num_opt_nonzero(
+    matches: &ArgMatches,
+    id: &str,
+    names: &[&str],
+    flag: &str,
+    target: &mut Option<u32>,
+) -> Result<()> {
+    if was_cli_set(matches, id) {
+        return Ok(());
+    }
+    let Some((name, parsed)) = parse_first_num_named(names)? else {
+        return Ok(());
+    };
+    if parsed == 0 {
+        return Err(anyhow!("{name}=0 is invalid: {flag} must be at least 1"));
+    }
+    *target = Some(parsed);
+    Ok(())
+}
+
 /// Test-only guard that isolates env-var tests from the runner's environment.
 ///
 /// Clears every `SPUR_/SLURM_/SALLOC_/SRUN_/SBATCH_`-prefixed variable on
@@ -174,13 +239,20 @@ where
 /// perturb the resolvers and a panicking test cannot leak state into the next
 /// one. Tests using it must be `#[serial]`.
 #[cfg(test)]
-pub(crate) struct EnvGuard;
+pub(crate) struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl EnvGuard {
     pub(crate) fn new() -> Self {
+        // Held for this guard's whole lifetime (not just `clear`/`set`) so a
+        // reader on another thread waits out the entire test, not just the
+        // moment a var happens to be mutated.
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ENV_LOCK_HELD.with(|h| h.set(true));
         Self::clear();
-        EnvGuard
+        EnvGuard { _lock: lock }
     }
 
     pub(crate) fn set(&self, key: &str, val: &str) {
@@ -208,6 +280,7 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         Self::clear();
+        ENV_LOCK_HELD.with(|h| h.set(false));
     }
 }
 

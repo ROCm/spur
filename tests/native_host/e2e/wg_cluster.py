@@ -250,7 +250,7 @@ class WgMesh:
                     on_index=on,
                     peer_key=self.pubkeys[other],
                     allowed_ip=f"{self.mesh_ip_for(other)}/32",
-                    endpoint=f"{self.nodes[other].host}:{WG_PORT}",
+                    endpoint=f"{self.nodes[other].address}:{WG_PORT}",
                 )
 
     def bring_up(self, indices: list[int]) -> None:
@@ -267,7 +267,7 @@ class WgMesh:
         head = indices[0]
         self.net_init(head)
         head_key = self.pubkeys[head]
-        head_endpoint = f"{self.nodes[head].host}:{WG_PORT}"
+        head_endpoint = f"{self.nodes[head].address}:{WG_PORT}"
         for i in indices[1:]:
             self.net_join(i, head_endpoint, head_key)
             # Head learns the worker (its underlay endpoint) so the tunnel is bidirectional.
@@ -275,7 +275,7 @@ class WgMesh:
                 on_index=head,
                 peer_key=self.pubkeys[i],
                 allowed_ip=f"{self.mesh_ip_for(i)}/32",
-                endpoint=f"{self.nodes[i].host}:{WG_PORT}",
+                endpoint=f"{self.nodes[i].address}:{WG_PORT}",
             )
         # Promote hub-and-spoke to full mesh. The loop above already wired every
         # head↔worker pair (net_join + the head's add-peer), so only the

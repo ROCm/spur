@@ -30,6 +30,8 @@ fn register_gpu_node(cm: &ClusterManager) {
                     link_type: GpuLinkType::PCIe,
                     stable_id,
                     topology: None,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()

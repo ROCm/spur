@@ -158,6 +158,8 @@ Followers forward write RPCs to the leader via a `LeaderProxy` that caches a cha
 
 Read RPCs are forwarded too (consistency with leader state), unless the request is itself already forwarded (prevents bounce loops).
 
+`Ping` is answered locally even on a follower (its hostname/version/etc. describe this controller), but its `capabilities` field is the leader's own list intersected with this controller's: a follower queries the leader (a `Ping` over the same `LeaderProxy` channel, marked already-forwarded so the far side never chases a further leader) and narrows to what both support, failing closed to none if no leader is reachable. This keeps a client from passing its capability check against a follower during a leader-last upgrade and then having the leader silently drop fields it doesn't know yet. The whole probe is bounded by `LEADER_CAPABILITY_PROBE_TIMEOUT_SECS`, channel acquisition included: `get_leader_channel()` has no bound of its own, so without this the `cached_channel` mutex it holds across `Endpoint::connect()` could jam every other forwarded RPC behind a hung dial. The leader `Endpoint` also carries a `connect_timeout` (reusing `LEADER_CAPABILITY_PROBE_TIMEOUT_SECS`, since it's shared with ordinary forwarding and must not exceed the probe's own bound), so a hung dial fails at that same bound instead of hanging past it.
+
 ### Snapshots
 
 `snapshot_state()` serializes the full cluster state to JSON. `restore_from_snapshot()` replaces all in-memory state. Snapshots ship in chunks of `RAFT_SNAPSHOT_MAX_CHUNK_SIZE` (1 MiB raw). The Raft gRPC message limit is 32 MiB (above tonic's 4 MiB default) to accommodate the JSON inflation of chunk payloads.
@@ -226,8 +228,9 @@ ranking/walk operations on large layouts; they do not use elapsed-time limits.
 At 31k lines, this is the largest file. It contains:
 
 - **`apply_operation()`** — the state machine apply: pattern-matches every `WalOperation` variant
-- **Job lifecycle** — submit validation (size check, submission limits, reservation/partition/QOS checks, hook execution), start (resource allocation, placement), complete (per-node reports, all-done detection), cancel, suspend/resume, requeue, preemption, priority changes
+- **Job lifecycle** — submit validation (size check, submission limits, reservation/partition/QOS checks, hook execution, `validate_per_gpu_options()` -- `--cpus-per-gpu`/`--mem-per-gpu` need a GPU request and reject `--cpus-per-gpu` combined with `-c` or `--mem` combined with `--mem-per-cpu`/`--mem-per-gpu`, as a backstop for REST/gRPC clients that bypass spur-cli's own check), start (resource allocation, placement), complete (per-node reports, all-done detection), cancel, suspend/resume, requeue, preemption, priority changes
 - **Node management** — register (with per-node serialization lock), heartbeat (GPU stable_id reconciliation), health checks (exclusive whole-node check jobs, force-drain for starvation, fail-drain on check failure), deregistration
+- **Core layout** — `apply_node_config_policy()` recomputes each node's `CoreLayout` (`spur_core::core_layout`) from its reported topology before clamping schedulable CPUs, so spec/trimmed cores are excluded rather than over-advertised. An unsatisfiable layout keeps the last good one (dropping it would free reserved cores under running jobs) and records `layout_error`. `node_layout_delivery()` hands the agent the current layout plus a `LayoutRevision` (Raft term, boot epoch, sequence) on registration; `record_layout_heartbeat()` asks a node to re-register, at most once per `LAYOUT_REREGISTER_INTERVAL`, only when its held layout's fingerprint has drifted from the computed one. `derive_core_layout()` passes the snapshot-persisted `Node.reserved_picks` to `CoreLayout::compute` and stores the result back (cleared with the layout, kept on error), so every replica and replay computes the same sticky picks. `record_layout_heartbeat()` also stores the `Heartbeat` RPC's `layout_blocked_cpus` field in the leader-local `Node.layout_blocked_cpus`, only when the agent holds the expected fingerprint and only for GPUs the node has; `recompute_core_layout()` clears it whenever the fingerprint changes
 - **Partition CRUD** — create, update (state/limits/preempt-mode/node-set), delete (with WAL suppression of config-seeded names)
 - **Reservation CRUD** — create, update, delete, expiration purging, end-time enforcement
 - **Token management** — create/list/revoke admission tokens
@@ -240,6 +243,8 @@ At 31k lines, this is the largest file. It contains:
 The `propose()` method wraps `raft.client_write()` and returns `ClientResponse`. All Raft proposals go through this single point.
 
 **Launch failure requeue:** On a dispatch failure, the job is requeued with exponential backoff (`launch_backoff_secs`): base * 2^requeue_count, capped at `MAX_LAUNCH_BACKOFF_SECS`. The shift is clamped at 16 to avoid overflow.
+
+A `ResourceExhausted` launch refusal carrying the `spur_proto::LAUNCH_REFUSAL_HEADER` trailer with `REFUSAL_RESERVED_CPUS_HELD` maps to `DispatchError::ReservedCpusHeld`. It cools the node down like `ResourcesUnavailable`, and when every failed node in a dispatch reported it, `backoff_pending_job_after_dispatch_failure(.., spare_requeue_budget: true)` holds the job without charging `max_batch_requeue`.
 
 ## Accounting
 
@@ -287,6 +292,8 @@ Async dispatch of job start/end records. `ClusterManager` calls `notifier.job_st
 Axum-based HTTP server on port 6820, nested under `/api/v1` and `/slurm/v0.0.42` (Slurm compatibility).
 
 **Routes:** `/ping`, `/jobs`, `/job/{job_id}` (GET, DELETE), `/job/submit` (POST), `/nodes`, `/node/{name}`, `/partitions`
+
+**Node fields:** `rest/convert.rs:node_to_json` maps `Node` field by field (not via `NodeInfo`). S:C:T (`sockets`/`cores`/`threads`, `null` when the agent sent no topology) and `gpu_cpus` come from `Node::socket_core_thread()`/`Node::gpu_cpus()`, the same helpers `node_to_proto` uses, so gRPC and REST cannot disagree.
 
 **Auth:** `rest_auth` middleware mirrors the gRPC `auth_middleware` policy. `/ping` is exempt. A forged token is always rejected even under permissive mode.
 
@@ -406,7 +413,7 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 
 ## Common Pitfalls
 
-**Config reload vs restart:** `scontrol reconfigure` re-reads `spur.conf` and atomically swaps `ClusterManager.config`. But several values are captured once at startup and are restart-only: the gRPC listen address, the Raft peer list, the scheduler tick interval, `max_jobs_per_cycle`, the JWT signing key, and the database pool.
+**Config reload vs restart:** `scontrol reconfigure` re-reads `spur.conf` and atomically swaps `ClusterManager.config`. But several values are captured once at startup and are restart-only: the gRPC listen address, the Raft peer list, the scheduler tick interval, `max_jobs_per_cycle`, the JWT signing key, and the database pool. A `[[nodes]]` change to spec cores or `restricted_cores_per_gpu` is also restart-only: `reconfigure` rejects it outright (`core_layout::restart_only_node_changes`) rather than let the leader and followers recompute a node's isolation unevenly before a failover.
 
 **`admission.node_names` is saved only by `scontrol reconfigure`:** Unset (the default) means no name filter: any node that passes the admission mode registers. `reconfigure()` waits for earlier Raft writes, then proposes `NodeInventoryUpdate` only when the file's list differs from the saved one (an unset field equals a cleared list), so older controllers never see the op unless an admin sets the list. The apply deletes unlisted nodes atomically and refuses busy, reserved, or Kubernetes-member nodes; restarts and registrations never save it. Tests live in `cluster/tests/node_inventory.rs`.
 
@@ -444,3 +451,7 @@ Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start 
 **Stepd recovery:** When a step supervisor detects a partial cohort (some nodes missing their supervisor), it reports to the controller. The controller probes all expected nodes, waits a grace period (15s), then fences (requeues) the job. `claim_stepd_recovery_fence()` serializes concurrent reporters under a lock so two past-grace reports cannot both fence the same run.
 
 **Migration advisory lock:** Database migrations use `pg_advisory_xact_lock(0x53505552, 1)` to serialize across concurrent controllers, since migrations now rewrite data and build unique indexes.
+
+**Evicted jobs' steps close inside the apply:** The `NodeStateChange(Down)` and `NodeRemove` apply arms call `complete_job_steps()` for every job `evict_jobs_on_node()` finalized, right there in `apply_operation()`, so every replica closes those steps the same way instead of relying on a leader-only sweep.
+
+**`CompleteJobStep` from a client is cancel-or-PTY only:** `server.rs`'s handler rejects `cancelled: false` for a non-PTY step with `InvalidArgument` — a client only ever cancels a step or reports a PTY step's exit; it never overwrites a running step's eventual result.

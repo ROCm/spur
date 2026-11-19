@@ -570,6 +570,13 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``14``
      - Restart
      - Fairshare usage decay half-life, in days.
+   * - ``def_cpu_per_gpu``
+     - integer
+     - unset
+     - Live
+     - Cluster-wide default CPUs per allocated GPU for a GPU job that sets neither
+       ``-c`` nor ``--cpus-per-gpu`` and whose partition sets no
+       ``def_cpu_per_gpu``. Must be greater than ``0``.
    * - ``default_time_limit_minutes``
      - integer
      - ``0``
@@ -1840,6 +1847,14 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
      - unset
      - Memory a job gets in this partition when it requests none. At most one
        of the three may be set.
+   * - ``def_cpu_per_gpu``
+     - integer
+     - unset
+     - CPUs per allocated GPU for a GPU job that sets neither ``-c`` nor
+       ``--cpus-per-gpu`` — Slurm's ``DefCpuPerGPU``. Resolved when the job is
+       submitted; a job listing several partitions uses it only if they all
+       agree. Falls back to ``[scheduler] def_cpu_per_gpu``. Must be greater
+       than ``0``.
 
 ``max_cpus_per_node`` and the five memory knobs above must be greater than
 ``0``; a ``0`` is a load error. Omit the key for no limit. ``scontrol`` and the
@@ -1877,7 +1892,7 @@ matches, and the first matching entry wins.
    * - ``cpus``
      - integer
      - ``0``
-     - Live
+     - Live; Restart on an entry that sets ``restricted_cores_per_gpu``
      - Cap on schedulable CPUs. The agent autodetects the host; a configured value
        below the detected count wins, a value above it is ignored (config cannot
        invent hardware). ``0`` means unset (use detected). Set this to the core
@@ -1893,7 +1908,7 @@ matches, and the first matching entry wins.
    * - ``reserved_memory_mb``
      - integer
      - ``0``
-     - Live; Restart on an entry that sets spec cores
+     - Live; Restart on an entry that sets spec cores or ``restricted_cores_per_gpu``
      - Memory in MB held back from the detected total for the OS and runtime
        (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
        together with ``memory_mb``; the smaller resulting value wins. Must be less
@@ -1931,6 +1946,33 @@ matches, and the first matching entry wins.
        *on* the specialized cores unless ``SlurmdOffSpec`` is set: Spur defaults
        to keeping them off, since the service that owns the cores (e.g. a WEKA
        client) expects them to itself.
+   * - ``restricted_cores_per_gpu``
+     - integer
+     - ``0``
+     - Restart
+     - Cores reserved next to each GPU for jobs that hold that GPU — Slurm's
+       ``RestrictedCoresPerGPU``. Each GPU, in stable-id order, takes the
+       lowest cores of its affinity that are not spec cores or another GPU's:
+       the ``cores`` of its ``[[devices.gres]]`` entry if set (see
+       ``[devices]`` below), else the cores of its NUMA node. Jobs without GPUs
+       never get these cores. Requires ``[cgroup] enabled = true`` and
+       ``constrain_cores = true`` (a load error otherwise). A node whose GPUs
+       have no affinity, or too few free cores near them, is excluded from
+       scheduling with a ``core-layout:`` reason. ``0`` means unset. Unlike
+       Slurm, GPUs are taken in stable-id order rather than gres.conf order,
+       and a node with the setting but no GPUs keeps all its cores for jobs
+       instead of being marked down. With it, a ``cpus`` cap shrinks the CPUs
+       jobs may use to whole cores and, as with Slurm's configured core count,
+       keeps the lowest cores in socket-major order (the last socket's highest
+       cores go first; spec cores are set aside before counting). Reserved
+       cores per GPU are chosen inside what remains; a cap too small to leave
+       each GPU its reserved cores is a ``core-layout:`` error, and changing
+       ``cpus`` on such an entry needs a restart. Once picked, a GPU keeps its
+       reserved cores when the layout is recomputed (a GPU added, removed or
+       repartitioned, a spec or cap change) when possible: only new GPUs, or
+       GPUs whose cores are no longer near them or usable, take the lowest
+       free cores near them. If keeping every GPU's cores would leave some
+       GPU too few, every GPU is re-picked lowest-first, as before.
    * - ``gres``
      - [string]
      - ``[]``
@@ -1996,12 +2038,15 @@ root, which every job runs under:
 
 * ``cpuset.cpus`` excludes the spec CPUs, so no job can land on them.
 * ``memory.high`` is set to the node's memory minus ``reserved_memory_mb``. It
-  only throttles jobs. ``memory.max`` is lowered to the same value only at a
-  moment when no job runs on the node, because lowering a hard limit below a
-  running job's usage can OOM-kill it. Until then the reservation is pending
-  (throttled, not hard-capped); drain the node once to make it hard right away.
-  A restarted ``spurd`` keeps a ``memory.max`` its predecessor set. Without
-  ``reserved_memory_mb`` the root's memory limits stay at ``max``.
+  only throttles jobs. ``memory.max`` is lowered to the same value once no job
+  that was running when ``spurd`` took up the current layout (or started) is
+  still running, because lowering a hard limit below a running job's usage can
+  OOM-kill it. Until then the reservation is pending (throttled, not
+  hard-capped). For jobs running at a layout change, ``memory.high`` and
+  ``memory.max`` are held at their previous values until those jobs end; a
+  change that leaves jobs more memory applies at once. A restarted ``spurd``
+  keeps a ``memory.max`` its predecessor set. Without ``reserved_memory_mb`` the
+  root's memory limits stay at ``max``.
 
 The service itself still has to pin to the reserved CPUs (e.g. WEKA's own
 ``isolate_cpusets`` / frontend core setting); Spur guarantees only that jobs stay
@@ -2014,14 +2059,35 @@ until its layout is written to the root.
 
 **Showing it.** ``scontrol show node`` reports ``CPUTot`` (all CPUs),
 ``CPUEfctv`` (CPUs left for jobs), ``CoreSpecCount``, ``CPUSpecList`` (the source
-of truth for which CPUs are reserved) and ``MemSpecLimit``.
+of truth for which CPUs are reserved), ``MemSpecLimit`` and, when
+``restricted_cores_per_gpu`` is set, ``RestrictedCoresPerGPU=<cores>(CPUs:<list>)``
+(the ``(CPUs:...)`` part, the union over all GPUs, is omitted when the node has no
+GPUs to reserve cores for). Each GPU's own picks are on its ``GPUDevice=`` line as
+``ReservedCPUs=<list>``, next to ``AffinityCPUs=<list>``, the CPUs they are
+drawn from (its ``[[devices.gres]] cores=``, else its NUMA node's). The
+``CPUTot=`` line carries ``Sockets=``, ``CoresPerSocket=`` and ``ThreadsPerCore=``
+from the node's reported topology.
 
-**Changing it.** ``core_spec_count``, ``cpu_spec_list`` and ``daemons_off_spec``
-are restart-only, and so is ``reserved_memory_mb`` on an entry that sets spec
-cores, because the layout is part of the inventory agent and controller agree on.
+**Changing it.** ``core_spec_count``, ``cpu_spec_list``, ``daemons_off_spec`` and
+``restricted_cores_per_gpu`` are restart-only, and so are ``reserved_memory_mb``
+on an entry that sets spec cores or ``restricted_cores_per_gpu`` and ``cpus`` on
+an entry that sets ``restricted_cores_per_gpu``, because the layout is part of
+the inventory agent and controller agree on.
 ``scontrol reconfigure`` with such a change is rejected as a whole and applies
 nothing, including unrelated live edits in the same file. Change the settings and
 restart the controllers; agents pick up the new layout when they re-register.
+
+A GPU whose new reserved CPUs are still held by jobs that started before the
+change is not used until those jobs end: queued jobs that need it wait with
+pending reason ``Resources``; that wait does not count toward
+``max_batch_requeue``. A launch refused because those CPUs are still held is
+spared up to 5 times before it counts. CPU-only jobs are not affected.
+
+Running jobs keep their CPUs and memory limits until they end: ``spurd`` never
+removes a CPU a running job is bound to from the ``spur`` root, and holds the
+root's ``memory.high`` and ``memory.max`` at their previous values while jobs
+from before the change run. The root narrows to the new layout as those jobs
+end.
 
 **When it cannot be enforced.** A node is excluded from scheduling and shown as
 ``DRAIN`` with a ``core-layout:`` reason (in ``sinfo -R``, ``scontrol show node``
@@ -2038,10 +2104,14 @@ and the REST API) when:
 This is derived state, not an operator drain, and clears once the cause is fixed.
 A restarted ``spurd`` leaves the root exactly as it found it until it has
 received the node's policy; if the controller cannot compute it, ``spurd`` keeps
-the existing limits and refuses new jobs. ``spurd`` resets only root limits it
-wrote itself (a marker in its state directory records them, and is removed if
-the root is gone after a reboot); limits an operator set on the ``spur`` root on
-a node without specialization are left alone.
+the existing limits and refuses new jobs. ``spurd`` resets root limits it wrote
+itself (a marker in its state directory records them, and is removed if the root
+is gone after a reboot), and also resets a root it finds already narrower than
+its current layout allows, even without that marker, as long as the node holds
+a core layout. Limits an operator set on the ``spur`` root on a node without
+specialization — neither spec cores nor ``restricted_cores_per_gpu`` configured —
+are left alone; on a node with either, ``spurd`` owns the root and resets limits
+it did not set itself.
 
 ``[network]``
 -------------
@@ -2525,6 +2595,24 @@ and ``flags`` ([string]). Examples:
    count = 4096
    flags = ["count_only"]
 
+``cores`` lists the cores near a GPU, by core index as in Slurm's
+``gres.conf Cores=`` (for example ``"0-63"``). To set it on a GPU that Spur
+already knows from CDI (auto-detected, or from a CDI spec), give an entry of the
+same ``name`` that names the GPU's render node. The entry is merged into that GPU
+instead of adding a second one: its ``type``, ``cores`` and ``links``, where set,
+replace what discovery or the CDI annotations reported, and the GPU keeps its
+discovered device nodes. A GPU with no ``cores`` uses the CPUs of its NUMA node.
+An entry that names no known render node (for example only ``/dev/dri/cardN``)
+is kept as a device of its own. Each partition of a partitioned GPU has its own
+render node, so give one entry per partition.
+
+.. code-block:: toml
+
+   [[devices.gres]]
+   name = "gpu"
+   file = "/dev/dri/renderD128"
+   cores = "0-15"
+
 Node inventory convergence
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2810,9 +2898,16 @@ statistics.
        not a device node is ignored, so an entry for hardware this node lacks is
        harmless. Read once at agent startup, like the rest of ``[cgroup]``.
 
-A job submitted without ``--mem`` has no memory budget, so ``memory.max``,
-``memory.high``, and ``memory.swap.max`` are all left at the kernel default.
-Constraining swap to zero while memory stayed unlimited would be incoherent.
+A job submitted without ``--mem``, ``--mem-per-cpu``, or ``--mem-per-gpu``
+(and whose partition sets no ``def_mem_per_*`` either) has no memory budget
+of its own, but is not left unbounded: ``memory.max`` and ``memory.high`` are
+both capped at the node's schedulable memory instead, with no
+``allowed_ram_percent`` scaling — matching Slurm's ``task/cgroup`` for a job
+with no ``--mem``. Swap is sized from that ceiling the same way as for an
+explicit budget. Only when the node's own schedulable memory cannot be
+determined either are ``memory.max``, ``memory.high``, and
+``memory.swap.max`` left at the kernel default; constraining swap to zero
+while memory stayed unlimited would be incoherent.
 
 The two ``constrain_*`` memory switches interact, matching Slurm. Constraining
 swap on its own does **not** leave RAM unlimited: the RAM ceiling becomes the
@@ -2985,8 +3080,6 @@ Deliberate differences from Slurm:
   the step keep running; set ``oom_kill_job = false`` for that behaviour.
 - **No CFS quota.** Slurm never writes ``cpu.max``; neither does Spur by default.
   ``cpu_quota`` exists for sites that want one.
-- **No ``--mem`` means unbounded.** Slurm substitutes the node's configured
-  ``RealMemory``; Spur has no such per-node figure and leaves the ceilings unset.
 - **No plugin selectors.** ``CgroupPlugin``, ``TaskPlugin``, and ``ProctrackType``
   have no Spur equivalent — the mechanism is not pluggable.
 - **Raising ``allowed_ram_percent`` above 100 over-commits the node** and can

@@ -77,7 +77,11 @@ Implements `SlurmAgent` gRPC trait. Key RPCs:
 
 - `LaunchJob` -- resolves SpurJob namespace via label lookup, validates
   `target_node` against the recorded allocation, creates a K8s Pod with
-  resource requests (CPU/memory/GPU), env vars (SPUR_* + SLURM_* twins),
+  resource requests (CPU/memory/GPU), env vars (SPUR_* + SLURM_* twins;
+  `SPUR_CPUS_ON_NODE` and the `--cpus-per-gpu`/`--mem-per-gpu` exports come
+  from spur-core's `resolve_cgroup_budget`/per-GPU env helpers, shared with
+  spurd so native and pod jobs size alike; the core layout is not applied to
+  Kubernetes-backed nodes),
   volume mounts (hostPath and PVC), shared memory, security context. For
   multi-node jobs: creates a headless Service for peer DNS discovery
   (`<sanitized-node>.spur-job-<id>.<ns>.svc.cluster.local`).

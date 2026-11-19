@@ -542,6 +542,7 @@ mod tests {
         assert!(StepState::Completed.is_terminal());
         assert!(StepState::Failed.is_terminal());
         assert!(StepState::Cancelled.is_terminal());
+        assert!(StepState::OutOfMemory.is_terminal());
     }
 
     #[test]
@@ -552,6 +553,7 @@ mod tests {
         assert_eq!(StepState::Failed.display(), "FAILED");
         assert_eq!(StepState::Pending.display(), "PENDING");
         assert_eq!(StepState::Cancelled.display(), "CANCELLED");
+        assert_eq!(StepState::OutOfMemory.display(), "OUT_OF_MEMORY");
     }
 
     // ── T50.58: Burst buffer field ────────────────────────────────

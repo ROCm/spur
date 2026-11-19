@@ -563,6 +563,7 @@ impl SlurmAccounting for AccountingService {
                 // recorded through it is treated as an ordinary one.
                 idle_fill: false,
                 time_limit_secs: None,
+                alloc_cpus: None,
             },
         )
         .await
@@ -682,98 +683,7 @@ impl SlurmAccounting for AccountingService {
 
         let jobs = records
             .iter()
-            .map(|r| JobInfo {
-                preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
-                    &r.preemption_usage,
-                )),
-                fabric_bindings: Default::default(),
-                gpu_bindings: Default::default(),
-                job_id: r.job_id,
-                name: r.name.clone(),
-                user: r.user_name.clone(),
-                uid: 0,
-                partition: r.partition.clone(),
-                effective_partition: String::new(),
-                mem_per_tres: String::new(),
-                account: r.account.clone(),
-                state: db_job_state_str_to_proto(&r.state),
-                state_reason: String::new(),
-                submit_time: Some(datetime_to_proto(r.submit_time)),
-                start_time: r.start_time.map(datetime_to_proto),
-                end_time: r.end_time.map(datetime_to_proto),
-                time_limit: r.time_limit_secs.map(|s| prost_types::Duration {
-                    seconds: s,
-                    nanos: 0,
-                }),
-                run_time: match (r.start_time, r.end_time) {
-                    (Some(s), Some(e)) => Some(prost_types::Duration {
-                        seconds: (e - s).num_seconds(),
-                        nanos: 0,
-                    }),
-                    _ => None,
-                },
-                num_nodes: r.num_nodes as u32,
-                num_tasks: r.num_tasks as u32,
-                cpus_per_task: 1,
-                nodelist: r.nodelist.clone(),
-                work_dir: String::new(),
-                command: String::new(),
-                exit_code: r.exit_code,
-                exit_signal: r.exit_signal,
-                derived_exit_code: r.derived_exit_code,
-                stdout_path: String::new(),
-                stderr_path: String::new(),
-                stdin_path: String::new(),
-                resources: None,
-                priority: 0,
-                qos: String::new(),
-                array_job_id: 0,
-                array_task_id: 0,
-                reservation: r.reservation.clone(),
-                comment: String::new(),
-                srun_step_dispatch: false,
-                req_gpus: r.total_gpus as u32,
-                req_gpus_detail: String::new(),
-                preempted_by: r.preempted_by.unwrap_or(0),
-                preempt_mode: r.preempt_mode.clone(),
-                preempt_qos: r.preempt_qos.clone(),
-                idle_fill: r.idle_fill,
-                end_reason: r.reason.clone(),
-                end_reason_detail: r.reason_detail.clone(),
-                ended_by: if show_actors {
-                    r.ended_by.clone()
-                } else {
-                    String::new()
-                },
-                ended_by_uid: r.ended_by_uid.filter(|_| show_actors),
-                // Live-only: a finished row has no current suspend or requeue.
-                suspended_by: String::new(),
-                last_requeue: String::new(),
-                last_requeue_by: String::new(),
-                preempt_time: None,
-                // Kept exhaustive so a new JobInfo field forces a decision here;
-                // the accounting store has no requested-placement columns.
-                req_nodelist: String::new(),
-                exc_nodelist: String::new(),
-                features: String::new(),
-                dependency: Vec::new(),
-                submit_line: String::new(),
-                req_tres: String::new(),
-                min_cpus_node: 0,
-                min_memory_node_mb: 0,
-                min_memory_is_per_cpu: false,
-                eligible_time: None,
-                accrue_time: None,
-                last_sched_eval: None,
-                deadline: None,
-                time_min: None,
-                requeue: false,
-                restarts: 0,
-                batch_flag: false,
-                exclusive: false,
-                planned_start_time: None,
-                sched_nodelist: String::new(),
-            })
+            .map(|r| history_job_info(r, show_actors))
             .collect();
 
         Ok(Response::new(GetJobHistoryResponse { jobs }))
@@ -1802,6 +1712,104 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
     }
 }
 
+/// One accounting-history row as the `JobInfo` sacct reads.
+fn history_job_info(r: &db::JobRecord, show_actors: bool) -> JobInfo {
+    JobInfo {
+        preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
+            &r.preemption_usage,
+        )),
+        fabric_bindings: Default::default(),
+        gpu_bindings: Default::default(),
+        job_id: r.job_id,
+        name: r.name.clone(),
+        user: r.user_name.clone(),
+        uid: 0,
+        partition: r.partition.clone(),
+        effective_partition: String::new(),
+        mem_per_tres: String::new(),
+        cpus_per_gpu: None,
+        alloc_cpus: r.alloc_cpus,
+        account: r.account.clone(),
+        state: db_job_state_str_to_proto(&r.state),
+        state_reason: String::new(),
+        submit_time: Some(datetime_to_proto(r.submit_time)),
+        start_time: r.start_time.map(datetime_to_proto),
+        end_time: r.end_time.map(datetime_to_proto),
+        time_limit: r.time_limit_secs.map(|s| prost_types::Duration {
+            seconds: s,
+            nanos: 0,
+        }),
+        run_time: match (r.start_time, r.end_time) {
+            (Some(s), Some(e)) => Some(prost_types::Duration {
+                seconds: (e - s).num_seconds(),
+                nanos: 0,
+            }),
+            _ => None,
+        },
+        num_nodes: r.num_nodes as u32,
+        num_tasks: r.num_tasks as u32,
+        cpus_per_task: r.cpus_per_task,
+        nodelist: r.nodelist.clone(),
+        work_dir: String::new(),
+        command: String::new(),
+        exit_code: r.exit_code,
+        exit_signal: r.exit_signal,
+        derived_exit_code: r.derived_exit_code,
+        stdout_path: String::new(),
+        stderr_path: String::new(),
+        stdin_path: String::new(),
+        resources: None,
+        priority: 0,
+        qos: String::new(),
+        array_job_id: 0,
+        array_task_id: 0,
+        reservation: r.reservation.clone(),
+        comment: String::new(),
+        srun_step_dispatch: false,
+        req_gpus: r.total_gpus as u32,
+        req_gpus_detail: String::new(),
+        preempted_by: r.preempted_by.unwrap_or(0),
+        preempt_mode: r.preempt_mode.clone(),
+        preempt_qos: r.preempt_qos.clone(),
+        idle_fill: r.idle_fill,
+        end_reason: r.reason.clone(),
+        end_reason_detail: r.reason_detail.clone(),
+        ended_by: if show_actors {
+            r.ended_by.clone()
+        } else {
+            String::new()
+        },
+        ended_by_uid: r.ended_by_uid.filter(|_| show_actors),
+        // Live-only: a finished row has no current suspend or requeue.
+        suspended_by: String::new(),
+        last_requeue: String::new(),
+        last_requeue_by: String::new(),
+        preempt_time: None,
+        // Kept exhaustive so a new JobInfo field forces a decision here;
+        // the accounting store has no requested-placement columns.
+        req_nodelist: String::new(),
+        exc_nodelist: String::new(),
+        features: String::new(),
+        dependency: Vec::new(),
+        submit_line: String::new(),
+        req_tres: String::new(),
+        min_cpus_node: 0,
+        min_memory_node_mb: 0,
+        min_memory_is_per_cpu: false,
+        eligible_time: None,
+        accrue_time: None,
+        last_sched_eval: None,
+        deadline: None,
+        time_min: None,
+        requeue: false,
+        restarts: 0,
+        batch_flag: false,
+        exclusive: false,
+        planned_start_time: None,
+        sched_nodelist: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2392,6 +2400,51 @@ mod tests {
         admin.extensions_mut().insert(identity("carol", true));
         let err = service.list_accounts(admin).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    fn history_record(alloc_cpus: Option<u64>) -> db::JobRecord {
+        db::JobRecord {
+            preemption_usage: Default::default(),
+            job_id: 7,
+            name: "per-gpu".into(),
+            user_name: "alice".into(),
+            account: "ml".into(),
+            partition: "gpu".into(),
+            state: "COMPLETED".into(),
+            exit_code: 0,
+            exit_signal: 0,
+            derived_exit_code: 0,
+            num_nodes: 1,
+            num_tasks: 2,
+            cpus_per_task: 3,
+            alloc_cpus,
+            nodelist: "n1".into(),
+            submit_time: Utc::now(),
+            start_time: None,
+            end_time: None,
+            reservation: String::new(),
+            preempted_by: None,
+            preempt_mode: String::new(),
+            preempt_qos: String::new(),
+            idle_fill: false,
+            total_gpus: 2,
+            time_limit_secs: None,
+            reason: String::new(),
+            reason_detail: String::new(),
+            ended_by: String::new(),
+            ended_by_uid: None,
+        }
+    }
+
+    #[test]
+    fn job_history_carries_the_recorded_cpus() {
+        let info = history_job_info(&history_record(Some(16)), false);
+        assert_eq!(info.alloc_cpus, Some(16));
+        assert_eq!(info.cpus_per_task, 3);
+
+        let legacy = history_job_info(&history_record(None), false);
+        assert_eq!(legacy.alloc_cpus, None);
+        assert_eq!(legacy.num_tasks * legacy.cpus_per_task, 6);
     }
 
     fn history_for(user: &str) -> Request<GetJobHistoryRequest> {

@@ -103,9 +103,15 @@ and countable pools (count-only, no device paths).
 `populate()` merges CDI cache + GRES cache:
 
 1. CDI entries first (sorted by PCI BDF, then by primary device path)
-2. GRES injectable entries
+2. GRES injectable entries: each is first tried against the discovered CDI
+   entries (`merge_into_discovered()`) by its `renderD*` node; a match
+   merges the configured `type`/`cores`/`links` onto the discovered GPU
+   (device nodes stay discovery's) instead of becoming a second device, so
+   `[[devices.gres]] cores=` can set a GPU's reserved-core affinity without
+   disabling auto-detection. Unmatched entries remain separate candidates.
 3. GRES countable pools
-4. Dedup by exact device-node path match (CDI wins)
+4. Dedup by exact device-node path match, for whatever GRES entries did not
+   merge (CDI wins)
 5. Assign sequential device_ids per gres_name
 6. Backfill stable_id from device_id when annotation absent
 

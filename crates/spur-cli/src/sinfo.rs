@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::{GetNodesRequest, GetPartitionsRequest, NodeInfo, PartitionInfo};
+use spur_proto::proto::{
+    GetNodesRequest, GetPartitionsRequest, NodeInfo, PartitionInfo, SocketCoreThread,
+};
 
 use crate::format_engine;
 
@@ -454,6 +456,7 @@ fn resolve_node_field(
             }
         }
         'l' => "UNLIMITED".into(), // Would need partition context
+        'z' => socket_core_thread_field(&[node]),
         _ => "?".into(),
     }
 }
@@ -488,7 +491,37 @@ fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) 
                     .join(","),
             )
         }
+        'z' => Some(socket_core_thread_field(nodes)),
         _ => None,
+    }
+}
+
+/// `%z`: Slurm's S:C:T. Simplified for Spur: prints the shared value only when
+/// every node in the row reports the same S:C:T; a single unknown node, or a
+/// mismatch across the row, falls back to `N/A` rather than Slurm's min/max
+/// `+` grouping.
+fn socket_core_thread_field(nodes: &[&NodeInfo]) -> String {
+    let mut all: Vec<&SocketCoreThread> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match node.socket_core_thread.as_ref() {
+            Some(sct) => all.push(sct),
+            None => return "N/A".into(),
+        }
+    }
+    let Some(first) = all.first() else {
+        return "N/A".into();
+    };
+    if all.iter().all(|s| {
+        s.sockets == first.sockets
+            && s.cores_per_socket == first.cores_per_socket
+            && s.threads_per_core == first.threads_per_core
+    }) {
+        format!(
+            "{}:{}:{}",
+            first.sockets, first.cores_per_socket, first.threads_per_core
+        )
+    } else {
+        "N/A".into()
     }
 }
 
@@ -1487,6 +1520,63 @@ mod tests {
         let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
         assert_eq!(lines.len(), 1, "orphan node still gets one row");
         assert!(lines[0].contains("orphan"));
+    }
+
+    // --- %z (S:C:T) tests ---
+
+    fn with_sct(name: &str, sockets: u32, cores: u32, threads: u32) -> NodeInfo {
+        NodeInfo {
+            socket_core_thread: Some(pb::SocketCoreThread {
+                sockets,
+                cores_per_socket: cores,
+                threads_per_core: threads,
+            }),
+            ..make_node(name, NodeState::NodeIdle, "batch")
+        }
+    }
+
+    #[test]
+    fn percent_z_shows_s_c_t_for_a_known_node() {
+        let fields = format_engine::parse_format("%N %z", &format_engine::sinfo_header);
+        assert!(format_engine::format_header(&fields).contains("S:C:T"));
+        let nodes = vec![with_sct("n1", 2, 64, 2)];
+        let lines = render_sinfo_output(&fields, &[make_partition("batch", true)], &nodes, true);
+        assert_eq!(lines, vec!["n1 2:64:2"]);
+    }
+
+    #[test]
+    fn percent_z_shows_na_for_an_unknown_node() {
+        let fields = format_engine::parse_format("%N %z", &format_engine::sinfo_header);
+        let nodes = vec![make_node("n2", NodeState::NodeIdle, "batch")];
+        let lines = render_sinfo_output(&fields, &[make_partition("batch", true)], &nodes, true);
+        assert_eq!(lines, vec!["n2 N/A"]);
+    }
+
+    #[test]
+    fn percent_z_grouped_row_shows_value_when_all_nodes_agree() {
+        let fields = format_engine::parse_format("%P %z", &format_engine::sinfo_header);
+        let nodes = vec![with_sct("n1", 2, 64, 2), with_sct("n2", 2, 64, 2)];
+        let lines = render_sinfo_output(&fields, &[make_partition("batch", true)], &nodes, false);
+        assert_eq!(lines, vec!["batch* 2:64:2"]);
+    }
+
+    #[test]
+    fn percent_z_grouped_row_shows_na_when_nodes_disagree() {
+        let fields = format_engine::parse_format("%P %z", &format_engine::sinfo_header);
+        let nodes = vec![with_sct("n1", 2, 64, 2), with_sct("n2", 1, 64, 2)];
+        let lines = render_sinfo_output(&fields, &[make_partition("batch", true)], &nodes, false);
+        assert_eq!(lines, vec!["batch* N/A"]);
+    }
+
+    #[test]
+    fn percent_z_grouped_row_shows_na_when_one_node_is_unknown() {
+        let fields = format_engine::parse_format("%P %z", &format_engine::sinfo_header);
+        let nodes = vec![
+            with_sct("n1", 2, 64, 2),
+            make_node("n2", NodeState::NodeIdle, "batch"),
+        ];
+        let lines = render_sinfo_output(&fields, &[make_partition("batch", true)], &nodes, false);
+        assert_eq!(lines, vec!["batch* N/A"]);
     }
 
     // --- list-reasons (-R) tests ---

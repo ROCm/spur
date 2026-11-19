@@ -35,7 +35,7 @@ fn wall_breach(spec: &JobSpec, max_wall: u32) -> bool {
 
 /// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
 fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
-    let cpus = (spec.num_tasks * spec.cpus_per_task) as u64;
+    let cpus = spec.total_cpus();
     let nodes = spec.num_nodes as u64;
     let mem = effective_memory_mb(spec, spec.num_nodes);
     let gpus = effective_gpus(spec, spec.num_nodes);
@@ -376,6 +376,26 @@ mod tests {
         assert_eq!(
             result,
             AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob)
+        );
+    }
+
+    #[test]
+    fn a_per_gpu_job_is_capped_on_its_gpu_sized_cpus() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Cpu, 32);
+        let limits = AccountLimits {
+            max_tres_per_job: Some(tres),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.num_tasks = 1;
+        job.spec.cpus_per_gpu = Some(16);
+        job.spec.gres = vec!["gpu:4".into()];
+        assert_eq!(
+            check_account_limits(&job, &limits, 0, 0, &TresRecord::new()),
+            AccountCheckResult::Blocked(PendingReason::AssocMaxCpuPerJobLimit),
+            "16 CPUs x 4 GPUs = 64 > 32"
         );
     }
 

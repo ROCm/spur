@@ -818,6 +818,10 @@ pub struct SchedulerConfig {
     /// Valid: "none" (default), "daily", "weekly", "monthly", "quarterly", "yearly".
     #[serde(default)]
     pub usage_reset_period: UsageResetPeriod,
+    /// CPUs per GPU for GPU jobs that set neither `-c` nor `--cpus-per-gpu`,
+    /// when their partition sets none.
+    #[serde(default)]
+    pub def_cpu_per_gpu: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1015,6 +1019,7 @@ impl Default for SchedulerConfig {
             idle_fill_max_cluster_fraction: 0.0,
             tres_billing_weights: String::new(),
             usage_reset_period: UsageResetPeriod::None,
+            def_cpu_per_gpu: None,
         }
     }
 }
@@ -1344,6 +1349,9 @@ pub struct PartitionConfig {
     pub def_mem_per_cpu: Option<u64>,
     #[serde(default)]
     pub def_mem_per_gpu: Option<u64>,
+    /// CPUs per GPU for GPU jobs that set neither `-c` nor `--cpus-per-gpu`.
+    #[serde(default)]
+    pub def_cpu_per_gpu: Option<u32>,
 }
 
 impl PartitionConfig {
@@ -1390,6 +1398,7 @@ impl PartitionConfig {
             ("def_mem_per_node", self.def_mem_per_node),
             ("def_mem_per_cpu", self.def_mem_per_cpu),
             ("def_mem_per_gpu", self.def_mem_per_gpu),
+            ("def_cpu_per_gpu", self.def_cpu_per_gpu.map(u64::from)),
         ];
         let Some((knob, _)) = knobs.into_iter().find(|(_, value)| *value == Some(0)) else {
             return Ok(());
@@ -1443,6 +1452,10 @@ pub struct NodeConfig {
     /// Unlike Slurm's `CpuSpecList`, these are OS IDs, not abstract IDs.
     #[serde(default)]
     pub cpu_spec_list: Option<String>,
+    /// Cores reserved next to each GPU for jobs holding that GPU (Slurm
+    /// `RestrictedCoresPerGPU`). Restart-only, like the spec settings.
+    #[serde(default)]
+    pub restricted_cores_per_gpu: Option<u32>,
     /// Keep spurd's threads off the spec CPUs (Slurm `SlurmdOffSpec`, inverted
     /// default). Supervisors inherit the mask in effect when they are started.
     #[serde(default = "default_true_fn")]
@@ -2409,6 +2422,16 @@ pub const DEFAULT_CONTROLLER_RPC_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_CONTROLLER_FAILOVER_COOLDOWN_SECS: u64 = 60;
 pub const DEFAULT_NATIVE_MINT_TIMEOUT_SECS: u64 = 5;
 
+/// Bounds spur-cli's `Ping` used only to check a capability before refusing a request — not
+/// worth the user's full patience if the controller is wedged.
+pub const CAPABILITY_PING_TIMEOUT_SECS: u64 = 5;
+
+/// Bounds a follower controller's internal `Ping` to the leader for a capability lookup only.
+pub const LEADER_CAPABILITY_PROBE_TIMEOUT_SECS: u64 = 2;
+
+// The follower must answer (even with an empty list) before the CLI's own ping above gives up.
+const _: () = assert!(LEADER_CAPABILITY_PROBE_TIMEOUT_SECS < CAPABILITY_PING_TIMEOUT_SECS);
+
 /// A fast local Unix-socket round trip, not a network RPC — tighter than
 /// `MAX_LAUNCH_BACKOFF_SECS` on purpose so a misconfigured value can't reopen the
 /// worker-thread-starvation hang this timeout exists to close.
@@ -2494,14 +2517,46 @@ pub struct CgroupLimits {
 impl CgroupConfig {
     /// `(memory.max, memory.high, memory.swap.max)` as Slurm's cgroup/v2 plugin
     /// computes them. Swap-without-RAM: the RAM ceiling becomes the RAM+swap total.
-    fn memory_limits(&self, memory_mb: u64) -> (Option<u64>, Option<u64>, Option<u64>) {
-        // A job with no memory budget gets no ceiling at all. Bounding swap on
-        // its own here would forbid swap while RAM stayed unlimited.
-        if memory_mb == 0 || !(self.constrain_ram_space || self.constrain_swap) {
+    ///
+    /// A job with no budget of its own (`memory_mb == 0`) but a known node
+    /// ceiling (`ceiling_mb > 0`) is capped at the ceiling instead: `memory.max`
+    /// and `memory.high` both land on it, with no `AllowedRAMSpace%` scaling —
+    /// matching Slurm's `task_cgroup_memory.c` for a job with no `--mem`. Swap
+    /// is still sized from it like an explicit budget.
+    fn memory_limits(
+        &self,
+        memory_mb: u64,
+        ceiling_mb: u64,
+    ) -> (Option<u64>, Option<u64>, Option<u64>) {
+        if !(self.constrain_ram_space || self.constrain_swap) {
             return (None, None, None);
         }
-        let memory_bytes = memory_mb.saturating_mul(1024 * 1024);
         let min_ram_bytes = self.min_ram_mb.saturating_mul(1024 * 1024);
+
+        if memory_mb == 0 {
+            // No budget and no known ceiling: leave the job unbounded, as today.
+            if ceiling_mb == 0 {
+                return (None, None, None);
+            }
+            let ceiling_bytes = ceiling_mb.saturating_mul(1024 * 1024);
+            let hard = ceiling_bytes.max(min_ram_bytes);
+            let combined = hard.saturating_add(
+                ceiling_bytes.saturating_mul(self.allowed_swap_percent as u64) / 100,
+            );
+            let memory_max = if self.constrain_ram_space {
+                hard
+            } else {
+                combined
+            };
+            let swap_max = if self.constrain_swap {
+                Some(combined.saturating_sub(memory_max))
+            } else {
+                None
+            };
+            return (Some(memory_max), Some(hard), swap_max);
+        }
+
+        let memory_bytes = memory_mb.saturating_mul(1024 * 1024);
 
         // The percentage only exists to build the ceilings from, so it reverts
         // to 100% when RAM itself is unconstrained.
@@ -2531,14 +2586,23 @@ impl CgroupConfig {
         (Some(memory_max), Some(soft), swap_max)
     }
 
-    /// Limits for a job budgeted `cpus`/`memory_mb` on `cpu_ids`. `None` when
-    /// disabled — the only place `enabled` is read, so it cannot be half-applied.
-    pub fn limits_for(&self, cpus: u32, memory_mb: u64, cpu_ids: &[u32]) -> Option<CgroupLimits> {
+    /// Limits for a job budgeted `cpus`/`memory_mb` on `cpu_ids`. `ceiling_mb` is
+    /// the node's schedulable memory, applied only when `memory_mb` is 0 (no
+    /// request of its own); 0 means no ceiling is known. `None` when disabled —
+    /// the only place `enabled` is read, so it cannot be half-applied.
+    pub fn limits_for(
+        &self,
+        cpus: u32,
+        memory_mb: u64,
+        ceiling_mb: u64,
+        cpu_ids: &[u32],
+    ) -> Option<CgroupLimits> {
         if !self.enabled {
             return None;
         }
         let cpus = cpus.max(1);
-        let (memory_max_bytes, memory_high_bytes, swap_max_bytes) = self.memory_limits(memory_mb);
+        let (memory_max_bytes, memory_high_bytes, swap_max_bytes) =
+            self.memory_limits(memory_mb, ceiling_mb);
         let cpu_quota_us = if self.cpu_quota {
             Some(cpus as u64 * CPU_PERIOD_US)
         } else {
@@ -2713,6 +2777,12 @@ impl SlurmConfig {
             })?;
             pc.validate_cpu_cap_alias()?;
             pc.validate_nonzero_limit_knobs()?;
+        }
+        if self.scheduler.def_cpu_per_gpu == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.def_cpu_per_gpu".into(),
+                value: "0 (omit the key for no default)".into(),
+            });
         }
         for partition in self.build_partitions() {
             partition
@@ -3188,6 +3258,16 @@ impl SlurmConfig {
                         .into(),
                 });
             }
+            // A job's own cpuset is what keeps it off other GPUs' reserved
+            // cores; without it the reservation would be accounting only.
+            if nc.restricted_cores_per_gpu.is_some_and(|r| r > 0)
+                && !(self.cgroup.enabled && self.cgroup.constrain_cores)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.restricted_cores_per_gpu", nc.names),
+                    value: "requires [cgroup] enabled = true and constrain_cores = true".into(),
+                });
+            }
             if let Some(list) = &nc.cpu_spec_list {
                 if let Err(e) = crate::cpu_topology::parse_cpu_list(list) {
                     return Err(ConfigError::InvalidValue {
@@ -3238,6 +3318,7 @@ impl SlurmConfig {
                 def_mem_per_node: pc.def_mem_per_node,
                 def_mem_per_cpu: pc.def_mem_per_cpu,
                 def_mem_per_gpu: pc.def_mem_per_gpu,
+                def_cpu_per_gpu: pc.def_cpu_per_gpu,
                 ..Default::default()
             })
             .collect()
@@ -3630,6 +3711,30 @@ node_names = ["n[01-02]", "n01", "service-a"]
     }
 
     #[test]
+    fn restricted_cores_per_gpu_requires_constrained_cgroups() {
+        let node = "[[nodes]]\nnames = \"n1\"\nrestricted_cores_per_gpu = 16\n";
+        for cgroup in ["constrain_cores = false", "enabled = false"] {
+            let error = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[cgroup]\n{cgroup}\n{node}"
+            ))
+            .unwrap_err();
+            let msg = error.to_string();
+            assert!(msg.contains("restricted_cores_per_gpu"), "{cgroup}: {msg}");
+        }
+        let config =
+            SlurmConfig::load_from_str(&format!("cluster_name = \"test\"\n{node}")).unwrap();
+        assert_eq!(config.nodes[0].restricted_cores_per_gpu, Some(16));
+    }
+
+    #[test]
+    fn spec_only_node_accepts_unconstrained_cores() {
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[cgroup]\nconstrain_cores = false\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn spec_cores_pass_with_cgroup_enabled() {
         let config = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[cgroup]\nenabled = true\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n",
@@ -3766,7 +3871,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
         // AllowedRAMSpace=100: Slurm clamps the soft limit to the hard one, so
         // both land on the allocation.
         let l = CgroupConfig::default()
-            .limits_for(4, 1024, &[])
+            .limits_for(4, 1024, 0, &[])
             .expect("enabled");
         assert_eq!(l.memory_max_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(l.memory_high_bytes, l.memory_max_bytes);
@@ -3779,7 +3884,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             allowed_ram_percent: 150,
             ..CgroupConfig::default()
         };
-        let l = c.limits_for(4, 1024, &[]).expect("enabled");
+        let l = c.limits_for(4, 1024, 0, &[]).expect("enabled");
         assert_eq!(l.memory_high_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(l.memory_max_bytes, Some(1536 * 1024 * 1024));
     }
@@ -3792,7 +3897,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             allowed_ram_percent: 50,
             ..CgroupConfig::default()
         };
-        let l = c.limits_for(4, 1024, &[]).expect("enabled");
+        let l = c.limits_for(4, 1024, 0, &[]).expect("enabled");
         assert_eq!(l.memory_max_bytes, Some(512 * 1024 * 1024));
         assert_eq!(l.memory_high_bytes, l.memory_max_bytes);
     }
@@ -3805,7 +3910,10 @@ node_names = ["n[01-02]", "n01", "service-a"]
             constrain_swap: true,
             ..CgroupConfig::default()
         };
-        assert_eq!(c.limits_for(4, 1024, &[]).unwrap().swap_max_bytes, Some(0));
+        assert_eq!(
+            c.limits_for(4, 1024, 0, &[]).unwrap().swap_max_bytes,
+            Some(0)
+        );
 
         let c50 = CgroupConfig {
             constrain_swap: true,
@@ -3813,7 +3921,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             ..CgroupConfig::default()
         };
         assert_eq!(
-            c50.limits_for(4, 1024, &[]).unwrap().swap_max_bytes,
+            c50.limits_for(4, 1024, 0, &[]).unwrap().swap_max_bytes,
             Some(512 * 1024 * 1024)
         );
 
@@ -3821,7 +3929,10 @@ node_names = ["n[01-02]", "n01", "service-a"]
             constrain_swap: false,
             ..CgroupConfig::default()
         };
-        assert_eq!(off.limits_for(4, 1024, &[]).unwrap().swap_max_bytes, None);
+        assert_eq!(
+            off.limits_for(4, 1024, 0, &[]).unwrap().swap_max_bytes,
+            None
+        );
     }
 
     #[test]
@@ -3834,7 +3945,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             ..CgroupConfig::default()
         };
         assert_eq!(
-            c.limits_for(4, 1024, &[]).unwrap().swap_max_bytes,
+            c.limits_for(4, 1024, 0, &[]).unwrap().swap_max_bytes,
             Some(256 * 1024 * 1024)
         );
     }
@@ -3863,7 +3974,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
                 allowed_swap_percent: 25,
                 ..CgroupConfig::default()
             };
-            let l = c.limits_for(1, 1024, &[]).expect("enabled");
+            let l = c.limits_for(1, 1024, 0, &[]).expect("enabled");
             assert_eq!(
                 (l.memory_max_bytes, l.memory_high_bytes, l.swap_max_bytes),
                 (want_max, want_high, want_swap),
@@ -3883,18 +3994,18 @@ node_names = ["n[01-02]", "n01", "service-a"]
             allowed_swap_percent: 50,
             ..CgroupConfig::default()
         };
-        let l = c.limits_for(1, 1024, &[]).expect("enabled");
+        let l = c.limits_for(1, 1024, 0, &[]).expect("enabled");
         assert_eq!(l.memory_max_bytes, Some(1536 * 1024 * 1024));
         assert_eq!(l.memory_high_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(l.swap_max_bytes, Some(0));
     }
 
     #[test]
-    fn unbounded_memory_leaves_swap_unbounded() {
+    fn unbounded_memory_leaves_swap_unbounded_with_no_ceiling() {
         // Writing memory.swap.max = 0 for a job with no memory limit would
         // forbid swap while RAM stays unlimited — a pair Slurm never emits.
         let l = CgroupConfig::default()
-            .limits_for(4, 0, &[])
+            .limits_for(4, 0, 0, &[])
             .expect("enabled");
         assert_eq!(l.memory_max_bytes, None);
         assert_eq!(l.memory_high_bytes, None);
@@ -3902,9 +4013,71 @@ node_names = ["n[01-02]", "n01", "service-a"]
     }
 
     #[test]
+    fn a_job_with_no_budget_is_capped_at_the_node_ceiling() {
+        // No AllowedRAMSpace% scaling: memory.max and memory.high both land on
+        // the ceiling itself, unlike an explicit budget's hard/soft split.
+        let l = CgroupConfig {
+            allowed_ram_percent: 50,
+            ..CgroupConfig::default()
+        }
+        .limits_for(4, 0, 8192, &[])
+        .expect("enabled");
+        let ceiling_bytes = 8192 * 1024 * 1024;
+        assert_eq!(l.memory_max_bytes, Some(ceiling_bytes));
+        assert_eq!(l.memory_high_bytes, Some(ceiling_bytes));
+        assert_eq!(l.swap_max_bytes, None);
+    }
+
+    #[test]
+    fn a_job_with_no_budget_sizes_swap_from_the_ceiling() {
+        let c = CgroupConfig {
+            constrain_swap: true,
+            allowed_swap_percent: 25,
+            ..CgroupConfig::default()
+        };
+        let l = c.limits_for(4, 0, 8192, &[]).expect("enabled");
+        let ceiling_bytes = 8192 * 1024 * 1024;
+        assert_eq!(l.memory_max_bytes, Some(ceiling_bytes));
+        assert_eq!(l.swap_max_bytes, Some(ceiling_bytes / 4));
+    }
+
+    #[test]
+    fn a_ceiling_floors_at_min_ram_mb_like_an_explicit_budget() {
+        let l = CgroupConfig::default()
+            .limits_for(1, 0, 8, &[])
+            .expect("enabled");
+        assert_eq!(l.memory_max_bytes, Some(30 * 1024 * 1024));
+        assert_eq!(l.memory_high_bytes, Some(30 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_ceiling_is_ignored_when_neither_ram_nor_swap_is_constrained() {
+        let off = CgroupConfig {
+            constrain_ram_space: false,
+            constrain_swap: false,
+            ..CgroupConfig::default()
+        };
+        let l = off.limits_for(4, 0, 8192, &[]).expect("enabled");
+        assert_eq!(l.memory_max_bytes, None);
+        assert_eq!(l.memory_high_bytes, None);
+        assert_eq!(l.swap_max_bytes, None);
+    }
+
+    #[test]
+    fn an_explicit_budget_ignores_the_ceiling() {
+        let with_ceiling = CgroupConfig::default()
+            .limits_for(4, 1024, 8192, &[])
+            .expect("enabled");
+        let without_ceiling = CgroupConfig::default()
+            .limits_for(4, 1024, 0, &[])
+            .expect("enabled");
+        assert_eq!(with_ceiling, without_ceiling);
+    }
+
+    #[test]
     fn memory_limits_floor_at_min_ram_mb() {
         let l = CgroupConfig::default()
-            .limits_for(1, 8, &[])
+            .limits_for(1, 8, 0, &[])
             .expect("enabled");
         assert_eq!(l.memory_max_bytes, Some(30 * 1024 * 1024));
         assert_eq!(l.memory_high_bytes, Some(30 * 1024 * 1024));
@@ -3914,7 +4087,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
     fn cpu_quota_is_opt_in() {
         assert_eq!(
             CgroupConfig::default()
-                .limits_for(4, 0, &[])
+                .limits_for(4, 0, 0, &[])
                 .unwrap()
                 .cpu_quota_us,
             None
@@ -3923,13 +4096,16 @@ node_names = ["n[01-02]", "n01", "service-a"]
             cpu_quota: true,
             ..CgroupConfig::default()
         };
-        assert_eq!(q.limits_for(4, 0, &[]).unwrap().cpu_quota_us, Some(400_000));
+        assert_eq!(
+            q.limits_for(4, 0, 0, &[]).unwrap().cpu_quota_us,
+            Some(400_000)
+        );
     }
 
     #[test]
     fn core_pinning_can_be_turned_off() {
         let on = CgroupConfig::default()
-            .limits_for(2, 0, &[0, 1])
+            .limits_for(2, 0, 0, &[0, 1])
             .expect("enabled");
         assert_eq!(on.cpuset_cpus, vec![0, 1]);
 
@@ -3938,7 +4114,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             ..CgroupConfig::default()
         };
         assert!(off
-            .limits_for(2, 0, &[0, 1])
+            .limits_for(2, 0, 0, &[0, 1])
             .unwrap()
             .cpuset_cpus
             .is_empty());
@@ -3950,7 +4126,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
             enabled: false,
             ..CgroupConfig::default()
         };
-        assert!(off.limits_for(4, 1024, &[0, 1]).is_none());
+        assert!(off.limits_for(4, 1024, 0, &[0, 1]).is_none());
     }
 
     #[test]
@@ -4044,7 +4220,7 @@ node_names = ["n[01-02]", "n01", "service-a"]
         assert_eq!(cfg.cgroup.allowed_swap_percent, 200);
 
         // 200% of a 1 GiB grant is 2 GiB of swap on top of the RAM ceiling.
-        let l = cfg.cgroup.limits_for(1, 1024, &[]).expect("enabled");
+        let l = cfg.cgroup.limits_for(1, 1024, 0, &[]).expect("enabled");
         assert_eq!(l.memory_max_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(l.swap_max_bytes, Some(2048 * 1024 * 1024));
     }
@@ -6447,6 +6623,36 @@ usage_reset_period = "biweekly"
         assert_eq!(parts[0].max_mem_per_cpu, Some(2048));
         assert_eq!(parts[0].def_mem_per_gpu, Some(8192));
         assert_eq!(parts[0].max_mem_per_node, None);
+    }
+
+    #[test]
+    fn def_cpu_per_gpu_is_carried_to_the_runtime_partition() {
+        let parts = load_partition("def_cpu_per_gpu = 16\ndef_mem_per_gpu = 8192\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(parts[0].def_cpu_per_gpu, Some(16));
+        assert_eq!(
+            parts[0].def_mem_per_gpu,
+            Some(8192),
+            "not in the def_mem group"
+        );
+        let err = rejected("def_cpu_per_gpu = 0\n");
+        assert!(err.contains("def_cpu_per_gpu"), "{err}");
+    }
+
+    #[test]
+    fn scheduler_def_cpu_per_gpu_loads_and_rejects_zero() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ndef_cpu_per_gpu = 8\n",
+        )
+        .unwrap();
+        assert_eq!(config.scheduler.def_cpu_per_gpu, Some(8));
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ndef_cpu_per_gpu = 0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("def_cpu_per_gpu"), "{err}");
     }
 
     #[test]

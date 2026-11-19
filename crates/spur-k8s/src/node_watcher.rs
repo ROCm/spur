@@ -297,6 +297,8 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
             // index is the only stable identity this synthetic inventory has.
             topology: None,
             stable_id: i as u64,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         })
         .collect();
 
@@ -731,6 +733,8 @@ mod tests {
                 link_type: 1,
                 topology: None,
                 stable_id: i as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect();
         ResourceSet {

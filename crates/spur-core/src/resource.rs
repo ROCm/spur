@@ -29,6 +29,12 @@ pub struct GpuResource {
     pub stable_id: u64,
     #[serde(default)]
     pub topology: Option<DeviceTopology>,
+    #[serde(default)]
+    pub numa_node: Option<u32>,
+    /// OS CPU IDs near the GPU, from `[[devices.gres]] cores=`; empty means
+    /// the CPUs of `numa_node`.
+    #[serde(default)]
+    pub affinity_cpus: Vec<u32>,
 }
 
 /// A set of compute resources (node-level inventory).
@@ -81,6 +87,23 @@ pub struct ResourceAllocations {
     pub fabric_binding: Option<crate::fabric_binding::FabricBinding>,
     #[serde(default)]
     pub gpu_binding: Option<crate::gpu_binding::GpuBinding>,
+    /// Of `cpus`, how many come from the allocated GPUs' reserved cores.
+    // Omitted at zero: allocations are in every job, step and Raft entry, and
+    // most nodes reserve nothing.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub reserved_cpus: u32,
+    /// Layout this allocation was placed under; one from an older layout is
+    /// counted as entirely general. A tag, not summed by `add`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub layout_fingerprint: u64,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A single allocated device entry.
@@ -166,9 +189,20 @@ impl ResourceAllocations {
             .unwrap_or(0)
     }
 
+    /// Reserved CPUs this allocation holds under the layout `fingerprint`; one
+    /// placed under any other layout is entirely general.
+    pub fn reserved_under(&self, fingerprint: u64) -> u32 {
+        if self.layout_fingerprint == fingerprint {
+            self.reserved_cpus
+        } else {
+            0
+        }
+    }
+
     pub fn add(&mut self, other: &ResourceAllocations) {
         self.cpus = self.cpus.saturating_add(other.cpus);
         self.memory_mb = self.memory_mb.saturating_add(other.memory_mb);
+        self.reserved_cpus = self.reserved_cpus.saturating_add(other.reserved_cpus);
         for (gres_name, devices) in &other.devices {
             let entry = self.devices.entry(gres_name.clone()).or_default();
             for dev in devices {
@@ -184,6 +218,7 @@ impl ResourceAllocations {
     pub fn subtract(&mut self, other: &ResourceAllocations) {
         self.cpus = self.cpus.saturating_sub(other.cpus);
         self.memory_mb = self.memory_mb.saturating_sub(other.memory_mb);
+        self.reserved_cpus = self.reserved_cpus.saturating_sub(other.reserved_cpus);
         for (gres_name, devices) in &other.devices {
             let Some(entry) = self.devices.get_mut(gres_name) else {
                 continue;
@@ -548,6 +583,8 @@ mod tests {
         let old = r#"{"cpus":8,"memory_mb":1024,"gpus":[{"device_id":0,"gpu_type":"amdgpu","memory_mb":4096,"peer_gpus":[],"link_type":"PCIe","stable_id":128}],"generic":{},"generation":7}"#;
         let inventory: super::ResourceSet = serde_json::from_str(old).unwrap();
         assert!(inventory.gpus[0].topology.is_none());
+        assert_eq!(inventory.gpus[0].numa_node, None);
+        assert!(inventory.gpus[0].affinity_cpus.is_empty());
         assert_eq!(inventory.generation, 7);
         assert_eq!(inventory.gpus[0].stable_id, 128);
     }
@@ -610,6 +647,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -619,6 +658,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 1,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -750,6 +791,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 0,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -779,6 +822,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 0,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -796,6 +841,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -805,6 +852,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -859,6 +908,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 128,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -868,6 +919,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 129,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -945,6 +998,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 0,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -971,6 +1026,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -980,6 +1037,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 1,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 2,
@@ -989,6 +1048,8 @@ mod tests {
                     link_type: GpuLinkType::NVLink,
                     topology: None,
                     stable_id: 2,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 3,
@@ -998,6 +1059,8 @@ mod tests {
                     link_type: GpuLinkType::NVLink,
                     topology: None,
                     stable_id: 3,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -1018,6 +1081,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -1027,6 +1092,8 @@ mod tests {
                     link_type: GpuLinkType::NVLink,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -1070,6 +1137,8 @@ mod accounting_tests {
             link_type: GpuLinkType::XGMI,
             topology: None,
             stable_id: device_id as u64,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         }
     }
 
@@ -1084,6 +1153,39 @@ mod accounting_tests {
             generation: 0,
             topology: None,
         }
+    }
+
+    #[test]
+    fn reserved_cpus_are_summed_and_released_with_the_allocation() {
+        let mut used = ResourceAllocations::default();
+        let job = ResourceAllocations {
+            cpus: 24,
+            reserved_cpus: 16,
+            ..Default::default()
+        };
+        used.add(&job);
+        used.add(&job);
+        assert_eq!(used.reserved_cpus, 32);
+        used.subtract(&job);
+        assert_eq!(used.reserved_cpus, 16);
+        used.subtract(&ResourceAllocations {
+            reserved_cpus: 99,
+            ..Default::default()
+        });
+        assert_eq!(used.reserved_cpus, 0, "clamps at zero like cpus");
+    }
+
+    #[test]
+    fn allocations_without_reserved_fields_deserialize_with_zero() {
+        let alloc: ResourceAllocations =
+            serde_json::from_str(r#"{"cpus":4,"memory_mb":0,"devices":{}}"#).unwrap();
+        assert_eq!(alloc.reserved_cpus, 0);
+        assert_eq!(alloc.layout_fingerprint, 0);
+        let json = serde_json::to_string(&alloc).unwrap();
+        assert!(
+            !json.contains("reserved_cpus") && !json.contains("layout_fingerprint"),
+            "{json}"
+        );
     }
 
     /// Releasing more than is held must clamp at zero rather than wrap, and a
@@ -1243,6 +1345,8 @@ mod accounting_tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 128,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -1252,6 +1356,8 @@ mod accounting_tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 129,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -1317,6 +1423,8 @@ mod accounting_tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 1,
@@ -1326,6 +1434,8 @@ mod accounting_tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 0,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
                 GpuResource {
                     device_id: 5,
@@ -1335,6 +1445,8 @@ mod accounting_tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 129,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 },
             ],
             generic: HashMap::new(),
@@ -1363,6 +1475,8 @@ mod accounting_tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 128,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -1384,6 +1498,8 @@ mod accounting_tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 0,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -1414,5 +1530,20 @@ mod convergence_fields_tests {
         let json = r#"{"cpus":8,"memory_mb":1024,"gpus":[],"generic":{}}"#;
         let r: ResourceSet = serde_json::from_str(json).unwrap();
         assert_eq!(r.generation, 0);
+    }
+
+    #[test]
+    fn reserved_cpus_count_only_under_their_own_layout() {
+        let alloc = ResourceAllocations {
+            reserved_cpus: 8,
+            layout_fingerprint: 42,
+            ..Default::default()
+        };
+        assert_eq!(alloc.reserved_under(42), 8);
+        assert_eq!(
+            alloc.reserved_under(43),
+            0,
+            "an older layout is all general"
+        );
     }
 }

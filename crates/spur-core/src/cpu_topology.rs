@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -24,6 +24,14 @@ pub struct CoreInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuTopology {
     pub cores: Vec<CoreInfo>,
+}
+
+/// Slurm's `Sockets`, `CoresPerSocket` and `ThreadsPerCore` for a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketCoreThread {
+    pub sockets: u32,
+    pub cores_per_socket: u32,
+    pub threads_per_core: u32,
 }
 
 /// One online CPU as read from sysfs.
@@ -68,6 +76,27 @@ impl CpuTopology {
     /// Abstract index of the core that holds `cpu`.
     pub fn core_of_cpu(&self, cpu: u32) -> Option<usize> {
         self.cores.iter().position(|c| c.cpus.contains(&cpu))
+    }
+
+    /// Integer division as slurmd's hwloc path does, so uneven sockets or
+    /// partly offline SMT round down instead of making the node unknown.
+    pub fn socket_core_thread(&self) -> Option<SocketCoreThread> {
+        let cores = self.cores.len() as u32;
+        if cores == 0 {
+            return None;
+        }
+        let sockets = self
+            .cores
+            .iter()
+            .map(|c| c.socket)
+            .collect::<BTreeSet<_>>()
+            .len() as u32;
+        let cpus: u32 = self.cores.iter().map(|c| c.cpus.len() as u32).sum();
+        Some(SocketCoreThread {
+            sockets,
+            cores_per_socket: (cores / sockets).max(1),
+            threads_per_core: (cpus / cores).max(1),
+        })
     }
 }
 
@@ -286,6 +315,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// One core per entry: (socket, CPUs in it); CPU IDs are assigned in order.
+    fn shaped(cores: &[(u32, u32)]) -> CpuTopology {
+        let mut next = 0;
+        let cores = cores
+            .iter()
+            .map(|&(socket, threads)| {
+                let cpus = (next..next + threads).collect();
+                next += threads;
+                CoreInfo {
+                    socket,
+                    numa_node: Some(socket),
+                    cpus,
+                }
+            })
+            .collect();
+        CpuTopology { cores }
+    }
+
+    fn sct(sockets: u32, cores_per_socket: u32, threads_per_core: u32) -> Option<SocketCoreThread> {
+        Some(SocketCoreThread {
+            sockets,
+            cores_per_socket,
+            threads_per_core,
+        })
+    }
+
+    #[test]
+    fn socket_core_thread_of_even_and_non_smt_nodes() {
+        let two_by_four_smt2: Vec<(u32, u32)> =
+            (0..2).flat_map(|s| (0..4).map(move |_| (s, 2))).collect();
+        assert_eq!(shaped(&two_by_four_smt2).socket_core_thread(), sct(2, 4, 2));
+        assert_eq!(shaped(&[(0, 1); 8]).socket_core_thread(), sct(1, 8, 1));
+        assert_eq!(
+            CpuTopology::from_cpus(&[
+                record(0, 0, 0),
+                record(128, 0, 0),
+                record(64, 1, 0),
+                record(192, 1, 0)
+            ])
+            .socket_core_thread(),
+            sct(2, 1, 2)
+        );
+    }
+
+    #[test]
+    fn socket_core_thread_rounds_down_like_slurmd() {
+        assert_eq!(
+            shaped(&[(0, 2), (0, 2), (0, 2), (1, 2), (1, 2)]).socket_core_thread(),
+            sct(2, 2, 2),
+            "3+2 uneven cores per socket floor to 2, as hwloc's cores/sockets"
+        );
+        assert_eq!(
+            shaped(&[(0, 2), (0, 2), (0, 2), (0, 1)]).socket_core_thread(),
+            sct(1, 4, 1),
+            "7 online CPUs over 4 cores floor to 1 thread"
+        );
+        assert_eq!(
+            shaped(&[(0, 1), (2, 1)]).socket_core_thread(),
+            sct(2, 1, 1),
+            "non-contiguous socket IDs count once each"
+        );
+        assert_eq!(CpuTopology::default().socket_core_thread(), None);
     }
 
     #[test]

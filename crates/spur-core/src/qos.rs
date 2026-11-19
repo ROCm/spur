@@ -49,7 +49,7 @@ fn wall_breach(spec: &JobSpec, max_wall: u32) -> bool {
 
 /// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
 fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
-    let cpus = (spec.num_tasks * spec.cpus_per_task) as u64;
+    let cpus = spec.total_cpus();
     let nodes = spec.num_nodes as u64;
     let mem = effective_memory_mb(spec, spec.num_nodes);
     let gpus = effective_gpus(spec, spec.num_nodes);
@@ -487,6 +487,48 @@ mod tests {
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn a_per_gpu_job_is_capped_on_its_gpu_sized_cpus() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Cpu, 32);
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                cpus_per_gpu: Some(16),
+                gres: vec!["gpu:4".into()],
+                time_limit: Some(chrono::Duration::hours(2)),
+                ..Default::default()
+            },
+        );
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit),
+            "16 CPUs x 4 GPUs = 64 > 32"
         );
     }
 

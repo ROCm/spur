@@ -140,7 +140,10 @@ pub async fn submit_job(
         account: body.job.account.unwrap_or_default(),
         num_nodes: body.job.nodes.unwrap_or(1),
         num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
-        cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
+        // Absent is "not given" (0), so a partition's def_cpu_per_gpu can apply.
+        cpus_per_task: body.job.cpus_per_task.unwrap_or(0),
+        cpus_per_gpu: body.job.cpus_per_gpu,
+        memory_per_gpu_mb: body.job.memory_per_gpu.unwrap_or(0),
         time_limit,
         script: body.job.script.unwrap_or_default(),
         environment: body.job.environment,

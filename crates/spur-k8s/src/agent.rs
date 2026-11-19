@@ -19,6 +19,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 use crate::crd::SpurJob;
+use spur_core::native_exec::resolve_cgroup_budget;
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
@@ -249,6 +250,7 @@ impl SlurmAgent for VirtualAgent {
             usage_reset_period: String::new(),
             kill_wait_secs: None,
             timeout_kill_wait_secs: None,
+            capabilities: Vec::new(),
         }))
     }
 
@@ -309,37 +311,13 @@ impl SlurmAgent for VirtualAgent {
         };
 
         // Build resource requests
-        let mut resource_requests = BTreeMap::new();
-        let mut resource_limits = BTreeMap::new();
-
-        if let Some(ref alloc) = req.allocated {
-            if alloc.cpus > 0 {
-                let cpu_str = alloc.cpus.to_string();
-                resource_requests.insert("cpu".to_string(), Quantity(cpu_str.clone()));
-                resource_limits.insert("cpu".to_string(), Quantity(cpu_str));
-            }
-            if alloc.memory_mb > 0 {
-                let mem_str = format!("{}Mi", alloc.memory_mb);
-                resource_requests.insert("memory".to_string(), Quantity(mem_str.clone()));
-                resource_limits.insert("memory".to_string(), Quantity(mem_str));
-            }
-            let gpu_count = alloc
-                .devices
-                .get("gpu")
-                .map(|d| d.devices.len() as u32)
-                .unwrap_or(0);
-            if gpu_count > 0 {
-                let gpu_str = gpu_count.to_string();
-                let gpu_type = spec
-                    .gres
-                    .iter()
-                    .find_map(|g| spur_core::resource::parse_gres(g))
-                    .and_then(|(_, t, _)| t);
-                let gpu_resource_key = gpu_vendor_resource_key(gpu_type.as_deref());
-                resource_limits.insert(gpu_resource_key.to_string(), Quantity(gpu_str.clone()));
-                resource_requests.insert(gpu_resource_key.to_string(), Quantity(gpu_str));
-            }
-        }
+        let gpu_type = spec
+            .gres
+            .iter()
+            .find_map(|g| spur_core::resource::parse_gres(g))
+            .and_then(|(_, t, _)| t);
+        let (mut resource_requests, mut resource_limits) =
+            pod_resource_maps(req.allocated.as_ref(), gpu_type.as_deref());
 
         // Compute node rank from task_offset.
         // peer_nodes contains addr:port strings (e.g., "10.0.0.1:6818")
@@ -364,8 +342,9 @@ impl SlurmAgent for VirtualAgent {
         senv.set_with_slurm_twin("SPUR_CPUS_PER_TASK", spec.cpus_per_task);
         senv.set_with_slurm_twin(
             "SPUR_CPUS_ON_NODE",
-            tasks_per_node * spec.cpus_per_task.max(1),
+            pod_cpus_on_node(req.allocated.as_ref(), &spec, tasks_per_node),
         );
+        SpurEnv::set_per_gpu(&mut senv, &spec);
         senv.set_with_slurm_twin("SPUR_TASKS_PER_NODE", tasks_per_node);
         senv.set_with_slurm_twin("SPUR_NODEID", node_rank);
         senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
@@ -844,6 +823,15 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
+    async fn claim_step(
+        &self,
+        _request: Request<ClaimStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "ClaimStep is not yet supported by the K8s virtual agent",
+        ))
+    }
+
     async fn register_job_allocation(
         &self,
         _request: Request<RegisterJobAllocationRequest>,
@@ -1223,6 +1211,54 @@ fn is_nvidia_gpu(gpu_type: &str) -> bool {
         || lower == "nvidia"
 }
 
+/// CPU half of `resolve_cgroup_budget`, shared with spurd so native and K8s
+/// jobs size `SPUR_CPUS_ON_NODE` alike (see crate AGENTS.md).
+fn pod_cpus_on_node(
+    alloc: Option<&ResourceAllocations>,
+    spec: &JobSpec,
+    tasks_per_node: u32,
+) -> u32 {
+    resolve_cgroup_budget(alloc, spec, tasks_per_node).0
+}
+
+/// CPU/memory/GPU `requests`/`limits` for the pod's container, from the job's
+/// allocation. A job with no memory request of its own gets neither map entry
+/// for memory: Kubernetes copies a set limit into an unset request, so giving
+/// such a pod a memory limit would make it request the whole node.
+fn pod_resource_maps(
+    alloc: Option<&ResourceAllocations>,
+    gpu_type: Option<&str>,
+) -> (BTreeMap<String, Quantity>, BTreeMap<String, Quantity>) {
+    let mut resource_requests = BTreeMap::new();
+    let mut resource_limits = BTreeMap::new();
+
+    if let Some(alloc) = alloc {
+        if alloc.cpus > 0 {
+            let cpu_str = alloc.cpus.to_string();
+            resource_requests.insert("cpu".to_string(), Quantity(cpu_str.clone()));
+            resource_limits.insert("cpu".to_string(), Quantity(cpu_str));
+        }
+        if alloc.memory_mb > 0 {
+            let mem_str = format!("{}Mi", alloc.memory_mb);
+            resource_requests.insert("memory".to_string(), Quantity(mem_str.clone()));
+            resource_limits.insert("memory".to_string(), Quantity(mem_str));
+        }
+        let gpu_count = alloc
+            .devices
+            .get("gpu")
+            .map(|d| d.devices.len() as u32)
+            .unwrap_or(0);
+        if gpu_count > 0 {
+            let gpu_str = gpu_count.to_string();
+            let gpu_resource_key = gpu_vendor_resource_key(gpu_type);
+            resource_limits.insert(gpu_resource_key.to_string(), Quantity(gpu_str.clone()));
+            resource_requests.insert(gpu_resource_key.to_string(), Quantity(gpu_str));
+        }
+    }
+
+    (resource_requests, resource_limits)
+}
+
 /// Build a gres string from GPU count and type.
 pub fn gpu_request_to_gres(count: u32, gpu_type: Option<&str>) -> String {
     let t = gpu_type.unwrap_or("any");
@@ -1260,6 +1296,60 @@ mod tests {
     fn target_node_allowed_when_allocation_not_yet_visible() {
         // Races the status projection: allowed but (in the real path) logged.
         assert!(validate_target_node("gpu-a-01", &[], 7).is_ok());
+    }
+
+    // --- pod_cpus_on_node: thin wrapper over spur-core's resolve_cgroup_budget,
+    // which carries the full CPU-sizing and per-GPU-env coverage ---
+
+    #[test]
+    fn pod_cpus_on_node_uses_the_allocations_cpus_when_set() {
+        let alloc = ResourceAllocations {
+            cpus: 32,
+            ..Default::default()
+        };
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            cpus_per_gpu: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(pod_cpus_on_node(Some(&alloc), &spec, 1), 32);
+    }
+
+    // --- pod_resource_maps ---
+
+    #[test]
+    fn pod_resource_maps_leaves_memory_unset_without_a_request() {
+        // Kubernetes copies a set limit into an unset request, so a job with
+        // no --mem must get neither map entry — not even a limit alone.
+        let alloc = ResourceAllocations {
+            cpus: 4,
+            memory_mb: 0,
+            ..Default::default()
+        };
+        let (requests, limits) = pod_resource_maps(Some(&alloc), None);
+        assert!(!requests.contains_key("memory"), "requests: {requests:?}");
+        assert!(!limits.contains_key("memory"), "limits: {limits:?}");
+    }
+
+    #[test]
+    fn pod_resource_maps_sets_equal_memory_request_and_limit_with_mem() {
+        let alloc = ResourceAllocations {
+            memory_mb: 2048,
+            ..Default::default()
+        };
+        let (requests, limits) = pod_resource_maps(Some(&alloc), None);
+        assert_eq!(
+            requests.get("memory"),
+            Some(&Quantity("2048Mi".to_string()))
+        );
+        assert_eq!(limits.get("memory"), Some(&Quantity("2048Mi".to_string())));
+    }
+
+    #[test]
+    fn pod_resource_maps_leaves_memory_unset_with_no_allocation_at_all() {
+        let (requests, limits) = pod_resource_maps(None, None);
+        assert!(!requests.contains_key("memory"));
+        assert!(!limits.contains_key("memory"));
     }
 
     // --- gpu_request_to_gres ---

@@ -684,8 +684,8 @@ Out of the box the job's cgroup gets:
   misses in ``extra_device_paths``, or turn the filter off with
   ``constrain_devices``.
 
-A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
-left unset.
+A job submitted without ``--mem`` has no memory budget of its own, so its memory
+ceilings are capped at the node's schedulable memory instead.
 
 Job termination waits for all processes in the owned cgroup, including
 children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
@@ -1205,7 +1205,8 @@ Operational notes
   across all agents when not passing explicit values.
 - Multi-rank ``--mpi=pmix`` steps use the same per-rank fork + ``setup_fork``
   path as batch jobs. Spur CPU bind (``--cpu-bind``) and per-rank GPU
-  partitioning (``SPUR_JOB_GPUS``) apply through the fork wrapper.
+  partitioning (of ``SPUR_LOCAL_GPUS`` in a step with GPUs of its own, else
+  ``SPUR_JOB_GPUS``) apply through the fork wrapper.
 - Batch stdout (``spur-<jobid>.out``) is often written on an **allocated agent**,
   not the submission host, when those filesystems are not shared.
 - A job may sit in ``COMPLETING`` after ranks have already printed and

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -269,6 +269,16 @@ pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
 /// Agent capability: the agent implements the `SignalJob` RPC.
 pub const CAP_SIGNAL_JOB: &str = "signal-job";
 
+/// Agent and controller capability: a step's own CPU, memory and GPU limits
+/// (`StepResources`) are honoured. A peer without it would run the step with
+/// the whole job's share, so typed steps are refused instead.
+pub const CAP_STEP_RESOURCES: &str = "step-resources";
+
+/// Controller capability: `--cpus-per-gpu`/`--mem-per-gpu` on a submitted job
+/// are honoured. A controller without it would silently drop them (and run
+/// the job with 1 CPU per task), so the CLI refuses those options instead.
+pub const CAP_PER_GPU_OPTIONS: &str = "per-gpu-options";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 
@@ -302,6 +312,15 @@ pub fn resolve_wal_node_source(
     } else {
         source.clone()
     }
+}
+
+/// One GPU's CPUs for display: its reserved picks under the node's current
+/// layout and the CPUs near it. An empty list is unknown or none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuCpus {
+    pub stable_id: u64,
+    pub reserved: Vec<u32>,
+    pub affinity: Vec<u32>,
 }
 
 /// A compute node in the cluster.
@@ -414,6 +433,15 @@ pub struct Node {
     /// from heartbeats, never persisted.
     #[serde(skip)]
     pub layout_enforce_error: Option<String>,
+    /// The per-GPU reserved CPUs the last good layout picked. Saved in the
+    /// snapshot because `core_layout` is not, so every replica and replay
+    /// recomputes from the same history.
+    #[serde(default)]
+    pub reserved_picks: Vec<crate::core_layout::GpuReservedCpus>,
+    /// Per GPU, reserved CPUs the agent reports held by a job not holding that
+    /// GPU, under the current layout. Leader-local, from heartbeats.
+    #[serde(skip)]
+    pub layout_blocked_cpus: BTreeMap<u64, u32>,
     /// Optional RPCs the node's agent advertised at registration (e.g. `CAP_SIGNAL_JOB`).
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -470,6 +498,8 @@ impl Node {
             spec_memory_mb: 0,
             layout_seq: 0,
             layout_enforce_error: None,
+            reserved_picks: Vec::new(),
+            layout_blocked_cpus: BTreeMap::new(),
             capabilities: Vec::new(),
             agent_instance: None,
         }
@@ -480,6 +510,43 @@ impl Node {
         self.capabilities.iter().any(|c| c == capability)
     }
 
+    /// Slurm's S:C:T from the topology the agent reported; `None` without one.
+    pub fn socket_core_thread(&self) -> Option<crate::cpu_topology::SocketCoreThread> {
+        self.detected_resources
+            .topology
+            .as_ref()
+            .and_then(crate::cpu_topology::CpuTopology::socket_core_thread)
+    }
+
+    /// Per schedulable GPU, its reserved and nearby CPUs. GPUs with neither
+    /// known are left out.
+    pub fn gpu_cpus(&self) -> Vec<GpuCpus> {
+        let topology = self.detected_resources.topology.as_ref();
+        let picks = self
+            .core_layout
+            .as_ref()
+            .map_or(&[][..], |l| l.gpu_reserved.as_slice());
+        self.total_resources
+            .gpus
+            .iter()
+            .filter_map(|gpu| {
+                let reserved = picks
+                    .iter()
+                    .find(|p| p.stable_id == gpu.stable_id)
+                    .map(|p| p.cpus.clone())
+                    .unwrap_or_default();
+                let affinity = topology
+                    .map(|t| crate::core_layout::gpu_affinity_cpus(t, gpu))
+                    .unwrap_or_default();
+                (!reserved.is_empty() || !affinity.is_empty()).then_some(GpuCpus {
+                    stable_id: gpu.stable_id,
+                    reserved,
+                    affinity,
+                })
+            })
+            .collect()
+    }
+
     /// Reset config-derived scheduling policy (features, weight) to defaults.
     /// Used when a node no longer matches any `NodeConfig` so stale policy does
     /// not persist. Keeps the "no match" state identical to a freshly created node.
@@ -488,10 +555,97 @@ impl Node {
         self.weight = Self::DEFAULT_WEIGHT;
     }
 
+    /// Blocked GPUs no job holds, as a busy allocation: a GPU job waits for
+    /// them rather than being refused at launch. No CPUs, so CPU-only jobs and
+    /// the general count are unaffected.
+    pub fn layout_blocked_alloc(&self) -> Option<ResourceAllocations> {
+        if self.layout_blocked_cpus.is_empty() {
+            return None;
+        }
+        let held = self.alloc_resources.device_ids("gpu");
+        // An id for a GPU this node doesn't have must never block scheduling:
+        // a skewed or buggy heartbeat would otherwise refuse every GPU job.
+        let ids: Vec<u64> = self
+            .layout_blocked_cpus
+            .iter()
+            .filter(|(id, &cpus)| {
+                cpus > 0
+                    && !held.contains(id)
+                    && self
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .any(|g| g.stable_id == **id)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        (!ids.is_empty()).then(|| ResourceAllocations::from_device_ids("gpu", &ids))
+    }
+
     /// Whether available inventory can satisfy a count-based request.
     pub fn can_satisfy_request(&self, request: &ResourceSet) -> bool {
+        match self.layout_blocked_alloc() {
+            Some(blocked) => {
+                let mut used = self.alloc_resources.clone();
+                used.add(&blocked);
+                self.fits_beside(&used, request)
+            }
+            None => self.fits_beside(&self.alloc_resources, request),
+        }
+    }
+
+    /// Whether `request` fits the empty node; false means never on this node.
+    pub fn can_ever_satisfy(&self, request: &ResourceSet) -> bool {
+        self.fits_beside(&ResourceAllocations::default(), request)
+    }
+
+    /// Add a job's slice to the node's total. Its reserved CPUs count only when
+    /// it was placed under the layout the total's reserved count belongs to.
+    pub fn hold(&mut self, slice: &ResourceAllocations) {
+        self.alloc_resources.add(&self.as_charged(slice));
+    }
+
+    /// Take a job's slice back out, by the same rule [`Node::hold`] used.
+    pub fn release(&mut self, slice: &ResourceAllocations) {
+        self.alloc_resources.subtract(&self.as_charged(slice));
+    }
+
+    fn as_charged(&self, slice: &ResourceAllocations) -> ResourceAllocations {
+        let mut charged = slice.clone();
+        charged.reserved_cpus = slice.reserved_under(self.alloc_resources.layout_fingerprint);
+        charged
+    }
+
+    /// Point the total's reserved count at the current layout. Under a new
+    /// layout every slice the node holds was placed under an older one, so all of
+    /// it counts as general. The tag is persisted, so a restart that derives the
+    /// same layout keeps the count.
+    pub fn sync_reserved_tag(&mut self) {
+        let current = self
+            .core_layout
+            .as_ref()
+            .filter(|l| l.pools().is_some())
+            .map_or(0, crate::core_layout::CoreLayout::fingerprint);
+        if self.alloc_resources.layout_fingerprint != current {
+            self.alloc_resources.reserved_cpus = 0;
+            self.alloc_resources.layout_fingerprint = current;
+        }
+    }
+
+    /// The node's CPU pools when its GPUs reserve cores; `None` keeps the
+    /// single-pool check.
+    pub fn cpu_pools(&self) -> Option<crate::core_layout::CpuPools> {
+        self.core_layout
+            .as_ref()
+            .and_then(crate::core_layout::CoreLayout::pools)
+    }
+
+    fn fits_beside(&self, used: &ResourceAllocations, request: &ResourceSet) -> bool {
         self.total_resources
-            .can_satisfy_with_allocated(&self.alloc_resources, request)
+            .can_satisfy_with_allocated(used, request)
+            && self
+                .cpu_pools()
+                .is_none_or(|p| p.admits(used, request.cpus, request.gpus.len() as u32))
     }
 
     /// Whether the node has any unallocated CPU headroom (a saturated node is full).
@@ -994,5 +1148,329 @@ mod tests {
             node_overlay(&node),
             Some(NodeOverlay::Reserved { maint: false })
         );
+    }
+
+    /// 4 general CPUs and 2 GPUs reserving 4 CPUs each.
+    fn reserved_node() -> Node {
+        use crate::core_layout::{CoreLayout, GpuReservedCpus};
+        use crate::resource::{GpuLinkType, GpuResource};
+        let gpu = |id: u64| GpuResource {
+            device_id: id as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id: id,
+            topology: None,
+            numa_node: None,
+            affinity_cpus: vec![],
+        };
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 12,
+                memory_mb: 1024,
+                gpus: vec![gpu(1), gpu(2)],
+                ..Default::default()
+            },
+        );
+        node.core_layout = Some(CoreLayout {
+            spec_cpus: vec![],
+            mem_spec_mb: 0,
+            gpu_reserved: vec![
+                GpuReservedCpus {
+                    stable_id: 1,
+                    cpus: vec![0, 1, 2, 3],
+                },
+                GpuReservedCpus {
+                    stable_id: 2,
+                    cpus: vec![4, 5, 6, 7],
+                },
+            ],
+            general_cpus: vec![8, 9, 10, 11],
+            daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        });
+        node
+    }
+
+    fn request(cpus: u32, gpus: u32) -> ResourceSet {
+        let mut gpu_list = reserved_node().total_resources.gpus;
+        gpu_list.truncate(gpus as usize);
+        for g in &mut gpu_list {
+            g.gpu_type = "any".into();
+        }
+        ResourceSet {
+            cpus,
+            gpus: gpu_list,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cpu_only_request_larger_than_general_can_never_be_satisfied() {
+        let node = reserved_node();
+        assert!(node.total_resources.can_satisfy(&request(5, 0)));
+        assert!(!node.can_ever_satisfy(&request(5, 0)));
+        assert!(node.can_ever_satisfy(&request(4, 0)));
+    }
+
+    #[test]
+    fn gpu_request_needs_general_cpus_only_beyond_its_reserved_cores() {
+        let mut node = reserved_node();
+        assert!(node.can_ever_satisfy(&request(12, 2)));
+        node.alloc_resources = ResourceAllocations::with_scalar(4, 0);
+        assert!(node.can_satisfy_request(&request(8, 2)));
+        assert!(!node.can_satisfy_request(&request(9, 2)));
+    }
+
+    #[test]
+    fn reserved_picks_survive_a_snapshot_round_trip() {
+        let mut node = reserved_node();
+        node.reserved_picks = node.core_layout.clone().unwrap().gpu_reserved;
+        node.layout_blocked_cpus.insert(1, 3);
+        let back: Node = serde_json::from_str(&serde_json::to_string(&node).unwrap()).unwrap();
+        assert_eq!(back.reserved_picks, node.reserved_picks);
+        assert!(
+            back.layout_blocked_cpus.is_empty(),
+            "leader-local, never persisted"
+        );
+    }
+
+    /// 12 single-thread cores on one socket; CPUs 0-5 on NUMA 0, 6-11 on NUMA 1.
+    fn twelve_cpu_topology() -> crate::cpu_topology::CpuTopology {
+        let records: Vec<_> = (0..12)
+            .map(|cpu| crate::cpu_topology::CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: cpu,
+                numa_node: Some(cpu / 6),
+            })
+            .collect();
+        crate::cpu_topology::CpuTopology::from_cpus(&records)
+    }
+
+    #[test]
+    fn gpu_cpus_pair_reserved_picks_with_nearby_cpus() {
+        let mut node = reserved_node();
+        assert_eq!(node.socket_core_thread(), None, "no topology reported");
+        assert_eq!(
+            node.gpu_cpus(),
+            vec![
+                GpuCpus {
+                    stable_id: 1,
+                    reserved: vec![0, 1, 2, 3],
+                    affinity: vec![]
+                },
+                GpuCpus {
+                    stable_id: 2,
+                    reserved: vec![4, 5, 6, 7],
+                    affinity: vec![]
+                },
+            ],
+            "without topology only the picks are known"
+        );
+
+        node.detected_resources.topology = Some(twelve_cpu_topology());
+        node.total_resources.gpus[0].numa_node = Some(0);
+        node.total_resources.gpus[1].affinity_cpus = vec![8, 9];
+        let mut third = node.total_resources.gpus[0].clone();
+        third.stable_id = 3;
+        third.numa_node = None;
+        node.total_resources.gpus.push(third);
+        assert_eq!(
+            node.socket_core_thread(),
+            Some(crate::cpu_topology::SocketCoreThread {
+                sockets: 1,
+                cores_per_socket: 12,
+                threads_per_core: 1,
+            })
+        );
+        assert_eq!(
+            node.gpu_cpus(),
+            vec![
+                GpuCpus {
+                    stable_id: 1,
+                    reserved: vec![0, 1, 2, 3],
+                    affinity: (0..6).collect()
+                },
+                GpuCpus {
+                    stable_id: 2,
+                    reserved: vec![4, 5, 6, 7],
+                    affinity: vec![8, 9]
+                },
+            ],
+            "GPU 3 has neither list, so it is left out"
+        );
+
+        node.core_layout = None;
+        assert_eq!(
+            node.gpu_cpus(),
+            vec![
+                GpuCpus {
+                    stable_id: 1,
+                    reserved: vec![],
+                    affinity: (0..6).collect()
+                },
+                GpuCpus {
+                    stable_id: 2,
+                    reserved: vec![],
+                    affinity: vec![8, 9]
+                },
+            ],
+            "nearby CPUs do not need a layout"
+        );
+    }
+
+    #[test]
+    fn a_node_without_reserved_picks_deserializes() {
+        let mut value = serde_json::to_value(reserved_node()).unwrap();
+        value.as_object_mut().unwrap().remove("reserved_picks");
+        let back: Node = serde_json::from_value(value).unwrap();
+        assert!(back.reserved_picks.is_empty());
+    }
+
+    #[test]
+    fn a_blocked_unheld_gpu_does_not_satisfy_a_gpu_request() {
+        let mut node = reserved_node();
+        node.layout_blocked_cpus.insert(1, 2);
+        assert!(
+            node.can_satisfy_request(&request(4, 1)),
+            "GPU 2 is still free"
+        );
+        assert!(!node.can_satisfy_request(&request(4, 2)));
+        node.layout_blocked_cpus.insert(2, 1);
+        assert!(!node.can_satisfy_request(&request(0, 1)));
+        assert!(
+            node.can_ever_satisfy(&request(4, 2)),
+            "only a wait, never 'never'"
+        );
+    }
+
+    #[test]
+    fn a_held_gpu_is_not_counted_twice() {
+        let mut node = reserved_node();
+        node.alloc_resources = ResourceAllocations::from_device_ids("gpu", &[1]);
+        node.layout_blocked_cpus.insert(1, 2);
+        assert_eq!(node.layout_blocked_alloc(), None);
+        assert!(node.can_satisfy_request(&request(4, 1)));
+    }
+
+    #[test]
+    fn a_blocked_id_for_an_unknown_gpu_is_ignored() {
+        let mut node = reserved_node();
+        node.layout_blocked_cpus.insert(99, 4);
+        assert_eq!(node.layout_blocked_alloc(), None);
+        assert!(node.can_satisfy_request(&request(12, 2)));
+    }
+
+    #[test]
+    fn cpu_only_requests_ignore_blocked_gpus() {
+        let mut node = reserved_node();
+        node.layout_blocked_cpus.insert(1, 4);
+        node.layout_blocked_cpus.insert(2, 4);
+        assert!(node.can_satisfy_request(&request(4, 0)));
+    }
+
+    #[test]
+    fn node_without_reservations_matches_its_total_resources() {
+        let mut node = reserved_node();
+        node.core_layout = None;
+        node.alloc_resources = ResourceAllocations::with_scalar(3, 0);
+        for (cpus, gpus) in [(5, 0), (9, 0), (10, 1), (12, 2)] {
+            let req = request(cpus, gpus);
+            assert_eq!(
+                node.can_ever_satisfy(&req),
+                node.total_resources.can_satisfy(&req)
+            );
+            assert_eq!(
+                node.can_satisfy_request(&req),
+                node.total_resources
+                    .can_satisfy_with_allocated(&node.alloc_resources, &req)
+            );
+        }
+    }
+
+    fn stamped(
+        cpus: u32,
+        layout: &crate::core_layout::CoreLayout,
+        gpu: u64,
+    ) -> ResourceAllocations {
+        let mut slice = ResourceAllocations::with_scalar(cpus, 0);
+        slice.devices.insert(
+            "gpu".into(),
+            vec![crate::resource::AllocatedDevice {
+                device_id: gpu,
+                count: 1,
+            }],
+        );
+        layout.stamp(&mut slice);
+        slice
+    }
+
+    #[test]
+    fn held_slices_keep_their_reserved_cpus_under_one_layout() {
+        let mut node = reserved_node();
+        node.sync_reserved_tag();
+        let layout = node.core_layout.clone().unwrap();
+        let slice = stamped(6, &layout, 1);
+        node.hold(&slice);
+        assert_eq!(node.alloc_resources.reserved_cpus, 4);
+        node.release(&slice);
+        assert_eq!(node.alloc_resources.reserved_cpus, 0);
+        assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn a_layout_change_makes_held_slices_general() {
+        let mut node = reserved_node();
+        node.sync_reserved_tag();
+        let old = node.core_layout.clone().unwrap();
+        let slice = stamped(4, &old, 1);
+        node.hold(&slice);
+
+        let mut new = old.clone();
+        new.gpu_reserved[0].cpus.pop();
+        node.core_layout = Some(new);
+        node.sync_reserved_tag();
+        assert_eq!(
+            node.alloc_resources.reserved_cpus, 0,
+            "now counted as general"
+        );
+        assert_eq!(node.alloc_resources.cpus, 4);
+
+        node.release(&slice);
+        assert_eq!(
+            node.alloc_resources.reserved_cpus, 0,
+            "no underflow into others"
+        );
+        assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn a_slice_stamped_under_another_layout_holds_no_reserved_cpus() {
+        let mut node = reserved_node();
+        node.sync_reserved_tag();
+        let mut other = node.core_layout.clone().unwrap();
+        other.general_cpus.pop();
+        node.hold(&stamped(4, &other, 1));
+        assert_eq!(node.alloc_resources.reserved_cpus, 0);
+    }
+
+    #[test]
+    fn an_unchanged_layout_after_restore_keeps_the_reserved_count() {
+        let mut node = reserved_node();
+        node.sync_reserved_tag();
+        let layout = node.core_layout.clone().unwrap();
+        node.hold(&stamped(4, &layout, 2));
+        let json = serde_json::to_string(&node).unwrap();
+        let mut restored: Node = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.core_layout.is_none(),
+            "the layout is derived, not stored"
+        );
+        restored.core_layout = Some(layout);
+        restored.sync_reserved_tag();
+        assert_eq!(restored.alloc_resources.reserved_cpus, 4);
     }
 }

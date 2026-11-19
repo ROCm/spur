@@ -328,7 +328,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'E' => format_timestamp(job.end_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
         'n' => job.nodelist.clone(),
-        'C' => (job.num_tasks * job.cpus_per_task.max(1)).to_string(),
+        'C' => ncpus(job).to_string(),
         'Q' => job.qos.clone(),
         'y' => {
             if job.preempted_by == 0 {
@@ -379,6 +379,21 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         }
         _ => "?".into(),
     }
+}
+
+/// CPU count a job holds: a history row's recorded allocation, else the `cpu=`
+/// entry in `req_tres` (already counts `--cpus-per-gpu`), else
+/// `num_tasks * cpus_per_task.max(1)` for rows that carry neither.
+pub(crate) fn ncpus(job: &spur_proto::proto::JobInfo) -> u32 {
+    if let Some(cpus) = job.alloc_cpus {
+        return u32::try_from(cpus).unwrap_or(u32::MAX);
+    }
+    job.req_tres
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(key, _)| *key == "cpu")
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or_else(|| job.num_tasks.saturating_mul(job.cpus_per_task.max(1)))
 }
 
 fn state_name(state: i32) -> String {
@@ -527,6 +542,64 @@ mod tests {
         assert_eq!(resolve_sacct_field(&j, 'R'), "0");
         j.min_memory_node_mb = 16000;
         assert_eq!(resolve_sacct_field(&j, 'R'), "16000M");
+    }
+
+    #[test]
+    fn ncpus_reads_a_history_rows_allocated_cpus() {
+        // A history row carries no req_tres; a one-task --cpus-per-gpu=8 job on
+        // two GPUs held 16 CPUs.
+        let j = JobInfo {
+            alloc_cpus: Some(16),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(ncpus(&j), 16);
+        assert_eq!(resolve_sacct_field(&j, 'C'), "16");
+    }
+
+    #[test]
+    fn ncpus_uses_the_req_tres_cpu_value_when_present() {
+        // req_tres already counts --cpus-per-gpu, so it must win over the naive
+        // num_tasks * cpus_per_task product.
+        let j = JobInfo {
+            req_tres: "cpu=16,node=1".into(),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(ncpus(&j), 16);
+        assert_eq!(resolve_sacct_field(&j, 'C'), "16");
+    }
+
+    #[test]
+    fn ncpus_falls_back_to_tasks_times_cpus_per_task_when_req_tres_is_empty() {
+        // Accounting-history rows may predate req_tres and leave it empty.
+        let j = JobInfo {
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        assert_eq!(ncpus(&j), 8);
+    }
+
+    #[test]
+    fn ncpus_falls_back_when_req_tres_has_no_cpu_entry_or_fails_to_parse() {
+        let no_cpu_key = JobInfo {
+            req_tres: "node=1,mem=1000M".into(),
+            num_tasks: 2,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(ncpus(&no_cpu_key), 2);
+
+        let malformed = JobInfo {
+            req_tres: "cpu=bogus".into(),
+            num_tasks: 3,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(ncpus(&malformed), 3);
     }
 
     #[test]

@@ -682,10 +682,17 @@ pub struct JobSpec {
     pub cpus_per_task: u32,
     pub memory_per_node_mb: Option<u64>,
     pub memory_per_cpu_mb: Option<u64>,
-    /// Memory per allocated GPU (MiB). Never submitted: only a partition's
-    /// `def_mem_per_gpu` sets it, so each node's memory follows its GPU share.
+    /// Memory per allocated GPU (MiB): `--mem-per-gpu`, or a partition's
+    /// `def_mem_per_gpu` when the job names no memory.
     #[serde(default)]
     pub memory_per_gpu_mb: Option<u64>,
+    /// CPUs per allocated GPU (`--cpus-per-gpu`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus_per_gpu: Option<u32>,
+    /// `-c` was not given, so `cpus_per_task` holds the default 1 and a
+    /// `def_cpu_per_gpu` may apply. Resolved at submit, never persisted.
+    #[serde(skip)]
+    pub cpus_per_task_unset: bool,
     pub gres: Vec<String>,
     /// GPU requests. At most one is set (see `gpu_request::resolve_gpu_demand`).
     /// `gpus` = total across the job, the others are per-node / per-task. A
@@ -835,6 +842,8 @@ impl Default for JobSpec {
             memory_per_node_mb: None,
             memory_per_cpu_mb: None,
             memory_per_gpu_mb: None,
+            cpus_per_gpu: None,
+            cpus_per_task_unset: false,
             gres: Vec::new(),
             gpus: None,
             gpus_per_node: None,
@@ -912,6 +921,44 @@ impl JobSpec {
             nodes.min(self.num_tasks.max(1))
         }
     }
+
+    /// CPUs the job needs on a node holding `tasks_on_node` of its tasks and
+    /// `gpus_on_node` of its GPUs.
+    pub fn cpus_on_node(&self, tasks_on_node: u32, gpus_on_node: u32) -> u32 {
+        let by_task = tasks_on_node.saturating_mul(self.cpus_per_task.max(1));
+        let by_gpu = self.cpus_per_gpu.unwrap_or(0).saturating_mul(gpus_on_node);
+        by_task.max(by_gpu)
+    }
+
+    /// CPUs the job needs in total, for job-wide limits: each node's floor at
+    /// the even task and GPU spread, so a node short of GPUs still counts its tasks.
+    pub fn total_cpus(&self) -> u64 {
+        let by_task = u64::from(self.num_tasks).saturating_mul(u64::from(self.cpus_per_task));
+        let Some(per_gpu) = self.cpus_per_gpu else {
+            return by_task;
+        };
+        let by_gpu = u64::from(per_gpu).saturating_mul(effective_gpus(self, self.num_nodes));
+        let tasks = crate::gpu_request::tasks_per_node_counts(self, self.num_nodes.max(1));
+        let by_node: u64 = tasks
+            .into_iter()
+            .zip(gpus_per_node_counts(self))
+            .map(|(tasks, gpus)| u64::from(self.cpus_on_node(tasks, gpus)))
+            .sum();
+        by_task.max(by_gpu).max(by_node)
+    }
+}
+
+/// GPUs on each node: a job total spread evenly with the remainder on the first
+/// nodes, zeros when the job asks for none or the request is invalid.
+pub fn gpus_per_node_counts(spec: &JobSpec) -> Vec<u32> {
+    let nodes = spec.num_nodes.max(1);
+    match crate::gpu_request::resolve_gpu_demand(spec) {
+        Ok(crate::gpu_request::GpuDemand::PerNode { counts, .. }) => counts,
+        Ok(crate::gpu_request::GpuDemand::Total { count, .. }) => (0..nodes)
+            .map(|i| count / nodes + u32::from(i < count % nodes))
+            .collect(),
+        Ok(crate::gpu_request::GpuDemand::None) | Err(_) => vec![0; nodes as usize],
+    }
 }
 
 /// Total memory (MB) a job of `num_nodes` nodes requests: per-node, or per-CPU/per-GPU
@@ -921,7 +968,7 @@ pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
         .map(|mem| mem * num_nodes as u64)
         .or_else(|| {
             spec.memory_per_cpu_mb
-                .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
+                .map(|mem| mem.saturating_mul(spec.total_cpus()))
         })
         .or_else(|| {
             spec.memory_per_gpu_mb
@@ -2145,6 +2192,111 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(effective_memory_mb(&spec, 2), 3072);
+    }
+
+    #[test]
+    fn cpus_on_node_takes_the_larger_of_task_and_gpu_sizing() {
+        let mut spec = JobSpec {
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            spec.cpus_on_node(4, 2),
+            8,
+            "no cpus_per_gpu: task sizing only"
+        );
+        spec.cpus_per_task = 1;
+        spec.cpus_per_gpu = Some(16);
+        assert_eq!(spec.cpus_on_node(1, 2), 32);
+        spec.cpus_per_task = 64;
+        spec.cpus_per_gpu = Some(4);
+        assert_eq!(
+            spec.cpus_on_node(1, 1),
+            64,
+            "-c dominates a small per-GPU count"
+        );
+    }
+
+    #[test]
+    fn total_cpus_sizes_a_per_gpu_job_by_its_gpus() {
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            cpus_per_gpu: Some(8),
+            gres: vec!["gpu:4".into()],
+            ..Default::default()
+        };
+        assert_eq!(spec.total_cpus(), 32);
+    }
+
+    #[test]
+    fn total_cpus_sums_each_nodes_task_and_gpu_floor() {
+        // -N2 -n10 --gpus=3 --cpus-per-gpu=4: GPUs [2,1], tasks [5,5] -> [8,5].
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 10,
+            cpus_per_task: 1,
+            cpus_per_gpu: Some(4),
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(spec.total_cpus(), 13);
+    }
+
+    #[test]
+    fn total_cpus_without_cpus_per_gpu_is_tasks_times_cpus_per_task() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 3,
+            cpus_per_task: 4,
+            ..Default::default()
+        };
+        assert_eq!(spec.total_cpus(), 12);
+    }
+
+    #[test]
+    fn gpus_per_node_counts_spreads_a_total_evenly() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            gpus: Some(crate::gpu_request::GpuRequest::new(3, None)),
+            ..Default::default()
+        };
+        assert_eq!(gpus_per_node_counts(&spec), vec![2, 1]);
+        let none = JobSpec {
+            num_nodes: 2,
+            ..Default::default()
+        };
+        assert_eq!(gpus_per_node_counts(&none), vec![0, 0]);
+    }
+
+    #[test]
+    fn effective_memory_mb_per_cpu_uses_the_per_gpu_cpu_count() {
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            cpus_per_gpu: Some(8),
+            memory_per_cpu_mb: Some(100),
+            gres: vec!["gpu:2".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 1), 1600);
+    }
+
+    #[test]
+    fn cpus_per_task_unset_is_never_persisted_and_cpus_per_gpu_is() {
+        let spec = JobSpec {
+            cpus_per_task_unset: true,
+            cpus_per_gpu: Some(8),
+            ..Default::default()
+        };
+        let back: JobSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert!(!back.cpus_per_task_unset);
+        assert_eq!(back.cpus_per_gpu, Some(8));
     }
 
     #[test]
@@ -3565,6 +3717,7 @@ mod tests {
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1707),
             memory_per_gpu_mb: None,
+            cpus_per_gpu: None,
         };
 
         job.start_in_partition(Some("a".into()), Some(adjusted));

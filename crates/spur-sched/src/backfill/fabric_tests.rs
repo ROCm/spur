@@ -54,6 +54,8 @@ fn nodes(count: usize) -> Vec<Node> {
                                     }),
                                     ..Default::default()
                                 }),
+                                numa_node: None,
+                                affinity_cpus: Vec::new(),
                             }
                         })
                         .collect(),

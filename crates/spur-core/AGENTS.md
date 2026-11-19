@@ -123,10 +123,12 @@ For ranking semantics and the shared preemption/reclaim flow, see
 ### JobSpec
 
 User-submitted job description. Fields cover resource requests (nodes, tasks,
-CPUs, memory, GPUs via `gres`/`gpus`/`gpus_per_node`/`gpus_per_task`),
-execution (script, argv, environment, work_dir), scheduling (QOS, priority,
-reservation, dependency, constraint, begin_time, deadline), containers, MPI,
-arrays, and K8s pod options.
+CPUs, memory, GPUs via `gres`/`gpus`/`gpus_per_node`/`gpus_per_task`,
+`cpus_per_gpu`, `memory_per_gpu_mb`), execution (script, argv, environment,
+work_dir), scheduling (QOS, priority, reservation, dependency, constraint,
+begin_time, deadline), containers, MPI, arrays, and K8s pod options.
+`cpus_per_task` of 0 means `-c` was not given, so a partition or
+`[scheduler]` `def_cpu_per_gpu` may size the job instead.
 
 `JobSpec` is serialized into the Raft WAL via `WalOperation::JobSubmit`. Every
 new field must deserialize when absent: `#[serde(default)]`, or a plain
@@ -217,6 +219,13 @@ Persisted in the Raft snapshot. Key fields:
 - `k0s_role`, `k0s_mesh_ip`, `k0s_pod_cidr`: native k0s cluster assignment.
 - `weight`: scheduling preference (higher = preferred).
 - `switch_name`: topology leaf switch (from config).
+- `reserved_picks`: the per-GPU reserved CPUs the last layout recompute chose.
+  Snapshot-persisted (`#[serde(default)]`), since `core_layout` itself is not,
+  so sticky picks survive a restart or replay.
+- `layout_blocked_cpus`: leader-local (`#[serde(skip)]`), per GPU, reserved
+  CPUs a heartbeat reports held by a job that does not hold that GPU under
+  the current layout. `layout_blocked_alloc()` turns an unheld blocked GPU
+  into a busy allocation that `can_satisfy_request()` adds to `alloc_resources`.
 
 ### NodeOverlay
 
@@ -236,7 +245,10 @@ operator caps and reserved memory from `NodeConfig`.
 ### GpuResource
 
 Individual GPU: `device_id` (positional), `gpu_type` (e.g. "mi300x"),
-`memory_mb`, `peer_gpus`, `link_type` (PCIe/XGMI/NVLink), `stable_id`.
+`memory_mb`, `peer_gpus`, `link_type` (PCIe/XGMI/NVLink), `stable_id`,
+`numa_node`, `affinity_cpus` (from `[[devices.gres]] cores=`; empty means
+"use `numa_node`'s CPUs"). The latter two feed `core_layout`'s per-GPU
+reserved-core placement.
 Allocation keys on `stable_id`, not positional `device_id`, so a mid-set GPU
 removal does not renumber existing allocations.
 
@@ -258,6 +270,33 @@ greedy availability-aware placement for the total case.
 
 Parses `"gpu:mi300x:4"` -> `(name, type, count)`. Trims whitespace, rejects
 empty strings.
+
+### Core layout (`core_layout.rs`)
+
+`CoreLayout::compute()` splits a node's online CPUs into `spec_cpus` (held
+for spurd/spurctld daemons, `[[nodes]] core_spec_count`/`cpu_spec_list`),
+`gpu_reserved` (per-GPU `GpuReservedCpus`, from `restricted_cores_per_gpu`;
+each GPU takes the lowest-numbered free cores of its affinity -- its
+`cores=` list if set, else its NUMA node's), `trimmed_cpus` (general CPUs a
+`[[nodes]] cpus` cap puts out of jobs' reach when cores are reserved per
+GPU), and `general_cpus` (the rest). `compute()` takes the node's previous
+`reserved_picks`: a GPU keeps its earlier reserved cores while they are still
+near it, online, not spec, and inside any cap; a GPU short of its count fills
+from the lowest free cores. If that sticky fill cannot fit every GPU, every
+GPU is re-picked fresh, lowest-first.
+`Ok(None)` when a node sets neither spec nor reserved cores.
+`CoreLayout::pools()` reduces this to `CpuPools`
+(general count + per-GPU reserved count), consumed by `spur-sched` for
+placement fit and by the agent for admission; `None` without per-GPU
+reservations keeps the old single-pool check. `fingerprint()` (FNV-1a) lets
+the agent tell a changed layout from the one it already holds; `0` means "no
+layout held" and is reserved.
+
+`restart_only_node_changes()` diffs two `[[nodes]]` tables for changes that
+would alter a node's layout (spec cores, `restricted_cores_per_gpu`); such a
+change is rejected by live `reconfigure` because an uneven recompute between
+leader and followers would change isolation before failover -- it needs a
+full controller restart.
 
 ---
 
@@ -414,7 +453,9 @@ register/update/state-change/remove, partition/reservation CRUD, k0s lifecycle.
 
 `JobStep`: sub-execution within a running job (srun inside sbatch). Tracks its
 own resources, task distribution (Block/Cyclic/Plane/Arbitrary), state
-(Pending/Running/Completed/Failed/Cancelled).
+(Pending/Running/Completed/Failed/Cancelled/OutOfMemory). `OutOfMemory` is a
+step killed by its own memory limit or the job's. `Cancelled` also ends a step
+whose client gave up before it ran (`CompleteJobStep` with `cancelled`).
 
 Special step IDs match Slurm's `slurm.h` sentinels: `STEP_BATCH` (0xFFFFFFFB),
 `STEP_EXTERN` (0xFFFFFFFC), `STEP_INTERACTIVE` (0xFFFFFFFA). User srun steps

@@ -255,9 +255,8 @@ allocation (:ref:`see the step resource flags <step-own-share>`):
    srun --container-image=batch.sqsh -c 8 --mem=32G --gpus=1 ./process.sh &
    wait
 
-Each such step has its own root filesystem, mount and PID namespaces, ``/tmp``
-and ``/dev/shm``, its own cgroup with the CPU, memory and GPU limits it asked
-for, and only its own GPUs. It still runs as your user and shares the node's
+Each such step runs from its own image in its own cgroup, with the CPU, memory
+and GPU share it asked for held for it, and only its own GPUs. It still runs as your user and shares the node's
 network namespace with the rest of the allocation.
 
 Exec Into a Running Container Job

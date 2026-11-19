@@ -48,6 +48,7 @@ pub mod reservation;
 pub mod resource;
 pub mod spur_env;
 pub mod step;
+pub mod step_shape;
 pub mod task_launch;
 pub mod time_spec;
 pub mod topology;

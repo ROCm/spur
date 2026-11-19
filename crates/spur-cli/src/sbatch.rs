@@ -1,7 +1,12 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::env_defaults::{apply_csv, apply_str, apply_string, env_first, was_cli_set};
+use crate::env_defaults::{
+    apply_csv, apply_num_opt_nonzero, apply_str, apply_string, env_first, was_cli_set,
+};
+use crate::resource_opts::{
+    option_source, requests_gpus, require_gpus, surviving, CPU_CONFLICT, MEM_CONFLICT,
+};
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -46,10 +51,10 @@ pub struct SbatchArgs {
     #[arg(
         short = 'c',
         long,
-        default_value = "1",
-        overrides_with = "cpus_per_task"
+        overrides_with = "cpus_per_task",
+        value_parser = clap::value_parser!(u32).range(1..)
     )]
-    pub cpus_per_task: u32,
+    pub cpus_per_task: Option<u32>,
 
     /// Memory per node (e.g., "4G", "4096M", "4096")
     #[arg(long, overrides_with = "mem")]
@@ -58,6 +63,14 @@ pub struct SbatchArgs {
     /// Memory per CPU
     #[arg(long, overrides_with = "mem_per_cpu")]
     pub mem_per_cpu: Option<String>,
+
+    /// CPUs per allocated GPU
+    #[arg(long, overrides_with = "cpus_per_gpu", value_parser = clap::value_parser!(u32).range(1..))]
+    pub cpus_per_gpu: Option<u32>,
+
+    /// Memory per allocated GPU (e.g., "8G")
+    #[arg(long, overrides_with = "mem_per_gpu")]
+    pub mem_per_gpu: Option<String>,
 
     /// Generic resources (e.g., "gpu:4", "gpu:mi300x:8")
     // Matches Slurm: `value_delimiter` keeps a single comma-list cumulative,
@@ -358,22 +371,30 @@ pub fn resolve_sbatch_args(
     let dir = SbatchArgs::try_parse_from(&directive_argv)?;
 
     let mut resolved = merge_resolved(&cli_matches, cli, dir);
-    resolve_sbatch_env(&cli_matches, &mut resolved);
+    resolve_sbatch_env(&cli_matches, &mut resolved)?;
+    resolve_option_conflicts(&cli_matches, &mut resolved)
+        .map_err(|e| clap_err(clap::error::ErrorKind::ArgumentConflict, e))?;
     Ok(resolved)
 }
 
-/// Apply `SBATCH_*` environment-variable defaults, each preceded by its
-/// `SPUR_*` native twin, to any flag not set on the command line.
-///
-/// Runs after the directive merge so an env value overrides a `#SBATCH`
-/// directive, and skips CLI-set flags so the command line still wins.
-///
-/// Flags whose `SPUR_*` twin is also injected into every running job's
-/// environment (`SPUR_JOB_NAME`, `SPUR_NODELIST`) take the `SBATCH_*` name
-/// only: reading the twin would make an `sbatch` submitted from inside a job
-/// silently inherit the enclosing job's name or node placement. Real Slurm
-/// does not inherit either for `sbatch`.
-fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) {
+/// Wrap an anyhow error from a Slurm option-source/conflict check as a clap
+/// error so it exits through the same path as `resolve_sbatch_args`'s other
+/// failures (usage error to stderr, exit code 2).
+fn clap_err(kind: clap::error::ErrorKind, e: anyhow::Error) -> clap::Error {
+    clap::Error::raw(kind, format!("{e}\n"))
+}
+
+const CPUS_PER_GPU_ENV: &[&str] = &["SBATCH_CPUS_PER_GPU"];
+const MEM_PER_GPU_ENV: &[&str] = &["SBATCH_MEM_PER_GPU"];
+const MEM_ENV: &[&str] = &["SPUR_MEM_PER_NODE", "SBATCH_MEM"];
+const MEM_PER_CPU_ENV: &[&str] = &["SPUR_MEM_PER_CPU", "SBATCH_MEM_PER_CPU"];
+
+const MEM_ENV_CONFLICT: &str =
+    "SBATCH_MEM, SBATCH_MEM_PER_CPU, and SBATCH_MEM_PER_GPU are mutually exclusive";
+
+/// Apply `SBATCH_*`/`SPUR_*` env-var defaults, after the directive merge, to any
+/// flag not set on the command line (see crate AGENTS.md for the output-twin exclusions).
+fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) -> clap::error::Result<()> {
     apply_str(
         matches,
         "job_name",
@@ -392,17 +413,26 @@ fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) {
         &["SPUR_ACCOUNT", "SBATCH_ACCOUNT"],
         &mut args.account,
     );
-    apply_str(
-        matches,
-        "mem",
-        &["SPUR_MEM_PER_NODE", "SBATCH_MEM"],
-        &mut args.mem,
-    );
+    apply_str(matches, "mem", MEM_ENV, &mut args.mem);
     apply_str(
         matches,
         "mem_per_cpu",
-        &["SPUR_MEM_PER_CPU", "SBATCH_MEM_PER_CPU"],
+        MEM_PER_CPU_ENV,
         &mut args.mem_per_cpu,
+    );
+    apply_num_opt_nonzero(
+        matches,
+        "cpus_per_gpu",
+        CPUS_PER_GPU_ENV,
+        "--cpus-per-gpu",
+        &mut args.cpus_per_gpu,
+    )
+    .map_err(|e| clap_err(clap::error::ErrorKind::ValueValidation, e))?;
+    apply_str(
+        matches,
+        "mem_per_gpu",
+        MEM_PER_GPU_ENV,
+        &mut args.mem_per_gpu,
     );
     apply_csv(
         matches,
@@ -469,6 +499,58 @@ fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) {
             args.nodefile = None;
         }
     }
+
+    Ok(())
+}
+
+/// Resolve the CPU and memory per-GPU conflict groups with Slurm's
+/// option-source rule: two explicit (CLI/directive) or two env sources in the
+/// same group is an error; one explicit source silently drops any env ones.
+fn resolve_option_conflicts(matches: &ArgMatches, args: &mut SbatchArgs) -> Result<()> {
+    let src = |id: &str, env: &[&str], set: bool| option_source(was_cli_set(matches, id), env, set);
+
+    // `cpus_per_task` has no input env var here (only `cpus_per_gpu` does), so
+    // an env-vs-env conflict in this group can never fire; `CPU_CONFLICT`
+    // covers both arguments.
+    let keep = surviving(
+        &[
+            src("cpus_per_task", &[], args.cpus_per_task.is_some()),
+            src(
+                "cpus_per_gpu",
+                CPUS_PER_GPU_ENV,
+                args.cpus_per_gpu.is_some(),
+            ),
+        ],
+        CPU_CONFLICT,
+        CPU_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.cpus_per_task = None;
+    }
+    if !keep[1] {
+        args.cpus_per_gpu = None;
+    }
+
+    let keep = surviving(
+        &[
+            src("mem", MEM_ENV, args.mem.is_some()),
+            src("mem_per_cpu", MEM_PER_CPU_ENV, args.mem_per_cpu.is_some()),
+            src("mem_per_gpu", MEM_PER_GPU_ENV, args.mem_per_gpu.is_some()),
+        ],
+        MEM_CONFLICT,
+        MEM_ENV_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.mem = None;
+    }
+    if !keep[1] {
+        args.mem_per_cpu = None;
+    }
+    if !keep[2] {
+        args.mem_per_gpu = None;
+    }
+
+    Ok(())
 }
 
 /// True when neither the CLI nor an env var set the field. `value_source` is
@@ -506,6 +588,8 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(cpus_per_task, "cpus_per_task");
     fallback!(mem, "mem");
     fallback!(mem_per_cpu, "mem_per_cpu");
+    fallback!(cpus_per_gpu, "cpus_per_gpu");
+    fallback!(mem_per_gpu, "mem_per_gpu");
     fallback!(gpus, "gpus");
     fallback!(gpus_per_node, "gpus_per_node");
     fallback!(gpus_per_task, "gpus_per_task");
@@ -657,7 +741,7 @@ fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
-fn parse_memory_mb(s: &str) -> Result<u64> {
+pub(crate) fn parse_memory_mb(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
         let val: f64 = gb.parse().context("invalid memory value")?;
@@ -862,6 +946,16 @@ pub(crate) fn build_sbatch_job_spec(
         gpus_per_task.is_some(),
         &gres,
     )?;
+    require_gpus(
+        args.cpus_per_gpu.is_some(),
+        args.mem_per_gpu.is_some(),
+        requests_gpus(
+            gpus.is_some(),
+            gpus_per_node.is_some(),
+            gpus_per_task.is_some(),
+            &gres,
+        ),
+    )?;
     // Don't push licenses into gres here — proto_to_job_spec already folds them in.
 
     // Parse time limit — use parse_time_seconds so that short values like
@@ -880,6 +974,11 @@ pub(crate) fn build_sbatch_job_spec(
     let memory_per_node = args.mem.as_ref().map(|m| parse_memory_mb(m)).transpose()?;
     let memory_per_cpu = args
         .mem_per_cpu
+        .as_ref()
+        .map(|m| parse_memory_mb(m))
+        .transpose()?;
+    let memory_per_gpu = args
+        .mem_per_gpu
         .as_ref()
         .map(|m| parse_memory_mb(m))
         .transpose()?;
@@ -913,7 +1012,7 @@ pub(crate) fn build_sbatch_job_spec(
         num_nodes: args.nodes,
         num_tasks: effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
-        cpus_per_task: args.cpus_per_task,
+        cpus_per_task: args.cpus_per_task.unwrap_or(0),
         memory_per_node_mb: memory_per_node.unwrap_or(0),
         memory_per_cpu_mb: memory_per_cpu.unwrap_or(0),
         gres,
@@ -1002,6 +1101,8 @@ pub(crate) fn build_sbatch_job_spec(
         initial_winsize: None,
         submit_line: submit_line.to_string(),
         client_keepalive: false,
+        cpus_per_gpu: args.cpus_per_gpu,
+        memory_per_gpu_mb: memory_per_gpu.unwrap_or(0),
     })
 }
 
@@ -1039,6 +1140,13 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
+
+    crate::resource_opts::require_per_gpu_options_capability(
+        &mut client,
+        job_spec.cpus_per_gpu,
+        job_spec.memory_per_gpu_mb,
+    )
+    .await?;
 
     let response = client
         .submit_job(SubmitJobRequest {
@@ -1153,6 +1261,12 @@ async fn wait_for_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_c_zero_is_rejected_by_clap() {
+        let err = SbatchArgs::command().try_get_matches_from(["sbatch", "-c", "0", "job.sh"]);
+        assert!(err.is_err(), "-c 0 must be a clap parse error");
+    }
 
     #[test]
     fn build_sbatch_job_spec_rejects_empty_file() {
@@ -1450,6 +1564,36 @@ echo "hello world"
         );
     }
 
+    /// An old controller that does not advertise `CAP_PER_GPU_OPTIONS` must
+    /// refuse before `SubmitJob`, not drop `--cpus-per-gpu` silently.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn per_gpu_options_without_the_capability_refuse_before_submit() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_ping_capabilities(vec![]);
+        let err = main_with_args(vec![
+            "sbatch".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "--export".into(),
+            "NONE".into(),
+            "--wrap".into(),
+            "echo hi".into(),
+            "--gpus".into(),
+            "1".into(),
+            "--cpus-per-gpu".into(),
+            "4".into(),
+        ])
+        .await
+        .expect_err("an old controller must refuse --cpus-per-gpu");
+        assert!(
+            err.to_string().contains("does not support --cpus-per-gpu"),
+            "got: {err}"
+        );
+        assert_eq!(capture.submit_job_calls(), 0);
+    }
+
     #[tokio::test]
     #[serial(env_injection)]
     async fn test_submit_path_builds_spec_with_defaulted_ntasks() {
@@ -1641,11 +1785,169 @@ echo "hello world"
 
     #[test]
     fn test_cli_can_override_default_value_arg() {
-        // `--cpus-per-task` has default_value = "1". Verify directive sets it
-        // and CLI overrides — no surprises from the default interacting with
-        // overrides_with.
+        // Verify directive sets it and CLI overrides — no surprises from
+        // `overrides_with` now that the flag has no clap default.
         let args = parse_merged(&["--cpus-per-task=4"], &["sbatch", "--cpus-per-task=8"]);
-        assert_eq!(args.cpus_per_task, 8);
+        assert_eq!(args.cpus_per_task, Some(8));
+    }
+
+    // --- --cpus-per-gpu / --mem-per-gpu ---
+
+    #[test]
+    fn cpus_per_task_defaults_to_zero_when_unset() {
+        let args = parse_merged(&[], &["sbatch", "--wrap", "hostname"]);
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert_eq!(spec.cpus_per_task, 0);
+    }
+
+    #[test]
+    fn cpus_per_task_cli_flag_sets_value() {
+        let args = parse_merged(&[], &["sbatch", "-c", "4", "--wrap", "hostname"]);
+        let spec = build_sbatch_job_spec(args, None, "sbatch -c 4 --wrap hostname").expect("spec");
+        assert_eq!(spec.cpus_per_task, 4);
+    }
+
+    #[test]
+    fn cpus_per_task_directive_sets_value() {
+        let args = parse_merged(&["-c", "4"], &["sbatch", "--wrap", "hostname"]);
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert_eq!(spec.cpus_per_task, 4);
+    }
+
+    #[test]
+    fn cpus_per_gpu_with_gres_sets_spec_field_and_leaves_cpus_per_task_unset() {
+        let args = parse_merged(
+            &[],
+            &[
+                "sbatch",
+                "--gres=gpu:2",
+                "--cpus-per-gpu=8",
+                "--wrap",
+                "hostname",
+            ],
+        );
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert_eq!(spec.cpus_per_gpu, Some(8));
+        assert_eq!(spec.cpus_per_task, 0);
+    }
+
+    #[test]
+    fn cpus_per_gpu_and_cpus_per_task_both_cli_conflict() {
+        let argv = ["sbatch", "--cpus-per-gpu=8", "-c", "2"].map(String::from);
+        let err = resolve_sbatch_args(&[], &argv).unwrap_err();
+        assert!(err.to_string().contains(CPU_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    fn cpus_per_gpu_cli_and_cpus_per_task_directive_both_explicit_conflict() {
+        let argv = ["sbatch", "--cpus-per-gpu=8"].map(String::from);
+        let directives = ["-c", "2"].map(String::from);
+        let err = resolve_sbatch_args(&directives, &argv).unwrap_err();
+        assert!(err.to_string().contains(CPU_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_dropped_when_cli_sets_cpus_per_task() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_CPUS_PER_GPU", "8");
+        let argv = ["sbatch", "-c", "2", "--gres=gpu:1"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        assert_eq!(args.cpus_per_gpu, None);
+        assert_eq!(args.cpus_per_task, Some(2));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_overrides_directive() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_CPUS_PER_GPU", "8");
+        let args = parse_merged(&["--cpus-per-gpu=4", "--gres=gpu:1"], &["sbatch"]);
+        assert_eq!(args.cpus_per_gpu, Some(8));
+    }
+
+    #[test]
+    fn mem_per_gpu_sets_spec_field() {
+        let args = parse_merged(
+            &[],
+            &[
+                "sbatch",
+                "--mem-per-gpu=8G",
+                "--gres=gpu:1",
+                "--wrap",
+                "hostname",
+            ],
+        );
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert_eq!(spec.memory_per_gpu_mb, 8192);
+    }
+
+    #[test]
+    fn mem_and_mem_per_gpu_both_cli_conflict() {
+        let argv = ["sbatch", "--mem=4G", "--mem-per-gpu=8G"].map(String::from);
+        let err = resolve_sbatch_args(&[], &argv).unwrap_err();
+        assert!(err.to_string().contains(MEM_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_mem_per_gpu_dropped_when_cli_sets_mem() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_MEM_PER_GPU", "8G");
+        let argv = ["sbatch", "--mem=4G", "--gres=gpu:1"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        assert_eq!(args.mem.as_deref(), Some("4G"));
+        assert_eq!(args.mem_per_gpu, None);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_mem_per_gpu_and_mem_per_cpu_conflict() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_MEM_PER_GPU", "8G");
+        env.set("SBATCH_MEM_PER_CPU", "512M");
+        let argv = ["sbatch", "--gres=gpu:1"].map(String::from);
+        let err = resolve_sbatch_args(&[], &argv).unwrap_err();
+        assert!(err.to_string().contains(MEM_ENV_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    fn cpus_per_gpu_without_gpus_rejected() {
+        let args = parse_merged(&[], &["sbatch", "--cpus-per-gpu=8", "--wrap", "hostname"]);
+        let err = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").unwrap_err();
+        assert_eq!(err.to_string(), "--cpus-per-gpu requires a GPU request");
+    }
+
+    #[test]
+    fn cpus_per_gpu_zero_is_rejected_on_cli() {
+        let argv = ["sbatch", "--cpus-per-gpu=0", "--gres=gpu:1"].map(String::from);
+        let err = resolve_sbatch_args(&[], &argv).unwrap_err();
+        assert!(err.to_string().contains("--cpus-per-gpu"), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_zero_is_rejected() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_CPUS_PER_GPU", "0");
+        let argv = ["sbatch", "--gres=gpu:1"].map(String::from);
+        let err = resolve_sbatch_args(&[], &argv).unwrap_err();
+        assert!(
+            err.to_string().contains("SBATCH_CPUS_PER_GPU"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_cpus_per_gpu_and_mem_per_gpu_twins_not_read_as_input() {
+        let env = EnvGuard::new();
+        env.set("SPUR_CPUS_PER_GPU", "8");
+        env.set("SPUR_MEM_PER_GPU", "1024");
+        let args = parse_merged(&[], &["sbatch", "--wrap", "hostname"]);
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert_eq!(spec.cpus_per_gpu, None);
+        assert_eq!(spec.memory_per_gpu_mb, 0);
     }
 
     // SBATCH_*/SPUR_* env vars provide defaults (CLI > env > directive). These
@@ -1777,7 +2079,6 @@ echo "hello world"
         env.set("SPUR_ACCOUNT", "proj");
         env.set("SPUR_QOS", "high");
         env.set("SPUR_MEM_PER_NODE", "8G");
-        env.set("SPUR_MEM_PER_CPU", "512M");
         env.set("SPUR_GRES", "gpu:2,fpga:1");
         env.set("SPUR_OUTPUT", "out.log");
         env.set("SPUR_ERROR", "err.log");
@@ -1790,7 +2091,6 @@ echo "hello world"
         assert_eq!(args.account.as_deref(), Some("proj"));
         assert_eq!(args.qos.as_deref(), Some("high"));
         assert_eq!(args.mem.as_deref(), Some("8G"));
-        assert_eq!(args.mem_per_cpu.as_deref(), Some("512M"));
         assert_eq!(args.gres, vec!["gpu:2", "fpga:1"]);
         assert_eq!(args.output.as_deref(), Some("out.log"));
         assert_eq!(args.error.as_deref(), Some("err.log"));
@@ -1799,6 +2099,17 @@ echo "hello world"
         assert_eq!(args.reservation.as_deref(), Some("maint"));
         assert_eq!(args.distribution.as_deref(), Some("cyclic"));
         assert_eq!(args.export, "NONE");
+    }
+
+    // SPUR_MEM_PER_CPU's twin is tested on its own: combined with
+    // SPUR_MEM_PER_NODE above it would now trip the mem/mem-per-cpu conflict.
+    #[test]
+    #[serial(env_injection)]
+    fn test_spur_mem_per_cpu_twin_provides_default() {
+        let env = EnvGuard::new();
+        env.set("SPUR_MEM_PER_CPU", "512M");
+        let args = parse_merged(&[], &["sbatch"]);
+        assert_eq!(args.mem_per_cpu.as_deref(), Some("512M"));
     }
 
     #[test]

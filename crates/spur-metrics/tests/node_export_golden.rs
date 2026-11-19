@@ -71,6 +71,8 @@ fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {
             link_type: GpuLinkType::XGMI,
             topology: None,
             stable_id: i as u64,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         });
     }
     ResourceSet {

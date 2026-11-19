@@ -742,7 +742,14 @@ pub struct ClusterManager {
     /// sweep can tell an abandoned reservation from one still being dispatched.
     /// Leader-local, never persisted: a new leader has issued no launches yet.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
+    /// Spared retries granted for held-reserved refusals, so a stuck leftover can't
+    /// re-dispatch forever without charging `max_batch_requeue`. Leader-local; a failover reset is harmless.
+    spared_dispatches: parking_lot::Mutex<HashMap<JobId, u32>>,
 }
+
+/// Spared retries a job gets before its held-reserved refusals count against
+/// `max_batch_requeue`, so a stuck leftover cannot re-dispatch it forever.
+const MAX_SPARED_DISPATCHES: u32 = 5;
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
 /// its finalization can be recognized and users can't spoof one. The full name
@@ -824,6 +831,43 @@ pub(crate) fn hook_memory_mb(
             .max()
             .unwrap_or(0)
     })
+}
+
+/// CPUs on the job's fullest node, the CPU count PrologSlurmctld reports.
+pub(crate) fn hook_cpus(
+    spec: &JobSpec,
+    per_node_alloc: &HashMap<String, ResourceAllocations>,
+) -> u32 {
+    per_node_alloc
+        .values()
+        .map(|alloc| alloc.cpus)
+        .max()
+        .unwrap_or(spec.cpus_per_task)
+}
+
+/// The HookContext for a job's EpilogSlurmctld run.
+fn epilog_hook_context(job_id: JobId, job: Option<&Job>) -> spur_core::hooks::HookContext {
+    spur_core::hooks::HookContext {
+        job_id,
+        work_dir: job
+            .map(|j| j.spec.work_dir.clone())
+            .unwrap_or_else(|| "/tmp".into()),
+        uid: job.map(|j| j.spec.uid).unwrap_or(0),
+        gid: job.map(|j| j.spec.gid).unwrap_or(0),
+        partition: job
+            .and_then(|j| j.spec.partition.clone())
+            .unwrap_or_default(),
+        nodelist: job.map(|j| j.allocated_nodes.join(",")).unwrap_or_default(),
+        script_context: "epilog_slurmctld".into(),
+        gpu_devices: Vec::new(),
+        // Same value PrologSlurmctld reports, so a script can't see them disagree.
+        cpus: job
+            .map(|j| hook_cpus(&j.spec, &j.per_node_alloc))
+            .unwrap_or(1),
+        memory_mb: job
+            .map(|j| hook_memory_mb(&j.spec, &j.per_node_alloc))
+            .unwrap_or(0),
+    }
 }
 
 /// What a run is charged to, recorded with its placement.
@@ -1130,6 +1174,7 @@ impl ClusterManager {
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
+            spared_dispatches: parking_lot::Mutex::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1329,7 +1374,7 @@ impl ClusterManager {
                 .filter(|n| claimed.contains(n.name.as_str()))
                 .filter(|n| {
                     placement.matches_for_reservation(n, reservations, now)
-                        && n.total_resources.can_satisfy(&required)
+                        && n.can_ever_satisfy(&required)
                 })
                 .map(|n| n.name.as_str())
                 .collect();
@@ -1457,7 +1502,23 @@ impl ClusterManager {
         self.run_job_submit_hook(&mut spec, &partitions)?;
         // The hook may rewrite constraint and GPU fields that were validated above.
         spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
+        // After the hook: it may drop the GPU request the per-GPU options need.
+        validate_per_gpu_options(&spec)?;
 
+        // Re-validate partition limits when this filled a value: EnforcePartLimits
+        // would otherwise only catch a breach at schedule time.
+        let cpu_per_gpu_filled =
+            apply_default_cpu_per_gpu(&mut spec, &partitions, config.scheduler.def_cpu_per_gpu);
+        if cpu_per_gpu_filled && config.scheduler.enforce_part_limits != EnforcePartLimits::No {
+            validate_partition_limits(
+                &spec,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+                user_requested_time,
+                &self.nodes.read(),
+                &self.get_reservations(),
+            )?;
+        }
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
         // that actually governs the job. A limit the hook set is left alone.
@@ -2434,7 +2495,7 @@ impl ClusterManager {
         // Close the step as the client's own CompleteJobStep would, so its exit
         // reaches DerivedExitCode whichever report lands first.
         if target.step_open {
-            self.record_step_complete(exit.job_id, exit.step_id, effective_exit)?;
+            self.record_step_complete(exit.job_id, exit.step_id, effective_exit, oom, false)?;
         }
         if !target.ends_job {
             return Ok(PtyExitOutcome::StepClosed);
@@ -3084,6 +3145,9 @@ impl ClusterManager {
                 job_id
             );
         }
+        // A successful dispatch resets the spared-retries count: the stuck
+        // leftover that earned them is gone.
+        self.spared_dispatches.lock().remove(&job_id);
 
         let nodelist = spur_core::hostlist::compress(&node_names);
         let node_count = node_names.len().max(1) as u32;
@@ -3148,6 +3212,7 @@ impl ClusterManager {
                 idle_fill,
                 // Seconds granularity preserves sub-minute limits like --time=0:00:30.
                 time_limit_secs: spec_for_notify.time_limit.map(|d| d.num_seconds()),
+                alloc_cpus: crate::accounting::db::allocated_cpus(&per_node_alloc),
             });
         }
 
@@ -3205,6 +3270,19 @@ impl ClusterManager {
     /// The launches this controller currently has on the wire.
     pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
         &self.dispatch_tracker
+    }
+
+    /// Grants one more spared retry for a held-reserved refusal, up to
+    /// [`MAX_SPARED_DISPATCHES`]; past the cap the refusal counts against
+    /// `max_batch_requeue` like any other.
+    pub(crate) fn take_spared_dispatch(&self, job_id: JobId) -> bool {
+        let mut spared = self.spared_dispatches.lock();
+        let used = spared.entry(job_id).or_insert(0);
+        if *used >= MAX_SPARED_DISPATCHES {
+            return false;
+        }
+        *used += 1;
+        true
     }
 
     /// Record completion from one allocated node (multi-node COMPLETING flow).
@@ -3895,30 +3973,7 @@ impl ClusterManager {
             return;
         };
         let job = self.get_job(job_id);
-        let ctx = spur_core::hooks::HookContext {
-            job_id,
-            work_dir: job
-                .as_ref()
-                .map(|j| j.spec.work_dir.clone())
-                .unwrap_or_else(|| "/tmp".into()),
-            uid: job.as_ref().map(|j| j.spec.uid).unwrap_or(0),
-            gid: job.as_ref().map(|j| j.spec.gid).unwrap_or(0),
-            partition: job
-                .as_ref()
-                .and_then(|j| j.spec.partition.clone())
-                .unwrap_or_default(),
-            nodelist: job
-                .as_ref()
-                .map(|j| j.allocated_nodes.join(","))
-                .unwrap_or_default(),
-            script_context: "epilog_slurmctld".into(),
-            gpu_devices: Vec::new(),
-            cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
-            memory_mb: job
-                .as_ref()
-                .map(|j| hook_memory_mb(&j.spec, &j.per_node_alloc))
-                .unwrap_or(0),
-        };
+        let ctx = epilog_hook_context(job_id, job.as_ref());
         tokio::spawn(async move {
             if let Err(e) = spur_core::hooks::run_hook(&epilog_ctld, &ctx).await {
                 warn!(job_id, error = %e, "EpilogSlurmctld failed");
@@ -4130,10 +4185,12 @@ impl ClusterManager {
     /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
     /// bookkeeping is gated on a real transition out of Running, so without this a
     /// flaky node's job would be reassigned to it every tick, forever unbounded.
+    /// `spare_requeue_budget` holds it without charging `max_batch_requeue`.
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
         run_attempt: u32,
+        spare_requeue_budget: bool,
     ) -> anyhow::Result<()> {
         let (begin_time, at_max_requeue) = {
             let jobs = self.jobs.read();
@@ -4145,14 +4202,15 @@ impl ClusterManager {
                 // failed confirmation and this call — nothing to back off.
                 return Ok(());
             }
-            let at_max_requeue = job.requeue_count >= self.config().controller.max_batch_requeue;
+            let at_max_requeue = !spare_requeue_budget
+                && job.requeue_count >= self.config().controller.max_batch_requeue;
             (self.launch_backoff_until(job), at_max_requeue)
         };
 
         self.propose(WalOperation::JobDispatchBackoff {
             job_id,
             begin_time,
-            spare_requeue_budget: false,
+            spare_requeue_budget,
             run_attempt,
             at_max_requeue,
         })?;
@@ -4956,11 +5014,13 @@ impl ClusterManager {
     /// layouts differ — an enforcement error alone does not help, but a corrected
     /// policy must still reach a failing node — and at most once per interval for
     /// the same layout; a node whose layout cannot be computed is never asked.
+    /// Blocked reserved CPUs are kept only when the agent holds the expected layout.
     pub fn record_layout_heartbeat(
         &self,
         name: &str,
         held_fingerprint: u64,
         enforcement_error: &str,
+        blocked: &[spur_proto::proto::GpuBlockedCpus],
     ) -> bool {
         let mut nodes = self.nodes.write();
         let Some(node) = nodes.get_mut(name) else {
@@ -4969,6 +5029,11 @@ impl ClusterManager {
         node.layout_enforce_error =
             (!enforcement_error.is_empty()).then(|| enforcement_error.to_string());
         let expected = node.core_layout.as_ref().map_or(0, CoreLayout::fingerprint);
+        node.layout_blocked_cpus = if held_fingerprint == expected {
+            reported_blocked_cpus(node, blocked)
+        } else {
+            BTreeMap::new()
+        };
         if node.layout_error.is_some() {
             return false;
         }
@@ -5994,11 +6059,15 @@ impl ClusterManager {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+        oom_killed: bool,
+        cancelled: bool,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::JobStepComplete {
             job_id,
             step_id,
             exit_code,
+            oom_killed,
+            cancelled,
         })?;
         Ok(())
     }
@@ -6442,9 +6511,12 @@ impl ClusterManager {
             });
 
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
-                match resource_impossible_reason(job, &nodes, &reservations) {
-                    Some(reason) => GateOutcome::Block(reason),
-                    None => GateOutcome::Keep,
+                let Some(reason) = resource_impossible_reason(job, &nodes, &reservations) else {
+                    return GateOutcome::Keep;
+                };
+                match general_pool_shortfall(job, &nodes, &reservations) {
+                    Some(desc) => GateOutcome::BlockDescribed(reason, desc),
+                    None => GateOutcome::Block(reason),
                 }
             });
         }
@@ -8505,15 +8577,18 @@ impl ClusterManager {
 
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
-    fn complete_job_steps(&self, job_id: &JobId, exit_code: i32, timestamp: DateTime<Utc>) {
+    /// `job_oom`: the job ended out of memory, which took its live steps with it.
+    fn complete_job_steps(
+        &self,
+        job_id: &JobId,
+        exit_code: i32,
+        job_oom: bool,
+        timestamp: DateTime<Utc>,
+    ) {
         let mut steps = self.steps.write();
         for step in steps.values_mut() {
             if step.job_id == *job_id && !step.state.is_terminal() {
-                step.state = if exit_code == 0 {
-                    StepState::Completed
-                } else {
-                    StepState::Failed
-                };
+                step.state = step_end_state(exit_code, job_oom, false);
                 step.exit_code = Some(exit_code);
                 step.end_time = Some(timestamp);
             }
@@ -8521,14 +8596,6 @@ impl ClusterManager {
         drop(steps);
         // Licenses are not returned here: usage is derived from running jobs, so a
         // job leaving the running set frees its licenses automatically.
-    }
-
-    /// Finalize steps for all evicted jobs returned by remove_node / health check.
-    pub fn complete_evicted_steps(&self, evicted: &[JobFinalized]) {
-        let now = Utc::now();
-        for fin in evicted {
-            self.complete_job_steps(&fin.job_id, fin.exit_code, now);
-        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -8589,7 +8656,7 @@ impl ClusterManager {
                     total.memory_mb / node_count as u64,
                 )
             });
-            node.alloc_resources.subtract(&slice);
+            node.release(&slice);
             node.update_state_from_alloc();
         }
     }
@@ -9235,7 +9302,7 @@ impl ClusterManager {
                 drop(nodes);
                 // Fire accounting for the terminated run as PREEMPTED, even
                 // though the job itself is now Pending-with-hold.
-                self.complete_job_steps(job_id, -1, timestamp);
+                self.complete_job_steps(job_id, -1, false, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
                     jobs_finalized: vec![finalized],
@@ -9339,7 +9406,7 @@ impl ClusterManager {
                     // Complete steps and fire accounting-end for the terminated
                     // run as REQUEUED; the terminal path already did this at its
                     // real completion, so it emits nothing here (no double-count).
-                    self.complete_job_steps(job_id, -1, timestamp);
+                    self.complete_job_steps(job_id, -1, false, timestamp);
                     return ClientResponse {
                         jobs_finalized: vec![finalized],
                         ..Default::default()
@@ -9422,14 +9489,14 @@ impl ClusterManager {
                                     total.memory_mb / node_count as u64,
                                 )
                             });
-                            node.alloc_resources.subtract(&slice);
+                            node.release(&slice);
                             node.update_state_from_alloc();
                         }
                     }
                 }
                 drop(jobs);
                 drop(nodes);
-                self.complete_job_steps(job_id, -1, timestamp);
+                self.complete_job_steps(job_id, -1, false, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
                     jobs_finalized: vec![finalized],
@@ -9581,7 +9648,7 @@ impl ClusterManager {
                                 resources.memory_mb / node_count as u64,
                             )
                         });
-                        node.alloc_resources.add(&slice);
+                        node.hold(&slice);
                         node.update_state_from_alloc();
                     }
                 }
@@ -9653,7 +9720,7 @@ impl ClusterManager {
                                         total.memory_mb / node_count as u64,
                                     )
                                 });
-                                node.alloc_resources.subtract(&slice);
+                                node.release(&slice);
                                 node.update_state_from_alloc();
                             }
                         }
@@ -9679,7 +9746,8 @@ impl ClusterManager {
                 if let Some(finalized) = finalized {
                     drop(jobs);
                     drop(nodes);
-                    self.complete_job_steps(job_id, finalized.exit_code, timestamp);
+                    let oom = finalized.state == JobState::OutOfMemory;
+                    self.complete_job_steps(job_id, finalized.exit_code, oom, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
                     return ClientResponse {
                         jobs_finalized: vec![finalized],
@@ -9887,30 +9955,32 @@ impl ClusterManager {
                 drop(jobs);
                 drop(nodes);
                 // A re-pended victim's run ended as preempted (-1), not as reported.
-                let steps_exit_code = response
-                    .jobs_finalized
-                    .first()
-                    .map_or(*exit_code, |finalized| finalized.exit_code);
-                self.complete_job_steps(job_id, steps_exit_code, timestamp);
+                let finalized = response.jobs_finalized.first();
+                let steps_exit_code = finalized.map_or(*exit_code, |f| f.exit_code);
+                let oom = finalized.is_some_and(|f| f.state == JobState::OutOfMemory);
+                self.complete_job_steps(job_id, steps_exit_code, oom, timestamp);
             }
             WalOperation::JobStepComplete {
                 job_id,
                 step_id,
                 exit_code,
+                oom_killed,
+                cancelled,
             } => {
-                // Keyed on job state, not step state: the eviction sweep
-                // (complete_evicted_steps) runs leader-only, so steps can diverge.
+                // A step of a job that ended stays closed with the job's own result.
                 let job_over = jobs.get(job_id).is_some_and(|j| j.state.is_terminal());
-                if !job_over {
+                // First end wins: a late completion must not rewrite a step already closed.
+                let already_ended = self
+                    .steps
+                    .read()
+                    .get(&(*job_id, *step_id))
+                    .is_some_and(|s| s.state.is_terminal());
+                if !job_over && !already_ended {
                     // Record the step's own exit code/state.
                     {
                         let mut steps = self.steps.write();
                         if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
-                            step.state = if *exit_code == 0 {
-                                StepState::Completed
-                            } else {
-                                StepState::Failed
-                            };
+                            step.state = step_end_state(*exit_code, *oom_killed, *cancelled);
                             step.exit_code = Some(*exit_code);
                             step.end_time = Some(timestamp);
                         }
@@ -9918,8 +9988,9 @@ impl ClusterManager {
                     // DerivedExitCode is the running max over srun steps (the batch
                     // step is excluded — it carries the job's own exit, not a step
                     // result). Maintained live so `scontrol show job` reflects it
-                    // mid-run, matching Slurm.
-                    if spur_core::step::is_user_step(*step_id) {
+                    // mid-run, matching Slurm. A cancelled step never ran, so it
+                    // must not move the derived exit code.
+                    if spur_core::step::is_user_step(*step_id) && !*cancelled {
                         if let Some(job) = jobs.get_mut(job_id) {
                             job.derived_exit_code = job.derived_exit_code.max(*exit_code);
                         }
@@ -10218,6 +10289,15 @@ impl ClusterManager {
                     for (preemptor, freed) in freed_for_preemptor {
                         self.record_preempt_freed_nodes(&jobs, &freed, preemptor);
                     }
+                    drop(jobs);
+                    drop(nodes);
+                    // Closed in the apply, not by a leader-side sweep, so every replica agrees.
+                    for fin in &response.jobs_finalized {
+                        let oom = fin.state == JobState::OutOfMemory;
+                        self.complete_job_steps(&fin.job_id, fin.exit_code, oom, timestamp);
+                    }
+                    self.next_job_id.store(next_id, Ordering::Relaxed);
+                    return response;
                 }
             }
             WalOperation::NodeLabelsUpdate { name, set, remove } => {
@@ -10300,6 +10380,15 @@ impl ClusterManager {
                     reason = reason.as_deref().unwrap_or(""),
                     "node removed from cluster"
                 );
+                drop(jobs);
+                drop(nodes);
+                // Closed in the apply, not by a leader-side sweep, so every replica agrees.
+                for fin in &response.jobs_finalized {
+                    let oom = fin.state == JobState::OutOfMemory;
+                    self.complete_job_steps(&fin.job_id, fin.exit_code, oom, timestamp);
+                }
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                return response;
             }
             WalOperation::NodeInventoryUpdate { inventory } => {
                 let reservations = self.reservations.read();
@@ -10691,6 +10780,9 @@ impl ClusterManager {
                     self.next_step_id
                         .write()
                         .retain(|id, _| !evicted.contains(id));
+                    self.spared_dispatches
+                        .lock()
+                        .retain(|id, _| !evicted.contains(id));
                 }
             }
         }
@@ -10891,17 +10983,18 @@ impl ClusterManager {
             node.weight = nc.weight;
             // Compute the layout before clamping so spec cores are excluded from
             // the schedulable CPU count (and CPUEfctv), not left over-advertised.
+            // CPUs a cap trims are excluded too: the cap may round down to whole cores.
             self.recompute_core_layout(node, Some(nc));
-            let spec_cpus = node
+            let excluded_cpus = node
                 .core_layout
                 .as_ref()
-                .map(|l| l.spec_cpus.len() as u32)
+                .map(|l| (l.spec_cpus.len() + l.trimmed_cpus.len()) as u32)
                 .unwrap_or(0);
             node.total_resources = node.detected_resources.clamped(
                 nc.cpus,
                 nc.memory_mb,
                 nc.reserved_memory_mb,
-                spec_cpus,
+                excluded_cpus,
             );
             // An unset memory cap prevents config validation from detecting this
             // scheduling stall until the agent reports its inventory.
@@ -10935,12 +11028,16 @@ impl ClusterManager {
         self.derive_core_layout(node, nc);
         if node.core_layout.as_ref().map(CoreLayout::fingerprint) != before {
             node.layout_seq += 1;
+            // The agent's counts were taken against the old reserved CPUs.
+            node.layout_blocked_cpus.clear();
         }
+        node.sync_reserved_tag();
     }
 
     fn derive_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
         let Some(nc) = nc else {
             node.core_layout = None;
+            node.reserved_picks.clear();
             node.layout_error = None;
             node.spec_memory_mb = 0;
             return;
@@ -10951,6 +11048,7 @@ impl ClusterManager {
         // shared `names="ALL"` spec policy does not make them unschedulable.
         if matches!(node.source, NodeSource::Kubernetes { .. }) {
             node.core_layout = None;
+            node.reserved_picks.clear();
             node.layout_error = None;
             return;
         }
@@ -10958,14 +11056,20 @@ impl ClusterManager {
         match CoreLayout::compute(
             node.detected_resources.topology.as_ref(),
             &settings,
+            &node.detected_resources.gpus,
             node.detected_resources.memory_mb,
+            &node.reserved_picks,
         ) {
             Ok(layout) => {
+                node.reserved_picks = layout
+                    .as_ref()
+                    .map(|l| l.gpu_reserved.clone())
+                    .unwrap_or_default();
                 node.core_layout = layout;
                 node.layout_error = None;
             }
-            // Keep the last good layout: dropping it would reach the agent as a
-            // clear and free the reserved cores under running jobs.
+            // Keep the last good layout and its picks: dropping it would reach
+            // the agent as a clear and free the reserved cores under running jobs.
             Err(e) => node.layout_error = Some(e.to_string()),
         }
     }
@@ -11150,7 +11254,7 @@ fn job_candidate_node_names(job: &Job, nodes: &[spur_core::node::Node]) -> Vec<S
             placement.allows_name(&node.name)
                 && placement.in_partition(node)
                 && placement.has_features(node)
-                && node.total_resources.can_satisfy(&required)
+                && node.can_ever_satisfy(&required)
         })
         .map(|n| n.name.clone())
         .collect()
@@ -11363,10 +11467,41 @@ fn resource_impossible_reason(
     let unknown_inventory = |n: &&Node| n.total_resources.cpus == 0 && n.state.is_up();
     let impossible = !eligible.is_empty()
         && !eligible.iter().any(unknown_inventory)
-        && !eligible
-            .iter()
-            .any(|n| n.total_resources.can_satisfy(&required));
+        && !eligible.iter().any(|n| n.can_ever_satisfy(&required));
     impossible.then_some(PendingReason::NodeConfigUnavailable)
+}
+
+/// Why a job no eligible node can ever hold would fit if the GPUs' reserved
+/// cores were general; `None` when some node is simply too small.
+fn general_pool_shortfall(
+    job: &Job,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<String> {
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let now = chrono::Utc::now();
+    let required = spur_sched::backfill::job_resource_request(job);
+    let gpus = required.gpus.len() as u32;
+    let (general, need) = nodes
+        .values()
+        .filter(|n| placement.eligible(n, reservations, now))
+        .filter(|n| n.total_resources.can_satisfy(&required))
+        .filter_map(|n| {
+            let pools = n.cpu_pools()?;
+            let share = spur_core::core_layout::reserved_share(
+                required.cpus,
+                gpus.saturating_mul(pools.reserved_per_gpu),
+            );
+            Some((pools.general, required.cpus - share))
+        })
+        .max_by_key(|(general, _)| *general)?;
+    let available =
+        format!("at most {general} per node are available outside GPU-reserved and spec cores");
+    Some(if gpus == 0 {
+        format!("CPU-only job needs {need} CPUs; {available}")
+    } else {
+        format!("GPU job needs {need} CPUs beyond its GPUs' reserved cores; {available}")
+    })
 }
 
 /// One capped resource whose limits, summed over the partitions sharing a
@@ -11562,7 +11697,7 @@ fn structural_unplaceable_reason(
     let k0s_recoverable = |n: &&Node| {
         n.is_k0s_reserved()
             && placement.matches_ignoring_k0s(n, reservations, now)
-            && n.total_resources.can_satisfy(&required)
+            && n.can_ever_satisfy(&required)
     };
 
     if placement.additive_listed_node_unavailable(
@@ -11579,7 +11714,7 @@ fn structural_unplaceable_reason(
             .iter()
             .filter(|n| {
                 placement.is_listed(&n.name)
-                    && n.total_resources.can_satisfy(&required)
+                    && n.can_ever_satisfy(&required)
                     && !placement.matches_for_reservation(n, reservations, now)
             })
             .collect();
@@ -12724,10 +12859,7 @@ impl<'a> ReuseView<'a> {
 /// job's CPU/node/mem/GPU footprint identically.
 fn job_tres(job: &Job) -> TresRecord {
     let mut tres = TresRecord::new();
-    tres.set(
-        TresType::Cpu,
-        (job.spec.num_tasks * job.spec.cpus_per_task) as u64,
-    );
+    tres.set(TresType::Cpu, job.spec.total_cpus());
     tres.set(TresType::Node, job.spec.num_nodes as u64);
     tres.set(
         TresType::Memory,
@@ -12927,6 +13059,26 @@ pub(crate) fn evaluate_registration(
         Some(node) if node.detected_resources != *incoming_resources => RegistrationAction::Update,
         Some(_) => RegistrationAction::Skip,
     }
+}
+
+/// The heartbeat's blocked counts, for GPUs this node has: an unknown id
+/// would otherwise sit in the map until the next layout change.
+fn reported_blocked_cpus(
+    node: &Node,
+    blocked: &[spur_proto::proto::GpuBlockedCpus],
+) -> BTreeMap<u64, u32> {
+    blocked
+        .iter()
+        .filter(|b| {
+            b.cpus > 0
+                && node
+                    .total_resources
+                    .gpus
+                    .iter()
+                    .any(|g| g.stable_id == b.stable_id)
+        })
+        .map(|b| (b.stable_id, b.cpus))
+        .collect()
 }
 
 /// Returns true if a node matches a partition's membership criteria.
@@ -13353,6 +13505,65 @@ impl WallCaps {
     }
 }
 
+/// Fills `--cpus-per-gpu` for a GPU job that set neither it nor `-c`, from the
+/// partition's default (if all agree) else the scheduler's; returns whether it filled a value.
+fn apply_default_cpu_per_gpu(
+    spec: &mut JobSpec,
+    partitions: &[Partition],
+    scheduler_default: Option<u32>,
+) -> bool {
+    if spec.cpus_per_gpu.is_some() || !spec.cpus_per_task_unset {
+        return false;
+    }
+    if matches!(
+        spur_core::gpu_request::resolve_gpu_demand(spec),
+        Ok(spur_core::gpu_request::GpuDemand::None) | Err(_)
+    ) {
+        return false;
+    }
+    let requested = partitions_for_defaulting(spec, partitions);
+    let first = requested.first().and_then(|p| p.def_cpu_per_gpu);
+    let agreed = first.filter(|_| requested.iter().all(|p| p.def_cpu_per_gpu == first));
+    spec.cpus_per_gpu = agreed.or(scheduler_default);
+    spec.cpus_per_gpu.is_some()
+}
+
+/// The CLI resolves option sources, so these fire only for a genuine double
+/// request or a REST/gRPC client that sets both.
+fn validate_per_gpu_options(spec: &JobSpec) -> Result<(), SubmitError> {
+    let memory_options = [
+        spec.memory_per_node_mb.is_some(),
+        spec.memory_per_cpu_mb.is_some(),
+        spec.memory_per_gpu_mb.is_some(),
+    ];
+    if memory_options.iter().filter(|set| **set).count() > 1 {
+        return Err(SubmitError::invalid(
+            "--mem, --mem-per-cpu, and --mem-per-gpu are mutually exclusive",
+        ));
+    }
+    if spec.cpus_per_gpu == Some(0) {
+        return Err(SubmitError::invalid("--cpus-per-gpu must be at least 1"));
+    }
+    if spec.cpus_per_gpu.is_some() && !spec.cpus_per_task_unset {
+        return Err(SubmitError::invalid(
+            "--cpus-per-gpu cannot be combined with --cpus-per-task (-c)",
+        ));
+    }
+    let has_gpus = !matches!(
+        spur_core::gpu_request::resolve_gpu_demand(spec),
+        Ok(spur_core::gpu_request::GpuDemand::None)
+    );
+    if spec.cpus_per_gpu.is_some() && !has_gpus {
+        return Err(SubmitError::invalid(
+            "--cpus-per-gpu requires a GPU request",
+        ));
+    }
+    if spec.memory_per_gpu_mb.is_some() && !has_gpus {
+        return Err(SubmitError::invalid("--mem-per-gpu requires a GPU request"));
+    }
+    Ok(())
+}
+
 /// Fill in a job's wall-time when none was requested. Each requested partition
 /// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
 /// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
@@ -13510,6 +13721,20 @@ fn validate_user_account(
             spec.user,
             valid_accounts.join(", ")
         ))),
+    }
+}
+
+/// A step's end state from its exit code, whether memory ran out under it,
+/// and whether the client gave up on it before it ran.
+fn step_end_state(exit_code: i32, oom_killed: bool, cancelled: bool) -> StepState {
+    if cancelled {
+        StepState::Cancelled
+    } else if oom_killed {
+        StepState::OutOfMemory
+    } else if exit_code == 0 {
+        StepState::Completed
+    } else {
+        StepState::Failed
     }
 }
 
@@ -13820,6 +14045,7 @@ pub(crate) mod tests {
                 def_mem_per_node: None,
                 def_mem_per_cpu: None,
                 def_mem_per_gpu: None,
+                def_cpu_per_gpu: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -14684,6 +14910,8 @@ state = "UP"
                         }),
                         ..Default::default()
                     }),
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -15255,6 +15483,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }
     }
 
@@ -15541,6 +15770,95 @@ state = "UP"
         .expect("activate");
         settle(&cm, id, JobState::Running);
         assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 4);
+    }
+
+    /// Spared retries for a held-reserved refusal are capped, so a stuck
+    /// leftover cannot re-dispatch a job forever without ever charging its
+    /// requeue budget; a successful dispatch resets the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spared_dispatches_stop_after_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("spared"));
+
+        for _ in 0..5 {
+            assert!(cm.take_spared_dispatch(id));
+        }
+        assert!(
+            !cm.take_spared_dispatch(id),
+            "the cap must stop spared retries"
+        );
+
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+
+        assert!(
+            cm.take_spared_dispatch(id),
+            "a successful dispatch resets the spared-retries count"
+        );
+    }
+
+    /// Drives the same two calls `confirm_dispatch_on_nodes` makes when every
+    /// failed node refused on held-reserved CPUs (`reserved_held == failures`):
+    /// `take_spared_dispatch` gates `spare_requeue_budget` into
+    /// `backoff_pending_job_after_dispatch_failure`. The requeue count must
+    /// stay flat while spared retries remain, then grow once the cap is hit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_cpus_held_refusals_charge_the_budget_after_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("reserved-held-cap"));
+
+        for attempt in 1..=MAX_SPARED_DISPATCHES {
+            let spare_requeue_budget = cm.take_spared_dispatch(id);
+            assert!(
+                spare_requeue_budget,
+                "attempt {attempt} must still be spared"
+            );
+            cm.backoff_pending_job_after_dispatch_failure(id, attempt, spare_requeue_budget)
+                .unwrap();
+            wait_for("spared backoff applied", || {
+                cm.get_job(id).is_some_and(|j| j.run_attempt == attempt)
+            });
+            assert_eq!(
+                cm.get_job(id).unwrap().requeue_count,
+                0,
+                "a spared retry must never charge the budget (attempt {attempt})"
+            );
+        }
+
+        let final_attempt = MAX_SPARED_DISPATCHES + 1;
+        let spare_requeue_budget = cm.take_spared_dispatch(id);
+        assert!(!spare_requeue_budget, "the cap must stop spared retries");
+        cm.backoff_pending_job_after_dispatch_failure(id, final_attempt, spare_requeue_budget)
+            .unwrap();
+        wait_for("budget charged past the cap", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16605,6 +16923,7 @@ state = "UP"
             def_mem_per_node: None,
             def_mem_per_cpu: None,
             def_mem_per_gpu: None,
+            def_cpu_per_gpu: None,
         });
         config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
         let cm = test_cluster_with_config(&dir, config).await;
@@ -16754,6 +17073,98 @@ state = "UP"
         assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
     }
 
+    fn invalid_message(err: SubmitError) -> String {
+        match err {
+            SubmitError::InvalidArgument(message) => message,
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_gpu_options_need_a_gpu_request() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut cpus = basic_spec("cpus");
+        cpus.cpus_per_gpu = Some(8);
+        cpus.cpus_per_task_unset = true;
+        let err = invalid_message(cm.submit_job(cpus).unwrap_err());
+        assert_eq!(err, "--cpus-per-gpu requires a GPU request");
+
+        let mut mem = basic_spec("mem");
+        mem.memory_per_gpu_mb = Some(1024);
+        let err = invalid_message(cm.submit_job(mem).unwrap_err());
+        assert_eq!(err, "--mem-per-gpu requires a GPU request");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpus_per_gpu_zero_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("zero");
+        spec.gres = vec!["gpu:1".into()];
+        spec.cpus_per_gpu = Some(0);
+        spec.cpus_per_task_unset = true;
+        let err = invalid_message(cm.submit_job(spec).unwrap_err());
+        assert_eq!(err, "--cpus-per-gpu must be at least 1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpus_per_gpu_cannot_be_combined_with_c() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("both");
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_gpu = Some(8);
+        spec.cpus_per_task = 1;
+        let err = invalid_message(cm.submit_job(spec).unwrap_err());
+        assert_eq!(
+            err,
+            "--cpus-per-gpu cannot be combined with --cpus-per-task (-c)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_options_are_mutually_exclusive() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("mem");
+        spec.gres = vec!["gpu:1".into()];
+        spec.memory_per_gpu_mb = Some(1024);
+        spec.memory_per_cpu_mb = Some(512);
+        let err = invalid_message(cm.submit_job(spec).unwrap_err());
+        assert_eq!(
+            err,
+            "--mem, --mem-per-cpu, and --mem-per-gpu are mutually exclusive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_dropping_the_gpus_of_a_per_gpu_job_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"gres":[]}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        let mut spec = basic_spec("hooked");
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_gpu = Some(8);
+        spec.cpus_per_task_unset = true;
+        let err = invalid_message(cm.submit_job(spec).unwrap_err());
+        assert_eq!(err, "--cpus-per-gpu requires a GPU request");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_per_gpu_job_with_gpus_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("ok");
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_gpu = Some(8);
+        spec.cpus_per_task_unset = true;
+        spec.memory_per_gpu_mb = Some(1024);
+        cm.submit_job(spec)
+            .expect("a GPU job may size CPUs and memory per GPU");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_hook_constraint_rewrite_is_revalidated() {
         for constraint in ["GPU.vram>=1GiB", "gpu.vram>=1GiB"] {
@@ -16888,6 +17299,7 @@ state = "UP"
             def_mem_per_node: None,
             def_mem_per_cpu: None,
             def_mem_per_gpu: None,
+            def_cpu_per_gpu: None,
         });
         config.hooks.job_submit_lua = Some(write_lua_script(
             &dir,
@@ -17156,6 +17568,8 @@ state = "UP"
             link_type: spur_core::resource::GpuLinkType::XGMI,
             topology: None,
             stable_id,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         }
     }
 
@@ -18749,6 +19163,655 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steps_killed_by_memory_end_out_of_memory() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("oom-steps")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        for step_id in [0, 1, 2] {
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(spur_core::step::JobStep {
+                    job_id: 1,
+                    step_id,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: spur_core::resource::ResourceAllocations::default(),
+                    nodes: vec!["worker1".into()],
+                    distribution: spur_core::step::TaskDistribution::Block,
+                    start_time: Some(Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    pty: false,
+                    job_shell: false,
+                }),
+            });
+        }
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 137,
+            oom_killed: true,
+            cancelled: false,
+        });
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 137,
+            oom_killed: false,
+            cancelled: false,
+        });
+        assert_eq!(cm.get_step(1, 0).unwrap().state, StepState::OutOfMemory);
+        assert_eq!(cm.get_step(1, 1).unwrap().state, StepState::Failed);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
+            at: None,
+            run_attempt: 0,
+        });
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::OutOfMemory);
+        assert_eq!(
+            cm.get_step(1, 2).unwrap().state,
+            StepState::OutOfMemory,
+            "a step still running when the job ran out of memory is not COMPLETED"
+        );
+        assert_eq!(cm.get_step(1, 1).unwrap().state, StepState::Failed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_step_ends_cancelled_and_leaves_the_derived_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("cancelled-step")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        for step_id in [1, 2] {
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(spur_core::step::JobStep {
+                    job_id: 1,
+                    step_id,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: spur_core::resource::ResourceAllocations::default(),
+                    nodes: vec!["worker1".into()],
+                    distribution: spur_core::step::TaskDistribution::Block,
+                    start_time: Some(Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    pty: false,
+                    job_shell: false,
+                }),
+            });
+        }
+
+        // Prime DerivedExitCode with a real step exit first, so the cancelled
+        // step's own (nonzero) exit_code has a chance to wrongly overwrite it
+        // if the `!cancelled` guard were ever lost.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
+        });
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 3);
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 2,
+            exit_code: 7,
+            oom_killed: false,
+            cancelled: true,
+        });
+        assert_eq!(cm.get_step(1, 2).unwrap().state, StepState::Cancelled);
+        assert_eq!(
+            cm.get_job(1).unwrap().derived_exit_code,
+            3,
+            "a cancelled step's exit_code must not reach DerivedExitCode"
+        );
+    }
+
+    /// First end wins: a late `cancelled` completion must not rewrite a step
+    /// already recorded COMPLETED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_completion_does_not_overwrite_a_completed_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("first-end-wins")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 1,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["worker1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            }),
+        });
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 0,
+            oom_killed: false,
+            cancelled: false,
+        });
+        assert_eq!(cm.get_step(1, 1).unwrap().state, StepState::Completed);
+
+        // A retry srun gave up on arrives after the step already completed.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 1,
+            oom_killed: false,
+            cancelled: true,
+        });
+        let step = cm.get_step(1, 1).unwrap();
+        assert_eq!(
+            step.state,
+            StepState::Completed,
+            "the first end (COMPLETED) must stand"
+        );
+        assert_eq!(step.exit_code, Some(0));
+    }
+
+    /// A node-loss eviction must close the evicted job's steps in the apply
+    /// itself, not via a leader-only sweep: otherwise a replica that never ran
+    /// the sweep (a follower) applies a late completion the leader already
+    /// dropped as a stale duplicate, and the two diverge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_steps_close_identically_on_every_replica() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cm_a = test_cluster(&dir_a).await;
+        let cm_b = test_cluster(&dir_b).await;
+
+        let register = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
+            labels: HashMap::new(),
+            source: NodeSource::default(),
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        };
+        let mut spec = basic_spec("evicted-steps");
+        spec.requeue = true;
+        let submit = WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(spec),
+        };
+        let alloc = scalar_alloc(2, 4000);
+        let start = WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["n1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        };
+        let step_create = WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            }),
+        };
+        // Stamped like a real proposal: every replica must apply the same
+        // instant, not each read its own clock.
+        let evicted_at = Utc::now();
+        let down = WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("health check failed".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: Some(evicted_at),
+        };
+        let requeue = WalOperation::job_state_change(1, JobState::NodeFail, JobState::Pending);
+        let complete = WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 1,
+            oom_killed: false,
+            cancelled: false,
+        };
+
+        for cm in [&cm_a, &cm_b] {
+            cm.apply_operation(&register);
+            cm.apply_operation(&submit);
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cm.apply_operation(&start);
+            cm.apply_operation(&step_create);
+        }
+
+        cm_a.apply_operation(&down);
+        cm_b.apply_operation(&down);
+
+        // The close happens in the apply itself, before any requeue or stale
+        // completion has a chance to race it.
+        for cm in [&cm_a, &cm_b] {
+            let step = cm.get_step(1, 0).unwrap();
+            assert!(
+                step.state.is_terminal(),
+                "node-loss eviction must close the step immediately"
+            );
+            assert_eq!(step.exit_code, Some(-1));
+            assert_eq!(step.end_time, Some(evicted_at));
+        }
+
+        cm_a.apply_operation(&requeue);
+        cm_b.apply_operation(&requeue);
+
+        cm_a.apply_operation(&complete);
+        cm_b.apply_operation(&complete);
+
+        // A stale completion arriving after requeue must not reopen the
+        // already-closed step.
+        for cm in [&cm_a, &cm_b] {
+            assert_eq!(
+                cm.get_step(1, 0).unwrap().exit_code,
+                Some(-1),
+                "a late completion must not overwrite the eviction's close"
+            );
+        }
+
+        let step_a = cm_a.get_step(1, 0).unwrap();
+        let step_b = cm_b.get_step(1, 0).unwrap();
+        assert_eq!(step_a.exit_code, step_b.exit_code);
+        assert_eq!(step_a.state, step_b.state);
+        assert_eq!(step_a.end_time, step_b.end_time);
+        assert_eq!(
+            cm_a.get_job(1).unwrap().derived_exit_code,
+            cm_b.get_job(1).unwrap().derived_exit_code
+        );
+    }
+
+    /// Same guarantee as above, via node removal rather than a health-check
+    /// Down transition: `NodeRemove`'s apply arm has its own
+    /// `complete_job_steps()` call, and a replica that skipped it would
+    /// diverge here too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_steps_close_identically_via_node_remove() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cm_a = test_cluster(&dir_a).await;
+        let cm_b = test_cluster(&dir_b).await;
+
+        let register = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
+            labels: HashMap::new(),
+            source: NodeSource::default(),
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        };
+        let submit = WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("evicted-steps-remove")),
+        };
+        let alloc = scalar_alloc(2, 4000);
+        let start = WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["n1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        };
+        let step_create = WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            }),
+        };
+        let removed_at = Utc::now();
+        let remove = WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: Some("force removed".into()),
+            at: Some(removed_at),
+            agent_instance: String::new(),
+            comm_url: None,
+        };
+
+        for cm in [&cm_a, &cm_b] {
+            cm.apply_operation(&register);
+            cm.apply_operation(&submit);
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cm.apply_operation(&start);
+            cm.apply_operation(&step_create);
+        }
+
+        cm_a.apply_operation(&remove);
+        cm_b.apply_operation(&remove);
+
+        for cm in [&cm_a, &cm_b] {
+            let step = cm.get_step(1, 0).unwrap();
+            assert!(
+                step.state.is_terminal(),
+                "node removal must close the step immediately"
+            );
+            assert_eq!(step.exit_code, Some(-1));
+            assert_eq!(step.end_time, Some(removed_at));
+        }
+
+        let step_a = cm_a.get_step(1, 0).unwrap();
+        let step_b = cm_b.get_step(1, 0).unwrap();
+        assert_eq!(step_a.exit_code, step_b.exit_code);
+        assert_eq!(step_a.state, step_b.state);
+        assert_eq!(step_a.end_time, step_b.end_time);
+    }
+
+    /// A job without `spec.requeue` stays in its terminal NodeFail state:
+    /// nothing proposes the Pending transition, so the step's eviction close
+    /// must not depend on one happening.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_steps_close_without_requeue_stay_terminal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("evicted-steps-no-requeue")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["n1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            }),
+        });
+
+        let evicted_at = Utc::now();
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("health check failed".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: Some(evicted_at),
+        });
+
+        assert_eq!(
+            cm.get_job(1).unwrap().state,
+            JobState::NodeFail,
+            "spec.requeue is false, so nothing requeues this job"
+        );
+        let step = cm.get_step(1, 0).unwrap();
+        assert!(step.state.is_terminal());
+        assert_eq!(step.exit_code, Some(-1));
+        assert_eq!(step.end_time, Some(evicted_at));
+    }
+
+    /// The reverse order: a real completion arriving after a step was
+    /// already recorded CANCELLED must not overwrite it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_real_completion_does_not_overwrite_a_cancelled_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("first-end-wins-reverse")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 1,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["worker1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            }),
+        });
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 0,
+            oom_killed: false,
+            cancelled: true,
+        });
+        assert_eq!(cm.get_step(1, 1).unwrap().state, StepState::Cancelled);
+        let before = cm.get_job(1).unwrap().derived_exit_code;
+
+        // A real completion for the step the controller already closed.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
+        });
+        let step = cm.get_step(1, 1).unwrap();
+        assert_eq!(
+            step.state,
+            StepState::Cancelled,
+            "the first end (CANCELLED) must stand"
+        );
+        assert_eq!(step.exit_code, Some(0));
+        assert_eq!(
+            cm.get_job(1).unwrap().derived_exit_code,
+            before,
+            "the derived exit code must not move either"
+        );
+    }
+
+    #[test]
+    fn a_job_step_complete_entry_without_cancelled_still_replays() {
+        let json = r#"{"JobStepComplete":{"job_id":1,"step_id":1,"exit_code":3}}"#;
+        let op: WalOperation = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobStepComplete {
+                cancelled: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_node_complete_oom_sets_out_of_memory() {
         // spurd reports an OOM kill as SIGKILL with the OOM sentinel bit OR'd in.
         // The job must finalize as OUT_OF_MEMORY / Reason=OutOfMemory, with the
@@ -18911,12 +19974,16 @@ state = "UP"
             job_id: 1,
             step_id: 0,
             exit_code: 7,
+            oom_killed: false,
+            cancelled: false,
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 1,
             exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
         });
         // 3 < 7, running max stays 7.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
@@ -18924,6 +19991,8 @@ state = "UP"
             job_id: 1,
             step_id: 2,
             exit_code: 2,
+            oom_killed: false,
+            cancelled: false,
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
 
@@ -18994,6 +20063,8 @@ state = "UP"
             job_id: 1,
             step_id: 0,
             exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -19012,6 +20083,8 @@ state = "UP"
             job_id: 1,
             step_id: 0,
             exit_code: 9,
+            oom_killed: false,
+            cancelled: false,
         });
 
         let after = cm.get_step(1, 0).expect("step still present");
@@ -19060,6 +20133,8 @@ state = "UP"
             job_id: 1,
             step_id: 0,
             exit_code: 5,
+            oom_killed: false,
+            cancelled: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -19123,6 +20198,8 @@ state = "UP"
             job_id: 1,
             step_id: STEP_BATCH,
             exit_code: 9,
+            oom_killed: false,
+            cancelled: false,
         });
         // Reserved step id -> derived untouched.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
@@ -20844,6 +21921,8 @@ state = "UP"
             job_id,
             step_id: 0,
             exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
         });
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id,
@@ -24670,6 +25749,76 @@ state = "UP"
         let mut spec = basic_spec("yearlong");
         spec.time_limit = Some(chrono::Duration::days(365));
         assert!(cm.submit_job(spec).is_ok());
+    }
+
+    /// `def_cpu_per_gpu` has to follow the submit hook, so a partition CPU cap
+    /// it would breach must be re-checked after it fills a value, not only
+    /// validated against the job's (still-zero) requested CPUs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enforce_part_limits_all_rejects_a_def_cpu_per_gpu_breach_at_submit() {
+        use spur_core::resource::ResourceSet;
+
+        fn gpu_job_spec() -> JobSpec {
+            let mut spec = basic_spec("gpu-job");
+            spec.cpus_per_task_unset = true;
+            spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+            spec
+        }
+
+        async fn register_two_gpu_node(cm: &ClusterManager) {
+            cm.register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 16,
+                    memory_mb: 32000,
+                    gpus: vec![gpu_resource(0, 0x1), gpu_resource(1, 0x2)],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+            wait_for("n1 registered", || cm.get_node("n1").is_some());
+        }
+
+        // A 2-GPU job fits an 8-CPU-per-node cap with `-c` unset (0 requested),
+        // but not once def_cpu_per_gpu=8 fills in 16 CPUs across its 2 GPUs.
+        let dir_all = TempDir::new().unwrap();
+        let mut cfg_all = test_config();
+        cfg_all.partitions[0].max_cpus_per_node = Some(8);
+        cfg_all.scheduler.def_cpu_per_gpu = Some(8);
+        cfg_all.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        let cm_all = test_cluster_with_config(&dir_all, cfg_all).await;
+        register_two_gpu_node(&cm_all).await;
+        let err = cm_all.submit_job(gpu_job_spec()).expect_err(
+            "def_cpu_per_gpu filling in 16 CPUs on an 8-CPU-capped partition must be rejected",
+        );
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("max_tres_per_node.cpu"),
+            "expected the CPU cap named, got: {msg}"
+        );
+
+        // EnforcePartLimits=No still admits (and would pend on the cap instead).
+        let dir_no = TempDir::new().unwrap();
+        let mut cfg_no = test_config();
+        cfg_no.partitions[0].max_cpus_per_node = Some(8);
+        cfg_no.scheduler.def_cpu_per_gpu = Some(8);
+        let cm_no = test_cluster_with_config(&dir_no, cfg_no).await;
+        register_two_gpu_node(&cm_no).await;
+        assert!(
+            cm_no.submit_job(gpu_job_spec()).is_ok(),
+            "EnforcePartLimits=No must still admit"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29250,6 +30399,268 @@ state = "UP"
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QosGrpCpuLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_cpus_per_gpu_job_charges_qos_its_per_gpu_cpus() {
+        // A `--cpus-per-gpu` job needs more CPUs than tasks x -c; the group cap
+        // must see them.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.qos_cache().insert(Qos {
+            name: "grp".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("g1");
+        s1.qos = Some("grp".into());
+        s1.gres = vec!["gpu:2".into()];
+        s1.cpus_per_gpu = Some(2);
+        s1.cpus_per_task_unset = true;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("g2");
+        s2.qos = Some("grp".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosGrpCpuLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_cpus_per_gpu_job_charges_its_account_its_per_gpu_cpus() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("c1");
+        s1.account = Some("research".into());
+        s1.gres = vec!["gpu:2".into()];
+        s1.cpus_per_gpu = Some(2);
+        s1.cpus_per_task_unset = true;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("c2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocGrpCpuLimit
+        );
+    }
+
+    #[test]
+    fn job_tres_charges_the_job_total_including_cpus_per_gpu() {
+        let mut spec = basic_spec("per-gpu");
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_gpu = Some(8);
+        let job = Job::new(1, spec);
+        assert_eq!(job_tres(&job).get(TresType::Cpu), 16);
+    }
+
+    /// 4 general CPUs and 2 GPUs reserving 4 CPUs each, in partition "default".
+    fn reserved_layout_node() -> Node {
+        use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let gpu = |id: u64| GpuResource {
+            device_id: id as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id: id,
+            topology: None,
+            numa_node: None,
+            affinity_cpus: vec![],
+        };
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 12,
+                memory_mb: 16000,
+                gpus: vec![gpu(1), gpu(2)],
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Idle;
+        node.partitions = vec!["default".into()];
+        node.core_layout = Some(CoreLayout {
+            spec_cpus: vec![],
+            mem_spec_mb: 0,
+            gpu_reserved: vec![
+                GpuReservedCpus {
+                    stable_id: 1,
+                    cpus: vec![0, 1, 2, 3],
+                },
+                GpuReservedCpus {
+                    stable_id: 2,
+                    cpus: vec![4, 5, 6, 7],
+                },
+            ],
+            general_cpus: vec![8, 9, 10, 11],
+            daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        });
+        node
+    }
+
+    #[test]
+    fn a_cpu_only_job_bigger_than_the_general_pool_is_never_runnable() {
+        let node = reserved_layout_node();
+        let nodes: HashMap<String, Node> = [("n1".to_string(), node.clone())].into();
+        let mut spec = basic_spec("big");
+        spec.partition = Some("default".into());
+        spec.num_tasks = 6;
+        let big = Job::new(1, spec.clone());
+        assert_eq!(
+            resource_impossible_reason(&big, &nodes, &[]),
+            Some(PendingReason::NodeConfigUnavailable)
+        );
+        assert!(job_candidate_node_names(&big, std::slice::from_ref(&node)).is_empty());
+
+        spec.num_tasks = 4;
+        let fits = Job::new(2, spec);
+        assert_eq!(resource_impossible_reason(&fits, &nodes, &[]), None);
+    }
+
+    #[test]
+    fn hook_cpus_reports_the_fullest_node() {
+        let spec = basic_spec("hook");
+        let allocs: HashMap<String, ResourceAllocations> = [
+            ("a".to_string(), ResourceAllocations::with_scalar(16, 0)),
+            ("b".to_string(), ResourceAllocations::with_scalar(8, 0)),
+        ]
+        .into();
+        assert_eq!(hook_cpus(&spec, &allocs), 16);
+        assert_eq!(hook_cpus(&spec, &HashMap::new()), 1);
+    }
+
+    #[test]
+    fn epilog_hook_context_reports_the_same_cpus_as_the_prolog() {
+        let mut spec = basic_spec("epilog-cpus");
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_gpu = Some(8);
+        let mut job = Job::new(42, spec.clone());
+        job.allocated_nodes = vec!["a".to_string(), "b".to_string()];
+        job.per_node_alloc = [
+            ("a".to_string(), ResourceAllocations::with_scalar(16, 0)),
+            ("b".to_string(), ResourceAllocations::with_scalar(8, 0)),
+        ]
+        .into();
+
+        let ctx = epilog_hook_context(42, Some(&job));
+        assert_eq!(ctx.cpus, hook_cpus(&spec, &job.per_node_alloc));
+        assert_eq!(ctx.cpus, 16);
+    }
+
+    #[test]
+    fn a_general_pool_shortfall_is_described() {
+        let node = reserved_layout_node();
+        let nodes: HashMap<String, Node> = [("n1".to_string(), node)].into();
+        let mut spec = basic_spec("big");
+        spec.partition = Some("default".into());
+        spec.num_tasks = 6;
+        assert_eq!(
+            general_pool_shortfall(&Job::new(1, spec.clone()), &nodes, &[]).as_deref(),
+            Some(
+                "CPU-only job needs 6 CPUs; at most 4 per node are available outside \
+                 GPU-reserved and spec cores"
+            )
+        );
+
+        spec.num_tasks = 1;
+        spec.cpus_per_task = 10;
+        spec.gres = vec!["gpu:1".into()];
+        assert_eq!(
+            general_pool_shortfall(&Job::new(2, spec.clone()), &nodes, &[]).as_deref(),
+            Some(
+                "GPU job needs 6 CPUs beyond its GPUs' reserved cores; at most 4 per node \
+                 are available outside GPU-reserved and spec cores"
+            )
+        );
+
+        spec.cpus_per_task = 13;
+        assert_eq!(
+            general_pool_shortfall(&Job::new(3, spec), &nodes, &[]),
+            None,
+            "too big for the whole node is not a pool shortfall"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_job_shows_its_general_pool_shortfall() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.nodes.write().insert("n1".into(), reserved_layout_node());
+        let mut spec = basic_spec("big");
+        spec.partition = Some("default".into());
+        spec.num_tasks = 6;
+        let id = submit_and_wait(&cm, spec);
+        cm.refresh_pending_reasons();
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::NodeConfigUnavailable);
+        assert!(
+            job.state_reason_display()
+                .contains("outside GPU-reserved and spec cores"),
+            "{}",
+            job.state_reason_display()
+        );
+    }
+
+    #[test]
+    fn a_gpu_job_covered_by_its_reserved_cores_is_runnable() {
+        let node = reserved_layout_node();
+        let nodes: HashMap<String, Node> = [("n1".to_string(), node.clone())].into();
+        let mut spec = basic_spec("gpu");
+        spec.partition = Some("default".into());
+        spec.gres = vec!["gpu:2".into()];
+        spec.cpus_per_task = 12;
+        let job = Job::new(1, spec);
+        assert_eq!(resource_impossible_reason(&job, &nodes, &[]), None);
+        assert_eq!(
+            job_candidate_node_names(&job, std::slice::from_ref(&node)),
+            vec!["n1".to_string()]
         );
     }
 
@@ -34910,7 +36321,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
 
         assert!(cm
-            .backoff_pending_job_after_dispatch_failure(999, 1)
+            .backoff_pending_job_after_dispatch_failure(999, 1, false)
             .is_ok());
     }
 
@@ -34922,7 +36333,9 @@ state = "UP"
         cm.cancel_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Cancelled);
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(id, 1).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(id, 1, false)
+            .is_ok());
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
     }
 
@@ -34932,7 +36345,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
 
-        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+        cm.backoff_pending_job_after_dispatch_failure(id, 1, false)
             .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
@@ -34945,20 +36358,53 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_with_spare_budget_keeps_requeue_count_and_never_holds() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.controller.max_batch_requeue = 1;
+        let cm = test_cluster_with_config(&dir, config).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-spared"));
+        cm.backoff_pending_job_after_dispatch_failure(id, 1, false)
+            .unwrap();
+        wait_for("budget spent", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        cm.backoff_pending_job_after_dispatch_failure(id, 2, true)
+            .unwrap();
+        wait_for("spared backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.run_attempt == 2)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.requeue_count, 1, "the budget is not spent");
+        assert!(job.priority > 0, "at the cap, yet not held");
+        assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+
+        cm.backoff_pending_job_after_dispatch_failure(id, 3, false)
+            .unwrap();
+        wait_for("held at the cap", || {
+            cm.get_job(id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_attempt_strictly_increases_across_consecutive_aborted_dispatches() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-run-attempt"));
         assert_eq!(cm.get_job(id).unwrap().run_attempt, 0);
 
-        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+        cm.backoff_pending_job_after_dispatch_failure(id, 1, false)
             .unwrap();
         wait_for("first backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
         assert_eq!(cm.get_job(id).unwrap().run_attempt, 1);
 
-        cm.backoff_pending_job_after_dispatch_failure(id, 2)
+        cm.backoff_pending_job_after_dispatch_failure(id, 2, false)
             .unwrap();
         wait_for("second backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
@@ -34972,7 +36418,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-monotonic"));
 
-        cm.backoff_pending_job_after_dispatch_failure(id, 5)
+        cm.backoff_pending_job_after_dispatch_failure(id, 5, false)
             .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.run_attempt == 5)
@@ -34998,7 +36444,7 @@ state = "UP"
         let id = submit_and_wait(&cm, basic_spec("backoff-hold-max-requeue"));
 
         for attempt in 1..=(max + 1) {
-            cm.backoff_pending_job_after_dispatch_failure(id, attempt)
+            cm.backoff_pending_job_after_dispatch_failure(id, attempt, false)
                 .unwrap();
         }
         wait_for("job held at max requeue", || {
@@ -35071,7 +36517,7 @@ state = "UP"
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
 
-        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+        cm.backoff_pending_job_after_dispatch_failure(id, 1, false)
             .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
@@ -35097,7 +36543,7 @@ state = "UP"
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+        cm.backoff_pending_job_after_dispatch_failure(id, 1, false)
             .unwrap();
         wait_for("first backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
@@ -35105,7 +36551,7 @@ state = "UP"
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id, 2)
+        cm.backoff_pending_job_after_dispatch_failure(id, 2, false)
             .unwrap();
         wait_for("second backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
@@ -41111,6 +42557,7 @@ state = "UP"
             core_spec_count: Some(count),
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }
     }
 
@@ -41160,6 +42607,69 @@ state = "UP"
     }
 
     #[test]
+    fn a_layout_change_turns_held_reserved_cpus_general() {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        use spur_core::resource::{AllocatedDevice, GpuLinkType, GpuResource};
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let records: Vec<CpuRecord> = (0..8)
+            .map(|cpu| CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: cpu,
+                numa_node: Some(0),
+            })
+            .collect();
+        let detected = ResourceSet {
+            cpus: 8,
+            memory_mb: 8192,
+            gpus: vec![GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                topology: None,
+                stable_id: 7,
+                numa_node: Some(0),
+                affinity_cpus: vec![],
+            }],
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut node = Node::new("n1".into(), detected.clone());
+        node.detected_resources = detected;
+        let reserving = |r| spur_core::config::NodeConfig {
+            core_spec_count: None,
+            restricted_cores_per_gpu: Some(r),
+            ..spec_node_config(0)
+        };
+
+        cm.recompute_core_layout(&mut node, Some(&reserving(2)));
+        let layout = node.core_layout.clone().expect("layout");
+        let mut slice = ResourceAllocations::with_scalar(4, 0);
+        slice.devices.insert(
+            "gpu".into(),
+            vec![AllocatedDevice {
+                device_id: 7,
+                count: 1,
+            }],
+        );
+        layout.stamp(&mut slice);
+        node.hold(&slice);
+        assert_eq!(node.alloc_resources.reserved_cpus, 2);
+
+        cm.recompute_core_layout(&mut node, Some(&reserving(3)));
+        assert_eq!(
+            node.alloc_resources.reserved_cpus, 0,
+            "a job placed under the old layout now counts as general"
+        );
+        node.release(&slice);
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(node.alloc_resources.reserved_cpus, 0);
+    }
+
+    #[test]
     fn a_layout_that_stops_computing_is_kept_and_delivered_with_its_error() {
         let dir = TempDir::new().unwrap();
         let cm = spec_cluster(&dir, 1);
@@ -41178,6 +42688,371 @@ state = "UP"
         let delivery = cm.node_layout_delivery("n1");
         assert!(delivery.layout.is_some());
         assert!(delivery.error.contains("topology"), "{}", delivery.error);
+    }
+
+    /// 2 sockets x 4 cores x 2 threads (CPUs 0-15), one GPU per socket.
+    fn two_socket_gpu_node() -> Node {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let records: Vec<CpuRecord> = (0..16)
+            .map(|cpu| CpuRecord {
+                cpu,
+                socket: cpu / 8,
+                core_id: cpu / 2,
+                numa_node: Some(cpu / 8),
+            })
+            .collect();
+        let gpu = |id: u64, numa: u32| GpuResource {
+            device_id: id as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            topology: None,
+            stable_id: id,
+            numa_node: Some(numa),
+            affinity_cpus: vec![],
+        };
+        let detected = ResourceSet {
+            cpus: 16,
+            memory_mb: 8192,
+            gpus: vec![gpu(1, 0), gpu(2, 1)],
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut node = Node::new("n1".into(), detected.clone());
+        node.detected_resources = detected;
+        node.state = NodeState::Idle;
+        node.partitions = vec!["default".into()];
+        node
+    }
+
+    fn capped_reserving_cluster(dir: &TempDir, cap: u32) -> ClusterManager {
+        let mut config = test_config();
+        config.nodes = vec![spur_core::config::NodeConfig {
+            core_spec_count: None,
+            restricted_cores_per_gpu: Some(1),
+            cpus: cap,
+            ..spec_node_config(0)
+        }];
+        ClusterManager::new(config, dir.path()).unwrap()
+    }
+
+    fn reserving_config(r: u32) -> spur_core::config::NodeConfig {
+        spur_core::config::NodeConfig {
+            core_spec_count: None,
+            restricted_cores_per_gpu: Some(r),
+            ..spec_node_config(0)
+        }
+    }
+
+    fn reserving_cluster(dir: &TempDir, r: u32) -> ClusterManager {
+        let mut config = test_config();
+        config.nodes = vec![reserving_config(r)];
+        ClusterManager::new(config, dir.path()).unwrap()
+    }
+
+    /// Picks the fresh rule would not make on `two_socket_gpu_node` at R=1:
+    /// GPU 1 on core 1 (CPUs 2-3) rather than core 0.
+    fn moved_picks() -> Vec<spur_core::core_layout::GpuReservedCpus> {
+        use spur_core::core_layout::GpuReservedCpus;
+        vec![
+            GpuReservedCpus {
+                stable_id: 1,
+                cpus: vec![2, 3],
+            },
+            GpuReservedCpus {
+                stable_id: 2,
+                cpus: vec![8, 9],
+            },
+        ]
+    }
+
+    fn reserved_cpus_of(node: &Node, stable_id: u64) -> Vec<u32> {
+        node.core_layout
+            .as_ref()
+            .and_then(|l| l.gpu_reserved.iter().find(|g| g.stable_id == stable_id))
+            .map(|g| g.cpus.clone())
+            .unwrap_or_default()
+    }
+
+    /// `two_socket_gpu_node`'s CPUs with GPUs `(stable_id, numa)`.
+    fn two_socket_detected(gpus: &[(u64, u32)]) -> ResourceSet {
+        let mut detected = two_socket_gpu_node().detected_resources;
+        let template = detected.gpus[0].clone();
+        detected.gpus = gpus
+            .iter()
+            .map(|&(id, numa)| spur_core::resource::GpuResource {
+                device_id: id as u32,
+                stable_id: id,
+                numa_node: Some(numa),
+                ..template.clone()
+            })
+            .collect();
+        detected
+    }
+
+    #[test]
+    fn derive_core_layout_passes_and_updates_reserved_picks() {
+        let dir = TempDir::new().unwrap();
+        let cm = reserving_cluster(&dir, 1);
+        let mut node = two_socket_gpu_node();
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(
+            reserved_cpus_of(&node, 1),
+            vec![0, 1],
+            "fresh: GPU 1's lowest core"
+        );
+        assert_eq!(
+            node.reserved_picks,
+            node.core_layout.as_ref().unwrap().gpu_reserved
+        );
+
+        node.reserved_picks = moved_picks();
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(
+            reserved_cpus_of(&node, 1),
+            vec![2, 3],
+            "kept from the previous picks"
+        );
+        assert_eq!(
+            node.reserved_picks,
+            node.core_layout.as_ref().unwrap().gpu_reserved
+        );
+
+        // The live-reconfigure path: unchanged inputs give the same picks.
+        let seq = node.layout_seq;
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(reserved_cpus_of(&node, 1), vec![2, 3]);
+        assert_eq!(node.layout_seq, seq);
+    }
+
+    #[test]
+    fn a_layout_error_keeps_the_previous_picks() {
+        let dir = TempDir::new().unwrap();
+        let cm = reserving_cluster(&dir, 1);
+        let mut node = two_socket_gpu_node();
+        node.reserved_picks = moved_picks();
+        cm.apply_node_config_policy(&mut node);
+        let (layout, picks) = (node.core_layout.clone(), node.reserved_picks.clone());
+
+        node.detected_resources.topology = None;
+        cm.apply_node_config_policy(&mut node);
+        assert!(node.layout_error.is_some());
+        assert_eq!(node.core_layout, layout);
+        assert_eq!(node.reserved_picks, picks);
+
+        node.detected_resources = two_socket_gpu_node().detected_resources;
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(
+            reserved_cpus_of(&node, 1),
+            vec![2, 3],
+            "a recovered layout resumes from the kept picks"
+        );
+    }
+
+    #[test]
+    fn reserved_picks_clear_with_the_layout_and_a_re_add_starts_fresh() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = two_socket_gpu_node();
+        node.reserved_picks = moved_picks();
+        cm.recompute_core_layout(&mut node, Some(&reserving_config(1)));
+        assert_eq!(reserved_cpus_of(&node, 1), vec![2, 3]);
+
+        let no_layout = spur_core::config::NodeConfig {
+            core_spec_count: None,
+            ..spec_node_config(0)
+        };
+        cm.recompute_core_layout(&mut node, Some(&no_layout));
+        assert!(node.core_layout.is_none());
+        assert!(node.reserved_picks.is_empty(), "layout settings removed");
+        cm.recompute_core_layout(&mut node, Some(&reserving_config(1)));
+        assert_eq!(reserved_cpus_of(&node, 1), vec![0, 1], "re-added: fresh");
+
+        node.reserved_picks = moved_picks();
+        cm.recompute_core_layout(&mut node, None);
+        assert!(node.reserved_picks.is_empty(), "no matching [[nodes]]");
+
+        let mut k8s = two_socket_gpu_node();
+        k8s.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        k8s.reserved_picks = moved_picks();
+        cm.recompute_core_layout(&mut k8s, Some(&reserving_config(1)));
+        assert!(
+            k8s.reserved_picks.is_empty(),
+            "Kubernetes nodes have no layout"
+        );
+    }
+
+    #[test]
+    fn a_restored_snapshot_recomputes_from_the_persisted_picks() {
+        let dir = TempDir::new().unwrap();
+        let cm = reserving_cluster(&dir, 1);
+        let mut node = two_socket_gpu_node();
+        node.reserved_picks = moved_picks();
+        cm.apply_node_config_policy(&mut node);
+        let layout = node.core_layout.clone();
+        cm.nodes.write().insert("n1".into(), node);
+        let data = cm.snapshot_state().unwrap();
+
+        let other = TempDir::new().unwrap();
+        let restored = reserving_cluster(&other, 1);
+        restored.restore_from_snapshot(&data).unwrap();
+        let node = restored.get_node("n1").unwrap();
+        assert_eq!(node.core_layout, layout, "not the fresh rule");
+        assert_eq!(reserved_cpus_of(&node, 1), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_replica_restored_mid_log_agrees_with_one_that_applied_it_all() {
+        let register = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: two_socket_detected(&[(2, 0), (3, 1)]),
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        };
+        // A lower-id GPU appears beside GPU 2: sticky keeps GPU 2 on core 0,
+        // where the fresh rule would move it to core 1.
+        let update = WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: two_socket_detected(&[(1, 0), (2, 0), (3, 1)]),
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: NodeSource::NativeHost,
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        };
+        let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let whole = reserving_cluster(&dir_a, 1);
+        let restored = reserving_cluster(&dir_b, 1);
+
+        whole.apply_operation(&register);
+        restored
+            .restore_from_snapshot(&whole.snapshot_state().unwrap())
+            .unwrap();
+        whole.apply_operation(&update);
+        restored.apply_operation(&update);
+
+        let (a, b) = (
+            whole.get_node("n1").unwrap(),
+            restored.get_node("n1").unwrap(),
+        );
+        assert_eq!(a.core_layout, b.core_layout);
+        assert_eq!(a.reserved_picks, b.reserved_picks);
+        assert_eq!(reserved_cpus_of(&a, 2), vec![0, 1], "GPU 2 kept its core");
+        assert_eq!(reserved_cpus_of(&a, 1), vec![2, 3]);
+    }
+
+    #[test]
+    fn blocked_cpus_are_kept_only_under_the_expected_fingerprint() {
+        use spur_proto::proto::GpuBlockedCpus;
+        let blocked = |stable_id, cpus| GpuBlockedCpus { stable_id, cpus };
+        let dir = TempDir::new().unwrap();
+        let cm = reserving_cluster(&dir, 1);
+        let mut node = two_socket_gpu_node();
+        cm.apply_node_config_policy(&mut node);
+        let expected = node.core_layout.as_ref().unwrap().fingerprint();
+        cm.nodes.write().insert("n1".into(), node);
+
+        cm.record_layout_heartbeat(
+            "n1",
+            expected,
+            "",
+            &[blocked(1, 2), blocked(99, 4), blocked(2, 0)],
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().layout_blocked_cpus,
+            BTreeMap::from([(1, 2)]),
+            "unknown GPU 99 and zero counts are dropped"
+        );
+
+        cm.record_layout_heartbeat("n1", 12345, "", &[blocked(2, 1)]);
+        assert!(
+            cm.get_node("n1").unwrap().layout_blocked_cpus.is_empty(),
+            "counts under another layout mean nothing here"
+        );
+
+        cm.record_layout_heartbeat("n1", expected, "", &[blocked(2, 1)]);
+        cm.record_layout_heartbeat("n1", expected, "", &[]);
+        assert!(
+            cm.get_node("n1").unwrap().layout_blocked_cpus.is_empty(),
+            "an empty report clears"
+        );
+    }
+
+    #[test]
+    fn a_layout_change_clears_blocked_cpus() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = two_socket_gpu_node();
+        cm.recompute_core_layout(&mut node, Some(&reserving_config(1)));
+        node.layout_blocked_cpus.insert(1, 2);
+
+        cm.recompute_core_layout(&mut node, Some(&reserving_config(1)));
+        assert_eq!(
+            node.layout_blocked_cpus.len(),
+            1,
+            "an unchanged layout keeps them"
+        );
+        cm.recompute_core_layout(&mut node, Some(&reserving_config(2)));
+        assert!(node.layout_blocked_cpus.is_empty());
+    }
+
+    #[test]
+    fn a_cpus_cap_beside_reserved_cores_trims_the_general_pool() {
+        let dir = TempDir::new().unwrap();
+        let cm = capped_reserving_cluster(&dir, 10);
+        let mut node = two_socket_gpu_node();
+        cm.apply_node_config_policy(&mut node);
+
+        assert!(node.layout_error.is_none(), "{:?}", node.layout_error);
+        assert_eq!(node.total_resources.cpus, 10);
+        assert_eq!(node.cpu_tot(), 10);
+        let pools = node.cpu_pools().expect("pools");
+        assert_eq!((pools.general, pools.reserved_total), (6, 4));
+        let layout = node.core_layout.as_ref().unwrap();
+        // The last socket's highest cores first, as Slurm keeps the lowest.
+        assert_eq!(layout.trimmed_cpus, vec![10, 11, 12, 13, 14, 15]);
+
+        let nodes: HashMap<String, Node> = [("n1".to_string(), node)].into();
+        let mut spec = basic_spec("cpu-only");
+        spec.partition = Some("default".into());
+        spec.num_tasks = 7;
+        assert_eq!(
+            general_pool_shortfall(&Job::new(1, spec.clone()), &nodes, &[]).as_deref(),
+            Some(
+                "CPU-only job needs 7 CPUs; at most 6 per node are available outside \
+                 GPU-reserved and spec cores"
+            )
+        );
+        spec.num_tasks = 6;
+        assert_eq!(
+            resource_impossible_reason(&Job::new(2, spec), &nodes, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cpus_cap_below_the_reserved_cores_blocks_the_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = capped_reserving_cluster(&dir, 3);
+        let mut node = two_socket_gpu_node();
+        cm.apply_node_config_policy(&mut node);
+        assert!(!node.is_schedulable());
+        let reason = node.layout_block_reason().unwrap();
+        assert!(reason.contains("cpus = 3"), "{reason}");
     }
 
     #[test]
@@ -41210,14 +43085,17 @@ state = "UP"
         let expected = node.core_layout.as_ref().unwrap().fingerprint();
         cm.nodes.write().insert("n1".into(), node);
 
-        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
-        assert!(cm.record_layout_heartbeat("n1", 0, ""));
-        assert!(!cm.record_layout_heartbeat("n1", 0, ""), "rate-limited");
+        assert!(!cm.record_layout_heartbeat("n1", expected, "", &[]));
+        assert!(cm.record_layout_heartbeat("n1", 0, "", &[]));
+        assert!(
+            !cm.record_layout_heartbeat("n1", 0, "", &[]),
+            "rate-limited"
+        );
 
-        assert!(!cm.record_layout_heartbeat("n1", expected, "root write failed"));
+        assert!(!cm.record_layout_heartbeat("n1", expected, "root write failed", &[]));
         let node = cm.get_node("n1").unwrap();
         assert!(
-            cm.record_layout_heartbeat("n1", 12345, "root write failed"),
+            cm.record_layout_heartbeat("n1", 12345, "root write failed", &[]),
             "a failing node holding a different layout still receives the current one"
         );
         assert!(!node.is_schedulable());
@@ -41225,7 +43103,7 @@ state = "UP"
             node.layout_drain_reason().as_deref(),
             Some("core-layout: not enforced: root write failed")
         );
-        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
+        assert!(!cm.record_layout_heartbeat("n1", expected, "", &[]));
         assert!(cm.get_node("n1").unwrap().is_schedulable());
     }
 
@@ -41273,6 +43151,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         };
         let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
         assert!(super::node_config_matches(&nc, "any-host", &labels));
@@ -41317,6 +43196,7 @@ state = "UP"
                 def_mem_per_node: None,
                 def_mem_per_cpu: None,
                 def_mem_per_gpu: None,
+                def_cpu_per_gpu: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -41345,6 +43225,7 @@ state = "UP"
                 def_mem_per_node: None,
                 def_mem_per_cpu: None,
                 def_mem_per_gpu: None,
+                def_cpu_per_gpu: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
@@ -41414,6 +43295,7 @@ state = "UP"
             def_mem_per_node: None,
             def_mem_per_cpu: None,
             def_mem_per_gpu: None,
+            def_cpu_per_gpu: None,
         }];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
@@ -41485,6 +43367,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         };
         assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
         assert!(super::node_config_matches(
@@ -41616,6 +43499,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -41668,6 +43552,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -41712,6 +43597,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -41766,6 +43652,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -41819,6 +43706,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -41862,6 +43750,7 @@ state = "UP"
             core_spec_count: None,
             cpu_spec_list: None,
             daemons_off_spec: true,
+            restricted_cores_per_gpu: None,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -43576,6 +45465,8 @@ state = "UP"
             job_id: id,
             step_id: 0,
             exit_code: 3,
+            oom_killed: false,
+            cancelled: false,
         });
 
         let exit = PtySessionExit {
@@ -43608,6 +45499,8 @@ state = "UP"
                     job_id: id,
                     step_id: 0,
                     exit_code: 0,
+                    oom_killed: false,
+                    cancelled: false,
                 });
             }
             let raft = cm.raft.read().clone().expect("raft is set");

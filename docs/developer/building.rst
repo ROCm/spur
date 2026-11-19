@@ -115,8 +115,8 @@ Environment Variables
      - Description
      - Example
    * - ``SPUR_TEST_NODES`` *(required)*
-     - Comma-separated list of node IPs/hostnames. First node becomes the controller. An entry may be prefixed ``user@`` to override the SSH user for that node (a bed where the controller and a GPU worker use different accounts); entries without a prefix fall back to ``SPUR_TEST_SSH_USER``.
-     - ``10.0.1.10,10.0.1.11,10.0.1.12`` or ``admin@10.0.1.10,amd@10.0.1.11``
+     - Comma-separated list of node IPs/hostnames. First node becomes the controller. An entry may be prefixed ``user@`` to override the SSH user for that node (a bed where the controller and a GPU worker use different accounts); entries without a prefix fall back to ``SPUR_TEST_SSH_USER``. An entry may end in ``:port`` to reach that node's SSH server on a port other than 22 (e.g. through a tunnel); the port applies to SSH only, the daemons still use the host. An entry may end in ``=address`` to give the node a separate cluster address the daemons advertise to each other, for beds reached through a tunnel where the SSH host (e.g. ``localhost``) isn't that address.
+     - ``10.0.1.10,10.0.1.11,10.0.1.12``, ``admin@10.0.1.10,amd@10.0.1.11``, ``amd@localhost:2222`` or ``user@localhost:2223=10.0.0.11``
    * - ``SPUR_TEST_SSH_USER`` *(required)*
      - Default SSH username, applied to every node entry without its own ``user@`` prefix.
      - ``vm``

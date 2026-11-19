@@ -42,6 +42,8 @@ fn gpu_node(name: &str, partitions: &[&str]) -> Node {
             link_type: GpuLinkType::PCIe,
             topology: None,
             stable_id: u64::from(i),
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         })
         .collect();
     n

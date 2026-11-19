@@ -418,6 +418,8 @@ mod tests {
                                     }),
                                     ..Default::default()
                                 }),
+                                numa_node: None,
+                                affinity_cpus: Vec::new(),
                             })
                             .collect(),
                         ..Default::default()

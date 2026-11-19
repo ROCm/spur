@@ -52,6 +52,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -70,6 +72,8 @@ mod tests {
                     link_type: GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -92,6 +96,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -110,6 +116,8 @@ mod tests {
                     link_type: GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -132,6 +140,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -149,6 +159,8 @@ mod tests {
                 link_type: GpuLinkType::PCIe,
                 topology: None,
                 stable_id: 0,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             ..Default::default()
         };
@@ -170,6 +182,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -188,6 +202,8 @@ mod tests {
                     link_type: GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -419,6 +435,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()

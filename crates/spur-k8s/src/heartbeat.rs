@@ -69,6 +69,7 @@ impl HeartbeatManager {
                             core_layout_fingerprint: 0,
                             spec_enforcement_error: String::new(),
                             agent_instance: String::new(), // no spurd process to keep out
+                            layout_blocked_cpus: Vec::new(),
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),

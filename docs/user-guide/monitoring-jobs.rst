@@ -350,6 +350,12 @@ PARTITION STATE CPUS MEMORY GRES``.
    sinfo -N -o "%N %.6D %.11T %c %m %G"
    sinfo -p gpu -l
 
+``%z`` prints Slurm's ``S:C:T`` (sockets, cores per socket, threads per core),
+as in ``sinfo -N -o "%N %z"``. A node whose agent reported no CPU topology
+shows ``N/A``. In the partition view, where a row covers several nodes, the
+row shows the shared value only when every node in it agrees; otherwise, or
+when any node is unknown, it shows ``N/A``.
+
 ``-R`` / ``--list-reasons`` lists only nodes that are unavailable (``down``,
 ``drain``, ``drng``, ``err``), grouped by the admin reason set when the node was
 drained or downed, one row per reason with a compressed nodelist:
@@ -370,6 +376,26 @@ to a name, or a node whose reason predates provenance tracking, renders as
 ``scontrol show node`` appends the same provenance to the reason line as
 ``Reason=<text> [<user>@<timestamp>]`` when a set-time is recorded, and the REST
 node object carries ``reason_uid`` and ``reason_time`` fields.
+
+``scontrol show node`` ends its ``CPUTot=`` line with Slurm's ``Sockets=``,
+``CoresPerSocket=`` and ``ThreadsPerCore=``, derived from the CPU topology the
+node's agent reported: cores and threads are divided evenly as ``slurmd`` does,
+so uneven sockets or partly offline threads round down. A node whose agent
+reported no topology (a Kubernetes-backed node, or an agent older than the
+controller) leaves the three fields out. A ``Capabilities=`` line lists the
+optional features the node's agent advertised (for example ``signal-job``).
+
+When a node reserves cores per GPU (``restricted_cores_per_gpu``),
+``scontrol show node`` adds ``RestrictedCoresPerGPU=<R>(CPUs:<list>)`` naming how many
+cores each GPU reserves and, across all GPUs, which CPU ids they are; a GPU job's CPUs beyond
+that count, or a CPU-only job, draw from the node's general pool instead. Each
+``GPUDevice=`` line then ends with ``ReservedCPUs=<list>``, that GPU's own picks,
+and ``AffinityCPUs=<list>``, the CPUs the picks are drawn from (the GPU's
+``cores=``, else its NUMA node's CPUs). Either field is left out when unknown,
+and ``AffinityCPUs`` is shown even without reserved cores. The REST node object
+carries the same data as ``sockets``, ``cores``, ``threads`` (``null`` when
+unknown), ``gpu_cpus`` (``stable_id``, ``reserved_cpus``, ``affinity_cpus``) and
+``capabilities``. See :doc:`/admin-guide/configuration` for the full node-field reference.
 
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
 allocated), ``mix`` (partly allocated), ``down``, ``drain`` (offline, not
@@ -495,6 +521,12 @@ the same form ``squeue`` and ``scontrol show job`` print (``node[01-04]``). It
 is recorded when the job starts, so it stays available after the job leaves
 the controller; a requeued job shows the nodes of its latest run. Jobs that
 started before this release recorded no node list and show it empty.
+
+``NCPUS`` is the job's total allocated CPUs, recorded when the job starts: for
+a ``--cpus-per-gpu`` job this already counts the CPUs its GPUs brought in, so
+it reads higher than ``cpus-per-task x tasks`` alone would suggest. Jobs that
+started before this release recorded no CPU count and show
+``cpus-per-task x tasks``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
@@ -651,7 +683,9 @@ the base job. A non-numeric ID is an error.
 
 Default fields: ``JobID NTasks NCPUS MemAlloc GPUAlloc Elapsed Nodelist``.
 ``--format``/``-o`` takes field names; ``--parsable``/``-p`` produces
-``|``-delimited output.
+``|``-delimited output. ``NCPUS`` is the running job's ``ReqTRES`` ``cpu=``
+count, so a ``--cpus-per-gpu`` job's count already includes the CPUs its GPUs
+brought in.
 
 .. note::
 
@@ -757,6 +791,10 @@ the job starts on its own once matching nodes join.
      - Node feature constraint from ``-C/--constraint``.
    * - ``ReqTRES``
      - Requested resource totals, e.g. ``cpu=16,mem=32000M,node=2,gres/gpu=8``.
+   * - ``CpusPerTres``
+     - ``gpu:<n>`` when the job set ``--cpus-per-gpu``; omitted otherwise.
+   * - ``MemPerTres``
+     - ``gpu:<MB>`` when the job set ``--mem-per-gpu``; omitted otherwise.
    * - ``MinCPUsNode`` / ``MinMemoryNode``
      - Per-node minima implied by the request. Memory is in MB with an ``M``
        suffix; a bare ``0`` means none was requested. A ``--mem-per-cpu`` job
@@ -854,7 +892,9 @@ is omitted for a job that is not in a grace. The REST job object
 ``/slurm/v0.0.42``) reports the same as ``preempt_time`` (Unix seconds, ``null``
 outside a grace) and ``end_time``. While the job is still running, ``end_time``
 is the projected end of its grace, not the time it finished: use ``job_state``
-to tell whether a job has ended.
+to tell whether a job has ended. The same job object also reports
+``cpus_per_gpu`` and ``memory_per_gpu``, both ``null`` when the job did not
+request them.
 
 .. _preemption-grace-user:
 

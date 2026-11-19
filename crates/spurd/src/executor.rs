@@ -172,6 +172,9 @@ pub struct JobLaunchConfig {
     pub stdin_path: String,
     pub cpus: u32,
     pub memory_mb: u64,
+    /// The node's schedulable memory, applied as the job's cgroup ceiling only
+    /// when `memory_mb` is 0 (no request of its own); 0 = no ceiling known.
+    pub memory_ceiling_mb: u64,
     pub gpu_devices: Vec<u64>,
     pub cpu_ids: Vec<u32>,
     pub open_mode: Option<String>,
@@ -598,6 +601,12 @@ pub async fn launch_job(
     spawn_job_process(cfg, spank).await
 }
 
+/// A typed step runs under its own CPUs, not the whole job's; untyped steps
+/// and the batch step keep the job's count.
+fn thread_count(cpus: u32, step_limits: &StepLimits) -> u32 {
+    step_limits.cpus.unwrap_or(cpus)
+}
+
 async fn spawn_job_process(
     cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
@@ -613,6 +622,7 @@ async fn spawn_job_process(
         ref stdin_path,
         cpus,
         memory_mb,
+        memory_ceiling_mb,
         gpu_devices: _,
         ref cpu_ids,
         ref open_mode,
@@ -634,6 +644,7 @@ async fn spawn_job_process(
         &cfg.cgroup,
         cpus,
         memory_mb,
+        memory_ceiling_mb,
         cpu_ids,
         device_paths,
         &cfg.step_limits,
@@ -738,11 +749,12 @@ async fn spawn_job_process(
     // Environment-based CPU/thread limiting — works even without cgroups.
     // Well-behaved applications (OpenMP, MKL, PyTorch, etc.) read these.
     if !cfg.pmix_multi_task {
-        env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
-        env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
-        env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
-        env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
-        env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+        let threads = thread_count(cpus, &cfg.step_limits);
+        env.insert("OMP_NUM_THREADS".into(), threads.to_string());
+        env.insert("MKL_NUM_THREADS".into(), threads.to_string());
+        env.insert("OPENBLAS_NUM_THREADS".into(), threads.to_string());
+        env.insert("VECLIB_MAXIMUM_THREADS".into(), threads.to_string());
+        env.insert("NUMEXPR_NUM_THREADS".into(), threads.to_string());
     }
 
     // Run SPANK Init/TaskInit against a handle seeded with the assembled env,
@@ -1150,13 +1162,27 @@ fn memory_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
 /// cap is always a quota, since the step shares its job's cpuset.
 fn step_limit_files(cgroup: &CgroupConfig, step: &StepLimits) -> Vec<(&'static str, String)> {
     let mut files: Vec<(&'static str, String)> = Vec::new();
-    let Some(sized) = cgroup.limits_for(step.cpus.unwrap_or(1), step.memory_mb.unwrap_or(0), &[])
+    // A typed step's memory is always an explicit value of its own (checked
+    // against the job's ceiling in step_resources.rs), so it never needs the
+    // node ceiling here.
+    let Some(sized) =
+        cgroup.limits_for(step.cpus.unwrap_or(1), step.memory_mb.unwrap_or(0), 0, &[])
     else {
         return files;
     };
-    if let Some(cpus) = step.cpus {
+    // An unpinned step has no cpuset of its own, so the quota is its only CPU bound.
+    if let Some(cpus) = step
+        .cpus
+        .filter(|_| cgroup.cpu_quota || step.cpu_ids.is_empty())
+    {
         let quota = u64::from(cpus) * sized.cpu_period_us;
         files.push(("cpu.max", format!("{quota} {}", sized.cpu_period_us)));
+    }
+    if !step.cpu_ids.is_empty() {
+        files.push((
+            "cpuset.cpus",
+            spur_core::cpu_topology::format_cpu_list(&step.cpu_ids),
+        ));
     }
     if step.memory_mb.is_some() {
         files.extend(memory_limit_files(&sized));
@@ -1203,7 +1229,7 @@ fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>
 /// Set up a cgroups v2 hierarchy for a job.
 // Keyed by attempt, not just job_id: a redispatch must never land in a
 // still-occupied cgroup left by a not-yet-reaped prior attempt.
-fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathBuf {
+pub(crate) fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathBuf {
     cgroup_root.join(format!("job_{}_{}", job_id, run_attempt))
 }
 
@@ -1297,11 +1323,13 @@ pub(crate) struct CgroupScope {
     pub step_id: spur_core::step::StepId,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn setup_cgroup(
     scope: CgroupScope,
     cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
+    memory_ceiling_mb: u64,
     cpu_ids: &[u32],
     device_paths: &[String],
     step_limits: &StepLimits,
@@ -1311,7 +1339,7 @@ pub(crate) fn setup_cgroup(
         run_attempt,
         step_id,
     } = scope;
-    let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
+    let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, memory_ceiling_mb, cpu_ids) else {
         if !step_limits.is_empty() {
             anyhow::bail!("[cgroup] the step asked for its own limits but cgroups are disabled");
         }
@@ -3090,13 +3118,43 @@ mod step_limit_files_tests {
     }
 
     #[test]
-    fn a_cpu_request_is_a_quota_even_when_jobs_get_none() {
+    fn an_unpinned_cpu_request_gets_a_cpu_max_without_the_quota_knob() {
+        let step = StepLimits {
+            cpus: Some(4),
+            ..Default::default()
+        };
+        let files = step_limit_files(&CgroupConfig::default(), &step);
+        assert_eq!(files, [("cpu.max", "400000 100000".to_string())]);
+    }
+
+    #[test]
+    fn the_quota_knob_still_sizes_a_cpu_request() {
         let step = StepLimits {
             cpus: Some(3),
             ..Default::default()
         };
-        let files = step_limit_files(&CgroupConfig::default(), &step);
+        let quota = CgroupConfig {
+            cpu_quota: true,
+            ..CgroupConfig::default()
+        };
+        let files = step_limit_files(&quota, &step);
         assert_eq!(files, [("cpu.max", "300000 100000".to_string())]);
+    }
+
+    #[test]
+    fn a_pinned_step_gets_its_own_cpuset() {
+        let step = StepLimits {
+            cpus: Some(2),
+            cpu_ids: vec![4, 5],
+            ..Default::default()
+        };
+        let files = step_limit_files(&CgroupConfig::default(), &step);
+        assert_eq!(get(&files, "cpuset.cpus"), Some("4-5"));
+        assert_eq!(
+            get(&files, "cpu.max"),
+            None,
+            "the cpuset pin is the step's CPU bound, not a quota"
+        );
     }
 
     #[test]
@@ -3152,13 +3210,32 @@ mod step_limit_files_tests {
             memory_mb: Some(64),
             ..Default::default()
         };
-        let err = setup_cgroup(scope, &disabled, 1, 0, &[], &[], &step).unwrap_err();
+        let err = setup_cgroup(scope, &disabled, 1, 0, 0, &[], &[], &step).unwrap_err();
         assert!(err.to_string().contains("cgroups are disabled"), "{err}");
         assert_eq!(
-            setup_cgroup(scope, &disabled, 1, 0, &[], &[], &StepLimits::default()).unwrap(),
+            setup_cgroup(scope, &disabled, 1, 0, 0, &[], &[], &StepLimits::default()).unwrap(),
             None,
             "a step without limits of its own still runs unconfined"
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_count_tests {
+    use super::{thread_count, StepLimits};
+
+    #[test]
+    fn a_typed_step_uses_its_own_cpus() {
+        let step = StepLimits {
+            cpus: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(thread_count(32, &step), 8);
+    }
+
+    #[test]
+    fn without_step_limits_it_falls_back_to_the_jobs_cpus() {
+        assert_eq!(thread_count(32, &StepLimits::default()), 32);
     }
 }
 
@@ -3173,7 +3250,20 @@ mod cgroup_files_tests {
         memory_mb: u64,
         cpu_ids: &[u32],
     ) -> Vec<(&'static str, String)> {
-        cgroup_limit_files(&cfg.limits_for(cpus, memory_mb, cpu_ids).expect("enabled"))
+        files_for_with_ceiling(cfg, cpus, memory_mb, 0, cpu_ids)
+    }
+
+    fn files_for_with_ceiling(
+        cfg: &CgroupConfig,
+        cpus: u32,
+        memory_mb: u64,
+        ceiling_mb: u64,
+        cpu_ids: &[u32],
+    ) -> Vec<(&'static str, String)> {
+        cgroup_limit_files(
+            &cfg.limits_for(cpus, memory_mb, ceiling_mb, cpu_ids)
+                .expect("enabled"),
+        )
     }
 
     #[test]
@@ -3223,7 +3313,7 @@ mod cgroup_files_tests {
     }
 
     #[test]
-    fn omits_memory_and_swap_for_an_unbounded_job() {
+    fn omits_memory_and_swap_for_an_unbounded_job_with_no_ceiling() {
         let files = files_for(&CgroupConfig::default(), 1, 0, &[]);
         let has = |k: &str| files.iter().any(|(n, _)| *n == k);
         assert!(!has("memory.max"));
@@ -3231,6 +3321,15 @@ mod cgroup_files_tests {
         assert!(!has("memory.swap.max"));
         assert!(!has("cpuset.cpus"));
         assert!(has("pids.max"));
+    }
+
+    #[test]
+    fn writes_the_node_ceiling_for_a_job_with_no_memory_request() {
+        let files = files_for_with_ceiling(&CgroupConfig::default(), 1, 0, 4096, &[]);
+        let get = |k: &str| files.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        let expect_mem = (4096u64 * 1024 * 1024).to_string();
+        assert_eq!(get("memory.max"), Some(expect_mem.as_str()));
+        assert_eq!(get("memory.high"), Some(expect_mem.as_str()));
     }
 
     #[test]
@@ -4421,6 +4520,7 @@ mod tests {
             stdin_path: String::new(),
             cpus: 1,
             memory_mb: 0,
+            memory_ceiling_mb: 0,
             gpu_devices: Vec::new(),
             cpu_ids: Vec::new(),
             open_mode: None,

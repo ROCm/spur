@@ -57,7 +57,8 @@ For each pending job in priority order:
 
 1. **Find suitable nodes** -- `find_suitable_nodes()` filters by partition,
    features, nodelist/exclude, reservation authorization, node state, k0s
-   reservation, and total resource capacity (`can_satisfy`).
+   reservation, and whether an empty node could ever hold it
+   (`Node::can_ever_satisfy`, which includes the general CPU pool below).
 
 2. **Compute earliest start per node** -- `earliest_valid_start()` combines
    the timeline's resource availability with reservation conflict checks,
@@ -163,15 +164,34 @@ Key operations:
 - **`accumulated_at(time)`** -- sum of resources held by all intervals active
   at `time` (half-open: `start <= time < end`).
 - **`earliest_start(request, duration, after)`** -- sweep-line search for the
-  first contiguous `[t, t+duration)` window where `total - accumulated >= request`.
+  first contiguous `[t, t+duration)` window where `total - accumulated >= request`
+  and, on a node whose GPUs reserve cores, the general pool also fits (`admits`).
   Uses `AllocationSweep` (a min-heap of interval end times) for O(n log n)
   incremental evaluation instead of O(n^2) brute force.
 - **`reserve_for_job()`** -- insert an interval (shadow reservation for a
   pending job, or a real allocation for a running job).
 - **`gc(horizon)`** -- drop intervals ending at or before `horizon`.
 
+### General CPU pool (reserved cores per GPU)
+
+On a node with `restricted_cores_per_gpu`, `CoreLayout::pools()` gives a
+`CpuPools` (general count, reserved CPUs per GPU). `CpuPools::admits` is the
+one fit rule, shared with spurctld through `Node::can_satisfy_request` /
+`Node::can_ever_satisfy`: a job's `reserved_share = min(cpus, gpus × R)` is
+always free (one job holds a GPU at a time), so only `cpus − reserved_share`
+must fit in the free general pool. Backfill stamps each allocation with
+`reserved_cpus` and the layout fingerprint (`CoreLayout::stamp`); nodes with no
+per-GPU reservations are neither checked nor stamped. Per-node CPUs are
+`JobSpec::cpus_on_node(tasks, gpus)` from the GPUs each node actually gets.
+
 `UNLIMITED_JOB_DURATION` (365 days) is the assumed occupancy for jobs with no
 `--time` limit, shared between backfill and spurctld's busy_until estimates.
+
+A GPU whose reserved CPUs a job not holding it still occupies after a layout
+change (`Node.layout_blocked_cpus`, reported by the agent) is busy: backfill
+reserves `Node::layout_blocked_alloc()` on the timeline over `[now, busy_until)`
+beside `alloc_resources`, so a GPU job is planned for when the blockers end.
+CPU-only jobs and `can_ever_satisfy` ignore it.
 
 ## Consumable TRES (`cons_tres.rs`)
 
@@ -181,9 +201,18 @@ ownership for release and reconciliation.
 
 ### Allocation lifecycle
 
-1. **`allocate_for_job()`** -- reserve CPU cores (first-fit bitmap), memory,
-   and GPU stable IDs. Marks the job as `launching` (exempt from reconcile
-   until committed or TTL-expired). Rejects duplicates (`DuplicateJob`),
+1. **`allocate_for_job()`** -- reserve CPU cores, memory, and GPU stable IDs.
+   Cores are first-fit unless `set_gpu_reserved()` gave per-GPU reserved CPUs;
+   then the job takes its own GPUs' reserved CPUs up to its reserved share,
+   all or nothing, and the rest from general CPUs on its GPUs' sockets, core
+   by core. A short reserved share is `ReservedCpusHeld` (a job from before a
+   layout change sits on the GPU's reserved CPUs; spurd refuses with the
+   `reserved-cpus-held` trailer), a short general pool `CpusUnavailable`;
+   either leaves the ledger untouched. `blocked_reserved_cpus(reserved)` counts,
+   per GPU in `reserved`, its CPUs taken by anyone not holding that GPU
+   (nonzero only); spurd reports it each heartbeat against its held layout.
+   Marks the job as `launching` (exempt from reconcile until committed or
+   TTL-expired). Rejects duplicates (`DuplicateJob`),
    in-use or fenced GPUs (`GpusUnavailable`), unknown GPU stable IDs
    (`GpusUnknown`), and stale attempts (`Superseded`).
 
@@ -218,7 +247,8 @@ stealing a live job's resources.
 If any held GPU stable ID is missing in the new inventory, or if a held core id
 is not in the fresh online set (id membership, not a count), the update is
 rejected (`AllocatedDevicesLost`) and capacity is left untouched -- the caller
-must drain or fail the affected jobs first.
+must drain or fail the affected jobs first. A successful update clears spec
+exclusions and per-GPU reserved CPUs; the caller re-applies both.
 
 ## Key types
 
@@ -322,3 +352,12 @@ Run unit tests: `cargo test -p spur-sched`
 10. **Idle-fill (borrow) jobs never hold future slots.** A borrowed job that
     cannot start now is silently dropped (no shadow reservation, no
     StartTime/SchedNodeList published), since it has no claim on capacity.
+
+11. **The reserved share must never spill into general.** The controller does
+    not charge a GPU job's reserved share against general; if the ledger let a
+    short reserved pool borrow general CPUs (e.g. a job from before a layout
+    change sits on them), general would be over-committed. The pick fails with
+    `ReservedCpusHeld` and the job requeues without spending its
+    `max_batch_requeue` budget. `tests/pool_invariant.rs` enumerates small node
+    shapes and job sequences, including layout changes and heartbeat-reported
+    blocking, to keep fit and picking in agreement.

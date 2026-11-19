@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::env_defaults::{
-    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, apply_string, was_cli_set,
+    apply_csv, apply_flag, apply_num, apply_num_opt, apply_num_opt_nonzero, apply_str,
+    apply_string, was_cli_set,
+};
+use crate::resource_opts::{
+    option_source, requests_gpus, require_gpus, surviving, OptionSource, CPU_CONFLICT, MEM_CONFLICT,
 };
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, Parser};
@@ -15,6 +19,7 @@ use spur_proto::proto::{
 };
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Run a parallel job (interactive or allocation-based).
 #[derive(Parser, Debug)]
@@ -49,12 +54,29 @@ pub struct SrunArgs {
     pub ntasks_per_node: Option<u32>,
 
     /// CPUs per task
-    #[arg(short = 'c', long, default_value = "1")]
-    pub cpus_per_task: u32,
+    #[arg(
+        short = 'c',
+        long,
+        overrides_with = "cpus_per_task",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub cpus_per_task: Option<u32>,
 
     /// Memory per node (e.g., "4G", "4096M")
     #[arg(long)]
     pub mem: Option<String>,
+
+    /// Memory per CPU
+    #[arg(long, overrides_with = "mem_per_cpu")]
+    pub mem_per_cpu: Option<String>,
+
+    /// CPUs per allocated GPU
+    #[arg(long, overrides_with = "cpus_per_gpu", value_parser = clap::value_parser!(u32).range(1..))]
+    pub cpus_per_gpu: Option<u32>,
+
+    /// Memory per allocated GPU (e.g., "8G")
+    #[arg(long, overrides_with = "mem_per_gpu")]
+    pub mem_per_gpu: Option<String>,
 
     /// Time limit
     #[arg(short = 't', long)]
@@ -303,6 +325,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // isolation properties — the PTY path does not inherit daemon env).
     if let Some(job_id) = args.jobid {
         if !args.external_launcher {
+            refuse_typed_jobid_attach(&args, &matches)?;
             let warnings = step_unsupported_warnings(&args)
                 .into_iter()
                 .chain(pty_step_unsupported_warnings(&args, &matches));
@@ -394,7 +417,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi, &submit_line).await
+    run_standalone_srun(
+        &mut args,
+        &matches,
+        &hooks,
+        &work_dir,
+        &resolved_mpi,
+        &submit_line,
+    )
+    .await
 }
 
 fn validate_step_constraints(constraint: Option<&str>, step_mode: bool) -> Result<()> {
@@ -418,6 +449,22 @@ fn resolve_srun_mpi(args: &SrunArgs, matches: &ArgMatches, step_mode: bool) -> R
         .map_err(|e| anyhow::anyhow!(e))?
         .expect("list handled above"))
 }
+
+// srun inherits these from the allocation's exported SLURM_* vars, unlike
+// sbatch/salloc which have no input env for -c.
+const CPUS_PER_TASK_ENV: &[&str] = &["SPUR_CPUS_PER_TASK", "SLURM_CPUS_PER_TASK"];
+const CPUS_PER_GPU_ENV: &[&str] = &["SPUR_CPUS_PER_GPU", "SLURM_CPUS_PER_GPU"];
+const MEM_ENV: &[&str] = &["SPUR_MEM_PER_NODE", "SLURM_MEM_PER_NODE"];
+const MEM_PER_CPU_ENV: &[&str] = &["SPUR_MEM_PER_CPU", "SLURM_MEM_PER_CPU"];
+const MEM_PER_GPU_ENV: &[&str] = &["SPUR_MEM_PER_GPU", "SLURM_MEM_PER_GPU"];
+
+// Both members here have a real input env var, so (unlike sbatch/salloc) an
+// env-vs-env conflict is reachable; name the `SLURM_*` vars the allocation
+// actually exported.
+const CPU_ENV_CONFLICT: &str = "SLURM_CPUS_PER_TASK and SLURM_CPUS_PER_GPU are mutually exclusive";
+// Matches Slurm's own wording (src/common/slurm_opt.c's env-conflict fatal()).
+const MEM_ENV_CONFLICT: &str =
+    "SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU, and SLURM_MEM_PER_NODE are mutually exclusive";
 
 /// Apply environment-variable defaults to any flag not set on the command
 /// line. srun mirrors real Slurm: most flags read `SLURM_*` (inherited from an
@@ -475,17 +522,31 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
         &mut args.ntasks,
     )?;
-    apply_num(
+    apply_num_opt(
         matches,
         "cpus_per_task",
-        &["SPUR_CPUS_PER_TASK", "SLURM_CPUS_PER_TASK"],
+        CPUS_PER_TASK_ENV,
         &mut args.cpus_per_task,
+    )?;
+    apply_str(matches, "mem", MEM_ENV, &mut args.mem);
+    apply_str(
+        matches,
+        "mem_per_cpu",
+        MEM_PER_CPU_ENV,
+        &mut args.mem_per_cpu,
+    );
+    apply_num_opt_nonzero(
+        matches,
+        "cpus_per_gpu",
+        CPUS_PER_GPU_ENV,
+        "--cpus-per-gpu",
+        &mut args.cpus_per_gpu,
     )?;
     apply_str(
         matches,
-        "mem",
-        &["SPUR_MEM_PER_NODE", "SLURM_MEM_PER_NODE"],
-        &mut args.mem,
+        "mem_per_gpu",
+        MEM_PER_GPU_ENV,
+        &mut args.mem_per_gpu,
     );
     apply_str(
         matches,
@@ -614,6 +675,58 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the CPU and memory per-GPU conflict groups with Slurm's
+/// option-source rule, for a standalone srun submitting a new job. Never
+/// called in step mode: a step inherits the allocation's own
+/// `SLURM_CPUS_PER_TASK`/`SLURM_CPUS_PER_GPU` pair, which must not conflict.
+fn resolve_job_option_conflicts(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
+    let src = |id: &str, env: &[&str], set: bool| option_source(was_cli_set(matches, id), env, set);
+
+    let keep = surviving(
+        &[
+            src(
+                "cpus_per_task",
+                CPUS_PER_TASK_ENV,
+                args.cpus_per_task.is_some(),
+            ),
+            src(
+                "cpus_per_gpu",
+                CPUS_PER_GPU_ENV,
+                args.cpus_per_gpu.is_some(),
+            ),
+        ],
+        CPU_CONFLICT,
+        CPU_ENV_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.cpus_per_task = None;
+    }
+    if !keep[1] {
+        args.cpus_per_gpu = None;
+    }
+
+    let keep = surviving(
+        &[
+            src("mem", MEM_ENV, args.mem.is_some()),
+            src("mem_per_cpu", MEM_PER_CPU_ENV, args.mem_per_cpu.is_some()),
+            src("mem_per_gpu", MEM_PER_GPU_ENV, args.mem_per_gpu.is_some()),
+        ],
+        MEM_CONFLICT,
+        MEM_ENV_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.mem = None;
+    }
+    if !keep[1] {
+        args.mem_per_cpu = None;
+    }
+    if !keep[2] {
+        args.mem_per_gpu = None;
+    }
+
+    Ok(())
+}
+
 struct ResolvedIoPaths {
     stdout: String,
     stderr: String,
@@ -679,6 +792,16 @@ fn build_srun_job_spec(
         gpus_per_task.is_some(),
         &gres,
     )?;
+    require_gpus(
+        args.cpus_per_gpu.is_some(),
+        args.mem_per_gpu.is_some(),
+        requests_gpus(
+            gpus.is_some(),
+            gpus_per_node.is_some(),
+            gpus_per_task.is_some(),
+            &gres,
+        ),
+    )?;
 
     let time_limit = args
         .time
@@ -694,7 +817,19 @@ fn build_srun_job_spec(
     let memory_mb = args
         .mem
         .as_ref()
-        .map(|m| parse_memory_mb(m))
+        .map(|m| crate::sbatch::parse_memory_mb(m))
+        .transpose()?
+        .unwrap_or(0);
+    let memory_per_cpu_mb = args
+        .mem_per_cpu
+        .as_ref()
+        .map(|m| crate::sbatch::parse_memory_mb(m))
+        .transpose()?
+        .unwrap_or(0);
+    let memory_per_gpu_mb = args
+        .mem_per_gpu
+        .as_ref()
+        .map(|m| crate::sbatch::parse_memory_mb(m))
         .transpose()?
         .unwrap_or(0);
 
@@ -722,8 +857,9 @@ fn build_srun_job_spec(
         num_nodes: args.nodes,
         num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
-        cpus_per_task: args.cpus_per_task,
+        cpus_per_task: args.cpus_per_task.unwrap_or(0),
         memory_per_node_mb: memory_mb,
+        memory_per_cpu_mb,
         gres,
         gpus,
         gpus_per_node,
@@ -776,6 +912,8 @@ fn build_srun_job_spec(
         srun_job: true,
         pty: args.pty,
         client_keepalive: true,
+        cpus_per_gpu: args.cpus_per_gpu,
+        memory_per_gpu_mb,
         ..Default::default()
     })
 }
@@ -816,64 +954,169 @@ fn container_spec_from_srun_args(args: &SrunArgs) -> Option<ContainerSpec> {
 /// step's environment, so values that arrive only through env stay shared.
 fn step_resources_from_cli(args: &SrunArgs, matches: &ArgMatches) -> Result<Option<StepResources>> {
     let cli = |id: &str| was_cli_set(matches, id);
+    let explicit = |id: &str| {
+        if cli(id) {
+            OptionSource::Explicit
+        } else {
+            OptionSource::Unset
+        }
+    };
+    // Every source here is `explicit` or `Unset` (never `Env`), so an
+    // env-vs-env conflict can't fire; the env message is never shown.
+    surviving(
+        &[explicit("cpus_per_task"), explicit("cpus_per_gpu")],
+        CPU_CONFLICT,
+        CPU_CONFLICT,
+    )?;
+    surviving(
+        &[
+            explicit("mem"),
+            explicit("mem_per_cpu"),
+            explicit("mem_per_gpu"),
+        ],
+        MEM_CONFLICT,
+        MEM_CONFLICT,
+    )?;
+
     let memory_mb = if cli("mem") {
-        args.mem.as_deref().map(parse_memory_mb).transpose()?
+        args.mem
+            .as_deref()
+            .map(crate::sbatch::parse_memory_mb)
+            .transpose()?
     } else {
         None
     };
-    let gpu_flag = |id: &str, value: &Option<String>| -> Result<Option<u32>> {
+    let memory_per_cpu_mb = if cli("mem_per_cpu") {
+        args.mem_per_cpu
+            .as_deref()
+            .map(crate::sbatch::parse_memory_mb)
+            .transpose()?
+    } else {
+        None
+    };
+    let memory_per_gpu_mb = if cli("mem_per_gpu") {
+        args.mem_per_gpu
+            .as_deref()
+            .map(crate::sbatch::parse_memory_mb)
+            .transpose()?
+    } else {
+        None
+    };
+
+    let gpu_flag = |id: &str, value: &Option<String>| -> Result<Option<(String, u32)>> {
         match value {
-            Some(v) if cli(id) => step_gpu_count(v).map(Some),
+            Some(v) if cli(id) => step_gpu_request(v).map(Some),
             _ => Ok(None),
         }
     };
     let gpus = gpu_flag("gpus", &args.gpus)?;
     let gpus_per_task = gpu_flag("gpus_per_task", &args.gpus_per_task)?;
     let gres_gpus = if cli("gres") {
-        step_gres_gpu_count(&args.gres)?
+        step_gres_gpu_request(&args.gres)
     } else {
         None
     };
     let gpus_per_node = gpu_flag("gpus_per_node", &args.gpus_per_node)?;
-    let forms = [gpus, gpus_per_task, gres_gpus, gpus_per_node];
-    if forms.iter().flatten().count() > 1 {
+    let form_count = [&gpus, &gpus_per_task, &gres_gpus, &gpus_per_node]
+        .iter()
+        .filter(|f| f.is_some())
+        .count();
+    if form_count > 1 {
         anyhow::bail!(
             "only one GPU request form (--gpus, --gpus-per-node, --gpus-per-task, or a gpu --gres) may be set"
         );
     }
-    let resources = StepResources {
-        cpus_per_task: cli("cpus_per_task").then_some(args.cpus_per_task),
+    let gpu_type = gpus
+        .as_ref()
+        .or(gpus_per_task.as_ref())
+        .or(gres_gpus.as_ref())
+        .or(gpus_per_node.as_ref())
+        .map(|(t, _)| t.clone())
+        .unwrap_or_default();
+
+    let mut resources = StepResources {
+        cpus_per_task: args.cpus_per_task.filter(|_| cli("cpus_per_task")),
         memory_mb,
-        gpus,
-        gpus_per_node: gpus_per_node.or(gres_gpus),
-        gpus_per_task,
+        gpus: gpus.map(|(_, c)| c),
+        gpus_per_node: gpus_per_node.map(|(_, c)| c).or(gres_gpus.map(|(_, c)| c)),
+        gpus_per_task: gpus_per_task.map(|(_, c)| c),
+        cpus_per_gpu: args.cpus_per_gpu.filter(|_| cli("cpus_per_gpu")),
+        memory_per_gpu_mb,
+        memory_per_cpu_mb,
+        gpu_type,
     };
+
+    let typed = resources != StepResources::default();
+    let cpu_typed = resources.cpus_per_task.is_some() || resources.cpus_per_gpu.is_some();
+    let gpu_form = resources.gpus.is_some_and(|n| n > 0)
+        || resources.gpus_per_node.is_some_and(|n| n > 0)
+        || resources.gpus_per_task.is_some_and(|n| n > 0);
+    if typed && !cpu_typed {
+        // As Slurm, a step sizes CPUs (and --mem-per-cpu) from the job's
+        // exported values when it gives no CPU flag of its own.
+        if gpu_form && args.cpus_per_gpu.is_some_and(|n| n > 0) {
+            resources.cpus_per_gpu = args.cpus_per_gpu;
+        } else {
+            resources.cpus_per_task = args.cpus_per_task.filter(|n| *n > 0);
+        }
+    }
+
     Ok((resources != StepResources::default()).then_some(resources))
 }
 
-/// A step's GPU count. Unlike a job's, zero is a request: the step gets no GPU.
-/// A step takes GPUs its job already holds, so it cannot ask for a type.
-fn step_gpu_count(value: &str) -> Result<u32> {
+/// A step's GPU count, with an optional type. Unlike a job's, zero is a
+/// request: the step gets no GPU.
+fn step_gpu_request(value: &str) -> Result<(String, u32)> {
     let value = value.trim();
-    let count = value.strip_prefix("gpu:").unwrap_or(value);
-    count
-        .parse()
-        .with_context(|| format!("a step's GPU request must be a plain count, got '{value}'"))
+    let value = value.strip_prefix("gpu:").unwrap_or(value);
+    let (gpu_type, count) = match value.rsplit_once(':') {
+        Some((t, c)) => (t.to_string(), c),
+        None => (String::new(), value),
+    };
+    let count = count.parse().with_context(|| {
+        format!("a step's GPU request must be a count or type:count, got '{value}'")
+    })?;
+    Ok((gpu_type, count))
 }
 
-fn step_gres_gpu_count(gres: &[String]) -> Result<Option<u32>> {
-    let mut gpus = None;
+/// A step's GPU gres entry, if any: the type (empty when untyped) and count.
+fn step_gres_gpu_request(gres: &[String]) -> Option<(String, u32)> {
+    let mut found = None;
     for entry in gres {
-        match spur_core::resource::parse_gres(entry) {
-            Some((name, None, count)) if name == "gpu" => gpus = Some(count),
-            Some((name, Some(_), _)) if name == "gpu" => anyhow::bail!(
-                "a step's GPU request must be a plain count, got '{}'",
-                entry.trim()
-            ),
-            _ => {}
+        if let Some((name, gpu_type, count)) = spur_core::resource::parse_gres(entry) {
+            if name == "gpu" {
+                found = Some((gpu_type.unwrap_or_default(), count));
+            }
         }
     }
-    Ok(gpus)
+    found
+}
+
+/// Refuse typed step resource flags before `srun --jobid --overlap` attaches
+/// to a running job: it shares the job's resources, so there is nothing to
+/// carve out. Must run before `SrunProlog` and before any warning prints —
+/// nothing else about this invocation should happen until this check passes.
+fn refuse_typed_jobid_attach(args: &SrunArgs, matches: &ArgMatches) -> Result<()> {
+    if step_resources_from_cli(args, matches)?.is_some() {
+        anyhow::bail!(
+            "srun --jobid attach shares the job's resources; drop -c/--mem*/--cpus-per-gpu/--gpus*/--gres"
+        );
+    }
+    Ok(())
+}
+
+/// Confirm the controller supports step resources before sending a `RunStep`
+/// that carries them; an older controller would accept the request and
+/// silently ignore the carve-out.
+async fn require_step_resources_capability(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+) -> Result<()> {
+    crate::resource_opts::require_controller_capability(
+        client,
+        spur_core::node::CAP_STEP_RESOURCES,
+        "the controller does not support step resources (-c/--mem*/--cpus-per-gpu/--gpus* on a step); upgrade spurctld or run the step without them",
+    )
+    .await
 }
 
 fn install_ctrl_c_cancel(
@@ -973,6 +1216,190 @@ struct StepDispatchParams<'a> {
     mpi: &'a str,
     user: &'a str,
     resources: Option<StepResources>,
+    /// Step id once a busy-share refusal has happened, else `NO_WAITING_STEP`.
+    /// The controller leaves the step runnable after such a refusal, so
+    /// Ctrl-C must close it even while a retry RunStep is in flight, not just
+    /// during the backoff sleep. Step id 0 is a valid step (the controller's
+    /// first user step id), so it cannot double as the "not waiting" value.
+    waiting_step: AtomicU64,
+}
+
+/// Sentinel meaning "no step is waiting on a busy-share retry". Step id 0 is
+/// a real, valid step id, so it cannot be reused for this.
+const NO_WAITING_STEP: u64 = u64::MAX;
+
+/// Backoff and notices for a step whose share is busy, as Slurm's srun prints them.
+struct BusyStepWait {
+    job_id: u32,
+    attempt: u32,
+    last_notice: Option<std::time::Instant>,
+    rng: Xorshift64,
+}
+
+const BUSY_STEP_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const BUSY_STEP_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Minimal xorshift64* PRNG for busy-step jitter: not cryptographic, just
+/// enough that two waiters seeded differently diverge.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        // xorshift requires a non-zero state or it stays stuck at 0 forever.
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+}
+
+/// Applies up to ±25% jitter to `base`, floored at zero so two waiters on the
+/// same base schedule don't retry in lockstep. `base` is already capped at
+/// `BUSY_STEP_MAX_DELAY`; jitter can carry the result up to 25% past that cap.
+fn jitter(rng: &mut Xorshift64, base: std::time::Duration) -> std::time::Duration {
+    let base_ms = base.as_millis() as i64;
+    let quarter = base_ms * 25 / 100;
+    if quarter == 0 {
+        return base;
+    }
+    let span = (2 * quarter + 1) as u64;
+    let offset = (rng.next_u64() % span) as i64 - quarter;
+    std::time::Duration::from_millis((base_ms + offset).max(0) as u64)
+}
+
+impl BusyStepWait {
+    fn new(job_id: u32) -> Self {
+        let seed = std::process::id() as u64
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+        Self::with_seed(job_id, seed)
+    }
+
+    fn with_seed(job_id: u32, seed: u64) -> Self {
+        Self {
+            job_id,
+            attempt: 0,
+            last_notice: None,
+            rng: Xorshift64::new(seed),
+        }
+    }
+
+    /// The un-jittered schedule entry for `attempt`: 1 s, doubling, capped at 10 s.
+    fn base_delay(attempt: u32) -> std::time::Duration {
+        std::time::Duration::from_secs(1u64 << attempt.min(4)).min(BUSY_STEP_MAX_DELAY)
+    }
+
+    /// Delay before the next try: the base schedule, jittered by up to ±25%
+    /// so two multi-node steps retrying in parallel don't stay in lockstep.
+    fn next_delay(&mut self) -> std::time::Duration {
+        let base = Self::base_delay(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
+        jitter(&mut self.rng, base)
+    }
+
+    /// The line to print now, if any: the first notice once, then at most every 60 s.
+    fn notice(&mut self, now: std::time::Instant) -> Option<String> {
+        let state = match self.last_notice {
+            None => "temporarily disabled",
+            Some(last) if now.duration_since(last) >= BUSY_STEP_NOTICE_INTERVAL => "still disabled",
+            Some(_) => return None,
+        };
+        self.last_notice = Some(now);
+        Some(format!(
+            "srun: Job {} step creation {state}, retrying (Requested nodes are busy)",
+            self.job_id
+        ))
+    }
+}
+
+/// Only a refusal the controller marks as a busy share leaves the step
+/// runnable for a retry; any other `ResourceExhausted` is final.
+fn is_busy_share(status: &tonic::Status) -> bool {
+    spur_proto::is_step_share_busy(status)
+}
+
+/// Refusals that mean the controller never launched the step; anything else
+/// (a lost controller, say) may have left it running, so its outcome is kept.
+fn never_launched(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition | tonic::Code::NotFound
+    )
+}
+
+/// The step id a signal handler should abandon, from `waiting_step`'s raw
+/// value, or `None` if nothing is waiting.
+fn step_to_abandon(waiting: u64) -> Option<u32> {
+    (waiting != NO_WAITING_STEP).then_some(waiting as u32)
+}
+
+/// Confirms a step's creation once it has already made the user wait, as
+/// Slurm's srun does (`src/srun/launch.c`'s `info("%ps started", ...)` in its
+/// `(i > 0) || step_queued` branch); a step that lands on the first try needs
+/// no such confirmation.
+fn step_created_notice(wait: &BusyStepWait, job_id: u32, step_id: u32) -> Option<String> {
+    (wait.attempt > 0).then(|| format!("srun: StepId={job_id}.{step_id} started"))
+}
+
+fn oom_notice(job_id: u32, step_id: u32) -> String {
+    format!(
+        "srun: error: Detected an oom_kill event in StepId={job_id}.{step_id}. \
+         Some of the step tasks have been OOM Killed."
+    )
+}
+
+// Real gRPC sockets defeat `start_paused`'s auto-advance, so tests shrink the
+// busy-share backoff instead of sleeping for real seconds.
+#[cfg(test)]
+thread_local! {
+    static TEST_BUSY_STEP_DELAY: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn busy_step_delay(wait: &mut BusyStepWait) -> std::time::Duration {
+    let delay = wait.next_delay();
+    #[cfg(test)]
+    {
+        if let Some(d) = TEST_BUSY_STEP_DELAY.with(|cell| cell.get()) {
+            return d;
+        }
+    }
+    delay
+}
+
+/// Closes a step srun gives up on before it ran. A step the controller already
+/// ended is a no-op there, so failures are not worth reporting.
+async fn abandon_step(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    step_id: u32,
+    user: &str,
+) {
+    let complete = client.complete_job_step(CompleteJobStepRequest {
+        job_id,
+        step_id,
+        exit_code: 0,
+        user: user.to_string(),
+        uid: nix::unistd::geteuid().as_raw(),
+        cancelled: true,
+    });
+    let _ = tokio::time::timeout(TERMINAL_RPC_TIMEOUT, complete).await;
 }
 
 async fn dispatch_step(
@@ -990,8 +1417,8 @@ async fn dispatch_step(
             job_id,
             command: args.command.clone(),
             num_tasks: ntasks,
-            cpus_per_task: args.cpus_per_task,
-            overlap: false,
+            cpus_per_task: args.cpus_per_task.unwrap_or(1),
+            overlap: args.overlap,
             pty: false,
             winsize: None,
             node: String::new(),
@@ -1043,11 +1470,46 @@ async fn dispatch_step(
         user: params.user.to_string(),
         container: container_spec_from_srun_args(args),
         execution_credential,
-        resources: params.resources,
+        resources: params.resources.clone(),
+        overlap: args.overlap,
+        // The controller only reads this on a busy outcome, which only a typed step can reach.
+        wait_if_busy: true,
     };
-    let resp = run_step_with_retry(client, run_step_req, &args.controller)
-        .await
-        .context("RunStep dispatch failed")?;
+    let mut wait = BusyStepWait::new(job_id);
+    let resp = loop {
+        match run_step_with_retry(client, run_step_req.clone(), &args.controller).await {
+            Ok(resp) => {
+                params.waiting_step.store(NO_WAITING_STEP, Ordering::SeqCst);
+                if let Some(notice) = step_created_notice(&wait, job_id, step_id) {
+                    eprintln!("{notice}");
+                }
+                break resp;
+            }
+            Err(status) if is_busy_share(&status) => {
+                if let Some(line) = wait.notice(std::time::Instant::now()) {
+                    eprintln!("{line}");
+                }
+                // Stays set through the next RunStep too: a retry launched by
+                // the controller after we gave up would otherwise complete
+                // normally and overwrite the cancel we'd skip.
+                params.waiting_step.store(step_id as u64, Ordering::SeqCst);
+                tokio::time::sleep(busy_step_delay(&mut wait)).await;
+            }
+            Err(status) => {
+                // Only a never-launched refusal is safe to abandon; anything else may
+                // have left the step running, so its real outcome is kept instead.
+                if never_launched(&status) {
+                    // Keep waiting_step set until abandon_step returns, so a signal
+                    // racing this await still sees a step to abandon (not a no-op).
+                    abandon_step(client, job_id, step_id, params.user).await;
+                    params.waiting_step.store(NO_WAITING_STEP, Ordering::SeqCst);
+                    anyhow::bail!("{}", status.message());
+                }
+                params.waiting_step.store(NO_WAITING_STEP, Ordering::SeqCst);
+                anyhow::bail!("RunStep dispatch failed: {status}");
+            }
+        }
+    };
 
     if !resp.node.is_empty() {
         eprintln!("srun: dispatched to node {}", resp.node);
@@ -1074,6 +1536,9 @@ async fn dispatch_step(
     for warning in &resp.warnings {
         eprintln!("srun: {warning}");
     }
+    if resp.oom_killed {
+        eprintln!("{}", oom_notice(job_id, step_id));
+    }
 
     Ok(StepDispatchResult {
         exit_code: resp.exit_code,
@@ -1082,6 +1547,24 @@ async fn dispatch_step(
 
 const RUN_STEP_RETRY_ATTEMPTS: u32 = 30;
 const RUN_STEP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+// As with the busy-share backoff: real gRPC sockets defeat `start_paused`, so
+// a test shrinks this instead of sleeping for real seconds.
+#[cfg(test)]
+thread_local! {
+    static TEST_RUN_STEP_RETRY_BACKOFF: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn run_step_retry_backoff() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = TEST_RUN_STEP_RETRY_BACKOFF.with(|cell| cell.get()) {
+            return d;
+        }
+    }
+    RUN_STEP_RETRY_BACKOFF
+}
 
 fn is_transient_error(status: &tonic::Status) -> bool {
     matches!(
@@ -1094,11 +1577,11 @@ async fn run_step_with_retry(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     req: RunStepRequest,
     controller_addr: &str,
-) -> Result<spur_proto::proto::RunStepResponse> {
+) -> Result<spur_proto::proto::RunStepResponse, tonic::Status> {
     let mut last_error = None;
     for attempt in 0..RUN_STEP_RETRY_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(RUN_STEP_RETRY_BACKOFF).await;
+            tokio::time::sleep(run_step_retry_backoff()).await;
             match crate::authclient::connect(controller_addr).await {
                 Ok(channel) => {
                     *client = spur_proto::controller_client(channel);
@@ -1123,16 +1606,14 @@ async fn run_step_with_retry(
                 );
                 last_error = Some(status);
             }
-            Err(status) => {
-                anyhow::bail!("RunStep failed: {status}");
-            }
+            Err(status) => return Err(status),
         }
     }
-    anyhow::bail!(
-        "RunStep failed after {} retries: {}",
-        RUN_STEP_RETRY_ATTEMPTS,
-        last_error.map_or_else(|| "unknown".to_string(), |e| e.to_string())
-    )
+    Err(last_error.unwrap_or_else(|| {
+        tonic::Status::unavailable(format!(
+            "RunStep failed after {RUN_STEP_RETRY_ATTEMPTS} retries"
+        ))
+    }))
 }
 
 /// Bounds the client's terminal RPCs so a stuck controller cannot hang the
@@ -1193,6 +1674,38 @@ async fn conclude_pty_session(
     }
 }
 
+// A waiting step is abandoned on SIGINT, SIGTERM, or SIGHUP alike, so one
+// future races all three and reports which one fired. Signal registration
+// (`install`) is split out from the wait so a test can raise the real signal
+// right after registering, with no window where it could hit the default
+// disposition.
+struct TerminatingSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+}
+
+impl TerminatingSignals {
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate()).context("install SIGTERM handler")?,
+            sighup: signal(SignalKind::hangup()).context("install SIGHUP handler")?,
+        })
+    }
+
+    async fn wait(&mut self) -> i32 {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => 2,
+            _ = self.sigterm.recv() => 15,
+            _ = self.sighup.recv() => 1,
+        }
+    }
+}
+
+async fn terminating_signal() -> Result<i32> {
+    Ok(TerminatingSignals::install()?.wait().await)
+}
+
 async fn dispatch_step_cancellable(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -1202,22 +1715,34 @@ async fn dispatch_step_cancellable(
     if cancel_job_on_interrupt {
         return dispatch_step(client, job_id, params).await;
     }
+    let mut abandon_client = client.clone();
     tokio::select! {
         result = dispatch_step(client, job_id, params) => result,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nsrun: step interrupted");
-            std::process::exit(130);
+        signo = terminating_signal() => {
+            let signo = signo?;
+            if let Some(waiting) = step_to_abandon(params.waiting_step.load(Ordering::SeqCst)) {
+                abandon_step(&mut abandon_client, job_id, waiting, params.user).await;
+            }
+            if signo == 2 {
+                eprintln!("\nsrun: step interrupted");
+            } else {
+                eprintln!("\nsrun: step terminated");
+            }
+            std::process::exit(128 + signo);
         }
     }
 }
 
 async fn run_standalone_srun(
-    args: &SrunArgs,
+    args: &mut SrunArgs,
+    matches: &ArgMatches,
     hooks: &HooksConfig,
     work_dir: &str,
     mpi: &str,
     submit_line: &str,
 ) -> Result<()> {
+    resolve_job_option_conflicts(matches, args)?;
+    let args: &SrunArgs = args;
     let io = resolve_io_paths(args);
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -1225,6 +1750,12 @@ async fn run_standalone_srun(
     let mut client = SlurmControllerClient::new(channel);
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi, submit_line)?;
     let submit_user = job_spec.user.clone();
+    crate::resource_opts::require_per_gpu_options_capability(
+        &mut client,
+        job_spec.cpus_per_gpu,
+        job_spec.memory_per_gpu_mb,
+    )
+    .await?;
     let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
@@ -1296,6 +1827,7 @@ async fn run_standalone_srun(
             mpi,
             user: &owner,
             resources: None,
+            waiting_step: AtomicU64::new(NO_WAITING_STEP),
         };
         let dispatch_result =
             dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
@@ -1772,6 +2304,7 @@ async fn complete_interactive_step(
         exit_code,
         user: user.to_string(),
         uid: nix::unistd::geteuid().as_raw(),
+        cancelled: false,
     });
     match tokio::time::timeout(std::time::Duration::from_secs(5), report).await {
         Ok(Ok(_)) => {}
@@ -2026,24 +2559,34 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
         );
     }
 
-    let sized = ["ntasks", "ntasks_per_node", "cpus_per_task", "nodes"]
+    let sized = ["ntasks", "ntasks_per_node", "nodes"]
         .iter()
         .any(|id| crate::env_defaults::was_cli_set(matches, id));
     if sized {
         warnings.push(
             "srun: warning: --pty runs a single task on one node; \
-             --ntasks/--ntasks-per-node/--cpus-per-task/--nodes are ignored"
+             --ntasks/--ntasks-per-node/--nodes are ignored"
                 .into(),
         );
     }
 
-    let own_share = ["mem", "gres", "gpus", "gpus_per_node", "gpus_per_task"]
-        .iter()
-        .any(|id| crate::env_defaults::was_cli_set(matches, id));
-    if own_share {
+    let own_resources = [
+        "cpus_per_task",
+        "cpus_per_gpu",
+        "mem",
+        "mem_per_cpu",
+        "mem_per_gpu",
+        "gres",
+        "gpus",
+        "gpus_per_node",
+        "gpus_per_task",
+    ]
+    .iter()
+    .any(|id| crate::env_defaults::was_cli_set(matches, id));
+    if own_resources {
         warnings.push(
-            "srun: warning: a --pty step shares its job's memory and GPUs; \
-             --mem/--gres/--gpus* are ignored"
+            "srun: warning: a --pty step runs with its job's CPUs, memory and GPUs; \
+             -c/--mem*/--cpus-per-gpu/--gres/--gpus* are ignored"
                 .into(),
         );
     }
@@ -2158,6 +2701,20 @@ async fn run_as_step(
     }
 
     let resources = step_resources_from_cli(args, matches)?;
+    if let Some(r) = &resources {
+        let known_step_nodes = was_cli_set(matches, "nodes")
+            .then_some(args.nodes)
+            .or_else(|| {
+                args.nodelist
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|pattern| spur_core::hostlist::expand(pattern).ok())
+                    .map(|hosts| hosts.len() as u32)
+            });
+        spur_core::step_shape::check(r, known_step_nodes)
+            .map_err(|e| anyhow::anyhow!("srun: error: {e}"))?;
+        require_step_resources_capability(&mut client).await?;
+    }
     let step_params = StepDispatchParams {
         args,
         explicit_num_nodes: was_cli_set(matches, "nodes").then_some(args.nodes),
@@ -2167,6 +2724,7 @@ async fn run_as_step(
         mpi: step_mpi,
         user: &user,
         resources,
+        waiting_step: AtomicU64::new(NO_WAITING_STEP),
     };
     let dispatch_result =
         dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
@@ -2186,18 +2744,6 @@ async fn run_as_step(
         true,
     )
     .await;
-}
-
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
-    }
 }
 
 fn load_hooks_config() -> HooksConfig {
@@ -2230,6 +2776,18 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    /// Step id 0 is the controller's first user step id (`allocate_step_id`
+    /// starts at 0), so a step 0 left waiting must still be abandoned.
+    #[test]
+    fn step_to_abandon_treats_step_zero_as_waiting() {
+        assert_eq!(step_to_abandon(0), Some(0));
+    }
+
+    #[test]
+    fn step_to_abandon_reports_none_when_nothing_is_waiting() {
+        assert_eq!(step_to_abandon(NO_WAITING_STEP), None);
+    }
 
     /// A --pty step now runs inside the requested container, so it no longer
     /// warns that container options are dropped.
@@ -2296,7 +2854,6 @@ mod tests {
         for argv in [
             &["srun", "--pty", "-n", "4", "bash"][..],
             &["srun", "--pty", "-N", "2", "bash"][..],
-            &["srun", "--pty", "-c", "8", "bash"][..],
             &["srun", "--pty", "--ntasks-per-node", "2", "bash"][..],
         ] {
             let (args, matches) = parse_srun(argv);
@@ -2365,11 +2922,19 @@ mod tests {
     }
 
     #[test]
-    fn a_step_cannot_pick_a_gpu_type_or_two_request_forms() {
+    fn a_step_can_pick_a_gpu_type_but_not_two_request_forms() {
+        let (args, matches) = parse_srun(&["srun", "--gpus", "mi300x:1", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.gpu_type, "mi300x");
+        assert_eq!(resources.gpus, Some(1));
+
+        let (args, matches) = parse_srun(&["srun", "--gres", "gpu:mi300x:2", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.gpu_type, "mi300x");
+        assert_eq!(resources.gpus_per_node, Some(2));
+
         for argv in [
-            &["srun", "--gpus", "mi300x:1", "true"][..],
-            &["srun", "--gres", "gpu:mi300x:1", "true"],
-            &["srun", "--gpus", "1", "--gpus-per-node", "1", "true"],
+            &["srun", "--gpus", "1", "--gpus-per-node", "1", "true"][..],
             &["srun", "--gres", "gpu:1", "--gpus-per-task", "1", "true"],
         ] {
             let (args, matches) = parse_srun(argv);
@@ -2380,32 +2945,46 @@ mod tests {
         }
     }
 
-    /// An allocation exports its own sizing into every step's environment; taking
-    /// it as the step's request would hand each step the whole job's share.
+    #[test]
+    fn typed_cpus_and_mem_per_gpu_flags_are_filled() {
+        let (args, matches) = parse_srun(&["srun", "--cpus-per-gpu", "4", "--gpus", "1", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.cpus_per_gpu, Some(4));
+        assert_eq!(resources.gpus, Some(1));
+    }
+
+    /// A typed step with no CPU flag of its own takes the job's exported
+    /// `-c`, which also sizes `--mem-per-cpu`.
     #[test]
     #[serial(env_injection)]
-    fn sizing_inherited_from_the_allocation_env_is_not_a_step_request() {
+    fn a_typed_step_inherits_the_jobs_cpus_per_task() {
         let _env = EnvGuard::new();
-        std::env::set_var("SPUR_CPUS_PER_TASK", "8");
-        std::env::set_var("SPUR_MEM_PER_NODE", "16G");
-        std::env::set_var("SPUR_GPUS_PER_NODE", "8");
-
+        std::env::set_var("SPUR_CPUS_PER_TASK", "4");
         let matches = SrunArgs::command()
-            .try_get_matches_from(["srun", "true"])
+            .try_get_matches_from(["srun", "--mem-per-cpu", "1G", "true"])
             .expect("parse failed");
         let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
         resolve_srun_env(&matches, &mut args).expect("env resolution failed");
 
-        assert_eq!(args.cpus_per_task, 8, "env must reach args");
-        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.cpus_per_task, Some(4));
+        assert_eq!(resources.memory_per_cpu_mb, Some(1024));
     }
 
     #[test]
-    fn pty_step_warns_that_it_shares_memory_and_gpus() {
-        let (args, matches) = parse_srun(&["srun", "--pty", "--mem", "1G", "bash"]);
-        let warnings = pty_step_unsupported_warnings(&args, &matches);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--mem"), "{warnings:?}");
+    #[serial(env_injection)]
+    fn a_typed_gpu_step_inherits_the_jobs_cpus_per_gpu() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_GPU", "8");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--gpus", "1", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.cpus_per_gpu, Some(8));
+        assert_eq!(resources.cpus_per_task, None);
     }
 
     #[test]
@@ -2444,6 +3023,333 @@ mod tests {
 
         let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
         assert!(!container_spec_from_srun_args(&args).unwrap().auth_socket);
+    }
+
+    /// A step asking for zero GPUs is not a GPU step, so it must not pick up
+    /// the job's `--cpus-per-gpu` sizing.
+    #[test]
+    #[serial(env_injection)]
+    fn gpus_zero_does_not_inherit_cpus_per_gpu() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_TASK", "1");
+        std::env::set_var("SPUR_CPUS_PER_GPU", "8");
+        for argv in [
+            &["srun", "--gpus", "0", "true"][..],
+            &["srun", "--gres", "gpu:0", "true"],
+        ] {
+            let matches = SrunArgs::command()
+                .try_get_matches_from(argv)
+                .expect("parse failed");
+            let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+            resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+            let resources = step_resources_from_cli(&args, &matches)
+                .expect("step resources resolution failed")
+                .expect("gpus=0 is still a typed step");
+            assert_eq!(resources.cpus_per_gpu, None, "{argv:?}");
+            assert!(
+                spur_core::step_shape::check(&resources, None).is_ok(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn an_untyped_step_inherits_nothing() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_TASK", "4");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn a_typed_cpu_form_beats_inheritance() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_TASK", "4");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "-c", "2", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(
+            resources.cpus_per_task,
+            Some(2),
+            "the step's own -c must win over inheritance"
+        );
+    }
+
+    #[test]
+    fn typed_mem_per_cpu_and_mem_per_gpu_are_parsed_to_mb() {
+        let (args, matches) = parse_srun(&["srun", "--mem-per-cpu", "1G", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.memory_per_cpu_mb, Some(1024));
+
+        let (args, matches) = parse_srun(&["srun", "--mem-per-gpu", "2G", "--gpus", "1", "true"]);
+        let resources = step_resources_from_cli(&args, &matches).unwrap().unwrap();
+        assert_eq!(resources.memory_per_gpu_mb, Some(2048));
+    }
+
+    #[test]
+    fn explicit_c_zero_is_rejected_by_clap() {
+        let err = SrunArgs::command().try_get_matches_from(["srun", "-c", "0", "true"]);
+        assert!(err.is_err(), "-c 0 must be a clap parse error");
+    }
+
+    #[test]
+    fn step_cpu_conflict_is_refused() {
+        let (args, matches) = parse_srun(&[
+            "srun",
+            "-c",
+            "2",
+            "--cpus-per-gpu",
+            "4",
+            "--gpus",
+            "1",
+            "true",
+        ]);
+        assert_eq!(
+            step_resources_from_cli(&args, &matches)
+                .unwrap_err()
+                .to_string(),
+            CPU_CONFLICT
+        );
+    }
+
+    #[test]
+    fn step_mem_conflict_is_refused() {
+        let (args, matches) = parse_srun(&["srun", "--mem", "1G", "--mem-per-cpu", "1G", "true"]);
+        assert_eq!(
+            step_resources_from_cli(&args, &matches)
+                .unwrap_err()
+                .to_string(),
+            MEM_CONFLICT
+        );
+    }
+
+    /// An allocation exports per-GPU/memory sizing into every step's
+    /// environment too; a step must only ever act on what this command line
+    /// itself typed.
+    #[test]
+    #[serial(env_injection)]
+    fn env_only_typed_flags_never_produce_a_step_request() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_CPUS_PER_GPU", "4");
+        std::env::set_var("SLURM_MEM_PER_GPU", "1024");
+        std::env::set_var("SLURM_CPUS_PER_TASK", "8");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(args.cpus_per_gpu, Some(4), "env must reach args");
+        assert_eq!(args.mem_per_gpu.as_deref(), Some("1024"));
+        assert_eq!(args.cpus_per_task, Some(8));
+        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+    }
+
+    /// A `--pty` step inside an allocation shares the job's resources: typed
+    /// flags warn, not bail.
+    #[test]
+    fn typed_step_flags_warn_instead_of_refusing_with_pty() {
+        for argv in [
+            &["srun", "--pty", "-c", "4", "bash"][..],
+            &["srun", "--pty", "--mem", "1G", "bash"],
+            &["srun", "--pty", "--gpus", "1", "bash"],
+            &["srun", "--pty", "--gres", "gpu:1", "bash"],
+            &[
+                "srun",
+                "--pty",
+                "--cpus-per-gpu",
+                "4",
+                "--gpus",
+                "1",
+                "bash",
+            ],
+        ] {
+            let (args, matches) = parse_srun(argv);
+            let warnings = pty_step_unsupported_warnings(&args, &matches);
+            assert!(
+                warnings.iter().any(|w| w.contains(
+                    "a --pty step runs with its job's CPUs, memory and GPUs; \
+                     -c/--mem*/--cpus-per-gpu/--gres/--gpus* are ignored"
+                )),
+                "{argv:?}: {warnings:?}"
+            );
+            assert!(
+                step_resources_from_cli(&args, &matches).unwrap().is_some(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_step_flags_are_refused_on_jobid_attach() {
+        let (args, matches) = parse_srun(&["srun", "--jobid", "1", "-c", "4", "bash"]);
+        assert_eq!(
+            refuse_typed_jobid_attach(&args, &matches)
+                .unwrap_err()
+                .to_string(),
+            "srun --jobid attach shares the job's resources; drop -c/--mem*/--cpus-per-gpu/--gpus*/--gres",
+        );
+    }
+
+    #[test]
+    fn refuse_typed_jobid_attach_is_silent_without_typed_resources() {
+        let (args, matches) = parse_srun(&["srun", "--jobid", "1", "--overlap", "bash"]);
+        assert!(refuse_typed_jobid_attach(&args, &matches).is_ok());
+    }
+
+    /// The typed-resource refusal on `--jobid --overlap` must run before
+    /// `SrunProlog`: point the prolog at a script that cannot exist, so if the
+    /// refusal ran after it, the error would be the prolog's, not this one's.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn jobid_attach_refusal_runs_before_the_prolog() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_PROLOG", "/nonexistent/srun-prolog-must-not-run.sh");
+
+        let err = main_with_args(vec![
+            "srun".into(),
+            "--jobid".into(),
+            "1".into(),
+            "--overlap".into(),
+            "--gpus".into(),
+            "1".into(),
+            "hostname".into(),
+        ])
+        .await
+        .expect_err("typed resources on a jobid attach must be refused");
+
+        assert_eq!(
+            err.to_string(),
+            "srun --jobid attach shares the job's resources; drop -c/--mem*/--cpus-per-gpu/--gpus*/--gres",
+            "the refusal must fire before SrunProlog ever runs"
+        );
+    }
+
+    /// A `--pty` step's own request never carries its typed flags: the agent
+    /// sees a fixed `cpus_per_task: 1` regardless of `-c`, and there is no
+    /// resources field at all in `CreateJobStepRequest` for mem/GPU to ride on.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn pty_step_with_typed_resources_dispatches_sharing_the_job() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_user("tester");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--pty", "-c", "4", "--gres", "gpu:1", "bash"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        args.controller = format!("http://{addr}");
+
+        let err = run_as_step(
+            &args,
+            &matches,
+            1,
+            &HooksConfig::default(),
+            "/tmp",
+            spur_core::mpi::MPI_NONE,
+        )
+        .await
+        .expect_err("mock returns no node address, so the session cannot open");
+
+        assert!(
+            err.to_string().contains("node address"),
+            "expected no refusal, only the mock's missing node address: {err}"
+        );
+        assert_eq!(
+            capture.create_step_calls(),
+            1,
+            "no refusal: CreateJobStep must be reached"
+        );
+        assert_eq!(
+            capture.create_step_cpus_per_task(),
+            1,
+            "the step's own -c must never reach the request; it shares the job's"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_check_requires_the_step_resources_capability() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = require_step_resources_capability(&mut client)
+            .await
+            .expect_err("an old controller without the capability must be refused");
+        assert!(err.to_string().contains("does not support step resources"));
+
+        capture.set_ping_capabilities(vec![spur_core::node::CAP_STEP_RESOURCES.to_string()]);
+        require_step_resources_capability(&mut client)
+            .await
+            .expect("a controller advertising the capability is accepted");
+    }
+
+    /// An allocation exports its own sizing into every step's environment; taking
+    /// it as the step's request would hand each step the whole job's share.
+    #[test]
+    #[serial(env_injection)]
+    fn sizing_inherited_from_the_allocation_env_is_not_a_step_request() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_CPUS_PER_TASK", "8");
+        std::env::set_var("SPUR_MEM_PER_NODE", "16G");
+        std::env::set_var("SPUR_GPUS_PER_NODE", "8");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(args.cpus_per_task, Some(8), "env must reach args");
+        assert_eq!(step_resources_from_cli(&args, &matches).unwrap(), None);
+    }
+
+    /// A step inherits both halves of an allocation's CPU sizing at once
+    /// (`SLURM_CPUS_PER_TASK` and `SLURM_CPUS_PER_GPU`), which would be a
+    /// `CPU_CONFLICT` on the standalone path. Step mode never runs that check,
+    /// so this combination must not error.
+    #[test]
+    #[serial(env_injection)]
+    fn step_mode_is_unaffected_by_the_standalone_cpu_conflict_rule() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_CPUS_PER_TASK", "2");
+        std::env::set_var("SLURM_CPUS_PER_GPU", "4");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(args.cpus_per_task, Some(2));
+        assert_eq!(args.cpus_per_gpu, Some(4));
+        assert_eq!(
+            step_resources_from_cli(&args, &matches).unwrap(),
+            None,
+            "neither flag was typed on this step's command line"
+        );
+    }
+
+    #[test]
+    fn pty_step_warns_about_mem_or_gpus_instead_of_refusing() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--mem", "1G", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("a --pty step runs with its job's CPUs, memory and GPUs"));
     }
 
     #[test]
@@ -2974,6 +3880,127 @@ mod tests {
         assert!(spec.qos.is_empty());
     }
 
+    /// Parse argv, apply env defaults, then resolve the standalone-path
+    /// conflict rule — the pipeline `run_standalone_srun` runs before
+    /// `build_srun_job_spec`.
+    fn resolve_standalone(argv: &[&str]) -> SrunArgs {
+        let matches = SrunArgs::command()
+            .try_get_matches_from(argv)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        resolve_job_option_conflicts(&matches, &mut args).expect("conflict resolution failed");
+        args
+    }
+
+    #[test]
+    fn build_srun_job_spec_cpus_per_task_absent_is_zero() {
+        let args = resolve_standalone(&["srun", "hostname"]);
+        let io = resolve_io_paths(&args);
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+        assert_eq!(spec.cpus_per_task, 0);
+    }
+
+    #[test]
+    fn build_srun_job_spec_mem_per_cpu_sets_mb() {
+        let args = resolve_standalone(&["srun", "--mem-per-cpu=2G", "hostname"]);
+        let io = resolve_io_paths(&args);
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+        assert_eq!(spec.memory_per_cpu_mb, 2048);
+    }
+
+    #[test]
+    fn build_srun_job_spec_cpus_and_mem_per_gpu_set() {
+        let args = resolve_standalone(&[
+            "srun",
+            "--gpus=1",
+            "--cpus-per-gpu=4",
+            "--mem-per-gpu=1G",
+            "hostname",
+        ]);
+        let io = resolve_io_paths(&args);
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+        assert_eq!(spec.cpus_per_gpu, Some(4));
+        assert_eq!(spec.memory_per_gpu_mb, 1024);
+    }
+
+    #[test]
+    fn cpus_per_gpu_without_gpus_is_rejected() {
+        let args = resolve_standalone(&["srun", "--cpus-per-gpu=4", "hostname"]);
+        let io = resolve_io_paths(&args);
+        let err = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").unwrap_err();
+        assert_eq!(err.to_string(), "--cpus-per-gpu requires a GPU request");
+    }
+
+    #[test]
+    fn cpus_per_gpu_zero_is_rejected_on_cli() {
+        let err = SrunArgs::command()
+            .try_get_matches_from(["srun", "--cpus-per-gpu=0", "hostname"])
+            .unwrap_err();
+        assert!(err.to_string().contains("--cpus-per-gpu"), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_zero_is_rejected() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_CPUS_PER_GPU", "0");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--gpus=1", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        let err = resolve_srun_env(&matches, &mut args).unwrap_err();
+        assert!(err.to_string().contains("SLURM_CPUS_PER_GPU"), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_task_and_env_cpus_per_gpu_conflict() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_CPUS_PER_TASK", "2");
+        std::env::set_var("SLURM_CPUS_PER_GPU", "4");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        let err = resolve_job_option_conflicts(&matches, &mut args).unwrap_err();
+        assert!(err.to_string().contains(CPU_ENV_CONFLICT), "got: {err}");
+    }
+
+    /// No flag was typed, so the message must name the env vars the user
+    /// actually set, not the flags behind them.
+    #[test]
+    #[serial(env_injection)]
+    fn env_mem_per_cpu_and_env_mem_per_gpu_conflict() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_MEM_PER_CPU", "1G");
+        std::env::set_var("SLURM_MEM_PER_GPU", "2G");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        let err = resolve_job_option_conflicts(&matches, &mut args).unwrap_err();
+        assert!(err.to_string().contains(MEM_ENV_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn cli_cpus_per_task_drops_env_cpus_per_gpu() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SLURM_CPUS_PER_GPU", "4");
+
+        let args = resolve_standalone(&["srun", "-c", "2", "hostname"]);
+        assert_eq!(args.cpus_per_task, Some(2));
+        assert_eq!(args.cpus_per_gpu, None);
+    }
+
     #[test]
     fn build_command_script_simple_argv() {
         assert_eq!(
@@ -3359,7 +4386,7 @@ mod tests {
         let args = resolve_from(&["srun", "hostname"]);
         assert_eq!(args.nodes, 1);
         assert_eq!(args.ntasks, None);
-        assert_eq!(args.cpus_per_task, 1);
+        assert_eq!(args.cpus_per_task, None);
         assert!(args.partition.is_none());
         assert!(args.mpi.is_none());
         assert!(!args.exclusive);
@@ -3380,7 +4407,7 @@ mod tests {
         env.set("SLURM_JOB_NUM_NODES", "3");
         let args = resolve_from(&["srun", "hostname"]);
         assert_eq!(args.ntasks, Some(4));
-        assert_eq!(args.cpus_per_task, 2);
+        assert_eq!(args.cpus_per_task, Some(2));
         assert_eq!(args.nodes, 3);
 
         // An explicit CLI value still wins over the inherited allocation env.
@@ -3541,8 +4568,72 @@ mod tests {
             mpi: spur_core::mpi::MPI_NONE,
             user: "tester",
             resources: None,
+            waiting_step: AtomicU64::new(NO_WAITING_STEP),
         };
         dispatch_step(client, 1, &params).await
+    }
+
+    /// The agent's shape checks also run client-side, before `CreateJobStep`,
+    /// so a malformed step never gets a stray record.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn srun_rejects_mem_per_gpu_without_gpus_before_creating_the_step() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_user("tester");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--mem-per-gpu", "1G", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        args.controller = format!("http://{addr}");
+
+        let err = run_as_step(
+            &args,
+            &matches,
+            1,
+            &HooksConfig::default(),
+            "/tmp",
+            spur_core::mpi::MPI_NONE,
+        )
+        .await
+        .expect_err("--mem-per-gpu without a GPU request must be refused client-side");
+
+        assert!(
+            err.to_string().contains("needs the step to ask for GPUs"),
+            "{err}"
+        );
+        assert_eq!(capture.create_step_calls(), 0);
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn srun_rejects_gpus_not_divisible_by_explicit_nodes() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_user("tester");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "-N", "2", "--gpus", "3", "true"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+        args.controller = format!("http://{addr}");
+
+        let err = run_as_step(
+            &args,
+            &matches,
+            1,
+            &HooksConfig::default(),
+            "/tmp",
+            spur_core::mpi::MPI_NONE,
+        )
+        .await
+        .expect_err("an uneven --gpus split across explicit nodes must be refused client-side");
+
+        assert!(err.to_string().contains("does not split evenly"), "{err}");
+        assert_eq!(capture.create_step_calls(), 0);
     }
 
     /// A session that dies after CreateJobStep must still close the step out —
@@ -3893,6 +4984,394 @@ mod tests {
         assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
     }
 
+    /// srun retries a busy share itself, so the controller must not record it
+    /// CANCELLED out from under a retry already in flight.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_sets_wait_if_busy() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert!(capture.run_step_wait_if_busy());
+    }
+
+    /// Zeroes the busy-share backoff for one test and restores it on drop.
+    struct BusyStepDelayGuard;
+
+    impl BusyStepDelayGuard {
+        fn zero() -> Self {
+            TEST_BUSY_STEP_DELAY.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
+            Self
+        }
+    }
+
+    impl Drop for BusyStepDelayGuard {
+        fn drop(&mut self) {
+            TEST_BUSY_STEP_DELAY.with(|cell| cell.set(None));
+        }
+    }
+
+    /// Zeroes the RunStep reconnect backoff for one test and restores it on drop.
+    struct RunStepRetryDelayGuard;
+
+    impl RunStepRetryDelayGuard {
+        fn zero() -> Self {
+            TEST_RUN_STEP_RETRY_BACKOFF.with(|cell| cell.set(Some(std::time::Duration::ZERO)));
+            Self
+        }
+    }
+
+    impl Drop for RunStepRetryDelayGuard {
+        fn drop(&mut self) {
+            TEST_RUN_STEP_RETRY_BACKOFF.with(|cell| cell.set(None));
+        }
+    }
+
+    #[test]
+    fn busy_step_backoff_doubles_to_ten_seconds() {
+        let d: Vec<u64> = (0..6)
+            .map(|a| BusyStepWait::base_delay(a).as_secs())
+            .collect();
+        assert_eq!(d, [1, 2, 4, 8, 10, 10]);
+    }
+
+    #[test]
+    fn busy_step_jitter_stays_within_a_quarter_of_the_base_schedule() {
+        for seed in [1u64, 42, 1_000_003, u64::MAX] {
+            let mut w = BusyStepWait::with_seed(7, seed);
+            for attempt in 0..6u32 {
+                let base = BusyStepWait::base_delay(attempt).as_millis() as i64;
+                let quarter = base * 25 / 100;
+                let got = w.next_delay().as_millis() as i64;
+                assert!(
+                    (base - quarter..=base + quarter).contains(&got),
+                    "attempt {attempt}: {got}ms outside [{}, {}]ms (base {base}ms)",
+                    base - quarter,
+                    base + quarter
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn busy_step_jitter_differs_across_seeds() {
+        let mut a = BusyStepWait::with_seed(7, 1);
+        let mut b = BusyStepWait::with_seed(7, 2);
+        let schedule_a: Vec<_> = (0..6).map(|_| a.next_delay()).collect();
+        let schedule_b: Vec<_> = (0..6).map(|_| b.next_delay()).collect();
+        assert_ne!(schedule_a, schedule_b);
+    }
+
+    #[test]
+    fn busy_step_notices_match_slurm_and_are_rate_limited() {
+        use std::time::Duration;
+        let mut w = BusyStepWait::new(7);
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            w.notice(t0).as_deref(),
+            Some(
+                "srun: Job 7 step creation temporarily disabled, retrying (Requested nodes are busy)"
+            )
+        );
+        assert_eq!(w.notice(t0 + Duration::from_secs(59)), None);
+        assert_eq!(
+            w.notice(t0 + Duration::from_secs(60)).as_deref(),
+            Some("srun: Job 7 step creation still disabled, retrying (Requested nodes are busy)")
+        );
+        assert_eq!(w.notice(t0 + Duration::from_secs(119)), None);
+    }
+
+    #[test]
+    fn step_created_notice_is_silent_on_the_first_try() {
+        let wait = BusyStepWait::new(7);
+        assert_eq!(step_created_notice(&wait, 7, 3), None);
+    }
+
+    #[test]
+    fn step_created_notice_confirms_a_step_that_needed_a_retry() {
+        let mut wait = BusyStepWait::new(7);
+        wait.next_delay();
+        assert_eq!(
+            step_created_notice(&wait, 7, 3).as_deref(),
+            Some("srun: StepId=7.3 started")
+        );
+    }
+
+    #[test]
+    fn oom_notice_matches_slurm() {
+        assert_eq!(
+            oom_notice(12, 3),
+            "srun: error: Detected an oom_kill event in StepId=12.3. \
+             Some of the step tasks have been OOM Killed."
+        );
+    }
+
+    #[test]
+    fn only_a_busy_share_is_waited_on() {
+        assert!(is_busy_share(&spur_proto::step_share_busy("busy")));
+        assert!(!is_busy_share(&tonic::Status::resource_exhausted(
+            "pending job cleanup"
+        )));
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Unavailable,
+        ] {
+            assert!(!is_busy_share(&tonic::Status::new(code, "x")));
+        }
+    }
+
+    /// A busy share is retried with the same step id until the step is placed.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_waits_out_a_busy_share() {
+        let _env = EnvGuard::new();
+        let _delay = BusyStepDelayGuard::zero();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_busy("Requested nodes are busy");
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let result = dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect("dispatch should succeed once the share frees");
+
+        assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
+        assert_eq!(
+            capture.run_step_step_ids(),
+            vec![crate::mock_controller::MOCK_STEP_ID; 2]
+        );
+        assert!(capture.cancelled_step_calls().is_empty());
+    }
+
+    /// Any `ResourceExhausted` without the controller's busy marker is final:
+    /// srun must not retry it, unlike a marked busy share.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_fails_fast_on_an_unmarked_resource_exhausted() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_error(tonic::Code::ResourceExhausted, "pending job cleanup");
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect_err("an unmarked ResourceExhausted must not be retried");
+
+        // Not a `never_launched` code, so it keeps the "RunStep dispatch
+        // failed" framing like any other non-refusal status.
+        assert!(err.to_string().contains("RunStep dispatch failed"), "{err}");
+        assert!(err.to_string().contains("pending job cleanup"), "{err}");
+        assert_eq!(capture.run_step_calls(), 1);
+        // Unlike a marked refusal, an unmarked ResourceExhausted is already recorded
+        // FAILED server-side, so srun must not also abandon the step.
+        assert!(capture.cancelled_step_calls().is_empty());
+    }
+
+    /// A non-busy refusal is shown as-is, not retried, and still abandons the
+    /// step (a no-op server-side if the controller already closed it).
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_reports_a_refusal_verbatim_without_retrying() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_error(
+            tonic::Code::InvalidArgument,
+            "--mem-per-gpu requires a GPU request",
+        );
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect_err("a refused step must fail");
+
+        assert_eq!(err.to_string(), "--mem-per-gpu requires a GPU request");
+        assert_eq!(capture.run_step_calls(), 1);
+        assert_eq!(
+            capture.cancelled_step_calls(),
+            vec![crate::mock_controller::MOCK_STEP_ID]
+        );
+    }
+
+    /// A lost controller connection may have left the step running on the
+    /// agents; abandoning it (CANCELLED) would overwrite a real outcome, so a
+    /// transport failure must fail without that side effect.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_does_not_abandon_after_a_transport_failure() {
+        let _env = EnvGuard::new();
+        let _delay = RunStepRetryDelayGuard::zero();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        for _ in 0..30 {
+            capture.push_run_step_error(tonic::Code::Unavailable, "controller unreachable");
+        }
+        let mut client = crate::mock_controller::client(addr).await;
+        // The retry loop reconnects against this address past the first
+        // attempt; without it a reconnect would fall through to the real
+        // default controller address instead of the mock.
+        std::env::set_var("SPUR_CONTROLLER_ADDR", format!("http://{addr}"));
+
+        let err = dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect_err("a transport failure must still fail once retries are exhausted");
+
+        // A transport failure is not a refusal: it keeps the "RunStep dispatch
+        // failed" framing (and the gRPC code) instead of the bare message a
+        // clean refusal gets.
+        assert!(
+            err.to_string().starts_with("RunStep dispatch failed:"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("controller unreachable"));
+        assert!(capture.cancelled_step_calls().is_empty());
+    }
+
+    // Registration is synchronous, so the real signal can be raised right
+    // after `install()` returns with no window where the default disposition
+    // (process termination) could still apply. Serialized against its SIGHUP
+    // twin: both raise a real, process-wide signal, which every listener for
+    // that signal kind in the process observes, not just the raising test's.
+    #[tokio::test]
+    #[serial(terminating_signals)]
+    async fn terminating_signals_reports_sigterm() {
+        let mut signals = TerminatingSignals::install().expect("install signal handlers");
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).expect("raise SIGTERM");
+        assert_eq!(signals.wait().await, 15);
+    }
+
+    #[tokio::test]
+    #[serial(terminating_signals)]
+    async fn terminating_signals_reports_sighup() {
+        let mut signals = TerminatingSignals::install().expect("install signal handlers");
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).expect("raise SIGHUP");
+        assert_eq!(signals.wait().await, 1);
+    }
+
+    /// A step left runnable by a busy refusal is closed when srun gives up on it.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_cancels_a_step_it_abandons_after_waiting() {
+        let _env = EnvGuard::new();
+        let _delay = BusyStepDelayGuard::zero();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_busy("Requested nodes are busy");
+        capture.push_run_step_error(tonic::Code::FailedPrecondition, "job 1 is not running");
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect_err("the second refusal must fail");
+
+        assert_eq!(err.to_string(), "job 1 is not running");
+        assert_eq!(capture.run_step_calls(), 2);
+        assert_eq!(
+            capture.cancelled_step_calls(),
+            vec![crate::mock_controller::MOCK_STEP_ID]
+        );
+    }
+
+    /// `waiting_step` must stay set across the abandon RPC itself, not just
+    /// up to the point it is sent — otherwise a signal racing the abandon
+    /// call sees `waiting_step == 0` and skips its own abandon, since the
+    /// in-flight one was cancelled along with the dropped dispatch future.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn waiting_step_stays_set_through_the_never_launched_abandon_call() {
+        let _env = EnvGuard::new();
+        let _delay = BusyStepDelayGuard::zero();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_busy("Requested nodes are busy");
+        capture.push_run_step_error(tonic::Code::FailedPrecondition, "job 1 is not running");
+        let gate = capture.gate_next_complete_job_step();
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("parse failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        let io = empty_io();
+        let params = StepDispatchParams {
+            args: &args,
+            explicit_num_nodes: was_cli_set(&matches, "nodes").then_some(args.nodes),
+            requested_nodelist: args.nodelist.as_deref(),
+            work_dir: "/tmp",
+            io: &io,
+            mpi: spur_core::mpi::MPI_NONE,
+            user: "tester",
+            resources: None,
+            waiting_step: AtomicU64::new(NO_WAITING_STEP),
+        };
+
+        let check_in_flight = async {
+            gate.wait_entered().await;
+            assert_ne!(
+                params.waiting_step.load(Ordering::SeqCst),
+                NO_WAITING_STEP,
+                "waiting_step must stay set while the abandon RunStep's \
+                 CompleteJobStep call is in flight"
+            );
+            gate.release();
+        };
+
+        let (result, _) = tokio::join!(dispatch_step(&mut client, 1, &params), check_in_flight);
+        result.expect_err("the second refusal must still fail");
+        assert_eq!(params.waiting_step.load(Ordering::SeqCst), NO_WAITING_STEP);
+    }
+
+    /// A retry RunStep launched after a busy refusal must still find
+    /// `waiting_step` set while it is in flight, not just during the backoff
+    /// sleep before it — otherwise a Ctrl-C landing mid-RPC leaves the step
+    /// running forever instead of being closed.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn waiting_step_stays_set_across_an_in_flight_retry() {
+        let _env = EnvGuard::new();
+        let _delay = BusyStepDelayGuard::zero();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.push_run_step_busy("Requested nodes are busy");
+        let gate = capture.gate_next_run_step();
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("parse failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        let io = empty_io();
+        let params = StepDispatchParams {
+            args: &args,
+            explicit_num_nodes: was_cli_set(&matches, "nodes").then_some(args.nodes),
+            requested_nodelist: args.nodelist.as_deref(),
+            work_dir: "/tmp",
+            io: &io,
+            mpi: spur_core::mpi::MPI_NONE,
+            user: "tester",
+            resources: None,
+            waiting_step: AtomicU64::new(NO_WAITING_STEP),
+        };
+
+        let check_in_flight = async {
+            gate.wait_entered().await;
+            assert_ne!(
+                params.waiting_step.load(Ordering::SeqCst),
+                NO_WAITING_STEP,
+                "waiting_step must stay set while the retry RunStep is in flight"
+            );
+            gate.release();
+        };
+
+        let (result, _) = tokio::join!(dispatch_step(&mut client, 1, &params), check_in_flight);
+        let result = result.expect("dispatch should succeed once the retry completes");
+
+        assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
+        assert_eq!(params.waiting_step.load(Ordering::SeqCst), NO_WAITING_STEP);
+    }
+
     #[tokio::test]
     #[serial(env_injection)]
     async fn dispatch_step_explicit_ntasks_overrides_node_default() {
@@ -4088,6 +5567,7 @@ mod tests {
             mpi: spur_core::mpi::MPI_NONE,
             user: "tester",
             resources: None,
+            waiting_step: AtomicU64::new(NO_WAITING_STEP),
         };
 
         let result = dispatch_step(&mut client, 1, &params).await.unwrap();
@@ -4147,6 +5627,34 @@ mod tests {
             !msg.contains("--overlap"),
             "--external-launcher should bypass the --overlap check, got: {msg}"
         );
+    }
+
+    /// An old controller that does not advertise `CAP_PER_GPU_OPTIONS` must
+    /// refuse before `SubmitJob`, not drop `--cpus-per-gpu` silently.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn per_gpu_options_without_the_capability_refuse_before_submit() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_ping_capabilities(vec![]);
+        let err = main_with_args(vec![
+            "srun".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "--gpus".into(),
+            "1".into(),
+            "--cpus-per-gpu".into(),
+            "4".into(),
+            "true".into(),
+        ])
+        .await
+        .expect_err("an old controller must refuse --cpus-per-gpu");
+        assert!(
+            err.to_string().contains("does not support --cpus-per-gpu"),
+            "got: {err}"
+        );
+        assert_eq!(capture.submit_job_calls(), 0);
+        assert_eq!(capture.create_step_calls(), 0);
     }
 
     /// --container-readonly is a no-op in the runtime today, so it is refused at

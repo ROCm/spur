@@ -1,9 +1,12 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
+use crate::env_defaults::{
+    apply_csv, apply_flag, apply_num_opt_nonzero, apply_str, apply_string, was_cli_set,
+};
+use crate::resource_opts::{option_source, requests_gpus, require_gpus, surviving, CPU_CONFLICT};
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, Parser};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobInfo, JobSpec, SubmitJobRequest};
@@ -39,8 +42,13 @@ pub struct SallocArgs {
     pub ntasks: Option<u32>,
 
     /// CPUs per task
-    #[arg(short = 'c', long, default_value = "1")]
-    pub cpus_per_task: u32,
+    #[arg(
+        short = 'c',
+        long,
+        overrides_with = "cpus_per_task",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub cpus_per_task: Option<u32>,
 
     /// Mount the node's credential mint socket into the container of each
     /// `srun --container-image` step in this allocation, so a nested srun there
@@ -50,8 +58,16 @@ pub struct SallocArgs {
     pub container_auth_socket: bool,
 
     /// Memory per node (e.g., "4G", "4096M")
-    #[arg(long)]
+    #[arg(long, overrides_with = "mem")]
     pub mem: Option<String>,
+
+    /// CPUs per allocated GPU
+    #[arg(long, overrides_with = "cpus_per_gpu", value_parser = clap::value_parser!(u32).range(1..))]
+    pub cpus_per_gpu: Option<u32>,
+
+    /// Memory per allocated GPU (e.g., "8G")
+    #[arg(long, overrides_with = "mem_per_gpu")]
+    pub mem_per_gpu: Option<String>,
 
     /// Time limit
     #[arg(short = 't', long, default_value = "1:00:00")]
@@ -131,9 +147,7 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let submit_line = crate::submitline::render(&args);
-    let matches = crate::clap_exit::matches_or_exit(SallocArgs::command(), &args);
-    let mut args = crate::clap_exit::from_matches_or_exit::<SallocArgs>(&matches);
-    resolve_salloc_env(&matches, &mut args);
+    let mut args = resolve_salloc_args(&args).unwrap_or_else(|e| e.exit());
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let controller = args.controller.clone();
@@ -159,6 +173,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
+
+    crate::resource_opts::require_per_gpu_options_capability(
+        &mut client,
+        job_spec.cpus_per_gpu,
+        job_spec.memory_per_gpu_mb,
+    )
+    .await?;
 
     let response = client
         .submit_job(SubmitJobRequest {
@@ -357,6 +378,12 @@ fn allocation_shell_env(job_id: u32, job: &JobInfo) -> SpurEnv {
     env.set_with_slurm_twin("SPUR_NPROCS", job.num_tasks);
     env.set_with_slurm_twin("SPUR_CPUS_PER_TASK", job.cpus_per_task);
     env.set_with_slurm_twin("SPUR_SUBMIT_DIR", &job.work_dir);
+    if let Some(cpus_per_gpu) = job.cpus_per_gpu {
+        env.set_with_slurm_twin("SPUR_CPUS_PER_GPU", cpus_per_gpu);
+    }
+    if let Some(mb) = job.mem_per_tres.strip_prefix("gpu:") {
+        env.set_with_slurm_twin("SPUR_MEM_PER_GPU", mb);
+    }
     env
 }
 
@@ -384,6 +411,16 @@ fn build_salloc_job_spec(
         gpus_per_task.is_some(),
         &gres,
     )?;
+    require_gpus(
+        args.cpus_per_gpu.is_some(),
+        args.mem_per_gpu.is_some(),
+        requests_gpus(
+            gpus.is_some(),
+            gpus_per_node.is_some(),
+            gpus_per_task.is_some(),
+            &gres,
+        ),
+    )?;
 
     let time_limit =
         spur_core::config::parse_time_minutes(&args.time).map(|mins| prost_types::Duration {
@@ -394,7 +431,13 @@ fn build_salloc_job_spec(
     let memory_mb = args
         .mem
         .as_ref()
-        .map(|m| parse_memory_mb(m))
+        .map(|m| crate::sbatch::parse_memory_mb(m))
+        .transpose()?
+        .unwrap_or(0);
+    let memory_per_gpu_mb = args
+        .mem_per_gpu
+        .as_ref()
+        .map(|m| crate::sbatch::parse_memory_mb(m))
         .transpose()?
         .unwrap_or(0);
 
@@ -411,8 +454,10 @@ fn build_salloc_job_spec(
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
         num_tasks: crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
-        cpus_per_task: args.cpus_per_task,
+        cpus_per_task: args.cpus_per_task.unwrap_or(0),
         memory_per_node_mb: memory_mb,
+        cpus_per_gpu: args.cpus_per_gpu,
+        memory_per_gpu_mb,
         gres,
         gpus,
         gpus_per_node,
@@ -434,11 +479,37 @@ fn build_salloc_job_spec(
     })
 }
 
-/// Apply `SALLOC_*` environment-variable defaults (plus `SPUR_*` native twins)
-/// to any flag not set on the command line. Mirrors real Slurm: salloc reads
-/// command-prefixed `SALLOC_*` vars, and notably provides no env var for
-/// `--nodes`, `--ntasks`, `--cpus-per-task`, or `--job-name`. CLI overrides env.
-fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
+const CPUS_PER_GPU_ENV: &[&str] = &["SALLOC_CPUS_PER_GPU"];
+const MEM_PER_GPU_ENV: &[&str] = &["SALLOC_MEM_PER_GPU"];
+const MEM_ENV: &[&str] = &["SPUR_MEM_PER_NODE", "SALLOC_MEM_PER_NODE"];
+
+// salloc has no `--mem-per-cpu` flag, so its own messages name only its two
+// real members instead of reusing sbatch/srun's three-flag `MEM_CONFLICT`.
+const MEM_CONFLICT: &str = "--mem and --mem-per-gpu are mutually exclusive";
+const MEM_ENV_CONFLICT: &str = "SALLOC_MEM_PER_NODE and SALLOC_MEM_PER_GPU are mutually exclusive";
+
+/// Resolve `SallocArgs` from argv, then apply `SALLOC_*` env defaults and the
+/// per-GPU/memory option-source conflict rule. Mirrors `resolve_sbatch_args`,
+/// minus directive merging (salloc has no directive source).
+pub(crate) fn resolve_salloc_args(cli_args: &[String]) -> clap::error::Result<SallocArgs> {
+    let matches = SallocArgs::command().try_get_matches_from(cli_args)?;
+    let mut args = SallocArgs::from_arg_matches(&matches)?;
+    resolve_salloc_env(&matches, &mut args)?;
+    resolve_option_conflicts(&matches, &mut args)
+        .map_err(|e| clap_err(clap::error::ErrorKind::ArgumentConflict, e))?;
+    Ok(args)
+}
+
+/// Wrap an anyhow error from a Slurm option-source/conflict check as a clap
+/// error so it exits through the same path as `resolve_salloc_args`'s other
+/// failures (usage error to stderr, exit code 2).
+fn clap_err(kind: clap::error::ErrorKind, e: anyhow::Error) -> clap::Error {
+    clap::Error::raw(kind, format!("{e}\n"))
+}
+
+/// Applies `SALLOC_*`/`SPUR_*` env defaults to any flag not set on the
+/// command line (see crate AGENTS.md "Environment variable precedence").
+fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) -> clap::error::Result<()> {
     apply_str(
         matches,
         "partition",
@@ -452,11 +523,20 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         &mut args.account,
     );
     apply_str(matches, "qos", &["SPUR_QOS", "SALLOC_QOS"], &mut args.qos);
+    apply_str(matches, "mem", MEM_ENV, &mut args.mem);
+    apply_num_opt_nonzero(
+        matches,
+        "cpus_per_gpu",
+        CPUS_PER_GPU_ENV,
+        "--cpus-per-gpu",
+        &mut args.cpus_per_gpu,
+    )
+    .map_err(|e| clap_err(clap::error::ErrorKind::ValueValidation, e))?;
     apply_str(
         matches,
-        "mem",
-        &["SPUR_MEM_PER_NODE", "SALLOC_MEM_PER_NODE"],
-        &mut args.mem,
+        "mem_per_gpu",
+        MEM_PER_GPU_ENV,
+        &mut args.mem_per_gpu,
     );
     apply_string(
         matches,
@@ -506,24 +586,64 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         &["SPUR_EXCLUSIVE", "SALLOC_EXCLUSIVE"],
         &mut args.exclusive,
     );
+    Ok(())
 }
 
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
+/// Resolve the CPU and memory per-GPU conflict groups with Slurm's
+/// option-source rule. salloc has no `-c` input env (`src` passes `&[]` for
+/// `cpus_per_task`) and no `--mem-per-cpu`, so the memory group has two members.
+fn resolve_option_conflicts(matches: &ArgMatches, args: &mut SallocArgs) -> Result<()> {
+    let src = |id: &str, env: &[&str], set: bool| option_source(was_cli_set(matches, id), env, set);
+
+    // `cpus_per_task` has no input env var here (only `cpus_per_gpu` does), so
+    // an env-vs-env conflict in this group can never fire; `CPU_CONFLICT`
+    // covers both arguments.
+    let keep = surviving(
+        &[
+            src("cpus_per_task", &[], args.cpus_per_task.is_some()),
+            src(
+                "cpus_per_gpu",
+                CPUS_PER_GPU_ENV,
+                args.cpus_per_gpu.is_some(),
+            ),
+        ],
+        CPU_CONFLICT,
+        CPU_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.cpus_per_task = None;
     }
+    if !keep[1] {
+        args.cpus_per_gpu = None;
+    }
+
+    let keep = surviving(
+        &[
+            src("mem", MEM_ENV, args.mem.is_some()),
+            src("mem_per_gpu", MEM_PER_GPU_ENV, args.mem_per_gpu.is_some()),
+        ],
+        MEM_CONFLICT,
+        MEM_ENV_CONFLICT,
+    )?;
+    if !keep[0] {
+        args.mem = None;
+    }
+    if !keep[1] {
+        args.mem_per_gpu = None;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::FromArgMatches;
+
+    #[test]
+    fn explicit_c_zero_is_rejected_by_clap() {
+        let err = SallocArgs::command().try_get_matches_from(["salloc", "-c", "0"]);
+        assert!(err.is_err(), "-c 0 must be a clap parse error");
+    }
 
     fn spec_from(args: &SallocArgs, submit_line: &str) -> Result<JobSpec> {
         let submission = Submission {
@@ -722,8 +842,13 @@ mod tests {
             .try_get_matches_from(cli)
             .expect("parse failed");
         let mut args = SallocArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
-        resolve_salloc_env(&matches, &mut args);
+        resolve_salloc_env(&matches, &mut args).expect("env resolution failed");
         args
+    }
+
+    fn resolve(cli: &[&str]) -> Result<SallocArgs> {
+        let cli: Vec<String> = cli.iter().map(|s| s.to_string()).collect();
+        resolve_salloc_args(&cli).map_err(anyhow::Error::from)
     }
 
     #[test]
@@ -870,5 +995,173 @@ mod tests {
             msg.contains("failed to connect to spurctld"),
             "expected a controller connect failure, got: {msg}"
         );
+    }
+
+    /// An old controller that does not advertise `CAP_PER_GPU_OPTIONS` must
+    /// refuse before `SubmitJob`, not drop `--cpus-per-gpu` silently.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn per_gpu_options_without_the_capability_refuse_before_submit() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_ping_capabilities(vec![]);
+        let err = main_with_args(vec![
+            "salloc".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "--gpus".into(),
+            "1".into(),
+            "--cpus-per-gpu".into(),
+            "4".into(),
+        ])
+        .await
+        .expect_err("an old controller must refuse --cpus-per-gpu");
+        assert!(
+            err.to_string().contains("does not support --cpus-per-gpu"),
+            "got: {err}"
+        );
+        assert_eq!(capture.submit_job_calls(), 0);
+    }
+
+    // --- --cpus-per-gpu / --mem-per-gpu ---
+
+    #[test]
+    fn cpus_per_task_defaults_to_zero_when_unset() {
+        let args = SallocArgs::parse_from(["salloc"]);
+        let spec = spec_from(&args, "salloc").expect("build spec");
+        assert_eq!(spec.cpus_per_task, 0);
+    }
+
+    #[test]
+    fn cpus_per_gpu_and_mem_per_gpu_set_spec_fields() {
+        let args = SallocArgs::try_parse_from([
+            "salloc",
+            "--gpus-per-node=2",
+            "--cpus-per-gpu=8",
+            "--mem-per-gpu=4G",
+        ])
+        .expect("parse failed");
+        let spec = spec_from(&args, "salloc --test").expect("build spec");
+        assert_eq!(spec.cpus_per_gpu, Some(8));
+        assert_eq!(spec.memory_per_gpu_mb, 4096);
+        assert_eq!(spec.cpus_per_task, 0);
+    }
+
+    #[test]
+    fn cpus_per_gpu_and_cpus_per_task_both_cli_conflict() {
+        let err = resolve(&["salloc", "--cpus-per-gpu=8", "-c", "2"]).unwrap_err();
+        assert!(err.to_string().contains(CPU_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_dropped_when_cli_sets_cpus_per_task() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_CPUS_PER_GPU", "8");
+        let args = resolve(&["salloc", "-c", "2", "--gres=gpu:1"]).expect("resolve failed");
+        assert_eq!(args.cpus_per_gpu, None);
+        assert_eq!(args.cpus_per_task, Some(2));
+    }
+
+    #[test]
+    fn mem_and_mem_per_gpu_both_cli_conflict() {
+        let err = resolve(&["salloc", "--mem=1G", "--mem-per-gpu=1G"]).unwrap_err();
+        assert!(err.to_string().contains(MEM_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_mem_per_node_and_mem_per_gpu_conflict() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_MEM_PER_NODE", "4G");
+        env.set("SALLOC_MEM_PER_GPU", "1G");
+        let err = resolve(&["salloc"]).unwrap_err();
+        assert!(err.to_string().contains(MEM_ENV_CONFLICT), "got: {err}");
+    }
+
+    #[test]
+    fn cpus_per_gpu_without_gpus_rejected() {
+        let args = SallocArgs::try_parse_from(["salloc", "--cpus-per-gpu=8"]).expect("parse");
+        let err = spec_from(&args, "salloc --test").unwrap_err();
+        assert_eq!(err.to_string(), "--cpus-per-gpu requires a GPU request");
+    }
+
+    #[test]
+    fn mem_per_gpu_without_gpus_rejected() {
+        let args = SallocArgs::try_parse_from(["salloc", "--mem-per-gpu=4G"]).expect("parse");
+        let err = spec_from(&args, "salloc --test").unwrap_err();
+        assert_eq!(err.to_string(), "--mem-per-gpu requires a GPU request");
+    }
+
+    #[test]
+    fn cpus_per_gpu_zero_is_rejected_on_cli() {
+        let err = resolve(&["salloc", "--cpus-per-gpu=0", "--gres=gpu:1"]).unwrap_err();
+        assert!(err.to_string().contains("--cpus-per-gpu"), "got: {err}");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_cpus_per_gpu_zero_is_rejected() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_CPUS_PER_GPU", "0");
+        let err = resolve(&["salloc", "--gres=gpu:1"]).unwrap_err();
+        assert!(
+            err.to_string().contains("SALLOC_CPUS_PER_GPU"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn salloc_cpus_per_gpu_and_mem_per_gpu_names_work() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_CPUS_PER_GPU", "4");
+        env.set("SALLOC_MEM_PER_GPU", "2G");
+        let args = resolve(&["salloc", "--gres=gpu:1"]).expect("resolve failed");
+        assert_eq!(args.cpus_per_gpu, Some(4));
+        assert_eq!(args.mem_per_gpu.as_deref(), Some("2G"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_cpus_per_gpu_and_mem_per_gpu_twins_not_read_as_input() {
+        let env = EnvGuard::new();
+        env.set("SPUR_CPUS_PER_GPU", "8");
+        env.set("SPUR_MEM_PER_GPU", "1024");
+        let args = resolve(&["salloc"]).expect("resolve failed");
+        let spec = spec_from(&args, "salloc --test").expect("build spec");
+        assert_eq!(spec.cpus_per_gpu, None);
+        assert_eq!(spec.memory_per_gpu_mb, 0);
+    }
+
+    #[test]
+    fn allocation_env_sets_cpus_per_gpu_and_mem_per_gpu_when_present() {
+        let job_info = JobInfo {
+            job_id: 42,
+            cpus_per_gpu: Some(8),
+            mem_per_tres: "gpu:4096".into(),
+            ..Default::default()
+        };
+        let map = allocation_shell_env(job_info.job_id, &job_info).into_map();
+        assert_eq!(map.get("SPUR_CPUS_PER_GPU").map(String::as_str), Some("8"));
+        assert_eq!(map.get("SLURM_CPUS_PER_GPU").map(String::as_str), Some("8"));
+        assert_eq!(
+            map.get("SPUR_MEM_PER_GPU").map(String::as_str),
+            Some("4096")
+        );
+        assert_eq!(
+            map.get("SLURM_MEM_PER_GPU").map(String::as_str),
+            Some("4096")
+        );
+    }
+
+    #[test]
+    fn allocation_env_omits_cpus_and_mem_per_gpu_when_absent() {
+        let job_info = JobInfo::default();
+        let map = allocation_shell_env(job_info.job_id, &job_info).into_map();
+        assert!(!map.contains_key("SPUR_CPUS_PER_GPU"));
+        assert!(!map.contains_key("SLURM_CPUS_PER_GPU"));
+        assert!(!map.contains_key("SPUR_MEM_PER_GPU"));
+        assert!(!map.contains_key("SLURM_MEM_PER_GPU"));
     }
 }

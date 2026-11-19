@@ -238,6 +238,8 @@ mod tests {
                     vram_bytes: Some(24),
                     ..Default::default()
                 }),
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             }],
             ..Default::default()
         };

@@ -145,7 +145,7 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
     Always removes the rule on exit, including when the body raises.
     """
     controller = cluster.nodes[0]
-    target = cluster.nodes[node_index].host
+    target = cluster.nodes[node_index].address
     rule_args = f"-d {target} -p tcp --dport {port} -j DROP"
     controller.exec(f"sudo iptables -A OUTPUT {rule_args}")
     try:
@@ -159,7 +159,7 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
     """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
     Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
     controller = cluster.nodes[0]
-    target = cluster.nodes[node_index].host
+    target = cluster.nodes[node_index].address
     rules = [
         f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP",
         f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP",
@@ -227,14 +227,18 @@ def isolate_controller(cluster: "SpurCluster", node_index: int):
 class SshNode:
     """SSH connection to a single test node."""
 
-    def __init__(self, host: str, user: str, password: str | None = None, key_path: str | None = None):
+    def __init__(self, host: str, user: str, password: str | None = None,
+                 key_path: str | None = None, port: int = 22, address: str | None = None):
         self.host = host
+        # Where other nodes/daemons reach this node, e.g. the underlay IP
+        # behind an SSH tunnel's `localhost`. Defaults to `host`.
+        self.address = address or host
         self.user = user
         self.client = paramiko.SSHClient()
         # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
 
-        connect_kwargs = {"hostname": host, "username": user}
+        connect_kwargs = {"hostname": host, "port": port, "username": user}
         if key_path:
             connect_kwargs["key_filename"] = key_path
         elif password:
@@ -409,7 +413,7 @@ class SpurCluster:
         self.etc_dir = f"{remote_dir}/etc"
         self.state_dir = f"{remote_dir}/state"
         self.log_dir = f"{remote_dir}/log"
-        self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
+        self.controller_addr = f"http://{nodes[0].address}:{CONTROLLER_PORT}"
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
@@ -1212,6 +1216,20 @@ class SpurCluster:
             return len(re.findall(r"gpu:[^,]+", gres))
         return 0
 
+    def node_real_memory_mb(self, node_name: str) -> int:
+        """Return the node's schedulable memory (MB) from scontrol show node.
+
+        This is the same figure spurctld sends agents as a job's memory
+        ceiling when it has no memory request of its own, so tests can assert
+        against it without hardcoding a node's memory size.
+        """
+        out = self.scontrol_show_node(node_name)
+        for line in out.splitlines():
+            match = re.search(r"RealMemory=(\d+)", line)
+            if match:
+                return int(match.group(1))
+        return 0
+
     def assert_sinfo_gpus(self, min_per_node: int = 1):
         for name in self.node_names:
             count = self.node_gpu_count(name)
@@ -1712,14 +1730,14 @@ tar -C "$R" -czf '{local_tar}' .
         # Agent-only hosts (beyond n_controllers) never get the HA rewrite
         # below, so write the shared config everywhere first.
         self._write_config()
-        peers = [f"{self.nodes[i].host}:{raft_port}" for i in range(n_controllers)]
+        peers = [f"{self.nodes[i].address}:{raft_port}" for i in range(n_controllers)]
         for i in range(n_controllers):
             self._write_ha_controller_config(i, peers, i + 1, raft_port)
         self.ha_controllers_started_at = time.time()
         for i in range(n_controllers):
             self._start_controller_on(i)
         self.controller_addr = ",".join(
-            f"http://{self.nodes[i].host}:{CONTROLLER_PORT}" for i in range(n_controllers)
+            f"http://{self.nodes[i].address}:{CONTROLLER_PORT}" for i in range(n_controllers)
         )
         # spurd's registration has no retry, so agents must not start until a
         # real election has produced a leader (a fixed sleep is too racy).
@@ -1888,7 +1906,7 @@ tar -C "$R" -czf '{local_tar}' .
     def _spurd_start_cmd(self, node_index: int) -> str:
         node = self.nodes[node_index]
         hostname = self.node_names[node_index]
-        address = node.host
+        address = node.address
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
         # `env VAR=val` runs under any sudo prefix, so the canary lands in spurd's
         # own environment in both the rootless and rootful launch shapes. Any
@@ -1954,6 +1972,90 @@ tar -C "$R" -czf '{local_tar}' .
             1 for name in self.node_names if states[name].startswith("idle")
         )
         return idle >= len(self.node_names)
+
+
+# --- CPU / GPU resource helpers ---
+
+# Prints the caller's CPU affinity, its own and its job's cgroup memory limit,
+# and the per-GPU sizing variables, one KEY=value per line.
+RESOURCE_PROBE = r"""#!/bin/bash
+CG=""
+while IFS= read -r line; do
+  case "$line" in 0::*) CG="${line#0::}" ;; esac
+done < /proc/self/cgroup
+JOB_CG="$CG"
+case "$CG" in */step_*) JOB_CG="${CG%/step_*}" ;; esac
+echo "CGROUP_PATH=$CG"
+echo "CPUS=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+echo "NPROC=$(nproc)"
+echo "MEM_MAX=$(cat "/sys/fs/cgroup$CG/memory.max" 2>/dev/null || echo UNREADABLE)"
+echo "JOB_MEM_MAX=$(cat "/sys/fs/cgroup$JOB_CG/memory.max" 2>/dev/null || echo UNREADABLE)"
+for v in SPUR_CPUS_ON_NODE SPUR_CPUS_PER_GPU SLURM_CPUS_PER_GPU SPUR_MEM_PER_GPU \
+         SLURM_MEM_PER_GPU SPUR_JOB_GPUS ROCR_VISIBLE_DEVICES OMP_NUM_THREADS; do
+  echo "$v=${!v-unset}"
+done
+echo RESOURCE_PROBE_OK
+"""
+
+
+def key_values(output: str) -> dict[str, str]:
+    """Parse ``KEY=value`` lines (the last occurrence of a key wins)."""
+    values = {}
+    for line in output.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def expand_cpulist(cpulist: str) -> set[int]:
+    """Expand a kernel CPU list like ``0-2,5`` into a set of CPU IDs."""
+    cpus: set[int] = set()
+    for part in cpulist.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        low, _, high = part.partition("-")
+        cpus.update(range(int(low), int(high or low) + 1))
+    return cpus
+
+
+def numa_cpus(node: SshNode) -> list[set[int]]:
+    """CPU set of each NUMA node on *node*."""
+    out = node.exec("cat /sys/devices/system/node/node*/cpulist")
+    return [expand_cpulist(line) for line in out.split() if line]
+
+
+def threads_per_core(node: SshNode) -> int:
+    """Hardware threads per core on *node* (SMT siblings)."""
+    cpus = int(node.exec("nproc --all").strip())
+    cores = int(node.exec("lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l").strip())
+    return max(1, cpus // max(1, cores))
+
+
+def restricted_cores_config(node: SshNode, per_gpu: int = 8) -> dict:
+    """Config overrides reserving cores for every GPU on *node*.
+
+    Halves *per_gpu* until the reserved cores leave a general pool, and skips
+    the test when even one core per GPU does not fit.
+    """
+    gpus = int(node.exec("ls /dev/dri/renderD* 2>/dev/null | wc -l").strip())
+    if gpus == 0:
+        pytest.skip("no GPU render nodes on node 0")
+    cpus = int(node.exec("nproc --all").strip())
+    threads = threads_per_core(node)
+    while per_gpu and gpus * per_gpu * threads >= cpus:
+        per_gpu //= 2
+    if not per_gpu:
+        pytest.skip(f"{cpus} CPUs leave no general pool beside {gpus} GPUs' reserved cores")
+    return {"nodes": [{"names": "ALL", "restricted_cores_per_gpu": per_gpu}]}
+
+
+def node_reserved_cpus(show_node: str) -> tuple[int, set[int]]:
+    """``RestrictedCoresPerGPU=<R>(CPUs:<list>)`` from ``scontrol show node``."""
+    m = re.search(r"RestrictedCoresPerGPU=(\d+)\(CPUs:([^)]*)\)", show_node)
+    assert m, f"no GPU-reserved CPUs shown:\n{show_node}"
+    return int(m.group(1)), expand_cpulist(m.group(2))
 
 
 # --- Job helpers ---

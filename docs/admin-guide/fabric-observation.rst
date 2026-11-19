@@ -26,6 +26,11 @@ bytes, and fabric observations. For example:
       FabricSource=amd-ualink Observation=observed PhysicalDomain=... FabricDomain=15 Endpoint=63 EndpointState=active Transport=UALoE
       PhysicalCapacity=72 FabricCapacity=4 ActiveEndpoints=[60,61,62,63] LocalEndpoints=[60,61,62,63]
 
+On a node with a known CPU topology, a ``GPUDevice=`` line also ends with
+``ReservedCPUs=<list>`` (the GPU's ``restricted_cores_per_gpu`` picks) and
+``AffinityCPUs=<list>`` (the CPUs near it). Each is left out when unknown; see
+:doc:`configuration`.
+
 ``observed`` means the attributes were read consistently. It does not mean the
 external fabric manager reports the partition as ready. Other statuses are ``incomplete`` (missing, malformed, or
 unreadable fields), ``inconsistent`` (conflicting or changing observations),

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use spur_core::core_layout::{CoreLayout, LayoutRevision};
 use spur_core::cpu_topology::format_cpu_list;
+use tracing::info;
 
 /// The CPUs the `spur/` root is confined to: every non-spec CPU, sorted.
 pub fn root_cpuset(layout: &CoreLayout) -> Vec<u32> {
@@ -20,22 +21,21 @@ pub fn root_cpuset(layout: &CoreLayout) -> Vec<u32> {
     cpus.into_iter().collect()
 }
 
-/// The root cpuset to write. cgroup v2 widens a child whose cpuset no longer
-/// intersects its parent's, so CPUs a live job would otherwise lose entirely
-/// stay in the root until it exits.
-pub fn reconcile_root_cpuset(desired: &[u32], live_job_cpusets: &[Vec<u32>]) -> Vec<u32> {
-    let desired_set: BTreeSet<u32> = desired.iter().copied().collect();
-    let mut keep = desired_set.clone();
-    for job in live_job_cpusets {
-        let job_set: BTreeSet<u32> = job.iter().copied().collect();
-        if job_set.is_empty() {
-            continue;
-        }
-        if job_set.is_disjoint(&desired_set) {
-            // Dropping to `desired` would empty this job's intersection with the
-            // root and widen it; defer by keeping the CPUs it still holds.
-            keep.extend(job_set);
-        }
+/// A job cgroup under the `spur/` root (see crate AGENTS.md "No narrowing"
+/// and "Root ownership" for how `populated` governs the memory floor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveJob {
+    pub dir: String,
+    pub cpus: Vec<u32>,
+    pub populated: bool,
+}
+
+/// The root cpuset to write: `desired` plus every CPU a live job's cpuset names
+/// (populated or not), so a layout change never narrows a running job.
+pub fn reconcile_root_cpuset(desired: &[u32], live_jobs: &[LiveJob]) -> Vec<u32> {
+    let mut keep: BTreeSet<u32> = desired.iter().copied().collect();
+    for job in live_jobs {
+        keep.extend(&job.cpus);
     }
     keep.into_iter().collect()
 }
@@ -45,8 +45,8 @@ pub fn reconcile_root_cpuset(desired: &[u32], live_job_cpusets: &[Vec<u32>]) -> 
 pub enum MemReservation {
     /// No spec memory target (unset or reset).
     Inactive,
-    /// `memory.high` throttles toward the target; `memory.max` waits for a
-    /// moment with no process under the root.
+    /// `memory.high` throttles toward the target; `memory.max` waits for the
+    /// jobs that ran when the layout last changed to end.
     Pending,
     /// `memory.max` holds the target.
     Active,
@@ -61,10 +61,10 @@ pub struct MemDecision {
     pub state: MemReservation,
 }
 
-/// `memory.high` (throttle only, never OOM) goes to the target at once.
-/// `memory.max` is lowered only while no process runs under the root, since a
-/// hard limit below a running job's usage can OOM it, or when the root's
-/// current `memory.max` already holds it at or below the target.
+/// `memory.high` (throttle only, never OOM) goes to the target. `memory.max`
+/// is lowered only once no job from before the last layout change runs
+/// (`quiescent`), since a hard limit below its usage can OOM it, or when the
+/// root's current `memory.max` already holds it at or below the target.
 pub fn mem_decision(
     target_mb: u64,
     quiescent: bool,
@@ -86,11 +86,16 @@ pub fn mem_decision(
 
 /// Where spurd's threads are pinned under `daemons_off_spec`; `None` widens them
 /// back to every online CPU. Supervisors inherit the mask in effect when forked.
+/// CPUs a cap trims are host CPUs, not spec cores, so daemons may use them.
 pub fn daemon_cpuset(layout: &CoreLayout) -> Option<Vec<u32>> {
     if !layout.daemons_off_spec || layout.spec_cpus.is_empty() {
         return None;
     }
-    Some(root_cpuset(layout))
+    let mut cpus = root_cpuset(layout);
+    cpus.extend(&layout.trimmed_cpus);
+    cpus.sort_unstable();
+    cpus.dedup();
+    Some(cpus)
 }
 
 /// Where a layout delivery came from. Only a registration reply may clear the
@@ -111,6 +116,33 @@ pub enum Delivery {
 pub struct RegistrationTicket {
     seq: u64,
     watermark: Option<LayoutRevision>,
+}
+
+/// Spec and cap-trimmed CPUs no job may take, and each GPU's reserved CPUs,
+/// which only the job holding that GPU may take. Re-applied to the ledger
+/// whenever it is rebuilt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerExclusions {
+    pub spec_cpus: Vec<u32>,
+    pub trimmed_cpus: Vec<u32>,
+    pub gpu_reserved: Vec<spur_core::core_layout::GpuReservedCpus>,
+}
+
+impl LedgerExclusions {
+    pub fn apply(&self, ledger: &mut spur_sched::cons_tres::NodeAllocation) {
+        let mut excluded = self.spec_cpus.clone();
+        excluded.extend(&self.trimmed_cpus);
+        ledger.set_spec_exclusions(&excluded);
+        ledger.set_gpu_reserved(&self.gpu_reserved);
+    }
+}
+
+/// The root's `memory.high` when the held layout last changed (`None` is
+/// `max`), held while a job running then is alive: it was admitted against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemFloor {
+    high_mb: Option<u64>,
+    jobs: BTreeSet<String>,
 }
 
 /// Holds the layout the controller last delivered and applies it to the
@@ -138,6 +170,10 @@ pub struct SpecEnforcer {
     /// Last value written per control file; unchanged values are not rewritten,
     /// since lowering `memory.high` reclaims synchronously in the writer.
     written: HashMap<&'static str, String>,
+    /// The next enforce takes a memory floor: set at start and by a
+    /// content-changing adopt, so jobs from before either keep their limits.
+    floor_pending: bool,
+    mem_floor: Option<MemFloor>,
 }
 
 impl SpecEnforcer {
@@ -156,6 +192,8 @@ impl SpecEnforcer {
             apply_error: None,
             unapplied: false,
             written: HashMap::new(),
+            floor_pending: true,
+            mem_floor: None,
         }
     }
 
@@ -192,6 +230,18 @@ impl SpecEnforcer {
 
     pub fn has_spec_cores(&self) -> bool {
         self.held.as_ref().is_some_and(|l| !l.spec_cpus.is_empty())
+    }
+
+    /// What the held layout withholds from the job ledger's free pick.
+    pub fn ledger_exclusions(&self) -> LedgerExclusions {
+        self.held
+            .as_ref()
+            .map(|l| LedgerExclusions {
+                spec_cpus: l.spec_cpus.clone(),
+                trimmed_cpus: l.trimmed_cpus.clone(),
+                gpu_reserved: l.gpu_reserved.clone(),
+            })
+            .unwrap_or_default()
     }
 
     pub fn spec_cpus(&self) -> Vec<u32> {
@@ -252,19 +302,20 @@ impl SpecEnforcer {
         self.held = incoming;
         self.max_tight = false;
         self.unapplied = true;
+        self.floor_pending = true;
         true
     }
 
-    /// Apply the held layout to the root. `live_job_cpusets` are the live jobs'
-    /// `cpuset.cpus`; `total_mem_mb` the node's memory, `None` when unreadable.
+    /// Apply the held layout to the root. `live_jobs` are the jobs running
+    /// under the root; `total_mem_mb` the node's memory, `None` when unreadable.
     pub fn apply(
         &mut self,
-        live_job_cpusets: &[Vec<u32>],
+        live_jobs: &[LiveJob],
         total_mem_mb: Option<u64>,
     ) -> io::Result<MemReservation> {
         let result = match self.held.clone() {
-            Some(layout) if !layout.spec_cpus.is_empty() => {
-                self.enforce(&layout, live_job_cpusets, total_mem_mb)
+            Some(layout) if !layout.spec_cpus.is_empty() || !layout.trimmed_cpus.is_empty() => {
+                self.enforce(&layout, live_jobs, total_mem_mb)
             }
             // Never reset a root before the policy is known: jobs may survive
             // this agent's restart under limits it would otherwise drop.
@@ -287,16 +338,19 @@ impl SpecEnforcer {
     fn enforce(
         &mut self,
         layout: &CoreLayout,
-        live_job_cpusets: &[Vec<u32>],
+        live_jobs: &[LiveJob],
         total_mem_mb: Option<u64>,
     ) -> io::Result<MemReservation> {
         // The root is otherwise created lazily by the first job.
         std::fs::create_dir_all(&self.root)?;
         self.mark_active()?;
-        let effective = reconcile_root_cpuset(&root_cpuset(layout), live_job_cpusets);
+        self.capture_floor(live_jobs);
+        let effective = reconcile_root_cpuset(&root_cpuset(layout), live_jobs);
         self.write("cpuset.cpus", format_cpu_list(&effective))?;
 
-        if layout.mem_spec_mb == 0 {
+        // mem_spec_mb without spec cores is scheduling-only (a trimmed-only
+        // layout never gets a root memory limit from reserved_memory_mb).
+        if layout.spec_cpus.is_empty() || layout.mem_spec_mb == 0 {
             self.write("memory.high", "max".into())?;
             self.write("memory.max", "max".into())?;
             return Ok(MemReservation::Inactive);
@@ -317,10 +371,15 @@ impl SpecEnforcer {
                 ),
             ));
         }
-        self.write("memory.high", mb_to_bytes(target))?;
+        let held_high = self.held_memory_high(target, live_jobs);
+        let floor_holds = held_high.is_some();
+        self.write(
+            "memory.high",
+            held_high.unwrap_or_else(|| mb_to_bytes(target)),
+        )?;
         let decision = mem_decision(
             target,
-            root_is_idle(&self.root),
+            !floor_holds,
             read_limit_mb(&self.root.join("memory.max")),
             self.max_tight,
         );
@@ -329,6 +388,43 @@ impl SpecEnforcer {
             self.max_tight = true;
         }
         Ok(decision.state)
+    }
+
+    /// Take the floor from the root as it is now, once per change. An
+    /// unpopulated (orphaned) job dir never enters the floor's job set.
+    fn capture_floor(&mut self, live_jobs: &[LiveJob]) {
+        if !std::mem::take(&mut self.floor_pending) {
+            return;
+        }
+        let jobs: BTreeSet<String> = live_jobs
+            .iter()
+            .filter(|j| j.populated)
+            .map(|j| j.dir.clone())
+            .collect();
+        self.mem_floor = (!jobs.is_empty()).then(|| MemFloor {
+            high_mb: read_limit_mb(&self.root.join("memory.high")),
+            jobs,
+        });
+    }
+
+    /// `memory.high` to keep while a job from before the last change runs: the
+    /// value then, or the target when that is higher. The floor is dropped
+    /// for good once none of its jobs is still populated.
+    fn held_memory_high(&mut self, target_mb: u64, live_jobs: &[LiveJob]) -> Option<String> {
+        let alive = self.mem_floor.as_ref().is_some_and(|f| {
+            live_jobs
+                .iter()
+                .any(|j| j.populated && f.jobs.contains(&j.dir))
+        });
+        if !alive {
+            self.mem_floor = None;
+            return None;
+        }
+        let floor = self.mem_floor.as_ref()?;
+        Some(match floor.high_mb {
+            Some(mb) => mb_to_bytes(target_mb.max(mb)),
+            None => "max".into(),
+        })
     }
 
     /// The CPUs spurd's threads should be pinned to, or `None` to widen back.
@@ -353,9 +449,24 @@ impl SpecEnforcer {
     /// ones a previous spurd left behind. A cpuset is cleared with a newline:
     /// a zero-byte write does not reset it.
     fn release_root(&mut self) -> io::Result<()> {
-        let left_by_earlier_run = self.marker.as_deref().is_some_and(Path::exists);
-        if !self.active && !left_by_earlier_run {
+        // The marker lives in this process's state_dir; the root is
+        // host-persistent, so also release when a held layout's root is
+        // itself narrowed, regardless of which run narrowed it.
+        let has_marker = self.marker.as_deref().is_some_and(Path::exists);
+        let narrowed = self.held.is_some() && self.root_narrowed();
+        if !self.active && !has_marker && !narrowed {
             return Ok(());
+        }
+        // Only the narrowing-without-marker case is a surprise worth a log
+        // line: the marker and `self.active` cases are spurd's own, expected
+        // bookkeeping. This fires once: the root reads clean on the next call.
+        if !self.active && !has_marker && narrowed {
+            info!(
+                cpuset_cpus = %read_cgroup(&self.root, "cpuset.cpus").unwrap_or_default(),
+                memory_high = %read_cgroup(&self.root, "memory.high").unwrap_or_default(),
+                memory_max = %read_cgroup(&self.root, "memory.max").unwrap_or_default(),
+                "releasing a spur root narrowed by an earlier run",
+            );
         }
         // A reboot removes the root but not the marker in persistent state.
         if self.root.exists() {
@@ -374,6 +485,16 @@ impl SpecEnforcer {
         Ok(())
     }
 
+    /// Whether the root's on-disk cpuset or memory limits are narrower than
+    /// a released root. A missing or unreadable file means nothing to release.
+    fn root_narrowed(&self) -> bool {
+        let cpuset_narrow = read_cgroup(&self.root, "cpuset.cpus").is_some_and(|s| !s.is_empty());
+        let mem_narrow = ["memory.high", "memory.max"]
+            .iter()
+            .any(|file| read_cgroup(&self.root, file).is_some_and(|s| s != "max"));
+        cpuset_narrow || mem_narrow
+    }
+
     fn write(&mut self, file: &'static str, value: String) -> io::Result<()> {
         if self.written.get(file) == Some(&value) {
             return Ok(());
@@ -382,13 +503,6 @@ impl SpecEnforcer {
         self.written.insert(file, value);
         Ok(())
     }
-}
-
-/// Whether no process runs anywhere under the root (`populated 0`). Unreadable
-/// counts as busy.
-fn root_is_idle(root: &Path) -> bool {
-    std::fs::read_to_string(root.join("cgroup.events"))
-        .is_ok_and(|events| events.lines().any(|l| l.trim() == "populated 0"))
 }
 
 /// A cgroup limit in MB, rounded down; `None` for `max` or an unreadable file.
@@ -403,6 +517,13 @@ fn mb_to_bytes(mb: u64) -> String {
 
 fn write_cgroup(root: &Path, file: &str, value: &str) -> io::Result<()> {
     std::fs::write(root.join(file), value)
+}
+
+/// A cgroup control file's content, trimmed; `None` when missing or unreadable.
+fn read_cgroup(root: &Path, file: &str) -> Option<String> {
+    std::fs::read_to_string(root.join(file))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(test)]
@@ -423,6 +544,23 @@ mod tests {
                 .collect(),
             general_cpus: general.to_vec(),
             daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        }
+    }
+
+    fn job(dir: &str, cpus: &[u32]) -> LiveJob {
+        LiveJob {
+            dir: dir.into(),
+            cpus: cpus.to_vec(),
+            populated: true,
+        }
+    }
+
+    fn unpopulated_job(dir: &str, cpus: &[u32]) -> LiveJob {
+        LiveJob {
+            dir: dir.into(),
+            cpus: cpus.to_vec(),
+            populated: false,
         }
     }
 
@@ -441,31 +579,56 @@ mod tests {
     #[test]
     fn reconcile_removes_cpus_no_live_job_needs() {
         // Desired drops CPU 7; the only job lives entirely on 0-3, so 7 goes.
-        let out = reconcile_root_cpuset(&[0, 1, 2, 3], &[vec![0, 1]]);
+        let out = reconcile_root_cpuset(&[0, 1, 2, 3], &[job("job_1_1", &[0, 1])]);
         assert_eq!(out, vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn reconcile_defers_a_cpu_a_live_job_still_sits_on() {
-        // Spec just took CPU 4; a running job is pinned to {4,5}. Dropping to
-        // {0,1} would empty the job's intersection with the root and widen it,
-        // so 4 and 5 are kept until the job exits.
-        let out = reconcile_root_cpuset(&[0, 1], &[vec![4, 5]]);
+        // Spec just took CPU 4; a running job is pinned to {4,5}. Both are kept
+        // until the job exits.
+        let out = reconcile_root_cpuset(&[0, 1], &[job("job_1_1", &[4, 5])]);
         assert_eq!(out, vec![0, 1, 4, 5]);
     }
 
     #[test]
     fn reconcile_keeps_root_when_job_still_partly_intersects() {
-        // Job on {1,4}: it still has CPU 1 in the desired root, so no deferral —
-        // CPU 4 is dropped even though the job holds it.
-        let out = reconcile_root_cpuset(&[0, 1], &[vec![1, 4]]);
-        assert_eq!(out, vec![0, 1]);
+        // Job on {1,4}: CPU 1 is still in the desired root, and CPU 4 stays
+        // too, so the job is never narrowed.
+        let out = reconcile_root_cpuset(&[0, 1], &[job("job_1_1", &[1, 4])]);
+        assert_eq!(out, vec![0, 1, 4]);
     }
 
     #[test]
     fn reconcile_ignores_jobs_with_no_recorded_cpuset() {
-        let out = reconcile_root_cpuset(&[0, 1], &[vec![]]);
+        let out = reconcile_root_cpuset(&[0, 1], &[job("job_1_1", &[])]);
         assert_eq!(out, vec![0, 1]);
+    }
+
+    #[test]
+    fn reconcile_keeps_every_cpu_a_live_job_names() {
+        let live = [
+            job("job_1_1", &[1, 5]),
+            job("job_2_1", &[6]),
+            job("job_3_1", &[]),
+        ];
+        assert_eq!(
+            reconcile_root_cpuset(&[0, 1, 2], &live),
+            vec![0, 1, 2, 5, 6]
+        );
+        assert_eq!(
+            reconcile_root_cpuset(&[0, 1, 2], &[]),
+            vec![0, 1, 2],
+            "narrows once they end"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_an_unpopulated_jobs_cpus_too() {
+        // An orphan dir's cpus still widen the root: populated only gates
+        // the memory floor, never the cpuset union.
+        let out = reconcile_root_cpuset(&[0, 1], &[unpopulated_job("job_9_1", &[4, 5])]);
+        assert_eq!(out, vec![0, 1, 4, 5]);
     }
 
     #[test]
@@ -477,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn mem_lowers_the_hard_limit_only_when_the_root_is_idle() {
+    fn mem_lowers_the_hard_limit_once_pre_change_jobs_end() {
         let d = mem_decision(1000, true, None, false);
         assert_eq!(d.memory_max_mb, Some(1000));
         assert_eq!(d.state, MemReservation::Active);
@@ -509,6 +672,15 @@ mod tests {
         assert_eq!(daemon_cpuset(&l), Some(vec![0, 1]));
         l.spec_cpus.clear();
         assert_eq!(daemon_cpuset(&l), None);
+    }
+
+    #[test]
+    fn cap_trimmed_cpus_stay_out_of_the_job_root_but_not_off_the_daemons() {
+        let mut l = layout(&[7], &[0, 1], &[(10, &[2, 3])], 0);
+        l.trimmed_cpus = vec![4, 5, 6];
+        assert_eq!(root_cpuset(&l), vec![0, 1, 2, 3]);
+        l.daemons_off_spec = true;
+        assert_eq!(daemon_cpuset(&l), Some(vec![0, 1, 2, 3, 4, 5, 6]));
     }
 
     fn rev(term: u64, boot: u64, seq: u64) -> LayoutRevision {
@@ -660,49 +832,8 @@ mod tests {
         std::fs::read_to_string(root.join(file)).ok()
     }
 
-    fn set_populated(root: &Path, populated: bool) {
-        let events = format!("populated {}\nfrozen 0\n", u8::from(populated));
-        std::fs::write(root.join("cgroup.events"), events).unwrap();
-    }
-
     #[test]
-    fn apply_throttles_at_once_and_lowers_max_only_when_no_job_runs() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut e = enforcer(dir.path());
-        register(
-            &mut e,
-            Some(layout(&[127, 255], &[0, 1, 2], &[], 1024)),
-            rev(1, 1, 1),
-        );
-        set_populated(dir.path(), true);
-
-        for _ in 0..3 {
-            assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Pending);
-        }
-        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0-2"));
-        assert_eq!(
-            read(dir.path(), "memory.high").as_deref(),
-            Some(mb_to_bytes(7168).as_str())
-        );
-        assert_eq!(
-            read(dir.path(), "memory.max"),
-            None,
-            "busy: max is left alone"
-        );
-
-        set_populated(dir.path(), false);
-        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Active);
-        assert_eq!(
-            read(dir.path(), "memory.max").as_deref(),
-            Some(mb_to_bytes(7168).as_str())
-        );
-
-        set_populated(dir.path(), true);
-        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Active);
-    }
-
-    #[test]
-    fn an_unreadable_populated_state_counts_as_busy() {
+    fn memory_high_is_held_while_pre_adoption_jobs_run() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = enforcer(dir.path());
         register(
@@ -710,8 +841,158 @@ mod tests {
             Some(layout(&[127], &[0, 1], &[], 1024)),
             rev(1, 1, 1),
         );
-        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Pending);
-        assert_eq!(read(dir.path(), "memory.max"), None);
+        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Active);
+        let old = job("job_1_1", &[0]);
+        e.apply(std::slice::from_ref(&old), Some(8192)).unwrap();
+
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 2048)),
+            rev(1, 1, 2),
+        );
+        let later = job("job_2_1", &[1]);
+        for live in [vec![old.clone()], vec![old.clone(), later]] {
+            assert_eq!(e.apply(&live, Some(8192)).unwrap(), MemReservation::Pending);
+            assert_eq!(
+                read(dir.path(), "memory.high").as_deref(),
+                Some(mb_to_bytes(7168).as_str()),
+                "held at the value job 1 was admitted against"
+            );
+            assert_eq!(
+                read(dir.path(), "memory.max").as_deref(),
+                Some(mb_to_bytes(7168).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn memory_converges_when_pre_adoption_jobs_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = enforcer(dir.path());
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 1024)),
+            rev(1, 1, 1),
+        );
+        e.apply(&[], Some(8192)).unwrap();
+        let old = job("job_1_1", &[0]);
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 2048)),
+            rev(1, 1, 2),
+        );
+        e.apply(&[old], Some(8192)).unwrap();
+
+        let later = job("job_2_1", &[1]);
+        assert_eq!(
+            e.apply(std::slice::from_ref(&later), Some(8192)).unwrap(),
+            MemReservation::Active,
+            "a job started after the change was admitted against the new memory"
+        );
+        for file in ["memory.high", "memory.max"] {
+            assert_eq!(
+                read(dir.path(), file).as_deref(),
+                Some(mb_to_bytes(6144).as_str()),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            e.apply(&[later], Some(8192)).unwrap(),
+            MemReservation::Active
+        );
+    }
+
+    #[test]
+    fn an_unpopulated_job_never_captures_or_holds_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = enforcer(dir.path());
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 1024)),
+            rev(1, 1, 1),
+        );
+        e.apply(&[], Some(8192)).unwrap();
+
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 2048)),
+            rev(1, 1, 2),
+        );
+        let orphan = unpopulated_job("job_1_1", &[0]);
+        assert_eq!(
+            e.apply(&[orphan], Some(8192)).unwrap(),
+            MemReservation::Active,
+            "an orphan (unpopulated, not ledger-held) never captures the floor"
+        );
+        for file in ["memory.high", "memory.max"] {
+            assert_eq!(
+                read(dir.path(), file).as_deref(),
+                Some(mb_to_bytes(6144).as_str()),
+                "{file} converges at once: no populated job to hold a floor"
+            );
+        }
+    }
+
+    #[test]
+    fn raising_memory_high_applies_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = enforcer(dir.path());
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 2048)),
+            rev(1, 1, 1),
+        );
+        e.apply(&[], Some(8192)).unwrap();
+        let old = job("job_1_1", &[0]);
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 1024)),
+            rev(1, 1, 2),
+        );
+        assert_eq!(e.apply(&[old], Some(8192)).unwrap(), MemReservation::Active);
+        for file in ["memory.high", "memory.max"] {
+            assert_eq!(
+                read(dir.path(), file).as_deref(),
+                Some(mb_to_bytes(7168).as_str()),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restarted_agent_takes_its_floor_from_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.high"), mb_to_bytes(7168)).unwrap();
+        std::fs::write(dir.path().join("memory.max"), mb_to_bytes(7168)).unwrap();
+        std::fs::write(dir.path().join("marker"), "").unwrap();
+        let mut e = enforcer(dir.path());
+        register(
+            &mut e,
+            Some(layout(&[127], &[0, 1], &[], 2048)),
+            rev(1, 2, 1),
+        );
+
+        let survivor = job("job_5_1", &[0]);
+        assert_eq!(
+            e.apply(&[survivor], Some(8192)).unwrap(),
+            MemReservation::Pending
+        );
+        for file in ["memory.high", "memory.max"] {
+            assert_eq!(
+                read(dir.path(), file).as_deref(),
+                Some(mb_to_bytes(7168).as_str()),
+                "{file} kept while the job that survived the restart runs"
+            );
+        }
+
+        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Active);
+        for file in ["memory.high", "memory.max"] {
+            assert_eq!(
+                read(dir.path(), file).as_deref(),
+                Some(mb_to_bytes(6144).as_str()),
+                "{file}"
+            );
+        }
     }
 
     #[test]
@@ -850,7 +1131,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut e = enforcer(dir.path());
         register(&mut e, Some(layout(&[2, 3], &[0, 1], &[], 0)), rev(1, 1, 1));
-        e.apply(&[vec![2, 3]], Some(4096)).unwrap();
+        e.apply(&[job("job_1_1", &[2, 3])], Some(4096)).unwrap();
         assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0-3"));
     }
 
@@ -899,6 +1180,92 @@ mod tests {
         assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0,1"));
         assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("123456"));
         assert!(e.enforcement_healthy());
+    }
+
+    #[test]
+    fn release_converges_a_stale_cpuset_even_without_the_marker() {
+        // Simulates a reserved-cores-only layout landing on a root a
+        // different state_dir (or spurd life) already narrowed: no marker
+        // for this process, but the root itself shows the leftover.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cpuset.cpus"), "0-233").unwrap();
+        let mut e = enforcer(dir.path());
+        register(&mut e, Some(layout(&[], &[0, 1], &[], 0)), rev(1, 1, 1));
+        e.apply(&[], Some(8192)).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("\n"));
+    }
+
+    #[test]
+    fn release_converges_a_stale_memory_max_even_without_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.max"), mb_to_bytes(4096)).unwrap();
+        let mut e = enforcer(dir.path());
+        register(&mut e, Some(layout(&[], &[0, 1], &[], 0)), rev(1, 1, 1));
+        e.apply(&[], Some(8192)).unwrap();
+        assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn release_leaves_an_already_clean_root_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cpuset.cpus"), "").unwrap();
+        std::fs::write(dir.path().join("memory.high"), "max").unwrap();
+        std::fs::write(dir.path().join("memory.max"), "max").unwrap();
+        let mut e = enforcer(dir.path());
+        register(&mut e, Some(layout(&[], &[0, 1], &[], 0)), rev(1, 1, 1));
+        e.apply(&[], Some(8192)).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some(""));
+        assert_eq!(read(dir.path(), "memory.high").as_deref(), Some("max"));
+        assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn a_trimmed_only_layout_narrows_the_root_cpuset_but_leaves_memory_at_max() {
+        // No spec cores, but a `cpus =` cap trimmed CPUs 4-6 out of jobs'
+        // reach: the root cpuset must exclude them too, even though memory
+        // enforcement (out of scope here) stays off.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = enforcer(dir.path());
+        let mut l = layout(&[], &[0, 1], &[(10, &[2, 3])], 2048);
+        l.trimmed_cpus = vec![4, 5, 6];
+        register(&mut e, Some(l), rev(1, 1, 1));
+        assert_eq!(e.apply(&[], Some(8192)).unwrap(), MemReservation::Inactive);
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0-3"));
+        assert_eq!(read(dir.path(), "memory.high").as_deref(), Some("max"));
+        assert_eq!(
+            read(dir.path(), "memory.max").as_deref(),
+            Some("max"),
+            "mem_spec_mb without spec cores is scheduling-only, never a root limit"
+        );
+    }
+
+    #[test]
+    fn a_restricted_cores_only_layout_releases_a_root_narrowed_as_if_by_an_operator() {
+        // Same on-disk state as operator_set_root_limits_are_left_alone, but
+        // this node holds a restricted_cores_per_gpu-only layout (no spec
+        // cores): it is spur-managed, so the root is released regardless,
+        // unlike a node with no layout at all.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cpuset.cpus"), "0,1").unwrap();
+        std::fs::write(dir.path().join("memory.max"), "123456").unwrap();
+        let mut e = enforcer(dir.path());
+        register(
+            &mut e,
+            Some(layout(&[], &[2, 3], &[(10, &[0, 1])], 0)),
+            rev(1, 1, 1),
+        );
+        e.apply(&[], Some(8192)).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("\n"));
+        assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn an_unknown_policy_leaves_a_narrowed_root_untouched_even_without_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cpuset.cpus"), "0-233").unwrap();
+        let mut e = enforcer(dir.path());
+        e.apply(&[], Some(8192)).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0-233"));
     }
 
     #[test]

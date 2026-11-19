@@ -327,11 +327,19 @@ fn hip_relative_indices(visible: &str) -> String {
 ///
 /// For a launch fenced to its own GPUs by a device filter: the runtimes there can
 /// open no other GPU, so they enumerate its GPUs from 0 and a node-wide id would
-/// name a device they cannot see. An id outside `SPUR_JOB_GPUS` is left as is.
+/// name a device they cannot see. `SPUR_JOB_GPUS` itself keeps the node's ids,
+/// as Slurm's `SLURM_JOB_GPUS` does, so tools can still tell which GPUs these
+/// are; `SPUR_LOCAL_GPUS` carries the local numbering for the per-task split.
+/// An id outside `SPUR_JOB_GPUS` is left as is.
 pub fn localize_gpu_selectors(env: &mut HashMap<String, String>) {
     let Some(ids) = env.get("SPUR_JOB_GPUS").cloned() else {
         return;
     };
+    let count = ids.split(',').filter(|id| !id.is_empty()).count();
+    if count > 0 {
+        let local: Vec<String> = (0..count).map(|i| i.to_string()).collect();
+        env.insert("SPUR_LOCAL_GPUS".into(), local.join(","));
+    }
     let rank: HashMap<&str, String> = ids
         .split(',')
         .filter(|id| !id.is_empty())
@@ -339,7 +347,6 @@ pub fn localize_gpu_selectors(env: &mut HashMap<String, String>) {
         .map(|(i, id)| (id, i.to_string()))
         .collect();
     for var in [
-        "SPUR_JOB_GPUS",
         "ROCR_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
         "GPU_DEVICE_ORDINAL",
@@ -669,13 +676,16 @@ fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
         .collect()
 }
 
-/// Bash that narrows one task's GPU visibility to its slice of `SPUR_JOB_GPUS`.
+/// Bash that narrows one task's GPU visibility to its slice of the launch's GPUs.
 ///
-/// `HIP_VISIBLE_DEVICES` is renumbered because `ROCR_VISIBLE_DEVICES` has already
-/// filtered and renumbered the driver-visible set by the time HIP applies its own
-/// selector; see `hip_relative_indices`.
+/// It slices `SPUR_LOCAL_GPUS` when a GPU fence set it, else `SPUR_JOB_GPUS`:
+/// inside the fence the runtimes number the GPUs from 0 while `SPUR_JOB_GPUS`
+/// keeps the node's ids. `HIP_VISIBLE_DEVICES` is renumbered because
+/// `ROCR_VISIBLE_DEVICES` has already filtered and renumbered the
+/// driver-visible set by the time HIP applies its own selector; see
+/// `hip_relative_indices`.
 const PER_TASK_GPU_VISIBILITY_BASH: &str = r#"  if [ -n "$SPUR_JOB_GPUS" ]; then
-    IFS=',' read -ra _ALL_GPUS <<< "$SPUR_JOB_GPUS"
+    IFS=',' read -ra _ALL_GPUS <<< "${SPUR_LOCAL_GPUS:-$SPUR_JOB_GPUS}"
     _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))
     if [ $_GPUS_PER_TASK -gt 0 ]; then
       _START=$((SPUR_LOCALID * _GPUS_PER_TASK))
@@ -1283,7 +1293,8 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         localize_gpu_selectors(&mut env);
-        assert_eq!(env["SPUR_JOB_GPUS"], "0,1");
+        assert_eq!(env["SPUR_JOB_GPUS"], "5,2", "the node's ids stay visible");
+        assert_eq!(env["SPUR_LOCAL_GPUS"], "0,1");
         assert_eq!(env["ROCR_VISIBLE_DEVICES"], "0,1");
         assert_eq!(
             env["CUDA_VISIBLE_DEVICES"], "1",
@@ -1372,6 +1383,75 @@ mod tests {
             target.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
             Some("5,6")
         );
+    }
+
+    fn task_gpu_visibility(env: &[(&str, &str)], local_id: u32, tasks: u32) -> String {
+        let script = format!(
+            "_TASKS_ON_NODE={tasks}\nSPUR_LOCALID={local_id}\n{PER_TASK_GPU_VISIBILITY_BASH}\
+             echo \"$ROCR_VISIBLE_DEVICES|$CUDA_VISIBLE_DEVICES\"\n"
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .envs(env.iter().copied())
+            .output()
+            .expect("run bash");
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn fenced_env(selectors: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = selectors
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        localize_gpu_selectors(&mut env);
+        env
+    }
+
+    fn as_pairs(env: &HashMap<String, String>) -> Vec<(&str, &str)> {
+        env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+
+    #[test]
+    fn per_task_gpu_visibility_slices_a_fenced_steps_local_gpus() {
+        // A step fenced to node GPUs 5 and 2: its runtimes see them as 0 and 1.
+        let env = fenced_env(&[("SPUR_JOB_GPUS", "5,2"), ("ROCR_VISIBLE_DEVICES", "5,2")]);
+        assert_eq!(task_gpu_visibility(&as_pairs(&env), 0, 2), "0|0");
+        assert_eq!(task_gpu_visibility(&as_pairs(&env), 1, 2), "1|1");
+    }
+
+    #[test]
+    fn per_task_gpu_visibility_slices_a_fence_without_selectors() {
+        // `no_gpu_env` GRES (or Intel) sets no selector of Spur's own.
+        let env = fenced_env(&[("SPUR_JOB_GPUS", "5,2")]);
+        assert_eq!(task_gpu_visibility(&as_pairs(&env), 1, 2), "1|1");
+    }
+
+    #[test]
+    fn per_task_gpu_visibility_slices_node_ids_outside_a_fenced_step() {
+        let env = [
+            ("SPUR_JOB_GPUS", "5,6,7,8"),
+            ("ROCR_VISIBLE_DEVICES", "5,6,7,8"),
+        ];
+        assert_eq!(task_gpu_visibility(&env, 1, 2), "7,8|7,8");
+    }
+
+    #[test]
+    fn a_users_own_selector_does_not_steer_the_per_task_split() {
+        let env = [
+            ("SPUR_JOB_GPUS", "5,6"),
+            ("CUDA_VISIBLE_DEVICES", "5,6"),
+            ("ROCR_VISIBLE_DEVICES", "0,1,2,3"),
+        ];
+        assert_eq!(task_gpu_visibility(&env, 1, 2), "6|6");
+    }
+
+    #[test]
+    fn per_task_gpu_visibility_leaves_a_zero_gpu_launch_denied() {
+        let env = [("SPUR_JOB_GPUS", ""), ("ROCR_VISIBLE_DEVICES", "-1")];
+        assert_eq!(task_gpu_visibility(&env, 0, 2), "-1|");
     }
 
     #[test]

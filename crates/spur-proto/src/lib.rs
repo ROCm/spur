@@ -27,6 +27,49 @@ pub const MAX_GRPC_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// while allowing large outbound responses.
 pub const MAX_GRPC_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
+/// gRPC metadata key an agent sets on a `ResourceExhausted` launch refusal to
+/// say why; an older controller ignores it and keeps its generic path.
+pub const LAUNCH_REFUSAL_HEADER: &str = "spur-launch-refusal";
+
+/// [`LAUNCH_REFUSAL_HEADER`] value: the GPU's reserved CPUs are held by a job
+/// from before a core-layout change, which the refused job did not cause.
+pub const REFUSAL_RESERVED_CPUS_HELD: &str = "reserved-cpus-held";
+
+/// [`LAUNCH_REFUSAL_HEADER`] value: a typed step's share on a node is held by
+/// the job's other steps, so the step stays runnable and srun retries it.
+pub const REFUSAL_STEP_SHARE_BUSY: &str = "step-share-busy";
+
+fn has_launch_refusal(status: &tonic::Status, value: &str) -> bool {
+    status
+        .metadata()
+        .get(LAUNCH_REFUSAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case(value))
+}
+
+/// Whether `status` refuses a launch over reserved CPUs held under an older layout.
+pub fn is_reserved_cpus_held_refusal(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && has_launch_refusal(status, REFUSAL_RESERVED_CPUS_HELD)
+}
+
+/// Builds a `ResourceExhausted` status marked as a busy typed-step share, so
+/// callers can tell it apart from any other resource refusal.
+pub fn step_share_busy(message: impl Into<String>) -> tonic::Status {
+    let mut status = tonic::Status::resource_exhausted(message);
+    status.metadata_mut().insert(
+        LAUNCH_REFUSAL_HEADER,
+        tonic::metadata::MetadataValue::from_static(REFUSAL_STEP_SHARE_BUSY),
+    );
+    status
+}
+
+/// Whether `status` refuses a launch because a typed step's share is busy.
+pub fn is_step_share_busy(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && has_launch_refusal(status, REFUSAL_STEP_SHARE_BUSY)
+}
+
 /// Transient and transport failures, including a client-side request timeout,
 /// are retried; a spec rejection would repeat forever, so it is not.
 pub fn controller_rpc_retryable(status: &tonic::Status) -> bool {
@@ -109,6 +152,51 @@ pub fn accounting_server<T: proto::slurm_accounting_server::SlurmAccounting>(
 mod tests {
     use super::controller_rpc_retryable;
     use prost::Message;
+
+    #[test]
+    fn step_resource_additions_preserve_wire_compatibility() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyStepResources {
+            #[prost(uint32, optional, tag = "1")]
+            cpus_per_task: Option<u32>,
+            #[prost(uint64, optional, tag = "2")]
+            memory_mb: Option<u64>,
+        }
+
+        let old_wire = LegacyStepResources {
+            cpus_per_task: Some(2),
+            memory_mb: Some(1024),
+        }
+        .encode_to_vec();
+        let decoded = super::StepResources::decode(old_wire.as_slice()).unwrap();
+        assert_eq!(decoded.cpus_per_task, Some(2));
+        assert_eq!(decoded.cpus_per_gpu, None);
+        assert_eq!(decoded.memory_per_gpu_mb, None);
+        assert_eq!(decoded.memory_per_cpu_mb, None);
+        assert!(decoded.gpu_type.is_empty());
+
+        let new = super::StepResources {
+            cpus_per_gpu: Some(8),
+            memory_per_gpu_mb: Some(4096),
+            memory_per_cpu_mb: Some(512),
+            gpu_type: "mi355x".into(),
+            ..decoded
+        };
+        let new_wire = new.encode_to_vec();
+        assert_eq!(
+            super::StepResources::decode(new_wire.as_slice()).unwrap(),
+            new
+        );
+        assert_eq!(
+            LegacyStepResources::decode(new_wire.as_slice()).unwrap(),
+            LegacyStepResources::decode(old_wire.as_slice()).unwrap(),
+            "an old peer still reads the fields it knows"
+        );
+
+        let response = super::RunCommandResponse::decode(b"\x08\x89\x01".as_slice()).unwrap();
+        assert_eq!(response.exit_code, 137);
+        assert!(!response.oom_killed);
+    }
 
     #[test]
     fn run_step_warnings_preserve_wire_compatibility() {
@@ -199,6 +287,7 @@ mod tests {
             }],
             general_cpus: vec![32, 33],
             daemons_off_spec: true,
+            trimmed_cpus: vec![34, 35],
         };
         let revision = crate::proto::LayoutRevision {
             term: 3,
@@ -300,6 +389,28 @@ mod tests {
     }
 
     #[test]
+    fn blocked_cpus_round_trip_and_default_to_none_blocked() {
+        use prost::Message;
+        let req = crate::proto::HeartbeatRequest {
+            hostname: "n1".into(),
+            layout_blocked_cpus: vec![crate::proto::GpuBlockedCpus {
+                stable_id: 7,
+                cpus: 4,
+            }],
+            ..Default::default()
+        };
+        let back = crate::proto::HeartbeatRequest::decode(req.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.layout_blocked_cpus, req.layout_blocked_cpus);
+        let old = crate::proto::HeartbeatRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::HeartbeatRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.layout_blocked_cpus.is_empty());
+    }
+
+    #[test]
     fn node_info_spec_fields_default_when_absent() {
         use prost::Message;
         let old = crate::proto::NodeInfo {
@@ -370,6 +481,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(mem_spec_mb.encode_to_vec(), [0xE8, 0x03, 0x01]);
+
+        let step_overlap = crate::proto::RunStepRequest {
+            overlap: true,
+            ..Default::default()
+        };
+        assert_eq!(step_overlap.encode_to_vec(), [0x70, 0x01]);
+        let command_overlap = crate::proto::RunCommandRequest {
+            overlap: true,
+            ..Default::default()
+        };
+        assert_eq!(command_overlap.encode_to_vec(), [0x98, 0x01, 0x01]);
+        let oom = crate::proto::RunCommandResponse {
+            oom_killed: true,
+            ..Default::default()
+        };
+        assert_eq!(oom.encode_to_vec(), [0x20, 0x01]);
+        let gpu_type = crate::proto::StepResources {
+            gpu_type: "a".into(),
+            ..Default::default()
+        };
+        assert_eq!(gpu_type.encode_to_vec(), [0x4A, 0x01, b'a']);
+        let capabilities = crate::proto::PingResponse {
+            capabilities: vec!["a".into()],
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0x6A, 0x01, b'a']);
     }
 
     #[test]
@@ -395,5 +532,69 @@ mod tests {
         let mut bytes = layout.encode_to_vec();
         bytes.pop();
         assert!(crate::proto::CoreLayout::decode(bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_refusal_trailer_is_recognised_only_with_its_value() {
+        use tonic::metadata::MetadataValue;
+        let mut status = tonic::Status::resource_exhausted("held");
+        assert!(!crate::is_reserved_cpus_held_refusal(&status));
+        status.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            MetadataValue::from_static(crate::REFUSAL_RESERVED_CPUS_HELD),
+        );
+        assert!(crate::is_reserved_cpus_held_refusal(&status));
+
+        let mut other = tonic::Status::resource_exhausted("held");
+        other.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            MetadataValue::from_static("other"),
+        );
+        assert!(!crate::is_reserved_cpus_held_refusal(&other));
+
+        let mut wrong_code = tonic::Status::internal("held");
+        wrong_code.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            MetadataValue::from_static(crate::REFUSAL_RESERVED_CPUS_HELD),
+        );
+        assert!(!crate::is_reserved_cpus_held_refusal(&wrong_code));
+    }
+
+    #[test]
+    fn a_share_busy_refusal_is_recognised_only_with_its_marker() {
+        let busy = crate::step_share_busy("held by step 3");
+        assert!(crate::is_step_share_busy(&busy));
+        assert!(!crate::is_reserved_cpus_held_refusal(&busy));
+        assert!(!crate::is_step_share_busy(
+            &tonic::Status::resource_exhausted("cleanup pending")
+        ));
+        let mut wrong_code = tonic::Status::failed_precondition("x");
+        wrong_code.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            tonic::metadata::MetadataValue::from_static(crate::REFUSAL_STEP_SHARE_BUSY),
+        );
+        assert!(!crate::is_step_share_busy(&wrong_code));
+    }
+
+    #[test]
+    fn the_refusal_trailer_match_ignores_whitespace_and_ascii_case() {
+        use tonic::metadata::MetadataValue;
+
+        let mut padded_and_cased = tonic::Status::resource_exhausted("held");
+        padded_and_cased.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            MetadataValue::from_static(" Reserved-CPUs-Held "),
+        );
+        assert!(crate::is_reserved_cpus_held_refusal(&padded_and_cased));
+
+        let mut unrelated = tonic::Status::resource_exhausted("held");
+        unrelated.metadata_mut().insert(
+            crate::LAUNCH_REFUSAL_HEADER,
+            MetadataValue::from_static("something-else"),
+        );
+        assert!(!crate::is_reserved_cpus_held_refusal(&unrelated));
+
+        let missing_header = tonic::Status::resource_exhausted("held");
+        assert!(!crate::is_reserved_cpus_held_refusal(&missing_header));
     }
 }
