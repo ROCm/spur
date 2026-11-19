@@ -85,18 +85,26 @@ class TestSpurJobLifecycle:
         )
 
     def test_scancel_of_a_multinode_job_releases_every_node(self, cluster):
+        # The CLI presents no credential, so only the job's owner may cancel it.
+        user = exec_in_pod(cluster.namespace, "spurctld-0", ["id", "-un"], check=True)
         job = multinode_spurjob("it-scancel", ["sleep", "600"], 2)
+        job["metadata"]["annotations"] = {"spur.amd.com/user": user.strip()}
         cluster.create_spurjob(job)
         running = wait_spurjob_state(cluster, "it-scancel", "Running", timeout=90)
         job_id = (running.get("status") or {}).get("spurJobId")
         assert job_id is not None, "a running SpurJob has a Spur job ID"
 
-        exec_in_pod(cluster.namespace, "spurctld-0", ["spur", "scancel", str(job_id)])
+        exec_in_pod(
+            cluster.namespace, "spurctld-0", ["spur", "scancel", str(job_id)], check=True
+        )
 
         # Unreported nodes are drained once complete_wait_secs (300 s) runs out.
         wait_spurjob_state(cluster, "it-scancel", "Cancelled", timeout=90)
         states = exec_in_pod(
-            cluster.namespace, "spurctld-0", ["spur", "nodes", "-N", "-h", "-o", "%N %t"]
+            cluster.namespace,
+            "spurctld-0",
+            ["spur", "nodes", "-N", "-h", "-o", "%N %t"],
+            check=True,
         )
         assert "drain" not in states, f"no node may be drained:\n{states}"
 

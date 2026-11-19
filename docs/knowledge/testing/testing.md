@@ -291,6 +291,9 @@ K8s E2E tests use the Python `kubernetes` client. `k8s_cluster.py` provides:
   operator manifests (StatefulSet for `spurctld`, DaemonSet for `spurd`).
   Supports `FixtureConfig.single_node()` and `FixtureConfig.raft_ha()`.
 - `wait_spurjob_state()` -- polls a SpurJob CR until it reaches a given state.
+- `exec_in_pod()` -- returns a command's stdout from a Pod. A failed command
+  returns silently (for polls that retry) unless `check=True`, which raises
+  with its exit status and stderr.
 - `simple_spurjob()` / `spurjob_with_env()` / `multinode_spurjob()` --
   factory functions for SpurJob CRD manifests.
 

@@ -759,20 +759,44 @@ def delete_namespace(name: str, *, wait: bool = False, timeout: int = 120) -> No
         logger.warning("timed out waiting for namespace %s to be deleted", name)
 
 
-def exec_in_pod(namespace: str, pod_name: str, command: list[str]) -> str:
+def exec_in_pod(
+    namespace: str, pod_name: str, command: list[str], *, check: bool = False
+) -> str:
+    """Return the command's stdout. A failed command is silent unless `check`,
+    so polls can retry a command that cannot succeed yet."""
     _load_kube_config()
     core = client.CoreV1Api()
-    resp = stream(
+    if not check:
+        return stream(
+            core.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=command,
+            stderr=False,
+            stdin=False,
+            stdout=True,
+            tty=False,
+        )
+    ws = stream(
         core.connect_get_namespaced_pod_exec,
         pod_name,
         namespace,
         command=command,
-        stderr=False,
+        stderr=True,
         stdin=False,
         stdout=True,
         tty=False,
+        _preload_content=False,
     )
-    return resp
+    ws.run_forever(timeout=DEFAULT_TIMEOUT)
+    code = ws.returncode
+    ws.close()
+    if code != 0:
+        outcome = "is still running" if code is None else f"exited {code}"
+        raise RuntimeError(
+            f"`{shlex.join(command)}` in {pod_name} {outcome}: {ws.read_stderr().strip()}"
+        )
+    return ws.read_stdout()
 
 
 def read_file_from_pod(namespace: str, pod_name: str, path: str) -> str:
