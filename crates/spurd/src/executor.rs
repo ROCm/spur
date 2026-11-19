@@ -1784,7 +1784,7 @@ pub fn deliver_signal(
 pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
     let workload = launcher_workload_pids(pid);
     signal_pids_except(&workload, sig, None);
-    if sig == Signal::SIGSTOP && workload.is_empty() && tracked == TrackedProcess::Launcher {
+    if sig == Signal::SIGSTOP && workload.is_empty() {
         stop_launcher_and_its_late_workload(pid, || launcher_workload_pids(pid));
     }
     signal_launcher(Some(pid), tracked, sig);
@@ -5404,8 +5404,11 @@ mod tests {
 
     impl Drop for StandIn {
         fn drop(&mut self) {
-            // The helper can sit in a group of its own, so it is killed by pid.
-            let _ = signal::kill(Pid::from_raw(self.helper), Signal::SIGKILL);
+            // The helper can sit in a group of its own, so it is killed by pid,
+            // unless it is already gone and its number may belong to someone else.
+            if state_of(self.helper).is_some() {
+                let _ = signal::kill(Pid::from_raw(self.helper), Signal::SIGKILL);
+            }
             if self.own_group {
                 let _ = signal::killpg(Pid::from_raw(self.leader), Signal::SIGKILL);
             } else {
