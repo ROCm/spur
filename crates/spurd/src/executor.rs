@@ -5378,7 +5378,7 @@ mod tests {
             return;
         }
         std::thread::spawn(|| {
-            let helper = std::process::Command::new("sleep")
+            let mut helper = std::process::Command::new("sleep")
                 .arg("3600")
                 .process_group(0)
                 .spawn()
@@ -5386,9 +5386,7 @@ mod tests {
             println!("ready {}", helper.id());
             // The forking thread has to outlive the helper, or the kernel hands
             // the helper to another thread and the listing no longer depends on it.
-            loop {
-                std::thread::park();
-            }
+            let _ = helper.wait();
         });
         loop {
             std::thread::park();
@@ -5519,8 +5517,9 @@ mod tests {
 
         signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGTERM);
 
-        // The workload never reaps its helper, so it is a zombie once it dies.
-        assert_eq!(await_state(launcher.helper, &[Some('Z'), None]), Some('Z'));
+        // Gone, or a zombie for the moment before the workload reaps it.
+        let state = await_state(launcher.helper, &[Some('Z'), None]);
+        assert!(matches!(state, Some('Z') | None), "{state:?}");
         assert_ne!(
             state_of(launcher.leader),
             Some('Z'),
