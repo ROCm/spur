@@ -5269,8 +5269,9 @@ mod tests {
                 stderr: err_fd,
             };
             let result = unsafe { raw.wire() };
-            // Exit with code 0 on success, 1 on failure.
-            std::process::exit(if result.is_ok() { 0 } else { 1 });
+            // `_exit`: the runtime's own exit would flush stdout, which another
+            // test thread may have locked when this process was forked.
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) };
         }
 
         // Parent: wait for child.
@@ -5295,7 +5296,7 @@ mod tests {
 
         if pid == 0 {
             let result = unsafe { raw.wire() };
-            std::process::exit(if result.is_err() { 0 } else { 1 });
+            unsafe { libc::_exit(if result.is_err() { 0 } else { 1 }) };
         }
 
         let mut status = 0i32;
