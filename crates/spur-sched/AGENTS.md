@@ -111,6 +111,10 @@ in the pending order, so no other job is planned between them.
 
 ### GPU placement modes
 
+`job_resource_request()` requires a one-node job's entire GPU total during
+candidate filtering, including exclusive jobs. Multi-node totals use a one-GPU
+minimum per candidate before allocation resolves their distribution.
+
 GPU demand is resolved via `spur_core::gpu_request::resolve_gpu_demand()`:
 
 - **`GpuDemand::PerNode`** -- `--gres=gpu:N` or `--gpus-per-task` scaled by

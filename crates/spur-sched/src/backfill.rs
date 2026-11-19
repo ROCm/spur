@@ -2134,14 +2134,16 @@ fn cpu_is_heterogeneous(job: &Job) -> bool {
 
 /// The single-node resource request used for feasibility filtering and
 /// earliest-start computation. For homogeneous demand this carries the exact
-/// per-node GPU count; for heterogeneous demand it carries the minimum (one
-/// GPU per node), with the concrete per-node counts resolved at allocation.
+/// per-node GPU count, including the whole GPU total for a one-node job.
+/// Multi-node heterogeneous demand carries the minimum (one GPU per node),
+/// with concrete per-node counts resolved at allocation.
 pub fn job_resource_request(job: &Job) -> ResourceSet {
     let mut rs = base_node_request(job);
     let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
-    // Heterogeneous demand needs at least one GPU per node for feasibility;
-    // homogeneous demand carries its exact per-node count.
-    let per_node = homogeneous_per_node(&demand).unwrap_or(1);
+    let per_node = match &demand {
+        GpuDemand::Total { count, .. } if job.spec.num_nodes <= 1 => *count,
+        _ => homogeneous_per_node(&demand).unwrap_or(1),
+    };
     rs.cpus = rs
         .cpus
         .max(job.spec.cpus_on_node(min_node_tasks(&job.spec), per_node));
@@ -3008,6 +3010,52 @@ mod tests {
         node.state = NodeState::Idle;
         node.partitions = vec!["default".into()];
         node
+    }
+
+    #[test]
+    fn one_node_gpu_total_rejects_insufficient_inventory_before_exclusive_placement() {
+        for exclusive in [false, true] {
+            for gpu_type in [None, Some("mi300x"), Some("other")] {
+                let mut nodes = [make_gpu_node(1), make_gpu_node(2)];
+                nodes[0].name = "small".into();
+                nodes[1].name = "big".into();
+                let job = Job::new(
+                    1,
+                    JobSpec {
+                        exclusive,
+                        gpus: Some(spur_core::gpu_request::GpuRequest::new(
+                            2,
+                            gpu_type.map(str::to_owned),
+                        )),
+                        memory_per_gpu_mb: Some(1000),
+                        ..Default::default()
+                    },
+                );
+                for available in [1, 2] {
+                    let cluster = ClusterState {
+                        nodes: &nodes[..available],
+                        partitions: &[],
+                        reservations: &[],
+                        topology: None,
+                        fabric: None,
+                        busy_until: &HashMap::new(),
+                        preemption_handoffs: &HashMap::new(),
+                        partition_node_usage: &HashMap::new(),
+                    };
+                    let assignments =
+                        BackfillScheduler::new(1).schedule(std::slice::from_ref(&job), &cluster);
+                    if available == 1 || gpu_type == Some("other") {
+                        assert!(assignments.is_empty(), "{exclusive} {gpu_type:?}");
+                    } else {
+                        assert_eq!(assignments.len(), 1);
+                        assert_eq!(assignments[0].nodes, vec!["big"]);
+                        let allocation = &assignments[0].per_node_alloc["big"];
+                        assert_eq!(allocation.total_device_count("gpu"), 2);
+                        assert_eq!(allocation.memory_mb, 2000);
+                    }
+                }
+            }
+        }
     }
 
     fn make_gpu_job(id: u32, gpu_count: u32) -> Job {

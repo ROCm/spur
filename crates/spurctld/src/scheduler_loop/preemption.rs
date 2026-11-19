@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use spur_core::job::{Job, JobId, JobState};
 use spur_core::node::Node;
 use spur_core::resource::ResourceAllocations;
-use spur_sched::backfill::BackfillScheduler;
+use spur_sched::backfill::{job_resource_request, BackfillScheduler};
 use spur_sched::immediate::{
     consumable_allocation, job_work, placement_job, placement_node, InputSize, PlacementProjection,
     SearchBudget, MAX_NODES, MAX_TRIALS, MAX_VICTIMS,
@@ -15,7 +15,7 @@ use spur_sched::immediate::{
 use spur_sched::partition_cap::{job_typed_gpu, PartitionNodeUsage, RunningCharge, TresCharge};
 use spur_sched::traits::{Assignment, ClusterState};
 
-use super::{node_request, partition_usage_from_jobs, ClusterManager, ReleaseWaits, VictimSearch};
+use super::{partition_usage_from_jobs, ClusterManager, ReleaseWaits, VictimSearch};
 use crate::victim_order::VictimOrder;
 
 #[cfg(test)]
@@ -296,7 +296,7 @@ fn preferred_victims(
     budget: &mut SearchBudget,
 ) -> Option<HashSet<JobId>> {
     let placement = spur_sched::node_match::NodePlacement::new(request);
-    let required = node_request(request);
+    let required = job_resource_request(request);
     let mut on_node: HashMap<&str, Vec<JobId>> = HashMap::new();
     for job in ordered {
         for node in &job.allocated_nodes {
@@ -367,7 +367,7 @@ fn direct_victims(
     {
         return Some(None);
     }
-    let required = node_request(job);
+    let required = job_resource_request(job);
     let partitions = spur_sched::partition_cap::candidate_partitions(job, state.partitions);
     let typed_gpu = job_typed_gpu(job);
     let mut on_node: HashMap<&str, Vec<&Job>> = HashMap::new();

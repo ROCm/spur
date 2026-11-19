@@ -458,6 +458,42 @@ fn job_total_gpus_release_two_tenants_instead_of_all_four() {
 }
 
 #[test]
+fn exclusive_gpu_total_selects_only_a_node_with_enough_gpus() {
+    for (big_first, fallback) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut f = Fixture::new(4);
+        let mut other = f.nodes[0].clone();
+        other.name = "n2".into();
+        f.nodes.push(other);
+        let big = usize::from(!big_first);
+        let small = 1 - big;
+        f.nodes[big].total_resources.gpus.truncate(2);
+        f.nodes[small].total_resources.gpus.truncate(1);
+        for index in 0..2 {
+            let allocation =
+                spur_core::resource::build_exclusive_allocation(&f.nodes[index].total_resources, 0);
+            f.hold_on(index, index as u32 + 1, allocation, true);
+        }
+        if fallback {
+            for node in &mut f.nodes {
+                node.partitions = vec!["default".into()];
+            }
+            f.partitions.push(spur_core::partition::Partition {
+                name: "default".into(),
+                is_default: true,
+                max_mem_per_node: Some(100),
+                ..Default::default()
+            });
+        }
+        let mut job = request(1, 0);
+        job.spec.exclusive = true;
+        job.spec.gpus = Some(GpuRequest::new(2, None));
+        assert_eq!(selected(&f, &job), Some(HashSet::from([big as u32 + 1])));
+        f.eligible.remove(&(big as u32 + 1));
+        assert_eq!(selected(&f, &job), None);
+    }
+}
+
+#[test]
 fn free_capacity_causes_no_eviction() {
     let mut f = Fixture::new(4);
     f.hold(1, 1, 0, &[], true);
