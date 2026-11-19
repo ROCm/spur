@@ -59,6 +59,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Accepted for compatibility on ``squeue``, ``sinfo``, ``sacct``, ``sstat``, ``sshare``, and ``sreport``. Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. ``sstat`` still prints ``MemAlloc`` with an ``M`` suffix whether or not the flag is passed.
    * - ``sacct`` ``ReqMem``
      - The ``ReqMem`` format field has no value yet and renders empty.
+   * - ``sacct --format``
+     - Field names must be spelled in full: Slurm's prefix abbreviations (``JobN`` for ``JobName``) and the ``ALL`` keyword are not accepted. A Slurm field Spur does not provide, such as ``AllocTRES``, ``MaxRSS``, or ``WorkDir``, prints ``N/A`` in every row. A name Slurm does not know either fails with ``Invalid field requested`` and exit 1, as in Slurm. Earlier Spur releases silently dropped both kinds of name and printed only the remaining columns.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``

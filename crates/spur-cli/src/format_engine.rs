@@ -141,26 +141,32 @@ pub fn parse_named_format(
     name_to_spec: &dyn Fn(&str) -> Option<char>,
     header_map: &dyn Fn(char) -> &'static str,
 ) -> Vec<FormatToken> {
-    parse_named_format_inner(fmt, name_to_spec, header_map, false)
-        .expect("skipping unknown names does not fail")
+    parse_named_items(fmt, &|name| {
+        name_to_spec(name).map(|spec| (spec, header_map(spec)))
+    })
+    .0
 }
 
-/// [`parse_named_format`], but an unknown name is `Invalid field requested: {name}`.
+/// [`parse_named_format`], but the first unknown name is `Invalid field requested: {name}`.
+/// `field` maps a name to its letter and header, so several names can share one letter.
 pub fn parse_named_format_strict(
     fmt: &str,
-    name_to_spec: &dyn Fn(&str) -> Option<char>,
-    header_map: &dyn Fn(char) -> &'static str,
+    field: &dyn Fn(&str) -> Option<(char, &'static str)>,
 ) -> anyhow::Result<Vec<FormatToken>> {
-    parse_named_format_inner(fmt, name_to_spec, header_map, true)
+    let (tokens, unknown) = parse_named_items(fmt, field);
+    if let Some(name) = unknown.first() {
+        anyhow::bail!("Invalid field requested: {name}");
+    }
+    Ok(tokens)
 }
 
-fn parse_named_format_inner(
-    fmt: &str,
-    name_to_spec: &dyn Fn(&str) -> Option<char>,
-    header_map: &dyn Fn(char) -> &'static str,
-    reject_unknown: bool,
-) -> anyhow::Result<Vec<FormatToken>> {
+/// The tokens for the known names, and the unknown names in input order.
+fn parse_named_items<'a>(
+    fmt: &'a str,
+    field: &dyn Fn(&str) -> Option<(char, &'static str)>,
+) -> (Vec<FormatToken>, Vec<&'a str>) {
     let mut tokens = Vec::new();
+    let mut unknown = Vec::new();
     let items: Vec<&str> = fmt.split(',').collect();
     for (i, item) in items.iter().enumerate() {
         let item = item.trim();
@@ -171,10 +177,9 @@ fn parse_named_format_inner(
             Some((n, w)) => (n.trim(), w.trim().parse::<i32>().unwrap_or(0)),
             None => (item, 0),
         };
-        let Some(spec) = name_to_spec(name) else {
-            if reject_unknown {
-                anyhow::bail!("Invalid field requested: {name}");
-            }
+        let Some((spec, header)) = field(name) else {
+            // A bare `%width` has no name; report the token the user typed.
+            unknown.push(if name.is_empty() { item } else { name });
             continue;
         };
         let abs_width = width.unsigned_abs() as usize;
@@ -183,13 +188,13 @@ fn parse_named_format_inner(
             width: abs_width,
             right_align: width >= 0,
             truncate: if abs_width > 0 { Some(abs_width) } else { None },
-            header: header_map(spec).to_string(),
+            header: header.to_string(),
         }));
         if i + 1 < items.len() {
             tokens.push(FormatToken::Literal(" ".to_string()));
         }
     }
-    Ok(tokens)
+    (tokens, unknown)
 }
 
 /// Parse Slurm's `-O`/`--Format` grammar: a comma-separated list of fields, each
@@ -689,24 +694,46 @@ mod tests {
         assert_eq!(field_count, 2);
     }
 
+    fn test_field(name: &str) -> Option<(char, &'static str)> {
+        test_name_to_spec(name).map(|spec| (spec, squeue_header(spec)))
+    }
+
     #[test]
     fn parse_named_format_strict_names_an_unknown_field() {
-        let err = parse_named_format_strict(
-            "JobID,NotAField,Partition",
-            &test_name_to_spec,
-            &squeue_header,
-        )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Invalid field requested: NotAField"));
+        let err = parse_named_format_strict("JobID,NotAField,Partition", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: NotAField");
+    }
+
+    #[test]
+    fn parse_named_format_strict_names_a_bare_width() {
+        let err = parse_named_format_strict("%20", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: %20");
+    }
+
+    #[test]
+    fn parse_named_format_strict_strips_a_width_from_an_unknown_field() {
+        let err = parse_named_format_strict("NotAField%10", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: NotAField");
+    }
+
+    #[test]
+    fn parse_named_format_strict_takes_each_header_from_the_lookup() {
+        let shared = |name: &str| match name {
+            "First" => Some(('-', "First")),
+            "Second" => Some(('-', "Second")),
+            _ => None,
+        };
+        let tokens = parse_named_format_strict("First,Second", &shared).unwrap();
+        let headers: Vec<&str> = only_fields(&tokens)
+            .iter()
+            .map(|field| field.header.as_str())
+            .collect();
+        assert_eq!(headers, ["First", "Second"]);
     }
 
     #[test]
     fn parse_named_format_strict_keeps_a_width_on_a_known_field() {
-        let tokens =
-            parse_named_format_strict("JobName%20,JobID%-8", &test_name_to_spec, &squeue_header)
-                .unwrap();
+        let tokens = parse_named_format_strict("JobName%20,JobID%-8", &test_field).unwrap();
         let fields = only_fields(&tokens);
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].spec, 'j');
