@@ -26598,6 +26598,75 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_node_preemption_keeps_protected_and_unneeded_tenants() {
+        let dir = TempDir::new().unwrap();
+        let mut config = preempting_config();
+        config.scheduler.preempt_victim_order.clear();
+        config.scheduler.preempt_exempt_time = 0;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 4, 100);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let mut tenants = Vec::new();
+        for (name, qos, cpus, mem) in [
+            ("protected", "high", 2, 60),
+            ("eligible-a", "low", 1, 20),
+            ("eligible-b", "low", 1, 20),
+        ] {
+            let mut spec = basic_spec(name);
+            spec.qos = Some(qos.into());
+            spec.cpus_per_task = cpus;
+            spec.memory_per_node_mb = Some(mem);
+            let id = submit_and_wait(&cm, spec);
+            let allocation = scalar_alloc(cpus, mem);
+            cm.start_job(
+                id,
+                vec!["n1".into()],
+                allocation.clone(),
+                per_node_for(&["n1"], allocation),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            tenants.push(cm.get_job(id).unwrap());
+        }
+        let mut spec = basic_spec("preemptor");
+        spec.qos = Some("high".into());
+        spec.memory_per_node_mb = Some(20);
+        let id = submit_and_wait(&cm, spec);
+        let pending = cm.get_job(id).unwrap();
+        assert!(!pending.spec.exclusive);
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&pending],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(&cm, tenants[1].job_id, JobState::Completing);
+        assert_eq!(
+            cm.get_job(tenants[1].job_id).unwrap().preempted_by,
+            Some(id)
+        );
+        for before in [&tenants[0], &tenants[2]] {
+            let after = cm.get_job(before.job_id).unwrap();
+            assert_eq!(after.state, JobState::Running);
+            assert_eq!(after.per_node_alloc, before.per_node_alloc);
+            assert_eq!(after.run_attempt, before.run_attempt);
+            assert_eq!(after.preempted_by, None);
+        }
+        report_nodes_released(&cm, tenants[1].job_id);
+        settle(&cm, tenants[1].job_id, JobState::Cancelled);
+        let assignments = run_one_scheduling_pass(&cm);
+        let assignment = assignments
+            .iter()
+            .find(|a| a.job_id == id)
+            .expect("shared placement");
+        assert_eq!(assignment.nodes, ["n1"]);
+        assert_eq!(assignment.per_node_alloc["n1"].cpus, 1);
+        assert_eq!(assignment.per_node_alloc["n1"].memory_mb, 20);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_skips_jobs_in_active_reservation_at_same_tier() {
         let dir = TempDir::new().unwrap();
         let config = preempting_config();
@@ -26654,10 +26723,6 @@ state = "UP"
         let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         insert_preempting_qos_pair(&cm, "low", "high");
-        // One victim per node: the atomic per-node eviction search vacates a
-        // node only when every occupant on it is evictable, so two victims
-        // sharing one node would both go in the same tick and never exercise
-        // the drain guard this test targets.
         register_node(&cm, "n1", 4, 8000);
         register_node(&cm, "n2", 4, 8000);
 

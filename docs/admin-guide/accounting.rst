@@ -1304,12 +1304,18 @@ node count.
 None of the keys reads the accounting database or fair-share; they use only what
 the controller holds in memory.
 
-The search is greedy and prunes unnecessary victims, but does not guarantee a
-globally cheapest set. It uses at most 128 placement trials per request and a
-shared cycle budget of 256 trials and two million work units. Input limits also
-bound snapshot size and node/victim counts. Exhaustion discards the whole set,
-even if a sufficient set was found before pruning finished; no eviction occurs
-from an incomplete search. A large request can remain pending at these limits.
+For uniform requests, the selector calculates the resource shortfall on each
+eligible node, chooses sufficient victim groups, and verifies the combined set
+with the normal placement rules. Other placement shapes use a bounded fallback
+that prunes unnecessary victims. Neither path guarantees a globally cheapest set.
+
+Reclaim and QOS preemption have separate budgets, each allowing 2064 placement
+trials and two million work units per cycle. Input limits bound copied metadata,
+4096 nodes, and 1024 eligible victims; unusually large metadata can reach its own
+limit before the node count. Exhaustion evicts nothing and logs a deferred-selection
+warning, distinct from finding that no eligible victims can help. Complex requests
+can remain pending at these limits. Reclaim skips the allocation snapshot when
+there are no eligible borrowed jobs.
 
 ``least_work`` comes first in the default because the cost of ``fewest_jobs`` grows
 with the victim's width: with one node needed, it prefers one 64-node job, 64

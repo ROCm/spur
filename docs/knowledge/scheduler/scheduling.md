@@ -233,35 +233,47 @@ Protected, reserved-pending, suspended, completing, grace-period, and same-cycle
 allocations remain charged. Unaccounted occupancy is retained; missing or
 inconsistent slices grant no release credit.
 
-The node-ranking heap supplies a preferred victim group using highest eligible
-QOS priority, `scheduler.preempt_victim_order`, then node name. Its credited gain
-counts candidate nodes whose eligible holders are all selected, capped by the
-remaining shortfall; it does not release protected allocations. Exact trials
-remain the placement proof. Job ordering uses QOS priority, preferred-group
-membership, configured keys, node name, then job ID. Work facts retain suspension
-time and come from the compact held-job snapshot, without accounting queries.
+For uniform requests with single-node victims, `direct_victims` uses the real
+`find_suitable_nodes` filter and calculates each node's CPU, memory, typed/stable
+GPU and partition-cap shortfall. It removes eligible allocations in QOS/configured
+order, prunes unnecessary local victims, and ranks the sufficient node groups with
+`VictimSearch`. The combined set gets one real placement verification. Protected
+allocations and charges stay present. A zero-victim result also needs verification.
 
-The selector checks unchanged and all-eligible projections, grows a sufficient
-prefix, and repeatedly removes unnecessary victims. `PlacementRequest` and
-`BackfillScheduler::place_now` share production partition resolution and concrete
-allocation helpers, with no future-slot convergence or trial logs. There is no
-global minimum-victim guarantee. One projection and one timeline workspace are
-reused; no subset history or persistent state is added. A bounded
-`PlacementScope` reuses names/partition/features matching across holder overlap
-checks, including preferred-node fallback. Nonlinear trial charges use that
-scope; full-domain validation/copy/scan and charge-seeding costs remain charged.
-Only request and global policy matching costs multiply by candidate count;
-aggregate node metadata and partition charges are charged once per trial.
-Injectable GPU counts are validated before resource feasibility can narrow them.
-Repeated GPU placeholder type text is sized before capacity probes can expand it.
+Uneven requests, multi-node victims, additive required nodes and partition memory
+policies use a fallback. It checks unchanged and all-eligible projections, bisects
+an ordered prefix while retaining a proven sufficient set, then repeatedly prunes
+unnecessary victims. Placement is not assumed monotone under scheduler heuristics;
+every accepted set has its own placement proof. The node-ranking heap supplies the
+preferred group using QOS priority, `scheduler.preempt_victim_order`, then node
+name. Suspension-aware work facts come from held jobs without accounting queries.
+There is no globally minimum-victim guarantee.
 
-Search storage has a conservative 32 MiB allowance, 4096-node and 1024-victim
-domain limits, bounded entries/text/hostlist expansion, 128 trials per request,
-and 256 trials plus two million charged work units per cycle. Reclaim and QOS
-preemption share the cycle budget. Exhaustion discards the set without eviction,
-including a sufficient set whose pruning could not finish. Large valid requests
-can remain pending at these limits. Heterogeneous job groups and GPU
-property/fabric-binding requests also defer this immediate victim search.
+`PlacementProjection` owns the bounded `PlacementRequest`, compact node copies
+and partition usage. Its static inputs cannot change between trials; only held
+allocations and charges can decrease. `BackfillScheduler::place_releasing` reuses
+prepared sizing and the production partition/allocation helpers without future
+convergence or trial logs. Trial timelines are reused. `PlacementScope` reuses
+name/partition/feature matching for overlap checks, including preferred-node
+fallback. Injectable GPU counts and expanded placeholder type text are bounded
+before allocation.
+
+`MAX_NODES` (4096) and `MAX_VICTIMS` (1024) bound the node and eligible-victim
+domains. `InputSize` counts entries and text, with `MAX_ENTRIES` (327680, 64 per
+node/victim allowance) and `MAX_TEXT` (5 MiB, 1024 bytes per node/victim allowance).
+These are aggregate metadata limits, not an RSS estimate or a guarantee for every
+possible node description. `MAX_HOSTS` (8192) and `MAX_NAME` (255 bytes) bound
+hostlist expansion. A 4096-node, eight-GPU fixture exercises capture and selection
+under the default limits.
+
+Each reclaim and QOS-preemption pass has its own `SearchBudget` with `MAX_TRIALS`
+(2064, `2 * MAX_VICTIMS + 16`) placement calls and `MAX_WORK` (2000000) work units.
+Requests within one pass share that budget. Snapshot/request rejection is logged;
+`SelectionDeferred` distinguishes incomplete selection from a proven no-op and is
+logged with the job ID. Incomplete searches evict nothing, even if pruning had a
+sufficient intermediate set. Complex requests can still defer at these limits.
+Reclaim skips snapshot construction when no pending request or eligible borrower
+exists. Heterogeneous job groups and GPU property/fabric-binding requests defer.
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching

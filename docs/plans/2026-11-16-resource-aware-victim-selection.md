@@ -11,13 +11,12 @@ It subtracts only selected eligible jobs' exact held slices from a private
 projection, and checks immediate placement through the scheduler's existing
 CPU, memory, GPU, partition, reservation, exclusivity, and handoff logic.
 
-The deterministic search first checks whether the request already fits, then
-whether removing all eligible jobs would place it. It grows a prefix ordered by
-QOS priority, a preferred group from the configured node-ranking policy,
-configured individual-job costs, node name, and job ID until placement succeeds.
-It then repeatedly removes victims whose eviction is unnecessary. Only a fully checked final set may be acted on.
-The search uses the existing greedy placement algorithm; it does not promise
-an exhaustive proof of impossibility or a globally minimum victim count.
+Uniform requests with single-node victims calculate sufficient per-node groups
+from actual allocations and partition charges, then verify their union once with
+the real placer. The fallback uses bisection to find a sufficient ordered prefix
+and repeatedly prunes unnecessary victims. QOS priority and configured victim
+costs retain deterministic ordering. Only a verified final set may be acted on;
+neither path guarantees a global minimum or exhaustively proves impossibility.
 
 Protected, suspended, completing, reserved-but-pending, and unknown residual
 allocations remain charged. Missing slices, inconsistent aggregate ownership,
@@ -33,9 +32,9 @@ victim because it retains the allocation.
 | `VictimPool` | Borrowed references to holders plus eligible IDs and QOS rank | At most 1,024 eligible victims |
 | `PlacementRequest` | Compact, canonicalized request; resource and placement sizing for immediate trials | Bounded hostlist expansion, GPU demand, and repeated GPU type text before allocation |
 | `PlacementScope` | Prepared set of nodes matching names, exclusions, preferred-node fallback, partitions, and static features; reused across holder overlap checks | At most 4,096 names; no per-victim hostlist expansion |
-| `SearchBudget` | One scheduling cycle, shared by reclaim and QOS preemption | 256 placement calls and 2,000,000 charged work units; 128 calls per request |
-| `InputSize` | Temporary conservative storage accounting | 32 MiB weighted allowance, 65,536 entries, 256 KiB text |
-| Projected nodes and partition usage | One mutable workspace reset between trials | No saved subsets or trial-history cache |
+| `SearchBudget` | One reclaim or QOS-preemption pass; independent budgets | `MAX_TRIALS` (2064) calls and `MAX_WORK` (2000000) charged work units |
+| `InputSize` | Temporary metadata entry/text accounting | `MAX_ENTRIES` (327680), `MAX_TEXT` (5 MiB); no allocator-size estimate |
+| `PlacementProjection` | One prepared request, fixed static inputs and reusable allocation/charge copies | Release-only trials avoid repeating input preparation |
 | `BackfillScheduler` timelines | Reused immediate-placement workspace | Containers reset for each trial; regular scheduling flags restored afterward |
 
 The node domain is limited to 4,096 nodes. Hostlist expansion is limited to
@@ -65,44 +64,20 @@ products defer without allocating those placeholders.
    calculation is now arithmetic O(nodes), replacing O(tasks) materialization.
 2. **Memory:** one snapshot and one mutable projection/workspace, with O(nodes +
    held slices + eligible jobs + charges) storage inside fixed input limits.
-   The 32 MiB allowance is conservative weighted accounting, not an
-   allocator-enforced process/RSS ceiling. Scripts and environments are excluded.
+   Entry and text caps bound metadata, not process RSS. Scripts and environments
+   are excluded. Node and victim counts do not bound arbitrary metadata alone.
 3. **Disk:** hypothetical trials do not write WAL entries, database records,
    files, or per-trial logs. Actual evictions retain the existing persistence
    path and typically decrease when unnecessary victims are spared.
-4. **Worst-case behavior:** budget exhaustion returns no victim set, including
-   during pruning. The pending job retries on later cycles; there is no
+4. **Worst-case behavior:** budget exhaustion returns `SelectionDeferred` and
+   logs the affected job, including when pruning cannot complete. The pending job retries on later cycles; there is no
    exponential subset enumeration or persistent accumulation between cycles.
 
-The original selector timing and heap measurements below predate integration
-with configured victim ordering. They compare the same prepared allocation
-fixtures against the original base revision. They exclude fixture construction and
-controller eligibility/snapshot overhead, and use an unoptimized test build.
-They measure selector cost, not cluster throughput or end-to-end latency.
-Each timing case runs 256 repetitions in five sequential fresh-process runs per
-revision. The table reports the median of the five case medians, in microseconds:
-
-| Prepared fixture | Base | Change | Additional time | Selected victims, base → change |
-| --- | ---: | ---: | ---: | --- |
-| One CPU from four shared jobs | 13.3 | 245.3 | 232.0 | 4 → 1 |
-| One node from eight busy nodes | 19.3 | 458.5 | 439.2 | 1 → 1 |
-| Eight-node request | 23.6 | 2,016.0 | 1,992.5 | 8 → 8 |
-| Protected sharing | 3.8 | 239.1 | 235.2 | 0 → 1 |
-| Unplaceable request | 6.9 | 136.2 | 129.3 | 0 → 0 |
-
-The extra checks cost substantially more CPU than the old selector: roughly
-18–86 times in the comparable successful fixtures, or 0.23–1.99 ms added in
-this unoptimized build. Protected sharing changes functionality, so its ratio
-would compare a successful search to an old rejection. Fewer real evictions
-reduce work in the existing kill, persistence, and accounting paths; this
-microbenchmark does not measure those savings.
-
-Massif sampled maximum live heap after the test harness's startup peak at
-69,125 bytes on the base and 104,697 bytes on the change (about 35 KiB added).
-These small fixtures include the prepared workload and harness allocations;
-this is not a per-search allocation total or a maximum-size-domain measurement.
-The whole process's sampled heap peak was dominated by test registration.
-No RSS or production-throughput ceiling is claimed.
+The current regressions count placement calls rather than measuring wall-clock
+performance: requests requiring 60, 64 and 1024 co-resident victims use one full
+placement verification. A 4096-node fixture with eight GPUs per node fits capture
+and selection within default limits. These checks do not measure RSS, production
+throughput or end-to-end latency.
 
 ## Required coverage and validation
 
@@ -126,8 +101,11 @@ allocation slices rather than an ID-only occupant simulation.
   ownership, reserved pending holders, same-cycle assignment accounting,
   malformed injectable GPU counts, expanded GPU type text in all four request
   forms, and resumed-victim snapshot/grace timing.
-- Byte/work/call limits, shared cycle budget, pruning exhaustion, huge task/GPU
-  requests, and rejection of changed oversized placement inputs.
+- Entry/text/work/call limits, explicit deferral versus no-fit results, independent
+  pass budgets, no-borrower snapshot bypass, huge task/GPU requests, and rejection
+  of changed oversized placement inputs.
+- Controller shared-node eviction keeps a protected tenant and an unnecessary
+  eligible tenant running with unchanged allocations and run attempts.
 - Existing grace, cancel/requeue, release, eligibility, dispatch, and accounting
   lifecycle tests remain applicable.
 

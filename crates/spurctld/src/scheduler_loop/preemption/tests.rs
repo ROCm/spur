@@ -6,6 +6,7 @@ use spur_core::gpu_request::GpuRequest;
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_sched::immediate::PlacementRequest;
 
 struct Fixture {
     nodes: Vec<Node>,
@@ -99,6 +100,8 @@ impl Fixture {
             DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
             budget,
         )
+        .ok()
+        .flatten()
     }
 
     fn state(&self) -> ClusterState<'_> {
@@ -304,6 +307,7 @@ fn topology_victims_enable_normal_scheduler_placement() {
             DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
             &mut SearchBudget::default(),
         )
+        .expect("bounded search")
         .expect("sufficient victim set");
         assert_eq!(victims, HashSet::from([3]));
         let mut released = f.nodes.clone();
@@ -581,11 +585,11 @@ fn another_preemptors_handoff_and_additive_required_node_block_eviction() {
 }
 
 #[test]
-fn byte_work_and_call_limits_return_no_victims() {
+fn input_work_and_call_limits_return_no_victims() {
     let mut f = Fixture::new(4);
     f.hold(1, 4, 0, &[], true);
     let mut budget = SearchBudget {
-        calls_left: 3,
+        calls_left: 0,
         work_left: 2_000_000,
     };
     assert_eq!(f.select(&request(1, 0), &mut budget), None);
@@ -603,12 +607,12 @@ fn byte_work_and_call_limits_return_no_victims() {
 }
 
 #[test]
-fn pruning_exhaustion_discards_even_a_sufficient_unpruned_set() {
+fn direct_selection_handles_many_necessary_victims() {
     let mut f = Fixture::new(64);
     for id in 1..=64 {
         f.hold(id, 1, 0, &[], true);
     }
-    assert_eq!(selected(&f, &request(64, 0)), None);
+    assert_eq!(selected(&f, &request(64, 0)), Some((1..=64).collect()));
     assert_eq!(f.nodes[0].alloc_resources.cpus, 64);
 }
 
@@ -617,7 +621,7 @@ fn a_cycle_budget_is_shared_across_requests() {
     let mut f = Fixture::new(4);
     f.hold(1, 4, 0, &[], true);
     let mut budget = SearchBudget {
-        calls_left: 4,
+        calls_left: 1,
         work_left: 2_000_000,
     };
     assert_eq!(
@@ -722,7 +726,10 @@ fn victim_selection_profile() {
             let outcome =
                 satisfiable_victim_set(&incoming, &pool, &state, now, &mut SearchBudget::default());
             times.push(begin.elapsed().as_nanos());
-            count = std::hint::black_box(outcome).map_or(0, |ids| ids.len());
+            count = std::hint::black_box(outcome)
+                .ok()
+                .flatten()
+                .map_or(0, |ids| ids.len());
         }
         times.sort_unstable();
         eprintln!(
@@ -1084,7 +1091,7 @@ fn expanded_gpu_type_text_defers_before_placeholder_allocation() {
     for form in ["total", "per_node", "per_task", "gres"] {
         for long_type in [false, true] {
             let gpu_type = if long_type {
-                "x".repeat(128 * 1024)
+                "x".repeat(spur_sched::immediate::MAX_TEXT / 2)
             } else {
                 "a".into()
             };
@@ -1200,4 +1207,200 @@ fn overflowing_device_totals_defer_without_placement() {
     }
     f.nodes[0].alloc_resources = slice.clone();
     assert_eq!(selected(&f, &request(1, 0)), None);
+}
+
+#[test]
+fn many_node_victims_need_one_placement_verification() {
+    for (nodes, per_node) in [(5, 12), (16, 64), (1, MAX_VICTIMS)] {
+        let mut f = Fixture::new(per_node as u32 + 1);
+        let template = f.nodes[0].clone();
+        f.nodes = (0..nodes)
+            .map(|i| {
+                let mut node = template.clone();
+                node.name = format!("node{i:04}");
+                node
+            })
+            .collect();
+        for i in 0..nodes {
+            f.hold_on(
+                i,
+                10_000 + i as u32,
+                ResourceAllocations::with_scalar(1, 0),
+                false,
+            );
+            for j in 0..per_node {
+                f.hold_on(
+                    i,
+                    (i * per_node + j + 1) as u32,
+                    ResourceAllocations::with_scalar(1, 0),
+                    true,
+                );
+            }
+        }
+        let mut incoming = request(per_node as u32, 0);
+        incoming.spec.num_nodes = nodes as u32;
+        incoming.spec.num_tasks = nodes as u32;
+        let mut budget = SearchBudget::default();
+        assert_eq!(f.select(&incoming, &mut budget), Some(f.eligible.clone()));
+        assert_eq!(budget.calls_left, SearchBudget::default().calls_left - 1);
+        f.partitions.push(spur_core::partition::Partition {
+            name: "default".into(),
+            is_default: true,
+            max_tres_per_node: [("cpu".into(), per_node as u64 + 1)].into(),
+            ..Default::default()
+        });
+        for node in &mut f.nodes {
+            node.partitions = vec!["default".into()];
+        }
+        for holder in &mut f.holders {
+            holder.effective_partition = Some("default".into());
+        }
+        f.usage = partition_usage_from_jobs(
+            &f.holders,
+            &f.partitions,
+            DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time"),
+            ReleaseWaits::of(&Default::default()),
+        );
+        let mut budget = SearchBudget::default();
+        assert_eq!(f.select(&incoming, &mut budget), Some(f.eligible.clone()));
+        assert_eq!(budget.calls_left, SearchBudget::default().calls_left - 1);
+    }
+}
+
+#[test]
+fn full_gpu_cluster_fits_snapshot_and_selection_limits() {
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+    let dir = tempfile::TempDir::new().expect("state directory");
+    let cluster = ClusterManager::new(
+        spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhostname = \"test\"\n",
+        )
+        .expect("config"),
+        dir.path(),
+    )
+    .expect("cluster");
+    let mut f = Fixture::new(8);
+    let mut template = f.nodes[0].clone();
+    template.partitions = vec!["default".into()];
+    template.features = vec!["gpu".into(), "compute".into()];
+    template.total_resources.gpus = (0..8)
+        .map(|i| {
+            let mut gpu = template.total_resources.gpus[0].clone();
+            gpu.device_id = i;
+            gpu.stable_id = u64::from(i) + 1000;
+            gpu.gpu_type = "MI300X".into();
+            gpu
+        })
+        .collect();
+    f.nodes = (0..MAX_NODES)
+        .map(|i| {
+            let mut node = template.clone();
+            node.name = format!("node{i:04}");
+            let register: WalOperation =
+                serde_json::from_value(serde_json::json!({"NodeRegister": {
+                    "name": node.name, "resources": node.total_resources, "address": ""
+                }}))
+                .expect("registration");
+            cluster.apply_operation(&register);
+            node
+        })
+        .collect();
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    let mut budget = SearchBudget::default();
+    let snapshot =
+        Snapshot::capture(&cluster, &f.state(), &[], now, &mut budget).expect("full snapshot");
+    assert_eq!(snapshot.nodes.len(), MAX_NODES);
+    f.nodes = snapshot.nodes;
+    for i in 0..MAX_NODES {
+        f.hold_on(
+            i,
+            i as u32 + 1,
+            ResourceAllocations::with_scalar(8, 0),
+            i < MAX_VICTIMS,
+        );
+    }
+    assert_eq!(
+        f.select(&request(1, 0), &mut budget),
+        Some(HashSet::from([1]))
+    );
+}
+
+#[test]
+fn selection_deferral_is_distinct_from_insufficient_capacity() {
+    let mut f = Fixture::new(4);
+    f.hold(1, 1, 0, &[], true);
+    f.hold(2, 3, 0, &[], false);
+    let pool = VictimPool {
+        evictable: &f.eligible,
+        holders: &f.holders,
+        priority: &f.priorities,
+        max_priority: None,
+        order: None,
+    };
+    let incoming = request(2, 0);
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+    assert_eq!(
+        satisfiable_victim_set(
+            &incoming,
+            &pool,
+            &f.state(),
+            now,
+            &mut SearchBudget::default()
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        satisfiable_victim_set(
+            &incoming,
+            &pool,
+            &f.state(),
+            now,
+            &mut SearchBudget {
+                calls_left: 0,
+                work_left: 0
+            }
+        ),
+        Err(SelectionDeferred)
+    );
+}
+
+#[tokio::test]
+async fn reclaim_without_borrowers_skips_snapshot_work() {
+    use crate::raft::StateMachineApply;
+    use spur_core::wal::WalOperation;
+    let dir = tempfile::TempDir::new().expect("state directory");
+    let cluster = std::sync::Arc::new(
+        ClusterManager::new(
+            spur_core::config::SlurmConfig::load_from_str(
+                "cluster_name = \"test\"\n[controller]\nhostname = \"test\"\n",
+            )
+            .expect("config"),
+            dir.path(),
+        )
+        .expect("cluster"),
+    );
+    let f = Fixture::new(4);
+    let register: WalOperation = serde_json::from_value(serde_json::json!({"NodeRegister": {
+        "name": "n1", "resources": f.nodes[0].total_resources, "address": ""
+    }}))
+    .expect("registration");
+    cluster.apply_operation(&register);
+    let incoming = request(1, 0);
+    let mut budget = SearchBudget::default();
+    assert_eq!(
+        super::super::reclaim_for_unplaced(
+            &cluster,
+            &[&incoming],
+            &HashSet::new(),
+            &f.state(),
+            &Default::default(),
+            &[],
+            &mut budget
+        )
+        .await,
+        (Vec::new(), None)
+    );
+    assert_eq!(budget.work_left, SearchBudget::default().work_left);
+    assert_eq!(budget.calls_left, SearchBudget::default().calls_left);
 }

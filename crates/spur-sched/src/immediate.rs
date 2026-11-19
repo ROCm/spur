@@ -13,8 +13,10 @@ use crate::node_match::NodePlacement;
 
 pub const MAX_NODES: usize = 4096;
 pub const MAX_VICTIMS: usize = 1024;
-pub const MAX_ENTRIES: usize = 65536;
-pub const MAX_TEXT: usize = 256 * 1024;
+pub const MAX_ENTRIES: usize = (MAX_NODES + MAX_VICTIMS) * 64;
+pub const MAX_TEXT: usize = (MAX_NODES + MAX_VICTIMS) * 1024;
+pub const MAX_TRIALS: usize = 2 * MAX_VICTIMS + 16;
+pub const MAX_WORK: usize = 2_000_000;
 pub const MAX_HOSTS: usize = 8192;
 pub const MAX_NAME: usize = 255;
 
@@ -26,7 +28,7 @@ pub fn job_work(job: &Job) -> Option<usize> {
         .checked_mul(8)
 }
 
-/// Shared across reclaim and QOS preemption in one scheduling cycle.
+/// Shared across requests within one reclaim or QOS preemption pass.
 #[derive(Debug)]
 pub struct SearchBudget {
     pub calls_left: usize,
@@ -36,8 +38,8 @@ pub struct SearchBudget {
 impl Default for SearchBudget {
     fn default() -> Self {
         Self {
-            calls_left: 256,
-            work_left: 2_000_000,
+            calls_left: MAX_TRIALS,
+            work_left: MAX_WORK,
         }
     }
 }
@@ -54,10 +56,9 @@ impl SearchBudget {
     }
 }
 
-/// Conservative storage allowance, including container overhead and trial copies.
+/// Structural limits for copied placement metadata; not an allocator-size estimate.
 #[derive(Default)]
 pub struct InputSize {
-    bytes: usize,
     entries: usize,
     text: usize,
 }
@@ -65,8 +66,7 @@ pub struct InputSize {
 impl InputSize {
     pub fn entries(&mut self, count: usize) -> Option<()> {
         self.entries = self.entries.checked_add(count)?;
-        self.bytes = self.bytes.checked_add(count.checked_mul(512)?)?;
-        (self.entries <= MAX_ENTRIES && self.bytes <= 32 * 1024 * 1024).then_some(())
+        (self.entries <= MAX_ENTRIES).then_some(())
     }
 
     pub fn text(&mut self, value: &str) -> Option<()> {
@@ -75,8 +75,7 @@ impl InputSize {
 
     fn text_bytes(&mut self, len: usize) -> Option<()> {
         self.text = self.text.checked_add(len)?;
-        self.bytes = self.bytes.checked_add(len.checked_mul(16)?)?;
-        (self.text <= MAX_TEXT && self.bytes <= 32 * 1024 * 1024).then_some(())
+        (self.text <= MAX_TEXT).then_some(())
     }
 
     pub fn strings<'a>(&mut self, values: impl IntoIterator<Item = &'a String>) -> Option<()> {
@@ -302,6 +301,94 @@ pub struct PlacementRequest {
     scope: PlacementScope,
 }
 
+/// Keeps static inputs fixed while trials only release allocations and charges.
+pub struct PlacementProjection<'a> {
+    pub(crate) request: PlacementRequest,
+    original: crate::traits::ClusterState<'a>,
+    nodes: Vec<Node>,
+    indices: HashMap<String, usize>,
+    usage: crate::partition_cap::PartitionNodeUsage,
+}
+
+impl<'a> PlacementProjection<'a> {
+    pub fn new(
+        job: &Job,
+        state: &crate::traits::ClusterState<'a>,
+        budget: &mut SearchBudget,
+        size: InputSize,
+    ) -> Option<Self> {
+        let request = PlacementRequest::with_size(job, state, budget, size)?;
+        let nodes: Vec<_> = state.nodes.iter().map(placement_node).collect();
+        let indices = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.clone(), i))
+            .collect();
+        Some(Self {
+            request,
+            original: crate::traits::ClusterState {
+                nodes: state.nodes,
+                ..*state
+            },
+            nodes,
+            indices,
+            usage: state.partition_node_usage.clone(),
+        })
+    }
+
+    pub fn job(&self) -> &Job {
+        self.request.job()
+    }
+
+    pub fn reset(&mut self) {
+        for (node, original) in self.nodes.iter_mut().zip(self.original.nodes) {
+            node.alloc_resources.cpus = original.alloc_resources.cpus;
+            node.alloc_resources.memory_mb = original.alloc_resources.memory_mb;
+            node.alloc_resources
+                .devices
+                .clone_from(&original.alloc_resources.devices);
+        }
+        self.usage.clone_from(self.original.partition_node_usage);
+    }
+
+    pub fn release(&mut self, name: &str, allocation: &ResourceAllocations) {
+        if let Some(&i) = self.indices.get(name) {
+            self.nodes[i].alloc_resources.subtract(allocation);
+        }
+    }
+
+    pub fn release_charges(&mut self, selected: &HashSet<spur_core::job::JobId>) {
+        for by_node in self.usage.values_mut() {
+            for charges in by_node.values_mut() {
+                charges.retain(|charge| !selected.contains(&charge.job_id));
+            }
+        }
+    }
+
+    pub(crate) fn state(&self) -> crate::traits::ClusterState<'_> {
+        crate::traits::ClusterState {
+            nodes: &self.nodes,
+            partition_node_usage: &self.usage,
+            ..self.original
+        }
+    }
+}
+
+pub fn placement_node(node: &Node) -> Node {
+    let mut copy = Node::new(node.name.clone(), Default::default());
+    copy.total_resources = consumable_inventory(&node.total_resources);
+    copy.alloc_resources = consumable_allocation(&node.alloc_resources);
+    copy.state = node.state;
+    copy.not_responding = node.not_responding;
+    copy.partitions = node.partitions.clone();
+    copy.features = node.features.clone();
+    copy.weight = node.weight;
+    copy.k0s_role = node.k0s_role;
+    copy.layout_error = node.layout_error.clone();
+    copy.layout_enforce_error = node.layout_enforce_error.clone();
+    copy
+}
+
 impl PlacementRequest {
     pub fn job(&self) -> &Job {
         &self.job
@@ -468,7 +555,7 @@ impl PlacementRequest {
         let partitions = crate::partition_cap::candidate_partitions(&job, state.partitions).len();
         // Separate candidate work from the scans and copies every node incurs.
         let trial_work = n
-            .checked_mul(n)?
+            .checked_mul(n.checked_add(1)?.ilog2() as usize + 1)?
             .checked_add(size.entries)?
             .checked_add(size.text)?
             .checked_add(scope.scan_work)?
@@ -485,8 +572,7 @@ impl PlacementRequest {
                 },
             )?
             .checked_add(n.checked_mul(matching_work)?)?
-            .checked_mul(partitions.max(1))?
-            .checked_mul(8)?;
+            .checked_mul(partitions.max(1))?;
         Some(Self {
             job,
             trial_work,

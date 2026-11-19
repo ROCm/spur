@@ -392,8 +392,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             ..cluster_state
         };
 
-        let mut victim_budget = SearchBudget::default();
-
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
         if assignments.len() < pending.len() {
@@ -450,7 +448,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &preempt_state,
                         &sched_cfg,
                         &assignments,
-                        &mut victim_budget,
+                        &mut SearchBudget::default(),
                         |job| limits.fits(job),
                     )
                     .await;
@@ -486,7 +484,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     &unscheduled,
                     &assignments,
                     &cluster.config().scheduler,
-                    &mut victim_budget,
+                    &mut SearchBudget::default(),
                     |job| limits.fits(job),
                 )
                 .await;
@@ -1699,6 +1697,7 @@ async fn try_preempt_with_handoffs<'j>(
     };
 
     let Some(snapshot) = PreemptionSnapshot::capture(cluster, state, assigned, now, budget) else {
+        warn!("preemption snapshot deferred: input limit, work limit, or inconsistent allocation records");
         return None;
     };
     let snapshot_state = snapshot.state(state);
@@ -1751,6 +1750,10 @@ async fn try_preempt_with_handoffs<'j>(
         let preemptor = *pending;
         let Some(prepared) = spur_sched::immediate::PlacementRequest::new(pending, state, budget)
         else {
+            warn!(
+                job_id = pending.job_id,
+                "preemption request deferred: unsupported input or search limit"
+            );
             continue;
         };
         let pending = prepared.job();
@@ -1844,7 +1847,16 @@ async fn try_preempt_with_handoffs<'j>(
             state,
             now,
             budget,
-        ) else {
+        )
+        .unwrap_or_else(|_| {
+            warn!(
+                job_id = pending.job_id,
+                work_left = budget.work_left,
+                calls_left = budget.calls_left,
+                "preemption selection deferred: input or search limit"
+            );
+            None
+        }) else {
             continue;
         };
 
@@ -2272,6 +2284,42 @@ pub(crate) fn federation_candidates(
         .collect()
 }
 
+fn reclaim_may_help(
+    cluster: &ClusterManager,
+    exempt_secs: u32,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let (preemptable, stamped_qos) = cluster.with_allocation_records(|jobs, _| {
+        let mut stamped_qos = HashSet::new();
+        for job in jobs
+            .values()
+            .filter(|job| job.state == spur_core::job::JobState::Running)
+        {
+            if job.allocated_nodes.is_empty()
+                || job.preempt_grace().is_some()
+                || job
+                    .start_time
+                    .map_or(0, |start| (now - start).num_seconds())
+                    < idle_fill_exempt_window(exempt_secs, job.preempt_requeue_count)
+            {
+                continue;
+            }
+            if job.idle_fill {
+                if let Some(qos) = &job.spec.qos {
+                    stamped_qos.insert(qos.clone());
+                }
+            } else if cluster.resolve_qos(job).idle_fill_preemptable {
+                return (true, stamped_qos);
+            }
+        }
+        (false, stamped_qos)
+    });
+    preemptable
+        || stamped_qos
+            .iter()
+            .any(|qos| cluster.qos_over_node_quota(qos))
+}
+
 /// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
 /// not place. Returns the nodes freed, which the caller holds out of the next cycle
 /// until the agents have confirmed the kill.
@@ -2295,8 +2343,12 @@ pub(crate) async fn reclaim_for_unplaced(
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
     let exempt_secs = sched.idle_fill_exempt_secs;
     let now = Utc::now();
+    if unplaced.is_empty() || !reclaim_may_help(cluster, exempt_secs, now) {
+        return (Vec::new(), None);
+    }
     let Some(snapshot) = PreemptionSnapshot::capture(cluster, cluster_state, assigned, now, budget)
     else {
+        warn!("reclaim snapshot deferred: input limit, work limit, or inconsistent allocation records");
         return (Vec::new(), None);
     };
     let snapshot_state = snapshot.state(cluster_state);
@@ -2387,7 +2439,16 @@ pub(crate) async fn reclaim_for_unplaced(
             cluster_state,
             now,
             budget,
-        ) else {
+        )
+        .unwrap_or_else(|_| {
+            warn!(
+                job_id = reclaimer.job_id,
+                work_left = budget.work_left,
+                calls_left = budget.calls_left,
+                "reclaim selection deferred: input or search limit"
+            );
+            None
+        }) else {
             continue;
         };
 
@@ -2476,7 +2537,7 @@ fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
 /// version identify the entry, so a re-ranked node's older entries are skipped.
 type SearchEntry<'a> = std::cmp::Reverse<(i32, Option<RankKey>, &'a str, usize, u32)>;
 
-/// Greedy pick over evacuable nodes, re-ranking only the nodes a pick changes.
+/// Greedy pick over per-node victim groups, re-ranking only groups a pick changes.
 struct VictimSearch<'s, 'a> {
     evacuable: &'s [(&'a Node, &'a [spur_core::job::JobId])],
     order: Option<&'s VictimOrder<'s>>,
@@ -2496,7 +2557,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         priority: &HashMap<spur_core::job::JobId, i32>,
         order: Option<&'s VictimOrder<'s>>,
     ) -> Self {
-        // A node costs the highest QOS priority it carries: evacuating it forfeits every run on it.
+        // Rank by the most expensive victim so cheaper tenants cannot hide a costly one.
         let costs = evacuable
             .iter()
             .map(|(_, jobs)| {
@@ -2668,8 +2729,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         Some(counted.len().min(cap))
     }
 
-    /// Evicts `i`'s jobs: returns how many nodes it emptied and the untaken nodes whose
-    /// rank that may change, those sharing a job with a node it left partly empty included.
+    /// Credit only complete victim groups; partially covered neighbours also need re-ranking.
     fn take(&mut self, i: usize, budget: &mut SearchBudget) -> Option<(usize, Vec<usize>)> {
         let adding: Vec<_> = self.new_jobs(i).collect();
         budget.spend(adding.len())?;
@@ -6463,6 +6523,8 @@ pub(crate) mod tests {
                 Utc::now(),
                 &mut SearchBudget::default(),
             )
+            .ok()
+            .flatten()
         }
 
         fn victim_set_without_handoffs(
@@ -6496,6 +6558,8 @@ pub(crate) mod tests {
                 now,
                 &mut SearchBudget::default(),
             )
+            .ok()
+            .flatten()
         }
 
         #[test]

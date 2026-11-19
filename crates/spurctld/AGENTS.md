@@ -203,9 +203,9 @@ When a `FabricView` has block data or an `external.block_file` is configured, ei
 
 ### Victim search internals
 
-`scheduler_loop::VictimSearch` ranks a preferred group of eligible victims for
-`satisfiable_victim_set`; exact allocation trials and pruning decide the final
-set, including on nodes with protected tenants. The [shared preemption/reclaim flow](../../docs/knowledge/scheduler/scheduling.md#victim-selection)
+`scheduler_loop::VictimSearch` ranks sufficient per-node victim groups for the
+direct selector, and a preferred group for its fallback. `satisfiable_victim_set`
+verifies the final set through real placement, including on protected shared nodes. The [shared preemption/reclaim flow](../../docs/knowledge/scheduler/scheduling.md#victim-selection)
 defines eligibility, ranking, and the placement proof before callers evict.
 
 `VictimOrder` (`victim_order.rs`) reads `VictimFacts` captured once per pass
@@ -215,8 +215,8 @@ The hash uses the preemptor ID and node name with fixed FNV-1a/finalizer
 constants, so it is stable across processes and toolchains.
 
 `SearchEntry` maintains that rank in a heap; entry versions invalidate old
-ranks. The job-to-node index credits each candidate node whose eligible holders
-are all selected; this is a ranking estimate, not a placement proof. Rank invalidation includes nodes sharing a
+ranks. The job-to-node index credits each candidate node whose victim group is fully
+selected; this is a ranking estimate, not a placement proof. Rank invalidation includes nodes sharing a
 remaining job with a partly emptied node: a pick can change another pick's
 gain without sharing a victim directly. A shrinking shortfall also
 invalidates wide picks whose credited gain is capped. Nodes with the same
@@ -224,8 +224,8 @@ occupant list share a memoized gain calculation within each ranking round.
 
 Tests compare heap selection with a full re-rank after every pick and count
 ranking/walk operations on large layouts; they do not use elapsed-time limits.
-Ranking scans, neighbour walks, and stale-entry work share the cycle search
-budget. Retired heap entries are compacted at twice the candidate count. Configured ordering is covered together with exact shared allocations
+Ranking scans, neighbour walks, and stale-entry work share the pass search
+budget. Reclaim and QOS preemption have separate budgets. Retired heap entries are compacted at twice the candidate count. Configured ordering is covered together with exact shared allocations
 and unpinned 64/128-node requests.
 
 ## Cluster Manager (cluster.rs)

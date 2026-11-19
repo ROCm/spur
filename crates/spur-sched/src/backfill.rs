@@ -223,6 +223,34 @@ impl<'a> HandoffGate<'a> {
 }
 
 impl BackfillScheduler {
+    pub fn place_releasing(
+        &mut self,
+        projection: &crate::immediate::PlacementProjection<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        let flags = (self.immediate, self.report_unplaced);
+        self.immediate = true;
+        self.report_unplaced = false;
+        let result = self.place_now_prepared(&projection.request, &projection.state(), now, budget);
+        (self.immediate, self.report_unplaced) = flags;
+        result
+    }
+
+    pub fn immediate_candidates(
+        &self,
+        request: &crate::immediate::PlacementProjection<'_>,
+        now: chrono::DateTime<Utc>,
+    ) -> Vec<usize> {
+        let state = request.state();
+        self.find_suitable_nodes(
+            request.job(),
+            &state,
+            &HandoffGate::new(state.preemption_handoffs),
+            now,
+        )
+    }
+
     /// Checks only the current window, sharing allocation and partition resolution.
     pub fn place_now(
         &mut self,

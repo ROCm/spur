@@ -280,8 +280,10 @@ reuses name/partition/feature matching, including preferred-node fallback.
 Nonlinear charges use that scope; full-domain scan/copy/seeding work stays charged.
 Only request and global policy matching costs multiply by candidate count;
 aggregate node metadata and partition charges are not multiplied again.
-Controller victim selection owns
-the projected allocations and shares `SearchBudget` across reclaim/preemption.
+`PlacementProjection` keeps prepared static inputs fixed while allocations and
+charges decrease; `place_releasing` reuses that preparation across trials.
+Reclaim and preemption each have an independent `SearchBudget`. The domain,
+metadata and work limits are defined in the [shared scheduling knowledge](../../docs/knowledge/scheduler/scheduling.md#victim-selection).
 Trial timelines are reused and memory-only allocations must be seeded.
 
 The crate is heavily unit-tested (each module has `#[cfg(test)] mod tests`).

@@ -9,8 +9,8 @@ use spur_core::node::Node;
 use spur_core::resource::ResourceAllocations;
 use spur_sched::backfill::BackfillScheduler;
 use spur_sched::immediate::{
-    consumable_allocation, consumable_inventory, job_work, placement_job, InputSize,
-    PlacementRequest, SearchBudget, MAX_NODES, MAX_VICTIMS,
+    consumable_allocation, job_work, placement_job, placement_node, InputSize, PlacementProjection,
+    SearchBudget, MAX_NODES, MAX_TRIALS, MAX_VICTIMS,
 };
 use spur_sched::partition_cap::{job_typed_gpu, PartitionNodeUsage, RunningCharge, TresCharge};
 use spur_sched::traits::{Assignment, ClusterState};
@@ -115,18 +115,7 @@ impl Snapshot {
             nodes.try_reserve_exact(state.nodes.len()).ok()?;
             for node in state.nodes {
                 let live = live_nodes.get(&node.name)?;
-                let mut copy = Node::new(node.name.clone(), Default::default());
-                copy.total_resources = consumable_inventory(&live.total_resources);
-                copy.alloc_resources = consumable_allocation(&live.alloc_resources);
-                copy.state = live.state;
-                copy.not_responding = live.not_responding;
-                copy.partitions = live.partitions.clone();
-                copy.features = live.features.clone();
-                copy.weight = live.weight;
-                copy.k0s_role = live.k0s_role;
-                copy.layout_error = live.layout_error.clone();
-                copy.layout_enforce_error = live.layout_enforce_error.clone();
-                nodes.push(copy);
+                nodes.push(placement_node(live));
             }
             let mut holders = Vec::new();
             for job in jobs.values().filter(holds) {
@@ -341,13 +330,201 @@ fn preferred_victims(
     Some(preferred)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SelectionDeferred;
+
+fn direct_victims(
+    projection: &PlacementProjection<'_>,
+    ordered: &[&Job],
+    pool: &VictimPool<'_>,
+    state: &ClusterState<'_>,
+    now: DateTime<Utc>,
+    budget: &mut SearchBudget,
+) -> Option<Option<HashSet<JobId>>> {
+    use spur_core::gpu_request::{resolve_gpu_demand, GpuDemand};
+    use spur_sched::node_match::NodePlacement;
+
+    let job = projection.job();
+    let cpus = spur_core::partition_limits::node_cpu_counts(&job.spec);
+    let uniform_gpu = match resolve_gpu_demand(&job.spec).ok()? {
+        GpuDemand::None => true,
+        GpuDemand::PerNode { counts, .. } => counts.windows(2).all(|pair| pair[0] == pair[1]),
+        GpuDemand::Total { .. } => job.spec.num_nodes <= 1,
+    };
+    let placement = NodePlacement::new(job);
+    if (!job.spec.exclusive && (!uniform_gpu || cpus.windows(2).any(|p| p[0] != p[1])))
+        || placement.nodelist_is_additive()
+        || ordered.iter().any(|job| job.allocated_nodes.len() != 1)
+        || state
+            .partitions
+            .iter()
+            .any(|p| p.has_memory_policy() || p.max_mem_per_node.is_some())
+    {
+        return Some(None);
+    }
+    let required = node_request(job);
+    let partitions = spur_sched::partition_cap::candidate_partitions(job, state.partitions);
+    let typed_gpu = job_typed_gpu(job);
+    let mut on_node: HashMap<&str, Vec<&Job>> = HashMap::new();
+    for victim in ordered {
+        let node = victim.allocated_nodes.first()?;
+        budget.spend(node.len().checked_add(1)?)?;
+        on_node.entry(node).or_default().push(victim);
+    }
+    let candidates = BackfillScheduler::new(1).immediate_candidates(projection, now);
+    let mut groups = Vec::new();
+    let mut free = 0usize;
+    for i in candidates {
+        let node = &state.nodes[i];
+        let required = if job.spec.exclusive {
+            &node.total_resources
+        } else {
+            &required
+        };
+        let device_work = node
+            .total_resources
+            .gpus
+            .len()
+            .checked_add(1)?
+            .checked_mul(
+                node.alloc_resources
+                    .devices
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    .checked_add(1)?,
+            )?;
+        let mut used: HashMap<&str, TresCharge> = HashMap::new();
+        let mut releases: HashMap<JobId, Vec<(&str, &TresCharge)>> = HashMap::new();
+        for (partition, by_node) in state.partition_node_usage {
+            for charge in by_node
+                .get(&node.name)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.until > now)
+            {
+                budget.spend(charge.tres.keys().count().checked_add(1)?)?;
+                used.entry(partition).or_default().add(&charge.tres);
+                releases
+                    .entry(charge.job_id)
+                    .or_default()
+                    .push((partition, &charge.tres));
+            }
+        }
+        let adjust = |id: JobId,
+                      used: &mut HashMap<&str, TresCharge>,
+                      release: bool,
+                      budget: &mut SearchBudget|
+         -> Option<()> {
+            for (partition, charge) in releases.get(&id).into_iter().flatten() {
+                budget.spend(charge.keys().count().checked_add(1)?)?;
+                if let Some(total) = used.get_mut(*partition) {
+                    if release {
+                        total.subtract(charge);
+                    } else {
+                        total.add(charge);
+                    }
+                }
+            }
+            Some(())
+        };
+        let work = device_work.checked_add(state.partitions.len().checked_mul(8)?)?;
+        let holding: Vec<_> = partitions
+            .iter()
+            .filter(|p| node.partitions.contains(&p.name))
+            .collect();
+        let charge = spur_sched::backfill::least_fullest_node_charge(
+            job,
+            required,
+            node,
+            typed_gpu.as_deref(),
+        );
+        let admissible: Vec<_> = holding.iter().filter(|p| p.admits(&job.spec)).collect();
+        let mut occupied = consumable_allocation(&node.alloc_resources);
+        let fits = |occupied: &ResourceAllocations, used: &HashMap<&str, TresCharge>| {
+            node.total_resources
+                .can_satisfy_with_allocated(occupied, required)
+                && (holding.is_empty()
+                    || admissible.iter().any(|partition| {
+                        spur_sched::partition_cap::partition_cap_ok(
+                            partition,
+                            &node.name,
+                            used.get(partition.name.as_str())
+                                .unwrap_or(&TresCharge::default()),
+                            &charge,
+                        )
+                        .is_ok()
+                    }))
+        };
+        budget.spend(work)?;
+        if fits(&occupied, &used) {
+            free += 1;
+            continue;
+        }
+        let Some(victims) = on_node.get(node.name.as_str()) else {
+            continue;
+        };
+        let mut chosen = Vec::new();
+        for victim in victims {
+            budget.spend(work)?;
+            occupied.subtract(victim.per_node_alloc.get(&node.name)?);
+            adjust(victim.job_id, &mut used, true, budget)?;
+            chosen.push(*victim);
+            if fits(&occupied, &used) {
+                break;
+            }
+        }
+        if !fits(&occupied, &used) {
+            continue;
+        }
+        let mut necessary = Vec::new();
+        for victim in chosen.into_iter().rev() {
+            budget.spend(work)?;
+            let slice = victim.per_node_alloc.get(&node.name)?;
+            add_checked(&mut occupied, slice)?;
+            adjust(victim.job_id, &mut used, false, budget)?;
+            if !fits(&occupied, &used) {
+                occupied.subtract(slice);
+                adjust(victim.job_id, &mut used, true, budget)?;
+                necessary.push(victim.job_id);
+            }
+        }
+        necessary.sort_unstable();
+        groups.push((node, necessary));
+    }
+    let short = (job.spec.num_nodes as usize).max(1).saturating_sub(free);
+    if short == 0 {
+        return Some(Some(HashSet::new()));
+    }
+    if groups.len() < short {
+        return Some(None);
+    }
+    let candidates: Vec<_> = groups
+        .iter()
+        .map(|(node, jobs)| (*node, jobs.as_slice()))
+        .collect();
+    let (victims, _) =
+        VictimSearch::new(&candidates, pool.priority, pool.order.as_ref()).run(short, budget)?;
+    Some(Some(victims))
+}
+
 pub(super) fn satisfiable_victim_set(
     reclaimer: &Job,
     pool: &VictimPool<'_>,
     state: &ClusterState<'_>,
     now: DateTime<Utc>,
     budget: &mut SearchBudget,
-) -> Option<HashSet<JobId>> {
+) -> Result<Option<HashSet<JobId>>, SelectionDeferred> {
+    select_victims(reclaimer, pool, state, now, budget).ok_or(SelectionDeferred)
+}
+
+fn select_victims(
+    reclaimer: &Job,
+    pool: &VictimPool<'_>,
+    state: &ClusterState<'_>,
+    now: DateTime<Utc>,
+    budget: &mut SearchBudget,
+) -> Option<Option<HashSet<JobId>>> {
     if pool.evictable.len() > MAX_VICTIMS {
         return None;
     }
@@ -390,7 +567,12 @@ pub(super) fn satisfiable_victim_set(
             ordered.push(holder);
         }
     }
-    let request = PlacementRequest::with_size(reclaimer, state, budget, size)?;
+    let mut projection = PlacementProjection::new(reclaimer, state, budget, size)?;
+    let node_index: HashMap<_, _> = state
+        .nodes
+        .iter()
+        .map(|node| (node.name.as_str(), node))
+        .collect();
     let mut known: HashMap<&str, ResourceAllocations> = HashMap::new();
     for holder in pool.holders {
         for (node, alloc) in holder
@@ -403,38 +585,30 @@ pub(super) fn satisfiable_victim_set(
             add_checked(held, alloc)?;
         }
     }
-    budget.spend(ordered.len().checked_mul(state.nodes.len())?)?;
     for job in &ordered {
-        budget.spend(job.per_node_alloc.len().checked_mul(state.nodes.len())?)?;
-        for (name, slice) in &job.per_node_alloc {
-            if let (Some(node), Some(all)) = (
-                state.nodes.iter().find(|n| n.name == *name),
-                known.get(name.as_str()),
-            ) {
+        for name in job.per_node_alloc.keys() {
+            budget.spend(name.len().checked_add(1)?)?;
+            if let (Some(node), Some(all)) =
+                (node_index.get(name.as_str()), known.get(name.as_str()))
+            {
                 budget.spend(allocation_merge_work(&node.alloc_resources, all)?)?;
-                budget.spend(slice.devices.len())?;
             }
         }
     }
     let valid = |job: &&Job| {
         job.per_node_alloc.iter().all(|(name, slice)| {
-            state
-                .nodes
-                .iter()
-                .find(|n| n.name == *name)
-                .is_none_or(|node| {
-                    (slice.generation == 0 || slice.generation == node.total_resources.generation)
-                        && known
-                            .get(name.as_str())
-                            .is_some_and(|all| contains(&node.alloc_resources, all))
-                })
+            node_index.get(name.as_str()).is_none_or(|node| {
+                (slice.generation == 0 || slice.generation == node.total_resources.generation)
+                    && known
+                        .get(name.as_str())
+                        .is_some_and(|all| contains(&node.alloc_resources, all))
+            })
         })
     };
     ordered.retain(valid);
     if ordered.is_empty() {
-        return None;
+        return Some(None);
     }
-    let preferred = preferred_victims(request.job(), &ordered, pool, state, now, budget)?;
     ordered.sort_by_cached_key(|job| {
         let node = job
             .allocated_nodes
@@ -451,82 +625,67 @@ pub(super) fn satisfiable_victim_set(
         });
         (
             pool.priority.get(&job.job_id).copied().unwrap_or(0),
-            !preferred.contains(&job.job_id),
             key,
             node.to_owned(),
             job.job_id,
         )
     });
-    let mut nodes: Vec<Node> = state
-        .nodes
-        .iter()
-        .map(|n| {
-            let mut node = Node::new(n.name.clone(), Default::default());
-            node.total_resources = consumable_inventory(&n.total_resources);
-            node.alloc_resources = consumable_allocation(&n.alloc_resources);
-            node.state = n.state;
-            node.not_responding = n.not_responding;
-            node.partitions = n.partitions.clone();
-            node.features = n.features.clone();
-            node.weight = n.weight;
-            node.k0s_role = n.k0s_role;
-            node.layout_error = n.layout_error.clone();
-            node.layout_enforce_error = n.layout_enforce_error.clone();
-            node
-        })
-        .collect();
-    let mut usage = state.partition_node_usage.clone();
     let mut scheduler = BackfillScheduler::new(1);
+    let direct = direct_victims(&projection, &ordered, pool, state, now, budget)?;
+    let preferred = if direct.is_none() {
+        preferred_victims(projection.job(), &ordered, pool, state, now, budget)?
+    } else {
+        HashSet::new()
+    };
+    ordered.sort_by_key(|job| {
+        (
+            pool.priority.get(&job.job_id).copied().unwrap_or(0),
+            !preferred.contains(&job.job_id),
+        )
+    });
     let mut calls = 0usize;
     let mut fits = |selected: &HashSet<JobId>| -> Option<bool> {
         calls = calls.checked_add(1)?;
-        if calls > 128 {
+        if calls > MAX_TRIALS {
             return None;
         }
-        budget.spend(
-            pool.holders
-                .len()
-                .checked_add(nodes.len().checked_mul(ordered.len())?)?,
-        )?;
-        for (node, original) in nodes.iter_mut().zip(state.nodes) {
-            node.alloc_resources.cpus = original.alloc_resources.cpus;
-            node.alloc_resources.memory_mb = original.alloc_resources.memory_mb;
-            node.alloc_resources
-                .devices
-                .clone_from(&original.alloc_resources.devices);
-            for job in ordered.iter().filter(|job| selected.contains(&job.job_id)) {
-                if let Some(slice) = job.per_node_alloc.get(&node.name) {
-                    node.alloc_resources.subtract(slice);
-                }
+        budget.spend(pool.holders.len().checked_add(state.nodes.len())?)?;
+        projection.reset();
+        for job in ordered.iter().filter(|job| selected.contains(&job.job_id)) {
+            for (name, slice) in &job.per_node_alloc {
+                budget.spend(name.len().checked_add(1)?)?;
+                projection.release(name, slice);
             }
         }
-        usage.clone_from(state.partition_node_usage);
-        for by_node in usage.values_mut() {
-            for charges in by_node.values_mut() {
-                charges.retain(|charge| !selected.contains(&charge.job_id));
-            }
-        }
-        let trial = ClusterState {
-            nodes: &nodes,
-            partition_node_usage: &usage,
-            ..*state
-        };
+        projection.release_charges(selected);
         scheduler
-            .place_now(&request, &trial, now, budget)
+            .place_releasing(&projection, now, budget)
             .map(|assignment| assignment.is_some())
     };
-    if fits(&HashSet::new())? {
-        return None;
-    }
-    let all = ordered.iter().map(|job| job.job_id).collect();
-    if !fits(&all)? {
-        return None;
-    }
-    let mut selected = HashSet::new();
-    for job in &ordered {
-        selected.insert(job.job_id);
+    if let Some(selected) = direct {
         if fits(&selected)? {
-            break;
+            return Some((!selected.is_empty()).then_some(selected));
+        }
+    }
+    if fits(&HashSet::new())? {
+        return Some(None);
+    }
+    let all: HashSet<_> = ordered.iter().map(|job| job.job_id).collect();
+    if !fits(&all)? {
+        return Some(None);
+    }
+    // Capacity need not be monotone under placement heuristics; keep the proven upper set.
+    let mut low = 0;
+    let mut high = ordered.len();
+    let mut selected = all;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        let trial = ordered[..middle].iter().map(|job| job.job_id).collect();
+        if fits(&trial)? {
+            high = middle;
+            selected = trial;
+        } else {
+            low = middle;
         }
     }
     loop {
@@ -542,7 +701,7 @@ pub(super) fn satisfiable_victim_set(
             }
         }
         if !changed {
-            return (!selected.is_empty()).then_some(selected);
+            return Some((!selected.is_empty()).then_some(selected));
         }
     }
 }
