@@ -1839,13 +1839,11 @@ fn stop_to_fixpoint(
             if Instant::now() < deadline {
                 continue;
             }
+            warn!(launcher, found = ?round, "stop ran out of time with more processes to stop");
+        } else {
+            let unsettled: Vec<_> = reached.iter().filter(|pid| !is_settled(**pid)).collect();
+            warn!(launcher, ?unsettled, "processes did not stop in time");
         }
-        let unsettled: Vec<_> = reached.iter().filter(|pid| !is_settled(**pid)).collect();
-        warn!(
-            launcher,
-            ?unsettled,
-            "stop did not settle in time, stopping what is found now"
-        );
         signal_pids_except(&collect(), Signal::SIGSTOP, Some(launcher));
         return;
     }
@@ -5847,11 +5845,24 @@ mod tests {
 
     #[test]
     fn a_pid_the_stop_cannot_reach_is_not_waited_for() {
+        let launcher = Spawned::new("sleep", &["3600"]);
         // No such process, so the signal fails as it does for another user's.
         let unreachable = i32::MAX;
-        let never_settled = |_| false;
+        let polled = std::cell::Cell::new(false);
+        let never_settled = |_| {
+            polled.set(true);
+            false
+        };
 
-        stop_to_fixpoint(1, || vec![unreachable], never_settled, UNBOUNDED);
+        // The budget only bounds a regression, which would wait on the pid.
+        stop_to_fixpoint(
+            launcher.pid(),
+            || vec![unreachable],
+            never_settled,
+            Duration::from_millis(50),
+        );
+
+        assert!(!polled.get(), "the stop waited for a pid it never reached");
     }
 
     #[test]
