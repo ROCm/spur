@@ -170,7 +170,9 @@ separate path for admin requeue so nothing else can resurrect a terminal job.
 
 Held in controller memory. Key fields beyond the spec:
 - `run_attempt`: monotonic epoch, bumped per dispatch. Guards stale completion reports.
-- `node_completions`: per-node exit status, drives `derived_completion()`.
+- `node_completions`: per-node exit status. `reported_outcome()` turns them into the run's
+  state, exit code, and signal, decided by `first_failed_node` else the first allocated
+  node; both the last report and the completing timeout's force-finish use it.
 - `time_limit_signaled_at`, `cancel_signaled_at`: replicated instants for deterministic verdicts.
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.

@@ -1031,6 +1031,8 @@ struct PendingJobCandidate {
 pub struct JobEndFacts {
     pub unreported_nodes: Vec<String>,
     pub cancel: Option<CancelProvenance>,
+    /// The exit signal the deciding node reported; `None` keeps the job's.
+    pub signal: Option<i32>,
 }
 
 /// Who is asking to cancel a job, before the owner is known.
@@ -3487,6 +3489,7 @@ impl ClusterManager {
             unreported_nodes: facts.unreported_nodes,
             cancel: facts.cancel,
             controller_initiated: false,
+            signal: facts.signal,
             at: None,
         })?;
         self.run_all_finalized_side_effects(&resp);
@@ -9082,40 +9085,24 @@ impl ClusterManager {
     /// Finalize a Completing run whose nodes have all reported, from the
     /// verdict their completions imply. `None` when the state machine refuses.
     fn finalize_reported_run(job: &mut Job, at: DateTime<Utc>) -> Option<JobFinalized> {
-        // The first failed copy of a per-node script, else the batch node
-        // (allocated_nodes[0]); empty when none allocated, where
-        // derived_completion falls back to the worst completion.
-        let primary = job
-            .first_failed_node
-            .clone()
-            .or_else(|| job.allocated_nodes.first().cloned())
-            .unwrap_or_default();
-        // spurd flags an OOM kill via a sentinel bit in the signal; detect it,
-        // then strip the bit so the stored signal is the real SIGKILL and the
-        // job reports OUT_OF_MEMORY.
-        let oom = job.reported_oom();
-        let (derived_state, final_exit, raw_signal) =
-            Job::derived_completion(&job.node_completions, &primary);
-        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-        let (final_state, final_reason) =
-            job.completion_verdict(derived_state, final_exit, final_signal, oom);
-        if let Err(e) = job.transition(final_state) {
+        let outcome = job.reported_outcome();
+        if let Err(e) = job.transition(outcome.state) {
             warn!(job_id = job.job_id, error = %e, "invalid final completion transition");
             return None;
         }
-        job.exit_code = Some(final_exit);
-        job.exit_signal = final_signal;
+        job.exit_code = Some(outcome.exit_code);
+        job.exit_signal = outcome.signal;
         // DerivedExitCode is the running max over srun steps, accumulated live
         // by JobStepComplete; a job with no srun steps keeps 0 (Slurm parity),
         // not the batch exit. Left as-is here.
-        job.set_pending_reason(final_reason);
+        job.set_pending_reason(outcome.reason);
         job.end_time = Some(at);
         job.preempt_pending = None;
         job.clear_node_reports();
         Some(JobFinalized::for_job(
             job,
-            job.end_of_run_state(final_state),
-            final_exit,
+            job.end_of_run_state(outcome.state),
+            outcome.exit_code,
         ))
     }
 
@@ -10090,6 +10077,7 @@ impl ClusterManager {
                 unreported_nodes,
                 cancel,
                 controller_initiated,
+                signal,
                 ..
             } => {
                 let freed_nodes;
@@ -10169,6 +10157,9 @@ impl ClusterManager {
                             job.cancelled_by = cancel.clone();
                         }
                         job.exit_code = Some(*exit_code);
+                        if let Some(signal) = signal {
+                            job.exit_signal = *signal;
+                        }
                         job.end_time = Some(timestamp);
                         // Derived from the replicated entry, so every replica reports
                         // the same reason for a job the watchdog had to force-kill or
@@ -22802,12 +22793,42 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: true,
+            signal: None,
             at: None,
         });
 
         assert!(cm.get_job(job_id).unwrap().retained_nodes.is_empty());
         assert_eq!(cpus_in_use(&cm, "n1"), 1);
         assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_complete_records_the_signal_it_carries() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let with_signal = running_per_node_job(&cm, &["n1"]);
+        let without = running_per_node_job(&cm, &["n2"]);
+        cm.jobs.write().get_mut(&without).unwrap().exit_signal = 7;
+        let complete = |job_id, signal| WalOperation::JobComplete {
+            job_id,
+            exit_code: 0,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            signal,
+            at: None,
+        };
+
+        cm.apply_operation(&complete(with_signal, Some(9)));
+        cm.apply_operation(&complete(without, None));
+
+        assert_eq!(cm.get_job(with_signal).unwrap().exit_signal, 9);
+        assert_eq!(
+            cm.get_job(without).unwrap().exit_signal,
+            7,
+            "an older leader's entry leaves the signal as it was"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -37243,6 +37264,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
         assert_eq!(cm.allocate_step_id(1), 0);
@@ -38778,6 +38800,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
 
@@ -38803,6 +38826,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
 
@@ -39266,6 +39290,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
@@ -39404,6 +39429,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
 
@@ -39541,6 +39567,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: Some(CancelProvenance::system()),
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at()),
         });
 
@@ -39620,6 +39647,7 @@ state = "UP"
                 unreported_nodes: Vec::new(),
                 cancel: None,
                 controller_initiated: false,
+                signal: None,
                 at: Some(grace_exit_at()),
             });
             cm.run_all_finalized_side_effects(&resp);
@@ -39748,6 +39776,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
         cm.run_all_finalized_side_effects(&resp);

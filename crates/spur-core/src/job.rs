@@ -1078,6 +1078,16 @@ pub struct NodeCompletion {
     pub signal: i32,
 }
 
+/// What a run's node reports say it ended with (see `Job::reported_outcome`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedOutcome {
+    pub state: JobState,
+    pub exit_code: i32,
+    /// The deciding node's signal; an OOM kill shows in `state` instead.
+    pub signal: i32,
+    pub reason: PendingReason,
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -1368,6 +1378,30 @@ impl Job {
             }
         }
         self.pending_reason.display().to_string()
+    }
+
+    /// The run's outcome from its node reports, decided by the first failed copy
+    /// of a per-node script, else the batch node (the first allocated). The one
+    /// selection both the last report and the completing timeout's force-finish use.
+    pub fn reported_outcome(&self) -> ReportedOutcome {
+        let deciding_node = self
+            .first_failed_node
+            .as_deref()
+            .or_else(|| self.allocated_nodes.first().map(String::as_str))
+            .unwrap_or_default();
+        let (derived_state, exit_code, raw_signal) =
+            Self::derived_completion(&self.node_completions, deciding_node);
+        // spurd flags an OOM kill with a sentinel bit in the signal; strip it so
+        // the stored signal is the real SIGKILL and the state says OUT_OF_MEMORY.
+        let signal = raw_signal & !OOM_SIGNAL_FLAG;
+        let (state, reason) =
+            self.completion_verdict(derived_state, exit_code, signal, self.reported_oom());
+        ReportedOutcome {
+            state,
+            exit_code,
+            signal,
+            reason,
+        }
     }
 
     /// Derive a job's `ExitCode` and state from per-node completions, matching
@@ -2214,6 +2248,53 @@ mod tests {
 
         let back: Job = serde_json::from_value(value).unwrap();
         assert!(back.retained_nodes.is_empty());
+    }
+
+    #[test]
+    fn the_first_failed_copy_decides_the_reported_outcome() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 3, signal: 0 });
+        assert_eq!(
+            job.reported_outcome().signal,
+            15,
+            "without a failed copy the batch node decides"
+        );
+
+        job.first_failed_node = Some("n2".into());
+
+        let outcome = job.reported_outcome();
+        assert_eq!(
+            (outcome.state, outcome.exit_code, outcome.signal),
+            (JobState::Failed, 3, 0)
+        );
+        assert_eq!(outcome.reason, PendingReason::NonZeroExitCode);
+    }
+
+    #[test]
+    fn a_reported_oom_kill_shows_in_the_state_not_the_signal() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into()];
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 9 | OOM_SIGNAL_FLAG,
+            },
+        );
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!(outcome.state, JobState::OutOfMemory);
+        assert_eq!(outcome.signal, 9);
     }
 
     #[test]

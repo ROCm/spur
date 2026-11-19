@@ -141,6 +141,7 @@ fn cancel(cm: &ClusterManager, origin: &str) {
             uid: Some(1000),
         }),
         controller_initiated: false,
+        signal: None,
         at: None,
     });
 }
