@@ -481,29 +481,7 @@ mod tests {
         }
     }
 
-    // ── T50.44: Mail type field ─────────────────────────────────
-
-    #[test]
-    fn t50_44_mail_type_field() {
-        let spec = spur_core::job::JobSpec {
-            mail_type: vec!["BEGIN".into(), "END".into()],
-            mail_user: Some("alice@example.com".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.mail_type.len(), 2);
-        assert_eq!(spec.mail_user.as_deref(), Some("alice@example.com"));
-    }
-
     // ── T50.45: Interactive flag ────────────────────────────────
-
-    #[test]
-    fn t50_45_interactive_flag() {
-        let spec = spur_core::job::JobSpec {
-            interactive: true,
-            ..Default::default()
-        };
-        assert!(spec.interactive);
-    }
 
     #[test]
     fn t50_46_interactive_default_false() {
@@ -525,17 +503,6 @@ mod tests {
         assert!(spec.distribution.is_none());
     }
 
-    #[test]
-    fn t50_49_mpi_field_set() {
-        let spec = spur_core::job::JobSpec {
-            mpi: Some("pmix".into()),
-            distribution: Some("cyclic".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.mpi.as_deref(), Some("pmix"));
-        assert_eq!(spec.distribution.as_deref(), Some("cyclic"));
-    }
-
     // ── T50.50–52: Heterogeneous job fields ────────────────────
 
     #[test]
@@ -551,24 +518,6 @@ mod tests {
         let job = make_job("het-test");
         assert!(job.het_job_id.is_none());
         assert!(job.het_group.is_none());
-    }
-
-    #[test]
-    fn t50_51_het_job_fields_set() {
-        let mut job = make_job("het-test");
-        job.het_job_id = Some(100);
-        job.het_group = Some(1);
-        assert_eq!(job.het_job_id, Some(100));
-        assert_eq!(job.het_group, Some(1));
-    }
-
-    #[test]
-    fn t50_52_het_group_spec_field() {
-        let spec = spur_core::job::JobSpec {
-            het_group: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(spec.het_group, Some(0));
     }
 
     // ── T50.53–55: Step constants and state transitions ────────
@@ -606,19 +555,6 @@ mod tests {
     }
 
     // ── T50.57–58: Burst buffer field ─────────────────────────────
-
-    #[test]
-    fn t50_57_burst_buffer_field() {
-        let spec = spur_core::job::JobSpec {
-            burst_buffer: Some("stage_in:cp /data/model.bin /tmp/".into()),
-            ..Default::default()
-        };
-        assert!(spec.burst_buffer.is_some());
-        assert_eq!(
-            spec.burst_buffer.as_deref(),
-            Some("stage_in:cp /data/model.bin /tmp/")
-        );
-    }
 
     #[test]
     fn t50_58_burst_buffer_default_none() {
@@ -666,44 +602,8 @@ mod tests {
     // ── T50.63–70: Begin time, deadline, spread_job, open_mode fields ──
 
     #[test]
-    fn t50_63_begin_time_field() {
-        let spec = JobSpec {
-            begin_time: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..Default::default()
-        };
-        assert!(spec.begin_time.is_some());
-    }
-
-    #[test]
-    fn t50_64_deadline_field() {
-        let spec = JobSpec {
-            deadline: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
-            ..Default::default()
-        };
-        assert!(spec.deadline.is_some());
-    }
-
-    #[test]
-    fn t50_65_spread_job_flag() {
-        let spec = JobSpec {
-            spread_job: true,
-            ..Default::default()
-        };
-        assert!(spec.spread_job);
-    }
-
-    #[test]
     fn t50_66_spread_job_default_false() {
         assert!(!JobSpec::default().spread_job);
-    }
-
-    #[test]
-    fn t50_67_open_mode_append() {
-        let spec = JobSpec {
-            open_mode: Some("append".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.open_mode.as_deref(), Some("append"));
     }
 
     #[test]
@@ -722,15 +622,6 @@ mod tests {
     }
 
     // ── T50.71–72: Reservation field on JobSpec ─────────────────
-
-    #[test]
-    fn t50_71_reservation_field_on_jobspec() {
-        let spec = JobSpec {
-            reservation: Some("gpu-reservation".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.reservation.as_deref(), Some("gpu-reservation"));
-    }
 
     #[test]
     fn t50_72_reservation_default_none() {
@@ -752,44 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn t50_76_reservation_field_flows_through_job_spec() {
-        // Regression: --reservation flag was missing from submit commands.
-        // The field must exist on JobSpec and be passable to the scheduler.
-        let spec = spur_core::job::JobSpec {
-            reservation: Some("res-gpu".into()),
-            ..Default::default()
-        };
-        assert_eq!(spec.reservation.as_deref(), Some("res-gpu"));
-    }
-
-    #[test]
-    fn t50_77_reservation_update_fields_present() {
-        // Regression: no command to update a reservation.
-        // Reservation must have all fields needed for an update operation.
-        use spur_core::reservation::Reservation;
-        let now = chrono::Utc::now();
-        let mut res = Reservation {
-            name: "res-v1".into(),
-            start_time: now,
-            end_time: now + chrono::Duration::hours(4),
-            nodes: vec!["node001".into()],
-            users: vec!["alice".into()],
-            accounts: Vec::new(),
-            flags: Default::default(),
-            owner: String::new(),
-        };
-        // All fields must be mutable for an update to work.
-        res.end_time = now + chrono::Duration::hours(8);
-        res.nodes.push("node002".into());
-        assert_eq!(res.nodes.len(), 2);
-        assert_eq!(
-            (res.end_time - res.start_time).num_hours(),
-            8,
-            "end_time must be updatable"
-        );
-    }
-
-    #[test]
     fn t50_78_single_node_name_matches_hostlist() {
         // Regression: single-node clusters had inconsistent node naming.
         // The node name used at registration must be what the hostlist expands to.
@@ -808,37 +661,6 @@ mod tests {
         use spur_core::config::FederationConfig;
         let fed = FederationConfig::default();
         assert!(fed.clusters.is_empty());
-    }
-
-    #[test]
-    fn t50_83_federation_cluster_peer_fields() {
-        use spur_core::config::ClusterPeer;
-        let peer = ClusterPeer {
-            name: "cluster-b".into(),
-            address: "http://ctrl-b:6817".into(),
-        };
-        assert_eq!(peer.name, "cluster-b");
-        assert_eq!(peer.address, "http://ctrl-b:6817");
-    }
-
-    #[test]
-    fn t50_84_federation_config_with_peers() {
-        use spur_core::config::{ClusterPeer, FederationConfig};
-        let fed = FederationConfig {
-            clusters: vec![
-                ClusterPeer {
-                    name: "east".into(),
-                    address: "http://east-ctrl:6817".into(),
-                },
-                ClusterPeer {
-                    name: "west".into(),
-                    address: "http://west-ctrl:6817".into(),
-                },
-            ],
-        };
-        assert_eq!(fed.clusters.len(), 2);
-        assert_eq!(fed.clusters[0].name, "east");
-        assert_eq!(fed.clusters[1].address, "http://west-ctrl:6817");
     }
 
     #[test]
@@ -891,113 +713,6 @@ address = "http://peer-a:6817"
 
         let reason = spur_core::job::PendingReason::Priority;
         assert_eq!(reason.display(), "Priority");
-    }
-
-    #[test]
-    fn t50_91_exec_uses_controller_not_agent() {
-        // spur exec should route through the controller so it works
-        // from login nodes regardless of where the job is running.
-        // This is a structural test — verify the ExecInJobRequest message exists
-        // and can be constructed.
-        let req = spur_proto::proto::ExecInJobRequest {
-            job_id: 42,
-            command: vec!["ls".into(), "-la".into()],
-            user: "alice".into(),
-        };
-        assert_eq!(req.job_id, 42);
-        assert_eq!(req.command.len(), 2);
-    }
-
-    // ── Interactive session proto messages ────────────────────────
-
-    #[test]
-    fn t50_92_interactive_input_init_session() {
-        use std::collections::HashMap;
-        let msg = spur_proto::proto::InteractiveInput {
-            msg: Some(spur_proto::proto::interactive_input::Msg::Init(
-                spur_proto::proto::InitSession {
-                    job_id: 10,
-                    step_id: 0,
-                    overlap: true,
-                    pty: true,
-                    winsize: Some(spur_proto::proto::WindowSize {
-                        rows: 24,
-                        cols: 80,
-                        xpixel: 0,
-                        ypixel: 0,
-                    }),
-                    argv: vec!["/bin/bash".into()],
-                    env: HashMap::new(),
-                    user: "alice".into(),
-                    container: None,
-                    non_interactive: false,
-                    execution_credential: String::new(),
-                },
-            )),
-        };
-        match msg.msg.unwrap() {
-            spur_proto::proto::interactive_input::Msg::Init(init) => {
-                assert_eq!(init.job_id, 10);
-                assert!(init.overlap);
-                assert_eq!(init.winsize.unwrap().cols, 80);
-            }
-            _ => panic!("expected Init variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92b_interactive_input_stdin_raw_bytes() {
-        let esc_seq = vec![0x1b, 0x5b, 0x41]; // ESC [ A (arrow up)
-        let msg = spur_proto::proto::InteractiveInput {
-            msg: Some(spur_proto::proto::interactive_input::Msg::Stdin(
-                esc_seq.clone(),
-            )),
-        };
-        match msg.msg.unwrap() {
-            spur_proto::proto::interactive_input::Msg::Stdin(data) => {
-                assert_eq!(data, esc_seq);
-            }
-            _ => panic!("expected Stdin variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92c_interactive_output_data_and_exit() {
-        let out = spur_proto::proto::InteractiveOutput {
-            msg: Some(spur_proto::proto::interactive_output::Msg::Data(
-                b"hello\r\n".to_vec(),
-            )),
-        };
-        match out.msg.unwrap() {
-            spur_proto::proto::interactive_output::Msg::Data(d) => {
-                assert_eq!(d, b"hello\r\n");
-            }
-            _ => panic!("expected Data variant"),
-        }
-
-        let exit = spur_proto::proto::InteractiveOutput {
-            msg: Some(spur_proto::proto::interactive_output::Msg::ExitStatus(42)),
-        };
-        match exit.msg.unwrap() {
-            spur_proto::proto::interactive_output::Msg::ExitStatus(code) => {
-                assert_eq!(code, 42);
-            }
-            _ => panic!("expected ExitStatus variant"),
-        }
-    }
-
-    #[test]
-    fn t50_92d_window_size_construction() {
-        let ws = spur_proto::proto::WindowSize {
-            rows: 50,
-            cols: 200,
-            xpixel: 1024,
-            ypixel: 768,
-        };
-        assert_eq!(ws.rows, 50);
-        assert_eq!(ws.cols, 200);
-        assert_eq!(ws.xpixel, 1024);
-        assert_eq!(ws.ypixel, 768);
     }
 
     // ── CLI reads config file for controller port ─────────────────

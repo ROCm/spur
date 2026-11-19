@@ -3692,7 +3692,6 @@ dependencies = [
  "chrono",
  "jsonwebtoken",
  "spur-core",
- "spur-proto",
  "spur-sched",
  "spur-spank",
 ]
