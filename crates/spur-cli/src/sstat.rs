@@ -195,10 +195,7 @@ fn resolve_field(job: &spur_proto::proto::JobInfo, field: &StatField) -> String 
     match field {
         StatField::JobId => job.job_id.to_string(),
         StatField::NTasks => job.num_tasks.to_string(),
-        StatField::Cpus => {
-            let cpus = job.num_tasks * job.cpus_per_task.max(1);
-            cpus.to_string()
-        }
+        StatField::Cpus => crate::sacct::ncpus(job).to_string(),
         StatField::MemAlloc => {
             if let Some(ref res) = job.resources {
                 format!("{}M", res.memory_mb)
@@ -300,5 +297,28 @@ mod tests {
     #[test]
     fn state_name_falls_back_to_unknown() {
         assert_eq!(state_name(i32::MAX), "UNKNOWN");
+    }
+
+    #[test]
+    fn cpus_field_uses_the_req_tres_cpu_value_when_present() {
+        // req_tres already counts --cpus-per-gpu, so it must win over the naive
+        // num_tasks * cpus_per_task product.
+        let job = spur_proto::proto::JobInfo {
+            req_tres: "cpu=16,node=1".into(),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(resolve_field(&job, &StatField::Cpus), "16");
+    }
+
+    #[test]
+    fn cpus_field_falls_back_when_req_tres_is_empty() {
+        let job = spur_proto::proto::JobInfo {
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        assert_eq!(resolve_field(&job, &StatField::Cpus), "8");
     }
 }

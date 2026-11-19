@@ -358,6 +358,13 @@ appends carrying that variant and **stops replicating** until it is itself upgra
 three-controller cluster that costs quorum. While the leader is still on the old build it
 cannot emit a new variant at all, which is what closes the window.
 
+``Ping``'s advertised ``capabilities`` are the leader's: a follower queries the leader
+before answering, narrowing its own list to whatever the leader also supports, so a
+typed step's capability check reflects whichever controller is actually in charge, not
+whichever one ``srun`` happens to reach. A follower that cannot reach a leader
+advertises none, rather than guessing. Until every controller in the cluster is
+upgraded, avoid the per-GPU options and typed steps these capabilities gate.
+
 Detection is a read-only ``GET`` to each controller's own loopback metrics listener
 (``http://127.0.0.1:6822/metrics/nodes``), which answers ``200`` on the leader and ``503``
 on a follower. It never blocks the upgrade: if no controller answers as leader, or more than
@@ -442,6 +449,117 @@ Behavior Changes Between Releases
 
 Some releases change how an existing ``spur.conf`` behaves without that file being
 edited. Review these before rolling binaries out.
+
+.. _gpu-cores-upgrade-notes:
+
+Reserved cores per GPU, per-step shares and CPU billing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **Upgrade every controller and agent before setting** ``restricted_cores_per_gpu``
+  or ``def_cpu_per_gpu``. An older controller ignores them; an older agent does
+  not report which cores sit near each GPU, so the node drains with a
+  ``core-layout:`` reason.
+- **Steps that ask for their own CPU, memory or GPU share** (``srun`` with
+  ``--cpus-per-task``, ``--mem``, ``--gpus`` and the per-GPU forms inside an
+  allocation) are refused on a node whose ``spurd`` predates this release, with
+  "upgrade spurd on <node>". Plain steps still run there. Inside a job, ``srun``
+  resolves to the node agent's own installation first, so on a node whose
+  ``spurd`` is not yet upgraded a job's ``srun`` is the older one: its ``-c``,
+  ``--mem`` and ``--gpus`` steps are refused the same way, and it rejects the
+  per-GPU options and ``--mem-per-cpu`` as unknown. Upgrade the agents before
+  relying on per-step limits. The previous controller forwarded these steps,
+  so the refusal itself is new while versions are mixed.
+- A node whose ``[[nodes]]`` entry sets only ``restricted_cores_per_gpu`` (no
+  spec cores) now has its ``spur`` cgroup root managed too: without a
+  ``cpus =`` cap, ``spurd`` resets any ``cpuset.cpus``/``memory.*`` limits an
+  operator had set on that root by hand, back to unconfined; with a cap that
+  trims CPUs, ``cpuset.cpus`` instead excludes the trimmed CPUs, so a job
+  cannot land on them even with ``[cgroup] required = false``. ``memory.*``
+  stays unconfined either way: ``reserved_memory_mb`` is scheduling-only on a
+  node with no spec cores — it is never written as a root cgroup limit; a job
+  with no memory request of its own is capped per job instead, at the node's
+  schedulable memory (see :ref:`cgroup-upgrade-notes` below).
+- **A job with no memory request of its own is now capped at the node's
+  schedulable memory** instead of running unbounded, matching Slurm. The
+  controller sends the ceiling (``node_memory_ceiling_mb``) on every launch;
+  an older controller sends 0, and the agent falls back to its own detected
+  total memory, so the job is still capped against a controller that
+  predates the field. Set ``constrain_ram_space = false`` to opt back out, as
+  for a job that does set ``--mem``.
+- **A step killed for running out of memory ends** ``OUT_OF_MEMORY``, also when
+  its whole job runs out of memory. An older controller cannot read that state,
+  either from the log or from a snapshot, so follow the leader-last order in
+  :ref:`upgrading-leader-last`. Once an upgraded leader has recorded one, roll
+  forward rather than back.
+- **A step that gives up waiting on ends** ``CANCELLED``, and ``srun``
+  reports it to the controller as exit code ``0`` with ``cancelled`` set. A
+  controller from before this release ignores the new ``cancelled`` field and
+  shows the step ``COMPLETED`` instead (not ``FAILED`` — the reported exit code
+  really is ``0``). This is not only a rollback concern: it also applies to an
+  old controller that has not yet been upgraded, paired with a new ``spur-cli``.
+- **An older** ``sbatch``/``salloc``/``srun`` **always sends** ``-c 1``, so a
+  partition's (or ``[scheduler]``'s) ``def_cpu_per_gpu`` only takes effect for
+  jobs submitted with an upgraded ``spur-cli`` — upgrade ``spur-cli`` on login
+  nodes before relying on it.
+- **An older** ``srun``'s **typed step that hits a busy share fails** instead of
+  waiting and retrying; only an upgraded ``srun`` backs off and retries as
+  described above. An upgraded controller also records that busy step
+  ``CANCELLED`` right away, since it has no way to tell an older client will
+  retry, so the step never sits ``RUNNING`` for a client that already gave up.
+- **A new** ``srun`` **refuses typed steps** (``-c``, ``--mem*``, ``--gpus*``, the
+  per-GPU forms) until the controllers are upgraded; plain steps still run.
+- **A client's** ``CompleteJobStep`` **now only cancels a step or closes a**
+  ``PTY`` **step**; ``srun`` never reports anything else this way. A custom
+  client that reported the exit code of any other step now gets
+  ``InvalidArgument`` instead.
+- **Upgrade the controllers before** ``spur-cli``. An older controller has no
+  per-GPU job fields: it would drop ``--cpus-per-gpu``/``--mem-per-gpu`` and
+  run the job with 1 CPU per task, so an upgraded ``sbatch``/``salloc``/``srun``
+  refuses those options against it.
+- **Combining** ``--mem`` **with** ``--mem-per-cpu`` **or** ``--mem-per-gpu``
+  **is now rejected**, by ``spur-cli`` and, as a backstop, the controller. An
+  older ``sbatch`` that sets both (for example ``#SBATCH --mem`` in the script
+  plus ``--mem-per-cpu`` on the command line) now fails the submission; it
+  previously ran with the per-node value winning.
+- **Inside a step that holds its own GPUs,** ``SPUR_JOB_GPUS`` **keeps the
+  node's GPU ids, and the local, zero-based numbering moved to**
+  ``SPUR_LOCAL_GPUS``. A script that set ``HIP_VISIBLE_DEVICES=$SPUR_JOB_GPUS``
+  to match what such a step's own GPU runtime sees now breaks there; point it
+  at ``SPUR_LOCAL_GPUS`` instead.
+- **CPU-seconds bill allocated CPUs.** Fair-share and ``sreport`` usage for jobs
+  started after the upgrade count the CPUs each job was allocated, so an
+  ``--exclusive`` job bills its whole nodes. The accounting database gains an
+  ``alloc_cpus`` column automatically; jobs recorded before it keep their old
+  ``tasks x cpus-per-task`` charge.
+- ``SPUR_CPUS_ON_NODE``/``SLURM_CPUS_ON_NODE`` **now report the CPUs allocated
+  on the node**, not ``cpus_per_task``. An ``--exclusive -n 4`` job now sees
+  its whole node's CPU count there instead of ``4``.
+- **Controller hooks report allocated CPUs.** ``PrologSlurmctld`` and
+  ``EpilogSlurmctld`` now see ``SLURM_CPUS_ON_NODE`` as the job's allocated CPUs
+  on its fullest node, not ``cpus_per_task`` alone. A plain ``-n4 -c2`` job placed
+  on one node previously reported ``2`` to both hooks; it now reports ``8``
+  (four tasks' worth of CPUs) to both.
+- **Queued GPU jobs wait out a core-layout change only once agents are
+  upgraded.** After a restart that changes spec cores, ``restricted_cores_per_gpu``
+  or a node's GPUs, an upgraded ``spurd`` reports which GPUs' new reserved CPUs
+  are still held by older jobs, and the controller keeps GPU jobs off those GPUs
+  until they free. An older ``spurd`` reports nothing, so such a job can still be
+  refused at launch and requeued, counting toward ``max_batch_requeue``; an
+  older controller ignores the report. Do not change GPUs or layout settings
+  while controllers run mixed versions: replicas agree on each GPU's reserved
+  cores only while those inputs stay unchanged. Rolling controllers back
+  removes per-GPU reservations; see the ``OUT_OF_MEMORY`` note above.
+- **Running jobs keep their CPUs and memory limits across a core-layout change
+  only on upgraded agents.** An older ``spurd`` shrinks the ``spur`` root to the
+  new layout at once, so a running job can lose CPUs it was bound to (it keeps
+  only those still in the new layout) and is throttled under a lowered
+  ``memory.high``. Upgrade every ``spurd`` before changing spec cores,
+  ``reserved_memory_mb``, ``restricted_cores_per_gpu`` or a node's GPUs while
+  jobs run.
+- ``[[devices.gres]]`` ``type``/``links`` **now override what discovery
+  reports** for the matching GPU, so an existing entry can change a GPU's type
+  on upgrade. An entry that matches only some of a render node's GPUs is
+  dropped with a warning in the ``spurd`` log.
 
 .. _cgroup-upgrade-notes:
 

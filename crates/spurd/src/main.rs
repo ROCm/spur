@@ -760,6 +760,9 @@ async fn main() -> anyhow::Result<()> {
     agent_service
         .replay_adopted_allocations(&recovered_stepds, &startup.renamed)
         .await;
+    // Replay has refilled the ledger, so blocked reserved CPUs can be counted;
+    // report them now rather than a period late.
+    reporter.request_heartbeat();
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
@@ -1184,7 +1187,7 @@ fn spawn_inventory_refresh(
                             &mut a,
                             &tick,
                             &reported,
-                            &reporter.held_spec_cpus(),
+                            &reporter.held_exclusions(),
                         )
                     };
                     match change {
@@ -1264,7 +1267,7 @@ fn spawn_inventory_refresh(
                             &mut a,
                             &tick,
                             &reconciled,
-                            &reporter.held_spec_cpus(),
+                            &reporter.held_exclusions(),
                         )
                     };
                     if let CapacityChange::AllocatedDevicesLost(v) = change {
@@ -1585,6 +1588,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 128 + i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             generic: Default::default(),

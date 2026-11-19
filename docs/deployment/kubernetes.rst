@@ -187,6 +187,32 @@ Apply with ``kubectl``:
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
 
+Pod sizing with ``--cpus-per-gpu``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job's pod gets its ``cpu`` request and limit from the controller's allocation, which already
+sizes a ``--cpus-per-gpu`` job by its GPUs. ``SPUR_CPUS_ON_NODE`` (and its ``SLURM_CPUS_ON_NODE``
+twin) in the pod's environment follow the same rule: the allocation's CPU count when the
+controller set one, else the larger of ``tasks_per_node × cpus_per_task`` and
+``cpus_per_gpu × gpus_on_node``. ``--cpus-per-gpu`` and ``--mem-per-gpu``, as requested, are also
+exported as ``SPUR_CPUS_PER_GPU``/``SLURM_CPUS_PER_GPU`` and ``SPUR_MEM_PER_GPU``/
+``SLURM_MEM_PER_GPU`` when the job sets them.
+
+``restricted_cores_per_gpu`` and the rest of a native node's core layout (``[[nodes]]`` reserved
+cores, general-pool sizing) apply only to native-host nodes. Kubernetes-backed nodes have no core
+layout of their own — the pod's CPU request is the only sizing the Kubernetes scheduler and
+kubelet see.
+
+The node's no-``--mem`` memory ceiling (see :doc:`native-host`) applies to native-host jobs only:
+a pod whose job sets no ``--mem`` gets neither ``requests.memory`` nor ``limits.memory``.
+Kubernetes copies a set limit into an unset request, so giving such a pod a limit alone would make
+it request the node's whole memory and could make the kubelet reject a second such pod. The pod's
+CPU request remains the only sizing for a job without ``--mem``.
+
+Steps that ask for their own share (``srun`` with ``-c``, ``--mem*``,
+``--cpus-per-gpu`` or ``--gpus*`` inside an allocation) are not supported on
+Kubernetes-backed nodes and are refused; plain steps run as before.
+
 Operator connection to the controller
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

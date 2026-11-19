@@ -201,6 +201,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: i as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             });
         }
         ResourceSet {

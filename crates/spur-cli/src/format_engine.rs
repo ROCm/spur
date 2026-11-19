@@ -497,6 +497,7 @@ pub fn sinfo_header(spec: char) -> &'static str {
         'E' => "REASON",
         'H' => "TIMESTAMP",
         'u' | 'U' => "USER",
+        'z' => "S:C:T",
         _ => "?",
     }
 }

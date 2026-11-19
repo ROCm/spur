@@ -200,6 +200,10 @@ The adjustment depends on how the job asked for memory:
   factor, rounded up to a whole MiB. Total memory stays the same or grows by
   a few MiB from that rounding (for example ``-c 2 --mem-per-cpu=5G`` with a
   2048 MiB limit becomes 6 CPUs × 1707 MiB = 10242 MiB); it never shrinks.
+  ``--cpus-per-gpu`` is multiplied by the same factor, so a job sized by its
+  GPUs keeps its memory too: ``--gres=gpu:2 --cpus-per-gpu=8 --mem-per-cpu=4G``
+  becomes 32 CPUs × 2 GiB = 64 GiB. Slurm multiplies only the CPUs per task,
+  which leaves such a job with half the memory it asked for.
 - ``--mem`` (per node) above ``CPUs × limit``: CPUs are raised to
   ``ceil(mem / limit)``.
 - Memory from ``def_mem_per_gpu``: handled like ``--mem`` for a node holding
@@ -361,12 +365,13 @@ Setting limits at runtime
 only for QOS and associations), with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
 ``cpu`` cap however it was set. The second line names the ``DefMemPer*`` and
 ``MaxMemPer*`` knobs that are set, or reads
-``DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED`` when none is:
+``DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED`` when none is, followed by
+``DefCpuPerGPU=<n>`` when ``def_cpu_per_gpu`` is set:
 
 .. code-block:: text
 
    MaxCPUsPerNode=64 MaxTRESPerNode=cpu=64,gres/gpu=0,mem=524288
-   DefMemPerCPU=1024 MaxMemPerNode=65536
+   DefMemPerCPU=1024 DefCpuPerGPU=4 MaxMemPerNode=65536
 
 ``scontrol create partition`` and ``scontrol update`` accept the same names
 (memory in MiB):
@@ -376,15 +381,16 @@ only for QOS and associations), with ``UNLIMITED`` for anything unset. ``MaxCPUs
    scontrol update PartitionName=cpu MaxCPUsPerNode=64
    scontrol update PartitionName=cpu MaxTRESPerNode=cpu=64,mem=131072,gres/gpu:a100=2
    scontrol update PartitionName=cpu MaxMemPerCPU=2048 DefMemPerGPU=8192
+   scontrol update PartitionName=gpu DefCpuPerGPU=4
 
 - ``MaxTRESPerNode=`` replaces the whole cap table, including a ``cpu`` cap set
   through ``MaxCPUsPerNode``. ``MaxTRESPerNode=`` with an empty value or
   ``UNLIMITED`` removes every cap. Its ``cpu``, ``mem``, and
   ``gres/gpu`` names are case-insensitive; a GPU type keeps the case given.
 - ``UNLIMITED`` or ``0`` leaves ``MaxCPUsPerNode``, ``MaxMemPerNode``,
-  ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, or ``DefMemPerGPU``
-  unset on create and clears it on update. To forbid a resource, use
-  ``MaxTRESPerNode`` with a ``0`` limit, for example
+  ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, ``DefMemPerGPU``, or
+  ``DefCpuPerGPU`` unset on create and clears it on update. To forbid a
+  resource, use ``MaxTRESPerNode`` with a ``0`` limit, for example
   ``MaxTRESPerNode=gres/gpu=0``. ``MaxTRESPerNode`` entries take numbers only;
   leave a key out to make it unlimited.
 - As in Slurm, ``MaxMemPerNode`` and ``MaxMemPerCPU`` are one setting, and so
@@ -405,9 +411,9 @@ only for QOS and associations), with ``UNLIMITED`` for anything unset. ``MaxCPUs
 
 The REST ``GET /api/v1/partitions`` (and ``/slurm/v0.0.42/partitions``) response
 includes ``max_cpus_per_node``, ``max_tres_per_node``, ``max_mem_per_node``,
-``max_mem_per_cpu``, ``def_mem_per_node``, ``def_mem_per_cpu``, and
-``def_mem_per_gpu`` for each partition. Unset values are ``null``;
-``max_tres_per_node`` is an object, empty when there are no caps.
+``max_mem_per_cpu``, ``def_mem_per_node``, ``def_mem_per_cpu``,
+``def_mem_per_gpu``, and ``def_cpu_per_gpu`` for each partition. Unset values
+are ``null``; ``max_tres_per_node`` is an object, empty when there are no caps.
 
 How caps combine with other limits
 ----------------------------------

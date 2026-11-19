@@ -124,7 +124,7 @@ pub struct NodeReporter {
     spec_root: std::path::PathBuf,
     /// The held layout's spec CPUs, readable without waiting on root I/O under
     /// `spec`, since allocation reads it while holding the allocation lock.
-    spec_cpus: RwLock<Vec<u32>>,
+    exclusions: RwLock<crate::spec::LedgerExclusions>,
     /// Whether spurd's threads are currently pinned off spec cores, so the mask
     /// is widened back to all online CPUs when the setting is removed.
     daemons_pinned: std::sync::atomic::AtomicBool,
@@ -135,6 +135,9 @@ pub struct NodeReporter {
     /// Random per process, so the controller can keep a deleted node out until spurd restarts.
     agent_instance: String,
     deleted_logged: std::sync::atomic::AtomicBool,
+    /// Wakes `heartbeat_loop` early, so blocked reserved CPUs under a changed
+    /// layout reach the controller at once rather than up to a period late.
+    heartbeat_now: tokio::sync::Notify,
 }
 
 impl NodeReporter {
@@ -178,13 +181,14 @@ impl NodeReporter {
                 true,
             )),
             spec_root: std::path::PathBuf::from(crate::executor::CGROUP_ROOT),
-            spec_cpus: RwLock::new(Vec::new()),
+            exclusions: RwLock::new(crate::spec::LedgerExclusions::default()),
             daemons_pinned: std::sync::atomic::AtomicBool::new(false),
             timeouts,
             baseline_dir: None,
             fences: RwLock::new(Fences::default()),
             agent_instance: uuid::Uuid::new_v4().simple().to_string(),
             deleted_logged: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_now: tokio::sync::Notify::new(),
         }
     }
 
@@ -254,7 +258,8 @@ impl NodeReporter {
             delivery,
         );
         if changed {
-            *write_recover(&self.spec_cpus) = spec.spec_cpus();
+            *write_recover(&self.exclusions) = spec.ledger_exclusions();
+            self.heartbeat_now.notify_one();
         }
         changed
     }
@@ -277,25 +282,52 @@ impl NodeReporter {
     }
 
     pub fn holds_spec_cores(&self) -> bool {
-        !read_recover(&self.spec_cpus).is_empty()
+        !read_recover(&self.exclusions).spec_cpus.is_empty()
     }
 
-    /// CPU IDs reserved for node services, for the local ledger to exclude.
-    pub fn held_spec_cpus(&self) -> Vec<u32> {
-        read_recover(&self.spec_cpus).clone()
+    /// The CPUs near each reported GPU: its configured `cores=`, else its NUMA
+    /// node's CPUs; empty when neither is known.
+    pub fn gpu_near_cpus(&self) -> Vec<(u64, Vec<u32>)> {
+        let resources = read_recover(&self.resources);
+        resources
+            .gpus
+            .iter()
+            .map(|gpu| {
+                let near = if gpu.affinity_cpus.is_empty() {
+                    numa_cpus(resources.topology.as_ref(), gpu.numa_node)
+                } else {
+                    gpu.affinity_cpus.clone()
+                };
+                (gpu.stable_id, near)
+            })
+            .collect()
+    }
+
+    /// Each reported GPU's type, for steps that ask for one type.
+    pub fn gpu_types(&self) -> Vec<(u64, String)> {
+        read_recover(&self.resources)
+            .gpus
+            .iter()
+            .map(|g| (g.stable_id, g.gpu_type.clone()))
+            .collect()
+    }
+
+    pub fn held_exclusions(&self) -> crate::spec::LedgerExclusions {
+        read_recover(&self.exclusions).clone()
     }
 
     /// Apply the held layout to the cgroup root and pin spurd off spec cores.
     /// Blocking: cgroup writes can reclaim synchronously.
     fn apply_spec_layout(&self) {
-        let root = self.spec_root.as_path();
-        let live = read_live_job_cpusets(root);
+        let live = self.live_jobs();
         let total = read_mem_total_mb();
         let daemon_cpus = {
             let mut spec = lock_recover(&self.spec);
             match spec.apply(&live, total) {
                 Ok(crate::spec::MemReservation::Pending) => {
-                    debug!("node spec memory reservation pending: jobs still run under the root")
+                    debug!(
+                        "node spec memory reservation pending: jobs from before the layout change still run"
+                    )
                 }
                 Ok(_) => {}
                 Err(e) => warn!(
@@ -324,6 +356,71 @@ impl NodeReporter {
                     }
                 }
             }
+        }
+    }
+
+    /// Every job cgroup plus ledger-held runs not yet reflected on disk (see
+    /// crate AGENTS.md "No narrowing"). Blocking: waits for the ledger lock.
+    fn live_jobs(&self) -> Vec<crate::spec::LiveJob> {
+        let root = self.spec_root.as_path();
+        let mut live = read_live_jobs(root);
+        let Some(allocation) = self.allocation.get() else {
+            return live;
+        };
+        let ledger = allocation.blocking_lock();
+        for job_id in ledger.held_job_gpu_ids().into_keys() {
+            let Some(attempt) = ledger.owner_attempt(job_id) else {
+                continue;
+            };
+            let Some(dir) = run_dir(root, job_id, attempt) else {
+                continue;
+            };
+            match live.iter_mut().find(|j| j.dir == dir) {
+                Some(job) => job.populated = true,
+                None => live.push(crate::spec::LiveJob {
+                    dir,
+                    // No cgroup yet: report the ledger's own CPUs, so a
+                    // layout change keeps them in the root cpuset too.
+                    cpus: ledger
+                        .owner_cpu_ids(job_id, attempt)
+                        .map(<[u32]>::to_vec)
+                        .unwrap_or_default(),
+                    populated: true,
+                }),
+            }
+        }
+        live
+    }
+
+    /// Send the next heartbeat now.
+    pub fn request_heartbeat(&self) {
+        self.heartbeat_now.notify_one();
+    }
+
+    /// The held layout's fingerprint and enforcement error, with per GPU the
+    /// reserved CPUs a job not holding it occupies, all about that one layout.
+    /// Blocking: a missed ledger lock would read as nothing blocked.
+    fn layout_report(&self) -> LayoutReport {
+        let (fingerprint, enforcement_error, reserved) = {
+            let spec = lock_recover(&self.spec);
+            (
+                spec.held_fingerprint(),
+                spec.enforcement_error().unwrap_or_default(),
+                spec.ledger_exclusions().gpu_reserved,
+            )
+        };
+        let blocked = self
+            .allocation
+            .get()
+            .map(|ledger| ledger.blocking_lock().blocked_reserved_cpus(&reserved))
+            .unwrap_or_default();
+        LayoutReport {
+            fingerprint,
+            enforcement_error,
+            blocked_cpus: blocked
+                .into_iter()
+                .map(|(stable_id, cpus)| spur_proto::proto::GpuBlockedCpus { stable_id, cpus })
+                .collect(),
         }
     }
 
@@ -517,7 +614,10 @@ impl NodeReporter {
             labels,
             join_token: self.join_token.clone(),
             topology: resources.topology.as_ref().map(Into::into),
-            capabilities: vec![spur_core::node::CAP_SIGNAL_JOB.into()],
+            capabilities: vec![
+                spur_core::node::CAP_SIGNAL_JOB.into(),
+                spur_core::node::CAP_STEP_RESOURCES.into(),
+            ],
             agent_instance: self.agent_instance.clone(),
         }
     }
@@ -601,19 +701,32 @@ impl NodeReporter {
 
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-            spur_core::config::HEARTBEAT_INTERVAL_SECS,
-        ));
+        let mut interval = heartbeat_interval();
 
         loop {
-            interval.tick().await;
+            next_heartbeat(&mut interval, &self.heartbeat_now).await;
 
             let reporter = Arc::clone(&self);
-            if let Err(e) = tokio::task::spawn_blocking(move || reporter.apply_spec_layout()).await
-            {
-                warn!(error = %e, "spec layout apply task failed");
-            }
-            let req = self.heartbeat_request().await;
+            let applied = tokio::task::spawn_blocking(move || {
+                reporter.apply_spec_layout();
+                reporter.layout_report()
+            })
+            .await;
+            let report = match applied {
+                Ok(report) => report,
+                Err(e) => {
+                    warn!(error = %e, "spec layout apply task failed");
+                    // Sent with no counts, as an older agent does; the launch
+                    // refusal still guards the GPUs.
+                    let spec = lock_recover(&self.spec);
+                    LayoutReport {
+                        fingerprint: spec.held_fingerprint(),
+                        enforcement_error: spec.enforcement_error().unwrap_or_default(),
+                        blocked_cpus: Vec::new(),
+                    }
+                }
+            };
+            let req = self.heartbeat_request(report).await;
             let (load, free_mem) = (req.cpu_load, req.free_memory_mb);
             let result = self.send_heartbeat(req).await;
             self.handle_heartbeat_result(result, load, free_mem).await;
@@ -668,22 +781,15 @@ impl NodeReporter {
         }
     }
 
-    /// One heartbeat's payload, taken after the spec layout was applied so it
-    /// reports the fingerprint now held.
-    async fn heartbeat_request(&self) -> spur_proto::proto::HeartbeatRequest {
+    /// One heartbeat's payload, taken after the spec layout was applied so
+    /// `report` reflects the fingerprint and blocked CPUs now held.
+    async fn heartbeat_request(&self, report: LayoutReport) -> spur_proto::proto::HeartbeatRequest {
         let (load, free_mem) = read_system_metrics();
         self.cpu_load.store(load as u64, Ordering::Relaxed);
         self.free_memory_mb.store(free_mem, Ordering::Relaxed);
         let held = self.held_jobs().await;
         let running_jobs_incomplete = held.is_none();
         let running_jobs = build_running_jobs(held.unwrap_or_default(), &self.held_job_gpu_ids());
-        let (core_layout_fingerprint, spec_enforcement_error) = {
-            let spec = lock_recover(&self.spec);
-            (
-                spec.held_fingerprint(),
-                spec.enforcement_error().unwrap_or_default(),
-            )
-        };
         spur_proto::proto::HeartbeatRequest {
             hostname: self.hostname.clone(),
             cpu_load: load,
@@ -700,9 +806,10 @@ impl NodeReporter {
                     install_duration_seconds: install_secs,
                 }
             }),
-            core_layout_fingerprint,
-            spec_enforcement_error,
+            core_layout_fingerprint: report.fingerprint,
+            spec_enforcement_error: report.enforcement_error,
             agent_instance: self.agent_instance.clone(),
+            layout_blocked_cpus: report.blocked_cpus,
         }
     }
 
@@ -732,6 +839,32 @@ impl NodeReporter {
         warn!(error = %e, "heartbeat did not reach the controller; retrying on another controller");
         self.with_controller(move |mut client| async move { client.heartbeat(retry).await })
             .await
+    }
+}
+
+/// What a heartbeat says about the held layout.
+#[derive(Default)]
+struct LayoutReport {
+    fingerprint: u64,
+    enforcement_error: String,
+    blocked_cpus: Vec<spur_proto::proto::GpuBlockedCpus>,
+}
+
+fn heartbeat_interval() -> tokio::time::Interval {
+    tokio::time::interval(Duration::from_secs(
+        spur_core::config::HEARTBEAT_INTERVAL_SECS,
+    ))
+}
+
+/// Wait for the period, or for an early wake-up, after which the period
+/// restarts from the heartbeat it sends.
+async fn next_heartbeat(interval: &mut tokio::time::Interval, wake: &tokio::sync::Notify) {
+    tokio::select! {
+        _ = interval.tick() => {}
+        () = wake.notified() => {
+            interval.reset_immediately();
+            interval.tick().await;
+        }
     }
 }
 
@@ -1189,13 +1322,13 @@ pub fn apply_to_ledger(
     ledger: &mut NodeAllocation,
     tick: &TickPlan,
     reported: &ResourceSet,
-    spec_cpus: &[u32],
+    exclusions: &crate::spec::LedgerExclusions,
 ) -> spur_sched::cons_tres::CapacityChange {
     ledger.rename_gpus(&tick.plan.renamed);
     let change = ledger.update_capacity(reported);
-    // The rebuild resets the per-CPU allocation bitmap, so re-apply the
-    // spec-core exclusions to the current layout.
-    ledger.set_spec_exclusions(spec_cpus);
+    // The rebuild resets the per-CPU allocation bitmap and clears both, so
+    // re-apply them to the current layout.
+    exclusions.apply(ledger);
     if change == spur_sched::cons_tres::CapacityChange::Applied {
         let ids: Vec<u64> = ledger.gpus.iter().map(|g| g.stable_id).collect();
         ledger.set_fenced(tick.ledger_fenced(&tick.fences, &ids));
@@ -1417,7 +1550,10 @@ fn pinned_gpu(held: &GpuResource, fresh: &ResourceSet) -> GpuResource {
 pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
     let cpus = discover_cpus();
     let memory_mb = discover_memory_mb();
-    let gpus = gpus_from_registry(registry);
+    // Real online topology so the local allocation ledger indexes jobs by
+    // real CPU IDs, not a synthetic 0..cpus that can hand out offline CPUs.
+    let topology = discover_cpu_topology(Path::new("/sys"));
+    let gpus = gpus_from_registry(registry, topology.as_ref());
 
     ResourceSet {
         cpus,
@@ -1428,9 +1564,7 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generation: 0,
         fabric_binding_version: spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY,
         block_file_revision: None,
-        // Real online topology so the local allocation ledger indexes jobs by
-        // real CPU IDs, not a synthetic 0..cpus that can hand out offline CPUs.
-        topology: discover_cpu_topology(Path::new("/sys")),
+        topology,
     }
 }
 
@@ -1467,7 +1601,10 @@ fn build_peer_gpus(links: Option<&[i32]>, gpu_device_ids: &[u32]) -> Vec<u32> {
 }
 
 /// Convert injectable GPU registry entries to `GpuResource` for the scheduler.
-fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
+fn gpus_from_registry(
+    registry: &DeviceRegistry,
+    topology: Option<&spur_core::cpu_topology::CpuTopology>,
+) -> Vec<GpuResource> {
     let gpu_entries: Vec<_> = registry
         .list()
         .iter()
@@ -1486,8 +1623,54 @@ fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
             link_type: link_type_to_gpu(resolve_link_type(entry)),
             topology: entry.topology.clone(),
             stable_id: entry.stable_id,
+            numa_node: entry
+                .numa_node
+                .or_else(|| entry.topology.as_ref().and_then(|t| t.numa_node)),
+            affinity_cpus: affinity_cpus_of(entry.cores.as_deref(), topology),
         })
         .collect()
+}
+
+fn numa_cpus(
+    topology: Option<&spur_core::cpu_topology::CpuTopology>,
+    numa_node: Option<u32>,
+) -> Vec<u32> {
+    let (Some(topology), Some(node)) = (topology, numa_node) else {
+        return Vec::new();
+    };
+    let mut cpus: Vec<u32> = topology
+        .cores
+        .iter()
+        .filter(|core| core.numa_node == Some(node))
+        .flat_map(|core| core.cpus.iter().copied())
+        .collect();
+    cpus.sort_unstable();
+    cpus
+}
+
+/// CPU IDs of the cores a GPU's `cores=` names (Slurm core indices, in the
+/// topology's socket-major order). An index beyond the node is dropped.
+fn affinity_cpus_of(
+    cores: Option<&[u32]>,
+    topology: Option<&spur_core::cpu_topology::CpuTopology>,
+) -> Vec<u32> {
+    let (Some(cores), Some(topology)) = (cores, topology) else {
+        return Vec::new();
+    };
+    let mut cpus = Vec::new();
+    for &index in cores {
+        match topology.cores.get(index as usize) {
+            Some(core) => cpus.extend(&core.cpus),
+            None => warn!(
+                core = index,
+                cores = topology.cores.len(),
+                "cores= names a core this node does not have; ignoring it"
+            ),
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    cpus
 }
 
 fn generic_from_registry(registry: &DeviceRegistry) -> HashMap<String, u64> {
@@ -1563,29 +1746,52 @@ fn read_sysfs_u32(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// The `cpuset.cpus` of each live job cgroup under the spur root, for the
-/// enforcer to reconcile the root against (so a shrinking root never empties a
-/// running job's set). A job with no cpuset bound contributes nothing.
-fn read_live_job_cpusets(root: &Path) -> Vec<Vec<u32>> {
-    let mut out = Vec::new();
+/// Every job cgroup directly under the spur root, with its `cpuset.cpus` and whether
+/// it is populated (see crate AGENTS.md "No narrowing" for how this feeds the memory floor).
+fn read_live_jobs(root: &Path) -> Vec<crate::spec::LiveJob> {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(n) = name.to_str() else { continue };
-        if !n.starts_with("job_") {
-            continue;
-        }
-        if let Ok(list) = std::fs::read_to_string(entry.path().join("cpuset.cpus")) {
-            if let Ok(cpus) = spur_core::cpu_topology::parse_cpu_list(list.trim()) {
-                if !cpus.is_empty() {
-                    out.push(cpus);
-                }
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.file_name().to_str()?.to_owned();
+            if !dir.starts_with("job_") {
+                return None;
             }
-        }
-    }
-    out
+            let cpus = std::fs::read_to_string(entry.path().join("cpuset.cpus"))
+                .ok()
+                .and_then(|list| spur_core::cpu_topology::parse_cpu_list(list.trim()).ok())
+                .unwrap_or_default();
+            let populated = is_populated(&entry.path());
+            Some(crate::spec::LiveJob {
+                dir,
+                cpus,
+                populated,
+            })
+        })
+        .collect()
+}
+
+/// `populated` in `cgroup.events` counts descendants; a job's processes live in
+/// `step_*` children, so its own `cgroup.procs` is empty. Unreadable counts as
+/// populated, the conservative choice.
+fn is_populated(job_dir: &Path) -> bool {
+    let Ok(events) = std::fs::read_to_string(job_dir.join("cgroup.events")) else {
+        return true;
+    };
+    events
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+        .is_none_or(|v| v.trim() != "0")
+}
+
+/// The directory name a run's cgroup gets under the root.
+fn run_dir(root: &Path, job_id: u32, run_attempt: u32) -> Option<String> {
+    crate::executor::cgroup_path_for(root, job_id, run_attempt)
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 /// Pin every thread of spurd to `cpus`. Best-effort: the caller logs a failure.
@@ -1747,6 +1953,7 @@ pub fn allocations_to_proto(
             .fabric_binding
             .as_ref()
             .map(spur_core::fabric_binding::to_proto),
+        reserved_cpus: r.reserved_cpus,
     }
 }
 
@@ -1772,6 +1979,8 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
                     .as_ref()
                     .map(spur_core::device_topology::to_proto),
                 stable_id: g.stable_id,
+                numa_node: g.numa_node,
+                affinity_cpus: g.affinity_cpus.clone(),
             })
             .collect(),
         generic: r.generic.clone(),
@@ -2207,7 +2416,7 @@ mod tests {
         let mut registry = DeviceRegistry::new();
         registry.populate(&cache, &GresCache::from_entries(&[]));
         let inventory = ResourceSet {
-            gpus: gpus_from_registry(&registry),
+            gpus: gpus_from_registry(&registry, None),
             ..Default::default()
         };
         assert_eq!(inventory.gpus[0].topology.as_ref(), Some(&expected));
@@ -2218,6 +2427,51 @@ mod tests {
     }
 
     use super::*;
+
+    /// 2 sockets x 2 cores x 2 threads: socket s, core c -> CPUs s*2+c and s*2+c+4.
+    fn small_topology() -> spur_core::cpu_topology::CpuTopology {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = (0..2u32)
+            .flat_map(|socket| {
+                (0..2u32).flat_map(move |core| {
+                    [0u32, 4].map(|thread| CpuRecord {
+                        cpu: socket * 2 + core + thread,
+                        socket,
+                        core_id: core,
+                        numa_node: Some(socket),
+                    })
+                })
+            })
+            .collect();
+        CpuTopology::from_cpus(&records)
+    }
+
+    #[test]
+    fn a_gpu_without_cores_is_near_its_numa_nodes_cpus() {
+        let topology = small_topology();
+        assert_eq!(numa_cpus(Some(&topology), Some(1)), vec![2, 3, 6, 7]);
+        assert!(numa_cpus(Some(&topology), None).is_empty());
+        assert!(numa_cpus(None, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn configured_cores_become_the_cpu_ids_of_those_cores() {
+        let topology = small_topology();
+        assert_eq!(
+            affinity_cpus_of(Some(&[0, 3]), Some(&topology)),
+            vec![0, 3, 4, 7]
+        );
+        assert_eq!(
+            affinity_cpus_of(Some(&[1, 9]), Some(&topology)),
+            vec![1, 5],
+            "a core beyond the node is dropped"
+        );
+        assert!(affinity_cpus_of(None, Some(&topology)).is_empty());
+        assert!(
+            affinity_cpus_of(Some(&[0]), None).is_empty(),
+            "no topology, no IDs"
+        );
+    }
     use spur_devices::cdi::annotations;
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
@@ -2267,15 +2521,278 @@ mod tests {
     }
 
     #[test]
-    fn read_live_job_cpusets_reads_each_job_dir() {
+    fn read_live_jobs_names_each_job_dir() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
-        write_file(&root.join("job_9_1/cpuset.cpus"), "4,5");
+        write_file(&root.join("job_7_0/cgroup.events"), "populated 1\n");
+        write_file(&root.join("job_9_1/cpuset.cpus"), "\n");
+        write_file(&root.join("job_9_1/cgroup.events"), "populated 1\n");
         write_file(&root.join("not_a_job/cpuset.cpus"), "8");
-        let mut sets = read_live_job_cpusets(root);
-        sets.sort();
-        assert_eq!(sets, vec![vec![0, 1, 2], vec![4, 5]]);
+        let mut jobs = read_live_jobs(root);
+        jobs.sort_by(|a, b| a.dir.cmp(&b.dir));
+        assert_eq!(
+            jobs,
+            vec![
+                crate::spec::LiveJob {
+                    dir: "job_7_0".into(),
+                    cpus: vec![0, 1, 2],
+                    populated: true,
+                },
+                crate::spec::LiveJob {
+                    dir: "job_9_1".into(),
+                    cpus: vec![],
+                    populated: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unpopulated_job_dir_is_returned_but_not_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        write_file(&root.join("job_7_0/cgroup.events"), "populated 0\n");
+        let jobs = read_live_jobs(root);
+        assert_eq!(
+            jobs,
+            vec![crate::spec::LiveJob {
+                dir: "job_7_0".into(),
+                cpus: vec![0, 1, 2],
+                populated: false,
+            }],
+            "its cpus must still widen the root, but it cannot hold the memory floor"
+        );
+    }
+
+    #[test]
+    fn a_job_with_processes_only_in_a_step_child_is_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        write_file(&root.join("job_7_0/cgroup.events"), "populated 1\n");
+        // The job's own cgroup.procs is empty: processes live in the step_*
+        // child. cgroup.procs must not be used as the liveness signal.
+        write_file(&root.join("job_7_0/cgroup.procs"), "");
+        write_file(&root.join("job_7_0/step_0/cgroup.procs"), "4242\n");
+        let jobs = read_live_jobs(root);
+        assert_eq!(
+            jobs,
+            vec![crate::spec::LiveJob {
+                dir: "job_7_0".into(),
+                cpus: vec![0, 1, 2],
+                populated: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_cgroup_events_counts_as_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No cgroup.events file at all: conservative default is populated, so
+        // a floor never narrows out from under a job we can't read.
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        let jobs = read_live_jobs(root);
+        assert_eq!(
+            jobs,
+            vec![crate::spec::LiveJob {
+                dir: "job_7_0".into(),
+                cpus: vec![0, 1, 2],
+                populated: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_ledger_run_without_a_cgroup_counts_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spur");
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0");
+        write_file(&root.join("job_7_0/cgroup.events"), "populated 1\n");
+        let reporter = test_reporter(rset(4, 0, vec![])).with_spec_enforcement(
+            root.clone(),
+            dir.path().join("marker"),
+            true,
+        );
+        let ledger = Arc::new(Mutex::new(NodeAllocation::new(
+            "n1".into(),
+            &rset(4, 0, vec![]),
+        )));
+        {
+            let mut alloc = ledger.blocking_lock();
+            alloc.allocate_for_job(3, 2, 1, 0, &[]).unwrap();
+            alloc.allocate_for_job(7, 0, 1, 0, &[]).unwrap();
+        }
+        reporter.set_allocation(ledger);
+
+        let mut live = reporter.live_jobs();
+        live.sort_by(|a, b| a.dir.cmp(&b.dir));
+        let dirs: Vec<&str> = live.iter().map(|j| j.dir.as_str()).collect();
+        assert_eq!(
+            dirs,
+            vec!["job_3_2", "job_7_0"],
+            "a launch in flight is live too"
+        );
+        assert_eq!(
+            live[0].cpus,
+            vec![0],
+            "the ledger's own cpus, so a layout change keeps them in the root cpuset"
+        );
+        assert_eq!(
+            live[1].cpus,
+            vec![0],
+            "the cgroup's cpuset, not a second entry"
+        );
+        assert!(
+            live.iter().all(|j| j.populated),
+            "both a ledger-only run and a populated cgroup hold the floor"
+        );
+    }
+
+    #[test]
+    fn a_starting_job_keeps_its_cpus_and_holds_the_floor() {
+        // setup_cgroup() writes the job's real cpuset.cpus before any
+        // process joins a step_* child, so the dir reads populated 0 for a
+        // window the ledger already covers: the merge must not drop its CPUs
+        // or treat it as unable to hold the floor.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spur");
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        write_file(&root.join("job_7_0/cgroup.events"), "populated 0\n");
+        let reporter = test_reporter(rset(4, 0, vec![])).with_spec_enforcement(
+            root.clone(),
+            dir.path().join("marker"),
+            true,
+        );
+        let ledger = Arc::new(Mutex::new(NodeAllocation::new(
+            "n1".into(),
+            &rset(4, 0, vec![]),
+        )));
+        {
+            let mut alloc = ledger.blocking_lock();
+            alloc.allocate_for_job(7, 0, 1, 0, &[]).unwrap();
+        }
+        reporter.set_allocation(ledger);
+
+        let live = reporter.live_jobs();
+        assert_eq!(
+            live,
+            vec![crate::spec::LiveJob {
+                dir: "job_7_0".into(),
+                cpus: vec![0, 1, 2],
+                populated: true,
+            }],
+            "the ledger holding the run must mark it populated despite the cgroup reading populated 0"
+        );
+    }
+
+    #[test]
+    fn an_orphan_keeps_its_cpus_but_cannot_hold_the_floor() {
+        // Nothing in the ledger claims this dir: a crash or teardown race
+        // left it behind. Its CPUs must still widen the root (never
+        // narrowed), but it must not count toward the memory floor.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spur");
+        write_file(&root.join("job_9_1/cpuset.cpus"), "4-5");
+        write_file(&root.join("job_9_1/cgroup.events"), "populated 0\n");
+        let reporter = test_reporter(rset(4, 0, vec![])).with_spec_enforcement(
+            root.clone(),
+            dir.path().join("marker"),
+            true,
+        );
+        reporter.set_allocation(Arc::new(Mutex::new(NodeAllocation::new(
+            "n1".into(),
+            &rset(4, 0, vec![]),
+        ))));
+
+        let live = reporter.live_jobs();
+        assert_eq!(
+            live,
+            vec![crate::spec::LiveJob {
+                dir: "job_9_1".into(),
+                cpus: vec![4, 5],
+                populated: false,
+            }]
+        );
+        assert_eq!(
+            crate::spec::reconcile_root_cpuset(&[0, 1], &live),
+            vec![0, 1, 4, 5],
+            "an orphan's cpus still widen the root"
+        );
+    }
+
+    fn reserved_layout() -> spur_proto::proto::CoreLayout {
+        spur_proto::proto::CoreLayout {
+            gpu_reserved: vec![spur_proto::proto::GpuReservedCpus {
+                stable_id: 7,
+                cpus: vec![0, 1],
+            }],
+            general_cpus: vec![2, 3],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn heartbeat_carries_blocked_cpus_with_the_held_fingerprint() {
+        let resources = rset(4, 0, vec![gpu(0, 7)]);
+        let reporter = test_reporter(resources.clone());
+        let ledger = Arc::new(Mutex::new(NodeAllocation::new("n1".into(), &resources)));
+        {
+            // First-fit onto CPU 0 before the node held a layout.
+            let mut alloc = ledger.blocking_lock();
+            alloc.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+            alloc.commit_job(1, 1);
+        }
+        reporter.set_allocation(Arc::clone(&ledger));
+        let layout = reserved_layout();
+        let fingerprint = spur_core::core_layout::CoreLayout::from(layout.clone()).fingerprint();
+        assert!(reporter.adopt_core_layout(Some(layout), None, crate::spec::Delivery::Launch));
+
+        let report = reporter.layout_report();
+        assert_eq!(report.fingerprint, fingerprint);
+        assert_eq!(
+            report.blocked_cpus,
+            vec![spur_proto::proto::GpuBlockedCpus {
+                stable_id: 7,
+                cpus: 1,
+            }]
+        );
+
+        ledger.blocking_lock().release_job(1);
+        assert!(
+            reporter.layout_report().blocked_cpus.is_empty(),
+            "cleared once the blocker ends"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adopting_a_new_layout_triggers_an_early_heartbeat() {
+        let reporter = test_reporter(rset(4, 0, vec![gpu(0, 7)]));
+        let mut interval = heartbeat_interval();
+        interval.tick().await;
+        let start = tokio::time::Instant::now();
+
+        assert!(reporter.adopt_core_layout(
+            Some(reserved_layout()),
+            None,
+            crate::spec::Delivery::Launch
+        ));
+        next_heartbeat(&mut interval, &reporter.heartbeat_now).await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "sent at once");
+
+        assert!(!reporter.adopt_core_layout(
+            Some(reserved_layout()),
+            None,
+            crate::spec::Delivery::Launch
+        ));
+        next_heartbeat(&mut interval, &reporter.heartbeat_now).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(spur_core::config::HEARTBEAT_INTERVAL_SECS),
+            "an unchanged layout waits a full period, counted from the early beat"
+        );
     }
 
     fn stable_registry(devices: &[(u64, &str)]) -> DeviceRegistry {
@@ -2354,6 +2871,52 @@ mod tests {
     }
 
     #[test]
+    fn registry_gpus_report_their_numa_node_and_configured_cores() {
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "0".into(),
+                annotations: [
+                    (annotations::GPU_TYPE.into(), "mi300x".into()),
+                    (annotations::NUMA_NODE.into(), "1".into()),
+                    (annotations::CORES.into(), "2-3".into()),
+                ]
+                .into(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![DeviceNode {
+                        path: "/dev/dri/renderD128".into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    }],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        };
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cache, &GresCache::from_entries(&[]));
+
+        let topology = small_topology();
+        let gpus = gpus_from_registry(&reg, Some(&topology));
+        assert_eq!(gpus[0].numa_node, Some(1));
+        assert_eq!(
+            gpus[0].affinity_cpus,
+            vec![2, 3, 6, 7],
+            "socket 1's two cores"
+        );
+    }
+
+    #[test]
     fn test_gpus_from_registry_link_type() {
         let spec = CdiSpec {
             cdi_version: "0.6.0".into(),
@@ -2389,7 +2952,7 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&cache, &GresCache::from_entries(&[]));
 
-        let gpus = gpus_from_registry(&reg);
+        let gpus = gpus_from_registry(&reg, None);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
     }
@@ -2430,7 +2993,7 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&cache, &GresCache::from_entries(&[]));
 
-        let gpus = gpus_from_registry(&reg);
+        let gpus = gpus_from_registry(&reg, None);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].stable_id, 129);
     }
@@ -2460,7 +3023,7 @@ mod tests {
         }]);
         reg.populate(&CdiCache::new(), &gres_cache);
 
-        let gpus = gpus_from_registry(&reg);
+        let gpus = gpus_from_registry(&reg, None);
         assert_eq!(gpus.len(), 3);
         for gpu in &gpus {
             assert_eq!(gpu.peer_gpus, vec![1, 2]);
@@ -2479,7 +3042,7 @@ mod tests {
         }]);
         reg.populate(&CdiCache::new(), &gres_cache);
 
-        let gpus = gpus_from_registry(&reg);
+        let gpus = gpus_from_registry(&reg, None);
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
         assert_eq!(gpus[1].link_type, GpuLinkType::XGMI);
@@ -2649,12 +3212,12 @@ mod tests {
         };
 
         let held = running.lock().await;
-        let req = reporter.heartbeat_request().await;
+        let req = reporter.heartbeat_request(LayoutReport::default()).await;
         assert!(req.running_jobs_incomplete);
         assert!(job_ids(&req).is_empty());
 
         drop(held);
-        let req = reporter.heartbeat_request().await;
+        let req = reporter.heartbeat_request(LayoutReport::default()).await;
         assert!(!req.running_jobs_incomplete);
         assert_eq!(job_ids(&req), vec![7]);
     }
@@ -2747,10 +3310,13 @@ mod tests {
     }
 
     #[test]
-    fn registration_request_advertises_signal_job() {
+    fn registration_request_advertises_signal_job_and_step_resources() {
         let reporter = test_reporter(rset(8, 0, vec![]));
         let req = reporter.registration_request(&rset(8, 0, vec![]));
-        assert_eq!(req.capabilities, vec!["signal-job".to_string()]);
+        assert_eq!(
+            req.capabilities,
+            vec!["signal-job".to_string(), "step-resources".to_string()]
+        );
     }
 
     #[test]
@@ -3125,7 +3691,7 @@ mod tests {
     async fn each_spurd_process_reports_its_own_instance() {
         let reporter = test_reporter(rset(8, 0, vec![]));
         let registration = reporter.registration_request(&rset(8, 0, vec![]));
-        let heartbeat = reporter.heartbeat_request().await;
+        let heartbeat = reporter.heartbeat_request(LayoutReport::default()).await;
         assert!(!registration.agent_instance.is_empty());
         assert_eq!(registration.agent_instance, heartbeat.agent_instance);
 
@@ -3219,6 +3785,8 @@ mod tests {
             link_type: GpuLinkType::XGMI,
             topology: None,
             stable_id: s,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         };
         let rs = |gpus: Vec<GpuResource>| ResourceSet {
             fabric_binding_version: 0,
@@ -3266,6 +3834,8 @@ mod tests {
             link_type: GpuLinkType::XGMI,
             topology: None,
             stable_id,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         }
     }
 
@@ -3692,7 +4262,12 @@ mod tests {
             }
             race(&mut self.ledger);
             let reported = tick.reported();
-            let change = apply_to_ledger(&mut self.ledger, &tick, &reported, &[]);
+            let change = apply_to_ledger(
+                &mut self.ledger,
+                &tick,
+                &reported,
+                &crate::spec::LedgerExclusions::default(),
+            );
             if change != spur_sched::cons_tres::CapacityChange::Applied {
                 return;
             }

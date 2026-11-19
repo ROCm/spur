@@ -110,6 +110,17 @@ All three require the **Administrator** role (see
 :ref:`privileged-operations`). ``delete`` refuses a partition that still has
 running, completing, or suspended jobs.
 
+A GPU partition can give GPU jobs a default number of CPUs per GPU with
+``def_cpu_per_gpu`` (Slurm's ``DefCpuPerGPU``; see
+:doc:`/admin-guide/configuration`). It applies, at submit, to GPU jobs that set
+neither ``-c`` nor ``--cpus-per-gpu``. Set or change it at runtime with
+``scontrol update partition``; ``DefCpuPerGPU=0`` clears it:
+
+.. code-block:: bash
+
+   scontrol update PartitionName=gpu DefCpuPerGPU=4
+   scontrol update PartitionName=gpu DefCpuPerGPU=0   # clears it
+
 Runtime changes are written to the controller's Raft log, so they replicate to
 follower controllers and survive a restart. A partition deleted at runtime stays
 deleted after a restart even if ``spur.conf`` still defines it. A restart does

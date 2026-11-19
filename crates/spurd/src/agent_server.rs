@@ -31,6 +31,7 @@ use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::gpu_binding::BindingCheck;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
+use spur_core::native_exec::resolve_cgroup_budget;
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
     batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
@@ -821,16 +822,25 @@ fn follow_ledger_renames(
     rename_descriptor_gpu_ids(state_dir, renamed);
 }
 
-/// A descriptor with no recorded cores — a step, or one written before they
-/// were persisted; the lowest free cores keep occupancy right if not identity.
-fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
-    allocation
-        .cpu_ids()
-        .iter()
-        .copied()
-        .filter(|&cpu| !allocation.is_allocated(cpu))
-        .take(cpus as usize)
-        .collect()
+/// What a surviving job's own cgroup says about the CPUs it runs on.
+enum LiveCpus {
+    Running(Vec<u32>),
+    /// No cgroup: the job did not survive, so there is nothing to place.
+    Gone,
+    /// The cgroup is there but its cpuset cannot be read.
+    Unknown,
+}
+
+fn read_live_cpus(cgroup_root: &std::path::Path, job_id: u32, run_attempt: u32) -> LiveCpus {
+    let job = crate::executor::cgroup_path_for(cgroup_root, job_id, run_attempt);
+    if !job.is_dir() {
+        return LiveCpus::Gone;
+    }
+    std::fs::read_to_string(job.join("cpuset.cpus.effective"))
+        .ok()
+        .and_then(|list| spur_core::cpu_topology::parse_cpu_list(list.trim()).ok())
+        .filter(|cpus| !cpus.is_empty())
+        .map_or(LiveCpus::Unknown, LiveCpus::Running)
 }
 
 /// Every supervisor a job currently holds. Job-level operations (signal,
@@ -1238,6 +1248,9 @@ pub struct TrackedJob {
     gpu_devices: Vec<u64>,
     cpus: u32,
     memory_mb: u64,
+    /// The node's schedulable memory, for a typed step's ceiling check when
+    /// `memory_mb` is 0; 0 = unknown (e.g. recovered after a restart).
+    memory_ceiling_mb: u64,
     nodelist: String,
     mpi: String,
     /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
@@ -1866,33 +1879,6 @@ async fn await_lease_expiry(
     }
 }
 
-/// Enforced per-node budget: the controller's allocation wins, the spec is the
-/// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
-fn resolve_cgroup_budget(
-    alloc: Option<&ResourceAllocations>,
-    spec: &JobSpec,
-    tasks_per_node: u32,
-) -> (u32, u64) {
-    let (alloc_cpus, alloc_mem_mb) = alloc.map(|a| (a.cpus, a.memory_mb)).unwrap_or((0, 0));
-    // Saturating: the spec is caller-supplied, and a wrapped product would set
-    // limits from a budget bearing no relation to what the job asked for.
-    let cpus = if alloc_cpus > 0 {
-        alloc_cpus
-    } else {
-        tasks_per_node
-            .max(1)
-            .saturating_mul(spec.cpus_per_task.max(1))
-    };
-    let memory_mb = if alloc_mem_mb > 0 {
-        alloc_mem_mb
-    } else if spec.memory_per_node_mb > 0 {
-        spec.memory_per_node_mb
-    } else {
-        spec.memory_per_cpu_mb.saturating_mul(cpus as u64)
-    };
-    (cpus, memory_mb)
-}
-
 /// What to do with an allocation once its cgroup setup has been attempted.
 enum AllocationCgroup {
     /// Enforcement is in place, or off by config; record the allocation.
@@ -2251,6 +2237,7 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         gpu_devices: descriptor.resources.gpu_devices.clone(),
         cpus: descriptor.resources.cpus,
         memory_mb: descriptor.resources.memory_mb,
+        memory_ceiling_mb: descriptor.resources.memory_ceiling_mb,
         nodelist: descriptor.resources.nodelist.clone(),
         mpi: descriptor.resources.mpi.clone(),
         run_attempt: descriptor.run_attempt,
@@ -3354,6 +3341,7 @@ fn cancelled_step_response() -> RunCommandResponse {
         exit_code: 128 + nix::sys::signal::Signal::SIGTERM as i32,
         stdout: String::new(),
         stderr: "step cancelled".into(),
+        oom_killed: false,
     }
 }
 
@@ -3414,63 +3402,52 @@ async fn kill_step_process_group(child: &mut tokio::process::Child) {
 }
 
 #[cfg(test)]
-mod budget_tests {
-    use super::resolve_cgroup_budget;
-    // Explicit path: `spur_core::resource::ResourceAllocations` is a different
-    // type with the same name, and the module glob-imports the proto one.
-    use spur_proto::proto::{JobSpec, ResourceAllocations};
+mod oom_tests {
+    use spur_core::job::OOM_SIGNAL_FLAG;
 
-    fn spec(cpus_per_task: u32, mem_node: u64, mem_per_cpu: u64) -> JobSpec {
-        JobSpec {
-            cpus_per_task,
-            memory_per_node_mb: mem_node,
-            memory_per_cpu_mb: mem_per_cpu,
-            ..Default::default()
-        }
-    }
-
+    // A child the supervisor sees OOM-killed via its cgroup, but which then
+    // exits on its own (no real signal), carries only the flag: `signal ==
+    // OOM_SIGNAL_FLAG`. `step_reply` must still report the real exit code.
     #[test]
-    fn allocation_wins_when_present() {
-        // Spec asks 2 cpus / 1024 MB per task; the node allocation grants 8/32G.
-        let alloc = ResourceAllocations {
-            cpus: 8,
-            memory_mb: 32_768,
-            ..Default::default()
-        };
+    fn step_reply_decodes_a_flag_only_oom_kill_with_the_real_exit_code() {
+        use crate::step_completion::StepOutcome;
         assert_eq!(
-            resolve_cgroup_budget(Some(&alloc), &spec(2, 1024, 0), 4),
-            (8, 32_768)
+            super::step_reply(StepOutcome {
+                exit_code: 3,
+                signal: OOM_SIGNAL_FLAG,
+            }),
+            (3, true),
         );
     }
 
     #[test]
-    fn spec_fallback_counts_every_task_on_the_node() {
-        // The G1 undercount: 4 tasks x 2 cpus is 8 cores, not 2.
-        assert_eq!(resolve_cgroup_budget(None, &spec(2, 1024, 0), 4), (8, 1024));
+    fn step_reply_keeps_deciding_real_signal_deaths_the_same_way() {
+        use crate::step_completion::StepOutcome;
+        assert_eq!(
+            super::step_reply(StepOutcome {
+                exit_code: 0,
+                signal: 9,
+            }),
+            (137, false),
+            "a plain SIGKILL"
+        );
+        assert_eq!(
+            super::step_reply(StepOutcome {
+                exit_code: 0,
+                signal: OOM_SIGNAL_FLAG | 9,
+            }),
+            (137, true),
+            "SIGKILL plus the OOM flag"
+        );
     }
 
-    #[test]
-    fn spec_fallback_honors_mem_per_cpu() {
-        // --mem-per-cpu=512 with 8 cores on this node.
-        assert_eq!(resolve_cgroup_budget(None, &spec(2, 0, 512), 4), (8, 4096));
-    }
-
-    #[test]
-    fn an_absurd_spec_saturates_instead_of_wrapping() {
-        // A spec reaches the agent unvalidated, and a wrapped product would
-        // hand limits_for a budget unrelated to the request.
-        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(100_000, 0, 0), 100_000);
-        assert_eq!(cpus, u32::MAX);
-        assert_eq!(memory_mb, 0, "no memory request stays unbounded");
-
-        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(u32::MAX, 0, u64::MAX), 2);
-        assert_eq!(cpus, u32::MAX);
-        assert_eq!(memory_mb, u64::MAX);
-    }
-
-    #[test]
-    fn floors_cpus_at_one() {
-        assert_eq!(resolve_cgroup_budget(None, &spec(0, 0, 0), 0), (1, 0));
+    // The replay path (`await_step` -> `awaited_step_response`) must decode a
+    // flag-only outcome the same way the live path does.
+    #[tokio::test]
+    async fn awaited_step_response_reports_the_real_exit_code_for_a_flag_only_oom_kill() {
+        let response = super::awaited_step_response(1, 1, 3, OOM_SIGNAL_FLAG).await;
+        assert_eq!(response.exit_code, 3);
+        assert!(response.oom_killed);
     }
 }
 
@@ -3748,7 +3725,7 @@ fn interactive_exit_future(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>> {
     Box::pin(async move {
         match waiter.await {
-            Ok(outcome) => spur_core::process::shell_exit_code(&step_exit_status(outcome)),
+            Ok(outcome) => step_reply(outcome).0,
             Err(_) => 128,
         }
     })
@@ -4108,12 +4085,13 @@ async fn awaited_step_response(
     exit_code: i32,
     signal: i32,
 ) -> RunCommandResponse {
+    let (exit_code, oom_killed) =
+        step_reply(crate::step_completion::StepOutcome { exit_code, signal });
     RunCommandResponse {
-        exit_code: spur_core::process::shell_exit_code(&step_exit_status(
-            crate::step_completion::StepOutcome { exit_code, signal },
-        )),
+        exit_code,
         stdout: read_back_step_output(job_id, step_id, false).await,
         stderr: read_back_step_output(job_id, step_id, true).await,
+        oom_killed,
     }
 }
 
@@ -4126,15 +4104,21 @@ async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> Strin
     String::new()
 }
 
-/// wait(2) encoding, so a caller comparing against a directly-reaped step's
-/// status sees the same shape.
-fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::process::ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    if outcome.signal != 0 {
-        std::process::ExitStatus::from_raw(outcome.signal)
+/// The reply for a step whose outcome may carry `OOM_SIGNAL_FLAG`: strips the
+/// flag before deciding between a signal exit and the real `exit_code`, so a
+/// flag-only outcome (the child exited on its own after being OOM-killed, no
+/// real signal) reports that exit code with `oom_killed` still true instead of
+/// collapsing to wait(2)'s "exit code 16, not signaled" once the signal is
+/// zero.
+fn step_reply(outcome: crate::step_completion::StepOutcome) -> (i32, bool) {
+    let oom_killed = outcome.signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
+    let signal = outcome.signal & !spur_core::job::OOM_SIGNAL_FLAG;
+    let exit_code = if signal != 0 {
+        128 + signal
     } else {
-        std::process::ExitStatus::from_raw(outcome.exit_code << 8)
-    }
+        outcome.exit_code
+    };
+    (exit_code, oom_killed)
 }
 
 /// Builds a fresh interactive step's process environment, in the same
@@ -4559,7 +4543,10 @@ pub struct AgentService {
     /// Serializes launches that would land on one supervisor session.
     step_launches: crate::job_lifecycle::StepLaunchLifecycle,
     /// GPUs launching steps have taken before their supervisor's descriptor holds them.
-    pending_step_gpus: crate::step_resources::PendingStepGpus,
+    pending_step_shares: crate::step_resources::PendingStepShares,
+    /// Typed-step shares claimed ahead of launch (two-phase dispatch), until
+    /// `RunCommand` consumes them, `CancelStep` releases them, or they expire.
+    step_claims: crate::step_resources::StepClaims,
     stepds: Arc<Mutex<StepdMap>>,
     stepd_state_dir: std::path::PathBuf,
     /// Candidate roots `RunCommand`'s job spool is created under, in order.
@@ -4702,7 +4689,8 @@ impl AgentService {
             interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             step_launches: crate::job_lifecycle::StepLaunchLifecycle::default(),
-            pending_step_gpus: crate::step_resources::PendingStepGpus::default(),
+            pending_step_shares: crate::step_resources::PendingStepShares::default(),
+            step_claims: crate::step_resources::StepClaims::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             force_legacy_launch: true,
@@ -4823,26 +4811,24 @@ impl AgentService {
         descriptors: &[crate::stepd::StepdDescriptor],
         renamed: &HashMap<u64, u64>,
     ) {
+        let root = std::path::Path::new(crate::executor::CGROUP_ROOT);
+        self.replay_adopted_allocations_in(descriptors, renamed, root)
+            .await;
+    }
+
+    async fn replay_adopted_allocations_in(
+        &self,
+        descriptors: &[crate::stepd::StepdDescriptor],
+        renamed: &HashMap<u64, u64>,
+        cgroup_root: &std::path::Path,
+    ) {
         let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         let mut allocation = self.allocation.lock().await;
+        // Before any replay, so a recovered job never lands on spec or another
+        // GPU's reserved CPUs.
+        self.apply_spec_exclusions(&mut allocation);
         for descriptor in replayable_allocations(descriptors) {
             let resources = &descriptor.resources;
-            // Dropping a contested core costs this job some occupancy; dropping
-            // the whole replay would leave its live GPUs reading free.
-            let cpu_ids = if resources.cpu_ids.is_empty() {
-                fallback_cpu_ids(&allocation, resources.cpus)
-            } else {
-                allocation.claimable_cpu_ids(descriptor.job_id, &resources.cpu_ids)
-            };
-            if cpu_ids.len() < resources.cpus as usize {
-                warn!(
-                    job_id = descriptor.job_id,
-                    wanted = resources.cpus,
-                    got = cpu_ids.len(),
-                    "fewer free cores than an adopted job recorded; its cores are \
-                     under-counted until it ends"
-                );
-            }
             // The ledger carries the current encoding for every job, bound or not.
             let recorded = renamed_gpu_ids(&resources.gpu_devices, renamed);
             // A legacy descriptor holds positional ids that no longer match the
@@ -4865,6 +4851,49 @@ impl AgentService {
                 }
                 None => recorded,
             };
+            // Dropping a contested core costs this job some occupancy; dropping
+            // the whole replay would leave its live GPUs reading free.
+            let cpu_ids = if !resources.cpu_ids.is_empty() {
+                allocation.claimable_cpu_ids(descriptor.job_id, &resources.cpu_ids)
+            } else {
+                match read_live_cpus(cgroup_root, descriptor.job_id, descriptor.run_attempt) {
+                    // The cgroup can expose more CPUs than the job's own
+                    // budget (e.g. it inherited the root's full cpuset before
+                    // ever writing its own), so cap the claim at resources.cpus.
+                    LiveCpus::Running(ids) => allocation
+                        .claimable_cpu_ids(descriptor.job_id, &ids)
+                        .into_iter()
+                        .take(resources.cpus as usize)
+                        .collect(),
+                    LiveCpus::Gone => {
+                        info!(
+                            job_id = descriptor.job_id,
+                            "an adopted job's cgroup is gone; nothing of it to hold"
+                        );
+                        continue;
+                    }
+                    // Counted but placed by the same rule as a launch, never on
+                    // another GPU's reserved CPUs: guessing a real placement is wrong.
+                    LiveCpus::Unknown => {
+                        warn!(
+                            job_id = descriptor.job_id,
+                            "an adopted job's cpuset is unreadable; holding its CPU count"
+                        );
+                        allocation
+                            .pick_cpu_ids(resources.cpus, &gpu_ids)
+                            .unwrap_or_default()
+                    }
+                }
+            };
+            if cpu_ids.len() < resources.cpus as usize {
+                warn!(
+                    job_id = descriptor.job_id,
+                    wanted = resources.cpus,
+                    got = cpu_ids.len(),
+                    "fewer free cores than an adopted job recorded; its cores are \
+                     under-counted until it ends"
+                );
+            }
             let restored = allocation.restore_for_job(
                 descriptor.job_id,
                 descriptor.run_attempt,
@@ -5059,39 +5088,97 @@ impl AgentService {
             .await
     }
 
-    /// Take `count` of the job's GPUs on this node for a step, skipping any that
-    /// a live supervisor of the same job attempt or another launching step holds.
-    async fn reserve_step_gpus(
+    /// Hold `request` beside what the job attempt's other typed steps hold:
+    /// pending launches, and supervisors through their descriptors.
+    async fn reserve_step_share(
         &self,
-        key: crate::step_resources::StepGpuKey,
-        job_gpus: &[u64],
-        count: usize,
-    ) -> Result<crate::step_resources::StepGpuReservation, Status> {
+        key: crate::step_resources::StepKey,
+        job: &crate::step_resources::JobShare<'_>,
+        request: &crate::step_resources::NodeRequest,
+    ) -> Result<crate::step_resources::StepShareReservation, Status> {
         let (job_id, run_attempt, step_id) = key;
+        // Lazy expiry is enough: a stale claim only matters when another
+        // step tries to reserve against it.
+        self.step_claims.expire(std::time::Instant::now());
+        // Before the steps lock: it locks the ledger, and the two are never nested.
+        let pin = self.step_pin_source(job_id, run_attempt).await;
         let stepds = self.stepds.lock().await;
-        let held = stepds
+        let held: Vec<_> = stepds
             .values()
             .filter(|d| d.job_id == job_id && d.run_attempt == run_attempt && d.step_id != step_id)
-            .filter_map(|d| d.resources.step_limits.gpus.as_ref())
-            .flatten()
-            .copied();
-        self.pending_step_gpus
-            .reserve(key, job_gpus, held, count)
-            .map_err(|exhausted| Status::resource_exhausted(exhausted.to_string()))
+            .map(|d| {
+                let key = (d.job_id, d.run_attempt, d.step_id);
+                (key, d.resources.step_limits.clone())
+            })
+            .collect();
+        self.pending_step_shares
+            .reserve_pinned(key, job, request, held, pin.as_ref())
+            .map_err(|exhausted| spur_proto::step_share_busy(exhausted.to_string()))
     }
 
-    /// Resolve a step's own share of this node and take its GPUs. A step that
-    /// asked for nothing gets empty limits and keeps sharing the job's resources.
+    /// Where a typed GPU step's pinned CPUs come from; `None` when cores are not
+    /// constrained or the job's CPU IDs are not known here.
+    async fn step_pin_source(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Option<crate::step_resources::PinSource> {
+        if !self.cgroup.constrain_cores {
+            return None;
+        }
+        let job_cpus = self
+            .allocation
+            .lock()
+            .await
+            .owner_cpu_ids(job_id, run_attempt)
+            .filter(|cpus| !cpus.is_empty())?
+            .to_vec();
+        let reserved_of = self
+            .reporter
+            .held_exclusions()
+            .gpu_reserved
+            .into_iter()
+            .map(|g| (g.stable_id, g.cpus))
+            .collect();
+        Some(crate::step_resources::PinSource {
+            job_cpus,
+            reserved_of,
+            near_of: self.reporter.gpu_near_cpus(),
+        })
+    }
+
+    /// The ceiling a job with no memory budget of its own gets on this node:
+    /// the controller's value, or (predating that field) this agent's own
+    /// detected total memory. Warns once when neither is known, since the job
+    /// then runs unbounded exactly as it always has.
+    fn resolve_memory_ceiling(&self, job_id: u32, node_memory_ceiling_mb: u64) -> u64 {
+        let detected = self.reporter.snapshot_resources().memory_mb;
+        let ceiling =
+            spur_core::native_exec::resolve_memory_ceiling(node_memory_ceiling_mb, detected);
+        if ceiling == 0 {
+            warn!(
+                job_id,
+                "no node memory ceiling available (older controller and undetectable local \
+                 memory); a job with no memory request of its own will run unbounded"
+            );
+        }
+        ceiling
+    }
+
+    /// Resolve a step's own share of this node and hold it. A step that asked
+    /// for nothing gets empty limits and keeps sharing the job's resources; an
+    /// `--overlap` step is limited but holds nothing, as in Slurm.
     async fn claim_step_share(
         &self,
         request: Option<&spur_proto::proto::StepResources>,
-        key: crate::step_resources::StepGpuKey,
+        key: crate::step_resources::StepKey,
         placement: crate::step_resources::StepPlacement,
         job: &crate::step_resources::JobShare<'_>,
+        overlap: bool,
     ) -> Result<
         (
             crate::step_resources::StepLimits,
-            Option<crate::step_resources::StepGpuReservation>,
+            Option<crate::step_resources::StepShareReservation>,
         ),
         Status,
     > {
@@ -5111,16 +5198,50 @@ impl AgentService {
                 self.reporter.hostname
             )));
         }
-        let reservation = match resolved.gpus {
-            Some(count) => Some(self.reserve_step_gpus(key, job.gpus, count).await?),
-            None => None,
+        if overlap {
+            let limits = crate::step_resources::StepLimits {
+                cpus: resolved.cpus,
+                memory_mb: resolved.memory_mb,
+                gpus: resolved.gpus.map(|n| resolved.gpu_pool[..n].to_vec()),
+                cpu_ids: Vec::new(),
+                overlap: true,
+            };
+            return Ok((limits, None));
+        }
+        let reservation = self.reserve_step_share(key, job, &resolved).await?;
+        Ok((reservation.limits().clone(), Some(reservation)))
+    }
+
+    /// Checks a `ClaimStep` request's credential, when native auth is
+    /// configured. Unlike `run_command`'s credential check, this never
+    /// records a launch acceptance — a claim starts nothing.
+    async fn verify_claim_credential(&self, req: &ClaimStepRequest) -> Result<(), Status> {
+        let Some(keys) = &self.cred_keys else {
+            return Ok(());
         };
-        let limits = crate::step_resources::StepLimits {
-            cpus: resolved.cpus,
-            memory_mb: resolved.memory_mb,
-            gpus: reservation.as_ref().map(|r| r.gpus().to_vec()),
-        };
-        Ok((limits, reservation))
+        if req.execution_credential.is_empty() {
+            return Err(Status::unauthenticated("execution credential required"));
+        }
+        let now = spur_core::native_mint::unix_now().unwrap_or(0);
+        let cred = spur_core::native_exec::verify_execution(
+            &req.execution_credential,
+            keys,
+            &self.cluster_id,
+            now,
+        )
+        .map_err(map_exec_err)?;
+        cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+            .map_err(map_exec_err)?;
+        cred.require_node(self.reporter.hostname.as_str())
+            .map_err(map_exec_err)?;
+        cred.require_run_attempt(req.run_attempt)
+            .map_err(map_exec_err)?;
+        if cred.job_id != req.job_id || cred.step_id != req.step_id {
+            return Err(Status::permission_denied(
+                "execution credential does not match the claimed step",
+            ));
+        }
+        Ok(())
     }
 
     /// Run a numbered step under its own supervisor. The job already holds its
@@ -5136,7 +5257,7 @@ impl AgentService {
             Option<crate::job_lifecycle::KeyedLifecycleGuard<u32>>,
         ),
         persist_cred: (String, String, String),
-    ) -> Result<Option<std::process::ExitStatus>, Status> {
+    ) -> Result<Option<(i32, bool)>, Status> {
         let (admission, lifecycle) = admission;
         let (job_id, _, step_id) = *admission.key();
         let run_attempt = cfg.run_attempt;
@@ -5267,7 +5388,7 @@ impl AgentService {
         }
 
         match waiter.await {
-            Ok(outcome) => Ok(Some(step_exit_status(outcome))),
+            Ok(outcome) => Ok(Some(step_reply(outcome))),
             // The supervisor died without reporting; its cgroup and session are
             // reaped by the crash watchdog, so only the status is lost here.
             Err(_) => Err(Status::internal(
@@ -6528,6 +6649,7 @@ impl SlurmAgent for AgentService {
             usage_reset_period: String::new(),
             kill_wait_secs: None,
             timeout_kill_wait_secs: None,
+            capabilities: Vec::new(),
         }))
     }
 
@@ -6775,10 +6897,11 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
         senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &spec.nodelist);
         senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
-        senv.set_with_slurm_twin(
-            "SPUR_CPUS_ON_NODE",
-            tasks_per_node.saturating_mul(spec.cpus_per_task.max(1)),
-        );
+        // The same count the job's cgroup is sized to, per-GPU CPUs included.
+        let (cpus_on_node, _) =
+            resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
+        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus_on_node);
+        SpurEnv::set_per_gpu(&mut senv, &spec);
         senv.set("SPUR_CONTROLLER_ADDR", &self.reporter.controller_addr);
 
         if array_job_id != 0 {
@@ -7042,6 +7165,7 @@ impl SlurmAgent for AgentService {
 
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
+        let memory_ceiling_mb = self.resolve_memory_ceiling(job_id, req.node_memory_ceiling_mb);
 
         // The generation check is performed inside `allocate_local_resources`
         // under the same allocation lock as the allocate, so a refresh publish
@@ -7144,6 +7268,7 @@ impl SlurmAgent for AgentService {
                 &self.cgroup,
                 cpus,
                 memory_mb,
+                memory_ceiling_mb,
                 &cpu_ids,
                 &host_device_plan.device_paths,
                 &crate::step_resources::StepLimits::default(),
@@ -7202,6 +7327,7 @@ impl SlurmAgent for AgentService {
             stdin_path: spec.stdin_path.clone(),
             cpus,
             memory_mb,
+            memory_ceiling_mb,
             gpu_devices: allocated_device_ids,
             cpu_ids,
             open_mode: if spec.open_mode.is_empty() {
@@ -7426,6 +7552,7 @@ impl SlurmAgent for AgentService {
                         gpu_devices: launch_cfg.gpu_devices,
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
+                        memory_ceiling_mb: launch_cfg.memory_ceiling_mb,
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
@@ -7736,8 +7863,12 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        // Literal attempt key: an "any attempt" tombstone would refuse a requeued run of the same step.
         self.launch_acceptance
             .cancel(req.job_id, req.step_id, req.run_attempt);
+        // A stale claim must go regardless of whether this attempt still runs.
+        self.step_claims
+            .release(req.job_id, req.run_attempt, req.step_id);
         // Step ids restart at 0 on a requeue, so a cancel from a superseded
         // attempt would otherwise signal the redispatch's step of the same id.
         if !self.runs_attempt(req.job_id, req.run_attempt).await {
@@ -7767,6 +7898,89 @@ impl SlurmAgent for AgentService {
         };
         if let Some(pid) = pid {
             signal_step_tree(pid, signal);
+        }
+        Ok(Response::new(()))
+    }
+
+    async fn claim_step(&self, request: Request<ClaimStepRequest>) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        if req.release {
+            self.step_claims
+                .release(req.job_id, req.run_attempt, req.step_id);
+            return Ok(Response::new(()));
+        }
+        self.verify_claim_credential(&req).await?;
+        let key = (req.job_id, req.run_attempt, req.step_id);
+        // Same slot as RunCommand, so a claim never races the launch that consumes it.
+        let _admission = self
+            .admit_step_launch(req.job_id, req.run_attempt, req.step_id)
+            .await;
+        self.step_claims
+            .release(req.job_id, req.run_attempt, req.step_id);
+        // A busy-retry release leaves the step live for srun's retry and never
+        // tombstones it; only an actual CancelStep does, so a claim arriving
+        // after one must hold nothing rather than re-reserve the share.
+        if self
+            .launch_acceptance
+            .is_cancelled(req.job_id, req.step_id, req.run_attempt)
+        {
+            return Err(Status::failed_precondition(format!(
+                "step {}.{} was cancelled",
+                req.job_id, req.step_id
+            )));
+        }
+        self.ensure_node_cleanup_ready()?;
+        let (cpus, memory_mb, memory_ceiling_mb, gpu_devices, attempt) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+                Status::not_found(format!("job {} not running on this node", req.job_id))
+            })?;
+            (
+                tracked.cpus,
+                tracked.memory_mb,
+                tracked.memory_ceiling_mb,
+                tracked.gpu_devices.clone(),
+                tracked.run_attempt,
+            )
+        };
+        if attempt != req.run_attempt {
+            return Err(Status::aborted(
+                "job attempt changed while claiming the step",
+            ));
+        }
+        let step_nodes = req
+            .nodelist
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .count()
+            .max(1) as u32;
+        let gpu_types = self.reporter.gpu_types();
+        let (_, reservation) = self
+            .claim_step_share(
+                req.resources.as_ref(),
+                key,
+                crate::step_resources::StepPlacement {
+                    tasks_on_node: req.num_tasks.max(1),
+                    step_nodes,
+                },
+                &crate::step_resources::JobShare {
+                    cpus,
+                    memory_mb,
+                    memory_ceiling_mb,
+                    gpus: &gpu_devices,
+                    gpu_types: &gpu_types,
+                },
+                false,
+            )
+            .await?;
+        if let Some(reservation) = reservation {
+            self.step_claims.hold(
+                key,
+                reservation,
+                std::time::Instant::now(),
+                crate::step_resources::claim_ttl(req.ttl_secs),
+            );
         }
         Ok(Response::new(()))
     }
@@ -7951,6 +8165,7 @@ impl SlurmAgent for AgentService {
 
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
+        let memory_ceiling_mb = self.resolve_memory_ceiling(req.job_id, req.node_memory_ceiling_mb);
 
         // Resolved before the running lock and the reservation: this is the one
         // step that awaits another lock, and failing here needs no release.
@@ -8029,6 +8244,7 @@ impl SlurmAgent for AgentService {
                     AllocError::CpusUnavailable => {
                         Status::resource_exhausted("allocated cores unavailable on this node")
                     }
+                    AllocError::ReservedCpusHeld => reserved_cpus_held_refusal(),
                 })?;
             result
         };
@@ -8048,6 +8264,7 @@ impl SlurmAgent for AgentService {
             &self.cgroup,
             cpus,
             memory_mb,
+            memory_ceiling_mb,
             &alloc_result.cpu_ids,
             &device_paths,
             &crate::step_resources::StepLimits::default(),
@@ -8135,6 +8352,7 @@ impl SlurmAgent for AgentService {
                 stdin_path: String::new(),
                 cpus,
                 memory_mb,
+                memory_ceiling_mb,
                 gpu_devices: controller_gpu_ids.clone(),
                 cpu_ids: alloc_result.cpu_ids.clone(),
                 open_mode: None,
@@ -8260,6 +8478,7 @@ impl SlurmAgent for AgentService {
                 gpu_devices: controller_gpu_ids.clone(),
                 cpus,
                 memory_mb,
+                memory_ceiling_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
                 // Matches the epoch the allocation table was keyed with; 0 from an
@@ -8406,6 +8625,19 @@ impl SlurmAgent for AgentService {
             .admit_step_launch(job_id, step_run_attempt, step_id)
             .await;
 
+        // Taken before the replay checks, so a re-sent step's claim never outlives this call.
+        let claimed_share = (!req.overlap)
+            .then(|| self.step_claims.take((job_id, step_run_attempt, step_id)))
+            .flatten();
+        if self
+            .launch_acceptance
+            .is_cancelled(job_id, step_id, step_run_attempt)
+        {
+            return Err(Status::failed_precondition(format!(
+                "step {job_id}.{step_id} was cancelled"
+            )));
+        }
+
         // Idempotent retry: if the same step already ran (or is still running)
         // for this run_attempt, return its result instead of relaunching.
         // This makes a controller-restart harmless: the re-sent RunStep
@@ -8530,6 +8762,7 @@ impl SlurmAgent for AgentService {
             partition,
             cpus,
             memory_mb,
+            memory_ceiling_mb,
             nodelist,
             job_mpi,
             job_owner,
@@ -8576,6 +8809,7 @@ impl SlurmAgent for AgentService {
                 tracked.partition.clone(),
                 tracked.cpus,
                 tracked.memory_mb,
+                tracked.memory_ceiling_mb,
                 nodelist,
                 tracked.mpi.clone(),
                 tracked.user.clone(),
@@ -8615,22 +8849,36 @@ impl SlurmAgent for AgentService {
             .max(1) as u32;
 
         // Held until this RPC returns. Once the step's supervisor is tracked, its
-        // descriptor holds the GPUs too, so a dropped RPC cannot free them early.
-        let (step_limits, _step_gpu_reservation) = self
-            .claim_step_share(
-                req.resources.as_ref(),
-                (job_id, job_attempt, step_id),
-                crate::step_resources::StepPlacement {
-                    tasks_on_node: num_tasks,
-                    step_nodes: num_nodes,
-                },
-                &crate::step_resources::JobShare {
-                    cpus,
-                    memory_mb,
-                    gpus: &gpu_devices,
-                },
-            )
-            .await?;
+        // descriptor holds the share too, so a dropped RPC cannot free it early.
+        let gpu_types = self.reporter.gpu_types();
+        // Without a claim (no ClaimStep was sent), reserve in a single phase.
+        if req.claimed && !req.overlap && claimed_share.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "step {job_id}.{step_id}'s claimed share expired before launch"
+            )));
+        }
+        let (step_limits, _step_share_reservation) = match claimed_share {
+            Some(reservation) => (reservation.limits().clone(), Some(reservation)),
+            None => {
+                self.claim_step_share(
+                    req.resources.as_ref(),
+                    (job_id, job_attempt, step_id),
+                    crate::step_resources::StepPlacement {
+                        tasks_on_node: num_tasks,
+                        step_nodes: num_nodes,
+                    },
+                    &crate::step_resources::JobShare {
+                        cpus,
+                        memory_mb,
+                        memory_ceiling_mb,
+                        gpus: &gpu_devices,
+                        gpu_types: &gpu_types,
+                    },
+                    req.overlap,
+                )
+                .await?
+            }
+        };
         let launch_gpus = step_limits
             .gpus
             .clone()
@@ -9010,6 +9258,7 @@ impl SlurmAgent for AgentService {
                 stdin_path: String::new(),
                 cpus,
                 memory_mb,
+                memory_ceiling_mb,
                 gpu_devices: gpu_devices.clone(),
                 cpu_ids: Vec::new(),
                 uid: req.uid,
@@ -9084,10 +9333,11 @@ impl SlurmAgent for AgentService {
         };
 
         // Dispatch paths, each wiring the step's stdio to the spool files above.
-        // `None` means the step was cancelled before it ran.
-        let maybe_status: Option<std::process::ExitStatus> = if let Some(step_cfg) =
-            supervised_step_cfg.take()
-        {
+        // `None` means the step was cancelled before it ran. Each arm reduces
+        // its own result (a real `ExitStatus` for the three host/container
+        // arms, an already-decoded reply for the supervised one) to the same
+        // (shell exit code, oom_killed) shape so the response is built once.
+        let maybe_reply: Option<(i32, bool)> = if let Some(step_cfg) = supervised_step_cfg.take() {
             // Supervised: the step gets its own spurstepd and outlives a restart
             // of this agent. Its script enters the parent's namespaces, if any,
             // so the supervisor itself stays outside them.
@@ -9154,6 +9404,11 @@ impl SlurmAgent for AgentService {
                 self.cgroup.required,
             )
             .await?
+            .map(|status| {
+                // The legacy direct-launch path (force_legacy_launch, test-only)
+                // never sees the cgroup OOM annotation spurstepd adds.
+                (spur_core::process::shell_exit_code(&status), false)
+            })
         } else if let StepContainerPlan::Fresh(c) = &step_container_plan {
             // Case 2: the step builds its own rootfs, outside the job's namespaces.
             let step_uid = req.uid;
@@ -9303,7 +9558,11 @@ impl SlurmAgent for AgentService {
             if child_pid != 0 {
                 rootfs_guard.pid = Some(child_pid);
             }
-            maybe_status
+            maybe_status.map(|status| {
+                // The legacy direct-launch path (force_legacy_launch, test-only)
+                // never sees the cgroup OOM annotation spurstepd adds.
+                (spur_core::process::shell_exit_code(&status), false)
+            })
         } else {
             // Case 3: no container — plain host process. Route through the same
             // launch plan as the other arms so the child joins the job cgroup.
@@ -9337,10 +9596,15 @@ impl SlurmAgent for AgentService {
                 self.cgroup.required,
             )
             .await?
+            .map(|status| {
+                // The legacy direct-launch path (force_legacy_launch, test-only)
+                // never sees the cgroup OOM annotation spurstepd adds.
+                (spur_core::process::shell_exit_code(&status), false)
+            })
         };
 
-        let status = match maybe_status {
-            Some(s) => s,
+        let (exit_code, oom) = match maybe_reply {
+            Some(reply) => reply,
             None => return Ok(Response::new(cancelled_step_response())),
         };
 
@@ -9387,9 +9651,10 @@ impl SlurmAgent for AgentService {
         };
         let stdout = read_back(stdout_path).await;
         Ok(Response::new(RunCommandResponse {
-            exit_code: spur_core::process::shell_exit_code(&status),
+            exit_code,
             stdout,
             stderr: read_back(stderr_path).await,
+            oom_killed: oom,
         }))
     }
 
@@ -9814,7 +10079,17 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         let step_id = spur_core::step::STEP_INTERACTIVE;
-        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user, allocation) = {
+        let (
+            run_attempt,
+            cpus,
+            memory_mb,
+            memory_ceiling_mb,
+            gpu_devices,
+            partition,
+            nodelist,
+            user,
+            allocation,
+        ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&init.job_id).ok_or_else(|| {
                 Status::failed_precondition(format!(
@@ -9826,6 +10101,7 @@ impl SlurmAgent for AgentService {
                 tracked.run_attempt,
                 tracked.cpus,
                 tracked.memory_mb,
+                tracked.memory_ceiling_mb,
                 tracked.gpu_devices.clone(),
                 tracked.partition.clone(),
                 tracked.nodelist.clone(),
@@ -9901,9 +10177,8 @@ impl SlurmAgent for AgentService {
                     run_attempt,
                     step_id,
                 )?;
-                let shell_code = spur_core::process::shell_exit_code(&step_exit_status(
-                    crate::step_completion::StepOutcome { exit_code, signal },
-                ));
+                let shell_code =
+                    step_reply(crate::step_completion::StepOutcome { exit_code, signal }).0;
                 info!(
                     job_id = init.job_id,
                     shell_code, "terminal already finished; reporting its recorded exit"
@@ -10074,6 +10349,7 @@ impl SlurmAgent for AgentService {
                         stdin_path: String::new(),
                         cpus,
                         memory_mb,
+                        memory_ceiling_mb,
                         gpu_devices,
                         cpu_ids: Vec::new(),
                         open_mode: None,
@@ -10466,6 +10742,20 @@ impl SlurmAgent for AgentService {
     }
 }
 
+/// A launch whose GPUs' reserved CPUs a job from before a core-layout change
+/// still holds. Still `ResourceExhausted`, so an older controller keeps its
+/// path; the trailer lets a newer one spare the job's requeue budget.
+fn reserved_cpus_held_refusal() -> Status {
+    let mut status = Status::resource_exhausted(
+        "reserved CPUs of the allocated GPUs are held by a job from before a core-layout change",
+    );
+    status.metadata_mut().insert(
+        spur_proto::LAUNCH_REFUSAL_HEADER,
+        tonic::metadata::MetadataValue::from_static(spur_proto::REFUSAL_RESERVED_CPUS_HELD),
+    );
+    status
+}
+
 impl AgentService {
     /// Refuse a new workload unless the node's core/memory specialization layout
     /// is in effect, independent of `[cgroup] required`.
@@ -10709,7 +10999,7 @@ impl AgentService {
 
     /// Exclude exactly the held layout's spec CPUs, under the allocation lock.
     fn apply_spec_exclusions(&self, alloc: &mut NodeAllocation) {
-        alloc.set_spec_exclusions(&self.reporter.held_spec_cpus());
+        self.reporter.held_exclusions().apply(alloc);
     }
 
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
@@ -10848,8 +11138,20 @@ impl AgentService {
                     "job {job_id} was superseded by a newer attempt on this node"
                 )));
             }
-            // Only a replay of recorded cores can raise this; dispatch derives
-            // its own, so reaching here means the ledger disagrees with the node.
+            // A job placed under an earlier layout still sits on these GPUs'
+            // reserved CPUs. It frees them on its own, so the refusal says so.
+            Err(AllocError::ReservedCpusHeld) => {
+                warn!(
+                    job_id,
+                    gpus = ?controller_gpu_ids,
+                    "rejecting launch: its GPUs' reserved CPUs are held by a job from \
+                     before a core-layout change"
+                );
+                return Err(reserved_cpus_held_refusal());
+            }
+            // The general pool is shorter than the controller counted.
+            // Resource-exhausted requeues the job instead of running it on CPUs
+            // it was never charged for.
             Err(AllocError::CpusUnavailable) => {
                 warn!(job_id, "rejecting launch: allocated cores unavailable");
                 return Err(Status::resource_exhausted(
@@ -11939,6 +12241,7 @@ impl TrackedJob {
             gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
+            memory_ceiling_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
@@ -15404,30 +15707,25 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_code_survives_the_wait_encoding() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = step_exit_status(crate::step_completion::StepOutcome {
-            exit_code: 7,
-            signal: 0,
-        });
-
-        assert_eq!(status.code(), Some(7));
-        assert_eq!(status.signal(), None);
+    fn step_reply_reports_a_plain_exit_code() {
+        assert_eq!(
+            step_reply(crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            }),
+            (7, false)
+        );
     }
 
     #[test]
-    fn a_signalled_step_reports_its_signal_not_an_exit_code() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = step_exit_status(crate::step_completion::StepOutcome {
-            exit_code: 0,
-            signal: nix::sys::signal::Signal::SIGTERM as i32,
-        });
-
+    fn step_reply_reports_128_plus_signal_for_a_signal_death() {
         assert_eq!(
-            status.signal(),
-            Some(nix::sys::signal::Signal::SIGTERM as i32)
+            step_reply(crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: nix::sys::signal::Signal::SIGTERM as i32,
+            }),
+            (128 + nix::sys::signal::Signal::SIGTERM as i32, false)
         );
-        assert_eq!(status.code(), None);
     }
 
     #[tokio::test]
@@ -15452,6 +15750,20 @@ mod tests {
         })
         .expect("send");
         assert_eq!(interactive_exit_future(rx).await, 128 + 9);
+    }
+
+    // A flag-only OOM kill (the child exited on its own after an OOM kill;
+    // `signal` carries only `OOM_SIGNAL_FLAG`, no real signal) must report the
+    // real exit code, not wait(2)'s "exit code 16" collapse.
+    #[tokio::test]
+    async fn interactive_exit_future_reports_the_real_exit_code_for_a_flag_only_oom_kill() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(crate::step_completion::StepOutcome {
+            exit_code: 3,
+            signal: spur_core::job::OOM_SIGNAL_FLAG,
+        })
+        .expect("send");
+        assert_eq!(interactive_exit_future(rx).await, 3);
     }
 
     // A dropped waiter (e.g. the stepd vanished without reporting) must not
@@ -16677,6 +16989,32 @@ mod tests {
         ))
     }
 
+    /// `resolve_memory_ceiling` is the one place both `LaunchJob` and
+    /// `RegisterJobAllocation` get a job's node ceiling from (see their call
+    /// sites), so exercising it here covers both RPCs' resolution at once.
+    #[tokio::test]
+    async fn resolve_memory_ceiling_prefers_the_controllers_value() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        assert_eq!(svc.resolve_memory_ceiling(1, 16_384), 16_384);
+    }
+
+    #[tokio::test]
+    async fn resolve_memory_ceiling_falls_back_to_detected_memory_for_an_older_controller() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // test_reporter()'s ResourceSet reports memory_mb: 8192.
+        assert_eq!(svc.resolve_memory_ceiling(1, 0), 8192);
+    }
+
     /// An executable script at a temp path that exits with `code`.
     fn failing_hook_script(code: i32) -> tempfile::TempPath {
         use std::io::Write;
@@ -17299,6 +17637,7 @@ mod tests {
             stdin_path: String::new(),
             cpus: 1,
             memory_mb: 0,
+            memory_ceiling_mb: 0,
             gpu_devices: Vec::new(),
             cpu_ids: Vec::new(),
             open_mode: None,
@@ -17459,6 +17798,7 @@ mod tests {
             gpu_binding: None,
             cpus: 8,
             memory_mb: 4096,
+            memory_ceiling_mb: 0,
             gpu_devices: vec![2, 3],
             cpu_ids: vec![0, 1, 2, 3, 4, 5, 6, 7],
             partition: "gpu".into(),
@@ -17577,6 +17917,61 @@ mod tests {
             .expect("a recorded exit must be returned, not parked on");
 
         assert_eq!(response.into_inner().exit_code, 5);
+    }
+
+    #[tokio::test]
+    async fn await_step_decodes_a_flag_only_oom_kill_with_the_real_exit_code() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            3,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, 3).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(44, 1, 3)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: spur_core::job::OOM_SIGNAL_FLAG,
+                synthesized: false,
+            })
+            .expect("record the step's exit");
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 0,
+            }))
+            .await
+            .expect("a recorded exit must be returned, not parked on")
+            .into_inner();
+
+        assert_eq!(response.exit_code, 3, "the real exit code, not 16");
+        assert!(
+            response.oom_killed,
+            "a flag-only outcome must still report oom_killed"
+        );
     }
 
     /// A batch session as its supervisor published it, recording where the
@@ -19973,6 +20368,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: device_id as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect();
         NodeReporter::new(
@@ -20043,6 +20440,7 @@ mod tests {
                 memory_mb: 0,
                 devices,
                 generation: 0,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         });
@@ -20760,6 +21158,8 @@ mod tests {
                     link_type: spur_core::resource::GpuLinkType::XGMI,
                     topology: None,
                     stable_id: 128,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 }],
                 generic: Default::default(),
                 generation: 7,
@@ -20810,6 +21210,7 @@ mod tests {
                 memory_mb: 0,
                 devices,
                 generation: 5,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         });
@@ -20860,6 +21261,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         });
@@ -20973,6 +21375,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             // Default (false): a genuine sbatch batch script, not an
             // explicit srun task fan-out.
@@ -21032,6 +21435,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             task_fanout: true,
             ..Default::default()
@@ -21081,6 +21485,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             // Default (false): a genuine sbatch job, not a routed srun
             // request — no pmix_plan is supplied either, so if this reached
@@ -21132,6 +21537,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         });
@@ -21301,6 +21707,7 @@ mod tests {
             memory_mb: 0,
             devices,
             generation: 0,
+            reserved_cpus: 0,
         };
 
         let res = svc
@@ -21353,6 +21760,7 @@ mod tests {
             memory_mb: 0,
             devices,
             generation: 0,
+            reserved_cpus: 0,
         };
 
         let res = svc
@@ -21395,6 +21803,7 @@ mod tests {
             memory_mb: 0,
             devices,
             generation: 0,
+            reserved_cpus: 0,
         };
 
         let res = svc
@@ -21448,6 +21857,7 @@ mod tests {
             memory_mb: 0,
             devices,
             generation: 0,
+            reserved_cpus: 0,
         };
 
         let res = svc
@@ -21481,6 +21891,7 @@ mod tests {
             memory_mb: 0,
             devices: map,
             generation: 0,
+            reserved_cpus: 0,
         }
     }
 
@@ -21585,6 +21996,7 @@ mod tests {
                 memory_mb: 0,
                 devices,
                 generation: 0,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         }))
@@ -21721,6 +22133,7 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
                 generation: 0,
+                reserved_cpus: 0,
             }),
             ..Default::default()
         }))
@@ -22128,7 +22541,9 @@ mod tests {
         crate::step_resources::JobShare {
             cpus: 8,
             memory_mb: 4096,
+            memory_ceiling_mb: 0,
             gpus,
+            gpu_types: &[],
         }
     }
 
@@ -22137,6 +22552,567 @@ mod tests {
             tasks_on_node: 1,
             step_nodes: 1,
         };
+
+    #[tokio::test]
+    async fn an_overlap_step_shares_held_gpus_and_holds_nothing() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.stepds
+            .lock()
+            .await
+            .insert((7, 1), gpu_holding_step(7, 0, 1, vec![10, 11]));
+        let request = StepResources {
+            gpus_per_node: Some(1),
+            ..Default::default()
+        };
+
+        let (limits, reservation) = svc
+            .claim_step_share(
+                Some(&request),
+                (7, 0, 2),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[10, 11]),
+                true,
+            )
+            .await
+            .expect("an overlap step never waits for held GPUs");
+        assert_eq!(limits.gpus, Some(vec![10]), "the first of the job's GPUs");
+        assert!(limits.overlap);
+        assert!(reservation.is_none(), "it holds nothing");
+
+        let err = svc
+            .claim_step_share(
+                Some(&request),
+                (7, 0, 3),
+                ONE_TASK_ONE_NODE,
+                &gpu_share(&[10, 11]),
+                false,
+            )
+            .await
+            .expect_err("a typed step still waits for the held GPUs");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(spur_proto::is_step_share_busy(&err));
+    }
+
+    // A pending cgroup cleanup is a node-wide gate, not a busy step share: it
+    // must never carry the busy marker, or srun would retry it forever.
+    #[tokio::test]
+    async fn run_command_cleanup_gate_is_not_a_busy_share() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let svc = test_agent_service(test_reporter()).with_runtime_state_dir(dir.path());
+        let store = crate::stepd::StepdStore::new(dir.path());
+        let record = crate::cgroup_cleanup::PendingCleanup {
+            job_id: 1,
+            run_attempt: 0,
+            step_id: 0,
+            cgroup: std::path::PathBuf::from("/sys/fs/cgroup/spur/job_1_0"),
+            quarantine_acknowledged: false,
+            deadline_unix_ms: 0,
+        };
+        store
+            .cleanup_store()
+            .track(&record)
+            .expect("track pending cleanup");
+
+        let err = svc
+            .ensure_node_cleanup_ready()
+            .expect_err("a pending cleanup refuses new work");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(!spur_proto::is_step_share_busy(&err));
+    }
+
+    fn claim_request(job_id: u32, step_id: u32, cpus_per_task: u32) -> ClaimStepRequest {
+        ClaimStepRequest {
+            job_id,
+            step_id,
+            run_attempt: 0,
+            num_tasks: 1,
+            nodelist: String::new(),
+            resources: Some(StepResources {
+                cpus_per_task: Some(cpus_per_task),
+                ..Default::default()
+            }),
+            execution_credential: String::new(),
+            release: false,
+            ttl_secs: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_step_holds_the_share_and_run_command_consumes_it() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(7, tracked).await;
+
+        svc.claim_step(Request::new(claim_request(7, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        let err = svc
+            .claim_step(Request::new(claim_request(7, 2, 1)))
+            .await
+            .expect_err("step 2's share is held by step 1's claim");
+        assert!(spur_proto::is_step_share_busy(&err));
+
+        let held = svc
+            .step_claims
+            .take((7, 0, 1))
+            .expect("the claim was held, not just checked");
+        svc.step_claims.hold(
+            (7, 0, 1),
+            held,
+            std::time::Instant::now(),
+            crate::step_resources::STEP_CLAIM_TTL,
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_step_requires_the_controller() {
+        let svc = test_agent_service(test_reporter()).with_root_override(true);
+        let mut req = Request::new(claim_request(7, 1, 1));
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .claim_step(req)
+            .await
+            .expect_err("only the controller may claim a step");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn step_credential(
+        cluster_id: &str,
+        job_id: u32,
+        step_id: u32,
+        run_attempt: u32,
+        node: &str,
+        now: u64,
+    ) -> spur_core::native_cred::ExecutionCredential {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
+        ExecutionCredential {
+            kind: CredentialKind::Step,
+            cluster_id: cluster_id.into(),
+            key_id: String::new(),
+            job_id,
+            step_id,
+            run_attempt,
+            user: "fixture".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: node.into(),
+                cpus: 1,
+                memory_mb: 1,
+                devices: vec![],
+            }],
+            command_digest: [0; 32],
+            container_digest: None,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 3600,
+            credential_id: [1; 16],
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_step_rejects_a_credential_for_another_step() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.cluster_id = "claim-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let credential = step_credential(&svc.cluster_id, 7, 1, 0, &svc.reporter.hostname, now);
+        let token =
+            spur_core::native_exec::sign_execution(credential, &signing, now).expect("token");
+
+        let mut req = claim_request(7, 2, 1);
+        req.execution_credential = token;
+        let err = svc
+            .claim_step(Request::new(req))
+            .await
+            .expect_err("a credential minted for step 1 must not claim step 2");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn a_busy_claim_records_no_launch_acceptance() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.cluster_id = "claim-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(7, tracked).await;
+
+        // Step 1 holds the whole share.
+        let cred1 = step_credential(&svc.cluster_id, 7, 1, 0, &svc.reporter.hostname, now);
+        let token1 = spur_core::native_exec::sign_execution(cred1, &signing, now).expect("token");
+        let mut req1 = claim_request(7, 1, 8);
+        req1.execution_credential = token1;
+        svc.claim_step(Request::new(req1))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        let cred2 = step_credential(&svc.cluster_id, 7, 2, 0, &svc.reporter.hostname, now);
+        let token2 =
+            spur_core::native_exec::sign_execution(cred2.clone(), &signing, now).expect("token");
+        let mut busy_req = claim_request(7, 2, 1);
+        busy_req.execution_credential = token2.clone();
+        let err = svc
+            .claim_step(Request::new(busy_req))
+            .await
+            .expect_err("step 2's share is held by step 1's claim");
+        assert!(spur_proto::is_step_share_busy(&err));
+        assert_eq!(
+            svc.launch_acceptance.accept(&cred2),
+            Ok(true),
+            "a busy claim must never record a launch acceptance"
+        );
+
+        // Release step 1 and retry: step 2's claim now succeeds.
+        svc.step_claims.release(7, 0, 1);
+        let mut req2 = claim_request(7, 2, 1);
+        req2.execution_credential = token2;
+        svc.claim_step(Request::new(req2))
+            .await
+            .expect("step 2 claims once step 1's share is released");
+    }
+
+    #[tokio::test]
+    async fn cancel_step_releases_a_claim() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(7, tracked).await;
+
+        svc.claim_step(Request::new(claim_request(7, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id: 7,
+            step_id: 1,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_step always succeeds");
+
+        svc.claim_step(Request::new(claim_request(7, 2, 8)))
+            .await
+            .expect("cancelling step 1 released its claim for step 2");
+    }
+
+    // The busy-retry path releases a step's claim without cancelling it
+    // (srun retries the same step id), so a `ClaimStep` arriving after an
+    // actual `CancelStep` must be refused instead — and must hold nothing,
+    // since a sibling step can then claim the job's whole share.
+    #[tokio::test]
+    async fn claim_step_after_cancel_step_refuses_and_holds_nothing() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(7, tracked).await;
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id: 7,
+            step_id: 1,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_step always succeeds");
+
+        let err = svc
+            .claim_step(Request::new(claim_request(7, 1, 8)))
+            .await
+            .expect_err("a claim arriving after the step's own cancel must not re-hold it");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("was cancelled"), "{err}");
+
+        svc.claim_step(Request::new(claim_request(7, 2, 8)))
+            .await
+            .expect("the refused claim must have held nothing, so a sibling claims the full share");
+    }
+
+    #[tokio::test]
+    async fn a_released_claim_frees_the_share() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(7, tracked).await;
+
+        svc.claim_step(Request::new(claim_request(7, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        let mut release_req = claim_request(7, 1, 8);
+        release_req.release = true;
+        svc.claim_step(Request::new(release_req))
+            .await
+            .expect("an explicit release always succeeds");
+
+        svc.claim_step(Request::new(claim_request(7, 2, 8)))
+            .await
+            .expect("step 2 claims once step 1's claim is released");
+    }
+
+    #[tokio::test]
+    async fn claim_step_then_run_command_consumes_the_claim() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.allow_root_jobs = true;
+        let job_id = 70001;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.claim_step(Request::new(claim_request(job_id, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        // A typed step's own limits need a supervised stepd, which this
+        // unit-test harness has no built binary for; the RPC still runs the
+        // real admission/claim-consuming path before hitting that refusal,
+        // which is what this test exercises.
+        let err = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                step_id: 1,
+                claimed: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a supervised stepd is unavailable in this test harness");
+        assert!(err.message().contains("supervised step"), "{err}");
+
+        assert!(
+            svc.step_claims.take((job_id, 0, 1)).is_none(),
+            "run_command must consume the claim before the supervise_step refusal, not merely check it"
+        );
+
+        // The share freed by step 1's claim consumption fits a fresh typed step.
+        svc.claim_step(Request::new(claim_request(job_id, 2, 8)))
+            .await
+            .expect("step 2 claims the share step 1 gave back");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_run_command_drops_its_claim() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.allow_root_jobs = true;
+        let job_id = 70002;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.claim_step(Request::new(claim_request(job_id, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        // The step already settled (e.g. the controller's first RunCommand was
+        // acknowledged but it retried anyway); the resend is answered from the
+        // memo without relaunching.
+        svc.step_completions
+            .complete(
+                job_id,
+                0,
+                1,
+                crate::step_completion::StepOutcome {
+                    exit_code: 0,
+                    signal: 0,
+                },
+            )
+            .await;
+
+        let resp = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                step_id: 1,
+                claimed: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("a replayed RunCommand returns the settled result")
+            .into_inner();
+        assert_eq!(resp.exit_code, 0);
+
+        assert!(
+            svc.step_claims.take((job_id, 0, 1)).is_none(),
+            "the early claim take must run before the replay short-circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_run_command_without_a_claim_is_refused() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.allow_root_jobs = true;
+        let job_id = 70003;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(job_id, tracked).await;
+
+        let err = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                step_id: 1,
+                claimed: true,
+                resources: Some(StepResources {
+                    cpus_per_task: Some(8),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a lost claim must refuse rather than silently reserve anew");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("expired"), "{err}");
+
+        // Nothing was reserved: a fresh typed step can take the whole share.
+        svc.claim_step(Request::new(claim_request(job_id, 2, 8)))
+            .await
+            .expect("the refused call must not have reserved anything");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_step_is_refused_without_credentials() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        svc.allow_root_jobs = true;
+        let job_id = 70004;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(job_id, tracked).await;
+        assert!(
+            svc.cred_keys.is_none(),
+            "no credential verification configured"
+        );
+
+        svc.claim_step(Request::new(claim_request(job_id, 1, 8)))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id,
+            step_id: 1,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_step always succeeds");
+
+        let err = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                step_id: 1,
+                claimed: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a cancelled step must be refused even without execution credentials");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("was cancelled"), "{err}");
+
+        // The claim taken for step 1 was dropped, not leaked: a fresh step
+        // asking for the whole share fits.
+        svc.claim_step(Request::new(claim_request(job_id, 2, 8)))
+            .await
+            .expect("the cancelled step's claim must have been freed");
+    }
+
+    #[tokio::test]
+    async fn claim_step_honours_the_controller_ttl() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let job_id = 70005;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cpus = 8;
+        svc.insert_test_job(job_id, tracked).await;
+
+        let before = std::time::Instant::now();
+        let mut req = claim_request(job_id, 1, 8);
+        req.ttl_secs = 630;
+        svc.claim_step(Request::new(req))
+            .await
+            .expect("step 1 claims the job's whole 8 CPUs");
+        let after = std::time::Instant::now();
+
+        let deadline = svc
+            .step_claims
+            .deadline((job_id, 0, 1))
+            .expect("the claim must be held");
+        assert!(
+            deadline >= before + std::time::Duration::from_secs(630)
+                && deadline <= after + std::time::Duration::from_secs(630),
+            "deadline should be ~630s from the claim: {:?}",
+            deadline
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_step_counts_once_while_its_launch_still_holds_its_share() {
+        let mut svc = test_agent_service(test_reporter()).with_root_override(true);
+        svc.cgroup = CgroupConfig::default();
+        let job = crate::step_resources::JobShare {
+            cpus: 32,
+            memory_mb: 4096,
+            memory_ceiling_mb: 0,
+            gpus: &[],
+            gpu_types: &[],
+        };
+        let cpus = |n| StepResources {
+            cpus_per_task: Some(n),
+            ..Default::default()
+        };
+        let (limits, _running) = svc
+            .claim_step_share(Some(&cpus(8)), (7, 0, 1), ONE_TASK_ONE_NODE, &job, false)
+            .await
+            .expect("the first step fits");
+        let mut descriptor = gpu_holding_step(7, 0, 1, Vec::new());
+        descriptor.resources.step_limits = limits;
+        svc.stepds.lock().await.insert((7, 1), descriptor);
+
+        let err = svc
+            .claim_step_share(Some(&cpus(25)), (7, 0, 2), ONE_TASK_ONE_NODE, &job, false)
+            .await
+            .expect_err("only 24 of the job's 32 CPUs are free");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+        let (limits, _) = svc
+            .claim_step_share(Some(&cpus(24)), (7, 0, 2), ONE_TASK_ONE_NODE, &job, false)
+            .await
+            .expect("the running step holds 8 CPUs, not 16");
+        assert_eq!(limits.cpus, Some(24));
+    }
 
     #[tokio::test]
     async fn a_step_takes_gpus_no_live_step_of_its_job_attempt_holds() {
@@ -22159,6 +23135,7 @@ mod tests {
                 (7, 0, 2),
                 ONE_TASK_ONE_NODE,
                 &gpu_share(&[10, 11, 12, 13]),
+                false,
             )
             .await
             .expect("two GPUs are free for job 7 attempt 0");
@@ -22176,6 +23153,7 @@ mod tests {
                 (7, 0, 3),
                 ONE_TASK_ONE_NODE,
                 &gpu_share(&[10, 11, 12, 13]),
+                false,
             )
             .await
             .unwrap_err();
@@ -22188,6 +23166,7 @@ mod tests {
                 (7, 0, 3),
                 ONE_TASK_ONE_NODE,
                 &gpu_share(&[10, 11, 12, 13]),
+                false,
             )
             .await
             .expect("a finished launch hands its GPUs back");
@@ -22204,6 +23183,7 @@ mod tests {
                     (7, 0, 1),
                     ONE_TASK_ONE_NODE,
                     &gpu_share(&[10]),
+                    false,
                 )
                 .await
                 .expect("nothing to enforce, so nothing to refuse");
@@ -22226,6 +23206,7 @@ mod tests {
                 (7, 0, 1),
                 ONE_TASK_ONE_NODE,
                 &gpu_share(&[]),
+                false,
             )
             .await
             .unwrap_err();
@@ -22724,6 +23705,7 @@ mod tests {
             gpu_devices: Vec::new(),
             cpus: 1,
             memory_mb: 0,
+            memory_ceiling_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
@@ -24174,6 +25156,7 @@ mod tests {
                 gpu_devices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
+                memory_ceiling_mb: 0,
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
@@ -24726,6 +25709,7 @@ mod tests {
                 gpu_devices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
+                memory_ceiling_mb: 0,
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
@@ -24815,6 +25799,7 @@ mod tests {
                 gpu_devices: Vec::new(),
                 cpus: 1,
                 memory_mb: 0,
+                memory_ceiling_mb: 0,
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt: 1,
@@ -25354,6 +26339,8 @@ mod tests {
             link_type: spur_core::resource::GpuLinkType::XGMI,
             topology: None,
             stable_id,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         }
     }
 
@@ -25497,6 +26484,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_layout_hands_gpu_jobs_their_reserved_cpus_and_cpu_jobs_none() {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let dir = tempfile::tempdir().unwrap();
+        let svc = spec_service(dir.path().join("spur"), true);
+        svc.reporter.adopt_core_layout(
+            Some(spur_proto::proto::CoreLayout {
+                gpu_reserved: vec![spur_proto::proto::GpuReservedCpus {
+                    stable_id: 7,
+                    cpus: vec![0, 1],
+                }],
+                general_cpus: vec![2, 3],
+                ..Default::default()
+            }),
+            None,
+            crate::spec::Delivery::Launch,
+        );
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                topology: None,
+                stable_id: 7,
+                numa_node: None,
+                affinity_cpus: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut alloc = NodeAllocation::new("n1".into(), &resources);
+        svc.apply_spec_exclusions(&mut alloc);
+
+        let gpu_job = alloc
+            .allocate_for_job(1, 1, 2, 0, &[7])
+            .expect("its reserved CPUs");
+        assert_eq!(gpu_job.cpu_ids, vec![0, 1]);
+        assert_eq!(
+            alloc.allocate_for_job(2, 1, 3, 0, &[]),
+            Err(spur_sched::cons_tres::AllocError::CpusUnavailable),
+            "only 2 general CPUs; reserved ones are never lent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_layout_never_hands_out_cpus_its_cap_trimmed() {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let dir = tempfile::tempdir().unwrap();
+        let svc = spec_service(dir.path().join("spur"), true);
+        svc.reporter.adopt_core_layout(
+            Some(spur_proto::proto::CoreLayout {
+                gpu_reserved: vec![spur_proto::proto::GpuReservedCpus {
+                    stable_id: 7,
+                    cpus: vec![0, 1],
+                }],
+                general_cpus: vec![2, 3],
+                trimmed_cpus: vec![4, 5],
+                ..Default::default()
+            }),
+            None,
+            crate::spec::Delivery::Launch,
+        );
+        let resources = ResourceSet {
+            cpus: 6,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                topology: None,
+                stable_id: 7,
+                numa_node: None,
+                affinity_cpus: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut alloc = NodeAllocation::new("n1".into(), &resources);
+        svc.apply_spec_exclusions(&mut alloc);
+
+        assert_eq!(
+            alloc.allocate_for_job(1, 1, 3, 0, &[]),
+            Err(spur_sched::cons_tres::AllocError::CpusUnavailable),
+            "only 2 general CPUs; trimmed ones are never handed out"
+        );
+        let cpu_job = alloc.allocate_for_job(2, 1, 2, 0, &[]).expect("general");
+        assert_eq!(cpu_job.cpu_ids, vec![2, 3]);
+        let gpu_job = alloc
+            .allocate_for_job(3, 1, 2, 0, &[7])
+            .expect("its reserved CPUs");
+        assert_eq!(gpu_job.cpu_ids, vec![0, 1]);
+        assert_eq!(alloc.free_cpus(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_launch_refused_over_held_reserved_cpus_sets_the_refusal_trailer() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        {
+            // Placed first-fit on CPU 0 before the node held any layout.
+            let mut alloc = svc.allocation.lock().await;
+            assert_eq!(
+                alloc.allocate_for_job(98, 1, 1, 0, &[]).unwrap().cpu_ids,
+                vec![0]
+            );
+            alloc.commit_job(98, 1);
+        }
+        svc.reporter.adopt_core_layout(
+            Some(spur_proto::proto::CoreLayout {
+                gpu_reserved: vec![spur_proto::proto::GpuReservedCpus {
+                    stable_id: 0,
+                    cpus: vec![0, 1],
+                }],
+                general_cpus: vec![2, 3],
+                ..Default::default()
+            }),
+            None,
+            crate::spec::Delivery::Launch,
+        );
+
+        let gpu_job = JobSpec {
+            cpus_per_task: 2,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        };
+        let mut allocated = gpu_alloc_request(&[0]);
+        allocated.cpus = 2;
+        let err = svc
+            .allocate_local_for_test(100, &gpu_job, Some(&allocated))
+            .await
+            .expect_err("GPU 0's reserved CPU 0 is held by job 98");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(spur_proto::is_reserved_cpus_held_refusal(&err));
+
+        let cpu_job = JobSpec {
+            cpus_per_task: 3,
+            ..Default::default()
+        };
+        let err = svc
+            .allocate_local_for_test(101, &cpu_job, None)
+            .await
+            .expect_err("only CPUs 2-3 are general");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            !spur_proto::is_reserved_cpus_held_refusal(&err),
+            "a short general pool keeps today's refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn spec_cores_refuse_workloads_when_this_nodes_cgroups_are_off() {
         let dir = tempfile::tempdir().unwrap();
         let svc = spec_service(dir.path().join("spur"), false);
@@ -25540,31 +26684,6 @@ mod tests {
         assert!(svc.reporter.spec_enforcement_error().is_some());
     }
 
-    #[test]
-    fn fallback_cpu_ids_returns_real_ids_on_a_sparse_online_set() {
-        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
-        let records: Vec<CpuRecord> = [0, 2, 5]
-            .iter()
-            .enumerate()
-            .map(|(i, &cpu)| CpuRecord {
-                cpu,
-                socket: 0,
-                core_id: i as u32,
-                numa_node: None,
-            })
-            .collect();
-        let resources = ResourceSet {
-            cpus: 3,
-            memory_mb: 1024,
-            topology: Some(CpuTopology::from_cpus(&records)),
-            ..Default::default()
-        };
-        let mut alloc = NodeAllocation::new("n1".into(), &resources);
-        alloc.mark_cpus_unavailable(&[0]);
-
-        assert_eq!(fallback_cpu_ids(&alloc, 2), vec![2, 5]);
-    }
-
     // An empty ledger was only correct while a restart killed every job: it now
     // lets a later dispatch hand out cores and GPUs an adopted job still holds.
     #[tokio::test]
@@ -25604,6 +26723,97 @@ mod tests {
         assert_eq!(alloc.allocated_gpu_ids(), vec![1]);
         assert_eq!(alloc.free_gpus(None), 1);
         assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+    }
+
+    /// A job descriptor that recorded no CPU IDs (a non-head node, or an older
+    /// agent), replayed against a cgroup root the test controls.
+    async fn replay_without_recorded_cpus(
+        cgroup: impl FnOnce(&std::path::Path),
+    ) -> (AgentService, tempfile::TempDir) {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("state and cgroup root");
+        let root = state.path().join("cgroup");
+        cgroup(&root.join("job_907_1"));
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            907,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("adopted.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 0,
+            ..Default::default()
+        };
+        svc.adopt_stepds(std::slice::from_ref(&descriptor)).await;
+        svc.replay_adopted_allocations_in(
+            std::slice::from_ref(&descriptor),
+            &HashMap::new(),
+            &root,
+        )
+        .await;
+        (svc, state)
+    }
+
+    #[tokio::test]
+    async fn a_job_without_recorded_cpus_keeps_the_cpus_its_cgroup_runs_on() {
+        let (svc, _state) = replay_without_recorded_cpus(|job| {
+            std::fs::create_dir_all(job).unwrap();
+            std::fs::write(job.join("cpuset.cpus.effective"), "1,3\n").unwrap();
+        })
+        .await;
+        let alloc = svc.allocation.lock().await;
+        assert!(
+            alloc.allocated_cpus[1] && alloc.allocated_cpus[3],
+            "its live CPUs"
+        );
+        assert!(
+            !alloc.allocated_cpus[0] && !alloc.allocated_cpus[2],
+            "never a guess"
+        );
+    }
+
+    // The root cgroup can expose far more CPUs than the job's own budget (it
+    // inherited the whole root's cpuset before ever writing its own), so the
+    // replayed claim must still be capped at `resources.cpus`.
+    #[tokio::test]
+    async fn a_job_without_recorded_cpus_claims_at_most_its_own_budget() {
+        let (svc, _state) = replay_without_recorded_cpus(|job| {
+            std::fs::create_dir_all(job).unwrap();
+            std::fs::write(job.join("cpuset.cpus.effective"), "0-3\n").unwrap();
+        })
+        .await;
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(
+            alloc.free_cpus(),
+            2,
+            "a 2-cpu job must not claim all 4 cpus its cgroup inherited from the root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_cgroup_is_gone_is_not_placed() {
+        let (svc, _state) = replay_without_recorded_cpus(|_| {}).await;
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), alloc.total_cpus, "nothing left to hold");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cpuset_still_holds_the_jobs_cpu_count() {
+        let (svc, _state) = replay_without_recorded_cpus(|job| {
+            std::fs::create_dir_all(job).unwrap();
+        })
+        .await;
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), alloc.total_cpus - 2, "held as unknown");
     }
 
     // Only the batch descriptor records the cores, and sessions are discovered
@@ -25841,6 +27051,8 @@ mod tests {
             link_type: GpuLinkType::XGMI,
             topology: None,
             stable_id,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         };
         let inventory = |ids: Vec<u64>| ResourceSet {
             cpus: 4,

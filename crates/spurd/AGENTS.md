@@ -67,6 +67,27 @@ src/
                       (start_job, signal, shutdown, serve_control), PTY
                       deposit/reclaim for interactive sessions.
 
+  spec.rs             SpecEnforcer: applies the controller-delivered
+                      CoreLayout to the `spur/` cgroup root (spec-core and
+                      cap-trimmed daemon pinning) and to the local
+                      NodeAllocation ledger (LedgerExclusions: spec/trimmed
+                      CPUs excluded outright, each GPU's reserved CPUs
+                      excluded from the general pool). RegistrationTicket /
+                      Delivery track where a layout came from so only a
+                      registration reply clears a stale one.
+
+  step_resources.rs   A typed srun step's own share of its job on one node:
+                      StepResources -> NodeRequest (resolve(), scaled by
+                      tasks-on-node), unenforceable() (refuses rather than
+                      silently sharing the job's limits when cgroups/root/
+                      memory/device enforcement is unavailable),
+                      PendingStepShares (in-flight typed-step reservations,
+                      keyed by job/run_attempt/step, checked against the
+                      job's live typed steps so concurrent steps cannot
+                      oversubscribe its share), pick_step_cpus (pins a typed
+                      step's CPUs to its own GPUs' reserved cores first, then
+                      cores near those GPUs, then the rest of the job's CPUs).
+
   container.rs        Native container runtime (no Docker/containerd). Squashfs
                       images, mount/PID namespace isolation (user namespace
                       only for rootless), bind mounts, GPU
@@ -191,6 +212,79 @@ src/
 - **`HeldJobs`** trait -- source of currently-held job IDs for heartbeat.
 - **`InventoryDelta`** / **`RefreshAction`** -- debounced inventory change
   classification (unchanged / grew / shrank / held-device-lost).
+- **`adopt_core_layout()`** -- stores a controller-delivered `CoreLayout` +
+  `LayoutRevision`, recording the delivery source (registration reply vs
+  heartbeat); `ensure_spec_enforced()` applies it to the cgroup root and the
+  job ledger if not already in effect.
+  A call that changes the layout wakes `heartbeat_loop` through a `Notify`
+  (`request_heartbeat()` does too, once after startup replay), so the
+  `Heartbeat` RPC's `layout_blocked_cpus` field reaches the controller at once.
+- **`layout_report()`** -- the held fingerprint and enforcement error with
+  `NodeAllocation::blocked_reserved_cpus()` against the held layout's
+  `gpu_reserved`, snapshotted under one `spec` lock, then counted under a
+  blocking ledger `lock()` (never `try_lock`: a miss would read as nothing
+  blocked). Runs in the heartbeat's `spawn_blocking` after `apply_spec_layout()`.
+
+### spec.rs
+- **`SpecEnforcer`** -- holds the layout last delivered and the cgroup root
+  path it is applied to. `needs_apply()` / `apply_spec_layout()` enforce the
+  root -- a `cpuset.cpus` excluding spec cores and cap-trimmed CPUs -- whenever
+  either is non-empty, so a `cpus =` cap alone (no spec cores) still narrows
+  the root; a layout with neither releases it. Root memory limits come only
+  from spec-core layouts: `mem_spec_mb` on a cap-only layout stays
+  scheduling-only, never written to the root. `daemon_cpuset()` gives spurd's
+  own thread pinning under `daemons_off_spec` (spec cores plus cap-trimmed
+  CPUs -- daemons may use CPUs a cap keeps from jobs).
+- **`LedgerExclusions`** -- spec/trimmed CPUs (excluded outright) and each
+  GPU's reserved CPUs (excluded from the general pool only); `apply()` calls
+  `NodeAllocation::set_spec_exclusions()` / `set_gpu_reserved()`.
+- **`RegistrationTicket`** / **`Delivery`** -- where a layout delivery came
+  from, so a stale heartbeat-sourced layout can never overwrite a fresher one
+  and only a registration reply clears a previously-held layout to `None`.
+- **Root ownership** -- `release_root()` normally resets only limits its own
+  marker (in `state_dir`) proves it wrote. A node holding ANY layout (spec
+  cores or `restricted_cores_per_gpu` only) is spur-managed, though: the root
+  is also released when its on-disk cpuset/memory show it was left narrowed
+  by some earlier run, even without that marker, logged once via `info!`. A
+  node with no layout held (`held == None`) still leaves an unmarked root
+  exactly as found -- that case may be an operator's own limits.
+- **No narrowing** -- `reconcile_root_cpuset()` keeps every CPU any `job_*`
+  dir's cpuset names in the root, populated or not: an orphan dir only ever
+  widens the root, never narrows it. A content-changing `adopt()`, and a
+  fresh spurd's first enforce, take a memory floor: the root's on-disk
+  `memory.high` and the runs then counted as populated (`job_<id>_<attempt>`
+  dirs plus ledger runs with no cgroup yet). While one of them runs,
+  `memory.high` stays at least the floor and `memory.max` is not lowered;
+  raising applies at once. `reporter.rs::read_live_jobs()` sets each
+  `LiveJob.populated` from its `cgroup.events`' `populated` field (unreadable
+  counts as populated, the conservative default); `NodeReporter::live_jobs()`
+  then also marks a dir populated if the node's ledger still holds that run,
+  covering a starting job whose cgroup predates its first process (real
+  `cpuset.cpus` already on disk, `populated 0` until a process joins a
+  `step_*` child). A run the ledger holds but with no cgroup dir at all yet
+  (reserved, before cgroup creation) is reported with the ledger's own
+  `owner_cpu_ids()`, not an empty list, so it is not narrowed out of the
+  root either. Only a true orphan -- unpopulated and unknown to the
+  ledger -- is excluded from the floor's job set, so it can never pin
+  `memory.high`/`memory.max` forever.
+
+### step_resources.rs
+- **`StepLimits`** -- what a typed step narrows its job's limits to on this
+  node (cpus, memory_mb, gpus, pinned cpu_ids); `None` leaves a resource
+  shared with the rest of the job. An `overlap` step (`srun --overlap`) is
+  limited the same way but holds nothing exclusively.
+- **`NodeRequest`** -- a step's request resolved for one node, before any GPU
+  is picked; `resolve()` scales `cpus_per_task`/`mem_per_*`/gpu counts by the
+  step's tasks on this node.
+- **`PendingStepShares`** -- in-flight typed-step reservations for a job
+  attempt, checked against both its live (held) typed steps and other
+  pending launches so two concurrent steps cannot oversubscribe the job's
+  share; `reserve_pinned()` returns a `ShareExhausted` error (mapped to gRPC
+  `ResourceExhausted`) when the ask does not fit.
+- **`PinSource`** / **`pick_step_cpus()`** -- CPUs for a typed, GPU-holding
+  step come from its own GPUs' reserved cores first, then cores near those
+  GPUs, then the rest of the job's CPUs; too few free CPUs falls back to the
+  job's shared cpuset instead of failing the step.
 
 ### cluster.rs
 - **`K0sAgent`** -- RPC-driven owner of k0s on this node. start/stop/status/
@@ -223,8 +317,8 @@ src/
 11. Spawn `heartbeat_loop` immediately -- before completion replay, so a slow
     replay never looks like a dead node.
 12. Replay unacknowledged stepd completions, spawn retry background task.
-13. Build `AgentService`, adopt recovered stepds, replay allocations, settle
-    stale stepds.
+13. Build `AgentService`, adopt recovered stepds, replay allocations (then
+    `request_heartbeat()`), settle stale stepds.
 14. Bind agent-socket Unix listener for supervisor completion notifications.
 15. Adopt any running spurd-owned k0s unit, spawn the k0s supervise loop.
 16. Start the reaper/monitor loop (`start_monitor`).
@@ -240,6 +334,8 @@ src/
 - Collects held job IDs from the running-jobs map.
 - Collects per-job GPU stable_ids from the NodeAllocation.
 - Reads k0s node state (unit_active, restart_count, one-shot install_ms).
+- Applies the held layout to the cgroup root and reports its fingerprint with,
+  per GPU, the reserved CPUs held by a job not holding that GPU.
 - Sends a `Heartbeat` RPC to the controller.
 - On failure, deprioritizes the failed endpoint for `failover_cooldown` and
   tries the next one.
@@ -344,6 +440,76 @@ Communication uses line-delimited JSON over a Unix socket at
   are recorded, and the controller is notified to fence them.
 - Corrupted sessions (unparseable descriptor): treated like stale -- cgroup
   reaped, fencing report sent.
+- `replay_adopted_allocations()` rebuilds the in-memory `NodeAllocation`
+  ledger for every live (re-adopted) descriptor: `apply_spec_exclusions()`
+  runs first so a recovered job never lands on spec or another GPU's
+  reserved cores. A descriptor's recorded `cpu_ids` are re-claimed via
+  `claimable_cpu_ids()` (drops cores no longer free rather than rejecting
+  the whole replay); without recorded CPUs, `read_live_cpus()` reads the
+  job's own cgroup `cpuset.cpus.effective` to recover what it actually holds
+  (`LiveCpus::Gone` when the cgroup is gone -- nothing to place; `Unknown`
+  when it cannot be read -- counted but not placed on specific cores). A
+  `Running` cpuset is capped at `resources.cpus` after claiming, since the
+  job's cgroup can still show the whole root's cpuset if it never wrote its
+  own (e.g. no recorded cpu_ids and no cpuset written before an upgrade).
+
+---
+
+## Typed srun Steps
+
+A step that types `-c`/`--mem*`/`--cpus-per-gpu`/`--mem-per-gpu` or a GPU
+count/type (a `RunCommandRequest`/`RunStepRequest` carrying `resources: Some`)
+gets its own CPUs, memory, and GPUs on each node, pinned to its GPUs'
+reserved cores when the node has any (`step_resources.rs`). A plain step
+(`resources: None`) keeps sharing its job's cgroup limits, as before.
+
+- **Memory ceiling for a no-`--mem` job (native-host only).** The controller
+  sends the node's schedulable memory as `node_memory_ceiling_mb` on launch;
+  when that is 0 (an older controller), the agent falls back to its own
+  detected total memory. The value is stored in
+  `StepdJobResources.memory_ceiling_mb` and used as the job's memory total
+  whenever the job itself has no `--mem` budget, so the job's cgroup and its
+  typed steps' `check_room` share the same ceiling rather than one
+  unconstrained share split unchecked between concurrent steps. K8s pods get
+  no such limit (decided in SPUR-404): this is native-host only.
+- **Refusal, not silent weakening.** A typed step is refused outright --
+  rather than launched sharing the job's limits -- when the controller lacks
+  `step-resources` in `PingResponse.capabilities`, the agent cannot enforce
+  it (`step_resources::unenforceable`: cgroups disabled, spurd not root, or
+  the specific resource's cgroup knob off), or it is a `--pty`/`srun --jobid`
+  attach.
+- **Two-phase claim.** A typed multi-node step claims its share on every node
+  (`ClaimStep`) before any node runs it, so a node that is busy never leaves
+  another node running while srun retries. The claim reserves only; `run_command`
+  takes it right after admission, before any replay/duplicate-request check, so a
+  re-sent `RunCommand` for a live or settled step never holds a second claim for
+  the TTL. The controller sizes the TTL per step (`ClaimStepRequest.ttl_secs =
+  2 * dispatch deadline + 30s`, `0` = agent default); the agent clamps it to
+  `[STEP_CLAIM_TTL (120s), MAX_STEP_CLAIM_TTL (1800s)]`. A `RunCommandRequest`
+  that arrives `claimed` but holds no claim (TTL expired, or `spurd` restarted
+  between phases) returns `FailedPrecondition` instead of silently reserving a
+  single-phase share -- a non-busy refusal, so the controller cancels the step's
+  other nodes at once rather than waiting out their time limit.
+- **Busy share.** If the step does not fit beside the job's other live typed
+  steps on some node, the agent returns `Status::resource_exhausted` carrying
+  the `spur-launch-refusal: step-share-busy` trailer; `spur-cli`'s srun retries
+  with Slurm's `step creation temporarily disabled, retrying` message
+  (`BusyStepWait`) rather than failing outright. A cancel tombstone recorded
+  for the step (`LaunchAcceptance::is_cancelled`) refuses a later `RunCommand`
+  or `ClaimStep` with "step J.S was cancelled" even without execution
+  credentials; a plain busy-retry release (`ClaimStepRequest{release: true}`)
+  never tombstones, since srun retries the same step id after one. The
+  controller's `run_step` only leaves a busy step `Running` for a waiting
+  retry when `RunStepRequest.wait_if_busy` is set (new `spur-cli` sets it);
+  otherwise it records the step `Cancelled` immediately so a client that
+  never retries does not leave it `Running` until the job ends.
+- **OOM vs cancel.** A step killed by its own memory limit reports
+  `oom_killed` on the `RunCommandResponse`/`RunStepResponse` (ends
+  `OUT_OF_MEMORY`); a client giving up on a step that never ran reports
+  `cancelled` on `CompleteJobStepRequest` (ends `CANCELLED`).
+- **An `--overlap` step** is limited like any typed step but holds nothing
+  (shares live GPUs/CPUs with the job and other overlap steps, never counted
+  against the job's share).
 
 ---
 
@@ -491,6 +657,22 @@ metrics).
 - `AllocationOnly` RunningJob holds a companion node's slice of an allocation
   without running user code. It must NOT be PID-namespaced (it would become
   PID 1 and drop unhandled signals).
+
+### Core layout and typed steps
+- The controller delivers a node's `CoreLayout` on registration only; a
+  layout change reaches a running agent through a controller-requested
+  re-register (`record_layout_heartbeat`), not a live push. Mid-flight
+  repinning of already-running jobs is out of scope.
+- `pick_step_cpus` pins a typed step's CPUs only when enough of the job's
+  free CPUs are near its GPUs; otherwise it returns an empty pick and the
+  step falls back to sharing the job's cpuset by count, not by specific
+  cores. This is a silent degrade, not an error.
+- `PendingStepShares` covers only the window between reserving a share and
+  handing it to a supervisor; it is in-memory, unpersisted, per agent
+  process. Once a supervisor exists, its stepd descriptor is the share's
+  record, so a step already running survives an agent restart and is
+  re-adopted with its limits intact; only a step still launching when spurd
+  crashes loses its reservation (the launch itself did not complete either).
 
 ### stepd sessions
 - The Unix socket protocol is line-delimited JSON, NOT framed protobuf.

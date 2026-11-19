@@ -81,17 +81,28 @@ def _get_ssh_key() -> str | None:
     return key if key else None
 
 
-def _parse_node_entry(entry: str, default_user: str) -> tuple[str, str]:
-    """Split an optional ``user@host`` node entry; falls back to default_user.
+def _parse_node_entry(entry: str, default_user: str) -> tuple[str, str, int, str]:
+    """Split a ``[user@]host[:port][=address]`` node entry into
+    (host, user, ssh_port, address).
 
     Lets a bed mix SSH identities per node (e.g. a login/controller host
     reachable as one user and a lab GPU worker reachable as another) without
-    requiring uniform credentials across SPUR_TEST_NODES.
+    requiring uniform credentials across SPUR_TEST_NODES. The port only applies
+    to the SSH connection (e.g. a node reached through a tunnel). The optional
+    ``=address`` is what the daemons advertise to each other, for beds where
+    the SSH host (e.g. a tunnel's ``localhost``) isn't a reachable cluster
+    address; it defaults to ``host`` when omitted.
     """
+    user = default_user
     if "@" in entry:
-        user, host = entry.split("@", 1)
-        return host, user
-    return entry, default_user
+        user, entry = entry.split("@", 1)
+    address = ""
+    if "=" in entry:
+        entry, address = entry.split("=", 1)
+    host, sep, port = entry.rpartition(":")
+    if sep and port.isdigit() and ":" not in host:
+        return host, user, int(port), address or host
+    return entry, user, 22, address or entry
 
 
 def _get_binaries_dir() -> str:
@@ -114,8 +125,9 @@ def ssh_nodes():
 
     nodes = []
     for entry in nodes_config:
-        host, user = _parse_node_entry(entry, default_user)
-        node = SshNode(host, user, password=ssh_password, key_path=ssh_key)
+        host, user, port, address = _parse_node_entry(entry, default_user)
+        node = SshNode(host, user, password=ssh_password, key_path=ssh_key, port=port,
+                       address=address)
         nodes.append(node)
 
     yield nodes
@@ -390,12 +402,13 @@ def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
 
 
 @pytest.fixture
-def gpu_cluster(request, ssh_nodes, remote_bin_dir):
+def gpu_cluster(request, ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture for GPU tests.
 
     Skips the entire test if no node has GPU device nodes.
     Decorate a test with ``@pytest.mark.rootful`` to launch spurd via sudo.
+    Honours ``cluster_config_overrides`` like ``cluster``.
     """
     if len(ssh_nodes) < 1:
         pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
@@ -403,7 +416,8 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
         pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
 
     as_root = request.node.get_closest_marker("rootful") is not None
-    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root,
+                        config_overrides=cluster_config_overrides)
     yield c
     c.teardown()
 

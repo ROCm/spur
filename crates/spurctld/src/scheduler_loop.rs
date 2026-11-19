@@ -32,7 +32,7 @@ use crate::victim_order::{victim_facts, RankKey, VictimOrder};
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
-const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
@@ -672,7 +672,7 @@ async fn process_assignment_inner(
             nodelist: assignment.nodes.join(","),
             script_context: "prolog_slurmctld".into(),
             gpu_devices: Vec::new(),
-            cpus: spec.cpus_per_task,
+            cpus: crate::cluster::hook_cpus(&spec, &per_node_allocs),
             memory_mb: crate::cluster::hook_memory_mb(&spec, &per_node_allocs),
         };
         if let Err(e) = spur_core::hooks::run_hook(&prolog_ctld, &ctx).await {
@@ -772,9 +772,11 @@ async fn process_assignment_inner(
                     &detail,
                     run_attempt,
                 ) {
-                    if let Err(e) =
-                        cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt)
-                    {
+                    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(
+                        job_id,
+                        run_attempt,
+                        false,
+                    ) {
                         error!(job_id, error = %e, "failed to back off after registration failure");
                     }
                 }
@@ -2357,7 +2359,7 @@ fn satisfiable_victim_set(
     // then refuse — including reservations and the k0s gate.
     let suitable = |node: &spur_core::node::Node| {
         placement.matches_for_reservation(node, reservations, now)
-            && node.total_resources.can_satisfy(&required)
+            && node.can_ever_satisfy(&required)
             && state.handoff_allows(reclaimer, &node.name)
     };
     // Evicting a node frees its partition caps only of what the victims held there.
@@ -2909,6 +2911,8 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         initial_winsize: None,
         submit_line: s.submit_line.clone().unwrap_or_default(),
         client_keepalive: s.client_keepalive,
+        cpus_per_gpu: s.cpus_per_gpu,
+        memory_per_gpu_mb: s.memory_per_gpu_mb.unwrap_or(0),
     }
 }
 
@@ -2939,6 +2943,10 @@ struct AgentDispatchParams<'a> {
     /// launched between re-registrations still lands under enforced spec cores.
     core_layout: Option<spur_proto::proto::CoreLayout>,
     layout_revision: spur_proto::proto::LayoutRevision,
+    /// The target node's schedulable memory, so a job with no memory budget of
+    /// its own gets a ceiling instead of running unbounded. 0 if the node is
+    /// unknown at dispatch time.
+    node_memory_ceiling_mb: u64,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -2957,6 +2965,10 @@ enum DispatchError {
     /// The agent cannot provide the allocated resources right now: they are in use
     /// locally, or a prior job's cleanup still holds the node. Carries the agent's reason.
     ResourcesUnavailable(String),
+    /// The agent refused because a GPU's reserved CPUs are still held by a job
+    /// from before a core-layout change: not the job's doing, so it does not
+    /// spend the requeue budget. Carries the agent's reason.
+    ReservedCpusHeld(String),
     /// Connect failed, or the RPC timed out without a response, as opposed to
     /// the agent responding with an explicit rejection.
     Unreachable(anyhow::Error),
@@ -2976,6 +2988,7 @@ impl DispatchError {
         match self {
             Self::PrologFailed(_) => "prolog failure",
             Self::ResourcesUnavailable(_) => "resources unavailable on agent",
+            Self::ReservedCpusHeld(_) => "reserved CPUs held under an older layout",
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
@@ -2986,7 +2999,9 @@ impl DispatchError {
     /// The agent's own explanation, which the category alone cannot convey.
     fn agent_reason(&self) -> Option<&str> {
         match self {
-            Self::ResourcesUnavailable(reason) | Self::AgentRejected(reason) => Some(reason),
+            Self::ResourcesUnavailable(reason)
+            | Self::ReservedCpusHeld(reason)
+            | Self::AgentRejected(reason) => Some(reason),
             _ => None,
         }
     }
@@ -2998,6 +3013,9 @@ impl std::fmt::Display for DispatchError {
             Self::PrologFailed(reason) => write!(f, "agent rejected job: {reason}"),
             Self::ResourcesUnavailable(reason) => {
                 write!(f, "agent rejected job: resources unavailable: {reason}")
+            }
+            Self::ReservedCpusHeld(reason) => {
+                write!(f, "agent rejected job: reserved CPUs held: {reason}")
             }
             Self::Unreachable(e) => write!(f, "agent unreachable: {e:#}"),
             Self::TimedOut(limit) => {
@@ -3023,6 +3041,28 @@ pub(crate) fn dispatch_deadline(cluster: &ClusterManager) -> Option<Duration> {
     match cluster.config().controller.dispatch_timeout_secs {
         0 => None,
         secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// Classify a failed LaunchJob call. A held-reserved-CPUs refusal rides as a
+/// trailer on `ResourceExhausted`, so an older controller keeps the plain path.
+fn dispatch_error_from_status(s: tonic::Status) -> DispatchError {
+    match s.code() {
+        tonic::Code::ResourceExhausted if spur_proto::is_reserved_cpus_held_refusal(&s) => {
+            DispatchError::ReservedCpusHeld(s.message().to_string())
+        }
+        tonic::Code::ResourceExhausted => {
+            DispatchError::ResourcesUnavailable(s.message().to_string())
+        }
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            DispatchError::Unreachable(s.into())
+        }
+        // The agent answered and refused. Reporting this as unreachable sent
+        // the operator looking for a network fault that does not exist.
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
+            DispatchError::AgentRejected(s.message().to_string())
+        }
+        _ => DispatchError::Other(s.into()),
     }
 }
 
@@ -3160,6 +3200,8 @@ async fn dispatch_to_agent(
         initial_winsize: None,
         submit_line: spec.submit_line.clone().unwrap_or_default(),
         client_keepalive: spec.client_keepalive,
+        cpus_per_gpu: spec.cpus_per_gpu,
+        memory_per_gpu_mb: spec.memory_per_gpu_mb.unwrap_or(0),
     };
 
     let response = client
@@ -3180,22 +3222,10 @@ async fn dispatch_to_agent(
             execution_credential: params.execution_credential.to_string(),
             core_layout: params.core_layout.clone(),
             layout_revision: Some(params.layout_revision),
+            node_memory_ceiling_mb: params.node_memory_ceiling_mb,
         })
         .await
-        .map_err(|s| match s.code() {
-            tonic::Code::ResourceExhausted => {
-                DispatchError::ResourcesUnavailable(s.message().to_string())
-            }
-            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
-                DispatchError::Unreachable(s.into())
-            }
-            // The agent answered and refused. Reporting this as unreachable sent
-            // the operator looking for a network fault that does not exist.
-            tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
-                DispatchError::AgentRejected(s.message().to_string())
-            }
-            _ => DispatchError::Other(s.into()),
-        })?;
+        .map_err(dispatch_error_from_status)?;
 
     let inner = response.into_inner();
     if !inner.success {
@@ -3296,6 +3326,8 @@ struct AllocationRegisterParams {
     allocated: spur_core::resource::ResourceAllocations,
     work_dir: String,
     run_attempt: u32,
+    /// The node's schedulable memory; see `AgentDispatchParams::node_memory_ceiling_mb`.
+    node_memory_ceiling_mb: u64,
 }
 
 /// Register a srun-only allocation on a node agent without launching a batch process.
@@ -3327,6 +3359,7 @@ async fn register_allocation_to_agent(
             work_dir: params.work_dir.clone(),
             user: params.user.clone(),
             run_attempt: params.run_attempt,
+            node_memory_ceiling_mb: params.node_memory_ceiling_mb,
         })
         .await
         .map_err(|s| RegisterError::Failed(s.into()))?
@@ -3434,6 +3467,10 @@ async fn register_allocation_on_nodes(
 
         let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
+        let node_memory_ceiling_mb = node_info
+            .as_ref()
+            .map(|n| n.total_resources.memory_mb)
+            .unwrap_or(0);
         let params = AllocationRegisterParams {
             job_id,
             partition: spec.partition.clone().unwrap_or_default(),
@@ -3445,6 +3482,7 @@ async fn register_allocation_on_nodes(
             allocated,
             work_dir: spec.work_dir.clone(),
             run_attempt,
+            node_memory_ceiling_mb,
         };
         // Held for the whole call: a cut taken before this lands must not read
         // this job's absence as meaningful — the node's own answer is what the
@@ -3532,7 +3570,7 @@ fn abort_pending_pmix_dispatch(
     run_attempt: u32,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
+    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt, false) {
         error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
     }
     DispatchConfirmOutcome::Aborted
@@ -3576,7 +3614,8 @@ fn abort_pending_pmix_dispatch(
 ///     `ClusterManager::backoff_pending_job_after_dispatch_failure`, as on the
 ///     srun-allocation path: `requeue_count` is bumped and `begin_time` pushed
 ///     out exponentially, and a job already at `max_batch_requeue` is held
-///     (`JobHoldMaxRequeue`) instead.
+///     (`JobHoldMaxRequeue`) instead. A dispatch whose every failed node
+///     refused over reserved CPUs held under an older layout spares that budget.
 #[allow(clippy::too_many_arguments)]
 async fn confirm_dispatch_on_nodes(
     cluster: Arc<ClusterManager>,
@@ -3592,6 +3631,7 @@ async fn confirm_dispatch_on_nodes(
 ) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
+    let mut reserved_held = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let mut agent_reasons = std::collections::BTreeSet::new();
@@ -3715,6 +3755,10 @@ async fn confirm_dispatch_on_nodes(
             let task_offset = node_idx as u32 * tasks_per_node;
             let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
             let delivery = cluster.node_layout_delivery(node_name);
+            let node_memory_ceiling_mb = cluster
+                .get_node(node_name)
+                .map(|n| n.total_resources.memory_mb)
+                .unwrap_or(0);
             let params = AgentDispatchParams {
                 job_id,
                 spec: &spec,
@@ -3735,6 +3779,7 @@ async fn confirm_dispatch_on_nodes(
                 execution_credential: "",
                 core_layout: delivery.layout.clone(),
                 layout_revision: delivery.revision,
+                node_memory_ceiling_mb,
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
                 Ok(Some(plan)) => plan,
@@ -3795,6 +3840,10 @@ async fn confirm_dispatch_on_nodes(
         let agent_addr = agent_addr.clone();
         let execution_credential = execution_credential.clone();
         let delivery = cluster.node_layout_delivery(node_name);
+        let node_memory_ceiling_mb = cluster
+            .get_node(node_name)
+            .map(|n| n.total_resources.memory_mb)
+            .unwrap_or(0);
         // Held for the whole call: a cut taken before this lands is silent about
         // the job for reasons that have nothing to do with the node dropping it.
         let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
@@ -3820,6 +3869,7 @@ async fn confirm_dispatch_on_nodes(
                 execution_credential: &execution_credential,
                 core_layout: delivery.layout.clone(),
                 layout_revision: delivery.revision,
+                node_memory_ceiling_mb,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
             // The join below drains every node, so one agent that accepts the call and never answers
@@ -3853,6 +3903,12 @@ async fn confirm_dispatch_on_nodes(
                 match e {
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
+                    }
+                    // Until the next heartbeat reports the blocked count, the
+                    // cooldown keeps re-dispatch to this node bounded.
+                    DispatchError::ReservedCpusHeld(_) => {
+                        reserved_held += 1;
+                        cluster.cool_down_node(&node_name)
                     }
                     DispatchError::ResourcesUnavailable(_) | DispatchError::Unreachable(_) => {
                         cluster.cool_down_node(&node_name)
@@ -3935,7 +3991,16 @@ async fn confirm_dispatch_on_nodes(
         &confirmation_detail,
         run_attempt,
     ) {
-        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
+        // Spare the budget only when every node that failed refused over
+        // older-layout leftovers. The job did not cause a node's held-reserved
+        // refusal, so nodes that confirmed don't matter.
+        let spare_requeue_budget =
+            reserved_held == failures && cluster.take_spared_dispatch(job_id);
+        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(
+            job_id,
+            run_attempt,
+            spare_requeue_budget,
+        ) {
             error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
         }
     }
@@ -5612,6 +5677,8 @@ pub(crate) mod tests {
             link_type: GpuLinkType::PCIe,
             topology: None,
             stable_id: device_id as u64,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         }
     }
 
@@ -6396,6 +6463,40 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn reclaim_skips_a_node_whose_general_pool_never_fits_the_job() {
+            use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+            // 8 CPUs, but 4 of them are a GPU's reserved cores: a 6-CPU CPU-only
+            // job can never run here, so evicting the occupant would help no one.
+            let mut layout_node = node("n1", 8);
+            layout_node.core_layout = Some(CoreLayout {
+                spec_cpus: vec![],
+                mem_spec_mb: 0,
+                gpu_reserved: vec![GpuReservedCpus {
+                    stable_id: 1,
+                    cpus: vec![0, 1, 2, 3],
+                }],
+                general_cpus: vec![4, 5, 6, 7],
+                daemons_off_spec: false,
+                trimmed_cpus: vec![],
+            });
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                [("n1", vec![7])].into_iter().collect();
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let pool = VictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+                order: None,
+            };
+            let nodes = [layout_node];
+            let big = reclaimer(1, 6);
+            assert!(victim_set_with_handoffs(&big, &pool, &nodes, &HashMap::new()).is_none());
+            let fits = reclaimer(1, 4);
+            assert!(victim_set_with_handoffs(&fits, &pool, &nodes, &HashMap::new()).is_some());
+        }
+
+        #[test]
         fn an_unplaceable_job_evicts_nothing_however_long_it_waits() {
             // The denial-of-service `try_preempt` would have allowed (D2): a job that
             // can never be placed anywhere must have no satisfiable victim set, so it
@@ -7162,6 +7263,8 @@ pub(crate) mod tests {
                         link_type: spur_core::resource::GpuLinkType::XGMI,
                         topology: None,
                         stable_id: u64::from(i) + 1,
+                        numa_node: None,
+                        affinity_cpus: Vec::new(),
                     })
                     .collect();
                 n
@@ -7295,6 +7398,10 @@ pub(crate) mod tests {
             suspend_calls: Arc<AtomicU32>,
             /// Hostname `ping` answers with, as a real agent reports its node name.
             ping_hostname: String,
+            /// Records each `node_memory_ceiling_mb` this agent receives on
+            /// `LaunchJob`/`RegisterJobAllocation`, so tests can assert the
+            /// controller filled it without a real spurd behind the RPC.
+            captured_node_memory_ceiling_mb: Option<Arc<std::sync::Mutex<Vec<u64>>>>,
         }
 
         #[tonic::async_trait]
@@ -7358,6 +7465,9 @@ pub(crate) mod tests {
                 let req = request.into_inner();
                 if let Some(sink) = &self.fanout_calls {
                     sink.lock().unwrap().push(req.task_fanout);
+                }
+                if let Some(sink) = &self.captured_node_memory_ceiling_mb {
+                    sink.lock().unwrap().push(req.node_memory_ceiling_mb);
                 }
                 let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
@@ -7470,15 +7580,27 @@ pub(crate) mod tests {
                 Ok(tonic::Response::new(()))
             }
 
+            async fn claim_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ClaimStepRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+
             async fn register_job_allocation(
                 &self,
-                _request: tonic::Request<spur_proto::proto::RegisterJobAllocationRequest>,
+                request: tonic::Request<spur_proto::proto::RegisterJobAllocationRequest>,
             ) -> Result<
                 tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>,
                 tonic::Status,
             > {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
+                }
+                if let Some(sink) = &self.captured_node_memory_ceiling_mb {
+                    sink.lock()
+                        .unwrap()
+                        .push(request.get_ref().node_memory_ceiling_mb);
                 }
                 // A prolog-rejecting node fails both dispatch paths the same way:
                 // register_job_allocation carries the typed failure_kind, just as
@@ -7655,6 +7777,41 @@ pub(crate) mod tests {
         /// true, so a test can assert on it — `spawn_mock_agent`/`_rejecting`/
         /// `_with_delay` don't need this, so they pass `capture: false` and
         /// discard the (empty) sink.
+        /// Mock agent that records `node_memory_ceiling_mb` from every
+        /// `LaunchJob`/`RegisterJobAllocation` request it receives.
+        async fn spawn_mock_agent_capturing_memory_ceiling(
+        ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<u64>>>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                cancel_requests: Default::default(),
+                signal_requests: Default::default(),
+                suspend_calls: Default::default(),
+                ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: Some(captured.clone()),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, captured)
+        }
+
         async fn spawn_mock_agent_capturing_fanout(
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
@@ -7687,6 +7844,7 @@ pub(crate) mod tests {
                 signal_requests: Default::default(),
                 suspend_calls: Default::default(),
                 ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7720,6 +7878,7 @@ pub(crate) mod tests {
                 signal_requests: Default::default(),
                 suspend_calls: Default::default(),
                 ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7753,6 +7912,7 @@ pub(crate) mod tests {
                 signal_requests: Default::default(),
                 suspend_calls: Default::default(),
                 ping_hostname: hostname.to_string(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7786,6 +7946,7 @@ pub(crate) mod tests {
                 signal_requests: Default::default(),
                 suspend_calls: Default::default(),
                 ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7823,6 +7984,7 @@ pub(crate) mod tests {
                 signal_requests: Default::default(),
                 suspend_calls: suspend_calls.clone(),
                 ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7860,6 +8022,7 @@ pub(crate) mod tests {
                 signal_requests: signal_requests.clone(),
                 suspend_calls: Default::default(),
                 ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -7928,6 +8091,7 @@ pub(crate) mod tests {
                     def_mem_per_node: None,
                     def_mem_per_cpu: None,
                     def_mem_per_gpu: None,
+                    def_cpu_per_gpu: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),
@@ -10276,6 +10440,52 @@ pub(crate) mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn launch_job_carries_the_nodes_schedulable_memory_as_the_ceiling() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, captured) = spawn_mock_agent_capturing_memory_ceiling().await;
+            register_node_at(&cm, "n1", addr);
+            assert_eq!(
+                cm.get_node("n1").unwrap().total_resources.memory_mb,
+                8000,
+                "precondition: the node's schedulable memory this test asserts against"
+            );
+
+            let job_id = submit_and_wait(&cm, batch_spec("batch-memory-ceiling", 1));
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+
+            assert!(started, "a clean single-node batch dispatch must start");
+            assert_eq!(
+                *captured.lock().unwrap(),
+                vec![8000],
+                "LaunchJobRequest.node_memory_ceiling_mb must carry the node's schedulable memory"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn register_job_allocation_carries_the_nodes_schedulable_memory_as_the_ceiling() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, captured) = spawn_mock_agent_capturing_memory_ceiling().await;
+            register_node_at(&cm, "n1", addr);
+
+            // No script: a standalone srun allocation, dispatched via
+            // RegisterJobAllocation rather than LaunchJob.
+            let mut spec = batch_spec("srun-memory-ceiling", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+
+            assert!(started, "a clean single-node srun allocation must start");
+            assert_eq!(
+                *captured.lock().unwrap(),
+                vec![8000],
+                "RegisterJobAllocationRequest.node_memory_ceiling_mb must carry the node's \
+                 schedulable memory"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn process_assignment_completes_pure_interactive_srun_without_a_launch_job_dispatch()
         {
             use spur_core::job::JobState;
@@ -10730,6 +10940,7 @@ pub(crate) mod tests {
                 memory_per_node_mb: None,
                 memory_per_cpu_mb: None,
                 memory_per_gpu_mb: Some(2048),
+                cpus_per_gpu: None,
             });
 
             assert!(process_assignment(cm.clone(), planned, false).await);
@@ -10942,6 +11153,101 @@ pub(crate) mod tests {
                  1 resources unavailable on agent; \
                  agent reported: node has unfinished job cgroup cleanup)"
             );
+        }
+
+        /// The refusal an upgraded agent sends when a GPU's reserved CPUs are
+        /// held by a job from before a layout change.
+        fn held_reserved_cpus_status() -> tonic::Status {
+            let mut status =
+                tonic::Status::resource_exhausted("reserved CPUs of GPU 1 are held by another job");
+            status.metadata_mut().insert(
+                spur_proto::LAUNCH_REFUSAL_HEADER,
+                tonic::metadata::MetadataValue::from_static(spur_proto::REFUSAL_RESERVED_CPUS_HELD),
+            );
+            status
+        }
+
+        #[test]
+        fn a_refusal_trailer_maps_to_reserved_cpus_held() {
+            assert!(matches!(
+                dispatch_error_from_status(held_reserved_cpus_status()),
+                DispatchError::ReservedCpusHeld(_)
+            ));
+            assert!(matches!(
+                dispatch_error_from_status(tonic::Status::resource_exhausted("busy")),
+                DispatchError::ResourcesUnavailable(_)
+            ));
+            let mut unknown = tonic::Status::resource_exhausted("busy");
+            unknown.metadata_mut().insert(
+                spur_proto::LAUNCH_REFUSAL_HEADER,
+                tonic::metadata::MetadataValue::from_static("something-else"),
+            );
+            assert!(
+                matches!(
+                    dispatch_error_from_status(unknown),
+                    DispatchError::ResourcesUnavailable(_)
+                ),
+                "an unknown refusal keeps today's path"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_dispatch_failing_only_on_held_reserved_cpus_spares_the_budget() {
+            use spur_core::job::{JobState, PendingReason};
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.max_batch_requeue = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+            let first = spawn_mock_agent_rejecting_with_status(held_reserved_cpus_status()).await;
+            let second = spawn_mock_agent_rejecting_with_status(held_reserved_cpus_status()).await;
+            register_node_at(&cm, "n1", first);
+            register_node_at(&cm, "n2", second);
+            let job_id = submit_and_wait(&cm, batch_spec("held-reserved", 2));
+            // At the cap already: an ordinary failure now would hold the job.
+            cm.backoff_pending_job_after_dispatch_failure(job_id, 1, false)
+                .unwrap();
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1", "n2"]).await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_eq!(job.requeue_count, 1);
+            assert!(job.priority > 0, "never held at max requeue for this");
+            assert!(job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()));
+            assert!(cm.nodes_on_dispatch_cooldown().contains("n1"));
+            assert!(cm.nodes_on_dispatch_cooldown().contains("n2"));
+            assert!(
+                job.state_reason()
+                    .contains("2 reserved CPUs held under an older layout"),
+                "{}",
+                job.state_reason()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_mixed_failure_still_spends_the_budget() {
+            use spur_core::job::{JobState, PendingReason};
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.max_batch_requeue = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+            let held = spawn_mock_agent_rejecting_with_status(held_reserved_cpus_status()).await;
+            let busy = spawn_mock_agent_rejecting_resources().await;
+            register_node_at(&cm, "n1", held);
+            register_node_at(&cm, "n2", busy);
+            let job_id = submit_and_wait(&cm, batch_spec("mixed-refusal", 2));
+            cm.backoff_pending_job_after_dispatch_failure(job_id, 1, false)
+                .unwrap();
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1", "n2"]).await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+            assert_eq!(job.priority, 0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

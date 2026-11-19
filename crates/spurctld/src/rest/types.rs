@@ -163,6 +163,8 @@ pub struct SubmitJobFields {
     pub nodes: Option<u32>,
     pub ntasks: Option<u32>,
     pub cpus_per_task: Option<u32>,
+    pub cpus_per_gpu: Option<u32>,
+    pub memory_per_gpu: Option<u64>,
     pub time_limit: Option<String>,
     pub script: Option<String>,
     #[serde(default)]

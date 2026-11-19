@@ -129,7 +129,9 @@ the agent's bookkeeping.
 
 1. Delegates controllers (`+memory +cpu +pids +cpuset`) on the spur root.
 2. Creates the job directory, reaping any stale occupant.
-3. Writes limit files: `memory.max`, `cpuset.cpus`, `pids.max`.
+3. Writes limit files: `memory.max`, `memory.high`, `cpuset.cpus`, `pids.max`. A
+   job with no `--mem` of its own is capped at the node's schedulable memory
+   instead of left unlimited.
 4. Steps that do not own the job's lifetime join the existing job cgroup as a
    child leaf rather than creating a new one.
 

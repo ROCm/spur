@@ -163,14 +163,26 @@ class TestCgroupDefaults:
         )
         assert _core_count(probe.values["cpuset.cpus"]) == 4, probe.context()
 
-    def test_job_without_a_memory_request_is_left_unbounded(self, cgroup_cluster):
-        # No memory budget means no memory ceiling, and so no swap ceiling either:
-        # swap 0 with RAM unlimited is a pair Slurm never emits.
-        probe = _run_probe(cgroup_cluster, ["--cpus-per-task=1"], "cg-nomem")
+    def test_job_without_a_memory_request_is_capped_at_the_node_ceiling(
+        self, cgroup_cluster
+    ):
+        # Slurm parity: a job with no memory budget of its own is still
+        # capped, at the node's schedulable memory rather than left
+        # unbounded. Swap stays unconstrained by default, as for an explicit
+        # budget: swap 0 with RAM unlimited is a pair Slurm never emits.
+        cluster = cgroup_cluster
+        ceiling_mb = cluster.node_real_memory_mb(cluster.node_names[0])
+        assert ceiling_mb > 0, (
+            "node 0 must report RealMemory for this test to mean anything\n"
+            f"{cluster.scontrol_show_node(cluster.node_names[0])}"
+        )
+
+        probe = _run_probe(cluster, ["--cpus-per-task=1"], "cg-nomem")
         vals = probe.values
 
-        assert vals["memory.max"] == "max", probe.context()
-        assert vals["memory.high"] == "max", probe.context()
+        expect = str(ceiling_mb * MIB)
+        assert vals["memory.max"] == expect, probe.context()
+        assert vals["memory.high"] == expect, probe.context()
         assert vals["memory.swap.max"] == "max", probe.context()
 
     def test_memory_ceiling_floors_at_min_ram_mb(self, cgroup_cluster):

@@ -39,6 +39,7 @@ message ResourceAllocations {
   uint64 generation = 4;  // node inventory generation this allocation was made under
   FabricBinding fabric_binding = 5;
   GpuPropertyBinding gpu_binding = 6;
+  uint32 reserved_cpus = 7;  // of `cpus`, how many come from the GPUs' reserved cores
 }
 
 message GpuResource {
@@ -49,6 +50,8 @@ message GpuResource {
   GpuLinkType link_type = 5;
   uint64 stable_id = 6;   // BDF(domain:bus:dev.func) + partition rank; stable per-logical-device identity
   DeviceTopology topology = 7;
+  optional uint32 numa_node = 8;
+  repeated uint32 affinity_cpus = 9;  // CPU IDs from `[[devices.gres]] cores=`; empty = its NUMA node's
 }
 
 // Optional observations; none of these fields assert authoritative fabric health.
@@ -203,6 +206,7 @@ message CoreLayout {
   repeated GpuReservedCpus gpu_reserved = 3;
   repeated uint32 general_cpus = 4;
   bool daemons_off_spec = 5;
+  repeated uint32 trimmed_cpus = 6;  // general CPUs a [[nodes]] cpus cap keeps from jobs
 }
 
 // Orders layout deliveries so the agent never adopts a stale one. Compared as
@@ -266,7 +270,7 @@ message JobSpec {
   // matching Slurm, rather than collapsing a multi-node request onto one node.
   uint32 num_tasks = 11;
   uint32 tasks_per_node = 12;
-  uint32 cpus_per_task = 13;
+  uint32 cpus_per_task = 13;  // 0 = `-c` not given, so a `def_cpu_per_gpu` may apply
   uint64 memory_per_node_mb = 14;
   uint64 memory_per_cpu_mb = 15;
   repeated string gres = 16;  // "gpu:mi300x:4"
@@ -368,6 +372,8 @@ message JobSpec {
   // Mount the node's credential mint socket into the job's container so a nested
   // srun there can authenticate. Off by default.
   bool container_auth_socket = 87;
+  optional uint32 cpus_per_gpu = 88;  // `--cpus-per-gpu`
+  uint64 memory_per_gpu_mb = 89;  // `--mem-per-gpu`; 0 = not given
 }
 
 message JobInfo {
@@ -505,6 +511,26 @@ message JobInfo {
   // def_mem_per_gpu set it. Empty when memory is not sized per GPU.
   string mem_per_tres = 92;
   PreemptionUsage preemption_usage = 93;
+  // `--cpus-per-gpu` as resolved at submit; unset when not sized per GPU.
+  optional uint32 cpus_per_gpu = 94;
+  // CPUs a finished run held across its nodes, from accounting history; unset
+  // on live jobs and on history rows recorded before it was kept.
+  optional uint64 alloc_cpus = 95;
+}
+
+// Slurm's Sockets/CoresPerSocket/ThreadsPerCore, from the agent's CPU topology
+// by integer division as slurmd does.
+message SocketCoreThread {
+  uint32 sockets = 1;
+  uint32 cores_per_socket = 2;
+  uint32 threads_per_core = 3;
+}
+
+// One GPU's CPUs as the controller sees them; an empty list is none or unknown.
+message GpuCpus {
+  uint64 stable_id = 1;
+  string reserved_cpus = 2;   // its restricted_cores_per_gpu picks, e.g. "0-3,128-131"
+  string affinity_cpus = 3;   // CPUs those picks come from: its cores=, else its NUMA node's
 }
 
 message NodeInfo {
@@ -559,6 +585,13 @@ message NodeInfo {
   // Slurm's NOT_RESPONDING (`*`): the leader's heartbeats from this node are
   // stale, so it takes no new work. Reflects the leader's view only.
   bool not_responding = 64;
+  uint32 restricted_cores_per_gpu = 65;
+  string reserved_cpus = 66;         // GPU-reserved CPU list, e.g. "0-7,64-71"; empty when none
+
+  // Absent when the agent reported no CPU topology.
+  SocketCoreThread socket_core_thread = 67;
+  repeated GpuCpus gpu_cpus = 68;      // GPUs with neither list known are left out
+  repeated string capabilities = 69;   // the agent's registration capabilities
 }
 
 message PartitionInfo {
@@ -599,6 +632,7 @@ message PartitionInfo {
   optional uint64 def_mem_per_gpu = 52;
   // Partition QOS whose limits bound every job in the partition; empty = none.
   string qos = 53;
+  optional uint32 def_cpu_per_gpu = 54;
 }
 
 // ============================================================
@@ -735,6 +769,9 @@ service SlurmAgent {
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
   // Stop an in-flight srun step on this node without cancelling the allocation job.
   rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
+  // Take a typed step's share of this node ahead of RunCommand, which consumes
+  // it, or drop it with `release`. Starts nothing.
+  rpc ClaimStep(ClaimStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   // Re-park on a step this agent is already running, after a client lost its
@@ -976,6 +1013,9 @@ message PingResponse {
   // controller predating the fields.
   optional uint32 kill_wait_secs = 11;
   optional uint32 timeout_kill_wait_secs = 12;
+  // Optional behaviours the controller supports (e.g. "step-resources"), so a
+  // client can refuse a request an older controller would silently weaken.
+  repeated string capabilities = 13;
 }
 
 message JobStateCount {
@@ -1189,6 +1229,15 @@ message HeartbeatRequest {
   string spec_enforcement_error = 9;  // why the held layout is not enforced; empty = enforced
   bool running_jobs_incomplete = 10;  // running_jobs is partial (contended agent lock); older agents never set it
   string agent_instance = 11;         // same value the agent registered with; empty from older agents and spur-k8s
+  // Per GPU, reserved CPUs held by non-holders under core_layout_fingerprint.
+  // Empty = none blocked, which is also what an older agent sends.
+  repeated GpuBlockedCpus layout_blocked_cpus = 12;
+}
+
+// Reserved CPUs of one GPU held by a job that does not hold that GPU.
+message GpuBlockedCpus {
+  uint64 stable_id = 1;
+  uint32 cpus = 2;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -1292,6 +1341,10 @@ message LaunchJobRequest {
   string execution_credential = 13;
   CoreLayout core_layout = 14;       // node's current layout; absent leaves the held one
   LayoutRevision layout_revision = 15;
+  // The node's schedulable memory: the ceiling a job with no memory budget of
+  // its own gets, Slurm-parity. 0 = unknown (older controller); the agent
+  // falls back to its own detected total.
+  uint64 node_memory_ceiling_mb = 16;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -1418,6 +1471,10 @@ message RunStepRequest {
   string execution_credential = 12;
   // Resources the step takes for itself on each node. Absent = it shares the job's.
   StepResources resources = 13;
+  // Share every resource with every other step and hold none (srun --overlap).
+  bool overlap = 14;
+  // Set by a client that retries a busy step itself; otherwise a busy step is recorded CANCELLED
+  bool wait_if_busy = 15;
 }
 
 // Resources a step inside an allocation takes for itself on each of its nodes,
@@ -1431,6 +1488,10 @@ message StepResources {
   optional uint32 gpus = 3;           // Across the step, split evenly over its nodes
   optional uint32 gpus_per_node = 4;
   optional uint32 gpus_per_task = 5;
+  optional uint32 cpus_per_gpu = 6;       // CPUs per GPU the step holds on the node
+  optional uint64 memory_per_gpu_mb = 7;  // Memory cap per GPU the step holds on the node
+  optional uint64 memory_per_cpu_mb = 8;  // Memory cap per CPU the step holds on the node
+  string gpu_type = 9;                    // Only GPUs of this type; empty = any
 }
 
 // Container settings carried on a step RPC, mirroring the JobSpec container
@@ -1455,6 +1516,7 @@ message RunStepResponse {
   string node = 4;       // Comma-separated hostnames that ran tasks
   // Separate diagnostics so live output streaming cannot suppress them.
   repeated string warnings = 5;
+  bool oom_killed = 6; // A task of the step was killed for running out of memory
 }
 
 // -- Native cluster (k0s) lifecycle messages --
@@ -1684,6 +1746,9 @@ message RunCommandRequest {
   string execution_credential = 17;
   // The step's own share of this node, as in RunStepRequest.
   StepResources resources = 18;
+  bool overlap = 19;  // As in RunStepRequest
+  // Set when a ClaimStep holds this node's share; a missing claim refuses rather than reserving anew.
+  bool claimed = 20;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1701,6 +1766,10 @@ message RegisterJobAllocationRequest {
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
   uint32 run_attempt = 13;
+  // The node's schedulable memory: the ceiling a job with no memory budget of
+  // its own gets, Slurm-parity. 0 = unknown (older controller); the agent
+  // falls back to its own detected total.
+  uint64 node_memory_ceiling_mb = 14;
 }
 
 message RegisterJobAllocationResponse {
@@ -1716,6 +1785,7 @@ message RunCommandResponse {
   int32 exit_code = 1;
   string stdout = 2;
   string stderr = 3;
+  bool oom_killed = 4;  // Killed for running out of memory, by its own limit or by the job's
 }
 
 message CancelStepRequest {
@@ -1723,6 +1793,18 @@ message CancelStepRequest {
   uint32 step_id = 2;
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
   uint32 run_attempt = 4;  // Step ids restart each attempt; 0 names any attempt
+}
+
+message ClaimStepRequest {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  uint32 run_attempt = 3;
+  uint32 num_tasks = 4;              // Tasks on this node, as in RunCommandRequest
+  string nodelist = 5;               // The step's nodes, as in RunCommandRequest
+  StepResources resources = 6;
+  string execution_credential = 7;   // As in RunCommandRequest; checked, not recorded
+  bool release = 8;                  // Drop this step's claim instead of taking one
+  uint32 ttl_secs = 9;               // How long the claim waits for RunCommand; 0 = agent default
 }
 
 message AwaitStepRequest {
@@ -2272,6 +2354,9 @@ message CompleteJobStepRequest {
   int32 exit_code = 3;
   string user = 4;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
   uint32 uid = 5;             // Caller Unix uid for Munge-like ownership when unauthenticated; 0 = absent
+  bool cancelled = 6;         // The client gave up on a step that never ran; ends CANCELLED.
+                              // A non-PTY step's real result comes from RunStep, so it accepts
+                              // only cancelled = true; a PTY step may also report cancelled = false.
 }
 
 // ============================================================
@@ -2312,6 +2397,7 @@ message CreatePartitionRequest {
   optional uint64 def_mem_per_cpu = 24;
   optional uint64 def_mem_per_gpu = 25;
   string qos = 26;  // partition QOS; empty = none
+  optional uint32 def_cpu_per_gpu = 27;  // absent or 0 = unset
 }
 
 message UpdatePartitionRequest {
@@ -2363,6 +2449,7 @@ message UpdatePartitionRequest {
   optional uint64 def_mem_per_cpu = 34;
   optional uint64 def_mem_per_gpu = 35;
   optional string qos = 36;  // partition QOS; absent = no change, empty = clear
+  optional uint32 def_cpu_per_gpu = 37;  // absent = no change; 0 = clear
 }
 
 message DeletePartitionRequest {

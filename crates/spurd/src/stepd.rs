@@ -41,6 +41,8 @@ pub struct StepdLaunchSpec {
     pub stdin_path: String,
     pub cpus: u32,
     pub memory_mb: u64,
+    #[serde(default)]
+    pub memory_ceiling_mb: u64,
     pub cpu_ids: Vec<u32>,
     #[serde(default)]
     pub gpu_devices: Vec<u64>,
@@ -163,6 +165,10 @@ pub struct StepdJobResources {
     pub cpus: u32,
     #[serde(default)]
     pub memory_mb: u64,
+    /// The node's schedulable memory, for a typed step's ceiling check when
+    /// `memory_mb` is 0; 0 = unknown. Persisted so a restart recovers it.
+    #[serde(default)]
+    pub memory_ceiling_mb: u64,
     #[serde(default)]
     pub gpu_devices: Vec<u64>,
     /// The exact cores, so a restart replays the binding the job is pinned to
@@ -203,6 +209,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             stdin_path: config.stdin_path.clone(),
             cpus: config.cpus,
             memory_mb: config.memory_mb,
+            memory_ceiling_mb: config.memory_ceiling_mb,
             gpu_devices: config.gpu_devices.clone(),
             cpu_ids: config.cpu_ids.clone(),
             open_mode: config.open_mode.clone(),
@@ -234,6 +241,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 gpu_binding: None,
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
+                memory_ceiling_mb: config.memory_ceiling_mb,
                 gpu_devices: config.gpu_devices.clone(),
                 cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
@@ -271,6 +279,7 @@ impl StepdLaunchSpec {
             stdin_path: self.stdin_path,
             cpus: self.cpus,
             memory_mb: self.memory_mb,
+            memory_ceiling_mb: self.memory_ceiling_mb,
             gpu_devices: self.gpu_devices,
             cpu_ids: self.cpu_ids,
             open_mode: self.open_mode,
@@ -4333,6 +4342,7 @@ mod tests {
             stdin_path: String::new(),
             cpus: 1,
             memory_mb: 0,
+            memory_ceiling_mb: 0,
             gpu_devices: Vec::new(),
             cpu_ids: Vec::new(),
             open_mode: None,
@@ -4646,6 +4656,7 @@ mod tests {
             cpus: Some(2),
             memory_mb: Some(512),
             gpus: Some(vec![5]),
+            ..Default::default()
         };
 
         let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");

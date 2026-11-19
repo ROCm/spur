@@ -123,11 +123,16 @@ pub enum StepState {
     Completed,
     Failed,
     Cancelled,
+    /// Killed by its own memory limit, or by the job's.
+    OutOfMemory,
 }
 
 impl StepState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::OutOfMemory
+        )
     }
 
     pub fn display(&self) -> &'static str {
@@ -137,6 +142,7 @@ impl StepState {
             Self::Completed => "COMPLETED",
             Self::Failed => "FAILED",
             Self::Cancelled => "CANCELLED",
+            Self::OutOfMemory => "OUT_OF_MEMORY",
         }
     }
 }
@@ -296,6 +302,12 @@ impl FromStr for GpuBind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_memory_is_a_terminal_step_state() {
+        assert!(StepState::OutOfMemory.is_terminal());
+        assert_eq!(StepState::OutOfMemory.display(), "OUT_OF_MEMORY");
+    }
 
     #[test]
     fn test_distribute_block() {

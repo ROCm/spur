@@ -207,7 +207,7 @@ impl<'a> NodePlacement<'a> {
             && nodes.into_iter().any(|n| {
                 self.is_listed(&n.name)
                     && self.eligible(n, reservations, now)
-                    && n.total_resources.can_satisfy(required)
+                    && n.can_ever_satisfy(required)
                     && !self.matches_for_reservation(n, reservations, now)
             })
     }

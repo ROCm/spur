@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{Duration, Utc};
 use tracing::{debug, info};
 
-use spur_core::gpu_request::{distribute_total, resolve_gpu_demand, GpuDemand};
+use spur_core::gpu_request::{
+    distribute_total, resolve_gpu_demand, tasks_per_node_counts, GpuDemand,
+};
 use spur_core::job::{Job, JobId, PartitionTresOvershoot};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
@@ -374,7 +376,10 @@ impl BackfillScheduler {
     fn init_timelines(&mut self, nodes: &[Node]) {
         self.timelines = nodes
             .iter()
-            .map(|n| NodeTimeline::new(n.name.clone(), n.total_resources.clone()))
+            .map(|n| {
+                NodeTimeline::new(n.name.clone(), n.total_resources.clone())
+                    .with_cpu_pools(n.cpu_pools())
+            })
             .collect();
     }
 
@@ -443,7 +448,7 @@ impl BackfillScheduler {
             if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
-            node.total_resources.can_satisfy(&required) && !handoffs.hides(job, &node.name)
+            node.can_ever_satisfy(&required) && !handoffs.hides(job, &node.name)
         };
         // An additive `--nodelist` needs every listed node, so one hidden node blocks the job.
         let listed_node_hidden = || {
@@ -496,20 +501,21 @@ impl BackfillScheduler {
     ) -> Option<HashMap<String, ResourceAllocations>> {
         let (at_time, duration) = window;
         let base = base_node_request(job);
-        let cpu_counts = node_cpu_counts(&job.spec);
+        let tasks = tasks_per_node_counts(&job.spec, job.spec.num_nodes.max(1));
         let gpu_type = demand.gpu_type();
+        // Size from the GPUs this node is given: a `--gpus` total lands
+        // greedily, not evenly, so `--cpus-per-gpu` CPUs follow it.
         let request = |idx: usize, gpus: u32| {
             let mut req = base.clone();
-            req.cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
+            let tasks_here = tasks.get(idx).copied().unwrap_or(1);
+            req.cpus = job.spec.cpus_on_node(tasks_here, gpus).max(1);
             req.memory_mb = node_memory_mb(&job.spec, u64::from(req.cpus), u64::from(gpus));
             req.gpus = placeholder_gpus(gpus, gpu_type);
             req
         };
         let fits = |ni: usize, req: &ResourceSet| {
             let current = self.timelines[ni].accumulated_at(at_time);
-            nodes[ni]
-                .total_resources
-                .can_satisfy_with_allocated(&current, req)
+            self.timelines[ni].admits(&current, req)
                 && self.scope_admits(ni, req, scope, at_time, duration)
         };
 
@@ -555,10 +561,9 @@ impl BackfillScheduler {
             }
             let node = &nodes[*ni];
             let current = self.timelines[*ni].accumulated_at(at_time);
-            per_node_alloc.insert(
-                node.name.clone(),
-                build_node_allocation(&node.total_resources, &current, &req),
-            );
+            let mut alloc = build_node_allocation(&node.total_resources, &current, &req);
+            stamp_allocation(node, &mut alloc);
+            per_node_alloc.insert(node.name.clone(), alloc);
         }
         Some(per_node_alloc)
     }
@@ -984,13 +989,18 @@ impl BackfillScheduler {
             // Add current allocations to timelines. Real per-node end times (from
             // busy_until) replace the flat placeholder wherever known.
             for (i, node) in cluster.nodes.iter().enumerate() {
+                let free_at = cluster
+                    .busy_until
+                    .get(&node.name)
+                    .copied()
+                    .unwrap_or(now + Duration::hours(24));
                 if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
-                    let free_at = cluster
-                        .busy_until
-                        .get(&node.name)
-                        .copied()
-                        .unwrap_or(now + Duration::hours(24));
                     self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
+                }
+                // Older-layout jobs on these GPUs' reserved CPUs end by
+                // busy_until at the latest, so a GPU job is planned, not refused.
+                if let Some(blocked) = node.layout_blocked_alloc() {
+                    self.timelines[i].reserve(now, free_at, blocked);
                 }
                 debug!(
                     node = %node.name,
@@ -1736,12 +1746,13 @@ impl BackfillScheduler {
         if !heterogeneous {
             for (ni, _) in &assigned_nodes {
                 let node = &cluster.nodes[*ni];
-                let node_alloc = if job.spec.exclusive {
+                let mut node_alloc = if job.spec.exclusive {
                     build_exclusive_allocation(&node.total_resources, required.memory_mb)
                 } else {
                     let current = self.timelines[*ni].accumulated_at(earliest);
                     build_node_allocation(&node.total_resources, &current, &required)
                 };
+                stamp_allocation(node, &mut node_alloc);
                 per_node_alloc.insert(node.name.clone(), node_alloc);
             }
         }
@@ -1751,6 +1762,14 @@ impl BackfillScheduler {
             start: earliest,
             per_node_alloc,
         })
+    }
+}
+
+/// Record which of the allocation's CPUs its GPUs' reserved cores cover. Only
+/// nodes whose GPUs reserve cores are tagged, so others serialize as before.
+fn stamp_allocation(node: &Node, alloc: &mut ResourceAllocations) {
+    if let Some(layout) = node.core_layout.as_ref().filter(|l| l.pools().is_some()) {
+        layout.stamp(alloc);
     }
 }
 
@@ -1837,11 +1856,7 @@ impl Scheduler for BackfillScheduler {
 pub fn base_node_request(job: &Job) -> ResourceSet {
     // Minimum per-node CPU share for feasibility filtering; exact per-node
     // counts are resolved at allocation. Floors at one CPU.
-    let cpus = match job.spec.tasks_per_node {
-        Some(tasks_per_node) => tasks_per_node * job.spec.cpus_per_task,
-        None => (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task,
-    }
-    .max(1);
+    let cpus = (min_node_tasks(&job.spec) * job.spec.cpus_per_task).max(1);
 
     let memory = node_memory_mb(&job.spec, u64::from(cpus), 0);
 
@@ -1878,6 +1893,12 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
     }
 }
 
+/// Tasks on the node holding the fewest, for the per-node CPU floor.
+fn min_node_tasks(spec: &spur_core::job::JobSpec) -> u32 {
+    spec.tasks_per_node
+        .unwrap_or(spec.num_tasks / spec.num_nodes.max(1))
+}
+
 /// Placeholder GPU list of `count` devices of an optional type, used to probe
 /// node capacity via [`ResourceSet::can_satisfy`] and build allocations.
 fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resource::GpuResource> {
@@ -1891,6 +1912,8 @@ fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resour
             link_type: spur_core::resource::GpuLinkType::PCIe,
             topology: None,
             stable_id: 0,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
         })
         .collect()
 }
@@ -1915,6 +1938,8 @@ fn cpu_is_heterogeneous(job: &Job) -> bool {
     if job.spec.exclusive {
         return false;
     }
+    // An estimate suffices: a `--gpus` total takes this path anyway, and
+    // per-node GPU counts are exact.
     let counts = node_cpu_counts(&job.spec);
     counts.iter().min() != counts.iter().max()
 }
@@ -1929,6 +1954,9 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
     // Heterogeneous demand needs at least one GPU per node for feasibility;
     // homogeneous demand carries its exact per-node count.
     let per_node = homogeneous_per_node(&demand).unwrap_or(1);
+    rs.cpus = rs
+        .cpus
+        .max(job.spec.cpus_on_node(min_node_tasks(&job.spec), per_node));
     rs.gpus = placeholder_gpus(per_node, demand.gpu_type());
     rs.memory_mb = node_memory_mb(&job.spec, u64::from(rs.cpus), u64::from(per_node));
     rs
@@ -2776,6 +2804,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: i as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect();
         let mut node = Node::new(
@@ -5477,6 +5507,246 @@ mod tests {
         // 4 tasks / 2 nodes = 2 tasks/node * 2 cpus = 4 cpus; 4 * 512 MB.
         assert_eq!(request.cpus, 4);
         assert_eq!(request.memory_mb, 2048);
+    }
+
+    /// `general` general CPUs plus `gpus` GPUs (stable ids 1..) reserving `r` CPUs each.
+    fn reserved_gpu_node(general: u32, gpus: u32, r: u32) -> Node {
+        use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+        let mut node = make_gpu_node(gpus);
+        for gpu in &mut node.total_resources.gpus {
+            gpu.stable_id += 1;
+        }
+        node.total_resources.cpus = general + gpus * r;
+        node.core_layout = Some(CoreLayout {
+            spec_cpus: vec![],
+            mem_spec_mb: 0,
+            gpu_reserved: (0..gpus)
+                .map(|g| GpuReservedCpus {
+                    stable_id: u64::from(g) + 1,
+                    cpus: (g * r..(g + 1) * r).collect(),
+                })
+                .collect(),
+            general_cpus: (gpus * r..gpus * r + general).collect(),
+            daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        });
+        node
+    }
+
+    fn schedule_on(nodes: &[Node], jobs: &[Job]) -> Vec<Assignment> {
+        schedule_with(nodes, &[], jobs)
+    }
+
+    fn schedule_with(nodes: &[Node], partitions: &[Partition], jobs: &[Job]) -> Vec<Assignment> {
+        let busy_until: HashMap<String, chrono::DateTime<Utc>> = nodes
+            .iter()
+            .map(|n| (n.name.clone(), Utc::now() + Duration::hours(2)))
+            .collect();
+        let state = ClusterState {
+            fabric: None,
+            nodes,
+            partitions,
+            reservations: &[],
+            topology: None,
+            busy_until: &busy_until,
+            preemption_handoffs: &HashMap::new(),
+            partition_node_usage: &Default::default(),
+        };
+        BackfillScheduler::new(100).schedule(jobs, &state)
+    }
+
+    fn gpu_job_with_cpus(id: u32, gpus: u32, cpus: u32) -> Job {
+        let mut job = make_gpu_job(id, gpus);
+        job.spec.cpus_per_task = cpus;
+        job
+    }
+
+    #[test]
+    fn cpu_only_job_waits_when_only_reserved_cpus_are_free() {
+        let mut node = reserved_gpu_node(4, 2, 4);
+        node.alloc_resources = ResourceAllocations::with_scalar(4, 0);
+        assert!(schedule_on(&[node], &[make_job(1, 1, 1)]).is_empty());
+    }
+
+    #[test]
+    fn gpu_job_runs_on_its_reserved_cpus_when_general_is_full() {
+        let mut node = reserved_gpu_node(4, 2, 4);
+        node.alloc_resources = ResourceAllocations::with_scalar(4, 0);
+        let started = schedule_on(&[node.clone()], &[gpu_job_with_cpus(1, 1, 4)]);
+        assert_eq!(started.len(), 1);
+        assert!(schedule_on(&[node], &[gpu_job_with_cpus(2, 1, 5)]).is_empty());
+    }
+
+    #[test]
+    fn allocations_carry_the_reserved_cpus_of_their_chosen_gpus() {
+        let node = reserved_gpu_node(4, 2, 4);
+        let fingerprint = node.core_layout.as_ref().map(|l| l.fingerprint());
+        let started = schedule_on(&[node], &[gpu_job_with_cpus(1, 1, 6)]);
+        let alloc = &started[0].per_node_alloc["gpu-node"];
+        assert_eq!(alloc.cpus, 6);
+        assert_eq!(alloc.reserved_cpus, 4);
+        assert_eq!(Some(alloc.layout_fingerprint), fingerprint);
+    }
+
+    #[test]
+    fn exclusive_job_takes_the_whole_layout_node() {
+        let node = reserved_gpu_node(4, 2, 4);
+        let mut job = make_job(1, 1, 1);
+        job.spec.exclusive = true;
+        let started = schedule_on(&[node], &[job]);
+        let alloc = &started[0].per_node_alloc["gpu-node"];
+        assert_eq!(alloc.cpus, 12);
+        assert_eq!(alloc.reserved_cpus, 8);
+    }
+
+    #[test]
+    fn same_cycle_jobs_share_the_general_pool() {
+        let node = reserved_gpu_node(4, 2, 4);
+        let jobs = [
+            make_job(1, 1, 3),
+            make_job(2, 1, 2),
+            gpu_job_with_cpus(3, 1, 5),
+        ];
+        let started: Vec<u32> = schedule_on(&[node], &jobs)
+            .iter()
+            .map(|a| a.job_id)
+            .collect();
+        assert_eq!(
+            started,
+            vec![1, 3],
+            "1 general CPU left: job 2 needs 2, job 3 needs 1 beyond its GPU's 4"
+        );
+    }
+
+    #[test]
+    fn cpu_only_job_too_big_for_the_general_pool_is_never_suitable() {
+        let node = reserved_gpu_node(4, 2, 4);
+        let state = ClusterState {
+            fabric: None,
+            nodes: std::slice::from_ref(&node),
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            busy_until: &HashMap::new(),
+            preemption_handoffs: &HashMap::new(),
+            partition_node_usage: &Default::default(),
+        };
+        let mut scheduler = BackfillScheduler::new(100);
+        scheduler.init_timelines(state.nodes);
+        let handoffs = HandoffGate::new(state.preemption_handoffs);
+        let suitable =
+            scheduler.find_suitable_nodes(&make_job(1, 1, 5), &state, &handoffs, Utc::now());
+        assert!(suitable.is_empty());
+    }
+
+    #[test]
+    fn a_gpu_job_skips_a_gpu_with_blocked_reserved_cpus() {
+        for (blocked, expected) in [(1, 2), (2, 1)] {
+            let mut node = reserved_gpu_node(4, 2, 4);
+            node.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+            node.layout_blocked_cpus.insert(blocked, 2);
+            let started = schedule_on(&[node], &[gpu_job_with_cpus(1, 1, 4)]);
+            assert_eq!(started.len(), 1, "GPU {expected} is still free");
+            assert_eq!(
+                gpu_ids_from_assignment(&started[0]),
+                HashSet::from([expected])
+            );
+        }
+    }
+
+    #[test]
+    fn with_every_gpu_blocked_a_gpu_job_is_planned_at_busy_until() {
+        let mut node = reserved_gpu_node(4, 2, 4);
+        node.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+        node.layout_blocked_cpus.extend([(1, 2), (2, 1)]);
+        let nodes = [node];
+        let free_at = Utc::now() + Duration::minutes(90);
+        let busy_until = HashMap::from([("gpu-node".to_string(), free_at)]);
+        let handoffs = HashMap::new();
+        let mut sched = BackfillScheduler::new(100);
+
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        assert!(sched
+            .schedule(&[gpu_job_with_cpus(1, 1, 4)], &state)
+            .is_empty());
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::FutureSlotReserved);
+        assert_eq!(outcome.planned_start, Some(free_at));
+    }
+
+    #[test]
+    fn cpu_only_jobs_ignore_blocked_gpus() {
+        let mut node = reserved_gpu_node(4, 2, 4);
+        node.layout_blocked_cpus.extend([(1, 4), (2, 4)]);
+        let started = schedule_on(&[node.clone()], &[make_job(1, 1, 4)]);
+        assert_eq!(started.len(), 1, "all 4 general CPUs are free");
+        assert!(
+            schedule_on(&[node], &[gpu_job_with_cpus(2, 1, 1)]).is_empty(),
+            "no running job holds the node, yet both GPUs read busy"
+        );
+    }
+
+    fn per_gpu_job(id: u32, nodes: u32, cpus_per_gpu: u32) -> Job {
+        let mut job = make_gpu_job(id, 0);
+        job.spec.gres.clear();
+        job.spec.num_nodes = nodes;
+        job.spec.num_tasks = nodes;
+        job.spec.cpus_per_task = 1;
+        job.spec.cpus_per_gpu = Some(cpus_per_gpu);
+        job
+    }
+
+    #[test]
+    fn cpus_per_gpu_job_sizes_each_node_from_its_own_gpus() {
+        let mut small = make_gpu_node(1);
+        small.name = "node001".into();
+        let mut big = make_gpu_node(4);
+        big.name = "node002".into();
+        let mut job = per_gpu_job(1, 2, 8);
+        job.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(5, None));
+        let started = schedule_on(&[small, big], &[job]);
+        assert_eq!(started.len(), 1);
+        for (node, alloc) in &started[0].per_node_alloc {
+            let gpus = alloc.total_device_count("gpu") as u32;
+            assert_eq!(alloc.cpus, 8 * gpus, "{node} holds {gpus} GPUs");
+        }
+    }
+
+    #[test]
+    fn cpus_per_gpu_sets_the_per_node_cpu_floor() {
+        let mut job = per_gpu_job(1, 1, 8);
+        job.spec.gres = vec!["gpu:2".into()];
+        let mut small = make_gpu_node(2);
+        small.total_resources.cpus = 12;
+        assert!(schedule_on(&[small], std::slice::from_ref(&job)).is_empty());
+        let mut fits = make_gpu_node(2);
+        fits.total_resources.cpus = 16;
+        let started = schedule_on(&[fits], &[job]);
+        assert_eq!(started[0].per_node_alloc["gpu-node"].cpus, 16);
+    }
+
+    #[test]
+    fn partition_cpu_cap_sees_only_the_surviving_cpu_option() {
+        let capped = Partition {
+            name: "default".into(),
+            max_tres_per_node: [("cpu".to_string(), 4)].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut explicit_c = make_gpu_job(1, 2);
+        explicit_c.spec.cpus_per_task = 2;
+        let started = schedule_with(
+            &[make_gpu_node(2)],
+            std::slice::from_ref(&capped),
+            &[explicit_c],
+        );
+        assert_eq!(started.len(), 1, "-c 2 survives: 2 CPUs under the cap");
+        let mut per_gpu = per_gpu_job(2, 1, 8);
+        per_gpu.spec.gres = vec!["gpu:2".into()];
+        let held = schedule_with(&[make_gpu_node(2)], &[capped], &[per_gpu]);
+        assert!(
+            held.is_empty(),
+            "--cpus-per-gpu=8 x 2 GPUs = 16 CPUs over the cap"
+        );
     }
 }
 

@@ -215,6 +215,7 @@ mock_agent_impl! {
         exec_in_job(proto::ExecInJobRequest) -> proto::ExecInJobResponse;
         run_command(proto::RunCommandRequest) -> proto::RunCommandResponse;
         cancel_step(proto::CancelStepRequest) -> ();
+        claim_step(proto::ClaimStepRequest) -> ();
         register_job_allocation(proto::RegisterJobAllocationRequest)
             -> proto::RegisterJobAllocationResponse;
         await_step(proto::AwaitStepRequest) -> proto::RunCommandResponse;

@@ -479,6 +479,7 @@ fn a_placement_is_planned_with_the_chosen_partitions_adjusted_request() {
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1536),
             memory_per_gpu_mb: None,
+            cpus_per_gpu: None,
         })
     );
     assert_eq!(cpus(&job(Some(5 * GIB), None)), 6);
@@ -559,6 +560,7 @@ async fn effective_partition_and_adjusted_request_survive_a_controller_restart()
                     memory_per_node_mb: None,
                     memory_per_cpu_mb: Some(1536),
                     memory_per_gpu_mb: None,
+                    cpus_per_gpu: None,
                 }),
             },
         )
@@ -653,6 +655,8 @@ fn typed_gpu_capacity_counts_only_that_type() {
         link_type: spur_core::resource::GpuLinkType::PCIe,
         topology: None,
         stable_id: 0,
+        numa_node: None,
+        affinity_cpus: Vec::new(),
     };
     let resources = ResourceSet {
         gpus: vec![gpu("a100"), gpu("a100"), gpu("mi300x")],
@@ -2106,4 +2110,176 @@ async fn a_node_limit_does_not_credit_a_node_whose_cap_is_full() {
     limit_account_nodes(&cm, 2);
     assert_eq!(run_pass(&cm), [id]);
     assert_eq!(placed(&cm, id).0, ["n2"]);
+}
+
+fn with_def_cpu_per_gpu(name: &str, def: Option<u32>) -> Partition {
+    Partition {
+        def_cpu_per_gpu: def,
+        ..partition(name, &[])
+    }
+}
+
+fn gpu_job_in(partition: &str) -> JobSpec {
+    JobSpec {
+        partition: Some(partition.into()),
+        gres: vec!["gpu:2".into()],
+        cpus_per_task_unset: true,
+        ..basic_spec("per-gpu")
+    }
+}
+
+fn resolved_cpus_per_gpu(cm: &ClusterManager, spec: JobSpec) -> Option<u32> {
+    let id = submit_and_wait(cm, spec);
+    cm.get_job(id).unwrap().spec.cpus_per_gpu
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn def_cpu_per_gpu_follows_job_then_partition_then_scheduler() {
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config();
+    config.scheduler.def_cpu_per_gpu = Some(4);
+    let cm = test_cluster_with_config(&dir, config).await;
+    for p in [
+        with_def_cpu_per_gpu("a", Some(8)),
+        with_def_cpu_per_gpu("b", Some(8)),
+        with_def_cpu_per_gpu("c", Some(16)),
+        with_def_cpu_per_gpu("plain", None),
+    ] {
+        cm.create_partition(p).unwrap();
+    }
+
+    let mut own = gpu_job_in("a");
+    own.cpus_per_gpu = Some(2);
+    assert_eq!(
+        resolved_cpus_per_gpu(&cm, own),
+        Some(2),
+        "the job's own value"
+    );
+    assert_eq!(resolved_cpus_per_gpu(&cm, gpu_job_in("a")), Some(8));
+    assert_eq!(
+        resolved_cpus_per_gpu(&cm, gpu_job_in("a,b")),
+        Some(8),
+        "partitions that agree"
+    );
+    assert_eq!(
+        resolved_cpus_per_gpu(&cm, gpu_job_in("a,c")),
+        Some(4),
+        "partitions that disagree fall back to [scheduler]"
+    );
+    assert_eq!(resolved_cpus_per_gpu(&cm, gpu_job_in("plain")), Some(4));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn def_cpu_per_gpu_skips_explicit_c_and_cpu_only_jobs() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![with_def_cpu_per_gpu("a", Some(8))],
+    )
+    .await;
+    let mut explicit = gpu_job_in("a");
+    explicit.cpus_per_task_unset = false;
+    explicit.cpus_per_task = 2;
+    assert_eq!(resolved_cpus_per_gpu(&cm, explicit), None);
+
+    let mut cpu_only = gpu_job_in("a");
+    cpu_only.gres.clear();
+    assert_eq!(resolved_cpus_per_gpu(&cm, cpu_only), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qos_limits_see_the_resolved_def_cpu_per_gpu() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![with_def_cpu_per_gpu("a", Some(8))],
+    )
+    .await;
+    register_node(&cm, "n1", 64, 64 * GIB);
+    let mut cap = TresRecord::new();
+    cap.set(TresType::Cpu, 8);
+    cm.qos_cache().insert(Qos {
+        name: "small".into(),
+        limits: spur_core::accounting::QosLimits {
+            max_tres_per_job: Some(cap),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut spec = gpu_job_in("a");
+    spec.qos = Some("small".into());
+    let id = submit_and_wait(&cm, spec);
+    cm.refresh_pending_reasons();
+    assert_eq!(
+        cm.get_job(id).unwrap().pending_reason,
+        PendingReason::QosMaxCpuPerJobLimit,
+        "2 GPUs x def 8 = 16 CPUs, over the cap of 8"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_cpu_cap_applies_on_top_of_the_general_pool_fit() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("gpu", &[("cpu", 10)])],
+    )
+    .await;
+    // 12 non-spec CPUs: 2 GPUs reserving 4 each, 4 general. The cap (10) sits
+    // below the node's non-spec total (12) but above its general pool (4).
+    let mut node = reserved_layout_node();
+    node.partitions = vec!["gpu".into()];
+    cm.nodes.write().insert("n1".into(), node);
+
+    // Needs exactly its own reserved cores plus the whole general pool (12
+    // CPUs: general_need = 12 - 8 = 4, which fills the general pool exactly),
+    // so the general/reserved split alone would admit it -- only the
+    // partition cap blocks it.
+    let mut gpu_spec = basic_spec("gpu-over-cap");
+    gpu_spec.partition = Some("gpu".into());
+    gpu_spec.gres = vec!["gpu:2".into()];
+    gpu_spec.cpus_per_gpu = Some(6);
+    gpu_spec.cpus_per_task_unset = true;
+    let gpu_id = submit_and_wait(&cm, gpu_spec);
+    cm.refresh_pending_reasons();
+    let gpu_job = cm.get_job(gpu_id).unwrap();
+    assert_eq!(gpu_job.pending_reason, PendingReason::PartitionTresLimit);
+    assert!(
+        gpu_job.state_reason_display().contains("12 CPUs")
+            && gpu_job
+                .state_reason_display()
+                .contains("max_tres_per_node.cpu is 10"),
+        "{}",
+        gpu_job.state_reason_display()
+    );
+
+    // Within the cap (5 < 10) but over the general pool (4 general CPUs, no
+    // GPUs to share reserved cores with): the cap does not block it, yet the
+    // general/reserved split still does, under its own distinct reason -- the
+    // two checks never mask one another.
+    let mut cpu_over_general = basic_spec("cpu-over-general");
+    cpu_over_general.partition = Some("gpu".into());
+    cpu_over_general.num_tasks = 5;
+    let cpu_id = submit_and_wait(&cm, cpu_over_general);
+    cm.refresh_pending_reasons();
+    let cpu_job = cm.get_job(cpu_id).unwrap();
+    assert_eq!(cpu_job.pending_reason, PendingReason::NodeConfigUnavailable);
+    assert!(
+        cpu_job
+            .state_reason_display()
+            .contains("outside GPU-reserved and spec cores"),
+        "{}",
+        cpu_job.state_reason_display()
+    );
+
+    // Within both the cap and the general pool: fully schedulable.
+    let mut fits = basic_spec("fits-both");
+    fits.partition = Some("gpu".into());
+    fits.num_tasks = 4;
+    let fits_id = submit_and_wait(&cm, fits);
+    cm.refresh_pending_reasons();
+    assert!(schedulable(&cm, fits_id));
 }

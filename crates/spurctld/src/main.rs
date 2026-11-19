@@ -26,6 +26,7 @@ mod rpc_stats;
 mod sched_stats;
 mod scheduler_loop;
 mod server;
+mod step_claims;
 mod victim_order;
 
 use std::path::PathBuf;
@@ -289,7 +290,6 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
             }
-            health_cluster.complete_evicted_steps(&evicted);
         }
     });
 
@@ -488,6 +488,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             def_mem_per_node: None,
             def_mem_per_cpu: None,
             def_mem_per_gpu: None,
+            def_cpu_per_gpu: None,
         }],
         nodes: Vec::new(),
         network: Default::default(),

@@ -295,9 +295,15 @@ tokens rather than leaving variables unset (unset is not reliably "no devices"):
 
 ### 5.4 Per-Task GPU Slicing
 
-For multi-task jobs, a shell wrapper divides `SPUR_JOB_GPUS` evenly across
-tasks on the node. Each task gets `total_gpus / tasks_per_node` GPUs, selected
-by `SPUR_LOCALID * gpus_per_task` as the offset into the allocated list.
+For multi-task jobs, a shell wrapper divides `SPUR_LOCAL_GPUS` (set only inside
+a step fenced to its own GPUs) or else `SPUR_JOB_GPUS` evenly across tasks on the
+node, and exports each task's slice as `ROCR_VISIBLE_DEVICES`,
+`CUDA_VISIBLE_DEVICES` and `GPU_DEVICE_ORDINAL`. Each task gets
+`total_gpus / tasks_per_node` GPUs, selected by `SPUR_LOCALID * gpus_per_task` as
+the offset. Inside the fence `localize_gpu_selectors` renumbers the runtime
+selectors from 0 and sets `SPUR_LOCAL_GPUS` to `0..n-1`, while `SPUR_JOB_GPUS`
+keeps the node's ids (like Slurm's `SLURM_JOB_GPUS`). `ZE_AFFINITY_MASK` is not
+split per task.
 
 ### 5.5 GPU Bind Modes
 

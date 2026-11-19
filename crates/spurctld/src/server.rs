@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
@@ -28,6 +28,7 @@ use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
 use crate::sched_stats::SchedStatsCollector;
+use crate::step_claims;
 
 use spur_core::native_peer::FORWARDED_HEADER;
 const LEADER_HEADER: &str = "x-spur-leader";
@@ -203,6 +204,12 @@ fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
 }
 
+/// `own` narrowed to the names `leader` also advertises: a follower must never
+/// claim a `Ping` capability the leader lacks.
+fn narrow_to_leader_capabilities(own: Vec<String>, leader: &[String]) -> Vec<String> {
+    own.into_iter().filter(|c| leader.contains(c)).collect()
+}
+
 /// Every field is an `Arc` or immutable config, so clones share state rather
 /// than fork it — the recovery fences below must be one map, not several.
 #[derive(Clone)]
@@ -274,8 +281,14 @@ impl LeaderProxy {
         } else {
             format!("http://{}", addr)
         };
+        // Every dial to the leader (forwarding writes and reads, the uncached resend,
+        // and the capability probe) shares this, so it must not exceed the probe's own
+        // bound: a hung dial fails at that bound instead of hanging past it.
+        let connect_timeout =
+            std::time::Duration::from_secs(spur_core::config::LEADER_CAPABILITY_PROBE_TIMEOUT_SECS);
         let endpoint = tonic::transport::Endpoint::from_shared(url)
-            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?;
+            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
+            .connect_timeout(connect_timeout);
         Ok((leader_id, endpoint))
     }
 
@@ -395,7 +408,26 @@ async fn replay_completed_step(
         stderr,
         node: step.nodes.join(","),
         warnings,
+        oom_killed: step.state == spur_core::step::StepState::OutOfMemory,
     })
+}
+
+/// A cancelled step never ran; replaying it as a completion would turn a
+/// retried RunStep into a false success. Callers must have already released
+/// any claims held for this step before calling this.
+async fn settle_terminal_step(
+    cluster: &ClusterManager,
+    job: &spur_core::job::Job,
+    step: &spur_core::step::JobStep,
+) -> Result<RunStepResponse, Status> {
+    if step.state == spur_core::step::StepState::Cancelled {
+        return Err(Status::failed_precondition(format!(
+            "step {}.{} was cancelled",
+            step.job_id, step.step_id
+        )));
+    }
+
+    replay_completed_step(cluster, job, step).await
 }
 
 async fn completed_step_output(
@@ -607,6 +639,55 @@ impl ControllerService {
                 result => return result,
             }
         }
+    }
+
+    /// Capabilities to advertise on `Ping`: a follower must not out-advertise the leader it
+    /// forwards SubmitJob/RunStep to, or the leader silently drops fields it doesn't know yet.
+    /// The leader, and an already-forwarded probe (this method's own query below), answer own.
+    async fn ping_capabilities<T>(&self, request: &Request<T>) -> Vec<String> {
+        let own = Self::own_capabilities();
+        if self.raft.is_leader() || Self::is_already_forwarded(request) {
+            return own;
+        }
+        match self.leader_capabilities().await {
+            Ok(leader) => narrow_to_leader_capabilities(own, &leader),
+            Err(e) => {
+                debug!("no leader capabilities for Ping, advertising none: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    // srun refuses step flags, and sbatch/salloc/srun refuse per-GPU job
+    // options, against a controller that lacks these.
+    fn own_capabilities() -> Vec<String> {
+        vec![
+            spur_core::node::CAP_STEP_RESOURCES.to_string(),
+            spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+        ]
+    }
+
+    /// A bounded `Ping` to the leader over the same channel [`Self::forward_to_leader`]
+    /// uses, marked already-forwarded so the far side (the leader, or a stale cached
+    /// "leader" that has since lost the role) answers its own capabilities rather than
+    /// forwarding again. The timeout wraps channel acquisition too, not just the ping
+    /// call: `get_leader_channel` has no bound of its own, so a dial that hangs (leader
+    /// gone unreachable mid-term) would otherwise block every other caller behind its
+    /// `cached_channel` mutex until the OS connect timeout, not this one.
+    async fn leader_capabilities(&self) -> Result<Vec<String>, Status> {
+        let timeout =
+            std::time::Duration::from_secs(spur_core::config::LEADER_CAPABILITY_PROBE_TIMEOUT_SECS);
+        let probe = async {
+            let channel = self.leader_proxy.get_leader_channel().await?;
+            let mut client = spur_proto::controller_client(channel);
+            let mut request = Request::new(());
+            *request.metadata_mut() = Self::forwarded_metadata();
+            client.ping(request).await
+        };
+        let response = tokio::time::timeout(timeout, probe)
+            .await
+            .map_err(|_| Status::deadline_exceeded("leader probe timed out"))??;
+        Ok(response.into_inner().capabilities)
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -2453,7 +2534,6 @@ impl SlurmController for ControllerService {
         self.spawn_cancel_for_evicted(&evicted);
         // The fan-out above resolves addresses from the node table, which no longer has this node.
         crate::scheduler_loop::spawn_kill_runs_on_node(&node, &runs);
-        self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(spur_proto::proto::DeregisterNodeResponse {
             evicted_jobs_count: evicted.len() as u32,
         }))
@@ -2490,7 +2570,6 @@ impl SlurmController for ControllerService {
             )
             .map_err(|e| Status::internal(e.to_string()))?;
         self.spawn_cancel_for_evicted(&evicted);
-        self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(()))
     }
 
@@ -2514,7 +2593,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(GetPartitionsResponse { partitions: proto }))
     }
 
-    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, request: Request<()>) -> Result<Response<PingResponse>, Status> {
         let hostname: String = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".into());
@@ -2529,6 +2608,7 @@ impl SlurmController for ControllerService {
             .collect();
 
         let config = self.cluster.config();
+        let capabilities = self.ping_capabilities(&request).await;
         Ok(Response::new(PingResponse {
             hostname,
             server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
@@ -2542,6 +2622,7 @@ impl SlurmController for ControllerService {
             timeout_kill_wait_secs: Some(config.scheduler.effective_timeout_kill_wait_secs()),
             tres_billing_weights: config.scheduler.tres_billing_weights.clone(),
             usage_reset_period: config.scheduler.usage_reset_period.as_str().to_owned(),
+            capabilities,
         }))
     }
 
@@ -2901,6 +2982,7 @@ impl SlurmController for ControllerService {
                 &req.hostname,
                 req.core_layout_fingerprint,
                 &req.spec_enforcement_error,
+                &req.layout_blocked_cpus,
             ) || self
                 .cluster
                 .agent_instance_unrecorded(&req.hostname, &req.agent_instance);
@@ -3374,9 +3456,32 @@ impl SlurmController for ControllerService {
             return Ok(Response::new(()));
         }
 
+        // RunStep records dispatched steps itself; a client may only abandon one or close its PTY step.
+        if !req.cancelled && !step.pty {
+            return Err(Status::invalid_argument(format!(
+                "step {}.{} is recorded by the controller; a client may only cancel it",
+                job_id, req.step_id
+            )));
+        }
+
         self.cluster
-            .record_step_complete(job_id, req.step_id, req.exit_code)
+            .record_step_complete(job_id, req.step_id, req.exit_code, false, req.cancelled)
             .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+
+        // srun abandoning a step may have left an admitted retry running (or
+        // about to claim) on its nodes: stop it there too, not just in the
+        // controller's record.
+        if req.cancelled && !step.nodes.is_empty() {
+            crate::scheduler_loop::cancel_step_on_nodes(
+                &self.cluster,
+                job_id,
+                job.run_attempt,
+                req.step_id,
+                &step.nodes,
+                15,
+            )
+            .await;
+        }
 
         Ok(Response::new(()))
     }
@@ -3942,7 +4047,7 @@ impl SlurmController for ControllerService {
             })?;
 
         if step.state.is_terminal() {
-            return replay_completed_step(&self.cluster, &job, &step)
+            return settle_terminal_step(&self.cluster, &job, &step)
                 .await
                 .map(Response::new);
         }
@@ -4001,6 +4106,25 @@ impl SlurmController for ControllerService {
                             continue;
                         }
                     };
+                    if step_takes_own_share(req.resources.as_ref())
+                        && !node.supports(spur_core::node::CAP_STEP_RESOURCES)
+                    {
+                        let message = if matches!(
+                            node.source,
+                            spur_core::node::NodeSource::Kubernetes { .. }
+                        ) {
+                            format!(
+                                "typed steps (-c, --mem*, --cpus-per-gpu, --gpus*) are not \
+                                 supported on Kubernetes-backed node {node_name}"
+                            )
+                        } else {
+                            format!(
+                                "this step asks for its own CPU, memory or GPU share, which \
+                                 spurd on {node_name} cannot enforce: upgrade spurd on {node_name}"
+                            )
+                        };
+                        return Err(Status::failed_precondition(message));
+                    }
                     dispatches.push(NodeDispatch {
                         node_name,
                         agent_addr,
@@ -4018,72 +4142,189 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let pmix_peers = if mpi == MPI_PMIX {
-            Some(
-                spur_core::mpi::PmixStepPeers::from_participants(
-                    dispatches
-                        .iter()
-                        .map(|dispatch| dispatch.node_tasks.node_index)
-                        .collect(),
-                    |idx| {
-                        let name = step.nodes.get(idx as usize)?;
-                        self.cluster
-                            .get_node(name)
-                            .and_then(|n| n.comm_addr().map(str::to_string))
-                    },
-                )
-                .map_err(Status::failed_precondition)?,
+        // Two-phase dispatch: a typed, non-overlap step claims its share on every
+        // node first, so a busy node waits rather than leaving a sibling running.
+        let step_claim_targets: Vec<step_claims::ClaimTarget> = dispatches
+            .iter()
+            .map(|d| step_claims::ClaimTarget {
+                node_name: d.node_name.clone(),
+                agent_addr: d.agent_addr.clone(),
+                tasks_on_node: d.node_tasks.tasks_on_node,
+            })
+            .collect();
+        let mut claimed_nodes: Vec<String> = Vec::new();
+        // Gates both running the claim phase below and releasing afterward:
+        // an untyped or overlap step never claims, so it must never release.
+        let claim_phase_ran = step_takes_own_share(req.resources.as_ref()) && !req.overlap;
+        // Releases every target if this future is dropped (e.g. srun killed)
+        // before the claims are handed to the RunCommand dispatch below —
+        // backstops the explicit releases on every return path in between.
+        let mut claim_release_guard: Option<step_claims::StepClaimReleaseGuard> = None;
+        if claim_phase_ran {
+            claim_release_guard = Some(step_claims::StepClaimReleaseGuard::new(
+                step_claim_targets.clone(),
+                job_id,
+                job.run_attempt,
+                step_id,
+            ));
+            let claim_request = ClaimStepRequest {
+                job_id,
+                step_id,
+                run_attempt: job.run_attempt,
+                num_tasks: 0,
+                nodelist: step.nodes.join(","),
+                resources: req.resources.clone(),
+                execution_credential: req.execution_credential.clone(),
+                release: false,
+                // Outlasts the claim phase plus the PMIx prepare, each bounded by the deadline.
+                ttl_secs: crate::scheduler_loop::dispatch_deadline(&self.cluster).map_or(0, |d| {
+                    d.as_secs()
+                        .saturating_mul(2)
+                        .saturating_add(30)
+                        .min(u32::MAX.into()) as u32
+                }),
+            };
+            match step_claims::claim_on_nodes(
+                &step_claim_targets,
+                claim_request,
+                crate::scheduler_loop::dispatch_deadline(&self.cluster),
             )
-        } else {
-            None
-        };
-        let needs_pmix_prepare = pmix_peers.as_ref().is_some_and(|peers| {
-            step_needs_pmix_prepare(
-                peers.num_nodes,
-                job.spec.mpi.as_deref(),
-                job.allocated_nodes.len() as u32,
-                job.spec.script.as_deref(),
-            )
-        });
+            .await
+            {
+                step_claims::ClaimVerdict::Busy { message } => {
+                    step_claims::release_on_nodes(
+                        &step_claim_targets,
+                        job_id,
+                        job.run_attempt,
+                        step_id,
+                    )
+                    .await;
+                    if let Some(guard) = claim_release_guard.as_mut() {
+                        guard.disarm();
+                    }
+                    if !req.wait_if_busy {
+                        if let Err(e) = self
+                            .cluster
+                            .record_step_complete(job_id, step_id, 0, false, true)
+                        {
+                            warn!(job_id, step_id, error = %e, "failed to record step completion");
+                        }
+                    }
+                    return Err(spur_proto::step_share_busy(message));
+                }
+                step_claims::ClaimVerdict::Refused { failures } => {
+                    step_claims::release_on_nodes(
+                        &step_claim_targets,
+                        job_id,
+                        job.run_attempt,
+                        step_id,
+                    )
+                    .await;
+                    if let Some(guard) = claim_release_guard.as_mut() {
+                        guard.disarm();
+                    }
+                    let failure_codes: Vec<Code> = failures.iter().map(|s| s.code()).collect();
+                    let messages: Vec<String> =
+                        failures.iter().map(|s| s.message().to_string()).collect();
+                    return finish_failed_step(
+                        &self.cluster,
+                        job_id,
+                        step_id,
+                        &[],
+                        &failure_codes,
+                        &messages,
+                        1,
+                        false,
+                        String::new(),
+                        format!("srun step dispatch errors:\n{}\n", messages.join("\n")),
+                        req.resources.as_ref(),
+                    );
+                }
+                step_claims::ClaimVerdict::Claimed(nodes) => {
+                    claimed_nodes = nodes;
+                }
+            }
+        }
+
         let run_attempt = job.run_attempt;
         let step_nodelist = step.nodes.join(",");
 
-        let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
-            if let Some(peers) = pmix_peers.as_ref() {
-                dispatches
-                    .iter()
-                    .map(|node_dispatch| {
-                        let local = spur_core::mpi::pmix_local_dispatch_for_step(
-                            peers,
-                            node_dispatch.node_tasks.node_index,
-                            job_id,
-                            step.step_id,
-                            step_num_tasks,
-                            node_dispatch.node_tasks.task_offset,
-                            node_dispatch.node_tasks.tasks_on_node,
-                            pmix_tmpdir.clone(),
-                            uid,
-                            gid,
-                            modex_connect_timeout_secs,
-                            modex_fence_timeout_secs,
-                            modex_verify_timeout_secs,
-                        )
-                        .map_err(Status::failed_precondition)?;
-                        spur_core::mpi::build_validated_pmix_plan_proto(mpi.as_str(), local)
-                            .map_err(Status::failed_precondition)?
-                            .ok_or_else(|| {
-                                Status::failed_precondition("job is not configured for PMIx")
-                            })
-                            .map(Some)
-                    })
-                    .collect::<Result<Vec<_>, Status>>()?
+        // Everything from here through PMIx prepare can fail after the claim
+        // phase above already holds `claimed_nodes` on the agents; any error
+        // must release them before returning, or they sit until their TTL.
+        let pmix_setup: Result<
+            (
+                bool,
+                Vec<Option<spur_proto::proto::PmixLaunchPlan>>,
+                Option<pmix_dispatch::PmixPreparedReleaseGuard>,
+            ),
+            Status,
+        > = async {
+            let pmix_peers = if mpi == MPI_PMIX {
+                Some(
+                    spur_core::mpi::PmixStepPeers::from_participants(
+                        dispatches
+                            .iter()
+                            .map(|dispatch| dispatch.node_tasks.node_index)
+                            .collect(),
+                        |idx| {
+                            let name = step.nodes.get(idx as usize)?;
+                            self.cluster
+                                .get_node(name)
+                                .and_then(|n| n.comm_addr().map(str::to_string))
+                        },
+                    )
+                    .map_err(Status::failed_precondition)?,
+                )
             } else {
-                vec![None; dispatches.len()]
+                None
             };
+            let needs_pmix_prepare = pmix_peers.as_ref().is_some_and(|peers| {
+                step_needs_pmix_prepare(
+                    peers.num_nodes,
+                    job.spec.mpi.as_deref(),
+                    job.allocated_nodes.len() as u32,
+                    job.spec.script.as_deref(),
+                )
+            });
 
-        let mut pmix_prepare_guard = None;
+            let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
+                if let Some(peers) = pmix_peers.as_ref() {
+                    dispatches
+                        .iter()
+                        .map(|node_dispatch| {
+                            let local = spur_core::mpi::pmix_local_dispatch_for_step(
+                                peers,
+                                node_dispatch.node_tasks.node_index,
+                                job_id,
+                                step.step_id,
+                                step_num_tasks,
+                                node_dispatch.node_tasks.task_offset,
+                                node_dispatch.node_tasks.tasks_on_node,
+                                pmix_tmpdir.clone(),
+                                uid,
+                                gid,
+                                modex_connect_timeout_secs,
+                                modex_fence_timeout_secs,
+                                modex_verify_timeout_secs,
+                            )
+                            .map_err(Status::failed_precondition)?;
+                            spur_core::mpi::build_validated_pmix_plan_proto(mpi.as_str(), local)
+                                .map_err(Status::failed_precondition)?
+                                .ok_or_else(|| {
+                                    Status::failed_precondition("job is not configured for PMIx")
+                                })
+                                .map(Some)
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?
+                } else {
+                    vec![None; dispatches.len()]
+                };
 
-        if needs_pmix_prepare {
+            if !needs_pmix_prepare {
+                return Ok((needs_pmix_prepare, dispatch_pmix_plans, None));
+            }
+
             if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
                 dispatches.iter().filter_map(|dispatch| {
                     self.cluster
@@ -4125,12 +4366,69 @@ impl SlurmController for ControllerService {
                 )));
             }
             let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
-            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs));
+            Ok((
+                needs_pmix_prepare,
+                dispatch_pmix_plans,
+                Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs)),
+            ))
+        }
+        .await;
+
+        let (needs_pmix_prepare, dispatch_pmix_plans, mut pmix_prepare_guard) = match pmix_setup {
+            Ok(v) => v,
+            Err(e) => {
+                if claim_phase_ran {
+                    step_claims::release_on_nodes(
+                        &step_claim_targets,
+                        job_id,
+                        job.run_attempt,
+                        step_id,
+                    )
+                    .await;
+                    if let Some(guard) = claim_release_guard.as_mut() {
+                        guard.disarm();
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // A cancelled or otherwise-ended step must not dispatch once every
+        // node has claimed — release the claims and replay the step's
+        // already-settled outcome instead of starting it.
+        if let Some(settled) = self
+            .cluster
+            .get_step(job_id, step_id)
+            .filter(|s| s.state.is_terminal())
+        {
+            if claim_phase_ran {
+                step_claims::release_on_nodes(
+                    &step_claim_targets,
+                    job_id,
+                    job.run_attempt,
+                    step_id,
+                )
+                .await;
+                if let Some(guard) = claim_release_guard.as_mut() {
+                    guard.disarm();
+                }
+            }
+            return settle_terminal_step(&self.cluster, &job, &settled)
+                .await
+                .map(Response::new);
+        }
+
+        // Claims are handed to the RunCommand dispatch below (each agent
+        // consumes its own via `claimed`); a drop past this point must not
+        // re-release what RunCommand now owns.
+        if let Some(guard) = claim_release_guard.as_mut() {
+            guard.disarm();
         }
 
         let mut set = tokio::task::JoinSet::new();
         for (dispatch, pmix_plan) in dispatches.iter().zip(dispatch_pmix_plans) {
             let node_name = dispatch.node_name.clone();
+            let claimed = claimed_nodes.contains(&dispatch.node_name);
             let agent_addr = dispatch.agent_addr.clone();
             let node_tasks = dispatch.node_tasks.clone();
             let command = command.clone();
@@ -4138,10 +4436,11 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             let container = step_container.clone();
-            let resources = req.resources;
+            let resources = req.resources.clone();
             let step_nodelist = step_nodelist.clone();
             let step_user = job.spec.user.clone();
             let execution_credential = req.execution_credential.clone();
+            let overlap = req.overlap;
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -4169,6 +4468,8 @@ impl SlurmController for ControllerService {
                         nodelist: step_nodelist.clone(),
                         execution_credential: execution_credential.clone(),
                         resources,
+                        overlap,
+                        claimed,
                     })
                     .await;
 
@@ -4185,10 +4486,15 @@ impl SlurmController for ControllerService {
                         reawait_step(&agent_addr, job_id, run_attempt, step_id, &step_user).await?
                     }
                     Err(error) => {
-                        return Err(Status::internal(format!(
-                            "run_command on {} failed: {}",
-                            node_name, error
-                        )))
+                        let message =
+                            format!("run_command on {} failed: {}", node_name, error.message());
+                        // Status::new drops metadata, so the busy marker must be
+                        // reapplied rather than just carried on the rewrapped error.
+                        return Err(if spur_proto::is_step_share_busy(&error) {
+                            spur_proto::step_share_busy(message)
+                        } else {
+                            Status::new(error.code(), message)
+                        });
                     }
                 };
 
@@ -4196,6 +4502,9 @@ impl SlurmController for ControllerService {
             });
         }
 
+        let mut failure_codes = Vec::new();
+        let mut busy_refusals = Vec::new();
+        let mut oom_killed = false;
         let mut max_exit = 0i32;
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -4206,6 +4515,7 @@ impl SlurmController for ControllerService {
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok((node_name, agent_resp))) => {
+                    oom_killed |= agent_resp.oom_killed;
                     max_exit = max_exit.max(agent_resp.exit_code);
                     stdout.push_str(&agent_resp.stdout);
                     stderr.push_str(&agent_resp.stderr);
@@ -4213,9 +4523,14 @@ impl SlurmController for ControllerService {
                 }
                 Ok(Err(e)) => {
                     warn!(job_id, step_id, error = %e, "step dispatch failed on one node");
-                    dispatch_errors.push(e.to_string());
+                    let busy = spur_proto::is_step_share_busy(&e);
+                    failure_codes.push(e.code());
+                    busy_refusals.push(busy);
+                    dispatch_errors.push(e.message().to_string());
                     max_exit = max_exit.max(1);
-                    if !step_abort_sent {
+                    // A busy node started nothing; cancelling it would tombstone
+                    // the launch acceptance the retry needs.
+                    if !busy && !step_abort_sent {
                         step_abort_sent = true;
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
@@ -4230,6 +4545,8 @@ impl SlurmController for ControllerService {
                 }
                 Err(e) => {
                     warn!(job_id, step_id, error = %e, "step dispatch task panicked");
+                    failure_codes.push(Code::Internal);
+                    busy_refusals.push(false);
                     dispatch_errors.push(format!("step dispatch task panicked: {e}"));
                     max_exit = max_exit.max(1);
                     if !step_abort_sent {
@@ -4264,22 +4581,50 @@ impl SlurmController for ControllerService {
             pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
         }
 
-        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
-            warn!(
+        // Every node refused busy: the step never ran anywhere, so it stays
+        // runnable for srun's retry rather than completing as failed.
+        let busy_everywhere = ran_nodes.is_empty()
+            && !busy_refusals.is_empty()
+            && busy_refusals.iter().all(|busy| *busy);
+        if busy_everywhere {
+            if !req.wait_if_busy {
+                if let Err(e) = self
+                    .cluster
+                    .record_step_complete(job_id, step_id, 0, false, true)
+                {
+                    warn!(job_id, step_id, error = %e, "failed to record step completion");
+                }
+            }
+            return Err(spur_proto::step_share_busy(dispatch_errors.join("; ")));
+        }
+        // A node that refused busy started nothing, but another node may have
+        // started (or refused for an unrelated reason): the step as a whole
+        // cannot continue, so stop it where it did claim or run.
+        if !step_abort_sent && busy_refusals.iter().any(|busy| *busy) {
+            crate::scheduler_loop::cancel_step_on_nodes(
+                &self.cluster,
                 job_id,
+                run_attempt,
                 step_id,
-                error = %e,
-                "failed to record step completion"
-            );
+                &step_node_names,
+                15,
+            )
+            .await;
         }
 
-        Ok(Response::new(RunStepResponse {
-            exit_code: max_exit,
+        finish_failed_step(
+            &self.cluster,
+            job_id,
+            step_id,
+            &ran_nodes,
+            &failure_codes,
+            &dispatch_errors,
+            max_exit,
+            oom_killed,
             stdout,
             stderr,
-            node: ran_nodes.join(","),
-            warnings: Vec::new(),
-        }))
+            req.resources.as_ref(),
+        )
     }
 
     // -- Native cluster (k0s) lifecycle. Leader-gated; record intent in the
@@ -5143,6 +5488,61 @@ fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a 
 
 // ---- Proto conversion helpers ----
 
+/// Whether a step asks for its own share instead of sharing the job's.
+fn step_takes_own_share(resources: Option<&spur_proto::proto::StepResources>) -> bool {
+    resources.is_some_and(spur_core::step_shape::takes_own_share)
+}
+
+/// The agents' verdict when every node refused the step with the same one, so
+/// srun can retry a busy share or show a bad request as is. Transport failures
+/// stay folded into the step's output: the CLI would retry those against the
+/// controller and re-dispatch the step.
+fn refused_everywhere(ran_nodes: &[String], failure_codes: &[Code]) -> Option<Code> {
+    let first = *failure_codes.first()?;
+    let verdict = matches!(
+        first,
+        Code::ResourceExhausted | Code::InvalidArgument | Code::FailedPrecondition
+    );
+    (verdict && ran_nodes.is_empty() && failure_codes.iter().all(|c| *c == first)).then_some(first)
+}
+
+/// Shared tail for `run_step`'s claim and run phases: records the step's completion
+/// and returns the agents' uniform refusal, if any, else the output collected so far.
+/// Only a typed step enforces its own share, so only a typed step's refusal
+/// is worth surfacing as `Err` instead of folding into the step's exit code.
+#[allow(clippy::too_many_arguments)]
+fn finish_failed_step(
+    cluster: &Arc<ClusterManager>,
+    job_id: u32,
+    step_id: u32,
+    ran_nodes: &[String],
+    failure_codes: &[Code],
+    dispatch_errors: &[String],
+    max_exit: i32,
+    oom_killed: bool,
+    stdout: String,
+    stderr: String,
+    resources: Option<&spur_proto::proto::StepResources>,
+) -> Result<Response<RunStepResponse>, Status> {
+    let refused = step_takes_own_share(resources)
+        .then(|| refused_everywhere(ran_nodes, failure_codes))
+        .flatten();
+    if let Err(e) = cluster.record_step_complete(job_id, step_id, max_exit, oom_killed, false) {
+        warn!(job_id, step_id, error = %e, "failed to record step completion");
+    }
+    if let Some(code) = refused {
+        return Err(Status::new(code, dispatch_errors.join("; ")));
+    }
+    Ok(Response::new(RunStepResponse {
+        exit_code: max_exit,
+        stdout,
+        stderr,
+        node: ran_nodes.join(","),
+        warnings: Vec::new(),
+        oom_killed,
+    }))
+}
+
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let mut gres = spec.gres;
     for lic in &spec.licenses {
@@ -5183,6 +5583,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             None
         },
         cpus_per_task: spec.cpus_per_task.max(1),
+        cpus_per_task_unset: spec.cpus_per_task == 0,
         memory_per_node_mb: if spec.memory_per_node_mb > 0 {
             Some(spec.memory_per_node_mb)
         } else {
@@ -5193,7 +5594,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             None
         },
-        memory_per_gpu_mb: None,
+        memory_per_gpu_mb: (spec.memory_per_gpu_mb > 0).then_some(spec.memory_per_gpu_mb),
         gres,
         gpus,
         gpus_per_node,
@@ -5367,6 +5768,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         pty: spec.pty,
         submit_line: sanitize_submit_line(&spec.submit_line),
         client_keepalive: spec.client_keepalive,
+        cpus_per_gpu: spec.cpus_per_gpu,
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -5395,6 +5797,8 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                 },
                 topology: g.topology.map(spur_core::device_topology::from_proto),
                 stable_id: g.stable_id,
+                numa_node: g.numa_node,
+                affinity_cpus: g.affinity_cpus,
             })
             .collect(),
         generic: r.generic,
@@ -5511,6 +5915,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
             &job.preemption_usage,
         )),
+        cpus_per_gpu: job.spec.cpus_per_gpu,
+        alloc_cpus: None,
         gpu_bindings: job
             .per_node_alloc
             .iter()
@@ -5704,7 +6110,9 @@ fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u64 {
 }
 
 fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u64 {
-    tasks_per_node(spec).saturating_mul(u64::from(spec.cpus_per_task.max(1)))
+    let tasks = u32::try_from(tasks_per_node(spec)).unwrap_or(u32::MAX);
+    let gpus = u32::try_from(spur_core::partition_limits::even_node_gpus(spec)).unwrap_or(u32::MAX);
+    u64::from(spec.cpus_on_node(tasks, gpus).max(1))
 }
 
 /// The memory floor as requested. A `--mem-per-cpu` job reports the per-CPU
@@ -5721,8 +6129,7 @@ fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
     let nodes = u64::from(spec.num_nodes.max(1));
     // The CPU total is the job's real ask, not the per-node minimum scaled up:
     // an uneven split (-N2 -n7) would otherwise round the total upward.
-    let cpu_total =
-        u64::from(spec.num_tasks.max(1)).saturating_mul(u64::from(spec.cpus_per_task.max(1)));
+    let cpu_total = spec.total_cpus().max(1);
     let mut parts = vec![format!("cpu={cpu_total}"), format!("node={nodes}")];
 
     // Memory totals the real ask too: per-CPU memory over the CPU total, and
@@ -5873,6 +6280,32 @@ fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec
         .collect()
 }
 
+/// The GPU-reserved CPU list and the cores each GPU reserves (one GPU's
+/// count: every GPU gets the same number or the layout fails).
+fn reserved_display(node: &spur_core::node::Node) -> (String, u32) {
+    let Some(layout) = node.core_layout.as_ref() else {
+        return (String::new(), 0);
+    };
+    let mut all: Vec<u32> = layout
+        .gpu_reserved
+        .iter()
+        .flat_map(|g| g.cpus.iter().copied())
+        .collect();
+    all.sort_unstable();
+    let per_gpu = match (
+        layout.gpu_reserved.first(),
+        &node.detected_resources.topology,
+    ) {
+        (Some(first), Some(topology)) => topology
+            .cores
+            .iter()
+            .filter(|c| c.cpus.iter().any(|cpu| first.cpus.contains(cpu)))
+            .count() as u32,
+        _ => 0,
+    };
+    (spur_core::cpu_topology::format_cpu_list(&all), per_gpu)
+}
+
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     // Core-spec display fields come from the CPU layout; the memory reservation
     // is shown for memory-only nodes too, which have no CPU layout.
@@ -5894,6 +6327,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         }
         _ => (String::new(), 0),
     };
+    let (reserved_cpus, restricted_cores_per_gpu) = reserved_display(node);
     let spec_mem_mb = node.spec_memory_mb;
     let layout_drain = node.layout_drain_reason();
     let state = if layout_drain.is_some() {
@@ -5939,6 +6373,23 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         mem_spec_mb: spec_mem_mb,
         cpu_tot: node.cpu_tot(),
         not_responding: node.not_responding,
+        restricted_cores_per_gpu,
+        reserved_cpus,
+        socket_core_thread: node.socket_core_thread().map(|s| SocketCoreThread {
+            sockets: s.sockets,
+            cores_per_socket: s.cores_per_socket,
+            threads_per_core: s.threads_per_core,
+        }),
+        gpu_cpus: node
+            .gpu_cpus()
+            .into_iter()
+            .map(|g| GpuCpus {
+                stable_id: g.stable_id,
+                reserved_cpus: spur_core::cpu_topology::format_cpu_list(&g.reserved),
+                affinity_cpus: spur_core::cpu_topology::format_cpu_list(&g.affinity),
+            })
+            .collect(),
+        capabilities: node.capabilities.clone(),
     }
 }
 
@@ -5986,6 +6437,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         def_mem_per_cpu: part.def_mem_per_cpu,
         def_mem_per_gpu: part.def_mem_per_gpu,
         qos: part.qos.clone().unwrap_or_default(),
+        def_cpu_per_gpu: part.def_cpu_per_gpu,
     }
 }
 
@@ -6009,6 +6461,7 @@ fn create_request_limits(
         def_mem_per_node: set(req.def_mem_per_node),
         def_mem_per_cpu: set(req.def_mem_per_cpu),
         def_mem_per_gpu: set(req.def_mem_per_gpu),
+        def_cpu_per_gpu: req.def_cpu_per_gpu.filter(|v| *v != 0),
     })
 }
 
@@ -6027,6 +6480,7 @@ fn update_request_limits(
         def_mem_per_node: clearable(req.def_mem_per_node),
         def_mem_per_cpu: clearable(req.def_mem_per_cpu),
         def_mem_per_gpu: clearable(req.def_mem_per_gpu),
+        def_cpu_per_gpu: req.def_cpu_per_gpu.map(|v| (v != 0).then_some(v)),
     }
 }
 
@@ -6061,6 +6515,7 @@ pub(crate) fn allocations_to_proto(
             .fabric_binding
             .as_ref()
             .map(spur_core::fabric_binding::to_proto),
+        reserved_cpus: r.reserved_cpus,
     }
 }
 
@@ -6094,6 +6549,8 @@ pub(crate) fn resource_to_proto(
                     .as_ref()
                     .map(spur_core::device_topology::to_proto),
                 stable_id: g.stable_id,
+                numa_node: g.numa_node,
+                affinity_cpus: g.affinity_cpus.clone(),
             })
             .collect(),
         generic: r.generic.clone(),
@@ -6712,7 +7169,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_set_proto_round_trip_preserves_stable_id_generation_and_topology() {
+    fn resource_set_proto_round_trip_preserves_stable_id_generation_topology_and_affinity() {
         use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
         let rs = ResourceSet {
             fabric_binding_version: 0,
@@ -6736,6 +7193,8 @@ mod tests {
                     ..Default::default()
                 }),
                 stable_id: 129,
+                numa_node: Some(1),
+                affinity_cpus: vec![64, 65, 192, 193],
             }],
             generic: Default::default(),
             generation: 42,
@@ -7498,6 +7957,8 @@ mod tests {
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
             generation: 0,
+            reserved_cpus: 0,
+            layout_fingerprint: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -7594,6 +8055,8 @@ mod tests {
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
             generation: 0,
+            reserved_cpus: 0,
+            layout_fingerprint: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -8000,6 +8463,8 @@ mod tests {
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
             generation: 0,
+            reserved_cpus: 0,
+            layout_fingerprint: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
@@ -8379,6 +8844,8 @@ mod tests {
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
             generation: 0,
+            reserved_cpus: 0,
+            layout_fingerprint: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -8795,6 +9262,20 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_advertises_step_resources() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert_eq!(
+            resp.capabilities,
+            vec![
+                spur_core::node::CAP_STEP_RESOURCES.to_string(),
+                spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+            ]
+        );
+    }
+
     // Ping carries the configured cluster name so `scontrol show config` can
     // report it without reading the login node's local config.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8863,6 +9344,9 @@ mod tests {
 
     type CancelLog = Arc<std::sync::Mutex<Vec<AgentCancelJobRequest>>>;
     type ExecLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::ExecInJobRequest>>>;
+    type CommandLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::RunCommandRequest>>>;
+    type StepCancelLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::CancelStepRequest>>>;
+    type ClaimLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::ClaimStepRequest>>>;
 
     struct ProbeAgent {
         active: bool,
@@ -8872,6 +9356,30 @@ mod tests {
         cancelled: Option<CancelLog>,
         /// Execs this agent was sent, for tests that assert on them.
         execs: Option<ExecLog>,
+        /// Step commands this agent was sent, and what it answers them with.
+        commands: Option<CommandLog>,
+        command_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+        /// `CancelStep` requests this agent was sent, for tests that assert a
+        /// busy refusal sends none.
+        step_cancels: Option<StepCancelLog>,
+        /// `ClaimStep` requests this agent was sent.
+        claims: Option<ClaimLog>,
+        /// What `claim_step` answers with; defaults to `Ok(())` when `None`.
+        claim_response: Option<Result<(), Status>>,
+        /// Runs synchronously inside `claim_step`, before `claim_response` is
+        /// returned — for a test simulating the step ending while claiming.
+        on_claim: Option<Arc<dyn Fn() + Send + Sync>>,
+        /// Blocks `run_command` until this agent's `cancel_step` is called —
+        /// for a test racing a sibling node's lost claim against this node's
+        /// dispatch.
+        block_on_cancel: Option<Arc<tokio::sync::Notify>>,
+        /// Blocks a non-release `claim_step` until notified — for a test
+        /// that drops the `run_step` future mid-claim.
+        block_on_claim: Option<Arc<tokio::sync::Notify>>,
+        /// Notified once this agent answers a release (`release: true`)
+        /// `claim_step` call — for a test synchronizing on the guard's
+        /// spawned release RPC instead of polling.
+        release_seen: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[tonic::async_trait]
@@ -8974,15 +9482,54 @@ mod tests {
         }
         async fn run_command(
             &self,
-            _request: Request<spur_proto::proto::RunCommandRequest>,
+            request: Request<spur_proto::proto::RunCommandRequest>,
         ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            if let Some(log) = &self.commands {
+                log.lock().expect("command log").push(request.into_inner());
+            }
+            if let Some(notify) = &self.block_on_cancel {
+                notify.notified().await;
+            }
+            match &self.command_response {
+                Some(response) => response.clone().map(Response::new),
+                None => Err(Status::unimplemented("not used in tests")),
+            }
         }
         async fn cancel_step(
             &self,
-            _request: Request<spur_proto::proto::CancelStepRequest>,
+            request: Request<spur_proto::proto::CancelStepRequest>,
         ) -> Result<Response<()>, Status> {
+            if let Some(log) = &self.step_cancels {
+                log.lock().unwrap().push(request.into_inner());
+            }
+            if let Some(notify) = &self.block_on_cancel {
+                notify.notify_one();
+            }
             Ok(Response::new(()))
+        }
+        async fn claim_step(
+            &self,
+            request: Request<spur_proto::proto::ClaimStepRequest>,
+        ) -> Result<Response<()>, Status> {
+            let req = request.into_inner();
+            let is_release = req.release;
+            if let Some(log) = &self.claims {
+                log.lock().unwrap().push(req);
+            }
+            if let Some(hook) = &self.on_claim {
+                hook();
+            }
+            if is_release {
+                if let Some(notify) = &self.release_seen {
+                    notify.notify_one();
+                }
+            } else if let Some(notify) = &self.block_on_claim {
+                notify.notified().await;
+            }
+            match &self.claim_response {
+                Some(response) => response.clone().map(Response::new),
+                None => Ok(Response::new(())),
+            }
         }
         async fn register_job_allocation(
             &self,
@@ -9068,6 +9615,15 @@ mod tests {
             step_started: None,
             cancelled: None,
             execs: None,
+            commands: None,
+            command_response: None,
+            step_cancels: None,
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
         })
         .await
     }
@@ -9081,6 +9637,15 @@ mod tests {
             step_started: None,
             cancelled: Some(cancelled.clone()),
             execs: None,
+            commands: None,
+            command_response: None,
+            step_cancels: None,
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
         })
         .await;
         (addr, cancelled)
@@ -9095,6 +9660,15 @@ mod tests {
             step_started: None,
             cancelled: None,
             execs: Some(execs.clone()),
+            commands: None,
+            command_response: None,
+            step_cancels: None,
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
         })
         .await;
         (addr, execs)
@@ -9111,6 +9685,540 @@ mod tests {
                 .await;
         });
         addr
+    }
+
+    /// A controller stub that answers `Ping` with a configurable capability
+    /// list and refuses every other RPC; a stand-in for "the leader" when only
+    /// its advertised capabilities matter to the test.
+    struct ProbeController {
+        capabilities: Vec<String>,
+        /// Set from inside `ping` when the request arrives already marked
+        /// forwarded, so a test can confirm the probe used the loop-breaker.
+        forwarded_header_seen: Option<Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    #[tonic::async_trait]
+    impl spur_proto::proto::slurm_controller_server::SlurmController for ProbeController {
+        async fn submit_job(
+            &self,
+            _request: Request<SubmitJobRequest>,
+        ) -> Result<Response<SubmitJobResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_jobs(
+            &self,
+            _request: Request<GetJobsRequest>,
+        ) -> Result<Response<GetJobsResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_job(
+            &self,
+            _request: Request<GetJobRequest>,
+        ) -> Result<Response<JobInfo>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cancel_job(
+            &self,
+            _request: Request<CancelJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn complete_job(
+            &self,
+            _request: Request<CompleteJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn job_keepalive(
+            &self,
+            _request: Request<JobKeepaliveRequest>,
+        ) -> Result<Response<JobKeepaliveResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn suspend_job(
+            &self,
+            _request: Request<SuspendJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn resume_job(
+            &self,
+            _request: Request<ResumeJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn update_job(
+            &self,
+            _request: Request<UpdateJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn requeue_job(
+            &self,
+            _request: Request<RequeueJobRequest>,
+        ) -> Result<Response<RequeueJobResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_nodes(
+            &self,
+            _request: Request<GetNodesRequest>,
+        ) -> Result<Response<GetNodesResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_fabric_topology(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn validate_block_file(
+            &self,
+            _request: Request<ValidateBlockFileRequest>,
+        ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_node(
+            &self,
+            _request: Request<GetNodeRequest>,
+        ) -> Result<Response<NodeInfo>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn update_node(
+            &self,
+            _request: Request<UpdateNodeRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn drain_node(
+            &self,
+            _request: Request<DrainNodeRequest>,
+        ) -> Result<Response<DrainNodeResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn deregister_node(
+            &self,
+            _request: Request<DeregisterNodeRequest>,
+        ) -> Result<Response<DeregisterNodeResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn deregister_agent(
+            &self,
+            _request: Request<DeregisterAgentRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_partitions(
+            &self,
+            _request: Request<GetPartitionsRequest>,
+        ) -> Result<Response<GetPartitionsResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_job_steps(
+            &self,
+            _request: Request<GetJobStepsRequest>,
+        ) -> Result<Response<GetJobStepsResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn create_job_step(
+            &self,
+            _request: Request<CreateJobStepRequest>,
+        ) -> Result<Response<CreateJobStepResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn complete_job_step(
+            &self,
+            _request: Request<CompleteJobStepRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn ping(&self, request: Request<()>) -> Result<Response<PingResponse>, Status> {
+            if let Some(seen) = &self.forwarded_header_seen {
+                seen.store(
+                    request.metadata().get(FORWARDED_HEADER).is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            Ok(Response::new(PingResponse {
+                capabilities: self.capabilities.clone(),
+                ..Default::default()
+            }))
+        }
+        async fn get_job_metrics(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<JobMetrics>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_node_metrics(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<NodeMetrics>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_rpc_stats(&self, _request: Request<()>) -> Result<Response<RpcStats>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn reset_diag_stats(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_sched_stats(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<SchedStats>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn get_assoc_mgr_info(
+            &self,
+            _request: Request<GetAssocMgrInfoRequest>,
+        ) -> Result<Response<GetAssocMgrInfoResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn register_agent(
+            &self,
+            _request: Request<RegisterAgentRequest>,
+        ) -> Result<Response<RegisterAgentResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn heartbeat(
+            &self,
+            _request: Request<HeartbeatRequest>,
+        ) -> Result<Response<HeartbeatResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn report_stepd_recovery(
+            &self,
+            _request: Request<StepdRecoveryRequest>,
+        ) -> Result<Response<StepdRecoveryResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn create_token(
+            &self,
+            _request: Request<CreateTokenRequest>,
+        ) -> Result<Response<CreateTokenResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn list_tokens(
+            &self,
+            _request: Request<ListTokensRequest>,
+        ) -> Result<Response<ListTokensResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn revoke_token(
+            &self,
+            _request: Request<RevokeTokenRequest>,
+        ) -> Result<Response<RevokeTokenResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn report_job_status(
+            &self,
+            _request: Request<ReportJobStatusRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn create_partition(
+            &self,
+            _request: Request<CreatePartitionRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn update_partition(
+            &self,
+            _request: Request<UpdatePartitionRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn delete_partition(
+            &self,
+            _request: Request<DeletePartitionRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn reconfigure(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn create_reservation(
+            &self,
+            _request: Request<CreateReservationRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn update_reservation(
+            &self,
+            _request: Request<UpdateReservationRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn delete_reservation(
+            &self,
+            _request: Request<DeleteReservationRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn list_reservations(
+            &self,
+            _request: Request<ListReservationsRequest>,
+        ) -> Result<Response<ListReservationsResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn exec_in_job(
+            &self,
+            _request: Request<ExecInJobRequest>,
+        ) -> Result<Response<ExecInJobResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn run_step(
+            &self,
+            _request: Request<RunStepRequest>,
+        ) -> Result<Response<RunStepResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_up(
+            &self,
+            _request: Request<ClusterUpRequest>,
+        ) -> Result<Response<ClusterUpResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_down(
+            &self,
+            _request: Request<ClusterDownRequest>,
+        ) -> Result<Response<ClusterDownResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_status(
+            &self,
+            _request: Request<ClusterStatusRequest>,
+        ) -> Result<Response<ClusterStatusResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_kubeconfig(
+            &self,
+            _request: Request<ClusterKubeconfigRequest>,
+        ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_add_nodes(
+            &self,
+            _request: Request<ClusterAddNodesRequest>,
+        ) -> Result<Response<ClusterAddNodesResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn cluster_remove_nodes(
+            &self,
+            _request: Request<ClusterRemoveNodesRequest>,
+        ) -> Result<Response<ClusterRemoveNodesResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+    }
+
+    async fn spawn_probe_controller_server(capabilities: Vec<String>) -> std::net::SocketAddr {
+        spawn_probe_controller_server_with(capabilities, None).await
+    }
+
+    async fn spawn_probe_controller_server_with(
+        capabilities: Vec<String>,
+        forwarded_header_seen: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> std::net::SocketAddr {
+        let incoming =
+            tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(spur_proto::controller_server(ProbeController {
+                    capabilities,
+                    forwarded_header_seen,
+                }))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr
+    }
+
+    /// A `ControllerService` whose single-node Raft is always its own, stable
+    /// leader (no peer exists to contest or destabilize it), with the
+    /// `LeaderProxy` pointed at `leader_addr` for that node id. Used to drive
+    /// `leader_capabilities()` directly against a real [`ProbeController`]
+    /// stub without depending on live multi-node election timing.
+    async fn service_with_leader_addr(
+        dir: &tempfile::TempDir,
+        leader_addr: std::net::SocketAddr,
+    ) -> ControllerService {
+        let mut svc = test_service(dir).await;
+        let mut client_addrs = BTreeMap::new();
+        client_addrs.insert(svc.raft.node_id, leader_addr.to_string());
+        svc.leader_proxy = LeaderProxy::new(svc.raft.clone(), client_addrs);
+        svc
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leader_capabilities_returns_whatever_the_leader_advertises() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub_addr =
+            spawn_probe_controller_server(vec![spur_core::node::CAP_STEP_RESOURCES.to_string()])
+                .await;
+        let svc = service_with_leader_addr(&dir, stub_addr).await;
+
+        let caps = svc.leader_capabilities().await.unwrap();
+        assert_eq!(caps, vec![spur_core::node::CAP_STEP_RESOURCES.to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leader_capabilities_marks_its_probe_as_already_forwarded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stub_addr = spawn_probe_controller_server_with(Vec::new(), Some(seen.clone())).await;
+        let svc = service_with_leader_addr(&dir, stub_addr).await;
+
+        svc.leader_capabilities().await.unwrap();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the leader-bound probe must carry the loop-breaker header, or a stale \
+             cached \"leader\" that has since lost the role would chase its own leader"
+        );
+    }
+
+    /// Fills a listener's one-connection accept backlog with two peers that are never
+    /// accepted, so the kernel silently drops the SYN for any further connect attempt
+    /// instead of answering or refusing it. This reproduces, deterministically and on
+    /// loopback only (no dependency on external network routing), the TCP-level hang
+    /// that `Endpoint::connect_timeout` exists to bound. The returned streams must be
+    /// held for the caller's whole test, or dropping them frees the backlog slot.
+    async fn backlog_saturated_addr() -> (std::net::SocketAddr, Vec<tokio::net::TcpStream>) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::mem::forget(listener); // never accept(): nothing ever drains the backlog
+
+        let mut fillers = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Ok(stream)) = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                fillers.push(stream);
+            }
+        }
+        (addr, fillers)
+    }
+
+    /// `service_with_leader_addr`, but the `RaftHandle` reports a `node_id` that
+    /// deliberately doesn't match the real elected leader, so `is_leader()` is false
+    /// and `ping_capabilities()` takes the leader-probe branch instead of answering
+    /// its own capabilities. A single-node test Raft always self-elects, so this is
+    /// the only way to exercise the follower path without a slower multi-node cluster.
+    /// `current_leader()` reads Raft metrics directly, not `node_id`, so forwarding
+    /// still resolves the real elected id.
+    async fn follower_service_with_leader_addr(
+        dir: &tempfile::TempDir,
+        leader_addr: std::net::SocketAddr,
+    ) -> ControllerService {
+        let mut svc = test_service(dir).await;
+        let elected_leader_id = svc.raft.node_id;
+        let mut client_addrs = BTreeMap::new();
+        client_addrs.insert(elected_leader_id, leader_addr.to_string());
+        let follower_raft = Arc::new(crate::raft::RaftHandle {
+            raft: svc.raft.raft.clone(),
+            node_id: elected_leader_id + 1,
+            peers: svc.raft.peers.clone(),
+            boot_epoch: svc.raft.boot_epoch,
+        });
+        svc.leader_proxy = LeaderProxy::new(follower_raft.clone(), client_addrs);
+        svc.raft = follower_raft;
+        svc
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leader_capabilities_is_bounded_when_the_leader_is_unreachable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (addr, _fillers) = backlog_saturated_addr().await;
+        let svc = follower_service_with_leader_addr(&dir, addr).await;
+
+        let bound =
+            std::time::Duration::from_secs(spur_core::config::LEADER_CAPABILITY_PROBE_TIMEOUT_SECS);
+        let started = std::time::Instant::now();
+        // The regression here is an unbounded hang, not a slow CI box, so the guard is
+        // generous relative to `bound`; only an actual hang trips it, not scheduling noise.
+        let err = tokio::time::timeout(bound * 10, svc.leader_capabilities())
+            .await
+            .expect("leader_capabilities() must not hang past its own probe bound")
+            .expect_err("an unreachable leader must not report capabilities");
+        assert!(
+            started.elapsed() < bound + std::time::Duration::from_secs(2),
+            "leader_capabilities() took {:?}, well past its {:?} bound (err: {err})",
+            started.elapsed(),
+            bound
+        );
+
+        let caps = svc.ping_capabilities(&Request::new(())).await;
+        assert!(
+            caps.is_empty(),
+            "ping must advertise no capabilities when the leader is unreachable"
+        );
+    }
+
+    #[test]
+    fn narrow_to_leader_capabilities_keeps_only_what_the_leader_also_has() {
+        let own = vec![
+            spur_core::node::CAP_STEP_RESOURCES.to_string(),
+            spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+        ];
+        assert_eq!(
+            narrow_to_leader_capabilities(own.clone(), &[]),
+            Vec::<String>::new(),
+            "a leader stub lacking every capability narrows to none"
+        );
+        assert_eq!(
+            narrow_to_leader_capabilities(own.clone(), &own),
+            own,
+            "a leader with matching capabilities is advertised in full"
+        );
+        assert_eq!(
+            narrow_to_leader_capabilities(
+                own.clone(),
+                &[spur_core::node::CAP_STEP_RESOURCES.to_string()]
+            ),
+            vec![spur_core::node::CAP_STEP_RESOURCES.to_string()],
+            "only the overlap survives"
+        );
+    }
+
+    /// The write side already fails closed with no leader
+    /// (`submit_job_fails_when_no_leader_elected`); `Ping` still answers, but
+    /// with no capabilities rather than guessing.
+    #[tokio::test]
+    async fn ping_advertises_no_capabilities_without_a_leader() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let svc = no_leader_service(cluster, dir.path()).await;
+
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert!(resp.capabilities.is_empty());
+    }
+
+    /// A probe already marked forwarded (this controller's own leader-capability
+    /// query landing on a stale cached "leader" that has since lost the role)
+    /// must answer its own list rather than chasing a further leader — the same
+    /// loop-breaker `is_already_forwarded` uses for mutating RPCs.
+    #[tokio::test]
+    async fn ping_already_marked_forwarded_answers_its_own_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let svc = no_leader_service(cluster, dir.path()).await;
+
+        let mut req = Request::new(());
+        *req.metadata_mut() = ControllerService::forwarded_metadata();
+        let resp = svc.ping(req).await.unwrap().into_inner();
+        assert_eq!(
+            resp.capabilities,
+            vec![
+                spur_core::node::CAP_STEP_RESOURCES.to_string(),
+                spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+            ]
+        );
     }
 
     /// A service under token admission, where registration makes a caller prove
@@ -10718,6 +11826,32 @@ mod tests {
     /// Re-point a registered node at a probe agent and wait for the change to
     /// land, so a recovery probe reaches that agent and not the old address.
     async fn point_node_at_probe_agent(svc: &ControllerService, name: &str, port: u16) {
+        point_node_at_agent_with(svc, name, port, Vec::new()).await;
+    }
+
+    async fn point_node_at_agent_with(
+        svc: &ControllerService,
+        name: &str,
+        port: u16,
+        capabilities: Vec<String>,
+    ) {
+        point_node_at_agent_with_source(
+            svc,
+            name,
+            port,
+            capabilities,
+            spur_core::node::NodeSource::NativeHost,
+        )
+        .await
+    }
+
+    async fn point_node_at_agent_with_source(
+        svc: &ControllerService,
+        name: &str,
+        port: u16,
+        capabilities: Vec<String>,
+        source: spur_core::node::NodeSource,
+    ) {
         svc.cluster
             .register_node(
                 name.into(),
@@ -10731,9 +11865,9 @@ mod tests {
                 port,
                 String::new(),
                 String::new(),
-                spur_core::node::NodeSource::NativeHost,
+                source,
                 std::collections::HashMap::new(),
-                Vec::new(),
+                capabilities,
                 true,
             )
             .expect("point the node at its probe agent");
@@ -12194,6 +13328,8 @@ mod tests {
                     fabric: Some(fabric),
                     ..Default::default()
                 }),
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             };
             svc.cluster
                 .register_node(
@@ -12660,6 +13796,27 @@ mod tests {
         .step_id
     }
 
+    /// Create a non-interactive step and return its id, so completion tests
+    /// can exercise the controller-recorded (non-PTY) path.
+    async fn non_pty_step_on(svc: &ControllerService, job_id: u32, owner: &str) -> u32 {
+        svc.create_job_step(Request::new(CreateJobStepRequest {
+            job_id,
+            command: vec!["bash".into()],
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            pty: false,
+            winsize: None,
+            node: String::new(),
+            user: owner.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("owner may create a step")
+        .into_inner()
+        .step_id
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_job_step_denies_non_owner() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -12721,6 +13878,180 @@ mod tests {
         assert_eq!(
             job.derived_exit_code, 7,
             "step exit must reach DerivedExitCode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_step_with_cancelled_ends_the_step_cancelled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = interactive_step_on(&svc, job_id, "ubuntu").await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            exit_code: 0,
+            user: "ubuntu".into(),
+            cancelled: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may cancel their own step");
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(step.state, spur_core::step::StepState::Cancelled);
+    }
+
+    /// RunStep records a dispatched step's real result itself; a client
+    /// reporting one as if it ran must not be able to overwrite that record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cannot_complete_a_running_non_pty_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = non_pty_step_on(&svc, job_id, "ubuntu").await;
+
+        let err = svc
+            .complete_job_step(Request::new(CompleteJobStepRequest {
+                job_id,
+                step_id,
+                exit_code: 0,
+                user: "ubuntu".into(),
+                cancelled: false,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a client must not report a non-PTY step's result");
+        assert_eq!(err.code(), Code::InvalidArgument);
+
+        svc.cluster
+            .record_step_complete(job_id, step_id, 3, false, false)
+            .expect("test setup: the controller's own report still lands");
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(
+            step.exit_code,
+            Some(3),
+            "the rejected client call must not have masked the real result"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_may_cancel_a_running_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = non_pty_step_on(&svc, job_id, "ubuntu").await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            exit_code: 0,
+            user: "ubuntu".into(),
+            cancelled: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("a client may still abandon a step that never reported in");
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(step.state, spur_core::step::StepState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_step_records_its_client_reported_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = interactive_step_on(&svc, job_id, "ubuntu").await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            exit_code: 5,
+            user: "ubuntu".into(),
+            cancelled: false,
+            ..Default::default()
+        }))
+        .await
+        .expect("a PTY step may report its own client-observed exit");
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(step.exit_code, Some(5));
+    }
+
+    /// srun abandoning a step must stop it on its nodes too, so an admitted
+    /// retry can't keep running (or claiming) after the controller records
+    /// the step cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_step_completion_cancels_the_step_on_its_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _commands, step_cancels) =
+            step_on_recording_agent_with_cancel_log(&svc, Vec::new(), Ok(ran(0, false))).await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id: 0,
+            exit_code: 0,
+            user: "ubuntu".into(),
+            cancelled: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may cancel their own step");
+
+        assert_eq!(
+            step_cancels.lock().unwrap().len(),
+            1,
+            "n1 must see a CancelStep"
+        );
+    }
+
+    // step_on_recording_agent_with_cancel_log seeds a pty: true step, so this
+    // covers a PTY step's own completion, not a non-PTY step (see
+    // a_client_cannot_complete_a_running_non_pty_step for that rejection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_steps_own_completion_sends_no_cancel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _commands, step_cancels) =
+            step_on_recording_agent_with_cancel_log(&svc, Vec::new(), Ok(ran(0, false))).await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id: 0,
+            exit_code: 0,
+            user: "ubuntu".into(),
+            cancelled: false,
+            ..Default::default()
+        }))
+        .await
+        .expect("a PTY step's own completion is accepted");
+
+        assert!(
+            step_cancels.lock().unwrap().is_empty(),
+            "a PTY step's own completion must not cancel anything on its nodes"
         );
     }
 
@@ -13250,7 +14581,7 @@ mod tests {
             })
             .expect("test setup: seed step");
         svc.cluster
-            .record_step_complete(job_id, 0, exit_code)
+            .record_step_complete(job_id, 0, exit_code, false, false)
             .expect("test setup: complete step");
         job_id
     }
@@ -13267,6 +14598,7 @@ mod tests {
                 exit_code: 99,
                 stdout: original_stdout.clone(),
                 stderr: "original stderr\n".into(),
+                oom_killed: false,
             })),
         )
         .await;
@@ -13373,6 +14705,15 @@ mod tests {
             step_started: Some(started.clone()),
             cancelled: None,
             execs: None,
+            commands: None,
+            command_response: None,
+            step_cancels: None,
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
         })
         .await;
         let replay = tokio::spawn(completed_step_output(
@@ -13404,6 +14745,7 @@ mod tests {
                 exit_code: 0,
                 stdout: "retained stdout".into(),
                 stderr: "retained stderr".into(),
+                oom_killed: false,
             })),
         )
         .await;
@@ -13441,7 +14783,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_step_replays_cancelled_step_output() {
+    async fn run_step_refuses_to_replay_cancelled_step_output() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = completed_step_owned_by(&svc, 137).await;
@@ -13459,12 +14801,15 @@ mod tests {
                 exit_code: 99,
                 stdout: "output before cancellation\n".into(),
                 stderr: "stderr before cancellation\n".into(),
+                oom_killed: false,
             })),
         )
         .await;
         point_node_at_probe_agent(&svc, "n1", agent.port()).await;
 
-        let response = svc
+        // A cancelled step never ran; replaying it would report a false
+        // success to a client that retries the RunStep that found it cancelled.
+        let err = svc
             .run_step(Request::new(RunStepRequest {
                 job_id,
                 step_id: 1,
@@ -13472,11 +14817,9 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect("a cancelled step replays its recorded result")
-            .into_inner();
-        assert_eq!(response.exit_code, 137);
-        assert_eq!(response.stdout, "output before cancellation\n");
-        assert_eq!(response.stderr, "stderr before cancellation\n");
+            .expect_err("a cancelled step must never be replayed as a success");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("was cancelled"), "{}", err.message());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13525,7 +14868,7 @@ mod tests {
         );
 
         svc.cluster
-            .record_step_complete(job_id, 0, 0)
+            .record_step_complete(job_id, 0, 0, false, false)
             .expect("test setup: complete step");
         let err = svc
             .run_step(Request::new(RunStepRequest {
@@ -13541,6 +14884,1133 @@ mod tests {
         assert!(err
             .message()
             .contains("not in the job's current allocation"));
+    }
+
+    /// A running job whose step 0 runs on n1, served by a recording agent.
+    async fn step_on_recording_agent(
+        svc: &ControllerService,
+        capabilities: Vec<String>,
+        response: Result<spur_proto::proto::RunCommandResponse, Status>,
+    ) -> (u32, CommandLog) {
+        let (job_id, commands, _cancelled) =
+            step_on_recording_agent_with_cancel_log(svc, capabilities, response).await;
+        (job_id, commands)
+    }
+
+    /// As [`step_on_recording_agent`], but also returns the `CancelStep`
+    /// requests the agent received, for tests asserting a busy refusal sends
+    /// none.
+    async fn step_on_recording_agent_with_cancel_log(
+        svc: &ControllerService,
+        capabilities: Vec<String>,
+        response: Result<spur_proto::proto::RunCommandResponse, Status>,
+    ) -> (u32, CommandLog, StepCancelLog) {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+        let job_id = running_job_owned_by(svc, "ubuntu").await;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let step_cancels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: true,
+            step_response: None,
+            step_started: None,
+            cancelled: None,
+            execs: None,
+            commands: Some(commands.clone()),
+            command_response: Some(response),
+            step_cancels: Some(step_cancels.clone()),
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
+        })
+        .await;
+        point_node_at_agent_with(svc, "n1", addr.port(), capabilities).await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: true,
+                job_shell: false,
+            })
+            .expect("test setup: seed step");
+        (job_id, commands, step_cancels)
+    }
+
+    fn ran(exit_code: i32, oom_killed: bool) -> spur_proto::proto::RunCommandResponse {
+        spur_proto::proto::RunCommandResponse {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            oom_killed,
+        }
+    }
+
+    fn step_request(job_id: u32, overlap: bool, typed: bool) -> RunStepRequest {
+        RunStepRequest {
+            job_id,
+            command: vec!["true".into()],
+            step_id: 0,
+            user: "ubuntu".into(),
+            overlap,
+            resources: typed.then(|| spur_proto::proto::StepResources {
+                cpus_per_task: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_uniform_agent_verdict_is_returned_as_the_step_status() {
+        let none: [String; 0] = [];
+        let one_ran = ["n2".to_string()];
+        assert_eq!(
+            refused_everywhere(&none, &[Code::ResourceExhausted, Code::ResourceExhausted]),
+            Some(Code::ResourceExhausted)
+        );
+        assert_eq!(
+            refused_everywhere(&none, &[Code::InvalidArgument]),
+            Some(Code::InvalidArgument)
+        );
+        assert_eq!(
+            refused_everywhere(&none, &[Code::Unavailable]),
+            None,
+            "transport"
+        );
+        assert_eq!(
+            refused_everywhere(&none, &[Code::ResourceExhausted, Code::InvalidArgument]),
+            None,
+            "mixed verdicts"
+        );
+        assert_eq!(
+            refused_everywhere(&one_ran, &[Code::ResourceExhausted]),
+            None,
+            "a node ran it"
+        );
+        assert_eq!(refused_everywhere(&none, &[]), None);
+    }
+
+    fn step_capable() -> Vec<String> {
+        vec![spur_core::node::CAP_STEP_RESOURCES.to_string()]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_forwards_overlap_to_the_agent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, commands) = step_on_recording_agent(&svc, Vec::new(), Ok(ran(0, false))).await;
+        svc.run_step(Request::new(step_request(job_id, true, false)))
+            .await
+            .expect("an untyped overlap step runs");
+        let sent = commands.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].overlap);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_refuses_a_typed_step_on_an_agent_without_step_resources() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, commands) = step_on_recording_agent(&svc, Vec::new(), Ok(ran(0, false))).await;
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("an old agent cannot enforce a step's own share");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("upgrade spurd on n1"),
+            "{}",
+            err.message()
+        );
+        assert!(commands.lock().unwrap().is_empty(), "nothing dispatched");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_refuses_a_typed_step_on_a_kubernetes_backed_node() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        point_node_at_agent_with_source(
+            &svc,
+            "n1",
+            9,
+            Vec::new(),
+            spur_core::node::NodeSource::Kubernetes {
+                namespace: "ns".into(),
+            },
+        )
+        .await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: true,
+                job_shell: false,
+            })
+            .expect("test setup: seed step");
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("a kubernetes-backed node cannot enforce a step's own share");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("Kubernetes-backed node n1"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_dispatches_a_typed_step_to_a_capable_agent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, commands) =
+            step_on_recording_agent(&svc, step_capable(), Ok(ran(0, false))).await;
+        svc.run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect("a capable agent takes typed steps");
+        assert_eq!(commands.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_returns_the_agents_code_when_every_node_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _, step_cancels) = step_on_recording_agent_with_cancel_log(
+            &svc,
+            step_capable(),
+            Err(spur_proto::step_share_busy("step resources are busy")),
+        )
+        .await;
+        let mut req = step_request(job_id, false, true);
+        req.wait_if_busy = true;
+        let err = svc
+            .run_step(Request::new(req))
+            .await
+            .expect_err("srun retries a busy share, so it must see the code");
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        assert!(spur_proto::is_step_share_busy(&err));
+        assert!(
+            err.message().contains("step resources are busy"),
+            "{}",
+            err.message()
+        );
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert!(
+            !step.state.is_terminal(),
+            "a busy step must stay runnable when the client waits for it"
+        );
+        assert!(
+            step_cancels.lock().unwrap().is_empty(),
+            "a busy refusal must send no CancelStep"
+        );
+    }
+
+    // Without wait_if_busy, a busy-everywhere step is recorded CANCELLED at
+    // once rather than left RUNNING for an older srun that never retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_cancels_a_busy_everywhere_step_without_wait_if_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _) = step_on_recording_agent(
+            &svc,
+            step_capable(),
+            Err(spur_proto::step_share_busy("step resources are busy")),
+        )
+        .await;
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("busy status is still returned on this first call");
+        assert!(spur_proto::is_step_share_busy(&err));
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(
+            step.state,
+            spur_core::step::StepState::Cancelled,
+            "an older srun's give-up must not leave the step RUNNING"
+        );
+    }
+
+    /// Unlike a marked busy share, a plain `ResourceExhausted` (the node
+    /// cleanup gate, say) is recorded as a real failure, not left runnable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_records_an_unmarked_resource_exhausted_as_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _) = step_on_recording_agent(
+            &svc,
+            step_capable(),
+            Err(Status::resource_exhausted("pending job cleanup")),
+        )
+        .await;
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("an unmarked ResourceExhausted must still fail the call");
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        assert!(!spur_proto::is_step_share_busy(&err));
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(step.state, spur_core::step::StepState::Failed);
+    }
+
+    /// A plain step has no typed share to enforce, so a uniform refusal folds
+    /// into its exit code like any other dispatch error, same as main.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_folds_a_plain_steps_refusal_into_its_exit_code() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _) = step_on_recording_agent(
+            &svc,
+            Vec::new(),
+            Err(Status::invalid_argument("bad step args")),
+        )
+        .await;
+        let resp = svc
+            .run_step(Request::new(step_request(job_id, false, false)))
+            .await
+            .expect("a plain step's refusal still returns Ok so srun runs its epilog")
+            .into_inner();
+        assert_eq!(resp.exit_code, 1);
+        assert!(resp.stderr.contains("bad step args"), "{}", resp.stderr);
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(step.state, spur_core::step::StepState::Failed);
+    }
+
+    /// A running 2-node job owned by `owner`, with step 0 across both nodes.
+    async fn two_node_typed_step_job(
+        svc: &ControllerService,
+        owner: &str,
+        n1_port: u16,
+        n2_port: u16,
+        capabilities: Vec<String>,
+    ) -> u32 {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        point_node_at_agent_with(svc, "n1", n1_port, capabilities.clone()).await;
+        point_node_at_agent_with(svc, "n2", n2_port, capabilities).await;
+        let spec = spur_core::job::JobSpec {
+            name: "two-node-typed".into(),
+            user: owner.into(),
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> = [
+            ("n1".to_string(), res.clone()),
+            ("n2".to_string(), res.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "n2".into()], res, per_node)
+            .expect("start two-node job");
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into(), "n2".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("test setup: seed two-node step");
+        job_id
+    }
+
+    fn claim_recording_agent(
+        command_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+        claim_response: Option<Result<(), Status>>,
+    ) -> (ProbeAgent, ClaimLog, CommandLog, StepCancelLog) {
+        let claims = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let step_cancels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = ProbeAgent {
+            active: true,
+            step_response: None,
+            step_started: None,
+            cancelled: None,
+            execs: None,
+            commands: Some(commands.clone()),
+            command_response,
+            step_cancels: Some(step_cancels.clone()),
+            claims: Some(claims.clone()),
+            claim_response,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
+        };
+        (agent, claims, commands, step_cancels)
+    }
+
+    // A multi-node typed step must wait as a whole when one node's share is
+    // busy, not leave the willing node's claim dangling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_node_typed_step_waits_when_one_node_is_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, n1_cancels) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+        let (n2_agent, n2_claims, n2_commands, n2_cancels) = claim_recording_agent(
+            Some(Ok(ran(0, false))),
+            Some(Err(spur_proto::step_share_busy("n2 is busy"))),
+        );
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        let mut req = step_request(job_id, false, true);
+        req.wait_if_busy = true;
+        let err = svc
+            .run_step(Request::new(req))
+            .await
+            .expect_err("n2's busy claim must wait the whole step");
+        assert!(spur_proto::is_step_share_busy(&err));
+
+        assert_eq!(
+            n1_claims.lock().unwrap().len(),
+            2,
+            "n1 sees exactly a claim then a release"
+        );
+        assert!(n1_claims.lock().unwrap()[1].release);
+        assert_eq!(
+            n2_claims.lock().unwrap().len(),
+            2,
+            "n2's own busy claim, then a release"
+        );
+        assert!(n2_claims.lock().unwrap()[1].release);
+
+        assert!(n1_commands.lock().unwrap().is_empty(), "n1 must not run");
+        assert!(n2_commands.lock().unwrap().is_empty(), "n2 must not run");
+        assert!(
+            n1_cancels.lock().unwrap().is_empty(),
+            "n1 must not be cancelled"
+        );
+        assert!(
+            n2_cancels.lock().unwrap().is_empty(),
+            "n2 must not be cancelled"
+        );
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(
+            step.state,
+            spur_core::step::StepState::Running,
+            "the client asked to wait for its busy share"
+        );
+    }
+
+    // Same claim-phase busy outcome, but without wait_if_busy: the step must
+    // not be left RUNNING for a client that never retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_node_typed_step_is_cancelled_when_busy_without_wait_if_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+        let (n2_agent, n2_claims, n2_commands, _) = claim_recording_agent(
+            Some(Ok(ran(0, false))),
+            Some(Err(spur_proto::step_share_busy("n2 is busy"))),
+        );
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("busy status is still returned on this first call");
+        assert!(spur_proto::is_step_share_busy(&err));
+
+        assert!(n1_claims.lock().unwrap()[1].release);
+        assert!(n2_claims.lock().unwrap()[1].release);
+        assert!(n1_commands.lock().unwrap().is_empty(), "n1 must not run");
+        assert!(n2_commands.lock().unwrap().is_empty(), "n2 must not run");
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(
+            step.state,
+            spur_core::step::StepState::Cancelled,
+            "no client asked to wait, so the busy step must not stay RUNNING"
+        );
+    }
+
+    // A later RunStep for a step the controller already cancelled on a busy
+    // outcome must refuse the replay, never report success, and never re-dispatch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_refuses_a_replay_of_a_step_cancelled_by_a_busy_refusal_without_waiting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, commands) = step_on_recording_agent(
+            &svc,
+            step_capable(),
+            Err(spur_proto::step_share_busy("step resources are busy")),
+        )
+        .await;
+        svc.run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("first call still returns the busy status");
+        assert_eq!(
+            svc.cluster.get_step(job_id, 0).unwrap().state,
+            spur_core::step::StepState::Cancelled
+        );
+        let dispatches_after_first_call = commands.lock().unwrap().len();
+
+        let err = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("a replay of a cancelled step must not report success");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("was cancelled"),
+            "message was: {}",
+            err.message()
+        );
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            dispatches_after_first_call,
+            "a cancelled step must never be dispatched again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_typed_step_runs_only_after_every_node_claimed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+        let (n2_agent, n2_claims, n2_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        svc.run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect("both nodes claim then run");
+
+        assert_eq!(n1_claims.lock().unwrap().len(), 1);
+        assert_eq!(n2_claims.lock().unwrap().len(), 1);
+        assert_eq!(n1_commands.lock().unwrap().len(), 1, "n1 ran once claimed");
+        assert_eq!(n2_commands.lock().unwrap().len(), 1, "n2 ran once claimed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untyped_or_overlap_step_skips_the_claim_phase() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let (agent, claims, _, _) = claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let addr = spawn_probe_agent_server(agent).await;
+        point_node_at_agent_with(&svc, "n1", addr.port(), step_capable()).await;
+
+        for step_id in [0u32, 1u32] {
+            svc.cluster
+                .create_step(JobStep {
+                    job_id,
+                    step_id,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: ResourceAllocations::default(),
+                    nodes: vec!["n1".into()],
+                    distribution: TaskDistribution::Block,
+                    start_time: Some(chrono::Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    pty: false,
+                    job_shell: false,
+                })
+                .expect("test setup: seed step");
+        }
+
+        svc.run_step(Request::new(RunStepRequest {
+            job_id,
+            command: vec!["true".into()],
+            step_id: 0,
+            user: "ubuntu".into(),
+            overlap: false,
+            resources: None,
+            ..Default::default()
+        }))
+        .await
+        .expect("an untyped step runs directly");
+        assert!(
+            claims.lock().unwrap().is_empty(),
+            "an untyped step must not claim"
+        );
+
+        svc.run_step(Request::new(RunStepRequest {
+            job_id,
+            command: vec!["true".into()],
+            step_id: 1,
+            user: "ubuntu".into(),
+            overlap: true,
+            resources: Some(StepResources {
+                cpus_per_task: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("a typed overlap step still skips the claim phase");
+        assert!(
+            claims.lock().unwrap().is_empty(),
+            "an overlap step must not claim either"
+        );
+    }
+
+    // A `gpu_type` alone is a filter on a count, not a request: it must not
+    // run the claim phase or mark the launch as claimed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_type_only_step_skips_the_claim_phase() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let (agent, claims, commands, _) = claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let addr = spawn_probe_agent_server(agent).await;
+        point_node_at_agent_with(&svc, "n1", addr.port(), step_capable()).await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("test setup: seed step");
+
+        svc.run_step(Request::new(RunStepRequest {
+            job_id,
+            command: vec!["true".into()],
+            step_id: 0,
+            user: "ubuntu".into(),
+            overlap: false,
+            resources: Some(StepResources {
+                gpu_type: "mi355x".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("a type-only step runs directly");
+
+        assert!(
+            claims.lock().unwrap().is_empty(),
+            "a gpu_type alone must not claim"
+        );
+        let command = commands
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("RunCommand was sent");
+        assert!(
+            !command.claimed,
+            "a gpu_type alone must not mark the launch as claimed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_without_claim_step_is_refused() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let (agent, claims, commands, _) = claim_recording_agent(
+            Some(Ok(ran(0, false))),
+            Some(Err(Status::unimplemented("ClaimStep"))),
+        );
+        let addr = spawn_probe_agent_server(agent).await;
+        point_node_at_agent_with(&svc, "n1", addr.port(), step_capable()).await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "step".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("test setup: seed step");
+
+        let response = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect("an agent without ClaimStep fails the step rather than dispatching to it")
+            .into_inner();
+        assert_eq!(response.exit_code, 1);
+        assert_eq!(
+            claims.lock().unwrap().len(),
+            2,
+            "the claim attempt, then its release"
+        );
+        assert!(
+            commands.lock().unwrap().is_empty(),
+            "RunCommand must not run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_command_carries_claimed_and_claim_ttl() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let (agent, claims, commands, _) = claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let addr = spawn_probe_agent_server(agent).await;
+        point_node_at_agent_with(&svc, "n1", addr.port(), step_capable()).await;
+
+        for step_id in [0u32, 1u32] {
+            svc.cluster
+                .create_step(JobStep {
+                    job_id,
+                    step_id,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: ResourceAllocations::default(),
+                    nodes: vec!["n1".into()],
+                    distribution: TaskDistribution::Block,
+                    start_time: Some(chrono::Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    pty: false,
+                    job_shell: false,
+                })
+                .expect("test setup: seed step");
+        }
+
+        svc.run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect("typed step claims then runs");
+        let claim = claims
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a claim was sent");
+        assert!(claim.ttl_secs > 0, "ttl sized from the dispatch deadline");
+        let command = commands
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("RunCommand was sent");
+        assert!(command.claimed, "a typed step marks the launch as claimed");
+
+        svc.run_step(Request::new(RunStepRequest {
+            job_id,
+            command: vec!["true".into()],
+            step_id: 1,
+            user: "ubuntu".into(),
+            overlap: false,
+            resources: None,
+            ..Default::default()
+        }))
+        .await
+        .expect("untyped step runs directly");
+        let command = commands
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("untyped RunCommand was sent");
+        assert!(!command.claimed, "an untyped step never claims");
+    }
+
+    // A node whose claim is lost by the time it is asked to run (e.g. the TTL
+    // lapsed) refuses RunCommand; the other node, already running, must be
+    // cancelled rather than left to finish alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_claim_on_one_node_cancels_the_other_before_returning() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, _, _, _) = claim_recording_agent(
+            Some(Err(Status::failed_precondition(
+                "n1's claimed share expired before launch",
+            ))),
+            None,
+        );
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (mut n2_agent, _, _, n2_cancels) = claim_recording_agent(Some(Ok(ran(0, false))), None);
+        n2_agent.block_on_cancel = Some(notify);
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+
+        // A hang here (n1's loss never cancelling n2) IS the regression this
+        // test guards, so a hang must fail the test rather than wedge the suite.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            svc.run_step(Request::new(step_request(job_id, false, true))),
+        )
+        .await
+        .expect("run_step hung: n1's lost claim did not cancel n2")
+        .expect("n2 ran, so the step completes rather than erroring")
+        .into_inner();
+        assert_eq!(response.exit_code, 1, "n1's lost claim failed the step");
+
+        let cancels = n2_cancels.lock().unwrap();
+        assert_eq!(cancels.len(), 1, "n2 recorded a CancelStep for the step");
+        assert_eq!(cancels[0].job_id, job_id);
+        assert_eq!(cancels[0].run_attempt, run_attempt);
+        assert_eq!(cancels[0].step_id, 0);
+    }
+
+    // PMIx prepare runs after the claim phase; a failure there must release
+    // every node's claim, not just the one(s) PMIx prepare touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pmix_prepare_failure_releases_every_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+        let (n2_agent, n2_claims, n2_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        let mut req = step_request(job_id, false, true);
+        // ProbeAgent's prepare_pmix always refuses; this step's 2-node PMIx
+        // plan needs prepare, so that refusal is the failure under test.
+        req.mpi = spur_core::mpi::MPI_PMIX.into();
+
+        svc.run_step(Request::new(req))
+            .await
+            .expect_err("PMIx prepare failing must fail the step");
+
+        assert_eq!(
+            n1_claims.lock().unwrap().len(),
+            2,
+            "n1 sees a claim then a release"
+        );
+        assert!(n1_claims.lock().unwrap()[1].release);
+        assert_eq!(
+            n2_claims.lock().unwrap().len(),
+            2,
+            "n2 sees a claim then a release"
+        );
+        assert!(n2_claims.lock().unwrap()[1].release);
+        assert!(
+            n1_commands.lock().unwrap().is_empty(),
+            "PMIx prepare failure must stop dispatch"
+        );
+        assert!(n2_commands.lock().unwrap().is_empty());
+    }
+
+    // Dropping the `run_step` future mid-claim (e.g. a killed srun) must not
+    // leave any node's claim held until its TTL — the drop guard releases
+    // every target, not just the ones that had already answered.
+    //
+    // Synchronized on explicit signals only (no sleeps, no timeouts): both
+    // nodes' claim arrival is awaited before the future is dropped (claim_on_nodes
+    // fans the two ClaimStep RPCs out concurrently, so n1's can otherwise still
+    // be in flight — unseen by n1_claims — when n2's claim is aborted), and
+    // both nodes' release arrival is awaited before asserting on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_future_dropped_mid_claim_releases_every_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (mut n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1_claim_entered = Arc::new(tokio::sync::Notify::new());
+        let n1_claim_entered_set = n1_claim_entered.clone();
+        n1_agent.on_claim = Some(Arc::new(move || {
+            n1_claim_entered_set.notify_one();
+        }));
+        let n1_release_seen = Arc::new(tokio::sync::Notify::new());
+        n1_agent.release_seen = Some(n1_release_seen.clone());
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+
+        let (mut n2_agent, n2_claims, n2_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n2_claim_entered = Arc::new(tokio::sync::Notify::new());
+        let n2_claim_entered_set = n2_claim_entered.clone();
+        n2_agent.on_claim = Some(Arc::new(move || {
+            n2_claim_entered_set.notify_one();
+        }));
+        // Never notified: n2's claim handler stalls here for the rest of the
+        // test, standing in for a claim RPC still on the wire when srun dies.
+        n2_agent.block_on_claim = Some(Arc::new(tokio::sync::Notify::new()));
+        let n2_release_seen = Arc::new(tokio::sync::Notify::new());
+        n2_agent.release_seen = Some(n2_release_seen.clone());
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        let svc_for_task = svc.clone();
+        let req = step_request(job_id, false, true);
+        let handle = tokio::spawn(async move { svc_for_task.run_step(Request::new(req)).await });
+
+        // Wait for both claims to land (n1's answers immediately; n2's stalls
+        // right after logging, inside its handler) before dropping the future —
+        // otherwise n1's ClaimStep can still be on the wire, unseen by
+        // n1_claims, when the abort races it.
+        tokio::join!(n1_claim_entered.notified(), n2_claim_entered.notified());
+        handle.abort();
+        let _ = handle.await;
+
+        // The guard's spawned release task answers both nodes independently;
+        // wait for each rather than asserting against a length that may not
+        // have landed yet.
+        tokio::join!(n1_release_seen.notified(), n2_release_seen.notified());
+
+        assert_eq!(
+            n1_claims.lock().unwrap().len(),
+            2,
+            "n1 sees a claim then a release from the dropped future's guard"
+        );
+        assert!(n1_claims.lock().unwrap()[1].release);
+        assert_eq!(
+            n2_claims.lock().unwrap().len(),
+            2,
+            "n2 sees a claim then a release even though its first claim never answered"
+        );
+        assert!(n2_claims.lock().unwrap()[1].release);
+        assert!(n1_commands.lock().unwrap().is_empty());
+        assert!(n2_commands.lock().unwrap().is_empty());
+    }
+
+    // An untyped step never enters the claim phase, so a PMIx prepare
+    // failure on it must not send any ClaimStep (claim or release) either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untyped_steps_pmix_prepare_failure_sends_no_claim_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+        let (n2_agent, n2_claims, n2_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+
+        let mut req = step_request(job_id, false, false);
+        req.mpi = spur_core::mpi::MPI_PMIX.into();
+
+        svc.run_step(Request::new(req))
+            .await
+            .expect_err("PMIx prepare failing must fail the step");
+
+        assert!(
+            n1_claims.lock().unwrap().is_empty(),
+            "n1 never claimed, so it must not see a release either"
+        );
+        assert!(
+            n2_claims.lock().unwrap().is_empty(),
+            "n2 never claimed, so it must not see a release either"
+        );
+        assert!(n1_commands.lock().unwrap().is_empty());
+        assert!(n2_commands.lock().unwrap().is_empty());
+    }
+
+    // The claim phase re-checks the step's terminal state before dispatching:
+    // a step cancelled while claiming must never see a RunCommand, and its
+    // already-granted claims must be released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_does_not_dispatch_a_step_cancelled_while_claiming() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let (n1_agent, n1_claims, n1_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let n1 = spawn_probe_agent_server(n1_agent).await;
+
+        let svc_for_hook = svc.clone();
+        let job_for_hook = Arc::new(std::sync::OnceLock::new());
+        let job_for_hook_set = job_for_hook.clone();
+        let (n2_agent, n2_claims, n2_commands, _) =
+            claim_recording_agent(Some(Ok(ran(0, false))), None);
+        let mut n2_agent = n2_agent;
+        n2_agent.on_claim = Some(Arc::new(move || {
+            if let Some(job_id) = job_for_hook_set.get() {
+                svc_for_hook
+                    .cluster
+                    .record_step_complete(*job_id, 0, 0, false, true)
+                    .expect("mark the step cancelled while n2 is claiming");
+            }
+        }));
+        let n2 = spawn_probe_agent_server(n2_agent).await;
+
+        let job_id =
+            two_node_typed_step_job(&svc, "ubuntu", n1.port(), n2.port(), step_capable()).await;
+        job_for_hook.set(job_id).expect("set once");
+
+        let status = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect_err("a step cancelled while claiming must never report a false success");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("was cancelled"));
+
+        assert!(n1_commands.lock().unwrap().is_empty(), "n1 must not run");
+        assert!(n2_commands.lock().unwrap().is_empty(), "n2 must not run");
+        assert_eq!(
+            n1_claims.lock().unwrap().len(),
+            2,
+            "n1's claim is released once the step is seen cancelled"
+        );
+        assert!(n1_claims.lock().unwrap()[1].release);
+        assert_eq!(
+            n2_claims.lock().unwrap().len(),
+            2,
+            "n2's own claim is released too"
+        );
+        assert!(n2_claims.lock().unwrap()[1].release);
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(step.state, spur_core::step::StepState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_records_an_oom_killed_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, _) = step_on_recording_agent(&svc, step_capable(), Ok(ran(137, true))).await;
+        let resp = svc
+            .run_step(Request::new(step_request(job_id, false, true)))
+            .await
+            .expect("an OOM-killed step still reports")
+            .into_inner();
+        assert!(resp.oom_killed);
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == 0)
+            .expect("step");
+        assert_eq!(step.state, spur_core::step::StepState::OutOfMemory);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14810,6 +17280,218 @@ mod tests {
     }
 
     #[test]
+    fn node_to_proto_shows_the_reserved_cores_per_gpu() {
+        use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = (0..4)
+            .flat_map(|core| {
+                [core, core + 4].map(|cpu| CpuRecord {
+                    cpu,
+                    socket: 0,
+                    core_id: core,
+                    numa_node: Some(0),
+                })
+            })
+            .collect();
+        let mut node = spur_core::node::Node::new("n1".into(), Default::default());
+        node.detected_resources.topology = Some(CpuTopology::from_cpus(&records));
+        node.core_layout = Some(CoreLayout {
+            spec_cpus: vec![],
+            mem_spec_mb: 0,
+            gpu_reserved: vec![
+                GpuReservedCpus {
+                    stable_id: 1,
+                    cpus: vec![0, 4],
+                },
+                GpuReservedCpus {
+                    stable_id: 2,
+                    cpus: vec![1, 5],
+                },
+            ],
+            general_cpus: vec![2, 3, 6, 7],
+            daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        });
+        let info = node_to_proto(&node);
+        assert_eq!(info.restricted_cores_per_gpu, 1, "one core, two threads");
+        assert_eq!(info.reserved_cpus, "0-1,4-5");
+
+        node.core_layout = None;
+        let info = node_to_proto(&node);
+        assert_eq!(info.restricted_cores_per_gpu, 0);
+        assert_eq!(info.reserved_cpus, "");
+    }
+
+    #[test]
+    fn node_to_proto_carries_cpu_shape_gpu_cpus_and_capabilities() {
+        use spur_core::core_layout::{CoreLayout, GpuReservedCpus};
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let records: Vec<CpuRecord> = (0..4)
+            .flat_map(|core| {
+                [core, core + 4].map(|cpu| CpuRecord {
+                    cpu,
+                    socket: 0,
+                    core_id: core,
+                    numa_node: Some(0),
+                })
+            })
+            .collect();
+        let gpu = |stable_id: u64, numa_node: Option<u32>| GpuResource {
+            device_id: stable_id as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id,
+            topology: None,
+            numa_node,
+            affinity_cpus: vec![],
+        };
+        let mut node = spur_core::node::Node::new(
+            "n1".into(),
+            spur_core::resource::ResourceSet {
+                gpus: vec![gpu(1, Some(0)), gpu(2, None)],
+                ..Default::default()
+            },
+        );
+        node.detected_resources.topology = Some(CpuTopology::from_cpus(&records));
+        node.core_layout = Some(CoreLayout {
+            spec_cpus: vec![],
+            mem_spec_mb: 0,
+            gpu_reserved: vec![
+                GpuReservedCpus {
+                    stable_id: 1,
+                    cpus: vec![0, 4],
+                },
+                GpuReservedCpus {
+                    stable_id: 2,
+                    cpus: vec![1, 5],
+                },
+            ],
+            general_cpus: vec![2, 3, 6, 7],
+            daemons_off_spec: false,
+            trimmed_cpus: vec![],
+        });
+        node.capabilities = vec!["signal-job".into(), "step-resources".into()];
+
+        let info = node_to_proto(&node);
+        assert_eq!(
+            info.socket_core_thread,
+            Some(SocketCoreThread {
+                sockets: 1,
+                cores_per_socket: 4,
+                threads_per_core: 2
+            })
+        );
+        assert_eq!(
+            info.gpu_cpus,
+            vec![
+                GpuCpus {
+                    stable_id: 1,
+                    reserved_cpus: "0,4".into(),
+                    affinity_cpus: "0-7".into()
+                },
+                GpuCpus {
+                    stable_id: 2,
+                    reserved_cpus: "1,5".into(),
+                    affinity_cpus: String::new()
+                },
+            ]
+        );
+        assert_eq!(info.capabilities, node.capabilities);
+
+        node.detected_resources.topology = None;
+        node.core_layout = None;
+        node.capabilities.clear();
+        let info = node_to_proto(&node);
+        assert_eq!(
+            info.socket_core_thread, None,
+            "unknown stays unset, not zero"
+        );
+        assert!(info.gpu_cpus.is_empty());
+        assert!(info.capabilities.is_empty());
+    }
+
+    #[test]
+    fn def_cpu_per_gpu_round_trips_through_partition_requests() {
+        let create = CreatePartitionRequest {
+            def_cpu_per_gpu: Some(8),
+            ..Default::default()
+        };
+        let limits = create_request_limits(&create).expect("valid");
+        assert_eq!(limits.def_cpu_per_gpu, Some(8));
+        let zero = CreatePartitionRequest {
+            def_cpu_per_gpu: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            create_request_limits(&zero).expect("valid").def_cpu_per_gpu,
+            None
+        );
+
+        let update = |def| UpdatePartitionRequest {
+            def_cpu_per_gpu: def,
+            ..Default::default()
+        };
+        assert_eq!(
+            update_request_limits(&update(None)).def_cpu_per_gpu,
+            None,
+            "no change"
+        );
+        assert_eq!(
+            update_request_limits(&update(Some(0))).def_cpu_per_gpu,
+            Some(None),
+            "clear"
+        );
+        assert_eq!(
+            update_request_limits(&update(Some(16))).def_cpu_per_gpu,
+            Some(Some(16))
+        );
+
+        let part = spur_core::partition::Partition {
+            name: "gpu".into(),
+            def_cpu_per_gpu: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(partition_to_proto(&part).def_cpu_per_gpu, Some(8));
+    }
+
+    #[test]
+    fn proto_to_job_spec_reads_a_zero_cpus_per_task_as_not_given() {
+        let spec = |cpus_per_task| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            cpus_per_task,
+            ..Default::default()
+        };
+        let unset = proto_to_job_spec(spec(0)).expect("valid");
+        assert_eq!(unset.cpus_per_task, 1);
+        assert!(unset.cpus_per_task_unset);
+        let explicit = proto_to_job_spec(spec(1)).expect("valid");
+        assert_eq!(explicit.cpus_per_task, 1);
+        assert!(
+            !explicit.cpus_per_task_unset,
+            "an old client's 1 is explicit"
+        );
+    }
+
+    #[test]
+    fn proto_to_job_spec_maps_the_per_gpu_options() {
+        let spec = |cpus_per_gpu, memory_per_gpu_mb| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            cpus_per_gpu,
+            memory_per_gpu_mb,
+            ..Default::default()
+        };
+        let set = proto_to_job_spec(spec(Some(8), 32_000)).expect("valid");
+        assert_eq!(set.cpus_per_gpu, Some(8));
+        assert_eq!(set.memory_per_gpu_mb, Some(32_000));
+        let unset = proto_to_job_spec(spec(None, 0)).expect("valid");
+        assert_eq!(unset.cpus_per_gpu, None);
+        assert_eq!(unset.memory_per_gpu_mb, None);
+    }
+
+    #[test]
     fn proto_to_job_spec_carries_the_keepalive_opt_in() {
         let spec = |client_keepalive| spur_proto::proto::JobSpec {
             name: "j".into(),
@@ -15022,9 +17704,11 @@ mod tests {
         let mut job = Job::new(7, JobSpec::default());
         assert_eq!(job_to_proto(&job).mem_per_tres, "");
         job.spec.memory_per_gpu_mb = Some(8192);
+        job.spec.cpus_per_gpu = Some(8);
         let info = job_to_proto(&job);
         assert_eq!(info.mem_per_tres, "gpu:8192");
         assert_eq!(info.min_memory_node_mb, 0);
+        assert_eq!(info.cpus_per_gpu, Some(8));
     }
 
     #[test]
@@ -15073,6 +17757,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(requested_tres(&spec), "cpu=3,mem=12288M,node=2");
+    }
+
+    #[test]
+    fn requested_tres_and_min_cpus_count_cpus_per_gpu() {
+        let spec = spur_core::job::JobSpec {
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            cpus_per_task_unset: true,
+            cpus_per_gpu: Some(8),
+            gres: vec!["gpu:2".into()],
+            ..Default::default()
+        };
+        assert!(
+            requested_tres(&spec).starts_with("cpu=16,"),
+            "{}",
+            requested_tres(&spec)
+        );
+        assert_eq!(min_cpus_per_node(&spec), 16);
     }
 
     #[test]

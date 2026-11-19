@@ -29,6 +29,8 @@ pub struct PartitionResourceLimits {
     pub def_mem_per_cpu: Option<u64>,
     #[serde(default)]
     pub def_mem_per_gpu: Option<u64>,
+    #[serde(default)]
+    pub def_cpu_per_gpu: Option<u32>,
 }
 
 impl PartitionResourceLimits {
@@ -40,6 +42,7 @@ impl PartitionResourceLimits {
             def_mem_per_node: partition.def_mem_per_node,
             def_mem_per_cpu: partition.def_mem_per_cpu,
             def_mem_per_gpu: partition.def_mem_per_gpu,
+            def_cpu_per_gpu: partition.def_cpu_per_gpu,
         }
     }
 
@@ -50,6 +53,7 @@ impl PartitionResourceLimits {
         partition.def_mem_per_node = self.def_mem_per_node;
         partition.def_mem_per_cpu = self.def_mem_per_cpu;
         partition.def_mem_per_gpu = self.def_mem_per_gpu;
+        partition.def_cpu_per_gpu = self.def_cpu_per_gpu;
     }
 }
 
@@ -115,6 +119,13 @@ pub struct PartitionLimitsUpdate {
         skip_serializing_if = "Option::is_none"
     )]
     pub def_mem_per_gpu: Option<Option<u64>>,
+    /// Not in the `def_mem_*` group: it sizes CPUs and is set independently.
+    #[serde(
+        default,
+        deserialize_with = "clear_or_set",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub def_cpu_per_gpu: Option<Option<u32>>,
 }
 
 impl PartitionLimitsUpdate {
@@ -128,6 +139,7 @@ impl PartitionLimitsUpdate {
             def_mem_per_node: Some(limits.def_mem_per_node),
             def_mem_per_cpu: Some(limits.def_mem_per_cpu),
             def_mem_per_gpu: Some(limits.def_mem_per_gpu),
+            def_cpu_per_gpu: Some(limits.def_cpu_per_gpu),
         }
     }
 
@@ -208,6 +220,9 @@ impl PartitionLimitsUpdate {
                 self.def_mem_per_gpu,
             ],
         );
+        if let Some(change) = self.def_cpu_per_gpu {
+            limits.def_cpu_per_gpu = change;
+        }
         Some(limits)
     }
 }
@@ -241,6 +256,10 @@ pub struct MemoryAdjustment {
     pub memory_per_cpu_mb: Option<u64>,
     #[serde(default)]
     pub memory_per_gpu_mb: Option<u64>,
+    /// Absent from adjustments recorded before it existed, which never changed it,
+    /// so `None` leaves the spec's value alone.
+    #[serde(default)]
+    pub cpus_per_gpu: Option<u32>,
 }
 
 impl MemoryAdjustment {
@@ -250,6 +269,7 @@ impl MemoryAdjustment {
             memory_per_node_mb: spec.memory_per_node_mb,
             memory_per_cpu_mb: spec.memory_per_cpu_mb,
             memory_per_gpu_mb: spec.memory_per_gpu_mb,
+            cpus_per_gpu: spec.cpus_per_gpu,
         }
     }
 
@@ -258,6 +278,9 @@ impl MemoryAdjustment {
         spec.memory_per_node_mb = self.memory_per_node_mb;
         spec.memory_per_cpu_mb = self.memory_per_cpu_mb;
         spec.memory_per_gpu_mb = self.memory_per_gpu_mb;
+        if self.cpus_per_gpu.is_some() {
+            spec.cpus_per_gpu = self.cpus_per_gpu;
+        }
     }
 }
 
@@ -305,16 +328,25 @@ fn min_tasks_per_node(spec: &JobSpec) -> u32 {
 
 /// CPUs on the node holding the smallest share, floored at one.
 fn min_node_cpus(spec: &JobSpec) -> u64 {
-    (u64::from(min_tasks_per_node(spec)) * u64::from(spec.cpus_per_task)).max(1)
+    u64::from(node_cpu_counts(spec).into_iter().min().unwrap_or(1))
 }
 
 /// CPUs the job uses on each node, in task-layout order (e.g. `-N2 -n7` ->
-/// `[4, 3]`), each floored at one.
+/// `[4, 3]`), each floored at one. A `--gpus` total is assumed spread evenly,
+/// so for a `--cpus-per-gpu` job this is an estimate; placement must size each
+/// node from the GPUs it actually gives it.
 pub fn node_cpu_counts(spec: &JobSpec) -> Vec<u32> {
-    let cpus_per_task = spec.cpus_per_task.max(1);
+    let gpus = match spec.cpus_per_gpu {
+        Some(_) => crate::job::gpus_per_node_counts(spec),
+        None => Vec::new(),
+    };
     tasks_per_node_counts(spec, spec.num_nodes.max(1))
         .into_iter()
-        .map(|tasks| tasks.saturating_mul(cpus_per_task).max(1))
+        .enumerate()
+        .map(|(i, tasks)| {
+            let gpus_here = gpus.get(i).copied().unwrap_or(0);
+            spec.cpus_on_node(tasks, gpus_here).max(1)
+        })
         .collect()
 }
 
@@ -414,7 +446,25 @@ impl Partition {
 
 /// Slurm `_valid_pn_min_mem`: over-limit `--mem-per-cpu` scales CPUs up and memory per CPU
 /// down by `ceil(mem / limit)`; over-limit `--mem` (or per-GPU, evenly spread) raises CPUs.
+/// Unlike Slurm, the per-CPU split scales `--cpus-per-gpu` too, so the job keeps its memory.
+///
+/// A `--cpus-per-gpu` job never gets `cpus_per_task` raised, by any of these branches:
+/// Slurm's own rule has no branch for a per-GPU CPU count at all (job_mgr.c
+/// `_valid_pn_min_mem`), so there is no parity target to extend, and raising
+/// `cpus_per_task` here would leave the job with both fields set, which submit
+/// validation forbids (though nothing re-validates this dispatch-time adjustment).
+/// With `--mem-per-gpu` it scales `cpus_per_gpu` directly from the job's own per-GPU
+/// memory. With per-node `--mem` instead, the per-node branch below scales
+/// `cpus_per_gpu` from the per-node need and the fewest GPUs any one node holds —
+/// that node needs the highest per-GPU CPU count to reach the same per-node total.
 fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjustment) {
+    if let (Some(per_gpu_mem), Some(cpg)) = (adjusted.memory_per_gpu_mb, adjusted.cpus_per_gpu) {
+        let need = per_gpu_mem.div_ceil(limit);
+        if need > u64::from(cpg) {
+            adjusted.cpus_per_gpu = Some(u32::try_from(need).unwrap_or(u32::MAX));
+        }
+        return;
+    }
     let mut probe = spec.clone();
     adjusted.apply_to(&mut probe);
     let per_node = adjusted.memory_per_node_mb.or_else(|| {
@@ -427,6 +477,23 @@ fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjust
         if needed <= min_node_cpus(&probe) {
             return;
         }
+        if let Some(cpg) = adjusted.cpus_per_gpu {
+            // A node with no GPUs of its own has nothing sound to scale cpus_per_gpu
+            // from; leave the job unchanged rather than guess at a value for it.
+            let Some(fewest) = crate::job::gpus_per_node_counts(&probe)
+                .into_iter()
+                .min()
+                .filter(|&gpus| gpus > 0)
+            else {
+                return;
+            };
+            let fewest = u64::from(fewest);
+            if needed > u64::from(cpg) * fewest {
+                adjusted.cpus_per_gpu =
+                    Some(u32::try_from(needed.div_ceil(fewest)).unwrap_or(u32::MAX));
+            }
+            return;
+        }
         let per_task = needed.div_ceil(u64::from(min_tasks_per_node(&probe)));
         adjusted.cpus_per_task = u32::try_from(per_task).unwrap_or(u32::MAX);
         return;
@@ -435,14 +502,128 @@ fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjust
         return;
     };
     let factor = per_cpu.div_ceil(limit);
-    let cpus = u64::from(adjusted.cpus_per_task.max(1)).saturating_mul(factor);
-    adjusted.cpus_per_task = u32::try_from(cpus).unwrap_or(u32::MAX);
+    adjusted.cpus_per_task = scale_cpus(adjusted.cpus_per_task.max(1), factor);
+    adjusted.cpus_per_gpu = adjusted.cpus_per_gpu.map(|cpus| scale_cpus(cpus, factor));
     adjusted.memory_per_cpu_mb = Some(per_cpu.div_ceil(factor));
+}
+
+fn scale_cpus(cpus: u32, factor: u64) -> u32 {
+    u32::try_from(u64::from(cpus).saturating_mul(factor)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn per_gpu_job(nodes: u32, gres: &str, cpus_per_gpu: u32) -> JobSpec {
+        JobSpec {
+            num_nodes: nodes,
+            num_tasks: nodes,
+            cpus_per_task: 1,
+            cpus_per_gpu: Some(cpus_per_gpu),
+            gres: vec![gres.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn def_cpu_per_gpu_merges_independently_of_the_memory_knobs() {
+        let current = Partition {
+            def_mem_per_gpu: Some(8192),
+            ..Default::default()
+        };
+        let set = PartitionLimitsUpdate {
+            def_cpu_per_gpu: Some(Some(16)),
+            ..Default::default()
+        };
+        let merged = set.merged(&current).unwrap();
+        assert_eq!(merged.def_cpu_per_gpu, Some(16));
+        assert_eq!(merged.def_mem_per_gpu, Some(8192));
+
+        let mut partition = current.clone();
+        merged.apply_to(&mut partition);
+        assert_eq!(partition.def_cpu_per_gpu, Some(16));
+        let clear = PartitionLimitsUpdate {
+            def_cpu_per_gpu: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(clear.merged(&partition).unwrap().def_cpu_per_gpu, None);
+        assert_eq!(
+            PartitionLimitsUpdate::replacing(&merged).def_cpu_per_gpu,
+            Some(Some(16))
+        );
+    }
+
+    #[test]
+    fn a_pre_change_limits_update_has_no_def_cpu_per_gpu() {
+        let update: PartitionLimitsUpdate =
+            serde_json::from_str(r#"{"def_mem_per_gpu":4096}"#).unwrap();
+        assert_eq!(update.def_cpu_per_gpu, None);
+        let limits: PartitionResourceLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(limits.def_cpu_per_gpu, None);
+    }
+
+    #[test]
+    fn node_cpu_counts_size_per_gpu_jobs_by_their_gpus() {
+        let spec = per_gpu_job(2, "gpu:4", 8);
+        assert_eq!(node_cpu_counts(&spec), vec![32, 32]);
+        assert_eq!(min_node_cpus(&spec), 32);
+    }
+
+    #[test]
+    fn node_cpu_counts_ignore_gpus_without_cpus_per_gpu() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 3,
+            gpus: Some(crate::gpu_request::GpuRequest::new(3, None)),
+            ..Default::default()
+        };
+        assert_eq!(node_cpu_counts(&spec), vec![3, 3]);
+    }
+
+    #[test]
+    fn a_max_mem_per_cpu_raise_below_the_per_gpu_count_changes_nothing() {
+        let p = Partition {
+            max_mem_per_cpu: Some(1000),
+            ..Default::default()
+        };
+        let spec = JobSpec {
+            memory_per_node_mb: Some(4000),
+            ..per_gpu_job(1, "gpu:1", 8)
+        };
+        // 4000 / 1000 needs 4 CPUs; the GPU already brings 8.
+        assert_eq!(p.memory_adjusted(&spec).cpus_per_task, 1);
+    }
+
+    #[test]
+    fn a_max_mem_per_cpu_split_keeps_a_per_gpu_jobs_memory() {
+        let p = Partition {
+            max_mem_per_cpu: Some(1024),
+            ..Default::default()
+        };
+        let spec = JobSpec {
+            memory_per_cpu_mb: Some(2048),
+            ..per_gpu_job(1, "gpu:2", 8)
+        };
+        let before = peak_node_memory_mb(&spec);
+        let mut adjusted = spec.clone();
+        p.memory_adjusted(&spec).apply_to(&mut adjusted);
+        assert_eq!(adjusted.memory_per_cpu_mb, Some(1024));
+        assert_eq!(node_cpu_counts(&adjusted), vec![32]);
+        assert_eq!(peak_node_memory_mb(&adjusted), before);
+    }
+
+    #[test]
+    fn an_adjustment_recorded_without_cpus_per_gpu_keeps_the_jobs_value() {
+        let recorded: MemoryAdjustment =
+            serde_json::from_str(r#"{"cpus_per_task":2,"memory_per_cpu_mb":1024}"#).unwrap();
+        assert_eq!(recorded.cpus_per_gpu, None);
+        let mut spec = per_gpu_job(1, "gpu:2", 8);
+        recorded.apply_to(&mut spec);
+        assert_eq!(spec.cpus_per_gpu, Some(8));
+        assert_eq!(spec.cpus_per_task, 2);
+    }
 
     #[test]
     fn candidate_requests_group_partitions_that_reshape_the_job_alike() {
@@ -641,6 +822,70 @@ mod tests {
         assert_eq!(adjusted.cpus_per_task, 4);
         assert!(p.node_memory_allowed(4, 8 * GIB));
         assert!(!p.node_memory_allowed(4, 12 * GIB));
+    }
+
+    #[test]
+    fn mem_per_gpu_over_the_limit_scales_cpus_per_gpu_not_cpus_per_task() {
+        let p = Partition {
+            max_mem_per_cpu: Some(1024),
+            ..Default::default()
+        };
+        // -N2 --gpus=3 --cpus-per-gpu=4 --mem-per-gpu=<mem>: an uneven 2+1 spread,
+        // so a fix that still compared the fullest node's memory against the
+        // smallest node's CPUs would size this job from the wrong node.
+        let job = |mem_per_gpu_mb| JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_gpu: Some(4),
+            memory_per_gpu_mb: Some(mem_per_gpu_mb),
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+
+        // 4G / 1024 = 4: no larger than the existing per-GPU count, so unchanged.
+        let fits = p.memory_adjusted(&job(4 * GIB));
+        assert_eq!(fits.cpus_per_gpu, Some(4));
+        assert_eq!(fits.cpus_per_task, 1);
+
+        // 8G / 1024 = 8: raises cpus_per_gpu; cpus_per_task must stay untouched.
+        let raised = p.memory_adjusted(&job(8 * GIB));
+        assert_eq!(raised.cpus_per_gpu, Some(8));
+        assert_eq!(raised.cpus_per_task, 1);
+    }
+
+    #[test]
+    fn per_node_mem_over_the_limit_scales_cpus_per_gpu_from_the_thinnest_node() {
+        let p = Partition {
+            max_mem_per_cpu: Some(1024),
+            ..Default::default()
+        };
+        // -N2 --gpus=3 --cpus-per-gpu=<cpg> --mem=8G: an uneven 2+1 spread, so the
+        // 1-GPU node needs the whole 8 CPUs from cpus_per_gpu alone.
+        let job = |cpus_per_gpu| JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_gpu: Some(cpus_per_gpu),
+            memory_per_node_mb: Some(8 * GIB),
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+
+        // needed = 8G / 1024 = 8 per node; cpus_per_gpu=2 only gives the 1-GPU
+        // node 2 CPUs, so it is raised to cover the full per-node need.
+        let raised = p.memory_adjusted(&job(2));
+        assert_eq!(raised.cpus_per_gpu, Some(8));
+        assert_eq!(raised.cpus_per_task, 1);
+
+        // cpus_per_gpu=10 already gives the 1-GPU node 10 CPUs, more than the
+        // 8 needed: no-op.
+        let fits = job(10);
+        assert_eq!(p.memory_adjusted(&fits), MemoryAdjustment::of(&fits));
     }
 
     #[test]

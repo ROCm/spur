@@ -25,6 +25,7 @@ mod node;
 mod nodelist;
 mod privilege;
 mod reason;
+mod resource_opts;
 mod sacct;
 mod sacctmgr;
 mod salloc;

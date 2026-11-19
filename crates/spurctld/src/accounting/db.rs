@@ -197,6 +197,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason_detail TEXT NOT NULL DEFAULT ''
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by_uid BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_limit_secs BIGINT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS alloc_cpus BIGINT;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -340,6 +341,17 @@ pub struct JobStartRecord {
     pub idle_fill: bool,
     /// Wall-clock time limit the user requested, in seconds. `None` when unlimited.
     pub time_limit_secs: Option<i64>,
+    /// CPUs allocated across all nodes, which CPU-seconds bill. `None` from
+    /// callers that do not know it; usage then falls back to tasks x -c.
+    pub alloc_cpus: Option<u64>,
+}
+
+/// CPUs a run holds across its nodes; `None` before it is placed.
+pub fn allocated_cpus(
+    per_node_alloc: &std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
+) -> Option<u64> {
+    let total: u64 = per_node_alloc.values().map(|a| u64::from(a.cpus)).sum();
+    (total > 0).then_some(total)
 }
 
 /// Record a job start in the database.
@@ -353,8 +365,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist, time_limit_secs)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16, $17)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist, time_limit_secs, alloc_cpus)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16, $17, $18)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -364,6 +376,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             num_nodes = EXCLUDED.num_nodes,
             num_tasks = EXCLUDED.num_tasks,
             cpus_per_task = EXCLUDED.cpus_per_task,
+            alloc_cpus = EXCLUDED.alloc_cpus,
             total_gpus = EXCLUDED.total_gpus,
             memory_mb = EXCLUDED.memory_mb,
             submit_time = EXCLUDED.submit_time,
@@ -409,13 +422,14 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.idle_fill)
     .bind(&rec.nodelist)
     .bind(rec.time_limit_secs)
+    .bind(rec.alloc_cpus.map(|c| i64::try_from(c).unwrap_or(i64::MAX)))
     .execute(&mut *conn)
     .await?;
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, alloc_cpus, total_gpus, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -534,7 +548,7 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
                 WHEN COALESCE((jobs.preemption_usage->>'revision')::numeric, 0)
                     <= COALESCE(($27->>'revision')::numeric, 0)
                 THEN COALESCE($27, jobs.preemption_usage) ELSE jobs.preemption_usage END
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, alloc_cpus, total_gpus, qos, state, idle_fill
         "#,
     )
     .bind(rec.job_id as i64)
@@ -643,6 +657,20 @@ pub async fn job_accounting_states(
         .collect())
 }
 
+/// CPU-seconds a run bills: its allocated CPUs, as Slurm does, so an exclusive
+/// job bills its whole nodes. Rows from before `alloc_cpus` use tasks x -c.
+fn job_cpu_seconds(
+    duration_secs: i64,
+    num_tasks: i32,
+    cpus_per_task: i32,
+    alloc_cpus: Option<i64>,
+) -> i64 {
+    let cpus = alloc_cpus
+        .filter(|c| *c > 0)
+        .unwrap_or(i64::from(num_tasks) * i64::from(cpus_per_task));
+    duration_secs.saturating_mul(cpus)
+}
+
 /// Update usage accounting for a completed job. Idempotent: the charge is
 /// applied at most once per job via a `usage_recorded` flag on the job row,
 /// so a reconcile pass that re-finalizes a job cannot double-bill it.
@@ -676,13 +704,14 @@ async fn update_usage(
         return Ok(());
     }
 
+    let alloc_cpus: Option<i64> = row.get("alloc_cpus");
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
     let total_gpus: i32 = row.get("total_gpus");
     let qos_name: String = row.get("qos");
 
     let duration_secs = (end_time - start_time).num_seconds().max(0);
-    let cpu_seconds = duration_secs * (num_tasks as i64) * (cpus_per_task as i64);
+    let cpu_seconds = job_cpu_seconds(duration_secs, num_tasks, cpus_per_task, alloc_cpus);
     let gpu_seconds = duration_secs * (total_gpus as i64);
 
     let usage_factor: f64 = if !qos_name.is_empty() {
@@ -743,6 +772,9 @@ pub struct JobRecord {
     pub derived_exit_code: i32,
     pub num_nodes: i32,
     pub num_tasks: i32,
+    pub cpus_per_task: u32,
+    /// CPUs the run held across its nodes; `None` on rows recorded before it was kept.
+    pub alloc_cpus: Option<u64>,
     pub nodelist: String,
     pub submit_time: DateTime<Utc>,
     pub start_time: Option<DateTime<Utc>>,
@@ -811,7 +843,8 @@ fn push_coordinated(
 fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
-         exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
+         exit_signal, derived_exit_code, num_nodes, num_tasks, cpus_per_task, alloc_cpus, \
+         nodelist, \
          submit_time, start_time, end_time, reservation, \
          preempted_by, preempt_mode, preempt_qos, idle_fill, total_gpus, time_limit_secs, \
          reason, reason_detail, ended_by, ended_by_uid, preemption_usage \
@@ -875,6 +908,10 @@ pub async fn get_job_history(
             derived_exit_code: row.get("derived_exit_code"),
             num_nodes: row.get("num_nodes"),
             num_tasks: row.get("num_tasks"),
+            cpus_per_task: u32::try_from(row.get::<i32, _>("cpus_per_task")).unwrap_or(1),
+            alloc_cpus: row
+                .get::<Option<i64>, _>("alloc_cpus")
+                .and_then(|cpus| u64::try_from(cpus).ok()),
             nodelist: row.get("nodelist"),
             submit_time: row.get("submit_time"),
             start_time: row.get("start_time"),
@@ -1318,6 +1355,30 @@ mod history_query_tests {
     use super::*;
 
     #[test]
+    fn cpu_seconds_bill_the_allocated_cpus_when_recorded() {
+        assert_eq!(
+            job_cpu_seconds(100, 1, 1, Some(64)),
+            6400,
+            "an exclusive node"
+        );
+        assert_eq!(
+            job_cpu_seconds(100, 1, 1, Some(16)),
+            1600,
+            "--cpus-per-gpu=8 x 2 GPUs"
+        );
+        assert_eq!(
+            job_cpu_seconds(100, 4, 2, None),
+            800,
+            "rows from before the column"
+        );
+        assert_eq!(
+            job_cpu_seconds(100, 4, 2, Some(0)),
+            800,
+            "an empty value falls back too"
+        );
+    }
+
+    #[test]
     fn a_coordinator_filter_is_applied_before_the_row_limit() {
         let accounts = vec!["physics".to_string()];
         let query = JobHistoryQuery {
@@ -1350,6 +1411,13 @@ mod history_query_tests {
             history_query_limit(1_000_000),
             i64::from(spur_core::accounting::MAX_JOB_HISTORY_FETCH)
         );
+    }
+
+    #[test]
+    fn job_history_reads_the_recorded_cpus() {
+        let sql = job_history_query(&JobHistoryQuery::default()).sql();
+        let sql = sql.as_str();
+        assert!(sql.contains(" cpus_per_task, alloc_cpus,"), "{sql}");
     }
 }
 
@@ -2377,6 +2445,7 @@ mod job_history_tests {
                 nodelist: String::new(),
                 idle_fill: false,
                 time_limit_secs: None,
+                alloc_cpus: None,
             },
         )
         .await
@@ -2402,6 +2471,58 @@ mod job_history_tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn usage_bills_the_allocated_cpus() {
+        let pool = test_pool().await.unwrap();
+        let job_id = test_job_id(97);
+        let user = format!("alloc-billing-{job_id}");
+        let start_time = Utc::now() - Duration::seconds(100);
+        let mut conn = pool.acquire().await.unwrap();
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id,
+                name: "exclusive".into(),
+                user: user.clone(),
+                account: "acct".into(),
+                partition: "gpu".into(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                total_gpus: 0,
+                memory_mb: 0,
+                submit_time: start_time,
+                start_time,
+                reservation: None,
+                nodelist: String::new(),
+                idle_fill: false,
+                time_limit_secs: None,
+                alloc_cpus: Some(64),
+            },
+        )
+        .await
+        .unwrap();
+        record_job_end(
+            &mut conn,
+            &end_record(job_id, "COMPLETED", start_time + Duration::seconds(100)),
+        )
+        .await
+        .unwrap();
+        let billed: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cpu_seconds), 0)::BIGINT FROM usage WHERE user_name = $1",
+        )
+        .bind(&user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            billed, 6400,
+            "64 allocated CPUs x 100 s, not 1 task x 1 CPU"
+        );
     }
 
     fn end_record(job_id: JobId, state: &str, end_time: DateTime<Utc>) -> JobEndRecord {
@@ -2454,6 +2575,7 @@ mod job_history_tests {
                 nodelist: String::new(),
                 idle_fill: false,
                 time_limit_secs: None,
+                alloc_cpus: None,
             },
         )
         .await?;
@@ -2879,6 +3001,7 @@ mod job_history_tests {
             nodelist: nodelist.to_string(),
             idle_fill: false,
             time_limit_secs: None,
+            alloc_cpus: None,
         };
         let history = |pool: PgPool| async move {
             get_job_history(
@@ -5100,6 +5223,7 @@ mod job_history_tests {
                 nodelist: String::new(),
                 total_gpus: 4,
                 time_limit_secs: Some(1800),
+                alloc_cpus: None,
             },
         )
         .await?;
@@ -5126,6 +5250,7 @@ mod job_history_tests {
                 nodelist: String::new(),
                 total_gpus: 0,
                 time_limit_secs: None,
+                alloc_cpus: None,
             },
         )
         .await?;

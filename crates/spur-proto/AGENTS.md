@@ -54,7 +54,7 @@ Central scheduler and cluster manager. Raft-replicated.
 Per-node daemon. Receives dispatched work from the controller.
 
 - **Job execution:** LaunchJob, StartJob, CancelJob, SuspendJob
-- **Step dispatch:** RunCommand, CancelStep, AwaitStep,
+- **Step dispatch:** RunCommand, CancelStep, ClaimStep, AwaitStep,
   RegisterJobAllocation
 - **PMIx:** PreparePmix, ReleasePmix
 - **Interactive:** InteractiveSession (bidirectional streaming),
@@ -101,6 +101,19 @@ openraft messages; spur-proto does not interpret them.
 | `ContainerSpec` | OCI container config for steps (image, mounts, env, entrypoint) |
 | `MeshMembership` | Full-mesh WireGuard peer set pushed to agents |
 | `InteractiveInput/Output` | Bidirectional PTY stream (init, stdin, resize, signal / data, exit) |
+| `CoreLayout` | A node's spec/GPU-reserved/trimmed/general CPU split, agent-enforced |
+| `SocketCoreThread` | Slurm's S:C:T for a node, from the agent's `CpuTopology`; `NodeInfo.socket_core_thread` (tag 67), absent when unknown |
+| `GpuCpus` | One GPU's reserved picks and nearby CPUs as CPU-list strings (empty = none/unknown); `NodeInfo.gpu_cpus` (tag 68). `NodeInfo.capabilities` (tag 69) echoes the agent's registration capabilities |
+| `StepResources` | A typed step's own CPU/memory/GPU ask on a node, carried on the `RunStep`/`RunCommand` request messages |
+| `GpuBlockedCpus` | Per GPU, reserved CPUs a non-holder still holds under `core_layout_fingerprint`; carried on the `Heartbeat` RPC's `layout_blocked_cpus` field (tag 11, empty = none blocked, also what an older agent sends) |
+
+## Capability negotiation
+
+The `Ping` response's `capabilities` field lists optional controller
+behaviours by name (e.g. `"step-resources"`) so a client can refuse a
+request an older controller would otherwise silently weaken, instead of
+failing later or running with less isolation than asked for. Append new
+capability strings; never repurpose one already shipped.
 
 ## gRPC size limits
 
@@ -124,6 +137,14 @@ directly with explicit limits.
   (covers Raft-leader bounces, transport errors, client timeouts).
 - **Not retryable:** InvalidArgument, PermissionDenied, NotFound,
   FailedPrecondition, OK -- spec rejections would repeat forever.
+
+## Launch refusal trailer
+
+An agent refusing `LaunchJob` with `ResourceExhausted` because a GPU's reserved
+CPUs are held under an older layout sets the metadata `LAUNCH_REFUSAL_HEADER`
+(`spur-launch-refusal`) to `REFUSAL_RESERVED_CPUS_HELD` (`reserved-cpus-held`);
+`is_reserved_cpus_held_refusal()` reads it. A trailer, not a `LaunchFailureKind`,
+so an older controller keeps its `ResourceExhausted` path (node cooldown).
 
 ## Wire compatibility with Slurm
 

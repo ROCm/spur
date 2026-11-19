@@ -45,6 +45,10 @@ src/
   nodelist.rs          --nodelist/--nodefile resolution
   privilege.rs         Client-side privilege check (root or sudo/wheel group)
   reason.rs            Node reason formatting (user@time)
+  resource_opts.rs     Option-source conflict rule for --cpus-per-gpu/--mem*:
+                      CLI/directive vs env-var source, Slurm's "two explicit
+                      or two from env is an error, explicit drops env" rule,
+                      and the GPU-request-required check for per-GPU options
   sacct.rs             sacct -- job accounting history
   sacctmgr.rs          sacctmgr -- account/user/QOS management
   salloc.rs            salloc -- interactive resource allocation
@@ -123,7 +127,18 @@ subcommand is injected automatically so users do not need to write
 ### Job submission (sbatch, srun, salloc)
 
 All three share the same resource flags (`-N`, `-n`, `-c`, `--gres`,
-`--gpus`, `--mem`, `--time`, `--constraint`, `--container-image`, etc.).
+`--gpus`, `--mem`, `--time`, `--constraint`, `--container-image`, etc.), plus
+`--cpus-per-gpu`/`--mem-per-gpu` (srun also takes `--mem-per-cpu`). `-c` is
+always sent as 0 when the user did not set it, so a partition's or
+`[scheduler]`'s `def_cpu_per_gpu` can size the job instead -- a script run
+against an older controller that always expects a positive `-c` is
+unaffected since it never omits it. `resource_opts.rs` enforces Slurm's
+option-source conflict rule: `--cpus-per-gpu` cannot combine with `-c`,
+and `--mem`/`--mem-per-cpu`/`--mem-per-gpu` are mutually exclusive, unless
+one side came from an env var and the other is explicit (CLI or directive),
+in which case the explicit one wins silently. Per-GPU options without a GPU
+request (`--gpus*` or `gpu:` in `--gres`) are rejected client-side before
+the controller sees them.
 
 **sbatch** resolves args with Slurm precedence: CLI > env > `#SBATCH`
 directives > defaults. Directives are parsed from script comments before
@@ -132,6 +147,14 @@ submission. `#PBS` directives are auto-converted for PBS migration.
 **srun** has three modes:
 - Standalone: submits a job, waits for it, streams output.
 - Step mode (inside `$SPUR_JOB_ID`): creates a job step in the allocation.
+  A step typing `-c`/`--mem*`/`--cpus-per-gpu`/`--mem-per-gpu`/a GPU
+  count/type gets its own resources on the agent, pinned to its own GPUs'
+  reserved cores where the node has any; an untyped step still shares the
+  job's limits. If the agent reports the step's share does not fit beside
+  the job's other live typed steps (`ResourceExhausted`), srun retries with
+  Slurm's `step creation temporarily disabled, retrying` message
+  (`BusyStepWait`) rather than failing; Ctrl-C during that wait ends the
+  step `CANCELLED` instead of launching it.
 - PTY mode (`--pty`): opens an interactive pseudo-terminal session.
 - Daemon placement (`--jobid + --external-launcher`): PRRTE orted fan-out.
 
@@ -155,11 +178,20 @@ comma-separated field names (`--format=JobID,JobName,State`).
 
 **sinfo** groups nodes by display state and compresses hostlists. Overlay
 states (plnd, resv, maint) are computed client-side. `-R` lists unavailable
-nodes grouped by admin reason with compressed nodelists.
+nodes grouped by admin reason with compressed nodelists. `%z` (S:C:T) renders
+`N/A` for a node without a topology, and in a grouped row renders the shared
+value only when every node in the row agrees, `N/A` otherwise (no min/max
+`+` grouping, rows are not split by it).
 
 **scontrol** supports both flag-style (`--name`, `--nodes`) and Slurm
 inline key=value syntax (`PartitionName=gpu Nodes=n[1-4]`). Hostlist
 patterns are expanded client-side via `spur_core::hostlist`.
+
+`scontrol show node` appends `Sockets=/CoresPerSocket=/ThreadsPerCore=` to its
+`CPUTot=` line (`node_cpu_line`), `ReservedCPUs=/AffinityCPUs=` to each
+`GPUDevice=` line (from `NodeInfo.gpu_cpus`, matched by `stable_id`), and a
+`Capabilities=` line. Every one is omitted when the controller sent nothing
+(an older controller), never printed as `0` or empty.
 
 ### Accounting management (sacctmgr)
 
@@ -169,6 +201,9 @@ output (`-p`/`-P`). Commands: `add`, `modify`, `delete`, `show`, `list`.
 ### Admin (scontrol)
 
 - `show job/node/partition/reservation/config/assoc_mgr/federation/steps`
+  -- node detail includes `RestrictedCoresPerGPU=<R>(CPUs:<list>)` when the
+  node reserves cores per GPU; job detail includes `CpusPerTres`/`MemPerTres`
+  when the job is sized per GPU
 - `create/update/delete` for partitions and reservations
 - `delete NodeName=<hostlist|ALL>` (also `delete node <hostlist|ALL>`) uses native node removal without force
 - `hold`, `release`, `suspend`, `resume`, `requeue`
@@ -240,7 +275,12 @@ Flags resolve from multiple sources in priority order:
 **sbatch**: CLI > env (`SPUR_*` then `SBATCH_*`) > `#SBATCH` directives >
 defaults. `SPUR_JOB_NAME` and `SPUR_NODELIST` are NOT read by sbatch
 (they are output vars injected into running jobs, and reading them would
-make a nested sbatch inherit the parent's placement).
+make a nested sbatch inherit the parent's placement). The same applies to
+the per-GPU `SPUR_*_PER_GPU` twins (`cpus_per_gpu`/`memory_per_gpu_mb`
+exported into a running job's environment): sbatch/salloc read only
+`SBATCH_*`/`SALLOC_*` for `--cpus-per-gpu`/`--mem-per-gpu`, never their
+`SPUR_*_PER_GPU` output twins, so a nested submit from inside a per-GPU job
+does not inherit its parent's sizing.
 
 **srun**: CLI > env (`SPUR_*` then `SLURM_*`) > defaults. srun reads
 `SLURM_*` because those are inherited from the allocation. `--export`
@@ -283,6 +323,10 @@ cargo test -p spur-cli
 
 Env-sensitive tests (`#[serial(env_injection)]`) must run serially; `cargo
 test` handles this via the `serial_test` crate.
+
+Run `spur-cli`'s suite on its own, not combined with other crates in one
+`cargo test` invocation: several srun PTY tests hang when run alongside
+other crates' test binaries.
 
 ## Common pitfalls
 

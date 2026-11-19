@@ -748,7 +748,6 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 
             for node in resp.into_inner().nodes {
                 let total = node.total_resources.as_ref();
-                let alloc = node.alloc_resources.as_ref();
                 println!("NodeName={}", node.name);
                 // Append `[user@time]` to the reason when a set-time is recorded,
                 // matching Slurm's `scontrol show node` format.
@@ -767,13 +766,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 if !node.partitions.is_empty() {
                     println!("   Partitions={}", node.partitions.join(","));
                 }
-                println!(
-                    "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
-                    cpu_tot(&node),
-                    alloc.map(|r| r.cpus).unwrap_or(0),
-                    total.map(|r| r.memory_mb).unwrap_or(0),
-                    node.free_memory_mb,
-                );
+                println!("   {}", node_cpu_line(&node));
                 let gpus = total.map(|r| r.gpus.len()).unwrap_or(0);
                 if gpus > 0 {
                     let gpu_types: Vec<String> = total
@@ -793,26 +786,17 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         println!("   BlockFileRevision={revision}");
                     }
                     for gpu in &resources.gpus {
-                        print!("{}", format_gpu_topology(gpu));
+                        let cpus = node.gpu_cpus.iter().find(|c| c.stable_id == gpu.stable_id);
+                        print!("{}", format_gpu_topology(gpu, cpus));
                     }
                 }
-                if !node.spec_cpus.is_empty() || node.core_spec_count > 0 || node.mem_spec_mb > 0 {
-                    // CPUEfctv is the schedulable CPU count (spec cores already
-                    // excluded upstream). Show whichever spec knobs are set.
-                    let mut parts =
-                        vec![format!("CPUEfctv={}", total.map(|r| r.cpus).unwrap_or(0))];
-                    if node.core_spec_count > 0 {
-                        parts.push(format!("CoreSpecCount={}", node.core_spec_count));
-                    }
-                    if !node.spec_cpus.is_empty() {
-                        parts.push(format!("CPUSpecList={}", node.spec_cpus));
-                    }
-                    if node.mem_spec_mb > 0 {
-                        parts.push(format!("MemSpecLimit={}", node.mem_spec_mb));
-                    }
-                    println!("   {}", parts.join(" "));
+                if let Some(line) = node_spec_line(&node) {
+                    println!("   {line}");
                 }
                 println!("   Arch={} OS={}", node.arch, node.os);
+                if let Some(line) = capabilities_line(&node) {
+                    println!("   {line}");
+                }
                 if !node.labels.is_empty() {
                     let mut label_str: Vec<String> = node
                         .labels
@@ -1199,14 +1183,17 @@ fn state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
-fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
+fn format_gpu_topology(
+    gpu: &spur_proto::proto::GpuResource,
+    cpus: Option<&spur_proto::proto::GpuCpus>,
+) -> String {
     use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
     let Some(topology) = &gpu.topology else {
         return String::new();
     };
     let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
     let mut output = format!(
-        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}\n",
+        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}",
         gpu.device_id,
         gpu.stable_id,
         text(topology.pci_bdf.as_deref()),
@@ -1219,6 +1206,15 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
             .map_or_else(|| "unknown".into(), |v| v.to_string()),
         gpu.gpu_type.escape_debug(),
     );
+    if let Some(cpus) = cpus {
+        if !cpus.reserved_cpus.is_empty() {
+            output.push_str(&format!(" ReservedCPUs={}", cpus.reserved_cpus));
+        }
+        if !cpus.affinity_cpus.is_empty() {
+            output.push_str(&format!(" AffinityCPUs={}", cpus.affinity_cpus));
+        }
+    }
+    output.push('\n');
     let Some(fabric) = &topology.fabric else {
         return output;
     };
@@ -1292,6 +1288,65 @@ fn cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
         return node.cpu_tot;
     }
     node.total_resources.as_ref().map_or(0, |r| r.cpus)
+}
+
+/// `CPUTot=... FreeMem=...`, then Slurm's `Sockets`/`CoresPerSocket`/
+/// `ThreadsPerCore` when the controller knows the node's CPU topology.
+fn node_cpu_line(node: &spur_proto::proto::NodeInfo) -> String {
+    let mut line = format!(
+        "CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
+        cpu_tot(node),
+        node.alloc_resources.as_ref().map_or(0, |r| r.cpus),
+        node.total_resources.as_ref().map_or(0, |r| r.memory_mb),
+        node.free_memory_mb,
+    );
+    if let Some(sct) = &node.socket_core_thread {
+        line.push_str(&format!(
+            " Sockets={} CoresPerSocket={} ThreadsPerCore={}",
+            sct.sockets, sct.cores_per_socket, sct.threads_per_core
+        ));
+    }
+    line
+}
+
+fn capabilities_line(node: &spur_proto::proto::NodeInfo) -> Option<String> {
+    (!node.capabilities.is_empty()).then(|| format!("Capabilities={}", node.capabilities.join(",")))
+}
+
+/// `CPUEfctv=.../CoreSpecCount=.../CPUSpecList=.../MemSpecLimit=.../RestrictedCoresPerGPU=...`
+/// line for `scontrol show node`; `None` when no spec or GPU-reserved-core knob is set.
+fn node_spec_line(node: &spur_proto::proto::NodeInfo) -> Option<String> {
+    let has_spec = !node.spec_cpus.is_empty() || node.core_spec_count > 0 || node.mem_spec_mb > 0;
+    if !has_spec && node.restricted_cores_per_gpu == 0 {
+        return None;
+    }
+    let mut parts = vec![format!(
+        "CPUEfctv={}",
+        node.total_resources.as_ref().map_or(0, |r| r.cpus)
+    )];
+    if node.core_spec_count > 0 {
+        parts.push(format!("CoreSpecCount={}", node.core_spec_count));
+    }
+    if !node.spec_cpus.is_empty() {
+        parts.push(format!("CPUSpecList={}", node.spec_cpus));
+    }
+    if node.mem_spec_mb > 0 {
+        parts.push(format!("MemSpecLimit={}", node.mem_spec_mb));
+    }
+    if node.restricted_cores_per_gpu > 0 {
+        if node.reserved_cpus.is_empty() {
+            parts.push(format!(
+                "RestrictedCoresPerGPU={}",
+                node.restricted_cores_per_gpu
+            ));
+        } else {
+            parts.push(format!(
+                "RestrictedCoresPerGPU={}(CPUs:{})",
+                node.restricted_cores_per_gpu, node.reserved_cpus
+            ));
+        }
+    }
+    Some(parts.join(" "))
 }
 
 /// `State=` value for `scontrol show node`, composited the way real Slurm
@@ -2018,6 +2073,7 @@ fn partition_update_request(
         def_mem_per_cpu: limits.def_mem_per_cpu,
         def_mem_per_gpu: limits.def_mem_per_gpu,
         qos,
+        def_cpu_per_gpu: limits.def_cpu_per_gpu,
     })
 }
 
@@ -2049,6 +2105,10 @@ fn partition_limit_lines(part: &spur_proto::proto::PartitionInfo) -> [String; 2]
     .into_iter()
     .find_map(|(name, v)| v.map(|v| format!("{name}={v}")))
     .unwrap_or_else(|| "DefMemPerNode=UNLIMITED".into());
+    let def_mem = match part.def_cpu_per_gpu {
+        Some(cpg) => format!("{def_mem} DefCpuPerGPU={cpg}"),
+        None => def_mem,
+    };
     let max_mem = match (part.max_mem_per_cpu, part.max_mem_per_node) {
         (Some(v), _) => format!("MaxMemPerCPU={v}"),
         (None, v) => format!("MaxMemPerNode={}", unlimited(v.map(|v| v.to_string()))),
@@ -2067,6 +2127,7 @@ struct PartitionLimitArgs {
     def_mem_per_node: Option<u64>,
     def_mem_per_cpu: Option<u64>,
     def_mem_per_gpu: Option<u64>,
+    def_cpu_per_gpu: Option<u32>,
 }
 
 impl PartitionLimitArgs {
@@ -2084,6 +2145,11 @@ impl PartitionLimitArgs {
             "maxcpuspernode" => {
                 let cpus = u32::try_from(count(value)?).map_err(|_| invalid())?;
                 self.max_cpus_per_node = Some(cpus);
+                return Ok(true);
+            }
+            "defcpupergpu" => {
+                let cpus = u32::try_from(count(value)?).map_err(|_| invalid())?;
+                self.def_cpu_per_gpu = Some(cpus);
                 return Ok(true);
             }
             "maxtrespernode" => {
@@ -2277,6 +2343,7 @@ async fn create_partition(
             def_mem_per_cpu: limits.def_mem_per_cpu.filter(|v| *v != 0),
             def_mem_per_gpu: limits.def_mem_per_gpu.filter(|v| *v != 0),
             qos: qos.to_string(),
+            def_cpu_per_gpu: limits.def_cpu_per_gpu.filter(|v| *v != 0),
         })
         .await
         .context("failed to create partition")?;
@@ -2709,6 +2776,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         "   MinCPUsNode={} {mem_label}={}",
         job.min_cpus_node, min_mem
     );
+    if let Some(cpg) = job.cpus_per_gpu {
+        let _ = writeln!(out, "   CpusPerTres=gpu:{cpg}");
+    }
     if !job.mem_per_tres.is_empty() {
         let _ = writeln!(out, "   MemPerTres={}", job.mem_per_tres);
     }
@@ -2868,14 +2938,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let detail = super::format_gpu_topology(&gpu);
+        let detail = super::format_gpu_topology(&gpu, None);
         assert!(detail.contains("PCI=0001:04:00.0"));
         assert!(detail.contains("NUMA=unknown VRAMBytes=309237645312"));
         assert!(detail
             .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
         assert!(detail.contains("ActiveEndpoints=[60,61]"));
         assert!(detail.contains("ObservationIssues=vpod_id:missing"));
-        assert!(super::format_gpu_topology(&GpuResource::default()).is_empty());
+        assert!(super::format_gpu_topology(&GpuResource::default(), None).is_empty());
     }
 
     use super::*;
@@ -3195,6 +3265,17 @@ mod tests {
         let per_gpu = "MinMemoryNode=0\n   MemPerTres=gpu:8192\n";
         assert!(out.contains(per_gpu), "missing {per_gpu:?}");
         assert!(!format_job_detail(&pending_pinned_job()).contains("MemPerTres"));
+    }
+
+    #[test]
+    fn job_detail_shows_cpus_per_gpu_as_cpus_per_tres_before_mem_per_tres() {
+        let mut job = pending_pinned_job();
+        job.cpus_per_gpu = Some(8);
+        job.mem_per_tres = "gpu:8192".into();
+        let out = format_job_detail(&job);
+        let lines = "CpusPerTres=gpu:8\n   MemPerTres=gpu:8192\n";
+        assert!(out.contains(lines), "missing {lines:?}: {out}");
+        assert!(!format_job_detail(&pending_pinned_job()).contains("CpusPerTres"));
     }
 
     #[test]
@@ -3518,6 +3599,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_spec_line_shows_restricted_cores_per_gpu_with_its_cpu_list() {
+        let node = spur_proto::proto::NodeInfo {
+            restricted_cores_per_gpu: 8,
+            reserved_cpus: "0-7,64-71".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            node_spec_line(&node).unwrap(),
+            "CPUEfctv=0 RestrictedCoresPerGPU=8(CPUs:0-7,64-71)"
+        );
+    }
+
+    #[test]
+    fn node_spec_line_omits_the_cpu_list_when_reserved_cpus_is_empty() {
+        let node = spur_proto::proto::NodeInfo {
+            restricted_cores_per_gpu: 8,
+            reserved_cpus: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            node_spec_line(&node).unwrap(),
+            "CPUEfctv=0 RestrictedCoresPerGPU=8"
+        );
+    }
+
+    #[test]
+    fn node_spec_line_none_when_nothing_is_set() {
+        assert_eq!(
+            node_spec_line(&spur_proto::proto::NodeInfo::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn node_cpu_line_adds_slurms_socket_fields_only_when_known() {
+        let mut node = spur_proto::proto::NodeInfo {
+            cpu_tot: 256,
+            free_memory_mb: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            node_cpu_line(&node),
+            "CPUTot=256 CPUAlloc=0 RealMemory=0 FreeMem=100",
+            "an older controller sends no S:C:T, so nothing is printed"
+        );
+        node.socket_core_thread = Some(spur_proto::proto::SocketCoreThread {
+            sockets: 2,
+            cores_per_socket: 64,
+            threads_per_core: 2,
+        });
+        assert_eq!(
+            node_cpu_line(&node),
+            "CPUTot=256 CPUAlloc=0 RealMemory=0 FreeMem=100 Sockets=2 CoresPerSocket=64 ThreadsPerCore=2"
+        );
+    }
+
+    #[test]
+    fn gpu_device_line_appends_reserved_and_affinity_cpus_when_known() {
+        use spur_proto::proto::{DeviceTopology, GpuCpus, GpuResource};
+        let gpu = GpuResource {
+            stable_id: 7,
+            topology: Some(DeviceTopology::default()),
+            ..Default::default()
+        };
+        let first = |s: String| s.lines().next().unwrap_or_default().to_string();
+        let both = GpuCpus {
+            stable_id: 7,
+            reserved_cpus: "0-3,128-131".into(),
+            affinity_cpus: "0-63,128-191".into(),
+        };
+        assert!(first(format_gpu_topology(&gpu, Some(&both)))
+            .ends_with("GPUType= ReservedCPUs=0-3,128-131 AffinityCPUs=0-63,128-191"));
+        let near_only = GpuCpus {
+            reserved_cpus: String::new(),
+            ..both.clone()
+        };
+        let line = first(format_gpu_topology(&gpu, Some(&near_only)));
+        assert!(!line.contains("ReservedCPUs"), "{line}");
+        assert!(line.ends_with(" AffinityCPUs=0-63,128-191"), "{line}");
+        let line = first(format_gpu_topology(&gpu, None));
+        assert!(line.ends_with("GPUType="), "{line}");
+        assert!(format_gpu_topology(&GpuResource::default(), Some(&both)).is_empty());
+    }
+
+    #[test]
+    fn capabilities_line_lists_the_agents_capabilities() {
+        let mut node = spur_proto::proto::NodeInfo::default();
+        assert_eq!(capabilities_line(&node), None);
+        node.capabilities = vec!["signal-job".into(), "step-resources".into()];
+        assert_eq!(
+            capabilities_line(&node).as_deref(),
+            Some("Capabilities=signal-job,step-resources")
+        );
+    }
+
     fn idle_node() -> spur_proto::proto::NodeInfo {
         spur_proto::proto::NodeInfo {
             state: spur_proto::proto::NodeState::NodeIdle as i32,
@@ -3705,6 +3882,19 @@ mod tests {
     }
 
     #[test]
+    fn update_partition_threads_def_cpu_per_gpu_through_including_a_clear() {
+        let req = partition_update_request(&p(&["PartitionName=gpu", "DefCpuPerGPU=4"])).unwrap();
+        assert_eq!(req.def_cpu_per_gpu, Some(4));
+
+        let cleared =
+            partition_update_request(&p(&["PartitionName=gpu", "DefCpuPerGPU=0"])).unwrap();
+        assert_eq!(cleared.def_cpu_per_gpu, Some(0));
+
+        let unset = partition_update_request(&p(&["PartitionName=gpu"])).unwrap();
+        assert_eq!(unset.def_cpu_per_gpu, None);
+    }
+
+    #[test]
     fn create_partition_rejects_a_malformed_grace_time() {
         let err = parse_partition_create_params(&p(&["PartitionName=gpu", "GraceTime=soon"]))
             .unwrap_err()
@@ -3718,6 +3908,16 @@ mod tests {
             .expect("valid parameters");
         assert_eq!(parsed.name, "gpu");
         assert_eq!(parsed.grace_time, Some(45));
+    }
+
+    #[test]
+    fn create_partition_reads_a_def_cpu_per_gpu() {
+        // The create request filters a 0 to "unset" (vs. update's "clear"), but
+        // that filtering happens where the request is built, so this checks what
+        // the pure parser produced.
+        let parsed = parse_partition_create_params(&p(&["PartitionName=gpu", "DefCpuPerGPU=4"]))
+            .expect("valid parameters");
+        assert_eq!(parsed.limits.def_cpu_per_gpu, Some(4));
     }
 
     #[test]
@@ -4736,6 +4936,13 @@ mod tests {
     }
 
     #[test]
+    fn partition_limit_keys_parse_def_cpu_per_gpu() {
+        let mut limits = PartitionLimitArgs::default();
+        assert!(limits.parse_key("defcpupergpu", "4").unwrap());
+        assert_eq!(limits.def_cpu_per_gpu, Some(4));
+    }
+
+    #[test]
     fn show_partition_prints_limits_in_slurm_spelling() {
         let plain = spur_proto::proto::PartitionInfo::default();
         assert_eq!(
@@ -4763,6 +4970,18 @@ mod tests {
                 "DefMemPerCPU=1024 MaxMemPerCPU=2048".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn show_partition_prints_def_cpu_per_gpu_when_set() {
+        let part = |def_cpu_per_gpu| spur_proto::proto::PartitionInfo {
+            def_cpu_per_gpu,
+            ..Default::default()
+        };
+        let set = partition_limit_lines(&part(Some(4)));
+        assert!(set[1].contains("DefCpuPerGPU=4"), "{set:?}");
+        let unset = partition_limit_lines(&part(None));
+        assert!(!unset[1].contains("DefCpuPerGPU"), "{unset:?}");
     }
 
     #[test]
@@ -4847,6 +5066,7 @@ mod tests {
             ]),
             def_mem_per_cpu: Some(1024),
             max_mem_per_cpu: Some(2048),
+            def_cpu_per_gpu: Some(4),
             ..Default::default()
         };
         let mut params = vec!["PartitionName=gpu".to_string()];
@@ -4862,6 +5082,7 @@ mod tests {
         assert_eq!(req.max_cpus_per_node, None);
         assert_eq!(req.def_mem_per_cpu, Some(1024));
         assert_eq!(req.max_mem_per_cpu, Some(2048));
+        assert_eq!(req.def_cpu_per_gpu, Some(4));
 
         let created = parse_partition_create_params(&params).unwrap();
         assert_eq!(
@@ -4869,6 +5090,7 @@ mod tests {
             Some(part.max_tres_per_node.clone())
         );
         assert_eq!(created.limits.max_cpus_per_node, None);
+        assert_eq!(created.limits.def_cpu_per_gpu, Some(4));
 
         let mut plain = vec!["PartitionName=gpu".to_string()];
         plain.extend(

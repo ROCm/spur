@@ -279,6 +279,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             idle_fill: job.idle_fill,
             // Seconds granularity preserves sub-minute limits like --time=0:00:30.
             time_limit_secs: spec.time_limit.map(|d| d.num_seconds()),
+            alloc_cpus: db::allocated_cpus(&job.per_node_alloc),
         },
     )
     .await
@@ -798,6 +799,7 @@ mod tests {
                     nodelist: String::new(),
                     idle_fill: false,
                     time_limit_secs: None,
+                    alloc_cpus: None,
                 },
             )
             .await?;

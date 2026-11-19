@@ -204,6 +204,7 @@ mod tests {
                 def_mem_per_node: None,
                 def_mem_per_cpu: None,
                 def_mem_per_gpu: None,
+                def_cpu_per_gpu: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),

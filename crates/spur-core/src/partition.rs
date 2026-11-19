@@ -72,6 +72,9 @@ pub struct Partition {
     pub def_mem_per_cpu: Option<u64>,
     #[serde(default)]
     pub def_mem_per_gpu: Option<u64>,
+    /// CPUs per GPU for GPU jobs that set neither `-c` nor `--cpus-per-gpu`.
+    #[serde(default)]
+    pub def_cpu_per_gpu: Option<u32>,
 }
 
 impl Partition {
@@ -356,6 +359,7 @@ impl Default for Partition {
             def_mem_per_node: None,
             def_mem_per_cpu: None,
             def_mem_per_gpu: None,
+            def_cpu_per_gpu: None,
         }
     }
 }
@@ -586,6 +590,7 @@ mod tests {
             "def_mem_per_node",
             "def_mem_per_cpu",
             "def_mem_per_gpu",
+            "def_cpu_per_gpu",
         ] {
             assert!(fields.remove(field).is_some(), "{field} must serialize");
         }
@@ -593,6 +598,7 @@ mod tests {
         assert!(back.max_tres_per_node.is_empty());
         assert_eq!(back.max_mem_per_cpu, None);
         assert_eq!(back.def_mem_per_gpu, None);
+        assert_eq!(back.def_cpu_per_gpu, None);
     }
 
     #[test]

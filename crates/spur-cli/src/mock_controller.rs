@@ -12,7 +12,7 @@
 //! `JobKeepalive`, `ValidateBlockFile`); every other RPC reports `unimplemented`
 //! so an unexpected call fails loudly instead of silently returning a default.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,13 @@ pub(crate) struct StepCapture {
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
     /// Sequence of `JobInfo` for successive `get_job` calls; last entry repeats.
     get_job_sequence: Arc<Mutex<Vec<proto::JobInfo>>>,
+    /// Number of `CreateJobStep` calls the mock received.
+    create_step_calls: Arc<AtomicU32>,
+    /// Capabilities the mock's `Ping` answers with; empty by default (an
+    /// old-controller stand-in), so a test opts in to a capability.
+    ping_capabilities: Arc<Mutex<Vec<String>>>,
     create_step_num_tasks: Arc<AtomicU32>,
+    create_step_cpus_per_task: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
     create_step_node: Arc<Mutex<String>>,
@@ -44,8 +50,12 @@ pub(crate) struct StepCapture {
     create_step_job_shell: Arc<AtomicBool>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
-    run_step_step_id: Arc<AtomicU32>,
+    cancelled_step_calls: Arc<Mutex<Vec<u32>>>,
+    run_step_step_ids: Arc<Mutex<Vec<u32>>>,
+    run_step_wait_if_busy: Arc<Mutex<Vec<bool>>>,
     run_step_calls: Arc<AtomicU32>,
+    /// Statuses the next `RunStep` calls fail with, in order, before succeeding.
+    run_step_errors: Arc<Mutex<VecDeque<tonic::Status>>>,
     run_step_response: Arc<Mutex<Option<proto::RunStepResponse>>>,
     get_node_response: Arc<Mutex<Option<proto::NodeInfo>>>,
     get_node_names: Arc<Mutex<Vec<String>>>,
@@ -59,6 +69,11 @@ pub(crate) struct StepCapture {
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     submit_job_id: Arc<AtomicU32>,
+    /// Number of `SubmitJob` calls the mock received, so a test can assert a
+    /// client-side refusal never reached the controller.
+    submit_job_calls: Arc<AtomicU32>,
+    /// When set, `ping` fails with this code instead of answering capabilities.
+    ping_error: Arc<Mutex<Option<tonic::Code>>>,
     cancel_job_calls: Arc<AtomicU32>,
     /// `(job_id, exit_code, user)` for every `CompleteJob` the mock received.
     complete_job_calls: Arc<Mutex<Vec<(u32, i32, String)>>>,
@@ -72,9 +87,78 @@ pub(crate) struct StepCapture {
     /// `JobKeepalive` calls still to reject as unauthenticated.
     keepalive_failures: Arc<AtomicU32>,
     block_validation_content: Arc<Mutex<Vec<String>>>,
+    /// Gate the next `RunStep` call awaits mid-flight, so a test can observe
+    /// client state while the RPC is in progress rather than only around it.
+    run_step_gate: Arc<Mutex<Option<RunStepGate>>>,
+    /// Gate the next `CompleteJobStep` call awaits mid-flight, so a test can
+    /// observe caller-side state while that RPC is in progress.
+    complete_step_gate: Arc<Mutex<Option<CompleteStepGate>>>,
+}
+
+/// Lets a test pause the next `RunStep` call that would otherwise succeed
+/// (a queued error still returns immediately), to observe caller-side state
+/// while that RPC is in flight.
+#[derive(Clone)]
+pub(crate) struct RunStepGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl RunStepGate {
+    /// Resolves once the gated `RunStep` call has started.
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Lets the gated `RunStep` call return its response.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// Lets a test pause the next `CompleteJobStep` call mid-flight, to observe
+/// caller-side state (e.g. `waiting_step`) while that RPC is in progress.
+#[derive(Clone)]
+pub(crate) struct CompleteStepGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl CompleteStepGate {
+    /// Resolves once the gated `CompleteJobStep` call has started.
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Lets the gated `CompleteJobStep` call return.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl StepCapture {
+    /// Blocks the next non-error `RunStep` response until the test calls
+    /// [`RunStepGate::release`].
+    pub(crate) fn gate_next_run_step(&self) -> RunStepGate {
+        let gate = RunStepGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.run_step_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Blocks the next `CompleteJobStep` call until the test calls
+    /// [`CompleteStepGate::release`].
+    pub(crate) fn gate_next_complete_job_step(&self) -> CompleteStepGate {
+        let gate = CompleteStepGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.complete_step_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
     pub(crate) fn block_validation_content(&self) -> Vec<String> {
         self.block_validation_content.lock().unwrap().clone()
     }
@@ -101,9 +185,25 @@ impl StepCapture {
         *self.get_job_response.lock().unwrap() = Some(Err(code));
     }
 
+    /// Number of `CreateJobStep` calls received, so a test can assert a
+    /// client-side rejection never reached the controller.
+    pub(crate) fn create_step_calls(&self) -> u32 {
+        self.create_step_calls.load(Ordering::SeqCst)
+    }
+
+    /// Capabilities the mock's `Ping` response carries from now on.
+    pub(crate) fn set_ping_capabilities(&self, capabilities: Vec<String>) {
+        *self.ping_capabilities.lock().unwrap() = capabilities;
+    }
+
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
+    }
+
+    /// `cpus_per_task` carried by the most recent `CreateJobStep`.
+    pub(crate) fn create_step_cpus_per_task(&self) -> u32 {
+        self.create_step_cpus_per_task.load(Ordering::SeqCst)
     }
 
     pub(crate) fn create_step_num_nodes(&self) -> u32 {
@@ -137,9 +237,45 @@ impl StepCapture {
         self.complete_step_calls.lock().unwrap().clone()
     }
 
+    /// Step ids of `CompleteJobStep` calls that closed the step as cancelled.
+    pub(crate) fn cancelled_step_calls(&self) -> Vec<u32> {
+        self.cancelled_step_calls.lock().unwrap().clone()
+    }
+
     /// Step id carried by the most recent `RunStep`.
     pub(crate) fn run_step_step_id(&self) -> u32 {
-        self.run_step_step_id.load(Ordering::SeqCst)
+        self.run_step_step_ids().last().copied().unwrap_or(0)
+    }
+
+    /// Step id of every `RunStep`, in call order.
+    pub(crate) fn run_step_step_ids(&self) -> Vec<u32> {
+        self.run_step_step_ids.lock().unwrap().clone()
+    }
+
+    /// `wait_if_busy` carried by the most recent `RunStep`.
+    pub(crate) fn run_step_wait_if_busy(&self) -> bool {
+        self.run_step_wait_if_busy
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn push_run_step_error(&self, code: tonic::Code, message: &str) {
+        self.run_step_errors
+            .lock()
+            .unwrap()
+            .push_back(tonic::Status::new(code, message));
+    }
+
+    /// Pushes a `RunStep` refusal marked busy, as the controller does when a
+    /// typed step's share is held.
+    pub(crate) fn push_run_step_busy(&self, message: &str) {
+        self.run_step_errors
+            .lock()
+            .unwrap()
+            .push_back(spur_proto::step_share_busy(message));
     }
 
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
@@ -199,6 +335,17 @@ impl StepCapture {
         self.submit_job_id.store(id, Ordering::SeqCst);
     }
 
+    /// Number of `SubmitJob` calls received, so a test can assert a
+    /// client-side rejection never reached the controller.
+    pub(crate) fn submit_job_calls(&self) -> u32 {
+        self.submit_job_calls.load(Ordering::SeqCst)
+    }
+
+    /// Make `ping` fail, as an unreachable or overloaded controller would.
+    pub(crate) fn set_ping_error(&self, code: tonic::Code) {
+        *self.ping_error.lock().unwrap() = Some(code);
+    }
+
     pub(crate) fn set_get_job_sequence(&self, seq: Vec<proto::JobInfo>) {
         *self.get_job_sequence.lock().unwrap() = seq;
     }
@@ -252,6 +399,19 @@ macro_rules! mock_controller_impl {
 
 mock_controller_impl! {
     implemented {
+        async fn ping(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> Result<tonic::Response<proto::PingResponse>, tonic::Status> {
+            if let Some(code) = *self.capture.ping_error.lock().unwrap() {
+                return Err(tonic::Status::new(code, "mock ping failure"));
+            }
+            Ok(tonic::Response::new(proto::PingResponse {
+                capabilities: self.capture.ping_capabilities.lock().unwrap().clone(),
+                ..Default::default()
+            }))
+        }
+
         async fn validate_block_file(
             &self,
             request: tonic::Request<proto::ValidateBlockFileRequest>,
@@ -267,9 +427,13 @@ mock_controller_impl! {
             request: tonic::Request<proto::CreateJobStepRequest>,
         ) -> Result<tonic::Response<proto::CreateJobStepResponse>, tonic::Status> {
             let request = request.into_inner();
+            self.capture.create_step_calls.fetch_add(1, Ordering::SeqCst);
             self.capture
                 .create_step_num_tasks
                 .store(request.num_tasks, Ordering::SeqCst);
+            self.capture
+                .create_step_cpus_per_task
+                .store(request.cpus_per_task, Ordering::SeqCst);
             self.capture
                 .create_step_num_nodes
                 .store(request.num_nodes, Ordering::SeqCst);
@@ -295,11 +459,19 @@ mock_controller_impl! {
             request: tonic::Request<proto::CompleteJobStepRequest>,
         ) -> Result<tonic::Response<()>, tonic::Status> {
             let req = request.into_inner();
+            if req.cancelled {
+                self.capture.cancelled_step_calls.lock().unwrap().push(req.step_id);
+            }
             self.capture
                 .complete_step_calls
                 .lock()
                 .unwrap()
                 .push((req.step_id, req.exit_code));
+            let gate = self.capture.complete_step_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             Ok(tonic::Response::new(()))
         }
 
@@ -331,6 +503,7 @@ mock_controller_impl! {
             &self,
             _request: tonic::Request<proto::SubmitJobRequest>,
         ) -> Result<tonic::Response<proto::SubmitJobResponse>, tonic::Status> {
+            self.capture.submit_job_calls.fetch_add(1, Ordering::SeqCst);
             Ok(tonic::Response::new(proto::SubmitJobResponse {
                 job_id: self.capture.submit_job_id.load(Ordering::SeqCst),
                 warnings: Vec::new(),
@@ -365,10 +538,24 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::RunStepRequest>,
         ) -> Result<tonic::Response<proto::RunStepResponse>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture.run_step_step_ids.lock().unwrap().push(request.step_id);
             self.capture
-                .run_step_step_id
-                .store(request.into_inner().step_id, Ordering::SeqCst);
+                .run_step_wait_if_busy
+                .lock()
+                .unwrap()
+                .push(request.wait_if_busy);
             self.capture.run_step_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(status) = self.capture.run_step_errors.lock().unwrap().pop_front() {
+                return Err(status);
+            }
+            // Gates only a call that will actually succeed: a queued error
+            // above still returns immediately, matching the busy-retry tests.
+            let gate = self.capture.run_step_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             if let Some(response) = self.capture.run_step_response.lock().unwrap().clone() {
                 return Ok(tonic::Response::new(response));
             }
@@ -378,6 +565,7 @@ mock_controller_impl! {
                 stderr: String::new(),
                 node: String::new(),
                 warnings: Vec::new(),
+                oom_killed: false,
             }))
         }
 
@@ -499,7 +687,6 @@ mock_controller_impl! {
         update_partition(proto::UpdatePartitionRequest) -> ();
         reconfigure(()) -> ();
         get_job_steps(proto::GetJobStepsRequest) -> proto::GetJobStepsResponse;
-        ping(()) -> proto::PingResponse;
         get_job_metrics(()) -> proto::JobMetrics;
         get_node_metrics(()) -> proto::NodeMetrics;
         get_rpc_stats(()) -> proto::RpcStats;
@@ -591,10 +778,20 @@ mod tests {
         let (addr, _capture) = spawn().await;
         let status = client(addr)
             .await
-            .ping(())
+            .suspend_job(proto::SuspendJobRequest::default())
             .await
-            .expect_err("ping is not mocked");
+            .expect_err("suspend_job is not mocked");
         assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert_eq!(status.message(), "ping");
+        assert_eq!(status.message(), "suspend_job");
+    }
+
+    /// `Ping` is implemented (it answers configurable capabilities for the
+    /// capability-check tests), so it is not an `unmocked_rpc` case: it must
+    /// answer empty capabilities, not `Unimplemented`, until a test opts in.
+    #[tokio::test]
+    async fn ping_defaults_to_no_capabilities() {
+        let (addr, _capture) = spawn().await;
+        let response = client(addr).await.ping(()).await.expect("ping is mocked");
+        assert!(response.into_inner().capabilities.is_empty());
     }
 }

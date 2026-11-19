@@ -5,6 +5,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use chrono::{DateTime, Duration, Utc};
+use spur_core::core_layout::CpuPools;
 use spur_core::partition::Partition;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 
@@ -23,6 +24,8 @@ pub struct NodeTimeline {
     pub node_name: String,
     pub total: ResourceSet,
     pub intervals: Vec<Interval>,
+    /// Set when the node's GPUs reserve cores: fit then also checks the general pool.
+    pub pools: Option<CpuPools>,
 }
 
 /// A time interval during which resources are allocated.
@@ -134,7 +137,21 @@ impl NodeTimeline {
             node_name,
             total,
             intervals: Vec::new(),
+            pools: None,
         }
+    }
+
+    pub fn with_cpu_pools(mut self, pools: Option<CpuPools>) -> Self {
+        self.pools = pools;
+        self
+    }
+
+    /// Whether `request` fits beside `used`: the node's counts, then its general pool.
+    pub fn admits(&self, used: &ResourceAllocations, request: &ResourceSet) -> bool {
+        self.total.can_satisfy_with_allocated(used, request)
+            && self
+                .pools
+                .is_none_or(|p| p.admits(used, request.cpus, request.gpus.len() as u32))
     }
 
     /// Index one past intervals with `start <= time` (`intervals` sorted by `start`).
@@ -155,7 +172,7 @@ impl NodeTimeline {
         request: Option<&ResourceSet>,
         cap: Option<CapCheck<'_>>,
     ) -> bool {
-        request.is_none_or(|r| self.total.can_satisfy_with_allocated(sweep.used(), r))
+        request.is_none_or(|r| self.admits(sweep.used(), r))
             && cap.is_none_or(|c| {
                 partition_cap_ok(c.partition, &self.node_name, sweep.charged(), c.charge).is_ok()
             })
@@ -197,7 +214,7 @@ impl NodeTimeline {
     /// Whether the request can be satisfied at a specific time.
     pub fn can_satisfy_at(&self, time: DateTime<Utc>, request: &ResourceSet) -> bool {
         let used = self.accumulated_at(time);
-        self.total.can_satisfy_with_allocated(&used, request)
+        self.admits(&used, request)
     }
 
     /// Find the earliest time at which `request` resources are available
@@ -360,6 +377,8 @@ mod tests {
                 link_type: spur_core::resource::GpuLinkType::PCIe,
                 topology: None,
                 stable_id: i as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect();
         NodeTimeline::new(
@@ -455,6 +474,8 @@ mod tests {
                     link_type: spur_core::resource::GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -486,6 +507,8 @@ mod tests {
                     link_type: spur_core::resource::GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()
@@ -765,6 +788,8 @@ mod tests {
                     link_type: spur_core::resource::GpuLinkType::PCIe,
                     topology: None,
                     stable_id: i as u64,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             ..Default::default()

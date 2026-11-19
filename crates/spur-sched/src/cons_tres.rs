@@ -6,9 +6,10 @@
 //! Tracks resources at core/socket/GPU granularity within a node.
 //! This is the equivalent of Slurm's select/cons_tres plugin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use spur_core::core_layout::{reserved_share, GpuReservedCpus};
 use spur_core::job::RunKey;
 use spur_core::resource::{GpuResource, ResourceSet};
 
@@ -134,8 +135,12 @@ pub enum AllocError {
     /// (older or duplicate) attempt lost the race and must not proceed.
     Superseded,
     /// A core being replayed does not exist on this node (the node's CPU count
-    /// shrank since the allocation was made), or another job still holds it.
+    /// shrank since the allocation was made), or another job still holds it;
+    /// or, with per-GPU reserved CPUs, a launch's general pool is short.
     CpusUnavailable,
+    /// A launch's GPUs' reserved CPUs are held by a job not holding those GPUs,
+    /// i.e. one placed under an earlier core layout; it frees them on its own.
+    ReservedCpusHeld,
 }
 
 /// Outcome of applying a fresh inventory to a node's live allocation.
@@ -185,6 +190,10 @@ pub struct NodeAllocation {
     /// Pre-change ids of repartitioned GPUs. One a job released may still
     /// overlap silicon another pre-change holder uses, so it is never handed out.
     fenced: HashSet<u64>,
+    /// Each GPU's reserved CPUs (by stable id); empty keeps first-fit picking.
+    reserved_of: HashMap<u64, Vec<u32>>,
+    /// CPU ID → (socket, core index), from the reported topology.
+    cpu_place: HashMap<u32, (u32, usize)>,
 }
 
 /// The node's real, online CPU IDs, sorted. Without a reported topology (e.g.
@@ -200,6 +209,16 @@ fn online_cpu_ids(resources: &ResourceSet) -> Vec<u32> {
 /// Real CPU ID → its position in `cpu_ids`.
 fn index_cpu_ids(cpu_ids: &[u32]) -> HashMap<u32, usize> {
     cpu_ids.iter().enumerate().map(|(i, &c)| (c, i)).collect()
+}
+
+/// Real CPU ID → (socket, core index); empty without a reported topology.
+fn place_cpus(resources: &ResourceSet) -> HashMap<u32, (u32, usize)> {
+    resources
+        .topology
+        .iter()
+        .flat_map(|t| t.cores.iter().enumerate())
+        .flat_map(|(i, core)| core.cpus.iter().map(move |&cpu| (cpu, (core.socket, i))))
+        .collect()
 }
 
 impl NodeAllocation {
@@ -221,7 +240,18 @@ impl NodeAllocation {
             owners: HashMap::new(),
             launching: HashMap::new(),
             fenced: HashSet::new(),
+            reserved_of: HashMap::new(),
+            cpu_place: place_cpus(resources),
         }
+    }
+
+    /// Hand each GPU's reserved CPUs only to jobs holding that GPU. Empty
+    /// restores first-fit. Re-apply after `update_capacity`, like spec CPUs.
+    pub fn set_gpu_reserved(&mut self, reserved: &[GpuReservedCpus]) {
+        self.reserved_of = reserved
+            .iter()
+            .map(|g| (g.stable_id, g.cpus.clone()))
+            .collect();
     }
 
     /// Exclude spec CPUs from jobs, including ones a running job already holds.
@@ -312,6 +342,8 @@ impl NodeAllocation {
         self.allocated_cpus = vec![false; fresh_cpu_ids.len()];
         self.cpu_ids = fresh_cpu_ids;
         self.cpu_index = fresh_cpu_index;
+        self.cpu_place = place_cpus(fresh);
+        self.reserved_of.clear();
         // Not persisted (see mark_cpus_unavailable's doc comment): the caller
         // re-derives spec CPUs from a fresh CoreLayout and re-applies them.
         self.unavailable.clear();
@@ -365,6 +397,29 @@ impl NodeAllocation {
             .is_some_and(|&pos| self.allocated_cpus[pos])
     }
 
+    /// Per GPU in `reserved`, its CPUs taken by anyone not holding that GPU:
+    /// under one layout only the holder can take them, so any other occupant
+    /// predates the layout. Nonzero entries only.
+    pub fn blocked_reserved_cpus(&self, reserved: &[GpuReservedCpus]) -> BTreeMap<u64, u32> {
+        reserved
+            .iter()
+            .filter_map(|gpu| {
+                let holders: HashSet<u32> = self
+                    .owners
+                    .values()
+                    .filter(|owned| owned.result.gpu_ids.contains(&gpu.stable_id))
+                    .flat_map(|owned| owned.result.cpu_ids.iter().copied())
+                    .collect();
+                let blocked = gpu
+                    .cpus
+                    .iter()
+                    .filter(|&&cpu| self.is_allocated(cpu) && !holders.contains(&cpu))
+                    .count() as u32;
+                (blocked > 0).then_some((gpu.stable_id, blocked))
+            })
+            .collect()
+    }
+
     /// Available memory.
     pub fn free_memory_mb(&self) -> u64 {
         self.total_memory_mb
@@ -395,6 +450,14 @@ impl NodeAllocation {
             .get(&job_id)
             .filter(|owned| owned.run_attempt == run_attempt)
             .map(|owned| owned.result.gpu_ids.as_slice())
+    }
+
+    /// CPU ids `run_attempt` of `job_id` holds.
+    pub fn owner_cpu_ids(&self, job_id: u32, run_attempt: u32) -> Option<&[u32]> {
+        self.owners
+            .get(&job_id)
+            .filter(|owned| owned.run_attempt == run_attempt)
+            .map(|owned| owned.result.cpu_ids.as_slice())
     }
 
     /// Stable ids of all currently-allocated GPUs (for diagnostics).
@@ -476,7 +539,9 @@ impl NodeAllocation {
     /// Reserve resources for a job, keyed by job id. GPU stable ids are the
     /// hard gate (unknown → `GpusUnknown`, in-use or fenced → `GpusUnavailable`); a
     /// launch already in flight for the same job id → `DuplicateJob`. CPU is
-    /// best-effort since the controller owns placement. Memory is always
+    /// best-effort since the controller owns placement, except with per-GPU
+    /// reserved CPUs, where a short reserved share is `ReservedCpusHeld` and a
+    /// short general pool `CpusUnavailable`. Memory is always
     /// accounted so release stays symmetric. Marked `launching` until
     /// `commit_job`/`release_job` so reconcile spares an in-flight launch.
     /// `run_attempt` is recorded so a later `commit_job` for a different
@@ -519,14 +584,17 @@ impl NodeAllocation {
             gpu_indices.push(idx);
         }
 
-        let mut cpu_ids = Vec::new();
-        for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
-            if !*allocated && cpu_ids.len() < cpus as usize {
-                *allocated = true;
-                cpu_ids.push(self.cpu_ids[i]);
+        let cpu_ids = if self.reserved_of.is_empty() {
+            self.first_free_cpus(cpus)
+        } else {
+            self.pick_pooled(cpus, gpu_device_ids)?
+        };
+
+        for cpu in &cpu_ids {
+            if let Some(&pos) = self.cpu_index.get(cpu) {
+                self.allocated_cpus[pos] = true;
             }
         }
-
         self.allocated_memory_mb += memory_mb;
         for &idx in &gpu_indices {
             self.gpu_allocated[idx] = true;
@@ -546,6 +614,84 @@ impl NodeAllocation {
         );
         self.launching.insert(job_id, Instant::now());
         Ok(result)
+    }
+
+    /// The CPUs a launch of `cpus` on `gpu_ids` would get now, without taking
+    /// them: pool-aware with per-GPU reservations, else first-fit.
+    pub fn pick_cpu_ids(&self, cpus: u32, gpu_ids: &[u64]) -> Result<Vec<u32>, AllocError> {
+        if self.reserved_of.is_empty() {
+            return Ok(self.first_free_cpus(cpus));
+        }
+        self.pick_pooled(cpus, gpu_ids)
+    }
+
+    fn first_free_cpus(&self, cpus: u32) -> Vec<u32> {
+        self.cpu_ids
+            .iter()
+            .zip(&self.allocated_cpus)
+            .filter(|(_, taken)| !**taken)
+            .map(|(&cpu, _)| cpu)
+            .take(cpus as usize)
+            .collect()
+    }
+
+    fn cpu_is_free(&self, cpu: u32) -> bool {
+        self.cpu_index
+            .get(&cpu)
+            .is_some_and(|&pos| !self.allocated_cpus[pos])
+    }
+
+    /// Sort key keeping a core's threads together, preferred sockets first.
+    fn core_order(&self, cpu: u32, preferred: &HashSet<u32>) -> (bool, usize, u32) {
+        let (socket, core) = self
+            .cpu_place
+            .get(&cpu)
+            .copied()
+            .unwrap_or((u32::MAX, usize::MAX));
+        (!preferred.contains(&socket), core, cpu)
+    }
+
+    /// The job's own GPUs' reserved CPUs up to its reserved share, then general
+    /// CPUs on those GPUs' sockets first. All or nothing: a short reserved pool
+    /// never borrows from general, which the controller does not charge for it.
+    fn pick_pooled(&self, cpus: u32, gpu_ids: &[u64]) -> Result<Vec<u32>, AllocError> {
+        let none = HashSet::new();
+        let mut own: Vec<u32> = gpu_ids
+            .iter()
+            .filter_map(|id| self.reserved_of.get(id))
+            .flatten()
+            .copied()
+            .collect();
+        own.sort_by_key(|&cpu| self.core_order(cpu, &none));
+        let share = reserved_share(cpus, own.len() as u32) as usize;
+        let mut picked: Vec<u32> = own
+            .iter()
+            .copied()
+            .filter(|&cpu| self.cpu_is_free(cpu))
+            .take(share)
+            .collect();
+        if picked.len() < share {
+            return Err(AllocError::ReservedCpusHeld);
+        }
+
+        let sockets: HashSet<u32> = own
+            .iter()
+            .filter_map(|cpu| self.cpu_place.get(cpu).map(|(socket, _)| *socket))
+            .collect();
+        let reserved: HashSet<u32> = self.reserved_of.values().flatten().copied().collect();
+        let mut general: Vec<u32> = self
+            .cpu_ids
+            .iter()
+            .copied()
+            .filter(|cpu| !reserved.contains(cpu) && self.cpu_is_free(*cpu))
+            .collect();
+        general.sort_by_key(|&cpu| self.core_order(cpu, &sockets));
+        let need = cpus as usize - share;
+        if general.len() < need {
+            return Err(AllocError::CpusUnavailable);
+        }
+        picked.extend(general.into_iter().take(need));
+        Ok(picked)
     }
 
     /// On this node, and either free or already this job's. Narrowing and the
@@ -767,6 +913,7 @@ impl AllocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::core_layout::GpuReservedCpus;
     use spur_core::cpu_topology::{CpuRecord, CpuTopology};
     use spur_core::resource::GpuLinkType;
 
@@ -815,6 +962,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: device_id as u64,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             })
             .collect();
 
@@ -1438,6 +1587,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: s,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             generic: Default::default(),
@@ -1475,6 +1626,8 @@ mod tests {
                     link_type: GpuLinkType::XGMI,
                     topology: None,
                     stable_id: s,
+                    numa_node: None,
+                    affinity_cpus: Vec::new(),
                 })
                 .collect(),
             generic: Default::default(),
@@ -1550,6 +1703,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 128,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             },
             GpuResource {
                 device_id: 1,
@@ -1559,6 +1714,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 129,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             },
             GpuResource {
                 device_id: 2,
@@ -1568,6 +1725,8 @@ mod tests {
                 link_type: GpuLinkType::XGMI,
                 topology: None,
                 stable_id: 130,
+                numa_node: None,
+                affinity_cpus: Vec::new(),
             },
         ];
         let rs = ResourceSet {
@@ -1810,5 +1969,213 @@ mod tests {
         // Capacity untouched: the old 4-id set and job 1's hold on id 2 survive.
         assert_eq!(node.free_cpus(), 3);
         assert_eq!(node.claimable_cpu_ids(1, &[2]), vec![2]);
+    }
+
+    /// 2 sockets x 4 cores x 2 threads: socket s, local core c -> CPUs s*4+c and
+    /// s*4+c+8. GPU 1 reserves socket 0 cores 0-1, GPU 2 socket 1 cores 0-1.
+    fn pooled_node() -> NodeAllocation {
+        let mut records = Vec::new();
+        for socket in 0..2u32 {
+            for core in 0..4u32 {
+                for thread in [0, 8] {
+                    records.push(CpuRecord {
+                        cpu: socket * 4 + core + thread,
+                        socket,
+                        core_id: core,
+                        numa_node: Some(socket),
+                    });
+                }
+            }
+        }
+        let gpu = |id: u64| GpuResource {
+            device_id: id as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            topology: None,
+            stable_id: id,
+            numa_node: None,
+            affinity_cpus: Vec::new(),
+        };
+        let resources = ResourceSet {
+            cpus: 16,
+            memory_mb: 1024,
+            gpus: vec![gpu(1), gpu(2)],
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut node = NodeAllocation::new("node001".into(), &resources);
+        node.set_gpu_reserved(&reserved_pools());
+        node
+    }
+
+    fn reserved_pools() -> Vec<GpuReservedCpus> {
+        vec![
+            GpuReservedCpus {
+                stable_id: 1,
+                cpus: vec![0, 1, 8, 9],
+            },
+            GpuReservedCpus {
+                stable_id: 2,
+                cpus: vec![4, 5, 12, 13],
+            },
+        ]
+    }
+
+    fn sorted(mut cpus: Vec<u32>) -> Vec<u32> {
+        cpus.sort_unstable();
+        cpus
+    }
+
+    /// A CPU-only job placed first-fit, as by an agent that did not know the
+    /// layout yet; the pools are re-applied after it.
+    fn place_before_the_layout(node: &mut NodeAllocation, job_id: u32, cpus: u32) -> Vec<u32> {
+        node.set_gpu_reserved(&[]);
+        let placed = node.allocate_for_job(job_id, 1, cpus, 0, &[]).unwrap();
+        node.commit_job(job_id, 1);
+        node.set_gpu_reserved(&reserved_pools());
+        placed.cpu_ids
+    }
+
+    #[test]
+    fn gpu_job_takes_its_own_reserved_cpus_first() {
+        let mut node = pooled_node();
+        let got = node.allocate_for_job(1, 1, 4, 0, &[1]).unwrap();
+        assert_eq!(sorted(got.cpu_ids), vec![0, 1, 8, 9]);
+    }
+
+    #[test]
+    fn a_partial_share_takes_whole_reserved_cores() {
+        let mut node = pooled_node();
+        let got = node.allocate_for_job(1, 1, 2, 0, &[2]).unwrap();
+        assert_eq!(sorted(got.cpu_ids), vec![4, 12], "both threads of core 0");
+    }
+
+    #[test]
+    fn excess_comes_from_general_on_the_gpus_socket_core_by_core() {
+        let mut node = pooled_node();
+        let got = node.allocate_for_job(1, 1, 6, 0, &[2]).unwrap();
+        assert_eq!(sorted(got.cpu_ids), vec![4, 5, 6, 12, 13, 14]);
+    }
+
+    #[test]
+    fn cpu_only_jobs_never_get_reserved_cpus() {
+        let mut node = pooled_node();
+        let got = node.allocate_for_job(1, 1, 8, 0, &[]).unwrap();
+        assert_eq!(sorted(got.cpu_ids), vec![2, 3, 6, 7, 10, 11, 14, 15]);
+        assert_eq!(
+            node.allocate_for_job(2, 1, 1, 0, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_reserved_share_shortfall_fails_the_whole_pick() {
+        let mut node = pooled_node();
+        node.set_gpu_reserved(&[]);
+        let legacy = node.allocate_for_job(1, 1, 1, 0, &[]).unwrap();
+        assert_eq!(legacy.cpu_ids, vec![0], "placed before the layout");
+        node.set_gpu_reserved(&reserved_pools());
+        let (free_cpus, free_gpus) = (node.free_cpus(), node.free_gpus(None));
+        assert_eq!(
+            node.allocate_for_job(2, 1, 4, 64, &[1]),
+            Err(AllocError::ReservedCpusHeld),
+            "never spills the share into general"
+        );
+        assert_eq!(node.free_cpus(), free_cpus);
+        assert_eq!(node.free_gpus(None), free_gpus);
+        assert_eq!(node.allocated_memory_mb, 0);
+        node.release_job(1);
+        let got = node.allocate_for_job(2, 1, 4, 64, &[1]).unwrap();
+        assert_eq!(sorted(got.cpu_ids), vec![0, 1, 8, 9]);
+    }
+
+    #[test]
+    fn a_general_shortfall_fails_the_whole_pick() {
+        let mut node = pooled_node();
+        node.allocate_for_job(1, 1, 7, 0, &[]).unwrap();
+        assert_eq!(
+            node.allocate_for_job(2, 1, 6, 0, &[1]),
+            Err(AllocError::CpusUnavailable),
+            "its 4 reserved CPUs are free; 2 general CPUs are not"
+        );
+        assert_eq!(node.free_gpus(None), 2);
+        // Never reported as blocking; nothing holds its reserved CPUs.
+        assert!(node.blocked_reserved_cpus(&reserved_pools()).is_empty());
+    }
+
+    #[test]
+    fn blocked_reserved_cpus_counts_only_non_holders() {
+        let mut node = pooled_node();
+        assert_eq!(
+            place_before_the_layout(&mut node, 1, 5),
+            vec![0, 1, 2, 3, 4]
+        );
+        node.allocate_for_job(2, 1, 2, 0, &[2]).unwrap();
+        assert_eq!(
+            node.blocked_reserved_cpus(&reserved_pools()),
+            BTreeMap::from([(1, 2), (2, 1)]),
+            "job 1 blocks CPUs 0-1 of GPU 1 and CPU 4 of GPU 2; GPU 2's holder blocks nothing"
+        );
+        let other = [GpuReservedCpus {
+            stable_id: 1,
+            cpus: vec![2, 3, 6],
+        }];
+        assert_eq!(
+            node.blocked_reserved_cpus(&other),
+            BTreeMap::from([(1, 2)]),
+            "counted against the layout passed in, not the ledger's pools"
+        );
+        node.release_job(1);
+        assert!(node.blocked_reserved_cpus(&reserved_pools()).is_empty());
+    }
+
+    #[test]
+    fn a_cpu_only_job_on_a_gpus_reserved_cpus_blocks_it() {
+        let mut node = pooled_node();
+        assert_eq!(place_before_the_layout(&mut node, 1, 3), vec![0, 1, 2]);
+        assert_eq!(
+            node.blocked_reserved_cpus(&reserved_pools()),
+            BTreeMap::from([(1, 2)])
+        );
+        node.release_job(1);
+        assert_eq!(
+            node.blocked_reserved_cpus(&reserved_pools()),
+            BTreeMap::new(),
+            "zero counts are left out"
+        );
+    }
+
+    #[test]
+    fn pick_pooled_refuses_with_reserved_cpus_held() {
+        let mut node = pooled_node();
+        assert_eq!(place_before_the_layout(&mut node, 1, 1), vec![0]);
+        assert_eq!(
+            node.pick_cpu_ids(4, &[1]),
+            Err(AllocError::ReservedCpusHeld)
+        );
+        assert_eq!(
+            node.allocate_for_job(2, 1, 4, 0, &[1]),
+            Err(AllocError::ReservedCpusHeld)
+        );
+        assert_eq!(
+            node.blocked_reserved_cpus(&reserved_pools()),
+            BTreeMap::from([(1, 1)]),
+            "the refusal and the report name the same CPU"
+        );
+        assert_eq!(
+            node.pick_cpu_ids(3, &[1]).map(sorted),
+            Ok(vec![1, 8, 9]),
+            "a share its free reserved CPUs cover still fits"
+        );
+    }
+
+    #[test]
+    fn nodes_without_reservations_keep_first_fit() {
+        let mut node = pooled_node();
+        node.set_gpu_reserved(&[]);
+        let got = node.allocate_for_job(1, 1, 3, 0, &[1]).unwrap();
+        assert_eq!(got.cpu_ids, vec![0, 1, 2]);
     }
 }

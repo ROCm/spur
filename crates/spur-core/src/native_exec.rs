@@ -63,6 +63,55 @@ pub fn proto_slice_devices(
     (a.cpus, a.memory_mb, devices)
 }
 
+/// Enforced per-node budget: the controller's allocation wins, the spec is
+/// the fallback (every task on this node, and `--mem-per-cpu` when `--mem`
+/// is unset). Shared by spurd's cgroup sizing and spur-k8s's pod resource
+/// sizing (which uses only the CPU half).
+pub fn resolve_cgroup_budget(
+    alloc: Option<&spur_proto::proto::ResourceAllocations>,
+    spec: &spur_proto::proto::JobSpec,
+    tasks_per_node: u32,
+) -> (u32, u64) {
+    let (alloc_cpus, alloc_mem_mb) = alloc.map(|a| (a.cpus, a.memory_mb)).unwrap_or((0, 0));
+    let gpus_here = alloc
+        .and_then(|a| a.devices.get("gpu"))
+        .map_or(0, |gpus| gpus.devices.len() as u32);
+    // Saturating: the spec is caller-supplied, and a wrapped product would set
+    // limits from a budget bearing no relation to what the job asked for.
+    let cpus = if alloc_cpus > 0 {
+        alloc_cpus
+    } else {
+        let by_task = tasks_per_node
+            .max(1)
+            .saturating_mul(spec.cpus_per_task.max(1));
+        let by_gpu = spec.cpus_per_gpu.unwrap_or(0).saturating_mul(gpus_here);
+        by_task.max(by_gpu)
+    };
+    let memory_mb = if alloc_mem_mb > 0 {
+        alloc_mem_mb
+    } else if spec.memory_per_node_mb > 0 {
+        spec.memory_per_node_mb
+    } else if spec.memory_per_gpu_mb > 0 {
+        spec.memory_per_gpu_mb.saturating_mul(u64::from(gpus_here))
+    } else {
+        spec.memory_per_cpu_mb.saturating_mul(cpus as u64)
+    };
+    (cpus, memory_mb)
+}
+
+/// The node-wide memory ceiling a job with no budget of its own gets: the
+/// controller's `node_memory_ceiling_mb` when it sent one, else the agent's own
+/// detected total memory (0 if that is unreadable too, which leaves the job
+/// unbounded exactly as it already is). Shared by LaunchJob and
+/// RegisterJobAllocation so the fallback is identical on both paths.
+pub fn resolve_memory_ceiling(node_memory_ceiling_mb: u64, detected_memory_mb: u64) -> u64 {
+    if node_memory_ceiling_mb > 0 {
+        node_memory_ceiling_mb
+    } else {
+        detected_memory_mb
+    }
+}
+
 pub fn slice_from_alloc(node: &str, alloc: &ResourceAllocations) -> NodeResourceSlice {
     let mut devices: Vec<_> = alloc
         .devices
@@ -277,6 +326,14 @@ impl LaunchAcceptance {
         );
     }
 
+    /// A cancel tombstone is recorded with or without execution credentials.
+    pub fn is_cancelled(&self, job_id: u32, step_id: u32, run_attempt: u32) -> bool {
+        self.lock()
+            .entries
+            .get(&(job_id, step_id, run_attempt))
+            .is_some_and(|e| e.cancelled)
+    }
+
     pub fn cancel_attempt(&self, job_id: u32, run_attempt: u32) {
         let now = Self::now();
         let mut inner = self.lock();
@@ -404,6 +461,14 @@ mod tests {
     }
 
     #[test]
+    fn is_cancelled_reflects_only_the_cancelled_tombstone() {
+        let cache = LaunchAcceptance::new();
+        cache.cancel(1, 2, 0);
+        assert!(cache.is_cancelled(1, 2, 0));
+        assert!(!cache.is_cancelled(1, 3, 0));
+    }
+
+    #[test]
     fn acceptance_capacity_evicts_the_soonest_expiry() {
         let now = crate::native_mint::unix_now().unwrap();
         let cache = LaunchAcceptance::with_capacity(2);
@@ -450,10 +515,113 @@ mod tests {
             )]
             .into(),
             generation: 0,
+            reserved_cpus: 0,
         };
         let (cpus, mem, devices) = proto_slice_devices(&Some(alloc));
         assert_eq!(cpus, 4);
         assert_eq!(mem, 512);
         assert_eq!(devices, vec![("gpu".into(), 1, 1), ("gpu".into(), 2, 1)]);
+    }
+
+    fn job_spec(cpus_per_task: u32, mem_node: u64, mem_per_cpu: u64) -> spur_proto::proto::JobSpec {
+        spur_proto::proto::JobSpec {
+            cpus_per_task,
+            memory_per_node_mb: mem_node,
+            memory_per_cpu_mb: mem_per_cpu,
+            ..Default::default()
+        }
+    }
+
+    fn alloc_with_gpus(
+        cpus: u32,
+        memory_mb: u64,
+        gpu_count: usize,
+    ) -> spur_proto::proto::ResourceAllocations {
+        let devices = (0..gpu_count as u64)
+            .map(|id| spur_proto::proto::AllocatedDevice {
+                device_id: id,
+                count: 1,
+            })
+            .collect();
+        spur_proto::proto::ResourceAllocations {
+            cpus,
+            memory_mb,
+            devices: [(
+                "gpu".to_string(),
+                spur_proto::proto::DeviceAllocations { devices },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_allocation_wins_when_present() {
+        // Spec asks 2 cpus / 1024 MB per task; the node allocation grants 8/32G.
+        let alloc = alloc_with_gpus(8, 32_768, 0);
+        assert_eq!(
+            resolve_cgroup_budget(Some(&alloc), &job_spec(2, 1024, 0), 4),
+            (8, 32_768)
+        );
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_spec_fallback_counts_every_task_on_the_node() {
+        // The undercount: 4 tasks x 2 cpus is 8 cores, not 2.
+        assert_eq!(
+            resolve_cgroup_budget(None, &job_spec(2, 1024, 0), 4),
+            (8, 1024)
+        );
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_spec_fallback_honors_mem_per_cpu() {
+        // --mem-per-cpu=512 with 8 cores on this node.
+        assert_eq!(
+            resolve_cgroup_budget(None, &job_spec(2, 0, 512), 4),
+            (8, 4096)
+        );
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_saturates_instead_of_wrapping() {
+        // A spec reaches the agent unvalidated, and a wrapped product would
+        // hand limits_for a budget unrelated to the request.
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &job_spec(100_000, 0, 0), 100_000);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, 0, "no memory request stays unbounded");
+
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &job_spec(u32::MAX, 0, u64::MAX), 2);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, u64::MAX);
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_floors_cpus_at_one() {
+        assert_eq!(resolve_cgroup_budget(None, &job_spec(0, 0, 0), 0), (1, 0));
+    }
+
+    #[test]
+    fn resolve_cgroup_budget_sizes_per_gpu_options_by_this_nodes_gpus() {
+        let mut per_gpu = job_spec(1, 0, 0);
+        per_gpu.cpus_per_gpu = Some(8);
+        per_gpu.memory_per_gpu_mb = 1000;
+        let alloc = alloc_with_gpus(0, 0, 2);
+        assert_eq!(resolve_cgroup_budget(Some(&alloc), &per_gpu, 1), (16, 2000));
+    }
+
+    #[test]
+    fn resolve_memory_ceiling_prefers_the_controllers_value() {
+        assert_eq!(resolve_memory_ceiling(16_384, 8192), 16_384);
+    }
+
+    #[test]
+    fn resolve_memory_ceiling_falls_back_to_detected_memory_for_an_older_controller() {
+        assert_eq!(resolve_memory_ceiling(0, 8192), 8192);
+    }
+
+    #[test]
+    fn resolve_memory_ceiling_is_zero_when_neither_is_known() {
+        assert_eq!(resolve_memory_ceiling(0, 0), 0);
     }
 }

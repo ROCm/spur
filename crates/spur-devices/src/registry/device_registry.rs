@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::cdi::cache::CdiCache;
 use crate::gres::cache::CountableGresPool;
@@ -35,18 +35,22 @@ impl DeviceRegistry {
             .map(|(_, cached)| from_cdi(cached))
             .collect();
         cdi_entries.sort_by(cdi_sort_key);
-        candidates.extend(cdi_entries);
 
+        let mut configured = Vec::new();
         for expanded in &gres_cache.injectable {
-            candidates.push(expanded_to_device_entry(expanded));
+            let entry = expanded_to_device_entry(expanded);
+            if !merge_into_discovered(&entry, &mut cdi_entries) {
+                configured.push(entry);
+            }
         }
+        candidates.extend(cdi_entries);
+        candidates.extend(configured);
 
         for pool in &gres_cache.countable {
             candidates.push(countable_pool_entry(pool));
         }
 
-        // Dedup only catches exact device path matches. CDI is filled first, so it wins.
-        // If autodetect is on and GRES also lists the same GPUs, that's a config mistake we don't fix.
+        // Dedup catches the remaining exact device path matches. CDI is filled first, so it wins.
         self.devices = dedup_by_device_paths(candidates);
         assign_device_ids(&mut self.devices);
 
@@ -231,6 +235,63 @@ fn primary_device_path(entry: &DeviceEntry) -> &str {
         .first()
         .map(|dn| dn.effective_host_path())
         .unwrap_or("")
+}
+
+/// Merges a configured entry into the discovered device whose render node it names
+/// (exact-path dedup would miss it, since a GPU also carries a `cardN` node).
+fn merge_into_discovered(configured: &DeviceEntry, discovered: &mut [DeviceEntry]) -> bool {
+    let paths: Vec<&str> = configured
+        .device_edits
+        .device_nodes
+        .iter()
+        .map(|dn| dn.effective_host_path())
+        .collect();
+    let mut matched: Vec<&str> = Vec::new();
+    for device in discovered
+        .iter_mut()
+        .filter(|device| entry_matches_gres_name(device, &configured.gres_name))
+    {
+        let Some(render_node) = paths.iter().copied().find(|path| {
+            path.starts_with("/dev/dri/renderD")
+                && device
+                    .device_edits
+                    .device_nodes
+                    .iter()
+                    .any(|dn| dn.effective_host_path() == *path)
+        }) else {
+            continue;
+        };
+        matched.push(render_node);
+        if configured.resource_type.is_some() {
+            device.resource_type = configured.resource_type.clone();
+        }
+        if configured.cores.is_some() {
+            device.cores = configured.cores.clone();
+        }
+        if configured.links.is_some() {
+            device.links = configured.links.clone();
+        }
+        device.inject_actions.merge(&configured.inject_actions);
+    }
+    if matched.is_empty() {
+        return false;
+    }
+    let unmatched: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|p| p.starts_with("/dev/dri/renderD") && !matched.contains(p))
+        .collect();
+    if unmatched.is_empty() {
+        info!(paths = ?paths, "configured GPU merged into the discovered one");
+    } else {
+        warn!(
+            matched = ?matched,
+            unmatched = ?unmatched,
+            "configured GPU entry merged into discovered GPUs; render nodes no GPU was \
+             discovered for are dropped with it"
+        );
+    }
+    true
 }
 
 /// Skips a later entry when its device-node paths exactly match one already kept.
@@ -1181,5 +1242,239 @@ mod tests {
         let (host_plan, container_plan) = build_injection_plans(&resolved, 1000, 1000);
         assert_eq!(host_plan.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0");
         assert_eq!(container_plan.device_nodes.len(), 3);
+    }
+
+    fn node(path: &str) -> DeviceNode {
+        DeviceNode {
+            path: path.into(),
+            host_path: None,
+            r#type: None,
+            major: None,
+            minor: None,
+            file_mode: None,
+            permissions: None,
+            uid: None,
+            gid: None,
+        }
+    }
+
+    /// Auto-detected GPUs as discovery reports them: `cardN` and `renderD{128+N}`
+    /// each, with an optional CDI cores annotation.
+    fn discovered_gpus(cores_annotations: &[Option<&str>]) -> CdiCache {
+        let devices = cores_annotations
+            .iter()
+            .enumerate()
+            .map(|(i, cores)| {
+                let mut annotations: HashMap<String, String> =
+                    [(annotations::AUTO_DETECTED.into(), "true".into())].into();
+                if let Some(cores) = cores {
+                    annotations.insert(annotations::CORES.into(), (*cores).into());
+                }
+                CdiDevice {
+                    name: i.to_string(),
+                    annotations,
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![
+                            node(&format!("/dev/dri/card{i}")),
+                            node(&format!("/dev/dri/renderD{}", 128 + i)),
+                        ],
+                        ..Default::default()
+                    }),
+                }
+            })
+            .collect();
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices,
+            container_edits: None,
+        };
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        cache
+    }
+
+    fn gpu_cores(reg: &DeviceRegistry) -> Vec<Option<Vec<u32>>> {
+        reg.list()
+            .iter()
+            .filter(|e| e.is_injectable())
+            .map(|e| e.cores.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_configured_render_node_merges_its_cores_onto_the_discovered_gpu() {
+        let cache = discovered_gpus(&[None, None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD129".into()),
+            cores: Some("64-71".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2, "no duplicate GPU");
+        assert_eq!(
+            gpu_cores(&reg),
+            vec![None, Some((64..=71).collect::<Vec<u32>>())]
+        );
+    }
+
+    #[test]
+    fn configured_cores_beat_the_cdi_annotation() {
+        let cache = discovered_gpus(&[Some("0-3"), Some("4-7")]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD128".into()),
+            cores: Some("32-35".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(
+            gpu_cores(&reg),
+            vec![Some(vec![32, 33, 34, 35]), Some(vec![4, 5, 6, 7])],
+            "spur.conf wins on GPU 0; GPU 1 keeps its annotation"
+        );
+    }
+
+    #[test]
+    fn a_configured_entry_without_cores_keeps_the_annotation() {
+        let cache = discovered_gpus(&[Some("0-3")]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD128".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1, 2, 3])]);
+    }
+
+    #[test]
+    fn an_entry_naming_several_discovered_gpus_merges_into_each() {
+        let cache = discovered_gpus(&[None, None, None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some("/dev/dri/renderD[128-129]".into()),
+            cores: Some("8-9".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(
+            gpu_cores(&reg),
+            vec![Some(vec![8, 9]), Some(vec![8, 9]), None]
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_no_render_node_stays_a_device_of_its_own() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/card0".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2, "only a render node merges");
+        assert_eq!(gpu_cores(&reg), vec![None, Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn a_file_range_merges_one_gpu_per_render_node() {
+        let cache = discovered_gpus(&[None, None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD[128-129]".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1]), Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn configured_type_wins_over_the_discovered_one() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            r#type: Some("mi325x".into()),
+            file: Some("/dev/dri/renderD128".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        let types: Vec<_> = reg.list().iter().map(|e| e.resource_type.clone()).collect();
+        assert_eq!(types, vec![Some("mi325x".to_string())]);
+    }
+
+    #[test]
+    fn an_entry_of_another_gres_name_does_not_merge() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "accel".into(),
+            file: Some("/dev/dri/renderD128".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+        assert_eq!(gpu_cores(&reg), vec![None, Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn the_merge_matches_the_cdi_host_path() {
+        let mut render = node("/dev/dri/renderD0");
+        render.host_path = Some("/dev/dri/renderD129".into());
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "0".into(),
+                annotations: Default::default(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![node("/dev/dri/card1"), render],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        };
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD129".into()),
+            cores: Some("4-5".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![4, 5])]);
     }
 }

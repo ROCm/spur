@@ -197,7 +197,7 @@ Served by spurd on each compute node. Called by spurctld for job dispatch
 and cluster component management.
 
 **Job execution:** LaunchJob, StartJob, CancelJob, SuspendJob,
-PreparePmix, ReleasePmix, RunCommand, CancelStep,
+PreparePmix, ReleasePmix, RunCommand, CancelStep, ClaimStep,
 RegisterJobAllocation, AwaitStep.
 
 **Cluster components:** StartClusterComponent, StopClusterComponent,
