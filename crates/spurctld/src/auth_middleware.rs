@@ -54,6 +54,92 @@ fn forwarded_body_digest_matches(frame: &[u8], expected: &[u8; 32]) -> Result<()
     Ok(())
 }
 
+/// The follower's body digest from `x-spur-forwarded-sha256`, if any.
+enum ForwardedDigest {
+    Absent,
+    Valid([u8; 32]),
+    Malformed,
+}
+
+fn forwarded_digest(headers: &http::HeaderMap) -> ForwardedDigest {
+    let Some(value) = headers.get(spur_core::native_peer::FORWARDED_DIGEST_HEADER) else {
+        return ForwardedDigest::Absent;
+    };
+    match value.to_str().ok().and_then(decode_sha256_hex) {
+        Some(digest) => ForwardedDigest::Valid(digest),
+        None => ForwardedDigest::Malformed,
+    }
+}
+
+fn decode_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+/// Classify a failure to buffer the forwarded body: an over-limit body is a
+/// terminal `ResourceExhausted`, but a read failure mid-collect (e.g. a reset) is
+/// the retryable integrity `DataLoss` the follower resends once.
+fn forwarded_collect_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> tonic::Status {
+    if err.is::<http_body_util::LengthLimitError>() {
+        return tonic::Status::resource_exhausted("forwarded request body exceeded the size limit");
+    }
+    tonic::Status::data_loss(format!(
+        "{}: body could not be read",
+        spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE
+    ))
+}
+
+/// Collect a forwarded request's body once and verify it against the digests the
+/// follower supplied: the transit header (`DataLoss` on mismatch — corruption on
+/// the hop, which the follower retries) and, when present, the signed envelope
+/// binding (`Unauthenticated` — a body that does not match the signed identity).
+/// Returns the request rebuilt from the collected bytes.
+async fn verify_forwarded_body(
+    req: Request<tonic::body::Body>,
+    transit: Option<[u8; 32]>,
+    signed: Option<[u8; 32]>,
+) -> Result<Request<tonic::body::Body>, Response<tonic::body::Body>> {
+    let (parts, body) = req.into_parts();
+    // Same ceiling the gRPC decoder would apply, plus the frame header, so a
+    // forwarded body costs no more memory here than in the handler.
+    let limit = spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN;
+    let collected = match Limited::new(body, limit).collect().await {
+        Ok(buf) => buf.to_bytes(),
+        Err(err) => return Err(forwarded_collect_error(&*err).into_http()),
+    };
+    // Transit integrity first: a header/body mismatch is corruption on the hop,
+    // not a forged identity, so it reads as DataLoss and the follower retries.
+    if let Some(expected) = transit {
+        if let Err(reason) = forwarded_body_digest_matches(&collected, &expected) {
+            return Err(tonic::Status::data_loss(format!(
+                "{}: corrupted in transit: {reason}",
+                spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE
+            ))
+            .into_http());
+        }
+    }
+    if let Some(expected) = signed {
+        if let Err(reason) = forwarded_body_digest_matches(&collected, &expected) {
+            return Err(tonic::Status::unauthenticated(format!(
+                "forwarded identity does not match this RPC: {reason}"
+            ))
+            .into_http());
+        }
+    }
+    Ok(Request::from_parts(
+        parts,
+        tonic::body::Body::new(Full::new(collected)),
+    ))
+}
+
 /// Marks an `Identity` as credential-verified, which the audit log's `verified` column keys off.
 /// A path deriving an identity without checking a credential must insert the `Identity` and not this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +229,24 @@ where
             .headers()
             .get(spur_core::native_peer::FORWARDED_HEADER)
             .is_some();
+        // The follower's body digest, checked below against the bytes actually
+        // received. A malformed header on a forwarded request is itself corruption.
+        let transit_digest = if forwarded {
+            match forwarded_digest(req.headers()) {
+                ForwardedDigest::Absent => None,
+                ForwardedDigest::Valid(digest) => Some(digest),
+                ForwardedDigest::Malformed => {
+                    let resp = tonic::Status::data_loss(format!(
+                        "{}: malformed body digest header",
+                        spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE
+                    ))
+                    .into_http();
+                    return Box::pin(async move { Ok(resp) });
+                }
+            }
+        } else {
+            None
+        };
         // A labeled block so an envelope-less forwarded request under
         // permissive/disabled can fall through to the normal decide() path below.
         'forwarded: {
@@ -187,37 +291,21 @@ where
                             req.extensions_mut().insert(binding);
                             req.extensions_mut().insert(Verified);
                             let mut inner = self.inner.clone();
-                            // The follower signed the digest of the bytes it sent. Verify against the
-                            // received bytes here, once, rather than re-encoding a decoded body in every
-                            // handler (prost maps have no canonical byte order, so a re-encode diverges).
+                            // Verify the received bytes here, once, rather than re-encoding a decoded
+                            // body in every handler (prost maps have no canonical byte order, so a
+                            // re-encode diverges). The transit header is checked first — a mismatch
+                            // there is corruption on the hop (DataLoss) — then the signed binding.
                             return Box::pin(async move {
-                                let (parts, body) = req.into_parts();
-                                // Same ceiling the gRPC decoder would apply, plus the frame header, so a
-                                // forwarded body costs no more memory here than in the handler.
-                                let limit =
-                                    spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN;
-                                let collected = match Limited::new(body, limit).collect().await {
-                                    Ok(buf) => buf.to_bytes(),
-                                    Err(_) => {
-                                        return Ok(tonic::Status::unauthenticated(
-                                            "forwarded request body exceeded the size limit or \
-                                         could not be read",
-                                        )
-                                        .into_http());
-                                    }
-                                };
-                                if let Err(reason) =
-                                    forwarded_body_digest_matches(&collected, &expected)
+                                let req = match verify_forwarded_body(
+                                    req,
+                                    transit_digest,
+                                    Some(expected),
+                                )
+                                .await
                                 {
-                                    return Ok(tonic::Status::unauthenticated(format!(
-                                        "forwarded identity does not match this RPC: {reason}"
-                                    ))
-                                    .into_http());
-                                }
-                                let req = Request::from_parts(
-                                    parts,
-                                    tonic::body::Body::new(Full::new(collected)),
-                                );
+                                    Ok(req) => req,
+                                    Err(resp) => return Ok(resp),
+                                };
                                 inner.call(req).await.map_err(Into::into)
                             });
                         }
@@ -269,6 +357,19 @@ where
         }
 
         let mut inner = self.inner.clone();
+        // An envelope-less forwarded request (permissive/disabled, or the JWT
+        // plugin) still carries the transit digest; verify it before the handler.
+        if forwarded {
+            if let Some(expected) = transit_digest {
+                return Box::pin(async move {
+                    let req = match verify_forwarded_body(req, Some(expected), None).await {
+                        Ok(req) => req,
+                        Err(resp) => return Ok(resp),
+                    };
+                    inner.call(req).await.map_err(Into::into)
+                });
+            }
+        }
         Box::pin(async move { inner.call(req).await.map_err(Into::into) })
     }
 }
@@ -276,6 +377,72 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sha256_header_decodes_only_when_well_formed() {
+        assert!(decode_sha256_hex(&"ab".repeat(32)).is_some());
+        assert_eq!(decode_sha256_hex(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        assert!(decode_sha256_hex("abcd").is_none(), "too short");
+        assert!(decode_sha256_hex(&"zz".repeat(32)).is_none(), "not hex");
+    }
+
+    #[tokio::test]
+    async fn transit_corruption_is_dataloss_and_a_forged_body_is_unauthenticated() {
+        let message = b"the forwarded request message bytes";
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        frame.extend_from_slice(message);
+        let good = spur_core::native_peer::request_digest(message);
+        let bad = [0xabu8; 32];
+        let make = || {
+            Request::new(tonic::body::Body::new(Full::new(bytes::Bytes::from(
+                frame.clone(),
+            ))))
+        };
+
+        // Correct transit digest passes; so does an old follower that sent none.
+        assert!(verify_forwarded_body(make(), Some(good), None)
+            .await
+            .is_ok());
+        assert!(verify_forwarded_body(make(), None, None).await.is_ok());
+
+        // A body corrupted on the hop: transit mismatch -> DataLoss (code 15).
+        let resp = verify_forwarded_body(make(), Some(bad), None)
+            .await
+            .expect_err("transit mismatch is rejected");
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "15");
+
+        // A body that matches no signed identity -> Unauthenticated (code 16).
+        let resp = verify_forwarded_body(make(), None, Some(bad))
+            .await
+            .expect_err("a forged body is rejected");
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    #[test]
+    fn a_read_failure_is_a_retryable_integrity_dataloss() {
+        // A reset mid-collect must not become a terminal auth error: it maps to the
+        // integrity DataLoss the follower retries, carrying the marker send_to_leader
+        // keys on.
+        let status = forwarded_collect_error(&std::io::Error::other("stream reset"));
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status
+            .message()
+            .contains(spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE));
+    }
+
+    #[tokio::test]
+    async fn an_over_limit_forwarded_body_is_rejected_not_retried() {
+        // Over the size ceiling is terminal (ResourceExhausted, code 8) — never the
+        // retryable DataLoss, so an oversized body is not resubmitted in a loop.
+        let huge = vec![0u8; spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN + 1];
+        let req = Request::new(tonic::body::Body::new(Full::new(bytes::Bytes::from(huge))));
+        let resp = verify_forwarded_body(req, Some([0u8; 32]), None)
+            .await
+            .expect_err("an over-limit body is rejected");
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
+    }
+
     use spur_core::auth::generate_token;
 
     fn cfg(mode: AuthMode, key: &str) -> BearerAuth {

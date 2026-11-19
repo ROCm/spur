@@ -12,6 +12,8 @@ pub mod raft_proto {
     tonic::include_proto!("raft_internal");
 }
 
+pub mod codec;
+
 pub use proto::*;
 
 /// Maximum size of a gRPC *response* (server encode / client decode), in bytes.

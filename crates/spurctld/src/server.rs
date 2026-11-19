@@ -259,41 +259,57 @@ impl LeaderProxy {
         }
     }
 
-    /// An open channel to the current leader. Forwarding drives the RPC over this
-    /// with a codec (see [`PassthroughCodec`]); a typed client is not needed.
-    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
+    /// The current leader's id and an unconnected endpoint to it.
+    fn leader_endpoint(&self) -> Result<(u64, tonic::transport::Endpoint), Status> {
         let leader_id = self
             .raft
             .current_leader()
             .ok_or_else(|| Status::unavailable("no leader elected yet"))?;
+        let addr = self
+            .client_addrs
+            .get(&leader_id)
+            .ok_or_else(|| Status::unavailable("leader address unknown"))?;
+        let url = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{}", addr)
+        };
+        let endpoint = tonic::transport::Endpoint::from_shared(url)
+            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?;
+        Ok((leader_id, endpoint))
+    }
+
+    /// An open channel to the current leader, cached and shared across forwards.
+    /// Forwarding drives the RPC over this with a codec (see [`PassthroughCodec`]);
+    /// a typed client is not needed.
+    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
+        let (leader_id, endpoint) = self.leader_endpoint()?;
 
         let mut cached = self.cached_channel.lock().await;
-
         if let Some((id, ref channel)) = *cached {
             if id == leader_id {
                 return Ok(channel.clone());
             }
         }
 
-        let addr = self
-            .client_addrs
-            .get(&leader_id)
-            .ok_or_else(|| Status::unavailable("leader address unknown"))?;
-
-        let url = if addr.starts_with("http") {
-            addr.clone()
-        } else {
-            format!("http://{}", addr)
-        };
-
-        let channel = tonic::transport::Endpoint::from_shared(url)
-            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
+        let channel = endpoint
             .connect()
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
 
         *cached = Some((leader_id, channel.clone()));
         Ok(channel)
+    }
+
+    /// A fresh, uncached connection to the current leader, to resend a request the
+    /// leader rejected as corrupted on the hop: a new connection sidesteps the stream
+    /// path that mangled the body, and the shared channel stays up for other forwards.
+    async fn dial_leader(&self) -> Result<tonic::transport::Channel, Status> {
+        let (_, endpoint) = self.leader_endpoint()?;
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))
     }
 }
 
@@ -553,17 +569,44 @@ impl ControllerService {
             .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
         let body = bytes::Bytes::from(body);
         let digest = spur_core::native_peer::request_digest(&body);
-        let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path)?;
-        let fwd = Request::from_parts(meta, http::Extensions::default(), body);
-        let mut grpc = tonic::client::Grpc::new(channel)
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-        grpc.ready()
-            .await
-            .map_err(|e| Status::unavailable(format!("leader connection not ready: {e}")))?;
-        let path = http::uri::PathAndQuery::try_from(path)
+        let rpc_path = http::uri::PathAndQuery::try_from(path)
             .map_err(|e| Status::internal(format!("invalid RPC path: {e}")))?;
-        grpc.unary(fwd, path, PassthroughCodec::<Resp>::new()).await
+
+        // Retry once, but only for the pre-handler integrity DataLoss the leader
+        // raises (FORWARDED_INTEGRITY_FAILURE): that rejection precedes any propose,
+        // so a resend cannot apply a write twice. A DataLoss from any other source
+        // may be post-propose, so it is returned as-is. The metadata — and its
+        // envelope nonce — is rebuilt each attempt, or the leader's replay cache
+        // would reject the retry as a duplicate.
+        let mut channel = channel;
+        let mut attempt = 0u8;
+        loop {
+            let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path)?;
+            let fwd = Request::from_parts(meta, http::Extensions::default(), body.clone());
+            let mut grpc = tonic::client::Grpc::new(channel.clone())
+                .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+            grpc.ready()
+                .await
+                .map_err(|e| Status::unavailable(format!("leader connection not ready: {e}")))?;
+            match grpc
+                .unary(fwd, rpc_path.clone(), PassthroughCodec::<Resp>::new())
+                .await
+            {
+                Err(status)
+                    if status.code() == Code::DataLoss
+                        && attempt == 0
+                        && status
+                            .message()
+                            .contains(spur_core::native_peer::FORWARDED_INTEGRITY_FAILURE) =>
+                {
+                    warn!("leader reported a corrupted forwarded body; retrying on a fresh connection");
+                    channel = self.leader_proxy.dial_leader().await?;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -1210,6 +1253,11 @@ impl ControllerService {
         action: &str,
     ) -> Result<tonic::metadata::MetadataMap, Status> {
         let peer = crate::native_keys::peer();
+        // Sent on every forwarded request, in every auth mode, so the leader can
+        // catch a body corrupted on the hop before any handler decodes it.
+        let digest_header = Self::hex_lower(&digest)
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .map_err(|e| Status::internal(format!("encode forwarded digest header: {e}")))?;
         match forward_auth_decision(peer.is_some(), identity) {
             // Native plugin with a verified identity: sign an envelope. A failure
             // here must NOT degrade to an unsigned forward, which would silently
@@ -1232,13 +1280,34 @@ impl ControllerService {
                     })?;
                 let mut meta = Self::forwarded_metadata();
                 meta.insert(spur_core::native_peer::IDENTITY_HEADER, value);
+                meta.insert(
+                    spur_core::native_peer::FORWARDED_DIGEST_HEADER,
+                    digest_header,
+                );
                 Ok(meta)
             }
             // Anonymous caller (permissive/disabled), or the JWT plugin (no peer
             // keys): forward without an envelope, preserving any Authorization
             // header so the leader authorizes the original caller.
-            ForwardAuth::Preserve => Ok(Self::forwarded_metadata_preserving(orig)),
+            ForwardAuth::Preserve => {
+                let mut meta = Self::forwarded_metadata_preserving(orig);
+                meta.insert(
+                    spur_core::native_peer::FORWARDED_DIGEST_HEADER,
+                    digest_header,
+                );
+                Ok(meta)
+            }
         }
+    }
+
+    /// Lowercase hex of a byte slice, for an ASCII metadata header value.
+    fn hex_lower(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {

@@ -20,6 +20,16 @@ use crate::native_replay::ReplayCache;
 pub const FORWARD_LIFETIME_SECS: u64 = 30;
 pub const IDENTITY_HEADER: &str = "x-spur-identity";
 pub const FORWARDED_HEADER: &str = "x-spur-forwarded";
+/// Hex SHA-256 of the forwarded request body, sent on every forwarded request so
+/// the leader can detect corruption on the follower→leader hop in any auth mode.
+pub const FORWARDED_DIGEST_HEADER: &str = "x-spur-forwarded-sha256";
+
+/// Phrase the leader's `DataLoss` status carries when a forwarded body fails its
+/// pre-handler integrity check (transit-digest mismatch or a malformed digest
+/// header). A follower retries a forwarded write only on a `DataLoss` carrying
+/// this phrase: that rejection precedes any propose, so the resend cannot
+/// double-apply. A `DataLoss` from any other source is returned to the caller.
+pub const FORWARDED_INTEGRITY_FAILURE: &str = "forwarded request body failed integrity check";
 
 /// The method path a request arrived on, carried in extensions so a handler can
 /// sign the path it forwards rather than the Rust request type.

@@ -24,6 +24,12 @@ always on: even a single-node deployment runs a one-member Raft cluster. In a
 multi-controller cluster, the leader handles all writes and non-leaders forward
 requests to it automatically, so clients can talk to any controller.
 
+A forwarded request carries a SHA-256 of its body, and the leader verifies the
+bytes it received against that digest before acting on them. A body corrupted on
+the follower-to-leader hop is rejected with ``DataLoss`` and the follower retries
+it once on a fresh connection; because the leader rejects it before any handler
+runs, a retry cannot apply a write twice.
+
 ``spurd`` — Node agent
 ~~~~~~~~~~~~~~~~~~~~~~~
 

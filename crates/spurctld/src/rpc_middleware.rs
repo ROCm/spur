@@ -65,6 +65,14 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let operation = grpc_operation_name(req.uri().path());
         let record = self.raft.is_leader() && should_record_operation(&operation);
+        // Captured before the request is consumed, to annotate a decode failure:
+        // which RPC, which peer, and whether a follower forwarded it — the one
+        // thing the codec's own log cannot see.
+        let peer = peer_addr(req.extensions());
+        let forwarded = req
+            .headers()
+            .get(spur_core::native_peer::FORWARDED_HEADER)
+            .is_some();
         let stats = self.stats.clone();
         let start = Instant::now();
         let mut inner = self.inner.clone();
@@ -74,9 +82,40 @@ where
             if record {
                 stats.record(&operation, start.elapsed());
             }
+            if let Ok(ref response) = result {
+                if response_is_decode_failure(response.headers()) {
+                    tracing::warn!(
+                        method = %operation,
+                        peer = peer.as_deref().unwrap_or("unknown"),
+                        forwarded,
+                        "a request failed to decode on this controller; see the codec log line \
+                         for the offset and byte window"
+                    );
+                }
+            }
             result.map_err(Into::into)
         })
     }
+}
+
+/// Whether a response is the trailers-only error tonic emits when the request
+/// body fails to decode: an `Internal` status whose message came from the
+/// diagnostic codec. Request-decode failures have no response message, so the
+/// status rides in the headers here rather than in trailers.
+fn response_is_decode_failure(headers: &http::HeaderMap) -> bool {
+    let internal = headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|code| code == "13");
+    // Match only the diagnostic codec's request-decode failure: it carries this
+    // marker and writes the codec log line this warning points at. A follower's
+    // "decode forwarded response: …" (a response-decode error on the forwarding
+    // path) does not, so it must not trigger the warning.
+    let from_codec = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|message| message.contains(spur_proto::codec::DECODE_FAILURE_MARKER));
+    internal && from_codec
 }
 
 /// Diagnostic RPCs excluded so reads and `sdiag` polling do not skew accumulators.
@@ -126,6 +165,45 @@ mod tests {
 
         // No connection info at all (a non-TCP or test transport) is not an error.
         assert_eq!(peer_addr(&http::Extensions::new()), None);
+    }
+
+    #[test]
+    fn a_decode_failure_response_is_recognised() {
+        let mut decode_fault = http::HeaderMap::new();
+        decode_fault.insert("grpc-status", "13".parse().unwrap());
+        decode_fault.insert(
+            "grpc-message",
+            "SubmitJobRequest failed to decode (120 bytes): ...; candidate non-UTF-8 byte at offset 40"
+                .parse()
+                .unwrap(),
+        );
+        assert!(response_is_decode_failure(&decode_fault));
+
+        let mut ok = http::HeaderMap::new();
+        ok.insert("grpc-status", "0".parse().unwrap());
+        assert!(!response_is_decode_failure(&ok));
+
+        // Internal, but not from the codec.
+        let mut other_internal = http::HeaderMap::new();
+        other_internal.insert("grpc-status", "13".parse().unwrap());
+        other_internal.insert("grpc-message", "raft propose failed".parse().unwrap());
+        assert!(!response_is_decode_failure(&other_internal));
+
+        // A forwarded response that will not decode is a different Internal error
+        // on the forwarding path; its message embeds prost's "failed to decode" but
+        // not the codec marker, so it must not read as a request-decode failure.
+        let mut forwarded_response = http::HeaderMap::new();
+        forwarded_response.insert("grpc-status", "13".parse().unwrap());
+        forwarded_response.insert(
+            "grpc-message",
+            "decode forwarded response: failed to decode Protobuf message"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!response_is_decode_failure(&forwarded_response));
+
+        // A normal response carries grpc-status in trailers, not headers.
+        assert!(!response_is_decode_failure(&http::HeaderMap::new()));
     }
 
     #[test]
