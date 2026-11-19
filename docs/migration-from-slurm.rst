@@ -69,6 +69,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Slurm limits a plain ``sacct`` to jobs since midnight and has no row cap. Spur has no time default. It prints the newest 100 jobs, a number you change with ``--limit``. ``-j`` returns every requested job that has a record, as in Slurm, up to 10000 rows. An id with no record is left out. A page that hides further matches prints ``sacct: warning: results truncated at N; more jobs matched`` to stderr and still exits 0.
    * - ``sacct`` ``-a``/``-X``
      - Slurm shows only your own jobs unless ``-a`` is given (root sees all). Spur already shows every job you may read (see :ref:`private-data`), so ``-a`` changes output only when it comes after ``-u``; the last of ``-a`` and ``-u`` wins, as in Slurm. ``-X``/``--allocations`` is accepted and has no effect because history has no step rows.
+   * - ``sacct --format``
+     - Field names must be spelled in full: Slurm's prefix abbreviations (``JobN`` for ``JobName``) and the ``ALL`` keyword are not accepted. A Slurm field Spur does not provide, such as ``AllocTRES``, ``MaxRSS``, or ``WorkDir``, prints ``N/A`` in every row. A name Slurm does not know either fails with ``Invalid field requested`` and exit 1, as in Slurm. Earlier Spur releases silently dropped both kinds of name and printed only the remaining columns.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``
