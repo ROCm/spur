@@ -26,6 +26,8 @@ pub mod pty;
 pub mod reporter;
 pub(crate) mod scratch;
 pub mod seccomp;
+#[cfg(test)]
+pub(crate) mod signal_recorder;
 pub mod spec;
 pub mod step_completion;
 pub mod step_resources;

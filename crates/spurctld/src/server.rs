@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
@@ -1524,8 +1524,9 @@ fn reported_held_gpu_ids(reported: &[RunningJobStatus]) -> Vec<(u32, Vec<u64>)> 
         .collect()
 }
 
-/// Reported runs `node` may release (see `is_reclaimable`).
-fn stale_reported_jobs(
+/// Reported runs `node` still holds but may release (see `is_reclaimable`),
+/// including ones already sent a stop that are still inside its kill wait.
+fn unreleased_stale_runs(
     cluster: &ClusterManager,
     node: &str,
     reported: &[RunningJobStatus],
@@ -1537,6 +1538,66 @@ fn stale_reported_jobs(
         .collect()
 }
 
+/// Reported runs `node` may release (see `is_reclaimable`) and that no recent stop is still
+/// working through.
+fn stale_reported_jobs(
+    cluster: &ClusterManager,
+    node: &str,
+    reported: &[RunningJobStatus],
+    now: DateTime<Utc>,
+) -> Vec<RunningJobStatus> {
+    reported
+        .iter()
+        .filter(|r| reclaim_due(cluster, node, r, now))
+        .cloned()
+        .collect()
+}
+
+/// Whether the heartbeat reclaim should send `node` a stop for its reported run.
+fn reclaim_due(
+    cluster: &ClusterManager,
+    node: &str,
+    report: &RunningJobStatus,
+    now: DateTime<Utc>,
+) -> bool {
+    if !is_reclaimable(cluster, node, report) {
+        return false;
+    }
+    if stop_recently_delivered(cluster, node, report, now) {
+        debug!(
+            job_id = report.job_id,
+            run_attempt = report.run_attempt,
+            node = %node,
+            "run is still within the kill wait of a stop already delivered — not re-sending"
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether a stop reached `node` for its reported run less than the reclaim grace ago. The
+/// window is the job's current graceful kill wait (as `is_reclaimable` uses), or the default
+/// kill wait for a job the controller no longer has.
+fn stop_recently_delivered(
+    cluster: &ClusterManager,
+    node: &str,
+    report: &RunningJobStatus,
+    now: DateTime<Utc>,
+) -> bool {
+    let sched = &cluster.config().scheduler;
+    let kill_wait = match cluster.get_job(report.job_id) {
+        Some(job) => crate::scheduler_loop::graceful_kill_wait_secs(sched, &job),
+        None => sched.effective_kill_wait_secs(),
+    };
+    cluster.recent_stops().delivered_within(
+        report.job_id,
+        report.run_attempt,
+        node,
+        cancel_reclaim_grace(kill_wait),
+        now,
+    )
+}
+
 /// Cancel each stale run on `node`, each scoped to the attempt the node reported so the
 /// agent ignores the cancel if a newer run has replaced that one. Best-effort.
 pub(crate) async fn cancel_stale_runs(
@@ -1546,7 +1607,7 @@ pub(crate) async fn cancel_stale_runs(
 ) {
     for report in stale {
         // Re-check against state that moved since the snapshot; it is the only guard for attempt 0.
-        if !is_reclaimable(&cluster, &node, &report) {
+        if !reclaim_due(&cluster, &node, &report, Utc::now()) {
             continue;
         }
         warn!(
@@ -2792,7 +2853,9 @@ impl SlurmController for ControllerService {
 
         // Recorded before the heartbeat lands, so a health pass never sees the node
         // back without its report. An incomplete list is Unknown, never clean.
-        let stale_runs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
+        // A run already sent a stop still counts until it is gone: the node stays held,
+        // only the re-send is spaced out.
+        let stale_runs = unreleased_stale_runs(&self.cluster, &req.hostname, &req.running_jobs);
         let report = if !stale_runs.is_empty() {
             let mut job_ids: Vec<u32> = stale_runs.iter().map(|r| r.job_id).collect();
             job_ids.sort_unstable();
@@ -2824,7 +2887,9 @@ impl SlurmController for ControllerService {
                 self.cluster
                     .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, stale_runs);
+            let due =
+                stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs, Utc::now());
+            self.reclaim_stale_agent_jobs(&req.hostname, due);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
@@ -7326,7 +7391,7 @@ mod tests {
         node: &str,
         reported: &[RunningJobStatus],
     ) -> Vec<u32> {
-        stale_reported_jobs(cluster, node, reported)
+        stale_reported_jobs(cluster, node, reported, Utc::now())
             .into_iter()
             .map(|r| r.job_id)
             .collect()
@@ -7663,7 +7728,7 @@ mod tests {
             .is_scheduling_hold());
 
         assert_eq!(
-            stale_reported_jobs(&cluster, "n1", &[report_run(50, 1)])
+            stale_reported_jobs(&cluster, "n1", &[report_run(50, 1)], Utc::now())
                 .iter()
                 .map(|r| (r.job_id, r.run_attempt))
                 .collect::<Vec<_>>(),
@@ -7904,7 +7969,7 @@ mod tests {
             "the node it no longer runs on may release it"
         );
         assert!(
-            stale_reported_jobs(&cluster, "n2", &reported).is_empty(),
+            stale_reported_jobs(&cluster, "n2", &reported, Utc::now()).is_empty(),
             "the node actually running it must never be told to release"
         );
     }
@@ -7942,7 +8007,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            stale_reported_jobs(&cluster, "n1", &reported).is_empty(),
+            stale_reported_jobs(&cluster, "n1", &reported, Utc::now()).is_empty(),
             "a Pending job the agent already holds is mid-launch, not stale"
         );
     }
@@ -7986,7 +8051,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            stale_reported_jobs(&cluster, "n1", &reported).is_empty(),
+            stale_reported_jobs(&cluster, "n1", &reported, Utc::now()).is_empty(),
             "Running with no nodelist yet is not authoritative — the node accepting the launch must be spared"
         );
     }
@@ -8368,7 +8433,7 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert!(!job.holds_a_placement(), "the requeue freed n1");
 
-        let stale = stale_reported_jobs(&cluster, "n1", &[report_run(80, 1)]);
+        let stale = stale_reported_jobs(&cluster, "n1", &[report_run(80, 1)], Utc::now());
         assert_eq!(
             stale
                 .iter()
@@ -8378,7 +8443,7 @@ mod tests {
             "the reclaim must target the run the node named"
         );
         assert!(
-            stale_reported_jobs(&cluster, "n1", &[report_run(80, 0)]).is_empty(),
+            stale_reported_jobs(&cluster, "n1", &[report_run(80, 0)], Utc::now()).is_empty(),
             "an old agent names no run, so it could be a launch in flight"
         );
     }
@@ -8419,6 +8484,184 @@ mod tests {
         assert!(
             !is_reclaimable(&cluster, "n2", &report_run(82, 2)),
             "a run the controller has not applied yet must not be killed"
+        );
+    }
+
+    fn config_with_kill_wait(kill_wait_secs: u32) -> spur_core::config::SlurmConfig {
+        let mut config = test_slurm_config();
+        config.scheduler.kill_wait_secs = kill_wait_secs;
+        config
+    }
+
+    fn stale_pairs(
+        cluster: &crate::cluster::ClusterManager,
+        node: &str,
+        reported: &[RunningJobStatus],
+        now: DateTime<Utc>,
+    ) -> Vec<(u32, u32)> {
+        stale_reported_jobs(cluster, node, reported, now)
+            .into_iter()
+            .map(|r| (r.job_id, r.run_attempt))
+            .collect()
+    }
+
+    /// A run inside its kill wait after a requeue was already told to stop; the next heartbeats
+    /// must not re-send, and only after the window may a lost stop be sent again.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_a_run_whose_stop_was_delivered_within_the_kill_wait() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(config_with_kill_wait(30), dir.path()).unwrap(),
+        );
+        place(&cluster, 90, &["n1"], 1);
+        fail_and_requeue(&cluster, 90);
+        let delivered = Utc::now();
+        cluster
+            .recent_stops()
+            .record(90, 1, "n1", delivered, chrono::Duration::seconds(600));
+        let reported = [report_run(90, 1)];
+        let window = cancel_reclaim_grace(30);
+
+        assert!(
+            stale_pairs(
+                &cluster,
+                "n1",
+                &reported,
+                delivered + chrono::Duration::seconds(10)
+            )
+            .is_empty(),
+            "a stop delivered 10 s ago is still being worked through"
+        );
+        assert_eq!(
+            stale_pairs(&cluster, "n1", &reported, delivered + window),
+            vec![(90, 1)],
+            "past the window the stop is re-sent in case it was lost"
+        );
+    }
+
+    /// The node health report must keep counting a run that is still stopping, even while
+    /// the re-send is spaced out, or a returning node would be released while it still runs it.
+    #[tokio::test]
+    async fn a_run_inside_its_stop_window_still_holds_the_node_but_is_not_resent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(config_with_kill_wait(30), dir.path()).unwrap(),
+        );
+        place(&cluster, 93, &["n1"], 1);
+        fail_and_requeue(&cluster, 93);
+        let delivered = Utc::now();
+        cluster
+            .recent_stops()
+            .record(93, 1, "n1", delivered, chrono::Duration::seconds(600));
+        let reported = [report_run(93, 1)];
+
+        let unreleased: Vec<(u32, u32)> = unreleased_stale_runs(&cluster, "n1", &reported)
+            .into_iter()
+            .map(|r| (r.job_id, r.run_attempt))
+            .collect();
+        assert_eq!(unreleased, vec![(93, 1)]);
+        assert!(stale_pairs(
+            &cluster,
+            "n1",
+            &reported,
+            delivered + chrono::Duration::seconds(10)
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_reported_jobs_still_reclaims_a_run_that_was_never_sent_a_stop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(config_with_kill_wait(30), dir.path()).unwrap(),
+        );
+        place(&cluster, 91, &["n1"], 1);
+        fail_and_requeue(&cluster, 91);
+        let now = Utc::now();
+        let elsewhere = chrono::Duration::seconds(600);
+        cluster.recent_stops().record(91, 1, "n2", now, elsewhere);
+        cluster.recent_stops().record(91, 0, "n1", now, elsewhere);
+        cluster.recent_stops().record(92, 1, "n1", now, elsewhere);
+
+        assert_eq!(
+            stale_pairs(&cluster, "n1", &[report_run(91, 1)], now),
+            vec![(91, 1)],
+            "a stop to another node, run, or job is no stop to this run"
+        );
+    }
+
+    /// A job gone terminal while its node still runs part of it keeps the same window.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_a_terminal_job_whose_stop_was_delivered() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(config_with_kill_wait(30), dir.path()).unwrap(),
+        );
+        place(&cluster, 93, &["n1"], 1);
+        cluster.apply_operation(&WalOperation::job_state_change(
+            93,
+            JobState::Pending,
+            JobState::Cancelled,
+        ));
+        let delivered = Utc::now();
+        cluster
+            .recent_stops()
+            .record(93, 1, "n1", delivered, chrono::Duration::seconds(600));
+        let reported = [report_run(93, 1)];
+
+        assert!(stale_pairs(&cluster, "n1", &reported, delivered).is_empty());
+        assert_eq!(
+            stale_pairs(
+                &cluster,
+                "n1",
+                &reported,
+                delivered + cancel_reclaim_grace(30)
+            ),
+            vec![(93, 1)]
+        );
+    }
+
+    /// A job the controller has forgotten takes the default kill wait for its window.
+    #[tokio::test]
+    async fn stale_reported_jobs_applies_the_kill_wait_window_to_a_forgotten_job() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(config_with_kill_wait(30), dir.path()).unwrap(),
+        );
+        place(&cluster, 94, &["n1"], 1);
+        cluster.apply_operation(&WalOperation::job_state_change(
+            94,
+            JobState::Pending,
+            JobState::Cancelled,
+        ));
+        cluster.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![94],
+        });
+        assert_eq!(job_state(&cluster, 94), None);
+        let delivered = Utc::now();
+        cluster
+            .recent_stops()
+            .record(94, 1, "n1", delivered, chrono::Duration::seconds(600));
+        let reported = [report_run(94, 1)];
+
+        assert!(stale_pairs(&cluster, "n1", &reported, delivered).is_empty());
+        assert_eq!(
+            stale_pairs(
+                &cluster,
+                "n1",
+                &reported,
+                delivered + cancel_reclaim_grace(30)
+            ),
+            vec![(94, 1)]
         );
     }
 
@@ -10220,6 +10463,16 @@ mod tests {
         svc.heartbeat(beat(&[30])).await.expect("heartbeat");
         assert!(svc.cluster.reports_stale_jobs("n1"));
 
+        svc.heartbeat(beat(&[])).await.expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
+
+        // A run that was just sent a stop is not re-sent one, but the node still
+        // holds it until it is gone.
+        svc.cluster
+            .recent_stops()
+            .record(30, 0, "n1", Utc::now(), chrono::Duration::seconds(600));
+        svc.heartbeat(beat(&[30])).await.expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
         svc.heartbeat(beat(&[])).await.expect("heartbeat");
         assert!(!svc.cluster.reports_stale_jobs("n1"));
 

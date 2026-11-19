@@ -215,7 +215,10 @@ control socket. The supervisor translates them to the workload:
    kill (catches pid-reuse races)
 
 `Shutdown` triggers `begin_teardown()` internally, sending SIGTERM via the
-same cgroup-first path.
+same cgroup-first path. The SIGTERM is sent once per run: a repeated
+`Shutdown` during teardown is acknowledged without re-signalling, unless the
+first attempt reached no process. `SignalAllocation` never marks teardown, so
+explicit signals (and the preemption-grace warning) are always delivered.
 
 ## I/O management
 
