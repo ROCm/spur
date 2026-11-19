@@ -229,22 +229,4 @@ state_dir = "/tmp/spur"
             config.controller.listen_addr
         );
     }
-
-    #[test]
-    #[allow(clippy::unnecessary_literal_unwrap)]
-    fn t52_17_cli_listen_overrides_config() {
-        // When --listen CLI arg is provided it wins; when absent, config value is used.
-        let config_addr = "[::]:6821";
-
-        let with_cli = Some("[::]:6822".to_string());
-        let final_addr = with_cli.unwrap_or_else(|| config_addr.to_string());
-        assert_eq!(final_addr, "[::]:6822", "CLI --listen must override config");
-
-        let no_cli: Option<String> = None;
-        let final_addr = no_cli.unwrap_or_else(|| config_addr.to_string());
-        assert_eq!(
-            final_addr, "[::]:6821",
-            "config listen_addr used when --listen absent"
-        );
-    }
 }

@@ -484,25 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn t07_19_federation_forward_decision() {
-        // If local scheduler returns fewer assignments than pending jobs,
-        // and federation is configured, unscheduled jobs should be forwarded.
-        // This tests the decision logic (not the RPC call itself).
-        let pending_count = 3usize;
-        let assigned_count = 1usize;
-        let has_federation = true;
-
-        let should_forward = has_federation && assigned_count < pending_count;
-        assert!(
-            should_forward,
-            "should forward when local can't schedule all"
-        );
-
-        let should_forward_no_peers = false;
-        assert!(!should_forward_no_peers, "no peers → no forward");
-    }
-
-    #[test]
     fn t07_20_federation_peer_address_format() {
         use spur_core::config::ClusterPeer;
         let peer = ClusterPeer {
