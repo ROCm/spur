@@ -11,9 +11,10 @@ job, the agent keeps the stale local allocation and rejects the next dispatch
 ("controller-allocated GPUs unavailable"), stranding the node until the job
 requeues to JobHoldMaxRequeue.
 
-This reproduces the stall deterministically without GPUs: rank 0 exits (and
-reports), rank 1 sleeps on a unique marker and never reports, so the job sits
-in COMPLETING until the shortened timeout force-finishes it. The fix must
+This reproduces the stall deterministically without GPUs: rank 0 fails, which
+ends the run and has Spur stop rank 1. Rank 1 ignores that SIGTERM and sleeps
+on a unique marker, and the kill wait outlasts the shortened completing wait,
+so the job sits in COMPLETING until the timeout force-finishes it. The fix must
 deliver a cancel to rank 1's node, killing the orphaned marker process.
 
 Requires at least 2 nodes in SPUR_TEST_NODES.
@@ -29,10 +30,17 @@ from cluster import parse_job_id, wait_job
 class TestCompletingTimeoutCancel:
     # Well above the 10s force-finish tick, low enough to keep the test fast.
     COMPLETE_WAIT = 15
+    # Far past the completing wait, so the force-finish, not the stop, ends rank 1.
+    KILL_WAIT = 120
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"scheduler": {"complete_wait_secs": self.COMPLETE_WAIT}}
+        return {
+            "scheduler": {
+                "complete_wait_secs": self.COMPLETE_WAIT,
+                "kill_wait_secs": self.KILL_WAIT,
+            }
+        }
 
     def test_completing_timeout_cancels_stuck_node(self, multi_node_cluster):
         cluster = multi_node_cluster
@@ -42,9 +50,10 @@ class TestCompletingTimeoutCancel:
         script = cluster.write_file(
             "completing-stuck.sh",
             "#!/bin/bash\n"
-            # Rank 0 exits immediately -> reports -> job enters COMPLETING.
-            'if [ "${SPUR_NODE_RANK}" = "0" ]; then exit 0; fi\n'
-            # Rank 1 outlives the run and never reports.
+            # Rank 0's failure ends the run -> job enters COMPLETING.
+            'if [ "${SPUR_NODE_RANK}" = "0" ]; then exit 3; fi\n'
+            # Rank 1 shrugs off the stop and never reports.
+            "trap '' TERM\n"
             f"sleep {marker}\n",
         )
         sb = cluster.sbatch(["-J", "completing-stuck", "-N", "2", script])
