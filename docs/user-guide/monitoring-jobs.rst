@@ -888,9 +888,9 @@ the job is preempted immediately.
   container, your command runs as PID 1 of it, which sees SIGTERM only if it
   installs a handler. Without one it runs until the SIGKILL. A step joins its
   job's container only on the node that runs the job's own process (the batch
-  node), and there it is not PID 1: an untrapped SIGTERM ends it. On the job's
-  other nodes a step with ``--container-image`` creates its own container, and
-  its command is PID 1.
+  node), and there it is not PID 1: a SIGTERM it does not trap ends it. On the
+  job's other nodes a step with ``--container-image`` creates its own container,
+  and its command is PID 1.
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
