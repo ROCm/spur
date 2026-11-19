@@ -233,21 +233,66 @@ Protected, reserved-pending, suspended, completing, grace-period, and same-cycle
 allocations remain charged. Unaccounted occupancy is retained; missing or
 inconsistent slices grant no release credit.
 
-For uniform requests with single-node victims, `direct_victims` uses the real
-`find_suitable_nodes` filter and calculates each node's CPU, memory, typed/stable
-GPU and partition-cap shortfall. It removes eligible allocations in QOS/configured
-order, prunes unnecessary local victims, and ranks the sufficient node groups with
-`VictimSearch`. The combined set gets one real placement verification. Protected
-allocations and charges stay present. A zero-victim result also needs verification.
+For supported uniform or exclusive requests with single-node victims,
+`direct_victims` uses the real `find_suitable_nodes` filter and calculates each
+node's CPU, memory, typed/stable GPU and partition-cap shortfall. It examines
+nodes sequentially, removes eligible allocations in QOS/configured order,
+prunes unnecessary local victims, and ranks
+the sufficient node groups with `VictimSearch`. The combined set gets one real
+placement verification. Protected allocations and charges stay present. A
+zero-victim result also needs verification.
 
-Uneven requests, multi-node victims, additive required nodes and partition memory
-policies use a fallback. It checks unchanged and all-eligible projections, bisects
-an ordered prefix while retaining a proven sufficient set, then repeatedly prunes
+#### Direct-selection eligibility
+
+`direct_victims` checks these conditions after candidate validation and before
+building local groups. Any matching condition chooses fallback:
+
+| Condition | Scope |
+| --- | --- |
+| Unequal per-node CPU or GPU counts | Non-exclusive incoming jobs only |
+| Positive `GpuDemand::Total` across multiple nodes | Non-exclusive incoming jobs, even when the total divides evenly |
+| A candidate victim holds allocations on multiple nodes | Any job in the validated eligible list, even if it would not be selected |
+| `NodePlacement::nodelist_is_additive()` | The incoming job requires named nodes plus additional nodes |
+| A partition has a memory-policy field listed below | Any partition in the supplied scheduler state, including unrelated partitions |
+
+The victim-width gate concerns the eligible list, not the incoming job's node
+count. A protected multi-node holder does not trigger that gate, but its slices
+remain allocated. `--exclusive` bypasses only the uneven-resource and GPU-total
+shape gates; it does not bypass the victim-width, additive-list or memory-policy
+gates. Node inventory must still satisfy the request.
+
+#### Partition memory-policy gates
+
+The memory-policy gate tests field presence, even when the job already specifies
+memory or needs no adjustment. `Partition::has_memory_policy()` covers the first
+four fields; `direct_victims` also checks `max_mem_per_node`. Values are in MiB.
+
+| Partition field | Placement effect |
+| --- | --- |
+| `def_mem_per_node` | Supplies default memory per node when memory is omitted |
+| `def_mem_per_cpu` | Supplies default memory per CPU when memory is omitted |
+| `def_mem_per_gpu` | Supplies default memory per GPU when memory is omitted |
+| `max_mem_per_cpu` | Can raise the job's CPU requirement to satisfy the memory-per-CPU limit |
+| `max_mem_per_node` | Limits one job's memory request on one node |
+
+An explicit job memory request and the cumulative partition cap
+`max_tres_per_node.mem` do not trigger fallback by themselves. Local selection
+already checks cumulative partition charges. The presence-based check over all
+partitions is broader than checking whether the incoming request needs adjustment
+in one of its candidate partitions.
+
+#### Fallback search
+
+Too few sufficient local groups or a failed final placement verification also
+choose fallback. It checks unchanged and all-eligible projections, bisects an
+ordered prefix while retaining a proven sufficient set, then repeatedly prunes
 unnecessary victims. Placement is not assumed monotone under scheduler heuristics;
 every accepted set has its own placement proof. The node-ranking heap supplies the
 preferred group using QOS priority, `scheduler.preempt_victim_order`, then node
 name. Suspension-aware work facts come from held jobs without accounting queries.
 There is no globally minimum-victim guarantee.
+
+#### Trial state and bounds
 
 `PlacementProjection` owns the bounded `PlacementRequest`, compact node copies
 and partition usage. Its static inputs cannot change between trials; only held
@@ -269,9 +314,9 @@ hostlist expansion. A 4096-node, eight-GPU fixture exercises capture and selecti
 under the default limits.
 
 Held-allocation traversal uses temporary membership sets for jobs wider than two
-nodes, avoiding repeated long node-list scans. Snapshot construction, ownership validation, and partition
-charges retain only allocated nodes without completion reports. No additional
-persisted allocation index is introduced.
+nodes, avoiding repeated long node-list scans. Snapshot construction, ownership
+validation, and partition charges retain only allocated nodes without completion
+reports. No additional persisted allocation index is introduced.
 
 Each reclaim and QOS-preemption pass has its own `SearchBudget` with `MAX_TRIALS`
 (2064, `2 * MAX_VICTIMS + 16`) placement calls and `MAX_WORK` (2000000) work units.
@@ -281,6 +326,44 @@ logged with the job ID. Incomplete searches evict nothing, even if pruning had a
 sufficient intermediate set. Complex requests can still defer at these limits.
 Reclaim skips snapshot construction when no pending request or eligible borrower
 exists. Heterogeneous job groups and GPU property/fabric-binding requests defer.
+
+#### Performance assessment
+
+The common path reduces full placement calls when local sufficient groups pass
+verification, particularly when many victims are necessary. It still scans
+candidate nodes, calculates local shortfalls and ranks groups; one full trial
+does not mean constant work or a proportional latency improvement. GPU matching
+and partition charges also affect the cost of each local resource check.
+
+Fallback bisection reduces growth trials for large necessary prefixes, but can
+make more full calls than linear growth when an early victim alone suffices.
+Mostly one-/two-node incoming jobs therefore do not establish a performance win:
+eligible victim widths and the partition gates determine which path runs.
+Pruning and all preparation remain charged against the bounded search budget.
+
+Both paths use temporary snapshots and mutable trial state. The common path
+also uses per-node groups and node indices, trading temporary storage for fewer
+scans. Projections are reused; trial count does not multiply the number of live
+snapshots. Inline type sizes and selected container payloads exclude owned heap
+contents, spare capacity and allocator overhead, so they are not total RSS or a
+measurement of the net memory difference between algorithms.
+
+The available mixed-workload timing evidence compares candidate/index processing
+within the implementation that already has the common path and bisection. Those
+fixtures use fallback. Their similar selection latency and process RSS do not
+establish a speedup over the original linear search, or an end-to-end scheduler
+speedup; snapshot construction and dispatch are outside that timing interval.
+Unoptimized test-process measurements are not production latency or memory
+bounds. An overall performance claim for mostly one-/two-node workloads still
+needs a direct original/current comparison with the same victim layouts and
+partition policies, including cases needing only one or two victims.
+
+The [worked search-cost comparisons](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-search-cost-comparisons),
+[temporary-memory calculations](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-temporary-memory-example),
+and [recorded measurement scope](../../plans/2026-11-16-resource-aware-victim-selection.md#recorded-measurements-of-the-later-indexing-follow-up)
+separate analytic operation counts, build-specific layouts and observed timings.
+
+#### Reclaim ordering
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching
