@@ -131,6 +131,18 @@ fn device_claim_status(job_id: u32, error: AllocError) -> Status {
     }
 }
 
+/// A typed step narrows only the job's GPUs; every other device the job holds
+/// stays reachable from the step.
+fn step_launch_devices(
+    job_devices: &spur_devices::DeviceSelection,
+    step_gpus: Option<&[u64]>,
+) -> spur_devices::DeviceSelection {
+    match step_gpus {
+        Some(gpus) => job_devices.clone().with("gpu", gpus.to_vec()),
+        None => job_devices.clone(),
+    }
+}
+
 /// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
@@ -9029,12 +9041,8 @@ impl SlurmAgent for AgentService {
                 .await?
             }
         };
-        let launch_gpus = step_limits
-            .gpus
-            .clone()
-            .unwrap_or_else(|| gpu_devices.clone());
-
-        let launch_devices = job_devices.clone().with("gpu", launch_gpus.clone());
+        let launch_devices = step_launch_devices(&job_devices, step_limits.gpus.as_deref());
+        let launch_gpus = launch_devices.gpus().to_vec();
         let (mut gpu_env, host_device_plan, container_device_plan) = if launch_devices.is_empty() {
             (HashMap::new(), None, None)
         } else {
@@ -17141,6 +17149,41 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&CdiCache::new(), &GresCache::from_entries(&gres));
         reg
+    }
+
+    #[test]
+    fn a_typed_step_in_a_gpu_and_vnic_job_takes_one_gpu_and_keeps_every_nic() {
+        let job = spur_devices::DeviceSelection::new()
+            .with("gpu", vec![10, 11])
+            .with("vnic", vec![0x900, 0x901]);
+        let step = step_launch_devices(&job, Some(&[11]));
+        assert_eq!(step.gpus(), &[11]);
+        assert_eq!(step.of("vnic"), &[0x900, 0x901]);
+        assert_eq!(step_launch_devices(&job, None), job);
+    }
+
+    #[test]
+    fn a_typed_step_device_filter_still_allows_the_jobs_uverbs() {
+        let reg = test_gpu_and_nic_registry();
+        let ids = |gres: &str| -> Vec<u64> {
+            reg.list()
+                .iter()
+                .filter(|e| e.gres_name == gres)
+                .map(|e| e.stable_id)
+                .collect()
+        };
+        let (gpus, nics) = (ids("gpu"), ids("nic"));
+        let job = spur_devices::DeviceSelection::new()
+            .with("gpu", gpus.clone())
+            .with("nic", nics);
+        let step = step_launch_devices(&job, Some(&gpus[..1]));
+        let (host, _) = reg.build_job_injection_plans(&step, 1000, 1000).unwrap();
+        for path in ["/dev/infiniband/uverbs0", "/dev/infiniband/uverbs1"] {
+            assert!(host.device_paths.contains(&path.to_string()), "{path}");
+        }
+        assert!(!host
+            .device_paths
+            .contains(&"/dev/dri/renderD129".to_string()));
     }
 
     #[test]

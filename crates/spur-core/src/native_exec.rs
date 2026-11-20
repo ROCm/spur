@@ -611,6 +611,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cgroup_budget_for_a_nic_only_job_ignores_cpus_per_gpu() {
+        let mut per_gpu = job_spec(1, 0, 0);
+        per_gpu.cpus_per_gpu = Some(8);
+        per_gpu.memory_per_gpu_mb = 1000;
+        let mut alloc = alloc_with_gpus(0, 0, 2);
+        let nics = alloc.devices.remove("gpu").unwrap();
+        alloc.devices.insert("vnic".into(), nics);
+        assert_eq!(resolve_cgroup_budget(Some(&alloc), &per_gpu, 1), (1, 0));
+    }
+
+    #[test]
     fn resolve_memory_ceiling_prefers_the_controllers_value() {
         assert_eq!(resolve_memory_ceiling(16_384, 8192), 16_384);
     }
