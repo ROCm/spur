@@ -3345,6 +3345,7 @@ async fn register_allocation_to_agent(
         .await
         .map_err(|e| RegisterError::Failed(e.into()))?;
 
+    #[allow(deprecated)]
     let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
             job_id: params.job_id,
@@ -5676,11 +5677,11 @@ pub(crate) mod tests {
 
     fn gpu(device_id: u32, gpu_type: &str) -> Device {
         Device {
+            numa_node: None,
+            affinity_cpus: Vec::new(),
             gres_name: "gpu".into(),
             device_type: gpu_type.into(),
             stable_id: device_id as u64,
-            numa_node: None,
-            affinity_cpus: Vec::new(),
             index: device_id,
             topology: None,
         }

@@ -175,7 +175,7 @@ pub struct JobLaunchConfig {
     /// The node's schedulable memory, applied as the job's cgroup ceiling only
     /// when `memory_mb` is 0 (no request of its own); 0 = no ceiling known.
     pub memory_ceiling_mb: u64,
-    pub gpu_devices: Vec<u64>,
+    pub devices: spur_devices::DeviceSelection,
     pub cpu_ids: Vec<u32>,
     pub open_mode: Option<String>,
     pub uid: u32,
@@ -581,24 +581,27 @@ pub async fn launch_job(
 ) -> Result<LaunchResult, LaunchError> {
     // Run prolog before anything else
     if let Some(ref prolog) = cfg.prolog_script {
-        let ctx = spur_core::hooks::HookContext {
-            job_id: cfg.job_id,
-            work_dir: cfg.work_dir.clone(),
-            uid: cfg.uid,
-            gid: cfg.gid,
-            partition: cfg.partition.clone(),
-            nodelist: cfg.nodelist.clone(),
-            script_context: "prolog_slurmd".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
-            cpus: cfg.cpus,
-            memory_mb: cfg.memory_mb,
-        };
-        spur_core::hooks::run_hook(prolog, &ctx)
+        spur_core::hooks::run_hook(prolog, &prolog_context(cfg))
             .await
             .map_err(LaunchError::PrologFailed)?;
     }
 
     spawn_job_process(cfg, spank).await
+}
+
+fn prolog_context(cfg: &JobLaunchConfig) -> spur_core::hooks::HookContext {
+    spur_core::hooks::HookContext {
+        job_id: cfg.job_id,
+        work_dir: cfg.work_dir.clone(),
+        uid: cfg.uid,
+        gid: cfg.gid,
+        partition: cfg.partition.clone(),
+        nodelist: cfg.nodelist.clone(),
+        script_context: "prolog_slurmd".into(),
+        gpu_devices: cfg.devices.gpus().to_vec(),
+        cpus: cfg.cpus,
+        memory_mb: cfg.memory_mb,
+    }
 }
 
 /// A typed step runs under its own CPUs, not the whole job's; untyped steps
@@ -623,7 +626,7 @@ async fn spawn_job_process(
         cpus,
         memory_mb,
         memory_ceiling_mb,
-        gpu_devices: _,
+        devices: _,
         ref cpu_ids,
         ref open_mode,
         uid,
@@ -789,7 +792,7 @@ async fn spawn_job_process(
             partition: cfg.partition.clone(),
             nodelist: cfg.nodelist.clone(),
             script_context: "prolog_task".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
+            gpu_devices: cfg.devices.gpus().to_vec(),
             cpus,
             memory_mb,
         };
@@ -826,7 +829,7 @@ async fn spawn_job_process(
                 partition: cfg.partition.clone(),
                 nodelist: cfg.nodelist.clone(),
                 script_context: "epilog_task".into(),
-                gpu_devices: cfg.gpu_devices.clone(),
+                gpu_devices: cfg.devices.gpus().to_vec(),
                 cpus,
                 memory_mb,
             };
@@ -3348,6 +3351,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_prolog_gets_the_stable_ids_of_the_jobs_gpus() {
+        let mut cfg = launch_cfg_for_paths(1, "job", "spur", "node-a");
+        cfg.devices = spur_devices::DeviceSelection::new()
+            .with("gpu", vec![327680])
+            .with("vnic", vec![0x900]);
+        cfg.host_device_plan = Some(spur_devices::inject::HostInjectionPlan {
+            env: [("SPUR_JOB_GPUS".to_string(), "0".to_string())].into(),
+            ..Default::default()
+        });
+        let ctx = prolog_context(&cfg);
+        assert_eq!(ctx.gpu_devices, vec![327680]);
+        assert_eq!(ctx.script_context, "prolog_slurmd");
+    }
+
+    #[test]
     fn step_output_enospc_under_the_owned_root_is_a_node_fault() {
         let path = Path::new("/var/spool/spur/job9/step0.out");
         let err = step_output_open_error(path, std::io::Error::from_raw_os_error(libc::ENOSPC));
@@ -4521,7 +4539,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             memory_ceiling_mb: 0,
-            gpu_devices: Vec::new(),
+            devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
             cpu_ids: Vec::new(),
             open_mode: None,
             uid: 0,

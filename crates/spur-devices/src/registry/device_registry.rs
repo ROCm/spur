@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{bail, Result};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::cdi::cache::CdiCache;
 use crate::gres::cache::CountableGresPool;
@@ -13,21 +13,67 @@ use crate::inject::{
     build_injection_plans, ContainerInjectionPlan, HostInjectionPlan, InjectActions,
 };
 use crate::registry::entry::{entry_matches_gres_name, from_cdi, DeviceCapability, DeviceEntry};
-use crate::types::DeviceSelection;
+use crate::selection::DeviceSelection;
+
+/// A countable pool dropped because its name is handed out by device.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShadowedPool {
+    pub gres_name: String,
+    pub resource_type: Option<String>,
+}
+
+/// How a configured entry or a candidate device was resolved. Kept as data
+/// because the registry is rebuilt every refresh; the caller logs changes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegistryNote {
+    /// Merged into the discovered devices it names.
+    Merged { paths: Vec<String> },
+    /// Merged, but these nodes are not on the devices it names.
+    DroppedNodes {
+        paths: Vec<String>,
+        dropped: Vec<String>,
+    },
+    /// Names only nodes every device of its kind shares, so names no device.
+    SharedOnly { paths: Vec<String> },
+    /// Skipped as a duplicate of a device already kept.
+    Duplicate {
+        kind: String,
+        existing_kind: String,
+        paths: Vec<String>,
+        rule: &'static str,
+    },
+}
 
 pub struct DeviceRegistry {
     devices: Vec<DeviceEntry>,
+    shadowed: Vec<ShadowedPool>,
+    notes: Vec<RegistryNote>,
 }
 
 impl DeviceRegistry {
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
+            shadowed: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
     pub fn populate(&mut self, cdi_cache: &CdiCache, gres_cache: &GresCache) {
+        self.populate_with_history(cdi_cache, gres_cache, &BTreeSet::new());
+    }
+
+    /// `by_id_history` names kinds handed out by device before: their pools
+    /// stay dropped even with no device of that name left, so jobs pend
+    /// instead of running without the devices they asked for.
+    pub fn populate_with_history(
+        &mut self,
+        cdi_cache: &CdiCache,
+        gres_cache: &GresCache,
+        by_id_history: &BTreeSet<String>,
+    ) {
         self.devices.clear();
+        self.notes.clear();
         let mut candidates = Vec::new();
 
         let mut cdi_entries: Vec<(String, DeviceEntry)> = cdi_cache
@@ -39,16 +85,10 @@ impl DeviceRegistry {
         let mut configured = Vec::new();
         for expanded in &gres_cache.injectable {
             let entry = expanded_to_device_entry(expanded);
-            if names_only_shared_nodes(&entry) {
-                let paths: Vec<&str> = entry.node_paths().collect();
-                warn!(
-                    paths = ?paths,
-                    "configured device names only nodes every device of its kind shares; dropping it"
-                );
-                continue;
-            }
-            if !merge_into_discovered(&entry, &mut cdi_entries) {
-                configured.push(entry);
+            match merge_into_discovered(&entry, &mut cdi_entries) {
+                Merge::Merged(notes) => self.notes.extend(notes),
+                Merge::SharedOnly(note) => self.notes.push(note),
+                Merge::Unmatched => configured.push(entry),
             }
         }
         candidates.extend(cdi_entries.into_iter().map(|(_, entry)| entry));
@@ -59,16 +99,35 @@ impl DeviceRegistry {
         }
 
         // CDI is filled first, so it wins over GRES naming the same device.
-        self.devices = dedup_by_device_paths(candidates);
+        let kept = dedup_by_device_paths(candidates, &mut self.notes);
+        let (devices, shadowed) = drop_shadowed_pools(kept, by_id_history);
+        self.devices = devices;
+        self.shadowed = shadowed;
+        self.notes.sort();
+        self.notes.dedup();
         assign_device_ids(&mut self.devices);
+    }
+
+    pub fn shadowed_pools(&self) -> &[ShadowedPool] {
+        &self.shadowed
+    }
+
+    pub fn notes(&self) -> &[RegistryNote] {
+        &self.notes
+    }
+
+    pub fn by_id_names(&self) -> BTreeSet<String> {
+        self.devices
+            .iter()
+            .filter(|e| e.is_injectable())
+            .map(|e| e.gres_name.clone())
+            .collect()
     }
 
     pub fn resolve_by_ids(&self, name: &str, device_ids: &[u64]) -> Result<Vec<&DeviceEntry>> {
         let mut resolved = Vec::new();
         for &id in device_ids {
-            let found = self.devices.iter().find(|e| {
-                e.is_injectable() && entry_matches_gres_name(e, name) && e.stable_id == id
-            });
+            let found = self.devices.iter().find(|e| is_injectable_id(e, name, id));
             match found {
                 Some(entry) => resolved.push(entry),
                 None => bail!(
@@ -89,10 +148,23 @@ impl DeviceRegistry {
         job_gid: u32,
     ) -> Result<(HostInjectionPlan, ContainerInjectionPlan)> {
         let mut devices = Vec::new();
-        for (gres_name, ids) in selection {
+        for (gres_name, ids) in selection.iter() {
             devices.extend(self.resolve_by_ids(gres_name, ids)?);
         }
         Ok(build_injection_plans(&devices, job_uid, job_gid))
+    }
+
+    /// Whether `key` (`name` or `name:type`) names one of this node's countable pools.
+    pub fn has_countable_pool(&self, key: &str) -> bool {
+        self.devices
+            .iter()
+            .filter(|e| e.is_countable_pool())
+            .any(
+                |e| match e.resource_type.as_deref().filter(|t| !t.is_empty()) {
+                    Some(t) => key == format!("{}:{t}", e.gres_name),
+                    None => key == e.gres_name,
+                },
+            )
     }
 
     pub fn has_injectable(&self, gres_name: &str) -> bool {
@@ -101,27 +173,47 @@ impl DeviceRegistry {
             .any(|e| e.is_injectable() && e.gres_name == gres_name)
     }
 
+    /// Whether `stable_id` resolves for injection, as `resolve_by_ids` would.
+    pub fn has_injectable_id(&self, gres_name: &str, stable_id: u64) -> bool {
+        self.devices
+            .iter()
+            .any(|e| is_injectable_id(e, gres_name, stable_id))
+    }
+
     /// The registry to inject from: `pinned` ids keep `previous`'s device even
-    /// where the new layout reuses the id; unreported `gres_name` ones drop.
+    /// where the new layout reuses the id, and ids of a reported kind that the
+    /// report left out drop. Kinds the report does not name are left as found.
     pub fn with_pinned(
         mut self,
         previous: &DeviceRegistry,
-        gres_name: &str,
-        reported: &std::collections::HashSet<u64>,
-        pinned: &std::collections::HashSet<u64>,
+        reported: &DeviceSelection,
+        pinned: &DeviceSelection,
     ) -> DeviceRegistry {
+        let names_kind = |selection: &DeviceSelection, gres: &str| {
+            selection.iter().any(|(kind, _)| kind == gres)
+        };
         // Exact name, as the reported inventory is built from it.
-        let is_gres = |e: &DeviceEntry| e.is_injectable() && e.gres_name == gres_name;
+        let is_pinned =
+            |e: &DeviceEntry| e.is_injectable() && pinned.of(&e.gres_name).contains(&e.stable_id);
         self.devices.retain(|e| {
-            !is_gres(e) || (reported.contains(&e.stable_id) && !pinned.contains(&e.stable_id))
+            if !e.is_injectable() || !names_kind(reported, &e.gres_name) {
+                return true;
+            }
+            reported.of(&e.gres_name).contains(&e.stable_id) && !is_pinned(e)
         });
         let kept: Vec<DeviceEntry> = previous
             .devices
             .iter()
-            .filter(|e| is_gres(e) && pinned.contains(&e.stable_id))
+            .filter(|e| is_pinned(e))
             .cloned()
             .collect();
         self.devices.extend(kept);
+        let (devices, shadowed) =
+            drop_shadowed_pools(std::mem::take(&mut self.devices), &BTreeSet::new());
+        self.devices = devices;
+        self.shadowed.extend(shadowed);
+        self.shadowed.sort();
+        self.shadowed.dedup();
         self
     }
 
@@ -223,35 +315,48 @@ fn sort_cdi_entries(entries: &mut [(String, DeviceEntry)]) {
     entries.sort_by(|(a_name, a), (b_name, b)| cdi_sort_key(a, b).then_with(|| a_name.cmp(b_name)));
 }
 
+fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
+    entry.is_injectable()
+        && entry_matches_gres_name(entry, gres_name)
+        && entry.stable_id == stable_id
+}
+
 fn primary_device_path(entry: &DeviceEntry) -> &str {
     entry.node_paths().next().unwrap_or("")
 }
 
-/// `/dev/kfd` alone, say: every device of its kind has it, so it names none.
-fn names_only_shared_nodes(entry: &DeviceEntry) -> bool {
-    entry.node_paths().next().is_some() && entry.own_node_paths().next().is_none()
+enum Merge {
+    Merged(Vec<RegistryNote>),
+    SharedOnly(RegistryNote),
+    Unmatched,
 }
 
 /// Merges a configured entry into the discovered devices of its name it names
 /// (exact-path dedup would miss it, since a GPU also carries a `cardN` node).
-/// Its nodes outside those devices are dropped; an entry naming none of them
-/// stays for dedup.
+/// Its nodes outside those devices are dropped; an entry naming only shared
+/// nodes (`/dev/kfd`) names no device; any other entry stays for dedup.
 fn merge_into_discovered(
     configured: &DeviceEntry,
     discovered: &mut [(String, DeviceEntry)],
-) -> bool {
+) -> Merge {
+    let paths: Vec<String> = configured.own_node_paths().map(str::to_owned).collect();
+    if paths.is_empty() && configured.node_paths().next().is_some() {
+        return Merge::SharedOnly(RegistryNote::SharedOnly {
+            paths: configured.node_paths().map(str::to_owned).collect(),
+        });
+    }
     let MergeTargets { targets, dropped } = merge_targets(configured, discovered);
     if targets.is_empty() {
-        return false;
+        return Merge::Unmatched;
     }
-    let paths: Vec<&str> = configured.own_node_paths().collect();
+    let mut notes = vec![RegistryNote::Merged {
+        paths: paths.clone(),
+    }];
     if !dropped.is_empty() {
-        warn!(
-            paths = ?paths,
-            dropped = ?dropped,
-            targets = ?targets,
-            "configured device names nodes the discovered devices it names lack; dropping them"
-        );
+        notes.push(RegistryNote::DroppedNodes {
+            paths,
+            dropped: dropped.into_iter().map(str::to_owned).collect(),
+        });
     }
     for &index in &targets {
         let device = &mut discovered[index].1;
@@ -263,8 +368,7 @@ fn merge_into_discovered(
         }
         device.inject_actions.merge(&configured.inject_actions);
     }
-    info!(paths = ?paths, "configured device merged into the discovered one");
-    true
+    Merge::Merged(notes)
 }
 
 /// The discovered devices a configured entry names, by index, and its own nodes
@@ -316,6 +420,35 @@ fn merge_targets<'a>(
 
 const GRES_KIND: &str = "spur.internal/gres";
 
+/// A countable pool named like a kind handed out by id would be counted by
+/// the controller and ignored by the agent, so discovered devices win. GPUs are
+/// always handed out by id, so a count-only `gpu` pool could never be used.
+fn drop_shadowed_pools(
+    devices: Vec<DeviceEntry>,
+    by_id_history: &BTreeSet<String>,
+) -> (Vec<DeviceEntry>, Vec<ShadowedPool>) {
+    let by_id: BTreeSet<String> = devices
+        .iter()
+        .filter(|e| e.is_injectable())
+        .map(|e| e.gres_name.clone())
+        .chain(std::iter::once("gpu".to_string()))
+        .chain(by_id_history.iter().cloned())
+        .collect();
+    let (shadowed, kept): (Vec<DeviceEntry>, Vec<DeviceEntry>) = devices
+        .into_iter()
+        .partition(|entry| entry.is_countable_pool() && by_id.contains(&entry.gres_name));
+    let mut shadowed: Vec<ShadowedPool> = shadowed
+        .into_iter()
+        .map(|entry| ShadowedPool {
+            gres_name: entry.gres_name,
+            resource_type: entry.resource_type,
+        })
+        .collect();
+    shadowed.sort();
+    shadowed.dedup();
+    (kept, shadowed)
+}
+
 fn sorted_node_paths(entry: &DeviceEntry) -> Vec<&str> {
     let mut paths: Vec<&str> = entry.node_paths().collect();
     paths.sort_unstable();
@@ -349,7 +482,10 @@ fn is_aggregate(entry: &DeviceEntry, candidates: &[DeviceEntry]) -> bool {
 
 /// Skips CDI aggregates, then a later entry naming a device already kept: the
 /// same node set, or for a GRES entry, any node it owns that a kept one owns.
-fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
+fn dedup_by_device_paths(
+    candidates: Vec<DeviceEntry>,
+    notes: &mut Vec<RegistryNote>,
+) -> Vec<DeviceEntry> {
     let aggregates: Vec<bool> = candidates
         .iter()
         .map(|entry| is_aggregate(entry, &candidates))
@@ -388,13 +524,12 @@ fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
             } else {
                 "gres-overlap"
             };
-            warn!(
-                duplicate_kind = %entry.kind,
-                existing_kind = %existing_kind,
-                paths = ?per_device_paths,
+            notes.push(RegistryNote::Duplicate {
+                kind: entry.kind.clone(),
+                existing_kind: existing_kind.clone(),
+                paths: per_device_paths,
                 rule,
-                "device duplicates one already kept; skipping"
-            );
+            });
             continue;
         }
 
@@ -414,7 +549,7 @@ mod tests {
     use crate::gres::entry::GresEntry;
     use crate::inject::merge_edits_from_devices;
     use crate::registry::entry::kind_matches_gres_name;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     fn populate_registry(
         reg: &mut DeviceRegistry,
@@ -500,8 +635,9 @@ mod tests {
     fn selection(entries: &[(&str, &[u64])]) -> DeviceSelection {
         entries
             .iter()
-            .map(|(gres, ids)| ((*gres).to_string(), ids.to_vec()))
-            .collect()
+            .fold(DeviceSelection::new(), |sel, (gres, ids)| {
+                sel.with(gres, ids.to_vec())
+            })
     }
 
     #[test]
@@ -601,16 +737,18 @@ mod tests {
                 gpu(0x110000, "/dev/dri/renderD128"),
                 gpu(0x110001, "/dev/dri/renderD129"),
             ],
+            ..DeviceRegistry::new()
         };
         let candidate = DeviceRegistry {
             devices: vec![
                 gpu(0x110000, "/dev/dri/renderD200"),
                 gpu(0x110001, "/dev/dri/renderD201"),
             ],
+            ..DeviceRegistry::new()
         };
-        let pinned: HashSet<u64> = [0x110000].into();
+        let pinned = DeviceSelection::new().with("gpu", vec![0x110000]);
 
-        let merged = candidate.with_pinned(&previous, "gpu", &pinned, &pinned);
+        let merged = candidate.with_pinned(&previous, &pinned, &pinned);
 
         let entries: Vec<(u64, &str)> = merged
             .list()
@@ -618,6 +756,44 @@ mod tests {
             .map(|e| (e.stable_id, primary_device_path(e)))
             .collect();
         assert_eq!(entries, vec![(0x110000, "/dev/dri/renderD128")]);
+    }
+
+    #[test]
+    fn a_pinned_device_of_any_kind_keeps_its_previous_entry() {
+        let nic = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry.gres_name = "nic".into();
+            entry
+        };
+        let previous = DeviceRegistry {
+            devices: vec![
+                nic(7, "/dev/infiniband/uverbs3"),
+                nic(8, "/dev/infiniband/uverbs4"),
+            ],
+            ..DeviceRegistry::new()
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![nic(8, "/dev/infiniband/uverbs0")],
+            ..DeviceRegistry::new()
+        };
+        let reported = DeviceSelection::new().with("nic", vec![7, 8]);
+        let pinned = DeviceSelection::new().with("nic", vec![7]);
+
+        let merged = candidate.with_pinned(&previous, &reported, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (8, "/dev/infiniband/uverbs0"),
+                (7, "/dev/infiniband/uverbs3")
+            ]
+        );
     }
 
     #[test]
@@ -635,6 +811,7 @@ mod tests {
                 gpu(0x120300, "/dev/dri/renderD131"),
                 gpu(0x110005, "/dev/dri/renderD133"),
             ],
+            ..DeviceRegistry::new()
         };
         let candidate = DeviceRegistry {
             devices: vec![
@@ -643,11 +820,14 @@ mod tests {
                 gpu(0x120000, "/dev/dri/renderD202"),
                 nic,
             ],
+            ..DeviceRegistry::new()
         };
-        let reported: HashSet<u64> = [0x110000, 0x110001, 0x120300].into();
-        let pinned: HashSet<u64> = [0x120300].into();
+        let reported = DeviceSelection::new()
+            .with("gpu", vec![0x110000, 0x110001, 0x120300])
+            .with("nic", vec![0x110003]);
+        let pinned = DeviceSelection::new().with("gpu", vec![0x120300]);
 
-        let merged = candidate.with_pinned(&previous, "gpu", &reported, &pinned);
+        let merged = candidate.with_pinned(&previous, &reported, &pinned);
 
         let entries: Vec<(u64, &str)> = merged
             .list()
@@ -687,7 +867,10 @@ mod tests {
 
     fn sorted_then_deduped(mut entries: Vec<(String, DeviceEntry)>) -> Vec<DeviceEntry> {
         sort_cdi_entries(&mut entries);
-        dedup_by_device_paths(entries.into_iter().map(|(_, e)| e).collect())
+        dedup_by_device_paths(
+            entries.into_iter().map(|(_, e)| e).collect(),
+            &mut Vec::new(),
+        )
     }
 
     fn rotations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
@@ -744,7 +927,10 @@ mod tests {
             let mut sorted = order;
             sort_cdi_entries(&mut sorted);
             assert_eq!(sorted[0].0, "example.com/gpu=0");
-            let kept = dedup_by_device_paths(sorted.into_iter().map(|(_, e)| e).collect());
+            let kept = dedup_by_device_paths(
+                sorted.into_iter().map(|(_, e)| e).collect(),
+                &mut Vec::new(),
+            );
             assert_eq!(kept.len(), 1);
         }
     }
@@ -773,6 +959,148 @@ mod tests {
             assert_eq!(kept.len(), 1);
             assert_eq!(kept[0].kind, "amd.com/gpu");
         }
+    }
+
+    fn count_only(name: &str, device_type: Option<&str>, count: u64) -> GresEntry {
+        GresEntry {
+            name: name.into(),
+            r#type: device_type.map(str::to_string),
+            count: Some(count),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }
+    }
+
+    fn nic_cache() -> CdiCache {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec(
+            "amd.com/nic",
+            &[
+                ("0", "/dev/infiniband/uverbs0"),
+                ("1", "/dev/infiniband/uverbs1"),
+            ],
+            ContainerEdits::default(),
+        )]);
+        cache
+    }
+
+    #[test]
+    fn a_countable_pool_named_like_discovered_devices_is_dropped() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(
+            &mut reg,
+            &nic_cache(),
+            &[
+                count_only("nic", None, 4),
+                count_only("nic", Some("pollara400"), 2),
+            ],
+        );
+        assert_eq!((reg.injectable_count(), reg.countable_count()), (2, 0));
+        assert_eq!(
+            reg.shadowed_pools(),
+            [shadowed("nic", None), shadowed("nic", Some("pollara400"))]
+        );
+    }
+
+    #[test]
+    fn a_count_only_gpu_pool_is_always_dropped() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &[count_only("gpu", None, 8)]);
+        assert_eq!(reg.countable_count(), 0);
+        assert_eq!(reg.shadowed_pools(), [shadowed("gpu", None)]);
+    }
+
+    #[test]
+    fn a_countable_pool_of_another_name_stays() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(
+            &mut reg,
+            &nic_cache(),
+            &[count_only("bandwidth", Some("lustre"), 64)],
+        );
+        assert_eq!(reg.countable_count(), 1);
+        assert!(reg.shadowed_pools().is_empty());
+    }
+
+    fn shadowed(gres_name: &str, resource_type: Option<&str>) -> ShadowedPool {
+        ShadowedPool {
+            gres_name: gres_name.into(),
+            resource_type: resource_type.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_pool_of_a_kind_handed_out_before_stays_dropped_after_its_devices_vanish() {
+        let pools = GresCache::from_entries(&[count_only("nic", None, 4)]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate_with_history(
+            &CdiCache::new(),
+            &pools,
+            &BTreeSet::from(["nic".to_string()]),
+        );
+        assert!(!reg.has_countable_pool("nic"));
+        assert_eq!(reg.shadowed_pools(), [shadowed("nic", None)]);
+
+        let mut fresh = DeviceRegistry::new();
+        fresh.populate(&CdiCache::new(), &pools);
+        assert!(fresh.has_countable_pool("nic"));
+        assert!(fresh.shadowed_pools().is_empty());
+    }
+
+    #[test]
+    fn a_pool_beside_pinned_devices_of_its_name_is_dropped() {
+        let mut previous = DeviceRegistry::new();
+        populate_registry(
+            &mut previous,
+            &CdiCache::new(),
+            &[GresEntry {
+                name: "nic".into(),
+                file: Some("/dev/infiniband/uverbs[0-1]".into()),
+                ..Default::default()
+            }],
+        );
+        let mut candidate = DeviceRegistry::new();
+        populate_registry(
+            &mut candidate,
+            &CdiCache::new(),
+            &[count_only("nic", None, 4)],
+        );
+
+        let merged = candidate.with_pinned(
+            &previous,
+            &DeviceSelection::new().with("nic", vec![]),
+            &DeviceSelection::new().with("nic", vec![1]),
+        );
+
+        assert!(merged.has_injectable("nic"));
+        assert!(!merged.has_countable_pool("nic"));
+        assert_eq!(merged.shadowed_pools(), [shadowed("nic", None)]);
+    }
+
+    #[test]
+    fn by_id_names_lists_every_injectable_kind() {
+        let mut reg = DeviceRegistry::new();
+        populate_registry(
+            &mut reg,
+            &CdiCache::new(),
+            &[
+                GresEntry {
+                    name: "gpu".into(),
+                    file: Some("/dev/dri/renderD128".into()),
+                    ..Default::default()
+                },
+                GresEntry {
+                    name: "nic".into(),
+                    file: Some("/dev/infiniband/uverbs0".into()),
+                    ..Default::default()
+                },
+                count_only("bandwidth", None, 64),
+            ],
+        );
+        assert_eq!(
+            reg.by_id_names(),
+            BTreeSet::from(["gpu".to_string(), "nic".to_string()])
+        );
     }
 
     #[test]
@@ -1900,7 +2228,42 @@ mod tests {
             let mut reg = DeviceRegistry::new();
             populate_registry(&mut reg, &cache, &kfd_only);
             assert_eq!(reg.injectable_count(), before, "/dev/kfd names no GPU");
+            assert_eq!(
+                reg.notes(),
+                [RegistryNote::SharedOnly {
+                    paths: vec!["/dev/kfd".into()]
+                }]
+            );
         }
+    }
+
+    #[test]
+    fn merges_and_dropped_nodes_are_recorded_not_logged() {
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/renderD200".into()),
+            ..Default::default()
+        }];
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &discovered_gpus(&[None]), &gres);
+        let paths = vec![
+            "/dev/dri/renderD128".to_string(),
+            "/dev/dri/renderD200".into(),
+        ];
+        assert_eq!(
+            reg.notes(),
+            [
+                RegistryNote::Merged {
+                    paths: paths.clone()
+                },
+                RegistryNote::DroppedNodes {
+                    paths,
+                    dropped: vec!["/dev/dri/renderD200".into()]
+                },
+            ]
+        );
+        populate_registry(&mut reg, &discovered_gpus(&[None]), &[]);
+        assert!(reg.notes().is_empty(), "a rebuild starts from no notes");
     }
 
     fn gres_device(file: &str) -> DeviceEntry {
@@ -1964,19 +2327,6 @@ mod tests {
     fn merge_targets_is_empty_when_no_node_is_discovered() {
         let configured = gres_device("/dev/dri/renderD200");
         assert!(merge_targets(&configured, &partitions()).targets.is_empty());
-    }
-
-    fn nic_cache() -> CdiCache {
-        let mut cache = CdiCache::new();
-        cache.add_specs(&[spec(
-            "amd.com/nic",
-            &[
-                ("0", "/dev/infiniband/uverbs0"),
-                ("1", "/dev/infiniband/uverbs1"),
-            ],
-            ContainerEdits::default(),
-        )]);
-        cache
     }
 
     #[test]

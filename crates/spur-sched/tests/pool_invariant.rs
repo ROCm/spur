@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::cpu_topology::{CpuRecord, CpuTopology};
-use spur_core::device::Device;
+use spur_core::device::{Device, DeviceSelection};
 use spur_core::node::Node;
 use spur_core::resource::{
     build_node_allocation, ResourceAllocations, ResourceRequest, ResourceSet,
@@ -25,9 +25,11 @@ enum Shape {
     Cpu(u32),
     /// GPUs, then CPUs as a multiple of one GPU's reserved CPUs plus an offset.
     Gpu(u32, u32, u32),
+    /// One NIC and CPUs, which only the general pool serves.
+    Nic(u32),
 }
 
-const SHAPES: [Shape; 8] = [
+const SHAPES: [Shape; 9] = [
     Shape::Cpu(1),
     Shape::Cpu(2),
     Shape::Cpu(4),
@@ -36,6 +38,7 @@ const SHAPES: [Shape; 8] = [
     Shape::Gpu(1, 1, 1),
     Shape::Gpu(2, 2, 0),
     Shape::Gpu(2, 2, 2),
+    Shape::Nic(1),
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -108,6 +111,16 @@ fn gpus(count: u32, sockets: u32) -> Vec<Device> {
         .collect()
 }
 
+/// Two NICs, one per NUMA node, beside the GPUs.
+fn nics() -> Vec<Device> {
+    (0..2)
+        .map(|i| Device {
+            numa_node: Some(i),
+            ..Device::new("nic", "pollara400", 0x900 + u64::from(i), i)
+        })
+        .collect()
+}
+
 impl Bed {
     /// `None` when the shape cannot hold the layout (too few cores per NUMA).
     fn new(sockets: u32, smt: bool, gpu_count: u32, r: u32, spec: u32) -> Option<Self> {
@@ -122,7 +135,7 @@ impl Bed {
         let resources = ResourceSet {
             cpus: topology.online_cpus().len() as u32,
             memory_mb: 1024,
-            devices: gpus,
+            devices: gpus.into_iter().chain(nics()).collect(),
             topology: Some(topology),
             ..Default::default()
         };
@@ -159,12 +172,14 @@ impl Bed {
     /// The job is placed as the scheduler does it: counts, then a stamped allocation.
     fn request(&self, shape: Shape) -> ResourceRequest {
         let rc = self.reserved_cpus_per_gpu();
-        let (gpus, cpus) = match shape {
-            Shape::Cpu(n) => (0, n),
-            Shape::Gpu(g, mult, extra) => (g, mult * rc + extra),
+        let (gpus, nics, cpus) = match shape {
+            Shape::Cpu(n) => (0, 0, n),
+            Shape::Gpu(g, mult, extra) => (g, 0, mult * rc + extra),
+            Shape::Nic(n) => (0, 1, n),
         };
         let mut request = ResourceRequest::with_scalar(cpus, 0);
         request.add_devices("gpu", None, gpus);
+        request.add_devices("nic", None, nics);
         request
     }
 
@@ -187,6 +202,9 @@ impl Bed {
         match self.ledger.allocate_for_job(id, 1, alloc.cpus, 0, &gpu_ids) {
             Ok(result) => {
                 self.check_pick(&alloc, &gpu_ids, &result.cpu_ids)?;
+                self.ledger
+                    .claim_devices(id, 1, &nic_selection(&alloc))
+                    .map_err(|e| format!("admitted {shape:?} but the NIC claim said {e:?}"))?;
                 self.ledger.commit_job(id, 1);
                 self.node.hold(&alloc);
                 self.running.push(Running {
@@ -308,13 +326,20 @@ impl Bed {
         };
         check_sticky(&self.layout, &layout)?;
         if matches!(change, Change::DropGpu | Change::AddGpu) {
-            self.resources.devices = gpus.clone();
+            let others: Vec<Device> = self
+                .resources
+                .devices
+                .iter()
+                .filter(|d| !d.is_gpu())
+                .cloned()
+                .collect();
+            self.resources.devices = gpus.into_iter().chain(others).collect();
             if let CapacityChange::AllocatedDevicesLost(lost) =
                 self.ledger.update_capacity(&self.resources)
             {
-                return Err(format!("dropped a held GPU: {lost:?}"));
+                return Err(format!("dropped a held device: {lost:?}"));
             }
-            self.node.total_resources.devices = gpus;
+            self.node.total_resources.devices = self.resources.devices.clone();
         }
         self.node.total_resources.cpus = self.resources.cpus - layout.spec_cpus.len() as u32;
         self.node.core_layout = Some(layout.clone());
@@ -353,6 +378,9 @@ impl Bed {
             self.ledger
                 .restore_for_job(job.id, 1, &job.cpu_ids, 0, &gpu_ids)
                 .map_err(|e| format!("replay of job {} failed: {e:?}", job.id))?;
+            self.ledger
+                .claim_devices(job.id, 1, &nic_selection(&job.alloc))
+                .map_err(|e| format!("replay of job {}'s NICs failed: {e:?}", job.id))?;
         }
         Ok(())
     }
@@ -417,6 +445,10 @@ impl Bed {
     }
 }
 
+fn nic_selection(alloc: &ResourceAllocations) -> DeviceSelection {
+    DeviceSelection::new().with("nic", alloc.device_ids("nic"))
+}
+
 /// A GPU present before and after keeps every pick that did not become spec,
 /// and a smaller R keeps only previous picks.
 fn check_sticky(before: &CoreLayout, after: &CoreLayout) -> Result<(), String> {
@@ -476,6 +508,7 @@ fn layout_alphabet() -> Vec<Event> {
         Event::Start(Shape::Cpu(2)),
         Event::Start(Shape::Gpu(1, 1, 0)),
         Event::Start(Shape::Gpu(1, 1, 1)),
+        Event::Start(Shape::Nic(1)),
         Event::FinishOldest,
         Event::Heartbeat,
     ]
@@ -651,4 +684,25 @@ fn layout_changes_never_refuse_a_job_admitted_after_a_heartbeat() {
         beds > 10,
         "too few valid node shapes ({beds}) to mean anything"
     );
+}
+
+#[test]
+fn a_layout_change_keeps_the_nodes_nics() {
+    let mut bed = Bed::new(2, false, 2, 1, 0).expect("bed");
+    let nics_of = |set: &ResourceSet| -> Vec<u64> {
+        set.devices
+            .iter()
+            .filter(|d| d.gres_name == "nic")
+            .map(|d| d.stable_id)
+            .collect()
+    };
+    for change in [Change::DropGpu, Change::AddGpu] {
+        bed.change_layout(change).unwrap();
+        assert_eq!(nics_of(&bed.resources), vec![0x900, 0x901], "{change:?}");
+        assert_eq!(
+            nics_of(&bed.node.total_resources),
+            vec![0x900, 0x901],
+            "{change:?}"
+        );
+    }
 }
