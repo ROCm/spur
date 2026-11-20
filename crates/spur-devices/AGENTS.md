@@ -111,13 +111,15 @@ and countable pools (count-only, no device paths).
 
 1. CDI entries first: entries with a PCI address, ordered by address, then stable id, then primary device path; then entries without one, by primary device path; the qualified device name breaks any remaining tie
 2. GRES injectable entries: each is first tried against the discovered CDI
-   entries (`merge_into_discovered()`) by its `renderD*` node; a match
-   merges the configured `type`/`cores`/`links` onto the discovered GPU
-   (device nodes stay discovery's) instead of becoming a second device, so
-   `[[devices.gres]] cores=` can set a GPU's reserved-core affinity without
-   disabling auto-detection. Unmatched entries remain separate candidates.
+   entries of its gres name (`merge_into_discovered()`, targets from
+   `merge_targets()`). Only its own nodes count (`own_node_paths()`, so not
+   `/dev/kfd`). A node only one discovered entry has names that entry; when
+   none does, a shared node (a partitioned GPU's `cardN`) names every entry
+   behind it. Its `type`/`cores`/`links` merge onto the named entries (device
+   nodes stay discovery's) and its other own nodes are dropped with a warning.
+   An entry naming no discovered entry stays a candidate.
 3. GRES countable pools
-4. Skip CDI aggregates (a device whose nodes are the union of two or more siblings of its kind, like `all`), then dedup: CDI against CDI by identical node set, a GRES entry that did not merge against anything by subset or superset (CDI wins)
+4. Skip CDI aggregates (a device whose nodes are the union of two or more siblings of its kind, like `all`), then dedup whatever did not merge: CDI against CDI by identical node set, a GRES entry against anything that owns one of its own nodes (CDI wins)
 5. Assign sequential device_ids per gres_name
 6. Backfill stable_id from device_id when annotation absent
 

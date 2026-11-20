@@ -35,10 +35,22 @@ impl DeviceRegistry {
             .map(|(name, cached)| (name.clone(), from_cdi(cached)))
             .collect();
         sort_cdi_entries(&mut cdi_entries);
+        // An aggregate shares every node with its parts, so it would make each
+        // node name several devices and widen what a GRES entry merges into.
+        let cdi_devices: Vec<DeviceEntry> = cdi_entries.iter().map(|(_, e)| e.clone()).collect();
+        cdi_entries.retain(|(_, entry)| !is_aggregate(entry, &cdi_devices));
 
         let mut configured = Vec::new();
         for expanded in &gres_cache.injectable {
             let entry = expanded_to_device_entry(expanded);
+            if names_only_shared_nodes(&entry) {
+                let paths: Vec<&str> = entry.node_paths().collect();
+                warn!(
+                    paths = ?paths,
+                    "configured device names only nodes every device of its kind shares; dropping it"
+                );
+                continue;
+            }
             if !merge_into_discovered(&entry, &mut cdi_entries) {
                 configured.push(entry);
             }
@@ -225,34 +237,34 @@ fn primary_device_path(entry: &DeviceEntry) -> &str {
     entry.node_paths().next().unwrap_or("")
 }
 
-/// Merges a configured entry into the discovered device whose render node it names
+/// `/dev/kfd` alone, say: every device of its kind has it, so it names none.
+fn names_only_shared_nodes(entry: &DeviceEntry) -> bool {
+    entry.node_paths().next().is_some() && entry.own_node_paths().next().is_none()
+}
+
+/// Merges a configured entry into the discovered devices of its name it names
 /// (exact-path dedup would miss it, since a GPU also carries a `cardN` node).
+/// Its nodes outside those devices are dropped; an entry naming none of them
+/// stays for dedup.
 fn merge_into_discovered(
     configured: &DeviceEntry,
     discovered: &mut [(String, DeviceEntry)],
 ) -> bool {
-    let paths: Vec<&str> = configured
-        .device_edits
-        .device_nodes
-        .iter()
-        .map(|dn| dn.effective_host_path())
-        .collect();
-    let mut matched: Vec<&str> = Vec::new();
-    for (_, device) in discovered
-        .iter_mut()
-        .filter(|(_, device)| entry_matches_gres_name(device, &configured.gres_name))
-    {
-        let Some(render_node) = paths.iter().copied().find(|path| {
-            path.starts_with("/dev/dri/renderD")
-                && device
-                    .device_edits
-                    .device_nodes
-                    .iter()
-                    .any(|dn| dn.effective_host_path() == *path)
-        }) else {
-            continue;
-        };
-        matched.push(render_node);
+    let MergeTargets { targets, dropped } = merge_targets(configured, discovered);
+    if targets.is_empty() {
+        return false;
+    }
+    let paths: Vec<&str> = configured.own_node_paths().collect();
+    if !dropped.is_empty() {
+        warn!(
+            paths = ?paths,
+            dropped = ?dropped,
+            targets = ?targets,
+            "configured device names nodes the discovered devices it names lack; dropping them"
+        );
+    }
+    for &index in &targets {
+        let device = &mut discovered[index].1;
         if configured.resource_type.is_some() {
             device.resource_type = configured.resource_type.clone();
         }
@@ -264,25 +276,55 @@ fn merge_into_discovered(
         }
         device.inject_actions.merge(&configured.inject_actions);
     }
-    if matched.is_empty() {
-        return false;
-    }
-    let unmatched: Vec<&str> = paths
-        .iter()
-        .copied()
-        .filter(|p| p.starts_with("/dev/dri/renderD") && !matched.contains(p))
-        .collect();
-    if unmatched.is_empty() {
-        info!(paths = ?paths, "configured GPU merged into the discovered one");
-    } else {
-        warn!(
-            matched = ?matched,
-            unmatched = ?unmatched,
-            "configured GPU entry merged into discovered GPUs; render nodes no GPU was \
-             discovered for are dropped with it"
-        );
-    }
+    info!(paths = ?paths, "configured device merged into the discovered one");
     true
+}
+
+/// The discovered devices a configured entry names, by index, and its own nodes
+/// none of them has.
+struct MergeTargets<'a> {
+    targets: Vec<usize>,
+    dropped: Vec<&'a str>,
+}
+
+/// A node only one device has names that device; when the entry names no such
+/// node, a shared one (a partitioned GPU's `cardN`) names every device behind it.
+fn merge_targets<'a>(
+    configured: &'a DeviceEntry,
+    discovered: &[(String, DeviceEntry)],
+) -> MergeTargets<'a> {
+    let own: Vec<&str> = configured.own_node_paths().collect();
+    let owners_of = |path: &str| -> Vec<usize> {
+        discovered
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, device))| {
+                entry_matches_gres_name(device, &configured.gres_name)
+                    && device.node_paths().any(|p| p == path)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let owners: Vec<Vec<usize>> = own.iter().map(|path| owners_of(path)).collect();
+    let unique: Vec<usize> = owners
+        .iter()
+        .filter(|o| o.len() == 1)
+        .map(|o| o[0])
+        .collect();
+    let mut targets = if unique.is_empty() {
+        owners.iter().flatten().copied().collect()
+    } else {
+        unique
+    };
+    targets.sort_unstable();
+    targets.dedup();
+    let dropped = own
+        .iter()
+        .zip(&owners)
+        .filter(|(_, o)| !o.iter().any(|index| targets.contains(index)))
+        .map(|(path, _)| *path)
+        .collect();
+    MergeTargets { targets, dropped }
 }
 
 const GRES_KIND: &str = "spur.internal/gres";
@@ -319,13 +361,13 @@ fn is_aggregate(entry: &DeviceEntry, candidates: &[DeviceEntry]) -> bool {
 }
 
 /// Skips CDI aggregates, then a later entry naming a device already kept: the
-/// same node set, or for a GRES entry, a subset or superset of a kept one.
+/// same node set, or for a GRES entry, any node it owns that a kept one owns.
 fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
     let aggregates: Vec<bool> = candidates
         .iter()
         .map(|entry| is_aggregate(entry, &candidates))
         .collect();
-    let mut seen: Vec<(Vec<String>, String)> = Vec::new();
+    let mut seen: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
     let mut result = Vec::new();
 
     for (entry, aggregate) in candidates.into_iter().zip(aggregates) {
@@ -342,22 +384,23 @@ fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
             continue;
         }
 
-        // GRES names a GPU by its render node while CDI adds the card, so a GRES
-        // entry inside (or around) a kept device is that device; two CDI devices
-        // are one only when they grant exactly the same nodes.
-        let is_subset = |a: &[String], b: &[String]| a.iter().all(|p| b.contains(p));
-        let duplicate = seen.iter().find(|(paths, kind)| {
+        // A GRES entry sharing a node it owns with a CDI device describes that
+        // device a second time. Otherwise devices are one only when they grant
+        // exactly the same nodes: partitions share a card node, GRES entries may
+        // share vendor control nodes, as in Slurm's MultipleFiles.
+        let own: Vec<String> = entry.own_node_paths().map(str::to_owned).collect();
+        let duplicate = seen.iter().find(|(paths, kept_own, kind)| {
             if *paths == per_device_paths {
                 return true;
             }
-            (entry.kind == GRES_KIND || kind == GRES_KIND)
-                && (is_subset(paths, &per_device_paths) || is_subset(&per_device_paths, paths))
+            ((entry.kind == GRES_KIND) != (kind == GRES_KIND))
+                && own.iter().any(|p| kept_own.contains(p))
         });
-        if let Some((paths, existing_kind)) = duplicate {
+        if let Some((paths, _, existing_kind)) = duplicate {
             let rule = if *paths == per_device_paths {
                 "exact"
             } else {
-                "gres-subset"
+                "gres-overlap"
             };
             warn!(
                 duplicate_kind = %entry.kind,
@@ -369,7 +412,7 @@ fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
             continue;
         }
 
-        seen.push((per_device_paths, entry.kind.clone()));
+        seen.push((per_device_paths, own, entry.kind.clone()));
         result.push(entry);
     }
 
@@ -1692,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_naming_only_a_card_node_dedups_into_its_gpu() {
+    fn an_entry_naming_only_a_card_node_merges_into_its_gpu() {
         let cache = discovered_gpus(&[None]);
         let gres = vec![GresEntry {
             name: "gpu".into(),
@@ -1704,9 +1747,407 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         populate_registry(&mut reg, &cache, &gres);
 
-        // Only a render node merges; the card node is part of the GPU, so it dedups away.
         assert_eq!(reg.injectable_count(), 1);
-        assert_eq!(gpu_cores(&reg), vec![None]);
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn a_gres_entry_partly_inside_a_discovered_gpu_merges_and_drops_the_rest() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/renderD200".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 1);
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn a_multi_file_entry_listing_kfd_merges_into_each_gpu_it_names() {
+        let cache = discovered_gpus(&[None, None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            r#type: Some("mi325x".into()),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/renderD129,/dev/kfd".into()),
+            cores: Some("8-9".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+        let gpus: Vec<(Option<&str>, Option<Vec<u32>>)> = reg
+            .list()
+            .iter()
+            .map(|e| (e.resource_type.as_deref(), e.cores.clone()))
+            .collect();
+        assert_eq!(gpus, vec![(Some("mi325x"), Some(vec![8, 9])); 2]);
+    }
+
+    #[test]
+    fn a_single_gpu_entry_listing_kfd_merges_its_type_and_cores() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            r#type: Some("mi325x".into()),
+            multiple_files: Some("/dev/dri/renderD128,/dev/kfd".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 1);
+        assert_eq!(reg.list()[0].resource_type.as_deref(), Some("mi325x"));
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1])]);
+    }
+
+    /// Two partitions of one GPU: own render nodes, one shared card node.
+    fn partitioned_gpu() -> CdiCache {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: ["128", "129"]
+                .iter()
+                .enumerate()
+                .map(|(i, minor)| CdiDevice {
+                    name: i.to_string(),
+                    annotations: Default::default(),
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![
+                            node(&format!("/dev/dri/renderD{minor}")),
+                            node("/dev/dri/card1"),
+                        ],
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            container_edits: None,
+        }]);
+        cache
+    }
+
+    #[test]
+    fn an_aggregate_cdi_device_does_not_widen_a_merge() {
+        let mut cache = partitioned_gpu();
+        cache.add_specs(&[CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "all".into(),
+                annotations: Default::default(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![
+                        node("/dev/dri/renderD128"),
+                        node("/dev/dri/renderD129"),
+                        node("/dev/dri/card1"),
+                    ],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        }]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/card1".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1]), None]);
+    }
+
+    #[test]
+    fn a_render_node_names_one_partition_even_beside_the_shared_card() {
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/card1".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &partitioned_gpu(), &gres);
+
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1]), None]);
+    }
+
+    #[test]
+    fn a_card_node_shared_by_partitions_merges_into_each_partition() {
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/card1".into()),
+            cores: Some("0-1".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &partitioned_gpu(), &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+        assert_eq!(gpu_cores(&reg), vec![Some(vec![0, 1]), Some(vec![0, 1])]);
+    }
+
+    #[test]
+    fn a_gres_entry_of_another_name_partly_overlapping_a_gpu_is_dropped() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "accel".into(),
+            multiple_files: Some("/dev/dri/renderD128,/dev/dri/renderD200".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 1);
+    }
+
+    #[test]
+    fn gres_entries_sharing_only_kfd_stay_distinct() {
+        let gres = vec![
+            GresEntry {
+                name: "gpu".into(),
+                multiple_files: Some("/dev/dri/renderD128,/dev/kfd".into()),
+                ..Default::default()
+            },
+            GresEntry {
+                name: "gpu".into(),
+                multiple_files: Some("/dev/dri/renderD129,/dev/kfd".into()),
+                ..Default::default()
+            },
+        ];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+    }
+
+    fn gres_gpus(files: &[&str]) -> Vec<GresEntry> {
+        files
+            .iter()
+            .map(|f| GresEntry {
+                name: "gpu".into(),
+                multiple_files: Some((*f).into()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gres_partitions_sharing_a_card_node_stay_distinct() {
+        let gres = gres_gpus(&[
+            "/dev/dri/renderD128,/dev/dri/card1",
+            "/dev/dri/renderD129,/dev/dri/card1",
+        ]);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &gres);
+        assert_eq!(reg.injectable_count(), 2);
+    }
+
+    #[test]
+    fn identical_gres_entries_are_one_device() {
+        let gres = gres_gpus(&[
+            "/dev/dri/renderD128,/dev/dri/card1",
+            "/dev/dri/renderD128,/dev/dri/card1",
+        ]);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &gres);
+        assert_eq!(reg.injectable_count(), 1);
+    }
+
+    #[test]
+    fn gres_entries_sharing_a_control_node_stay_distinct() {
+        let gres = gres_gpus(&["/dev/nvidia0,/dev/nvidiactl", "/dev/nvidia1,/dev/nvidiactl"]);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &CdiCache::new(), &gres);
+        assert_eq!(reg.injectable_count(), 2);
+    }
+
+    #[test]
+    fn a_gres_entry_naming_a_cdi_nics_node_merges_into_it() {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec(
+            "amd.com/nic",
+            &[("0", "/dev/infiniband/uverbs0")],
+            ContainerEdits::default(),
+        )]);
+        let gres = vec![GresEntry {
+            name: "nic".into(),
+            r#type: Some("pollara400".into()),
+            file: Some("/dev/infiniband/uverbs0".into()),
+            cores: Some("4-5".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 1);
+        assert_eq!(reg.list()[0].resource_type.as_deref(), Some("pollara400"));
+        assert_eq!(reg.list()[0].cores, Some(vec![4, 5]));
+    }
+
+    #[test]
+    fn a_gres_entry_naming_only_unknown_nodes_stays_a_device() {
+        let cache = discovered_gpus(&[None]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD200".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+
+        assert_eq!(reg.injectable_count(), 2);
+    }
+
+    #[test]
+    fn a_gres_entry_naming_only_shared_nodes_is_dropped() {
+        let kfd_only = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/kfd".into()),
+            ..Default::default()
+        }];
+        for cache in [discovered_gpus(&[None, None]), CdiCache::new()] {
+            let before = cache.len();
+            let mut reg = DeviceRegistry::new();
+            populate_registry(&mut reg, &cache, &kfd_only);
+            assert_eq!(reg.injectable_count(), before, "/dev/kfd names no GPU");
+        }
+    }
+
+    fn gres_device(file: &str) -> DeviceEntry {
+        let cache = GresCache::from_entries(&[GresEntry {
+            name: "gpu".into(),
+            multiple_files: Some(file.into()),
+            ..Default::default()
+        }]);
+        expanded_to_device_entry(&cache.injectable[0])
+    }
+
+    fn partitions() -> Vec<(String, DeviceEntry)> {
+        vec![
+            cdi_entry(
+                "amd.com/gpu",
+                "0",
+                &["/dev/dri/renderD128", "/dev/dri/card1"],
+            ),
+            cdi_entry(
+                "amd.com/gpu",
+                "1",
+                &["/dev/dri/renderD129", "/dev/dri/card1"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn merge_targets_prefers_a_node_unique_to_one_device() {
+        let configured = gres_device("/dev/dri/renderD128,/dev/dri/card1");
+        let targets = merge_targets(&configured, &partitions());
+        assert_eq!(targets.targets, vec![0]);
+        assert!(targets.dropped.is_empty());
+    }
+
+    #[test]
+    fn merge_targets_takes_every_owner_of_a_shared_node() {
+        let configured = gres_device("/dev/dri/card1");
+        assert_eq!(
+            merge_targets(&configured, &partitions()).targets,
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn merge_targets_lists_nodes_no_target_has() {
+        let configured = gres_device("/dev/dri/renderD128,/dev/dri/renderD200");
+        let targets = merge_targets(&configured, &partitions());
+        assert_eq!(targets.targets, vec![0]);
+        assert_eq!(targets.dropped, vec!["/dev/dri/renderD200"]);
+    }
+
+    #[test]
+    fn merge_targets_ignores_shared_nodes() {
+        let configured = gres_device("/dev/dri/renderD128,/dev/kfd");
+        let targets = merge_targets(&configured, &partitions());
+        assert_eq!(targets.targets, vec![0]);
+        assert!(targets.dropped.is_empty());
+    }
+
+    #[test]
+    fn merge_targets_is_empty_when_no_node_is_discovered() {
+        let configured = gres_device("/dev/dri/renderD200");
+        assert!(merge_targets(&configured, &partitions()).targets.is_empty());
+    }
+
+    fn nic_cache() -> CdiCache {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec(
+            "amd.com/nic",
+            &[
+                ("0", "/dev/infiniband/uverbs0"),
+                ("1", "/dev/infiniband/uverbs1"),
+            ],
+            ContainerEdits::default(),
+        )]);
+        cache
+    }
+
+    #[test]
+    fn a_nic_gres_entry_inside_a_discovered_nic_merges_type_and_cores() {
+        let gres = vec![GresEntry {
+            name: "nic".into(),
+            r#type: Some("pollara400".into()),
+            file: Some("/dev/infiniband/uverbs1".into()),
+            cores: Some("4-5".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &nic_cache(), &gres);
+
+        assert_eq!(reg.injectable_count(), 2, "no duplicate NIC");
+        let nics: Vec<(Option<&str>, Option<Vec<u32>>)> = reg
+            .list()
+            .iter()
+            .map(|e| (e.resource_type.as_deref(), e.cores.clone()))
+            .collect();
+        assert_eq!(
+            nics,
+            vec![(None, None), (Some("pollara400"), Some(vec![4, 5]))]
+        );
+    }
+
+    #[test]
+    fn a_gres_entry_of_another_name_does_not_merge_into_a_nic() {
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/infiniband/uverbs1".into()),
+            cores: Some("4-5".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &nic_cache(), &gres);
+
+        assert!(reg.list().iter().all(|e| e.cores.is_none()));
     }
 
     #[test]

@@ -74,6 +74,18 @@ impl DeviceEntry {
             .iter()
             .map(|dn| dn.effective_host_path())
     }
+
+    /// Its node paths minus any its kind shares (a GRES entry's `/dev/kfd`), so
+    /// only nodes that identify this one device.
+    pub fn own_node_paths(&self) -> impl Iterator<Item = &str> {
+        self.node_paths().filter(move |path| {
+            !self
+                .shared_edits
+                .device_nodes
+                .iter()
+                .any(|dn| dn.effective_host_path() == *path)
+        })
+    }
 }
 
 pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {

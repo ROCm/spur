@@ -2596,17 +2596,25 @@ and ``flags`` ([string]). Examples:
    count = 4096
    flags = ["count_only"]
 
-``cores`` lists the cores near a GPU, by core index as in Slurm's
-``gres.conf Cores=`` (for example ``"0-63"``). To set it on a GPU that Spur
-already knows from CDI (auto-detected, or from a CDI spec), give an entry of the
-same ``name`` that names the GPU's render node. The entry is merged into that GPU
-instead of adding a second one: its ``type``, ``cores`` and ``links``, where set,
-replace what discovery or the CDI annotations reported, and the GPU keeps its
-discovered device nodes. A GPU with no ``cores`` uses the CPUs of its NUMA node.
-An entry that names no known render node but only other nodes of a known
-device (for example only ``/dev/dri/cardN``) is dropped, since that device is
-already reported. Each partition of a partitioned GPU has its own
-render node, so give one entry per partition.
+``cores`` lists the cores near a device, by core index as in Slurm's
+``gres.conf Cores=`` (for example ``"0-63"``). Only GPUs use it, to place their
+reserved cores; on other kinds it is accepted and has no effect. To set
+``type`` or ``cores`` on a device Spur already knows from CDI (auto-detected,
+or from a CDI spec), give an entry of the same ``name`` that names one of its
+device nodes, for example a GPU's render node or the ``uverbs`` node of a NIC. The
+entry is merged into the devices it names instead of adding a device: its
+``type``, ``cores`` and ``links``, where set, replace what discovery or the CDI
+annotations reported, and each device keeps its discovered device nodes.
+``/dev/kfd`` and other nodes every device of a kind shares do not name a
+device. A node several devices share, such as the ``/dev/dri/cardN`` of a
+partitioned GPU, names all of them unless the entry also names a node of only
+one. Device nodes of the entry outside the devices it names are dropped, with
+a warning in the ``spurd`` log. An entry that names no known device is a device
+of its own, unless it shares a device node with a discovered or CDI device;
+then it is dropped with a warning. Entries may share nodes with each other,
+such as a partitioned GPU's card node or a vendor control node. A GPU with no ``cores`` uses the CPUs of its NUMA
+node. Each partition of a partitioned GPU has its own render node, so give one
+entry per partition to set them apart.
 
 .. code-block:: toml
 

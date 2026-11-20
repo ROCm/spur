@@ -556,10 +556,12 @@ Reserved cores per GPU, per-step shares and CPU billing
   ``memory.high``. Upgrade every ``spurd`` before changing spec cores,
   ``reserved_memory_mb``, ``restricted_cores_per_gpu`` or a node's GPUs while
   jobs run.
-- ``[[devices.gres]]`` ``type``/``links`` **now override what discovery
-  reports** for the matching GPU, so an existing entry can change a GPU's type
-  on upgrade. An entry that matches only some of a render node's GPUs is
-  dropped with a warning in the ``spurd`` log.
+- ``[[devices.gres]]`` ``type``, ``cores`` and ``links`` **now override what
+  discovery reports** for the devices an entry names, so an existing entry can
+  change a GPU's type on upgrade. Device nodes of an entry that belong to none
+  of the devices it names are dropped with a warning in the ``spurd`` log, and
+  an entry that shares a device node with a discovered or CDI device is
+  dropped.
 
 .. _cgroup-upgrade-notes:
 
