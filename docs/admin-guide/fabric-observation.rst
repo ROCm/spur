@@ -31,6 +31,9 @@ On a node with a known CPU topology, a ``GPUDevice=`` line also ends with
 ``AffinityCPUs=<list>`` (the CPUs near it). Each is left out when unknown; see
 :doc:`configuration`.
 
+A Kubernetes node with ``spur.amd.com/gpu-memory-mb`` set prints a
+``GPUDevice=`` line per GPU too, with its PCI address and NUMA node unknown.
+
 ``observed`` means the attributes were read consistently. It does not mean the
 external fabric manager reports the partition as ready. Other statuses are ``incomplete`` (missing, malformed, or
 unreadable fields), ``inconsistent`` (conflicting or changing observations),
@@ -89,7 +92,8 @@ regenerating the specs. GRES-only entries do not acquire topology automatically.
 Integration contract
 --------------------
 
-``GpuResource.topology`` is optional in persisted inventory and the gRPC API.
+``Device.topology`` (and the deprecated ``GpuResource.topology``) is optional in
+persisted inventory and the gRPC API.
 Older agents and saved inventories omit it. New agents send typed
 ``DeviceTopology`` and ``FabricObservation`` messages through registration;
 node/resource responses preserve them. Unknown wire status values map to

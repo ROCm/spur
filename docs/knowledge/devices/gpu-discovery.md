@@ -155,8 +155,8 @@ Real nonzero stable_ids from KFD discovery are never overwritten.
 `ResourceSet` (resource.rs) carries the node's inventory:
 
 - `cpus`, `memory_mb` -- scalar resources
-- `gpus: Vec<GpuResource>` -- per-GPU: device_id, gpu_type, memory_mb,
-  peer_gpus, link_type, stable_id, topology
+- `devices: Vec<Device>` -- every allocatable device: gres_name, device_type,
+  stable_id, index (positional), topology. `gpus()` views the GPUs.
 - `generic: HashMap<String, u64>` -- countable GRES (bandwidth, licenses)
 - `generation` -- bumped on every topology rebuild
 
@@ -170,7 +170,7 @@ GPU's `stable_id`.
 within a node. For GPUs:
 
 - `gpu_allocated: Vec<bool>` -- one bool per GPU in the inventory
-- `gpus: Vec<GpuResource>` -- the node's GPU table
+- `gpus: Vec<Device>` -- the node's GPU table
 
 Key operations:
 
@@ -209,8 +209,8 @@ a GPU repartition), the controller detects whether a held GPU's stable_id
 disappeared:
 
 - If a stable_id an allocation holds is missing from the new inventory, the
-  node cannot offer any GPU until the held job finishes (the
-  `holds_unknown_gpu` check).
+  node cannot offer any GPU until the held job finishes (`ResourceSet::holds`
+  returns `None` for any unknown GPU id, id 0 included).
 - This prevents a repartition from silently reusing a stable_id for a different
   logical device.
 
@@ -395,8 +395,9 @@ shift (e.g. after a driver reload):
   than picking up the new entry that happens to share the id.
 
 A node holding an allocated stable_id that disappeared from the inventory
-offers zero GPUs until the holding job finishes (`holds_unknown_gpu` returns
-true). This is conservative but prevents silent corruption.
+offers zero GPUs until the holding job finishes (`ResourceSet::holds` returns
+`None` for any unknown GPU id, id 0 included). This is conservative but prevents
+silent corruption.
 
 ---
 
@@ -468,13 +469,13 @@ All CDI annotations use the `spur.amd.com/` prefix. Key fields stored in
 | Annotation | Example | Notes |
 |---|---|---|
 | `spur.amd.com/gpu-type` | `mi300x` | PCI device_id lookup or product_name normalization |
-| `spur.amd.com/memory-mb` | `196608` | VRAM from KFD mem_banks |
+| `spur.amd.com/memory-mb` | `196608` | VRAM from KFD mem_banks; written for rollback, not read |
 | `spur.amd.com/numa-node` | `0` | From PCI device sysfs |
 | `spur.amd.com/pci-bdf` | `0000:c1:00.0` | Decoded from location_id |
 | `spur.amd.com/stable-id` | `327680` | BDF-encoded reload-invariant id |
 | `spur.amd.com/render-minor` | `128` | DRM render minor number |
-| `spur.amd.com/link-type` | `xgmi` | `pcie`, `xgmi`, or `nvlink` |
-| `spur.amd.com/links` | `-1,4,4,0` | Weight matrix (-1 = self) |
+| `spur.amd.com/link-type` | `xgmi` | `pcie`, `xgmi`, or `nvlink`; written for rollback, not read |
+| `spur.amd.com/links` | `-1,4,4,0` | Weight matrix (-1 = self); written for rollback, not read |
 | `spur.amd.com/cores` | `0-3,8,16-18` | Core affinity range notation |
 | `spur.amd.com/compute-partition` | `CPX` | Active compute partition |
 | `spur.amd.com/memory-partition` | `NPS4` | Active memory partition |

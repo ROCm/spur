@@ -5,6 +5,7 @@
 
 use super::*;
 use spur_core::config::EnforcePartLimits;
+use spur_core::device::Device;
 use spur_core::job::PartitionTresOvershoot;
 use spur_core::partition_limits::MemoryAdjustment;
 
@@ -647,19 +648,17 @@ fn overcommitted_caps_are_reported_per_node_and_resource() {
 
 #[test]
 fn typed_gpu_capacity_counts_only_that_type() {
-    let gpu = |ty: &str| spur_core::resource::GpuResource {
-        device_id: 0,
-        gpu_type: ty.into(),
-        memory_mb: 0,
-        peer_gpus: Vec::new(),
-        link_type: spur_core::resource::GpuLinkType::PCIe,
-        topology: None,
-        stable_id: 0,
+    let gpu = |ty: &str| Device {
         numa_node: None,
         affinity_cpus: Vec::new(),
+        gres_name: "gpu".into(),
+        device_type: ty.into(),
+        stable_id: 0,
+        index: 0,
+        topology: None,
     };
     let resources = ResourceSet {
-        gpus: vec![gpu("a100"), gpu("a100"), gpu("mi300x")],
+        devices: vec![gpu("a100"), gpu("a100"), gpu("mi300x")],
         ..Default::default()
     };
     assert_eq!(node_tres_capacity(&resources, "gres/gpu"), 3);

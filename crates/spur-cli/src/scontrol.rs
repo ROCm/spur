@@ -767,15 +767,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     println!("   Partitions={}", node.partitions.join(","));
                 }
                 println!("   {}", node_cpu_line(&node));
-                let gpus = total.map(|r| r.gpus.len()).unwrap_or(0);
-                if gpus > 0 {
-                    let gpu_types: Vec<String> = total
-                        .unwrap()
-                        .gpus
-                        .iter()
-                        .map(|g| format!("gpu:{}:1", g.gpu_type))
-                        .collect();
-                    println!("   Gres={}", gpu_types.join(","));
+                let gres = total.map(crate::gres_fmt::node_gres).unwrap_or_default();
+                if !gres.is_empty() {
+                    println!("   Gres={}", gres.join(","));
                 }
                 if let Some(resources) = total {
                     println!(
@@ -785,7 +779,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     if let Some(revision) = &resources.block_file_revision {
                         println!("   BlockFileRevision={revision}");
                     }
-                    for gpu in &resources.gpus {
+                    for gpu in crate::gres_fmt::node_devices(resources)
+                        .iter()
+                        .filter(|d| d.gres_name == "gpu")
+                    {
                         let cpus = node.gpu_cpus.iter().find(|c| c.stable_id == gpu.stable_id);
                         print!("{}", format_gpu_topology(gpu, cpus));
                     }
@@ -1184,7 +1181,7 @@ fn state_name(state: i32) -> &'static str {
 }
 
 fn format_gpu_topology(
-    gpu: &spur_proto::proto::GpuResource,
+    gpu: &spur_proto::proto::Device,
     cpus: Option<&spur_proto::proto::GpuCpus>,
 ) -> String {
     use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
@@ -1194,7 +1191,7 @@ fn format_gpu_topology(
     let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
     let mut output = format!(
         "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}",
-        gpu.device_id,
+        gpu.index,
         gpu.stable_id,
         text(topology.pci_bdf.as_deref()),
         text(topology.pci_root.as_deref()),
@@ -1204,7 +1201,7 @@ fn format_gpu_topology(
         topology
             .vram_bytes
             .map_or_else(|| "unknown".into(), |v| v.to_string()),
-        gpu.gpu_type.escape_debug(),
+        gpu.device_type.escape_debug(),
     );
     if let Some(cpus) = cpus {
         if !cpus.reserved_cpus.is_empty() {
@@ -2918,7 +2915,8 @@ mod tests {
     #[test]
     fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
         use spur_proto::proto::*;
-        let gpu = GpuResource {
+        let gpu = Device {
+            gres_name: "gpu".into(),
             stable_id: 128,
             topology: Some(DeviceTopology {
                 pci_bdf: Some("0001:04:00.0".into()),
@@ -2945,7 +2943,7 @@ mod tests {
             .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
         assert!(detail.contains("ActiveEndpoints=[60,61]"));
         assert!(detail.contains("ObservationIssues=vpod_id:missing"));
-        assert!(super::format_gpu_topology(&GpuResource::default(), None).is_empty());
+        assert!(super::format_gpu_topology(&Device::default(), None).is_empty());
     }
 
     use super::*;
@@ -3658,8 +3656,8 @@ mod tests {
 
     #[test]
     fn gpu_device_line_appends_reserved_and_affinity_cpus_when_known() {
-        use spur_proto::proto::{DeviceTopology, GpuCpus, GpuResource};
-        let gpu = GpuResource {
+        use spur_proto::proto::{Device, DeviceTopology, GpuCpus};
+        let gpu = Device {
             stable_id: 7,
             topology: Some(DeviceTopology::default()),
             ..Default::default()
@@ -3681,7 +3679,7 @@ mod tests {
         assert!(line.ends_with(" AffinityCPUs=0-63,128-191"), "{line}");
         let line = first(format_gpu_topology(&gpu, None));
         assert!(line.ends_with("GPUType="), "{line}");
-        assert!(format_gpu_topology(&GpuResource::default(), Some(&both)).is_empty());
+        assert!(format_gpu_topology(&Device::default(), Some(&both)).is_empty());
     }
 
     #[test]

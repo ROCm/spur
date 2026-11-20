@@ -201,7 +201,7 @@ impl<'a> NodePlacement<'a> {
         nodes: impl IntoIterator<Item = &'n Node>,
         reservations: &[Reservation],
         now: DateTime<Utc>,
-        required: &spur_core::resource::ResourceSet,
+        required: &spur_core::resource::ResourceRequest,
     ) -> bool {
         self.nodelist_is_additive()
             && nodes.into_iter().any(|n| {

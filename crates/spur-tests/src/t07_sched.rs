@@ -223,11 +223,7 @@ mod tests {
             },
         );
         let now = Utc::now();
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(64, 256_000);
         assert!(tl.can_satisfy_at(now, &req));
     }
 
@@ -248,16 +244,8 @@ mod tests {
             spur_core::resource::ResourceAllocations::with_scalar(32, 128_000),
         );
 
-        let req32 = ResourceSet {
-            cpus: 32,
-            memory_mb: 128_000,
-            ..Default::default()
-        };
-        let req64 = ResourceSet {
-            cpus: 64,
-            memory_mb: 256_000,
-            ..Default::default()
-        };
+        let req32 = ResourceRequest::with_scalar(32, 128_000);
+        let req64 = ResourceRequest::with_scalar(64, 256_000);
         assert!(tl.can_satisfy_at(now + Duration::hours(1), &req32));
         assert!(tl.can_satisfy_at(now + Duration::hours(5), &req64));
     }
@@ -280,10 +268,7 @@ mod tests {
             spur_core::resource::ResourceAllocations::with_scalar(48, 0),
         );
 
-        let req = ResourceSet {
-            cpus: 32,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(32, 0);
         let start = tl.earliest_start(&req, Duration::hours(2), now);
         assert!(start >= now + Duration::hours(4));
     }

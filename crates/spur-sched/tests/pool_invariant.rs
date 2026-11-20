@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+use spur_core::device::Device;
 use spur_core::node::Node;
 use spur_core::resource::{
-    build_node_allocation, GpuLinkType, GpuResource, ResourceAllocations, ResourceSet,
+    build_node_allocation, ResourceAllocations, ResourceRequest, ResourceSet,
 };
 use spur_sched::cons_tres::{AllocError, CapacityChange, NodeAllocation};
 
@@ -98,18 +99,11 @@ fn topology(sockets: u32, smt: bool) -> CpuTopology {
     CpuTopology::from_cpus(&records)
 }
 
-fn gpus(count: u32, sockets: u32) -> Vec<GpuResource> {
+fn gpus(count: u32, sockets: u32) -> Vec<Device> {
     (0..count)
-        .map(|i| GpuResource {
-            device_id: i,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
-            stable_id: u64::from(i) + 1,
+        .map(|i| Device {
             numa_node: Some(i % sockets),
-            affinity_cpus: vec![],
+            ..Device::gpu(u64::from(i) + 1, "mi300x", i)
         })
         .collect()
 }
@@ -128,7 +122,7 @@ impl Bed {
         let resources = ResourceSet {
             cpus: topology.online_cpus().len() as u32,
             memory_mb: 1024,
-            gpus,
+            devices: gpus,
             topology: Some(topology),
             ..Default::default()
         };
@@ -163,27 +157,20 @@ impl Bed {
     }
 
     /// The job is placed as the scheduler does it: counts, then a stamped allocation.
-    fn request(&self, shape: Shape) -> ResourceSet {
+    fn request(&self, shape: Shape) -> ResourceRequest {
         let rc = self.reserved_cpus_per_gpu();
         let (gpus, cpus) = match shape {
             Shape::Cpu(n) => (0, n),
             Shape::Gpu(g, mult, extra) => (g, mult * rc + extra),
         };
-        let mut gpu_list = self.node.total_resources.gpus.clone();
-        gpu_list.truncate(gpus as usize);
-        for gpu in &mut gpu_list {
-            gpu.gpu_type = "any".into();
-        }
-        ResourceSet {
-            cpus,
-            gpus: gpu_list,
-            ..Default::default()
-        }
+        let mut request = ResourceRequest::with_scalar(cpus, 0);
+        request.add_devices("gpu", None, gpus);
+        request
     }
 
     fn start(&mut self, shape: Shape) -> Result<(), String> {
         let request = self.request(shape);
-        if request.gpus.len() > self.node.total_resources.gpus.len()
+        if request.device_count("gpu") as usize > self.node.total_resources.gpus().count()
             || !self.node.can_satisfy_request(&request)
         {
             return Ok(());
@@ -267,7 +254,7 @@ impl Bed {
     /// cannot be computed keeps the last good one, as the controller does.
     fn change_layout(&mut self, change: Change) -> Result<(), String> {
         let mut settings = self.settings.clone();
-        let mut gpus = self.resources.gpus.clone();
+        let mut gpus: Vec<Device> = self.resources.gpus().cloned().collect();
         let r = settings.restricted_cores_per_gpu.unwrap_or(0);
         let spec = settings.core_spec_count.unwrap_or(0);
         match change {
@@ -304,7 +291,7 @@ impl Bed {
                 let id = gpus.iter().map(|g| g.stable_id).max().unwrap_or(0) + 1;
                 let mut gpu = gpus[0].clone();
                 gpu.stable_id = id;
-                gpu.device_id = (id - 1) as u32;
+                gpu.index = (id - 1) as u32;
                 gpu.numa_node = Some((id - 1) as u32 % sockets);
                 gpus.push(gpu);
             }
@@ -321,13 +308,13 @@ impl Bed {
         };
         check_sticky(&self.layout, &layout)?;
         if matches!(change, Change::DropGpu | Change::AddGpu) {
-            self.resources.gpus = gpus.clone();
+            self.resources.devices = gpus.clone();
             if let CapacityChange::AllocatedDevicesLost(lost) =
                 self.ledger.update_capacity(&self.resources)
             {
                 return Err(format!("dropped a held GPU: {lost:?}"));
             }
-            self.node.total_resources.gpus = gpus;
+            self.node.total_resources.devices = gpus;
         }
         self.node.total_resources.cpus = self.resources.cpus - layout.spec_cpus.len() as u32;
         self.node.core_layout = Some(layout.clone());

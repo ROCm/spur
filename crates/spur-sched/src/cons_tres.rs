@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use spur_core::core_layout::{reserved_share, GpuReservedCpus};
+use spur_core::device::Device;
 use spur_core::job::RunKey;
-use spur_core::resource::{GpuResource, ResourceSet};
+use spur_core::resource::ResourceSet;
 
 /// Why a caller is entitled to hand a run's slice back. A slice is released only
 /// on a controller decision, so every ground names the decision it rests on.
@@ -179,7 +180,7 @@ pub struct NodeAllocation {
     /// GPU allocations: device_id → allocated?
     pub gpu_allocated: Vec<bool>,
     /// GPU info for type matching.
-    pub gpus: Vec<GpuResource>,
+    pub gpus: Vec<Device>,
     /// Per-job ownership, so an allocation can be released by job id and
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
@@ -223,7 +224,7 @@ fn place_cpus(resources: &ResourceSet) -> HashMap<u32, (u32, usize)> {
 
 impl NodeAllocation {
     pub fn new(name: String, resources: &ResourceSet) -> Self {
-        let num_gpus = resources.gpus.len();
+        let num_gpus = resources.gpus().count();
         let cpu_ids = online_cpu_ids(resources);
         let cpu_index = index_cpu_ids(&cpu_ids);
         Self {
@@ -236,7 +237,7 @@ impl NodeAllocation {
             total_memory_mb: resources.memory_mb,
             allocated_memory_mb: 0,
             gpu_allocated: vec![false; num_gpus],
-            gpus: resources.gpus.clone(),
+            gpus: resources.gpus().cloned().collect(),
             owners: HashMap::new(),
             launching: HashMap::new(),
             fenced: HashSet::new(),
@@ -297,7 +298,7 @@ impl NodeAllocation {
     /// reports the lost devices and leaves capacity untouched so the caller
     /// can drive policy (drain/fail) before anything is mutated.
     pub fn update_capacity(&mut self, fresh: &ResourceSet) -> CapacityChange {
-        let fresh_ids: HashSet<u64> = fresh.gpus.iter().map(|g| g.stable_id).collect();
+        let fresh_ids: HashSet<u64> = fresh.gpus().map(|g| g.stable_id).collect();
         let fresh_cpu_ids = online_cpu_ids(fresh);
         let fresh_cpu_index = index_cpu_ids(&fresh_cpu_ids);
 
@@ -348,7 +349,7 @@ impl NodeAllocation {
         // re-derives spec CPUs from a fresh CoreLayout and re-applies them.
         self.unavailable.clear();
         self.total_memory_mb = fresh.memory_mb;
-        self.gpus = fresh.gpus.clone();
+        self.gpus = fresh.gpus().cloned().collect();
         self.gpu_allocated = vec![false; self.gpus.len()];
         for owned in self.owners.values() {
             for &cpu in &owned.result.cpu_ids {
@@ -502,7 +503,7 @@ impl NodeAllocation {
                 }
                 if let Some(gtype) = gpu_type {
                     if gtype != "any"
-                        && self.gpus.get(*i).map(|g| g.gpu_type.as_str()) != Some(gtype)
+                        && self.gpus.get(*i).map(|g| g.device_type.as_str()) != Some(gtype)
                     {
                         return false;
                     }
@@ -915,7 +916,6 @@ mod tests {
     use super::*;
     use spur_core::core_layout::GpuReservedCpus;
     use spur_core::cpu_topology::{CpuRecord, CpuTopology};
-    use spur_core::resource::GpuLinkType;
 
     fn make_node(cpus: u32, mem: u64, num_gpus: usize, gpu_type: &str) -> NodeAllocation {
         make_node_with_ids(cpus, mem, (0..num_gpus as u32).collect(), gpu_type)
@@ -939,7 +939,7 @@ mod tests {
         let resources = ResourceSet {
             cpus: online_ids.len() as u32,
             memory_mb: mem,
-            gpus: vec![],
+            devices: vec![],
             topology: Some(topology),
             ..Default::default()
         };
@@ -952,25 +952,23 @@ mod tests {
         device_ids: Vec<u32>,
         gpu_type: &str,
     ) -> NodeAllocation {
-        let gpus: Vec<GpuResource> = device_ids
+        let gpus: Vec<Device> = device_ids
             .into_iter()
-            .map(|device_id| GpuResource {
-                device_id,
-                gpu_type: gpu_type.into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
-                stable_id: device_id as u64,
+            .map(|device_id| Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: gpu_type.into(),
+                stable_id: device_id as u64,
+                index: device_id,
+                topology: None,
             })
             .collect();
 
         let resources = ResourceSet {
             cpus,
             memory_mb: mem,
-            gpus,
+            devices: gpus,
             ..Default::default()
         };
 
@@ -1577,18 +1575,16 @@ mod tests {
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: ids
+            devices: ids
                 .iter()
-                .map(|&(d, s)| GpuResource {
-                    device_id: d,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
-                    stable_id: s,
+                .map(|&(d, s)| Device {
                     numa_node: None,
                     affinity_cpus: Vec::new(),
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
+                    stable_id: s,
+                    index: d,
+                    topology: None,
                 })
                 .collect(),
             generic: Default::default(),
@@ -1616,18 +1612,16 @@ mod tests {
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: ids
+            devices: ids
                 .iter()
-                .map(|&(d, s)| GpuResource {
-                    device_id: d,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
-                    stable_id: s,
+                .map(|&(d, s)| Device {
                     numa_node: None,
                     affinity_cpus: Vec::new(),
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
+                    stable_id: s,
+                    index: d,
+                    topology: None,
                 })
                 .collect(),
             generic: Default::default(),
@@ -1651,7 +1645,7 @@ mod tests {
         let node_rs = |cpus: u32| ResourceSet {
             cpus,
             memory_mb: 1024,
-            gpus: vec![],
+            devices: vec![],
             ..Default::default()
         };
         let mut node = NodeAllocation::new("n".into(), &node_rs(8));
@@ -1675,7 +1669,7 @@ mod tests {
         let node_rs = |cpus: u32| ResourceSet {
             cpus,
             memory_mb: 1024,
-            gpus: vec![],
+            devices: vec![],
             ..Default::default()
         };
         let mut node = NodeAllocation::new("n".into(), &node_rs(8));
@@ -1695,38 +1689,32 @@ mod tests {
         // GPU vanishes and capacity is rebuilt with device_id renumbered (0,1) but
         // stable_id preserved (129,130), the job's GPU must still resolve.
         let gpus = vec![
-            GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
+            Device {
+                numa_node: None,
+                affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
                 stable_id: 128,
+                index: 0,
+                topology: None,
+            },
+            Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
-            },
-            GpuResource {
-                device_id: 1,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
                 stable_id: 129,
-                numa_node: None,
-                affinity_cpus: Vec::new(),
-            },
-            GpuResource {
-                device_id: 2,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
+                index: 1,
                 topology: None,
-                stable_id: 130,
+            },
+            Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
+                stable_id: 130,
+                index: 2,
+                topology: None,
             },
         ];
         let rs = ResourceSet {
@@ -1734,7 +1722,7 @@ mod tests {
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus,
+            devices: gpus,
             generic: Default::default(),
             generation: 1,
             topology: None,
@@ -1922,7 +1910,7 @@ mod tests {
         let fresh = ResourceSet {
             cpus: 4,
             memory_mb: 64_000,
-            gpus: vec![],
+            devices: vec![],
             topology: Some(topology_of(&[0, 2, 3, 4])),
             ..Default::default()
         };
@@ -1958,7 +1946,7 @@ mod tests {
         let fresh = ResourceSet {
             cpus: 4,
             memory_mb: 64_000,
-            gpus: vec![],
+            devices: vec![],
             topology: Some(topology_of(&[0, 1, 3, 4])), // id 2 gone, id 4 new; same count
             ..Default::default()
         };
@@ -1974,6 +1962,10 @@ mod tests {
     /// 2 sockets x 4 cores x 2 threads: socket s, local core c -> CPUs s*4+c and
     /// s*4+c+8. GPU 1 reserves socket 0 cores 0-1, GPU 2 socket 1 cores 0-1.
     fn pooled_node() -> NodeAllocation {
+        pooled_node_with_nics(&[])
+    }
+
+    fn pooled_node_with_nics(nic_ids: &[u64]) -> NodeAllocation {
         let mut records = Vec::new();
         for socket in 0..2u32 {
             for core in 0..4u32 {
@@ -1987,21 +1979,14 @@ mod tests {
                 }
             }
         }
-        let gpu = |id: u64| GpuResource {
-            device_id: id as u32,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
-            stable_id: id,
-            numa_node: None,
-            affinity_cpus: Vec::new(),
-        };
+        let gpu = |id: u64| Device::gpu(id, "mi300x", id as u32);
         let resources = ResourceSet {
             cpus: 16,
             memory_mb: 1024,
-            gpus: vec![gpu(1), gpu(2)],
+            devices: [gpu(1), gpu(2)]
+                .into_iter()
+                .chain(nic_ids.iter().map(|&id| Device::new("nic", "", id, 0)))
+                .collect(),
             topology: Some(CpuTopology::from_cpus(&records)),
             ..Default::default()
         };

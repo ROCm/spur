@@ -2416,7 +2416,8 @@ fn satisfiable_victim_set(
 
 /// What one node must hold for `job`: the per-node minimum, except that a one-node
 /// job needs its whole GPU total on that node.
-fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
+fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceRequest {
+    use spur_core::device::GPU_GRES;
     use spur_core::gpu_request::{resolve_gpu_demand, GpuDemand};
 
     let mut request = backfill::job_resource_request(job);
@@ -2424,8 +2425,13 @@ fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
         Ok(GpuDemand::Total { count, .. }) if job.spec.num_nodes <= 1 => count,
         _ => return request,
     };
-    if let Some(gpu) = request.gpus.first().cloned() {
-        request.gpus = vec![gpu; total as usize];
+    let gpu_key = request
+        .devices
+        .keys()
+        .find(|key| key.gres_name == GPU_GRES)
+        .cloned();
+    if let Some(key) = gpu_key {
+        request.set_devices(GPU_GRES, key.device_type.as_deref(), total);
     }
     request.memory_mb = spur_core::partition_limits::node_memory_mb(
         &job.spec,
@@ -5029,10 +5035,10 @@ pub async fn send_suspend_to_agents(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use spur_core::device::Device;
     use spur_core::job::{Job, JobSpec};
     use spur_core::resource::{
-        build_exclusive_allocation, build_node_allocation, GpuLinkType, GpuResource,
-        ResourceAllocations, ResourceSet,
+        build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
 
@@ -5655,30 +5661,28 @@ pub(crate) mod tests {
         );
     }
 
-    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<Device>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus,
             memory_mb,
-            gpus,
+            devices: gpus,
             generic: HashMap::new(),
             generation: 0,
             topology: None,
         }
     }
 
-    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
-        GpuResource {
-            device_id,
-            gpu_type: gpu_type.into(),
-            memory_mb: 192_000,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::PCIe,
-            topology: None,
+    fn gpu(device_id: u32, gpu_type: &str) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: gpu_type.into(),
             stable_id: device_id as u64,
             numa_node: None,
             affinity_cpus: Vec::new(),
+            index: device_id,
+            topology: None,
         }
     }
 
@@ -5700,7 +5704,7 @@ pub(crate) mod tests {
     fn request_per_node(
         nodes: &[String],
         totals: &HashMap<String, ResourceSet>,
-        request: &ResourceSet,
+        request: &spur_core::resource::ResourceRequest,
     ) -> HashMap<String, ResourceAllocations> {
         nodes
             .iter()
@@ -5826,7 +5830,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_a,
             generation: 0,
             topology: None,
@@ -5839,7 +5843,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_b,
             generation: 0,
             topology: None,
@@ -7236,13 +7240,13 @@ pub(crate) mod tests {
             one.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
             one.spec.memory_per_gpu_mb = Some(1000);
             let request = node_request(&one);
-            assert_eq!((request.gpus.len(), request.memory_mb), (8, 8000));
+            assert_eq!((request.device_count("gpu"), request.memory_mb), (8, 8000));
 
             let mut two = one.clone();
             two.spec.num_nodes = 2;
             let request = node_request(&two);
             assert_eq!(
-                (request.gpus.len(), request.memory_mb),
+                (request.device_count("gpu"), request.memory_mb),
                 (1, 1000),
                 "spread over two nodes, each node only needs one"
             );
@@ -7254,18 +7258,8 @@ pub(crate) mod tests {
             // search never revisits a pick, so nothing is evicted (a documented limit).
             let gpu_node = |name: &str, count: u32| {
                 let mut n = node(name, 4);
-                n.total_resources.gpus = (0..count)
-                    .map(|i| spur_core::resource::GpuResource {
-                        device_id: i,
-                        gpu_type: "mi300x".into(),
-                        memory_mb: 0,
-                        peer_gpus: vec![],
-                        link_type: spur_core::resource::GpuLinkType::XGMI,
-                        topology: None,
-                        stable_id: u64::from(i) + 1,
-                        numa_node: None,
-                        affinity_cpus: Vec::new(),
-                    })
+                n.total_resources.devices = (0..count)
+                    .map(|i| spur_core::device::Device::gpu(u64::from(i) + 1, "mi300x", i))
                     .collect();
                 n
             };

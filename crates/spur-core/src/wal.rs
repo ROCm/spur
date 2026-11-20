@@ -2557,19 +2557,19 @@ mod node_inventory_wal_compat {
         let WalOperation::NodeUpdate { resources, .. } = op else {
             panic!("wrong variant");
         };
-        let ids: Vec<u64> = resources.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: Vec<u64> = resources.gpus().map(|g| g.stable_id).collect();
         assert_eq!(ids, vec![0x110000, 0x120000]);
-        assert_eq!(resources.gpus[0].gpu_type, "mi300x");
+        assert_eq!(resources.devices[0].device_type, "mi300x");
         assert_eq!(
-            resources.gpus[0]
+            resources.devices[0]
                 .topology
                 .as_ref()
                 .and_then(|t| t.vram_bytes),
             Some(206158430208)
         );
         assert_eq!(resources.generation, 5);
-        assert_eq!(resources.gpus[0].numa_node, Some(0));
-        assert_eq!(resources.gpus[1].affinity_cpus, vec![32, 33, 96, 97]);
+        assert_eq!(resources.devices[0].numa_node, Some(0));
+        assert_eq!(resources.devices[1].affinity_cpus, vec![32, 33, 96, 97]);
         assert!(resources.topology.is_some());
     }
 }

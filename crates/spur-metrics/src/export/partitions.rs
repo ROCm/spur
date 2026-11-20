@@ -161,7 +161,7 @@ mod tests {
                 block_file_revision: None,
                 cpus: 8,
                 memory_mb: 16384,
-                gpus: Vec::new(),
+                devices: Vec::new(),
                 generic: Default::default(),
                 generation: 0,
                 topology: None,

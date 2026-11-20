@@ -16,7 +16,7 @@ use spur_core::partition::{
     TRES_GPU, TRES_MEM,
 };
 use spur_core::partition_limits::MemoryAdjustment;
-use spur_core::resource::{ResourceAllocations, ResourceSet};
+use spur_core::resource::{ResourceAllocations, ResourceRequest};
 
 /// Partition-cap charge per TRES key (`mem` in MiB). TRES counts, not devices, because
 /// whether a GPU counts against a typed key depends on how it was requested.
@@ -55,11 +55,11 @@ impl TresCharge {
         Self(tres)
     }
 
-    pub fn from_request(request: &ResourceSet, typed_gpu: Option<&str>) -> Self {
+    pub fn from_request(request: &ResourceRequest, typed_gpu: Option<&str>) -> Self {
         Self::new(
             u64::from(request.cpus),
             request.memory_mb,
-            request.gpus.len() as u64,
+            u64::from(request.device_count("gpu")),
             typed_gpu,
         )
     }
