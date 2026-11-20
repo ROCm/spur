@@ -613,6 +613,48 @@ async fn a_worker_released_after_the_budget_deletes_nothing() {
     assert!(fixture.exists(1));
 }
 
+// Opening the write end on drop lets a reader blocked on the FIFO finish, even after a panic.
+struct UnblockFifo(PathBuf);
+
+impl Drop for UnblockFifo {
+    fn drop(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn a_stuck_process_read_holds_no_job_lock() {
+    use std::future::Future;
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[1]);
+    let cmdline = fixture.process(100, &["stuck"], b"").join("cmdline");
+    fs::remove_file(&cmdline).unwrap();
+    nix::unistd::mkfifo(&cmdline, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let _unblock = UnblockFifo(cmdline);
+    let mut paths = fixture.paths();
+    paths.budget = std::time::Duration::from_secs(1);
+    let summary = fixture
+        .agent
+        .cleanup_startup_job_spools_with_inventory(paths)
+        .await;
+    assert_eq!(summary.deleted, 0);
+    assert!(fixture.exists(1));
+    let mut launch = Box::pin(fixture.agent.lifecycle.acquire(1));
+    std::future::poll_fn(|context| {
+        assert!(
+            launch.as_mut().poll(context).is_ready(),
+            "the job's lock is still held"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn startup_spool_skips_processes_that_exit_mid_inventory() {
     let controller = ControllerFixture::new(true);

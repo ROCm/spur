@@ -190,10 +190,11 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   possibly on the same node, and new steps of jobs already running there fail
   until the pass ends.
 * ``spurd`` reads every process's environment, working directory and open
-  files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
-  fail and nothing in the affected batch is removed; the agent logs
+  files once, before it locks any job. Without ``CAP_SYS_PTRACE`` (for example
+  in a container) these reads fail and nothing is removed; the agent logs
   ``retained job spools: activity inventory uncertain`` with the number of
-  directories kept.
+  directories kept. A read stuck on a hung process keeps everything until the
+  next start, without blocking later launches.
 * Symlinks in the spool path (for example ``/var/spool`` on another disk) are
   followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
   mount point, or a tree deeper than 256 levels is logged with ``kept job
@@ -208,9 +209,9 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   agent from another cluster on the same host could remove the first agent's
   leftover directories.
 
-Directories kept because the controller did not confirm them or the activity
-inventory was uncertain are logged with a count per batch of 128 job ids
-(``retained job spools: <reason>``); directories left when the time runs out
+Directories kept because the activity inventory was uncertain, or the
+controller did not confirm them (per batch of 128 job ids), are logged with a
+count (``retained job spools: <reason>``); directories left when the time runs out
 log ``retained remaining job spools`` with the reason. Each path is logged at
 debug level. Directories still in use log ``retained locally owned job spool``
 or ``retained job spool: runtime session, cgroup or process still holds it``;

@@ -85,13 +85,47 @@ pub(crate) async fn run(
             return summary;
         }
     };
+    // Read before any job lock is taken: a /proc read can block forever, and must not strand locks.
+    let found = candidates.len();
+    let paths = Arc::new(paths);
+    let reading = tokio::task::spawn_blocking({
+        let paths = paths.clone();
+        move || {
+            let inventory = activity_inventory(&candidates, &paths, deadline);
+            (candidates, inventory)
+        }
+    });
+    let (candidates, inventory) = match tokio::time::timeout_at(deadline.into(), reading).await {
+        Ok(Ok((candidates, Ok(inventory)))) => (candidates, Arc::new(inventory)),
+        Ok(Ok((candidates, Err(error)))) => {
+            for candidate in &candidates {
+                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained job spool: activity inventory uncertain");
+            }
+            warn!(count = found, %error, "retained job spools: activity inventory uncertain");
+            summary.retained += found;
+            summary.log();
+            return summary;
+        }
+        Ok(Err(error)) => {
+            warn!(count = found, %error, "retained job spools: activity inventory failed");
+            summary.retained += found;
+            summary.errors += 1;
+            summary.log();
+            return summary;
+        }
+        Err(_) => {
+            warn!(count = found, "retained job spools: activity inventory exceeded the time budget; startup will continue");
+            summary.retained += found;
+            summary.log();
+            return summary;
+        }
+    };
     let ids: Vec<_> = candidates
         .iter()
         .map(|c| c.spool.job_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let paths = Arc::new(paths);
     let mut candidates: HashMap<u32, Vec<Candidate>> =
         candidates
             .into_iter()
@@ -164,17 +198,19 @@ pub(crate) async fn run(
             continue;
         }
         let in_flight = eligible.len();
-        let paths = paths.clone();
+        let inventory = inventory.clone();
+        #[cfg(test)]
+        let gate = paths.worker_gate.clone();
         // Keep guards in the worker so cancellation cannot release launch exclusion
         // while blocking filesystem operations still run.
         let worker = tokio::task::spawn_blocking(move || {
             let _guards = guards;
             #[cfg(test)]
-            if let Some(gate) = &paths.worker_gate {
+            if let Some(gate) = &gate {
                 gate.0.notify_one();
                 gate.1.wait();
             }
-            clean_inactive(eligible, &paths, deadline)
+            clean_inactive(eligible, &inventory, deadline)
         });
         // A worker stuck in the kernel keeps its guards; its own deadline checks stop late deletions.
         let Ok(worker) = tokio::time::timeout_at(deadline.into(), worker).await else {
@@ -276,21 +312,10 @@ fn discover(paths: Vec<PathBuf>) -> Vec<Candidate> {
 
 fn clean_inactive(
     candidates: Vec<Candidate>,
-    paths: &ActivityPaths,
+    inventory: &Inventory,
     deadline: Instant,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
-    let inventory = match activity_inventory(&candidates, paths, deadline) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            for candidate in &candidates {
-                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained job spool: activity inventory uncertain");
-            }
-            warn!(count = candidates.len(), %error, "retained job spools: activity inventory uncertain");
-            summary.retained += candidates.len();
-            return summary;
-        }
-    };
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
         let path = &candidate.path;

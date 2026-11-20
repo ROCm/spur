@@ -152,8 +152,7 @@ def test_uncertain_or_unsafe_startup_inventory_retains_spools(local_cluster, fau
     log = cluster.start_agent()
     assert (orphan / "sentinel").read_text() == "job 501\n", log
     assert "deleted=0" in log, log
-    expected_queries = 1 if fault == "unknown-runtime" else 0
-    assert len(cluster.call("queries")) == expected_queries
+    assert cluster.call("queries") == []
 
 
 def test_symlinked_spool_root_is_followed_but_nothing_beneath_it(local_cluster):

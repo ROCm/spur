@@ -439,7 +439,7 @@ surviving workloads:
 - a `spurstepd` supervisor, recognised by comm, argv[0] or exe name only when
   its real and effective uid are the daemon's, protects the job in its
   arguments, even if its runtime record disappeared; such a process without a
-  job id retains every candidate in the batch;
+  job id retains every candidate;
 - a valid `SPUR_JOB_ID`, `SPUR_JOBID`, `SLURM_JOB_ID` or `SLURM_JOBID` in a
   process environment protects that job id; unparsable values are ignored;
 - a working directory or open file inside a spool protects it, matched by path
@@ -447,7 +447,8 @@ surviving workloads:
   mounts are recognised; targets on recognised network and FUSE filesystems
   are not stat-ed.
   A process that is exiting mid-scan is skipped. Reading other processes needs
-  `CAP_SYS_PTRACE`.
+  `CAP_SYS_PTRACE`. The inventory is read once, before any job's lifecycle lock
+  is taken, so a read blocked on a hung process strands no lock.
 
 Unsafe or unreadable roots, uncertain activity information, unknown job states,
 non-authoritative responses and restricted missing-job responses cause folders
