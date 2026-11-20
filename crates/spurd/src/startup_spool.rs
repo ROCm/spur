@@ -146,22 +146,22 @@ pub(crate) async fn run(
         Ok(Ok((candidates, Ok(inventory)))) => (candidates, Arc::new(inventory)),
         Ok(Ok((candidates, Err(error)))) => {
             for candidate in &candidates {
-                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained job spool: activity inventory uncertain");
+                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained {}: activity inventory uncertain", candidate.spool.kind.label());
             }
-            warn!(count = found, %error, "retained job spools: activity inventory uncertain");
+            warn!(count = found, %error, "retained directories: activity inventory uncertain");
             summary.retained += found;
             summary.log();
             return summary;
         }
         Ok(Err(error)) => {
-            warn!(count = found, %error, "retained job spools: activity inventory failed");
+            warn!(count = found, %error, "retained directories: activity inventory failed");
             summary.retained += found;
             summary.errors += 1;
             summary.log();
             return summary;
         }
         Err(_) => {
-            warn!(count = found, "retained job spools: activity inventory exceeded the time budget; startup will continue");
+            warn!(count = found, "retained directories: activity inventory exceeded the time budget; startup will continue");
             summary.retained += found;
             summary.log();
             return summary;
@@ -247,18 +247,17 @@ pub(crate) async fn run(
         }
         let in_flight = eligible.len();
         let inventory = inventory.clone();
-        #[cfg(test)]
-        let gate = paths.worker_gate.clone();
+        let paths = paths.clone();
         // Keep guards in the worker so cancellation cannot release launch exclusion
         // while blocking filesystem operations still run.
         let worker = tokio::task::spawn_blocking(move || {
             let _guards = guards;
             #[cfg(test)]
-            if let Some(gate) = &gate {
+            if let Some(gate) = &paths.worker_gate {
                 gate.0.notify_one();
                 gate.1.wait();
             }
-            clean_inactive(eligible, &inventory, deadline)
+            clean_inactive(eligible, &paths, &inventory, deadline)
         });
         // A worker stuck in the kernel keeps its guards; its own deadline checks stop late deletions.
         let Ok(worker) = tokio::time::timeout_at(deadline.into(), worker).await else {
@@ -380,21 +379,11 @@ fn trash_leftovers(root: &SpoolRoot) -> Vec<Candidate> {
 
 fn clean_inactive(
     candidates: Vec<Candidate>,
+    paths: &ActivityPaths,
     inventory: &Inventory,
     deadline: Instant,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
-    let inventory = match activity_inventory(&candidates, paths, deadline) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            for candidate in &candidates {
-                debug!(job_id = candidate.spool.job_id, path = %candidate.path.display(), "retained {}: activity inventory uncertain", candidate.spool.kind.label());
-            }
-            warn!(count = candidates.len(), %error, "retained directories: activity inventory uncertain");
-            summary.retained += candidates.len();
-            return summary;
-        }
-    };
     let bound = Bound::until(deadline);
     for candidate in candidates {
         let job_id = candidate.spool.job_id;
@@ -435,14 +424,14 @@ fn clean_inactive(
                 };
                 let mountinfo = paths.proc_root.join("self/mountinfo");
                 match unmount_rootfs(&candidate, &inventory.held, &mountinfo) {
-                    Ok(Some((detached, spool))) => {
+                    Ok((detached, Some(spool))) => {
                         match move_to_trash(&candidate.root, &spool, trash) {
                             Ok(trashed) => {
                                 info!(job_id, path = %path.display(), detached, trash = %trashed.path.display(), "queued orphan container rootfs for background deletion");
                                 summary.pending_rootfs.push(PendingRootfs(trashed));
                             }
                             Err(error) => {
-                                warn!(job_id, path = %path.display(), %error, "kept container rootfs: could not move it to the trash");
+                                warn!(job_id, path = %path.display(), detached, %error, "kept container rootfs: could not move it to the trash");
                                 match kept_reason(&error) {
                                     Some(_) => summary.retained += 1,
                                     None => summary.errors += 1,
@@ -451,8 +440,8 @@ fn clean_inactive(
                         }
                         continue;
                     }
-                    Ok(None) => {
-                        info!(job_id, path = %path.display(), "retained {kind}: a process holds the directory under its mount");
+                    Ok((detached, None)) => {
+                        info!(job_id, path = %path.display(), detached, "retained {kind}: a process holds the directory under its mount");
                         summary.retained += 1;
                         continue;
                     }
@@ -501,16 +490,16 @@ fn unmount_rootfs(
     candidate: &Candidate,
     held: &HashSet<(u64, u64)>,
     mountinfo: &Path,
-) -> io::Result<Option<(usize, JobSpool)>> {
+) -> io::Result<(usize, Option<JobSpool>)> {
     let unmounted = candidate
         .root
         .unmount_beneath(&candidate.spool, mountinfo)?;
     let spool = candidate.root.reopen(&candidate.spool, unmounted)?;
     // The directory a mount hid is not among the identities discovered for the entry.
     if spool.identities().any(|id| held.contains(&id)) {
-        return Ok(None);
+        return Ok((unmounted.count, None));
     }
-    Ok(Some((unmounted.count, spool)))
+    Ok((unmounted.count, Some(spool)))
 }
 
 /// Deletes the container rootfs trees in the trash after the agent serves; no job lock is needed.

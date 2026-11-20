@@ -190,10 +190,11 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   refused and retried later, possibly on the same node, and new steps of jobs
   already running there fail until the pass ends.
 * ``spurd`` reads every process's environment, working directory and open
-  files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
-  fail and nothing in the affected batch is removed; the agent logs
+  files once, before it locks any job. Without ``CAP_SYS_PTRACE`` (for example
+  in a container) these reads fail and nothing is removed; the agent logs
   ``retained directories: activity inventory uncertain`` with the number of
-  directories kept.
+  directories kept. A read stuck on a hung process keeps everything until the
+  next start, without blocking later launches.
 * Symlinks in the spool path (for example ``/var/spool`` on another disk) are
   followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
   mount point, or a tree deeper than 256 levels is logged with ``kept job
@@ -224,17 +225,20 @@ owned by the ``spurd`` user and not writable by group or others.
   namespace (such as the container itself) is checked against its own mount
   table, and a bind mount of the rootfs directory or anything under it on the
   same filesystem, in the agent's or a running process's mount namespace, keeps
-  it. A mount table that cannot be read keeps every directory in the batch.
+  it. A bind of something inside an overlay or tmpfs layer is not detected. A
+  mount table that cannot be read keeps every directory.
 * Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
   ``merged``, or a mount on the directory itself) is unmounted first, without a
-  lazy detach. If one stays mounted the directory is kept and ``kept container
-  rootfs: a mount beneath it could not be unmounted`` is logged; the next start
-  tries again.
+  lazy detach. If one stays mounted the directory is kept, possibly with other
+  layers already unmounted, and ``kept container rootfs: a mount beneath it
+  could not be unmounted`` is logged; the next start tries again.
 * The pass then moves the directory, still under its job's lock, into
   ``spur:trash`` inside the container directory, so its job's path is free
   before the agent accepts work. The trash must be owned by the ``spurd`` user
   and accessible only to it; ``spurd`` creates it that way. If the move fails
-  the directory is kept for the next start.
+  the directory, now unmounted, is kept for the next start. In the rare case
+  that the moved directory no longer matches and cannot be moved back, it stays
+  in the trash and is deleted with it (logged at error level).
 * The trash is emptied in the background after ``spurd`` starts serving, one
   directory at a time, with no time limit, so a large image does not delay
   startup; until then it holds the disk space. Stopping ``spurd`` halts the
@@ -254,9 +258,9 @@ trash`` for its contents; an entry in it that cannot be opened logs ``skipped
 unexpected container trash entry``. A finished background run logs ``background
 container rootfs cleanup finished deleted=<n> kept=<n> failed=<n>``.
 
-Directories kept because the controller did not confirm them or the activity
-inventory was uncertain are logged with a count per batch of 128 job ids
-(``retained directories: <reason>``); directories left when the time runs out
+Directories kept because the activity inventory was uncertain, or the
+controller did not confirm them (per batch of 128 job ids), are logged with a
+count (``retained directories: <reason>``); directories left when the time runs out
 log ``retained remaining directories`` with the reason. Each path is logged at
 debug level. Directories still in use log ``retained locally owned job spool``
 or ``retained job spool: runtime session, cgroup or process still holds it``;

@@ -105,6 +105,8 @@ impl SpoolFixture {
         )
         .unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(directory.path().join("host")).unwrap();
+        fs::write(directory.path().join("host/sentinel"), "host").unwrap();
         for id in ids {
             let job = root.join(format!("job{id}"));
             fs::create_dir(&job).unwrap();
@@ -143,7 +145,11 @@ impl SpoolFixture {
         fs::create_dir_all(base.join("usr/lib/python3")).unwrap();
         fs::create_dir_all(base.join("root")).unwrap();
         fs::write(base.join("usr/lib/python3/site.py"), "image").unwrap();
-        symlink("/", base.join("usr/host-root")).unwrap();
+        symlink(
+            self.directory.path().join("host"),
+            base.join("usr/host-root"),
+        )
+        .unwrap();
         symlink("usr/lib", base.join("lib")).unwrap();
         base
     }
@@ -152,6 +158,12 @@ impl SpoolFixture {
         let mut summary = self.run().await;
         let pending = std::mem::take(&mut summary.pending_rootfs);
         delete_pending_rootfs(pending, no_stop()).await;
+        let sentinel = self.directory.path().join("host/sentinel");
+        assert_eq!(
+            fs::read_to_string(sentinel).unwrap(),
+            "host",
+            "a link was followed"
+        );
         summary
     }
 

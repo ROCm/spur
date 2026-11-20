@@ -322,11 +322,11 @@ def test_completion_removes_spool_when_openat2_is_unavailable(local_cluster):
     assert "JobState=COMPLETED" in cluster.cli("control", "show", "job", job_id)
 
 
-def _make_rootfs(base):
+def _make_rootfs(base, host):
     (base / "usr/lib").mkdir(parents=True)
     (base / "usr/lib/site.py").write_text("image\n")
     (base / "lib").symlink_to("usr/lib")
-    (base / "host").symlink_to("/")
+    (base / "host").symlink_to(host, target_is_directory=True)
     return base
 
 
@@ -335,16 +335,19 @@ def test_orphan_container_rootfs_is_unmounted_and_removed_after_serving(local_cl
     containers = cluster.spool / "containers"
     containers.mkdir()
     containers.chmod(0o755)
-    extracted = _make_rootfs(containers / "job_501")
+    host = cluster.root / "host"
+    host.mkdir()
+    (host / "sentinel").write_text("host\n")
+    extracted = _make_rootfs(containers / "job_501", host)
     overlay = containers / "job_502"
     for layer in ["lower", "upper", "work", "merged"]:
         (overlay / layer).mkdir(parents=True)
     upper = "/var/spool/spur/containers/job_502/upper"
     cluster.call("mount_tmpfs", path=upper)
-    first_step = _make_rootfs(containers / "step_501_0")
-    decoy = _make_rootfs(containers / "job_0501")
-    named = _make_rootfs(containers / "my-image")
-    never_issued = _make_rootfs(containers / f"job_{NEVER_ISSUED}")
+    first_step = _make_rootfs(containers / "step_501_0", host)
+    decoy = _make_rootfs(containers / "job_0501", host)
+    named = _make_rootfs(containers / "my-image", host)
+    never_issued = _make_rootfs(containers / f"job_{NEVER_ISSUED}", host)
     log = cluster.start_agent()
     assert "queued orphan container rootfs for background deletion" in log, log
     log = cluster.wait_file(cluster.agent["log"], "deleted orphan container rootfs job_id=502")
@@ -358,3 +361,4 @@ def test_orphan_container_rootfs_is_unmounted_and_removed_after_serving(local_cl
     assert not cluster.call("mounted", path=upper)
     assert (named / "usr/lib/site.py").read_text() == "image\n"
     assert (never_issued / "usr/lib/site.py").read_text() == "image\n"
+    assert (host / "sentinel").read_text() == "host\n"

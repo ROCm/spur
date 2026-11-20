@@ -487,7 +487,8 @@ lifecycle lock, the entry is renamed (`RENAME_NOREPLACE`, a wall-clock suffix)
 into `spur:trash` in the container dir (opened beneath the root, owner-only:
 spool-root checks plus no group/other access), so a relaunch never finds the
 old tree at its path; a rename that fails, or whose moved entry no longer
-matches, keeps it in place for the next start. The trash is emptied after the
+matches, keeps it in place for the next start (unless moving it back fails too,
+which is logged and leaves it in the trash). The trash is emptied after the
 agent serves, one entry at a time, without the lock, with no time budget and a
 stop flag set when the agent exits by any path. Entries left by an
 interrupted run are found by discovery and deleted without asking the
