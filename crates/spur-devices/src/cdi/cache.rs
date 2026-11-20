@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -16,7 +16,6 @@ pub struct CachedDevice {
     pub device: CdiDevice,
     pub kind: String,
     pub shared_edits: Option<crate::cdi::spec::ContainerEdits>,
-    pub spec_annotations: HashMap<String, String>,
     pub source_path: String,
     pub priority: i32,
 }
@@ -65,7 +64,7 @@ impl CdiCache {
         for extra in cdi_spec_dirs {
             cdi_dirs.push(PathBuf::from(extra));
         }
-        let live = auto_detect.then(crate::cdi::discovery::discover_to_cdi);
+        let live = auto_detect.then(crate::discovery::discover_all_cdi);
         Self::load_with(&cdi_dirs, live.as_deref())
     }
 
@@ -78,11 +77,7 @@ impl CdiCache {
         }
 
         if let Some(live) = live {
-            if cache.is_empty() {
-                cache.add_specs(live);
-            } else {
-                cache.refresh_topology(live);
-            }
+            cache.merge_live(live);
         }
 
         info!(
@@ -92,6 +87,19 @@ impl CdiCache {
         );
 
         cache
+    }
+
+    /// An on-disk spec stays authoritative for its kind; live discovery only
+    /// refreshes its topology. Kinds with no on-disk spec come from discovery.
+    fn merge_live(&mut self, live: &[CdiSpec]) {
+        let on_disk: HashSet<String> = self.devices.values().map(|d| d.kind.clone()).collect();
+        let (present, absent): (Vec<CdiSpec>, Vec<CdiSpec>) = live
+            .iter()
+            .cloned()
+            .partition(|spec| on_disk.contains(&spec.kind));
+        // Before adding discovered kinds: it rewrites every cached GPU's topology.
+        self.refresh_topology(&present);
+        self.add_specs(&absent);
     }
 
     fn refresh_topology(&mut self, live: &[CdiSpec]) {
@@ -272,7 +280,6 @@ impl CdiCache {
                     device: device.clone(),
                     kind: spec.kind.clone(),
                     shared_edits: spec.container_edits.clone(),
-                    spec_annotations: spec.annotations.clone(),
                     source_path: source_path.to_owned(),
                     priority,
                 },
@@ -621,12 +628,61 @@ mod tests {
     }
 
     #[test]
+    fn a_live_kind_missing_on_disk_is_added_beside_on_disk_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        make_amd_spec(&["0"])
+            .write_json(&dir.path().join("amd.json"))
+            .unwrap();
+        let mut live_nic = make_amd_spec(&["0", "1"]);
+        live_nic.kind = "amd.com/nic".into();
+        let live = [make_amd_spec(&["0", "1"]), live_nic];
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
+        assert!(cache.get_device("amd.com/gpu=0").is_some());
+        assert!(
+            cache.get_device("amd.com/gpu=1").is_none(),
+            "the on-disk GPU spec stays authoritative for its kind"
+        );
+        assert!(cache.get_device("amd.com/nic=0").is_some());
+        assert!(cache.get_device("amd.com/nic=1").is_some());
+    }
+
+    #[test]
     fn live_discovery_fills_an_empty_spec_dir() {
         let dir = tempfile::tempdir().unwrap();
         let live = [make_amd_spec(&["0", "1"])];
 
         let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn a_discovered_gpu_keeps_its_live_topology() {
+        use crate::cdi::annotations::DeviceMetadata;
+        use crate::topology::DeviceTopology;
+        let topology = DeviceTopology {
+            pci_bdf: Some("0002:00:01.0".into()),
+            numa_node: Some(0),
+            pci_root: Some("pci0002:00".into()),
+            vram_bytes: Some(309_220_868_096),
+            fabric: None,
+        };
+        let mut live = make_amd_spec(&["0"]);
+        let meta = DeviceMetadata {
+            pci_bdf: topology.pci_bdf.clone(),
+            topology: Some(topology.clone()),
+            stable_id: Some(33_556_480),
+            ..DeviceMetadata::from_annotations(&HashMap::new())
+        };
+        live.devices[0].annotations = meta.to_annotations();
+        let dir = tempfile::tempdir().unwrap();
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&[live]));
+        let cached = cache.get_device("amd.com/gpu=0").unwrap();
+        assert_eq!(
+            DeviceMetadata::from_annotations(&cached.device.annotations).topology,
+            Some(topology)
+        );
     }
 
     #[test]

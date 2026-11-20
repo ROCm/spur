@@ -1674,7 +1674,7 @@ mod tests {
         registry
             .list()
             .iter()
-            .map(|e| (e.stable_id, e.device_paths.clone()))
+            .map(|e| (e.stable_id, e.node_paths().map(str::to_owned).collect()))
             .collect()
     }
 

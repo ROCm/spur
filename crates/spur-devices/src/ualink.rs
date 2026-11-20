@@ -208,24 +208,6 @@ fn has_issue(o: &FabricObservation, field: &str) -> bool {
     })
 }
 
-pub fn pci_root(device: &Path) -> Option<String> {
-    let resolved = device.canonicalize().ok()?;
-    resolved
-        .ancestors()
-        .filter_map(|path| path.file_name()?.to_str())
-        .find(|name| {
-            let bytes = name.as_bytes();
-            bytes.len() == 10
-                && name.starts_with("pci")
-                && bytes[7] == b':'
-                && bytes[3..7]
-                    .iter()
-                    .chain(&bytes[8..])
-                    .all(u8::is_ascii_hexdigit)
-        })
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,16 +366,5 @@ mod tests {
         let own = a.fabric.unwrap().without_peer_conflicts();
         assert!(own.issues.iter().any(|i| i.field == "accel_id"));
         assert_eq!(own.status, Status::Inconsistent);
-    }
-
-    #[test]
-    fn resolves_node_scoped_pci_host_bridge() {
-        let dir = tempfile::tempdir().unwrap();
-        let device = dir
-            .path()
-            .join("devices/pci0001:00/0001:00:01.1/0001:04:00.0");
-        std::fs::create_dir_all(&device).unwrap();
-        assert_eq!(pci_root(&device).as_deref(), Some("pci0001:00"));
-        assert_eq!(pci_root(dir.path()), None);
     }
 }

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use spur_devices::cdi::STABLE_ID_PARTITION_MASK;
+use spur_devices::pci::STABLE_ID_PARTITION_MASK;
 
 const FUNCTION_SHIFT: u32 = 8;
 const FUNCTION_MASK: u64 = 0x7 << FUNCTION_SHIFT;

@@ -437,7 +437,7 @@ k0s's containerd inject `amd.com/gpu` devices into pods.
 
 ### Discovery
 
-`spur_devices::cdi::discovery::discover_to_cdi` scans the KFD topology
+`spur_devices::discovery::discover_gpu_cdi` scans the KFD topology
 (`/sys/class/kfd/kfd/topology/nodes/`) for AMD GPU nodes. For each GPU it
 records:
 

@@ -2863,8 +2863,9 @@ mod tests {
 
         let path = |id: u64| {
             published.resolve_by_ids("gpu", &[id]).unwrap()[0]
-                .device_paths
-                .clone()
+                .node_paths()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
         };
         assert_eq!(path(sid(0x11, 1)), vec!["/dev/dri/renderD201".to_string()]);
         assert_eq!(path(sid(0x12, 0)), vec!["/dev/dri/renderD130".to_string()]);
@@ -3856,7 +3857,7 @@ mod tests {
     /// bits) plus a low-8-bit partition rank. Two ids with the same `bus` share
     /// physical silicon.
     fn sid(bus: u64, partition: u64) -> u64 {
-        (bus << 16) | (partition & spur_devices::cdi::STABLE_ID_PARTITION_MASK)
+        (bus << 16) | (partition & spur_devices::pci::STABLE_ID_PARTITION_MASK)
     }
 
     #[test]
