@@ -49,7 +49,7 @@ pub(crate) fn budget_exhausted() -> io::Error {
     )
 }
 
-/// Why a job spool was kept rather than deleted, for the rare cases an admin must clean by hand.
+/// Why an entry was kept rather than deleted, for the rare cases an admin must clean by hand.
 pub(crate) fn kept_reason(error: &io::Error) -> Option<&'static str> {
     match error.raw_os_error() {
         Some(libc::EXDEV) => Some("contains a mount point, not crossed"),

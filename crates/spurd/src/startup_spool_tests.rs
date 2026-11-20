@@ -6,6 +6,17 @@ use crate::startup_spool::{ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+/// Waits until the pass's worker is parked; fails rather than hangs if the pass ends first.
+async fn worker_reached(
+    gate: &(tokio::sync::Notify, std::sync::Barrier),
+    cleanup: &mut tokio::task::JoinHandle<CleanupSummary>,
+) {
+    tokio::select! {
+        _ = gate.0.notified() => {}
+        result = cleanup => panic!("the pass ended before its worker started: {result:?}"),
+    }
+}
+
 /// Re-runs one ignored test under `unshare`; a child that ran no test fails too.
 fn run_in_namespaces(test: &str, marker: &str, unshare: &[&str]) {
     let (_, module) = module_path!().split_once("::").unwrap();
@@ -104,7 +115,7 @@ impl SpoolFixture {
             cgroups_enabled: self.agent.cgroup.enabled,
             supervisor_uid: nix::unistd::geteuid().as_raw(),
             budget: STARTUP_CLEANUP_BUDGET,
-            worker_barriers: None,
+            worker_gate: None,
         }
     }
 
@@ -577,27 +588,24 @@ async fn a_worker_released_after_the_budget_deletes_nothing() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = Arc::new(SpoolFixture::new(&controller, &[1]));
-    let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-    let cleanup = tokio::spawn({
+    let gate = Arc::new((tokio::sync::Notify::new(), std::sync::Barrier::new(2)));
+    let mut cleanup = tokio::spawn({
         let fixture = fixture.clone();
-        let barriers = barriers.clone();
+        let gate = gate.clone();
         async move {
             let mut paths = fixture.paths();
             paths.budget = std::time::Duration::from_secs(1);
-            paths.worker_barriers = Some(barriers);
+            paths.worker_gate = Some(gate);
             fixture
                 .agent
                 .cleanup_startup_job_spools_with_inventory(paths)
                 .await
         }
     });
-    let reached = barriers.clone();
-    tokio::task::spawn_blocking(move || reached.0.wait())
-        .await
-        .unwrap();
+    worker_reached(&gate, &mut cleanup).await;
     // The pass returns at its deadline while the worker is still parked.
     assert_eq!(cleanup.await.unwrap().deleted, 0);
-    let release = barriers.clone();
+    let release = gate.clone();
     tokio::task::spawn_blocking(move || release.1.wait())
         .await
         .unwrap();
@@ -759,25 +767,20 @@ async fn startup_spool_excludes_launch_even_if_the_startup_future_is_cancelled()
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = Arc::new(SpoolFixture::new(&controller, &[1]));
-    let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-    let cleanup = tokio::spawn({
+    let gate = Arc::new((tokio::sync::Notify::new(), std::sync::Barrier::new(2)));
+    let mut cleanup = tokio::spawn({
         let fixture = fixture.clone();
-        let barriers = barriers.clone();
+        let gate = gate.clone();
         async move {
             let mut paths = fixture.paths();
-            paths.worker_barriers = Some(barriers);
+            paths.worker_gate = Some(gate);
             fixture
                 .agent
                 .cleanup_startup_job_spools_with_inventory(paths)
                 .await
         }
     });
-    tokio::task::spawn_blocking({
-        let barriers = barriers.clone();
-        move || barriers.0.wait()
-    })
-    .await
-    .unwrap();
+    worker_reached(&gate, &mut cleanup).await;
     let mut launch = Box::pin(fixture.agent.lifecycle.acquire(1));
     std::future::poll_fn(|context| {
         assert!(matches!(launch.as_mut().poll(context), Poll::Pending));
@@ -791,7 +794,7 @@ async fn startup_spool_excludes_launch_even_if_the_startup_future_is_cancelled()
         Poll::Ready(())
     })
     .await;
-    barriers.1.wait();
+    gate.1.wait();
     let _launch_guard = launch.await;
     assert!(!fixture.exists(1));
 }

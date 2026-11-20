@@ -397,8 +397,8 @@ The supervisor is unaffected by the restart -- it runs in its own session
 After initial completion replay, runtime pruning, supervisor adoption and
 stale-session settlement, `spurd` makes one pass over direct `job<id>`
 directories under `/var/spool/spur` and, for a non-root agent, the
-temporary-directory `spur` fallback. This pass finishes before the agent starts its RPC server and background runtime
-pruning, and is bounded by a 60-second budget; anything not decided by then is
+temporary-directory `spur` fallback. This pass finishes before the agent starts
+its RPC server and background runtime pruning, and is bounded by a 60-second budget; anything not decided by then is
 retained and logged. Heartbeats continue throughout startup. The roots are fixed
 and not configurable; the configured controller state directory does not add a
 spool root, and no periodic spool scan is installed (restarting `spurd` is the

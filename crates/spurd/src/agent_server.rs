@@ -5082,7 +5082,7 @@ impl AgentService {
             supervisor_uid: nix::unistd::geteuid().as_raw(),
             budget: crate::startup_spool::STARTUP_CLEANUP_BUDGET,
             #[cfg(test)]
-            worker_barriers: None,
+            worker_gate: None,
         })
         .await;
     }
@@ -22430,6 +22430,10 @@ mod tests {
             }
         });
         while svc.running.lock().await.contains_key(&job_id) {
+            assert!(
+                !wait.is_finished(),
+                "the cancel wait gave up before the job exited"
+            );
             tokio::task::yield_now().await;
         }
         tokio::task::yield_now().await;

@@ -31,7 +31,7 @@ pub(crate) struct ActivityPaths {
     pub(crate) supervisor_uid: u32,
     pub(crate) budget: Duration,
     #[cfg(test)]
-    pub(crate) worker_barriers: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+    pub(crate) worker_gate: Option<Arc<(tokio::sync::Notify, std::sync::Barrier)>>,
 }
 
 #[derive(Debug, Default)]
@@ -170,9 +170,9 @@ pub(crate) async fn run(
         let worker = tokio::task::spawn_blocking(move || {
             let _guards = guards;
             #[cfg(test)]
-            if let Some(barriers) = &paths.worker_barriers {
-                barriers.0.wait();
-                barriers.1.wait();
+            if let Some(gate) = &paths.worker_gate {
+                gate.0.notify_one();
+                gate.1.wait();
             }
             clean_inactive(eligible, &paths, deadline)
         });
