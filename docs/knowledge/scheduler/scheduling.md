@@ -13,9 +13,12 @@ Spur uses a **backfill scheduler** with priority ordering. Each cycle:
    then by descending effective priority, then by job_id. Idle-fill candidates
    are appended after all in-quota jobs.
 2. For each job, compute its earliest start time across all suitable nodes.
-3. If a job can start now, assign it and commit its resources to the timeline.
+3. If a job can start now, ask the pass's `StartAdmission` whether its limits
+   hold on the nodes it got; if so, assign it and commit its resources to the
+   timeline. A refused job starts nothing and holds nothing.
 4. If a job cannot start now, create a **shadow reservation** (future slot) so
-   lower-priority jobs cannot steal its projected capacity.
+   lower-priority jobs cannot steal its projected capacity, unless
+   `StartAdmission::may_reserve` refuses it as over its limits.
 5. Lower-priority jobs backfill into capacity not held by running jobs or
    shadow reservations.
 
@@ -378,6 +381,13 @@ skipped (`HetGroupIncomplete`). This prevents partial placement of a group
 where one component runs and the others wait indefinitely.
 
 Single-component het groups (only the anchor) are treated as normal jobs.
+
+**Queue order** -- backfill places a group's components one after another, at
+its highest-ranked component's place in the pending order, as Slurm does with
+`bf_hetjob_prio=max`. spurctld's tiers count: a reservation or a hoisted
+preemptor on one component moves the others up with it. No other job is planned
+while a placed component's nodes wait on the rest, so a group refused at start
+frees its nodes before the next job is planned.
 
 The pre-check verifies node suitability (features, partitions, capacity) but not
 simultaneous availability. Actual scheduling may still defer a component if the

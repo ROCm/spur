@@ -617,16 +617,11 @@ QOS keys
      - TRES cap across all of one user's jobs under this QOS.
    * - ``grptres``
      - ``""``
-     - Aggregate TRES cap across all jobs under this QOS. Counted against running
-       jobs and the jobs starting in the same scheduling pass. A pending job that
-       fits the cap but cannot be placed yet, for example because it waits for a
-       busy node, keeps its place in the queue but does not hold the rest of the
-       cap from lower-priority jobs that can start now. A pass re-checks up to
-       eight times, so a longer chain of such waiting jobs can still hold the
-       cap. A job that preempted others keeps its share of the cap while the node
-       its preemption frees is held for it (see the preemption note in
-       :doc:`configuration`), so another job under the same cap can't take that
-       room. The same applies to an account's ``grptres``.
+     - Aggregate TRES cap across all jobs under this QOS. Charged when a job
+       starts, on the nodes it got, so a waiting job holds none of the cap,
+       except a job whose preemption is still in flight (see
+       :ref:`limits-charged-at-start`). The same applies to an account's
+       ``grptres``.
    * - ``grpwall``
      - unset (no limit)
      - Aggregate wall-clock budget across all jobs under this QOS. A bare integer
@@ -685,9 +680,11 @@ How it behaves:
   onto a node the partition QOS already holds needs no new node (see
   :ref:`grptres-node-packing`).
 - A job submitted to several partitions (``-p gpu,cpu``) is narrowed to the
-  partitions whose QOS still admits it, and waits only when none does. Until it is
-  placed, it counts against every candidate partition's QOS for the rest of that
-  scheduling pass, so a later job in the same pass may wait one pass longer.
+  partitions whose QOS still admits it, and waits only when none does. It is
+  charged to the QOS of the partition it starts in, when it starts (see
+  `When limits are charged`_). If an earlier start in the same scheduling pass
+  fills that QOS, the job is refused there and runs in another of its partitions
+  from the next pass.
 - Idle-fill borrowed jobs count toward the partition QOS, and a job is never lent
   idle capacity past it: the cap bounds what a user holds, borrowed or not. A
   suspended job, and one still in its kill wait, count until each of their nodes
@@ -749,6 +746,43 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 .. code-block:: bash
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
+
+.. _limits-charged-at-start:
+
+When limits are charged
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The limits that count running work (``grptres``, ``maxtresperuser``,
+``maxjobsperuser`` and an association's ``maxrunningjobs``) are charged when a
+job starts, on the nodes it got, as in Slurm. This holds for the job QOS, the
+association and the partition QOS, which is charged in the partition the job
+starts in (see `Partition QOS: capping a user across accounts`_). A scheduling
+pass checks each start, in the order it places jobs, against the running jobs
+and the starts before it in the same pass, so no start goes over a cap.
+
+A waiting job holds no room. A job that cannot be placed yet, for example
+because it is pinned to a busy node, waits for a reservation or needs a node
+that is draining, keeps its place in the queue but does not stop lower-priority
+jobs under the same limit from starting.
+
+A job that fits its limits on its own, but not after the jobs started earlier in
+the same pass, is not started. It holds no future slot and starts no burst-buffer
+stage-in, and pends with its limit reason, for example ``QOSGrpNodeLimit``. A
+heterogeneous job's components that can start in the same pass are checked
+together, and start together or not at all. A pass places all its components one
+after another, at the first component's place in the queue, so the jobs queued
+behind them can use a refused job's nodes in the same pass.
+
+The exception is a job that preempted others: it keeps its share of its limits
+while its eviction is in flight (see the preemption note in
+:doc:`configuration`), so another job under the same limit can't take that room.
+Preemption, idle-fill reclaim and federation forwarding act only for a job that
+still fits its limits after the starts in the same pass and the evictions in
+flight.
+
+Licenses and burst-buffer capacity are not charged this way: a pass reserves
+them when it first considers a job, before placing it, so a job that is then not
+started or not staged in holds them for that pass.
 
 .. _maxwall-default:
 
@@ -1590,7 +1624,12 @@ use only part of each node's resources. Placement honors this: when a job is
 admitted on the basis that it can pack onto specific already-occupied nodes,
 scheduling actually places it there (as if those nodes had been given as an
 additive ``--nodelist``), rather than spreading it to an idle node elsewhere
-in the cluster and silently exceeding the cap. Packing applies only when a
+in the cluster and silently exceeding the cap. The cap is checked again when
+the job starts, on the nodes it got (see :ref:`limits-charged-at-start`): a
+node the group already occupies adds no node, and a job whose nodes would take
+the group over the cap is not started. Several jobs that fit only by packing
+may be steered to the same nodes; one that no longer fits there once the
+earlier ones start waits for a later pass. Packing applies only when a
 node cap is configured for that QOS or account; without one, jobs are placed
 as if the group held no nodes. An occupied node counts toward packing only if
 the job would also fit under the

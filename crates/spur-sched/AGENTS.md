@@ -49,7 +49,8 @@ effective_priority = base_priority * fair_share_factor * age_factor * partition_
 spurctld sorts pending jobs before handing them to the scheduler: reservation
 holders first, then hoisted preemptors, then by effective priority (descending),
 then by job_id (ascending), with idle-fill jobs appended at the end. The
-scheduler itself does not re-sort; it trusts the input order.
+scheduler itself does not re-sort; it trusts the input order, except that it
+moves a het job's components up behind its first one.
 
 ### Backfill pass (`backfill.rs`)
 
@@ -103,7 +104,8 @@ Het job components (linked by `het_job_id`) are gang-scheduled: if any
 component cannot find enough suitable nodes, the entire group is skipped.
 The pre-check runs `find_suitable_nodes()` for each component independently;
 actual timeline contention may still prevent placement even if the pre-check
-passes.
+passes. The components are placed one after another, at the first one's place
+in the pending order, so no other job is planned between them.
 
 ### GPU placement modes
 
@@ -298,9 +300,10 @@ Run unit tests: `cargo test -p spur-sched`
 
 ## Common pitfalls
 
-1. **Input order matters.** The scheduler does not re-sort pending jobs. If
-   spurctld passes them in wrong priority order, higher-priority jobs may get
-   shadow-reserved after lower-priority ones consume their slots.
+1. **Input order matters.** The scheduler does not re-sort pending jobs (beyond
+   keeping a het job's components together). If spurctld passes them in wrong
+   priority order, higher-priority jobs may get shadow-reserved after
+   lower-priority ones consume their slots.
 
 2. **busy_until vs flat placeholder.** Nodes without a `busy_until` entry get
    a 24-hour placeholder. This is conservative but can cause small jobs to be

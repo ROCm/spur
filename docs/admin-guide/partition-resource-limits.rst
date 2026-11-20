@@ -419,11 +419,11 @@ How caps combine with other limits
 ----------------------------------
 
 Spur applies the job's QOS, its user and account association, the partition
-it runs in, and physical node capacity together. A job runs only if it passes
-all of them. A partition cap never loosens an association or QOS limit, and the
-other way round. This is not Slurm's hierarchy, where the first layer that
-defines a limit wins. Inheriting limits from parent accounts or the root, and
-partition QOS, are not supported.
+it runs in and that partition's :ref:`QOS <partition-qos>`, and physical node
+capacity together. A job runs only if it passes all of them. A partition cap
+never loosens an association or QOS limit, and the other way round. This is not
+Slurm's hierarchy, where the first layer that defines a limit wins. Inheriting
+limits from parent accounts or the root is not supported.
 
 Partition caps (``max_tres_per_node``) are additional constraints on top of the
 association and QOS limits. A partition's memory policy can change a job's CPU
@@ -449,10 +449,11 @@ in ``a`` and 6 CPUs in ``b``. With an association ``GrpTRES=cpu=4`` the job
 can only run in ``a``, so it runs there; ``b`` is not considered for it. With
 ``GrpTRES=cpu=3`` neither fits and the job pends with ``AssocGrpCpuLimit``.
 
-Within one scheduling pass, a job that could run in several partitions holds
-the largest of their requests against shared association and QOS limits until
-it starts, so jobs queued behind it in the same pass are never admitted past a
-limit. Once it starts, only the request of the partition it runs in is charged.
+A job that could run in several partitions is charged against shared
+association and QOS limits when it starts, with the request of the partition it
+runs in (see :ref:`limits-charged-at-start`). Until then it holds none of them,
+except while a preemption it triggered is in flight: then it holds the largest
+of the requests that fit, since it may start in any of those partitions.
 
 Jobs started by :doc:`idle-fill-scheduling` count against partition caps like
 any other running job, and an idle-fill start must fit within the cap.

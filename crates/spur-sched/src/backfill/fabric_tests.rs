@@ -408,6 +408,53 @@ fn a_refused_fabric_job_reserves_nothing_and_leaves_its_block_to_later_jobs() {
 }
 
 #[test]
+fn a_fabric_job_refused_its_future_slot_holds_none_and_leaves_the_gap_to_a_longer_job() {
+    let mut nodes = nodes(2);
+    nodes[0].alloc_resources = ResourceAllocations {
+        cpus: 1,
+        devices: [(
+            "gpu".into(),
+            vec![
+                AllocatedDevice::injectable(42),
+                AllocatedDevice::injectable(43),
+            ],
+        )]
+        .into(),
+        ..Default::default()
+    };
+    nodes[0].state = NodeState::Mixed;
+    let view = FabricView::from_nodes("test", &nodes, now(), 90);
+    let mut admission = Recorder {
+        refused_slots: HashSet::from([1]),
+        ..Default::default()
+    };
+    let mut long = job(2, 1, 1);
+    long.spec.time_limit = Some(Duration::seconds(90));
+
+    let (scheduler, assignments) =
+        run_admitting(&nodes, &[job(1, 2, 4), long], true, view, &mut admission);
+
+    assert_eq!(
+        admission.slots_asked,
+        [Asked {
+            job_id: 1,
+            nodes: vec!["n0".to_string(), "n1".to_string()],
+            start: now() + Duration::seconds(60),
+            end: now() + Duration::seconds(90),
+        }]
+    );
+    assert_eq!(
+        scheduler.last_outcome[&1].kind,
+        UnplacedKind::RefusedAtStart
+    );
+    assert!(!holds_a_slot(&scheduler, 1));
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[test]
 fn required_nodelist_and_node_exclusivity_are_preserved() {
     let nodes = nodes(4);
     let mut request = job(1, 2, 2);

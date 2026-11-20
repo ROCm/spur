@@ -108,7 +108,7 @@ resolve to `Administrator`: `Admin`, `Administrator`, `SuperUser`.
 
 ## QOS Enforcement
 
-QOS limits are checked at two points:
+QOS limits are checked at three points:
 
 1. **Submission gate** (`check_qos_submit_limits`): submit-count limits
    (`MaxSubmitJobsPerUser`, `MaxSubmitJobsPerAccount`, `GrpSubmitJobs`) always
@@ -117,6 +117,13 @@ QOS limits are checked at two points:
 
 2. **Scheduler gate** (`check_qos_limits`): all limits checked with real
    aggregated load. Returns `Allowed` or `Blocked(PendingReason)`.
+
+3. **Start check** (`LimitAdmission` in `cluster/limit_admission.rs`): each
+   start the backfill pass places is re-checked on its nodes against the
+   running jobs, the starts before it in the pass and the room held by
+   evictions in flight, then charged to the pass's `QuotaLedger` under its job
+   QOS, its account and the partition QOS of the partition it starts in. A
+   waiting job is charged nothing; a refused start pends with the limit's reason.
 
 Limit dimensions checked for TRES caps: CPU, Node, Memory, GPU. A dimension
 capped at 0 is treated as uncapped. Comparisons are strict `>` (at the cap =

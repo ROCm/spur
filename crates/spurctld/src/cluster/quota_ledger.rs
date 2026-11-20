@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! QOS and account usage summed once from the job table, so the admission gates
-//! read a scope's usage instead of scanning every job on every check.
+//! QOS, account and partition QOS usage summed once from the job table, so the
+//! admission gates read a scope's usage instead of scanning every job on every check.
+//! A scheduling pass charges its starts into the same ledger, so each start sees the
+//! ones before it.
 
 use std::collections::HashMap;
 
@@ -11,30 +13,32 @@ use spur_core::job::{Job, JobId};
 
 use super::{account_of, is_submitted, RunningTresAccumulator};
 
-/// Usage per QOS and per account, with each user's share in it, borrowed from
-/// the job table it was summed from.
-#[derive(Default)]
-pub(super) struct QuotaLedger<'a> {
-    qos: HashMap<&'a str, ScopeTally<'a>>,
-    accounts: HashMap<&'a str, ScopeTally<'a>>,
+/// Usage per QOS, per account and per partition QOS, with each user's share in it.
+/// Owns its names so it outlives the read of the job table it was summed from.
+#[derive(Clone, Default)]
+pub(super) struct QuotaLedger {
+    qos: HashMap<String, ScopeTally>,
+    accounts: HashMap<String, ScopeTally>,
+    /// Counts no submitted jobs: a partition QOS applies no submit limit.
+    partition_qos: HashMap<String, ScopeTally>,
 }
 
-#[derive(Default)]
-struct ScopeTally<'a> {
-    running: RunningTresAccumulator<'a>,
-    users: HashMap<&'a str, UserTally<'a>>,
+#[derive(Clone, Default)]
+struct ScopeTally {
+    running: RunningTresAccumulator,
+    users: HashMap<String, UserTally>,
 }
 
-#[derive(Default)]
-struct UserTally<'a> {
+#[derive(Clone, Default)]
+struct UserTally {
     running_jobs: u32,
-    running: RunningTresAccumulator<'a>,
+    running: RunningTresAccumulator,
     /// The user's pending and running jobs in the scope, ascending.
     submitted: Vec<JobId>,
 }
 
-impl<'a> QuotaLedger<'a> {
-    pub(super) fn from_jobs(jobs: impl IntoIterator<Item = &'a Job>) -> Self {
+impl QuotaLedger {
+    pub(super) fn from_jobs<'a>(jobs: impl IntoIterator<Item = &'a Job>) -> Self {
         let mut ledger = Self::default();
         for job in jobs {
             ledger.add(job);
@@ -55,7 +59,94 @@ impl<'a> QuotaLedger<'a> {
         QuotaView::of(self.accounts.get(account), user)
     }
 
-    fn add(&mut self, job: &'a Job) {
+    pub(super) fn partition_qos(&self, qos: &str, user: &str) -> QuotaView<'_> {
+        QuotaView::of(self.partition_qos.get(qos), user)
+    }
+
+    /// Adds each of `jobs` still holding its allocation to the partition QOS
+    /// `charged_qos` names for it. Borrowed runs count too: a partition QOS bounds
+    /// what a user holds, borrowed or not.
+    pub(super) fn add_partition_qos<'a, 'q>(
+        &mut self,
+        jobs: impl IntoIterator<Item = &'a Job>,
+        charged_qos: impl Fn(&Job) -> Option<&'q str>,
+    ) {
+        for job in jobs.into_iter().filter(|job| job.holds_allocation()) {
+            if let Some(qos) = charged_qos(job) {
+                update(&mut self.partition_qos, qos, |scope| {
+                    scope.add(job, true, false)
+                });
+            }
+        }
+    }
+
+    /// Charges `job` as running on `nodes`, under `partition_qos` if its partition
+    /// has one. A borrowed start adds no node to its QOS, whose node cap it runs
+    /// outside of, but counts in every other figure for the rest of the pass.
+    pub(super) fn charge_start(
+        &mut self,
+        job: &Job,
+        nodes: &[String],
+        partition_qos: Option<&str>,
+    ) {
+        if let Some(qos) = job.spec.qos.as_deref() {
+            let qos_nodes: &[String] = if job.idle_fill { &[] } else { nodes };
+            update(&mut self.qos, qos, |scope| {
+                scope.start(job, qos_nodes, nodes)
+            });
+        }
+        for (tallies, name) in [
+            (&mut self.accounts, account_of(job)),
+            (&mut self.partition_qos, partition_qos),
+        ] {
+            if let Some(name) = name {
+                update(tallies, name, |scope| scope.start(job, nodes, nodes));
+            }
+        }
+    }
+
+    /// The tallies the `starts` [charged](QuotaLedger::charge_start) could change,
+    /// each a job and its partition QOS, for [`QuotaLedger::restore`].
+    pub(super) fn snapshot<'a>(
+        &self,
+        starts: impl IntoIterator<Item = (&'a Job, Option<&'a str>)>,
+    ) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        for (job, partition_qos) in starts {
+            for (taken, tallies, name) in [
+                (&mut snapshot.qos, &self.qos, job.spec.qos.as_deref()),
+                (&mut snapshot.accounts, &self.accounts, account_of(job)),
+                (
+                    &mut snapshot.partition_qos,
+                    &self.partition_qos,
+                    partition_qos,
+                ),
+            ] {
+                if let Some(name) = name.filter(|n| !taken.iter().any(|(t, _)| t == n)) {
+                    taken.push((name.to_owned(), tallies.get(name).cloned()));
+                }
+            }
+        }
+        snapshot
+    }
+
+    /// Puts back the tallies `snapshot` took, undoing every start charged since.
+    pub(super) fn restore(&mut self, snapshot: Snapshot) {
+        for (tallies, taken) in [
+            (&mut self.qos, snapshot.qos),
+            (&mut self.accounts, snapshot.accounts),
+            (&mut self.partition_qos, snapshot.partition_qos),
+        ] {
+            for (name, tally) in taken {
+                match tally {
+                    Some(tally) => tallies.insert(name, tally),
+                    None => tallies.remove(&name),
+                };
+            }
+        }
+    }
+
+    fn add(&mut self, job: &Job) {
         // A borrowed run (`idle_fill` stamped) is outside every quota aggregate:
         // counted, it would block its team's legitimate jobs at a gate, where
         // reclaim never sees them (§7, D1). A job reclaimable only through
@@ -74,34 +165,61 @@ impl<'a> QuotaLedger<'a> {
             (&mut self.accounts, account_of(job)),
         ] {
             if let Some(name) = name {
-                scopes.entry(name).or_default().add(job, running, submitted);
+                update(scopes, name, |scope| scope.add(job, running, submitted));
             }
         }
     }
 }
 
-impl<'a> ScopeTally<'a> {
-    fn add(&mut self, job: &'a Job, running: bool, submitted: bool) {
-        let user = self.users.entry(job.spec.user.as_str()).or_default();
+/// Some scopes' tallies as they stood, `None` for a scope that had none.
+#[derive(Default)]
+pub(super) struct Snapshot {
+    qos: Vec<(String, Option<ScopeTally>)>,
+    accounts: Vec<(String, Option<ScopeTally>)>,
+    partition_qos: Vec<(String, Option<ScopeTally>)>,
+}
+
+/// Runs `f` on the tally under `name`, allocating the name only when it is new.
+fn update<T: Default>(tallies: &mut HashMap<String, T>, name: &str, f: impl FnOnce(&mut T)) {
+    match tallies.get_mut(name) {
+        Some(tally) => f(tally),
+        None => f(tallies.entry(name.to_owned()).or_default()),
+    }
+}
+
+impl ScopeTally {
+    fn add(&mut self, job: &Job, running: bool, submitted: bool) {
         if running {
             self.running.add(job);
-            user.running.add(job);
+        }
+        update(&mut self.users, &job.spec.user, |user| {
+            if running {
+                user.running.add(job);
+                user.running_jobs += 1;
+            }
+            if submitted {
+                user.submitted.push(job.job_id);
+            }
+        });
+    }
+
+    fn start(&mut self, job: &Job, scope_nodes: &[String], user_nodes: &[String]) {
+        self.running.add_on(job, scope_nodes);
+        update(&mut self.users, &job.spec.user, |user| {
+            user.running.add_on(job, user_nodes);
             user.running_jobs += 1;
-        }
-        if submitted {
-            user.submitted.push(job.job_id);
-        }
+        });
     }
 }
 
 /// What one user and their whole scope already use, for a gate checking a job.
 pub(super) struct QuotaView<'a> {
-    scope: Option<&'a ScopeTally<'a>>,
-    user: Option<&'a UserTally<'a>>,
+    scope: Option<&'a ScopeTally>,
+    user: Option<&'a UserTally>,
 }
 
 impl<'a> QuotaView<'a> {
-    fn of(scope: Option<&'a ScopeTally<'a>>, user: &str) -> Self {
+    fn of(scope: Option<&'a ScopeTally>, user: &str) -> Self {
         Self {
             scope,
             user: scope.and_then(|s| s.users.get(user)),
@@ -136,6 +254,10 @@ impl<'a> QuotaView<'a> {
     /// Nodes the scope's running jobs occupy.
     pub(super) fn occupied(&self) -> impl Iterator<Item = &'a str> {
         self.scope.into_iter().flat_map(|s| s.running.nodes())
+    }
+
+    pub(super) fn occupies(&self, node: &str) -> bool {
+        self.scope.is_some_and(|s| s.running.occupies(node))
     }
 }
 
@@ -203,6 +325,140 @@ mod tests {
                 assert_eq!(tres.get(TresType::Cpu), 2);
             }
             assert_eq!(usage.occupied().collect::<Vec<_>>(), ["n2"]);
+        }
+    }
+
+    /// A pending job in "team" and "acct" without a placement, and the nodes it starts on.
+    fn starting(id: JobId, user: &str, nodes: &[&str]) -> (Job, Vec<String>) {
+        let mut job = job(id, user, "team", JobState::Pending, nodes);
+        let placed = std::mem::take(&mut job.allocated_nodes);
+        (job, placed)
+    }
+
+    #[test]
+    fn a_start_charges_its_qos_and_account() {
+        let running = job(1, "alice", "team", JobState::Running, &["n1"]);
+        let (start, placed) = starting(2, "alice", &["n2", "n3"]);
+        let mut ledger = QuotaLedger::from_jobs([&running, &start]);
+        ledger.charge_start(&start, &placed, None);
+        for usage in [ledger.qos("team", "alice"), ledger.account("acct", "alice")] {
+            assert_eq!(usage.user_running_jobs(), 2);
+            assert_eq!(usage.user_submitted_before(3), 2);
+            for tres in [usage.user_running_tres(), usage.scope_running_tres()] {
+                assert_eq!(tres.get(TresType::Node), 3);
+                assert_eq!(tres.get(TresType::Cpu), 4);
+            }
+            let mut occupied: Vec<_> = usage.occupied().collect();
+            occupied.sort();
+            assert_eq!(occupied, ["n1", "n2", "n3"]);
+        }
+    }
+
+    #[test]
+    fn a_start_counts_a_node_its_scope_already_occupies_once() {
+        let running = job(1, "alice", "team", JobState::Running, &["n1"]);
+        let mut ledger = QuotaLedger::from_jobs([&running]);
+        for (start, placed) in [
+            starting(2, "alice", &["n1", "n2"]),
+            starting(3, "bob", &["n2"]),
+        ] {
+            ledger.charge_start(&start, &placed, None);
+        }
+        for (alice, bob) in [
+            (ledger.qos("team", "alice"), ledger.qos("team", "bob")),
+            (
+                ledger.account("acct", "alice"),
+                ledger.account("acct", "bob"),
+            ),
+        ] {
+            assert_eq!(alice.scope_running_tres().get(TresType::Node), 2);
+            assert_eq!(alice.scope_running_tres().get(TresType::Cpu), 6);
+            assert_eq!(alice.user_running_tres().get(TresType::Node), 2);
+            assert_eq!(alice.user_running_jobs(), 2);
+            assert_eq!(bob.user_running_tres().get(TresType::Node), 1);
+            assert_eq!(bob.user_running_jobs(), 1);
+        }
+    }
+
+    #[test]
+    fn a_borrowed_start_adds_no_node_to_its_qos() {
+        let (mut borrowed, placed) = starting(1, "alice", &["n1"]);
+        borrowed.idle_fill = true;
+        let mut ledger = QuotaLedger::from_jobs([&borrowed]);
+        ledger.charge_start(&borrowed, &placed, None);
+
+        let qos = ledger.qos("team", "alice");
+        assert!(!qos.occupies("n1"));
+        assert_eq!(qos.occupied().count(), 0);
+        assert_eq!(qos.scope_running_tres().get(TresType::Node), 0);
+        assert_eq!(qos.scope_running_tres().get(TresType::Cpu), 2);
+        assert_eq!(qos.user_running_jobs(), 1);
+        assert_eq!(qos.user_running_tres().get(TresType::Node), 1);
+        assert_eq!(qos.user_running_tres().get(TresType::Cpu), 2);
+
+        let account = ledger.account("acct", "alice");
+        assert!(account.occupies("n1"));
+        assert_eq!(account.user_running_jobs(), 1);
+        for tres in [account.user_running_tres(), account.scope_running_tres()] {
+            assert_eq!(tres.get(TresType::Node), 1);
+            assert_eq!(tres.get(TresType::Cpu), 2);
+        }
+    }
+
+    #[test]
+    fn a_partition_qos_counts_every_run_still_holding_its_allocation() {
+        let mut borrowed = job(1, "alice", "team", JobState::Running, &["n1"]);
+        borrowed.idle_fill = true;
+        let jobs = [
+            borrowed,
+            job(2, "alice", "team", JobState::Suspended, &["n2"]),
+            job(3, "alice", "team", JobState::Completing, &["n3"]),
+            job(4, "alice", "team", JobState::Pending, &[]),
+            job(5, "alice", "team", JobState::Completed, &["n4"]),
+        ];
+        let mut ledger = QuotaLedger::default();
+        ledger.add_partition_qos(&jobs, |_| Some("cap"));
+
+        let usage = ledger.partition_qos("cap", "alice");
+        assert_eq!(usage.user_running_jobs(), 3);
+        assert_eq!(usage.user_submitted_before(9), 0);
+        assert_eq!(usage.scope_running_tres().get(TresType::Node), 3);
+        let mut occupied: Vec<_> = usage.occupied().collect();
+        occupied.sort();
+        assert_eq!(occupied, ["n1", "n2", "n3"]);
+    }
+
+    #[test]
+    fn a_borrowed_start_adds_its_node_to_its_partition_qos() {
+        let (mut borrowed, placed) = starting(1, "alice", &["n1"]);
+        borrowed.idle_fill = true;
+        let mut ledger = QuotaLedger::default();
+        ledger.charge_start(&borrowed, &placed, Some("cap"));
+
+        let usage = ledger.partition_qos("cap", "alice");
+        assert!(usage.occupies("n1"));
+        assert_eq!(usage.user_running_jobs(), 1);
+        assert_eq!(usage.scope_running_tres().get(TresType::Node), 1);
+        assert!(!ledger.qos("team", "alice").occupies("n1"));
+    }
+
+    #[test]
+    fn restore_undoes_a_start_in_every_scope() {
+        let running = job(1, "alice", "team", JobState::Running, &["n1"]);
+        let (start, placed) = starting(2, "alice", &["n2"]);
+        let mut ledger = QuotaLedger::from_jobs([&running]);
+        ledger.add_partition_qos([&running], |_| Some("cap"));
+        let snapshot = ledger.snapshot([(&start, Some("cap"))]);
+        ledger.charge_start(&start, &placed, Some("cap"));
+        ledger.restore(snapshot);
+
+        for usage in [
+            ledger.qos("team", "alice"),
+            ledger.account("acct", "alice"),
+            ledger.partition_qos("cap", "alice"),
+        ] {
+            assert_eq!(usage.user_running_jobs(), 1);
+            assert_eq!(usage.occupied().collect::<Vec<_>>(), ["n1"]);
         }
     }
 

@@ -1708,6 +1708,12 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
+    /// The id shared by a heterogeneous job's components: the first component's.
+    pub fn het_key(&self) -> Option<JobId> {
+        self.het_job_id
+            .or((self.het_group == Some(0)).then_some(self.job_id))
+    }
+
     /// True while a future `begin_time` defers this job's start, whether it came
     /// from `--begin`, a preemption requeue, or a launch-failure backoff.
     pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {

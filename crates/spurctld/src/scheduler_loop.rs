@@ -24,7 +24,7 @@ use spur_sched::partition_cap::{
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
-use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
+use crate::cluster::{ClassifiedPass, ClusterManager, JobEndFacts, JobFilter, LimitAdmission};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::victim_order::{victim_facts, RankKey, VictimOrder};
@@ -310,15 +310,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // per-tick maintenance.
         cluster.run_node_health_pass();
 
-        // Classify once, apply reasons, and stage only candidates admitted by
-        // that classification. Run before the empty-check so reasons stay fresh
-        // even with nothing schedulable.
-        let mut trial_scheduler = scheduler.for_trial();
-        let (classification, unclaimed) = classify_without_phantom_claims(&cluster, |c| {
-            trial_placement(&cluster, &mut trial_scheduler, c)
-        });
-        let (mut pending, idle_fill_candidates) = cluster.apply_classification(classification);
+        // Classify once and apply reasons. Run before the empty-check so reasons
+        // stay fresh even with nothing schedulable.
+        let ClassifiedPass {
+            jobs: mut pending,
+            idle_fill_candidates,
+            mut limits,
+            stage_in,
+        } = cluster.apply_classification(cluster.classify_pending_jobs());
         if pending.is_empty() && idle_fill_candidates.is_empty() {
+            cluster.stage_in_and_report_refusals(&stage_in, &mut limits);
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
@@ -327,11 +328,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
-        let partitions = cluster.get_partitions();
-        let reservations = cluster.get_reservations();
-        // Only this pass's in-quota admissions own handoffs, so derive them before borrowers join.
-        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
+        let cycle_start = Instant::now();
+        let view = PassView::read(&cluster, &pending);
 
         // Append the borrow candidates below every in-quota job, strictly after the
         // node set and the depth metric are derived from the in-quota list alone. A
@@ -361,68 +359,32 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
-        if nodes.is_empty() {
+        if view.nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
+            cluster.stage_in_and_report_refusals(&stage_in, &mut limits);
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
             scheduler.clear_outcomes();
             continue;
         }
 
-        let cycle_start = Instant::now();
-
-        let busy_until = running_jobs_busy_until(&cluster);
-        let partition_node_usage = running_partition_usage(&cluster);
-        let config = cluster.config();
-        let view = cluster.fabric_view(chrono::Utc::now());
-        let topology = config
-            .topology
-            .as_ref()
-            .and_then(|config| config.build(&cluster.get_nodes(), &view));
-        let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
-        let cluster_state = ClusterState {
-            fabric: fabric.as_ref(),
-            nodes: &nodes,
-            partitions: &partitions,
-            reservations: &reservations,
-            topology: topology.as_ref(),
-            busy_until: &busy_until,
-            preemption_handoffs: &handoffs,
-            partition_node_usage: &partition_node_usage,
-        };
-
-        // Catch panics in the scheduler so that a single bad job doesn't kill
-        // the entire scheduling loop.
-        let sched_ref = &mut scheduler;
+        let cluster_state = view.state();
         let schedule_start = Instant::now();
-        let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            claimed_assignments(sched_ref, &pending, &cluster_state, &unclaimed)
-        })) {
-            Ok(a) => a,
-            Err(e) => {
-                error!(
-                    "scheduler panicked: {:?} — skipping cycle",
-                    e.downcast_ref::<String>()
-                        .map(|s| s.as_str())
-                        .or_else(|| e.downcast_ref::<&str>().copied())
-                        .unwrap_or("unknown")
-                );
-                let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                let schedule_time_us =
-                    schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
-                // Fail safe: a scheduler that just panicked can't be trusted
-                // to have produced a valid plan, planned or otherwise.
-                cluster.set_planned_reservations(HashMap::new());
-                cluster.set_planned_job_starts(HashMap::new());
-                sched_ref.clear_outcomes();
-                continue;
-            }
-        };
+        let planned = plan_pass(
+            &cluster,
+            &mut scheduler,
+            &pending,
+            &cluster_state,
+            &mut limits,
+            &stage_in,
+        );
         let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        cluster.set_planned_reservations(sched_ref.planned_starts());
-        cluster.set_planned_job_starts(sched_ref.planned_job_starts());
-        let preempt_handoffs = without_released(&handoffs, sched_ref.released_handoffs());
+        let Some(assignments) = planned else {
+            let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
+            continue;
+        };
+        let preempt_handoffs = without_released(&view.handoffs, scheduler.released_handoffs());
         let preempt_state = ClusterState {
             preemption_handoffs: &preempt_handoffs,
             ..cluster_state
@@ -447,19 +409,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // Update pending_reason for unscheduled jobs to reflect actual cause.
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
-                cluster.update_pending_reasons(&unscheduled, &cluster_state);
-                cluster
-                    .annotate_partition_cap_pending(&unscheduled, scheduler.partition_cap_blocks());
-                cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
+                report_unscheduled(&cluster, &unscheduled, &limits, &cluster_state, &scheduler);
             }
 
             let unscheduled: Vec<_> = unscheduled
                 .into_iter()
-                .filter(|job| {
-                    !fabric
-                        .as_ref()
-                        .is_some_and(|context| context.requires_binding(job))
-                })
+                .filter(|job| !view.fabric.requires_binding(job))
                 .collect();
             {
                 // Deliberately outside the `unscheduled` guard: that list excludes
@@ -477,16 +432,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     // and federation: rule (B) lets a higher-priority idle-fill job
                     // displace strictly-lower-priority opportunistic work. The
                     // ceiling inside keeps it from touching anything with a claim.
-                    let reclaimers: Vec<_> = pending
-                        .iter()
-                        .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
-                        .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
-                        .filter(|job| {
-                            !fabric
-                                .as_ref()
-                                .is_some_and(|context| context.requires_binding(job))
-                        })
-                        .collect();
+                    let reclaimers = reclaimers(
+                        &pending,
+                        &assignments,
+                        &reclaim_in_flight,
+                        &limits,
+                        &view.fabric,
+                    );
                     let (freed, freed_for) = reclaim_for_unplaced(
                         &cluster,
                         &reclaimers,
@@ -494,6 +446,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &preempt_state,
                         &sched_cfg,
                         &assignments,
+                        |job| limits.fits(job),
                     )
                     .await;
                     if !freed.is_empty() {
@@ -522,19 +475,22 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
 
             if !unscheduled.is_empty() {
-                try_preempt_with_handoffs(
+                let preemptor = try_preempt_with_handoffs(
                     &cluster,
                     &preempt_state,
                     &unscheduled,
                     &assignments,
                     &cluster.config().scheduler,
+                    |job| limits.fits(job),
                 )
                 .await;
+                if let Some(preemptor) = preemptor {
+                    limits.record_eviction(preemptor);
+                }
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config().federation.clusters.is_empty() {
-                    let jobs_to_fwd: Vec<spur_core::job::Job> =
-                        unscheduled.iter().map(|j| (*j).clone()).collect();
+                    let jobs_to_fwd = federation_candidates(&limits, &unscheduled);
                     let fed_cluster = cluster.clone();
                     tokio::spawn(async move {
                         forward_to_federation(&fed_cluster, &jobs_to_fwd).await;
@@ -997,97 +953,6 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Bounds the classifications per pass, which cost a trial placement each; a longer
-/// chain of waiting claimants keeps its last claims for the pass.
-const MAX_CLAIM_ROUNDS: usize = 8;
-
-/// Admission claims quota before placement, so a job that then cannot start would
-/// hold headroom from the jobs behind it; reclassify with such jobs unclaimed, except
-/// preemptors whose eviction is still in flight.
-pub(crate) fn classify_without_phantom_claims(
-    cluster: &ClusterManager,
-    mut trial: impl FnMut(&crate::cluster::PendingJobClassification) -> HashSet<spur_core::job::JobId>,
-) -> (
-    crate::cluster::PendingJobClassification,
-    HashSet<spur_core::job::JobId>,
-) {
-    let mut unclaimed = HashSet::new();
-    let mut classification = cluster.classify_pending_jobs_with(&unclaimed);
-    for _ in 1..MAX_CLAIM_ROUNDS {
-        if !classification.claims_blocked || classification.jobs.is_empty() {
-            break;
-        }
-        let Ok(placed) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trial(&classification)))
-        else {
-            // Keeping the claims fails closed: nothing extra is admitted under a cap.
-            error!("trial placement panicked; keeping this pass's quota claims");
-            break;
-        };
-        let newly_unclaimed: Vec<_> = classification
-            .jobs
-            .iter()
-            .map(|job| job.job_id)
-            .filter(|id| !placed.contains(id) && !unclaimed.contains(id))
-            .filter(|id| !classification.evicting.contains(id))
-            .collect();
-        if newly_unclaimed.is_empty() {
-            break;
-        }
-        unclaimed.extend(newly_unclaimed);
-        classification = cluster.classify_pending_jobs_with(&unclaimed);
-    }
-    (classification, unclaimed)
-}
-
-/// Which in-quota jobs this classification's placement would start now. Same inputs as
-/// the real pass, including borrow candidates at the tail; nothing is dispatched.
-pub(crate) fn trial_placement(
-    cluster: &ClusterManager,
-    scheduler: &mut BackfillScheduler,
-    classification: &crate::cluster::PendingJobClassification,
-) -> HashSet<spur_core::job::JobId> {
-    let nodes = cluster.nodes_off_dispatch_cooldown(&classification.jobs);
-    let partitions = cluster.get_partitions();
-    let reservations = cluster.get_reservations();
-    let busy_until = running_jobs_busy_until(cluster);
-    let partition_node_usage = running_partition_usage(cluster);
-    let config = cluster.config();
-    let view = cluster.fabric_view(Utc::now());
-    let topology = config
-        .topology
-        .as_ref()
-        .and_then(|config| config.build(&cluster.get_nodes(), &view));
-    let fabric = spur_sched::traits::FabricSchedulingContext { view };
-    let handoffs = cluster.preemption_handoffs(&classification.jobs, &nodes, &reservations);
-    let state = ClusterState {
-        fabric: Some(&fabric),
-        nodes: &nodes,
-        partitions: &partitions,
-        reservations: &reservations,
-        topology: topology.as_ref(),
-        busy_until: &busy_until,
-        preemption_handoffs: &handoffs,
-        partition_node_usage: &partition_node_usage,
-    };
-    let mut list = classification.jobs.clone();
-    list.extend(
-        classification
-            .idle_fill_candidates
-            .iter()
-            .cloned()
-            .map(|mut job| {
-                job.idle_fill = true;
-                job
-            }),
-    );
-    scheduler
-        .schedule(&list, &state)
-        .into_iter()
-        .map(|a| a.job_id)
-        .collect()
-}
-
 /// Pass-start handoffs minus the holds placement freed; the victim search would otherwise
 /// evict for nodes that are already free.
 pub(crate) fn without_released(
@@ -1107,35 +972,268 @@ pub(crate) fn without_released(
         .collect()
 }
 
-/// The pass's placement, minus jobs that took no quota claim and so must not start.
-pub(crate) fn claimed_assignments(
-    scheduler: &mut impl Scheduler,
-    pending: &[spur_core::job::Job],
-    state: &ClusterState,
-    unclaimed: &HashSet<spur_core::job::JobId>,
-) -> Vec<Assignment> {
-    without_unclaimed(scheduler.schedule(pending, state), unclaimed)
+/// The cluster as one scheduling pass places against it, read once.
+pub(crate) struct PassView {
+    pub(crate) nodes: Vec<Node>,
+    partitions: Vec<spur_core::partition::Partition>,
+    reservations: Vec<spur_core::reservation::Reservation>,
+    pub(crate) handoffs: HashMap<String, Vec<spur_core::job::JobId>>,
+    busy_until: HashMap<String, DateTime<Utc>>,
+    partition_node_usage: PartitionNodeUsage,
+    pub(crate) fabric: spur_sched::traits::FabricSchedulingContext,
+    topology: Option<spur_core::topology::TopologyTree>,
 }
 
-/// Dispatching a job that took no quota this pass could breach a cap. Placement should
-/// not return one, but node state can change between the trial and the real pass.
-fn without_unclaimed(
-    assignments: Vec<Assignment>,
-    unclaimed: &HashSet<spur_core::job::JobId>,
+impl PassView {
+    /// Read for `in_quota`, the jobs classification admitted, before any borrower
+    /// joins: only they own handoffs or lift a node's dispatch cooldown.
+    pub(crate) fn read(cluster: &ClusterManager, in_quota: &[spur_core::job::Job]) -> Self {
+        let nodes = cluster.nodes_off_dispatch_cooldown(in_quota);
+        let reservations = cluster.get_reservations();
+        let handoffs = cluster.preemption_handoffs(in_quota, &nodes, &reservations);
+        let view = cluster.fabric_view(Utc::now());
+        let topology = cluster
+            .config()
+            .topology
+            .as_ref()
+            .and_then(|config| config.build(&cluster.get_nodes(), &view));
+        Self {
+            nodes,
+            partitions: cluster.get_partitions(),
+            reservations,
+            handoffs,
+            busy_until: running_jobs_busy_until(cluster),
+            partition_node_usage: running_partition_usage(cluster),
+            fabric: spur_sched::traits::FabricSchedulingContext { view },
+            topology,
+        }
+    }
+
+    pub(crate) fn state(&self) -> ClusterState<'_> {
+        ClusterState {
+            fabric: Some(&self.fabric),
+            nodes: &self.nodes,
+            partitions: &self.partitions,
+            reservations: &self.reservations,
+            topology: self.topology.as_ref(),
+            busy_until: &self.busy_until,
+            preemption_handoffs: &self.handoffs,
+            partition_node_usage: &self.partition_node_usage,
+        }
+    }
+}
+
+/// Places `pending` on `state`, charging each start to `limits`, then stages in the
+/// `stage_in` jobs still within their limits and publishes the plan and refusals. If the
+/// scheduler panics, none of it can be trusted: the plan is cleared and it returns `None`.
+pub(crate) fn plan_pass(
+    cluster: &ClusterManager,
+    scheduler: &mut BackfillScheduler,
+    pending: &[spur_core::job::Job],
+    state: &ClusterState<'_>,
+    limits: &mut LimitAdmission<'_>,
+    stage_in: &[spur_core::job::Job],
+) -> Option<Vec<Assignment>> {
+    let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scheduler.schedule_with(pending, state, Utc::now(), limits)
+    }));
+    match placed {
+        Ok(assignments) => {
+            cluster.set_planned_reservations(scheduler.planned_starts());
+            cluster.set_planned_job_starts(scheduler.planned_job_starts());
+            cluster.stage_in_and_report_refusals(stage_in, limits);
+            Some(assignments)
+        }
+        Err(e) => {
+            error!(
+                "scheduler panicked: {:?} — skipping cycle",
+                e.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown")
+            );
+            cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
+            None
+        }
+    }
+}
+
+/// Names why each of `unscheduled` didn't start this pass. A job refused at start
+/// keeps the limit that refused it.
+pub(crate) fn report_unscheduled(
+    cluster: &ClusterManager,
+    unscheduled: &[&spur_core::job::Job],
+    limits: &LimitAdmission<'_>,
+    state: &ClusterState<'_>,
+    scheduler: &BackfillScheduler,
+) {
+    let unplaced: Vec<_> = unscheduled
+        .iter()
+        .copied()
+        .filter(|job| !limits.refused(job.job_id))
+        .collect();
+    cluster.update_pending_reasons(&unplaced, state);
+    cluster.annotate_partition_cap_pending(&unplaced, scheduler.partition_cap_blocks());
+    cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
+}
+
+/// The loop's placement of `pending` over the cluster's current state, asking
+/// `admission` before each start; nothing is dispatched.
+#[cfg(test)]
+pub(crate) fn place(
+    cluster: &ClusterManager,
+    scheduler: &mut BackfillScheduler,
+    pending: &[spur_core::job::Job],
+    admission: &mut dyn spur_sched::traits::StartAdmission,
 ) -> Vec<Assignment> {
-    assignments
-        .into_iter()
-        .filter(|assignment| {
-            let held_claim = !unclaimed.contains(&assignment.job_id);
-            if !held_claim {
-                debug!(
-                    job_id = assignment.job_id,
-                    "not starting a job that held no quota claim this pass"
-                );
-            }
-            held_claim
-        })
-        .collect()
+    let in_quota: Vec<_> = pending.iter().filter(|j| !j.idle_fill).cloned().collect();
+    let view = PassView::read(cluster, &in_quota);
+    scheduler.schedule_with(pending, &view.state(), Utc::now(), admission)
+}
+
+/// One pass as the loop runs it, up to dispatch.
+#[cfg(test)]
+pub(crate) struct TestPass<'a> {
+    /// The in-quota jobs classification admitted, as classified, in placement order.
+    pub(crate) pending: Vec<spur_core::job::Job>,
+    /// The borrow candidates placed after them, stamped `idle_fill`.
+    pub(crate) borrowers: Vec<spur_core::job::Job>,
+    pub(crate) assignments: Vec<Assignment>,
+    /// The limits after this pass's starts, refusals applied as pending reasons.
+    pub(crate) limits: LimitAdmission<'a>,
+    pub(crate) scheduler: BackfillScheduler,
+    view: PassView,
+}
+
+#[cfg(test)]
+impl TestPass<'_> {
+    pub(crate) fn state(&self) -> ClusterState<'_> {
+        self.view.state()
+    }
+
+    pub(crate) fn admitted(&self) -> Vec<spur_core::job::JobId> {
+        self.pending.iter().map(|job| job.job_id).collect()
+    }
+
+    pub(crate) fn borrowed(&self) -> Vec<spur_core::job::JobId> {
+        self.borrowers.iter().map(|job| job.job_id).collect()
+    }
+
+    pub(crate) fn started(&self) -> Vec<spur_core::job::JobId> {
+        self.assignments.iter().map(|a| a.job_id).collect()
+    }
+
+    pub(crate) fn unstarted(&self) -> Vec<&spur_core::job::Job> {
+        self.pending
+            .iter()
+            .filter(|job| !self.assignments.iter().any(|a| a.job_id == job.job_id))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pass(cluster: &ClusterManager) -> TestPass<'_> {
+    let ClassifiedPass {
+        jobs: mut pending,
+        idle_fill_candidates,
+        mut limits,
+        stage_in,
+    } = cluster.apply_classification(cluster.classify_pending_jobs());
+    let in_quota = pending.len();
+    let view = PassView::read(cluster, &pending);
+    pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
+        job.idle_fill = true;
+        job
+    }));
+    let mut scheduler =
+        BackfillScheduler::new(cluster.config().scheduler.max_jobs_per_cycle as usize);
+    let assignments = plan_pass(
+        cluster,
+        &mut scheduler,
+        &pending,
+        &view.state(),
+        &mut limits,
+        &stage_in,
+    )
+    .expect("the scheduler panicked");
+    let borrowers = pending.split_off(in_quota);
+    TestPass {
+        pending,
+        borrowers,
+        assignments,
+        limits,
+        scheduler,
+        view,
+    }
+}
+
+/// The loop's evictions after `pass`, for its unstarted jobs that fit their limits,
+/// holding the room an eviction frees for its preemptor.
+#[cfg(test)]
+pub(crate) async fn preempt_unstarted(cluster: &Arc<ClusterManager>, pass: &mut TestPass<'_>) {
+    let handoffs = without_released(&pass.view.handoffs, pass.scheduler.released_handoffs());
+    let state = ClusterState {
+        preemption_handoffs: &handoffs,
+        ..pass.view.state()
+    };
+    let unstarted = pass.unstarted();
+    let limits = &pass.limits;
+    let preemptor = try_preempt_with_handoffs(
+        cluster,
+        &state,
+        &unstarted,
+        &pass.assignments,
+        &cluster.config().scheduler,
+        |job| limits.fits(job),
+    )
+    .await
+    .cloned();
+    if let Some(preemptor) = preemptor {
+        pass.limits.record_eviction(&preemptor);
+    }
+}
+
+/// The loop's idle-fill reclaim after `pass`, for its jobs that didn't start. Returns
+/// the nodes freed.
+#[cfg(test)]
+pub(crate) async fn reclaim_unstarted(
+    cluster: &Arc<ClusterManager>,
+    pass: &TestPass<'_>,
+) -> Vec<String> {
+    let handoffs = without_released(&pass.view.handoffs, pass.scheduler.released_handoffs());
+    let state = ClusterState {
+        preemption_handoffs: &handoffs,
+        ..pass.view.state()
+    };
+    let pending: Vec<_> = pass
+        .pending
+        .iter()
+        .chain(&pass.borrowers)
+        .cloned()
+        .collect();
+    let reclaimers = reclaimers(
+        &pending,
+        &pass.assignments,
+        &HashMap::new(),
+        &pass.limits,
+        &pass.view.fabric,
+    );
+    let borrowed = pass.borrowed().into_iter().collect();
+    let mut sched = cluster.config().scheduler.clone();
+    sched.idle_fill_exempt_secs = 0;
+    reclaim_for_unplaced(
+        cluster,
+        &reclaimers,
+        &borrowed,
+        &state,
+        &sched,
+        &pass.assignments,
+        |job| pass.limits.fits(job),
+    )
+    .await
+    .0
 }
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
@@ -1492,7 +1590,7 @@ pub(crate) async fn try_preempt_beside(
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
     };
-    try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
+    try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched, |_| true).await;
 }
 
 /// Node -> jobs holding it: running, suspended and draining jobs on the nodes they still
@@ -1540,9 +1638,17 @@ pub(crate) async fn reclaim_for(
     };
     let mut sched = cluster.config().scheduler.clone();
     sched.idle_fill_exempt_secs = 0;
-    reclaim_for_unplaced(cluster, unplaced, &HashSet::new(), &state, &sched, &[])
-        .await
-        .0
+    reclaim_for_unplaced(
+        cluster,
+        unplaced,
+        &HashSet::new(),
+        &state,
+        &sched,
+        &[],
+        |_| true,
+    )
+    .await
+    .0
 }
 
 /// The victim search over a given pass state, as the scheduler loop runs it.
@@ -1554,24 +1660,26 @@ pub(crate) async fn try_preempt_in(
     assigned: &[Assignment],
 ) {
     let sched = cluster.config().scheduler.clone();
-    try_preempt_with_handoffs(cluster, state, unscheduled, assigned, &sched).await;
+    try_preempt_with_handoffs(cluster, state, unscheduled, assigned, &sched, |_| true).await;
 }
 
 /// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).
 /// A non-`gone` failure mid-set leaves the already-evicted victims evicted, job still unplaced.
-async fn try_preempt_with_handoffs(
+/// Only a job that `fits` its limits evicts anyone. Returns the job that evicted.
+async fn try_preempt_with_handoffs<'j>(
     cluster: &Arc<ClusterManager>,
     state: &ClusterState<'_>,
-    unscheduled: &[&spur_core::job::Job],
+    unscheduled: &[&'j spur_core::job::Job],
     assigned: &[Assignment],
     sched: &spur_core::config::SchedulerConfig,
-) {
+    fits: impl Fn(&spur_core::job::Job) -> bool,
+) -> Option<&'j spur_core::job::Job> {
     use spur_core::job::JobState;
     use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
 
     if !qos_priority_preemption_enabled(sched) {
-        return;
+        return None;
     }
 
     let now = chrono::Utc::now();
@@ -1703,7 +1811,8 @@ async fn try_preempt_with_handoffs(
             }
             eligible.push((candidate, mode));
         }
-        if eligible.is_empty() {
+        // Evicting for a job its limits would refuse at start preempts its victims for nothing.
+        if eligible.is_empty() || !fits(pending) {
             continue;
         }
 
@@ -1816,9 +1925,10 @@ async fn try_preempt_with_handoffs(
         if preempted {
             // `occupants` is now stale, so a second pending job could otherwise
             // prove placement on nodes already promised away.
-            break;
+            return Some(*pending);
         }
     }
+    None
 }
 
 /// How the victim loop proceeds after one victim's preemption attempt.
@@ -2140,13 +2250,46 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
         .min(CAP_SECS)
 }
 
+/// The jobs in `pending` the pass didn't start that idle-fill reclaim may free nodes
+/// for. Nodes can't help a job its limits refused: freeing them would evict a
+/// borrowed run for nothing.
+fn reclaimers<'j>(
+    pending: &'j [spur_core::job::Job],
+    assignments: &[Assignment],
+    in_flight: &HashMap<spur_core::job::JobId, DateTime<Utc>>,
+    limits: &LimitAdmission<'_>,
+    fabric: &spur_sched::traits::FabricSchedulingContext,
+) -> Vec<&'j spur_core::job::Job> {
+    pending
+        .iter()
+        .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+        .filter(|j| !in_flight.contains_key(&j.job_id))
+        .filter(|j| !limits.refused(j.job_id))
+        .filter(|job| !fabric.requires_binding(job))
+        .collect()
+}
+
+/// The unscheduled jobs to forward to federated peers: those still within their
+/// limits after this pass's starts and the evictions in flight.
+pub(crate) fn federation_candidates(
+    limits: &LimitAdmission<'_>,
+    unscheduled: &[&spur_core::job::Job],
+) -> Vec<spur_core::job::Job> {
+    limits
+        .fitting(unscheduled.iter().copied())
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 /// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
 /// not place. Returns the nodes freed, which the caller holds out of the next cycle
 /// until the agents have confirmed the kill.
 ///
 /// Separate from `try_preempt`: the pool is borrowed runs, an opportunistic
 /// reclaimer sits under a QOS priority ceiling, and the eviction is always
-/// `Requeue`. Both prove the shortfall closes first (D2, §8.1).
+/// `Requeue`. Both prove the shortfall closes first (D2, §8.1), and reclaim only for a
+/// job that `fits` its limits.
 pub(crate) async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
@@ -2157,6 +2300,7 @@ pub(crate) async fn reclaim_for_unplaced(
     cluster_state: &ClusterState<'_>,
     sched: &spur_core::config::SchedulerConfig,
     assigned: &[Assignment],
+    fits: impl Fn(&spur_core::job::Job) -> bool,
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
     let exempt_secs = sched.idle_fill_exempt_secs;
     let now = Utc::now();
@@ -2233,6 +2377,9 @@ pub(crate) async fn reclaim_for_unplaced(
     let facts = (!victim_keys.is_empty()).then(|| victim_facts(&running, now));
 
     for reclaimer in unplaced {
+        if !fits(reclaimer) {
+            continue;
+        }
         // An opportunistic reclaimer displaces only opportunistic work strictly
         // below it. A job with a genuine quota claim has no such ceiling: borrowed
         // capacity is a loan and anyone with a claim can call it in.
@@ -11797,9 +11944,16 @@ pub(crate) mod tests {
 
                 let mut sched = cm.config().scheduler.clone();
                 sched.idle_fill_exempt_secs = 0;
-                let (freed, freed_for) =
-                    reclaim_for_unplaced(&cm, &[&hunter], &HashSet::new(), &state, &sched, &[])
-                        .await;
+                let (freed, freed_for) = reclaim_for_unplaced(
+                    &cm,
+                    &[&hunter],
+                    &HashSet::new(),
+                    &state,
+                    &sched,
+                    &[],
+                    |_| true,
+                )
+                .await;
 
                 assert!(freed.is_empty());
                 assert_eq!(freed_for, None);

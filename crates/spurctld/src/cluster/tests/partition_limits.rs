@@ -392,13 +392,17 @@ fn a_claim_covers_the_most_of_each_resource_among_admitted_requests() {
             },
         )
     };
-    let admitted = |qos_charge| QuotaVerdict::Admitted {
-        account: AccountAdmitted {
-            charge: 1,
-            admits_without_credit: true,
+    let charge = |nodes| GateAdmitted {
+        charge: NodeCharge {
+            nodes,
+            credited: Default::default(),
         },
+        admits_without_credit: true,
+    };
+    let admitted = |qos_charge| QuotaVerdict::Admitted {
+        account: charge(1),
         partition_qos: PartitionQosAdmitted::default(),
-        qos_charge,
+        qos: charge(qos_charge),
     };
     let outcomes = [
         (probe("cpus", 4, GIB), admitted(1)),
@@ -1046,40 +1050,15 @@ fn limit_block_reports_a_max_mem_per_node_violation() {
 /// One scheduling pass composed from the loop's own steps, minus agent RPCs:
 /// every placement is reserved and activated as a confirmed dispatch would be.
 fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
-    use spur_sched::backfill::BackfillScheduler;
-
-    let mut trial = BackfillScheduler::new(100);
-    let (classification, unclaimed) =
-        crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
-        });
-    let (pending, _) = cm.apply_classification(classification);
-    let nodes = cm.nodes_off_dispatch_cooldown(&pending);
-    let partitions = cm.get_partitions();
-    let reservations = cm.get_reservations();
-    let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
-    let usage = crate::scheduler_loop::running_partition_usage(cm);
-    let handoffs = cm.preemption_handoffs(&pending, &nodes, &reservations);
-    let state = spur_sched::traits::ClusterState {
-        nodes: &nodes,
-        partitions: &partitions,
-        reservations: &reservations,
-        topology: None,
-        fabric: None,
-        busy_until: &busy_until,
-        preemption_handoffs: &handoffs,
-        partition_node_usage: &usage,
-    };
-    let mut scheduler = BackfillScheduler::new(100);
-    let assignments =
-        crate::scheduler_loop::claimed_assignments(&mut scheduler, &pending, &state, &unclaimed);
-    let unscheduled: Vec<&Job> = pending
-        .iter()
-        .filter(|j| !assignments.iter().any(|a| a.job_id == j.job_id))
-        .collect();
-    cm.update_pending_reasons(&unscheduled, &state);
-    cm.annotate_partition_cap_pending(&unscheduled, scheduler.partition_cap_blocks());
-    for a in &assignments {
+    let pass = crate::scheduler_loop::test_pass(cm);
+    crate::scheduler_loop::report_unscheduled(
+        cm,
+        &pass.unstarted(),
+        &pass.limits,
+        &pass.state(),
+        &pass.scheduler,
+    );
+    for a in &pass.assignments {
         let job = cm.get_job(a.job_id).unwrap();
         let attribution = RunAttribution::for_assignment(a, false);
         let resources =
@@ -1093,7 +1072,7 @@ fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
             attribution,
         );
     }
-    assignments.iter().map(|a| a.job_id).collect()
+    pass.started()
 }
 
 fn activate(
@@ -1241,6 +1220,40 @@ async fn a_qos_limit_still_blocks_a_job_the_cap_admits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_refused_its_slot_by_a_limit_keeps_that_reason_when_the_cap_also_delays_it() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    run_on(&cm, spec_in("cpu", 4), "n1", 4);
+    let mut grp = TresRecord::new();
+    grp.set(TresType::Cpu, 8);
+    cm.qos_cache().insert(Qos {
+        name: "pool".into(),
+        limits: spur_core::accounting::QosLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let pool = |cpus: u32| JobSpec {
+        qos: Some("pool".into()),
+        ..spec_in("cpu", cpus)
+    };
+    let first = submit_and_wait(&cm, pool(4));
+    // The cap delays it behind `first`, and `first`'s start leaves the QOS too
+    // few CPUs for the slot.
+    let second = submit_and_wait(&cm, pool(5));
+
+    assert_eq!(run_pass(&cm), [first]);
+    assert_eq!(reason(&cm, second).0, PendingReason::QosGrpCpuLimit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_first_failing_gate_names_the_pending_reason() {
     let dir = TempDir::new().unwrap();
     let cm = cluster_with(
@@ -1294,8 +1307,8 @@ async fn a_job_blocked_only_by_a_full_cap_holds_no_grp_node_quota() {
     for n in ["n1", "n2", "n3"] {
         register_node(&cm, n, 16, 64 * GIB);
     }
-    // n1's full cap earns `capped` no reuse credit there, so it claims both
-    // nodes of quota left beside n1 and none remains for `fits`.
+    // n1's full cap earns `capped` no reuse credit there, so it would need both
+    // nodes of quota left beside n1, and must not hold them from `fits`.
     let mut grp = TresRecord::new();
     grp.set(TresType::Node, 3);
     cm.qos_cache().insert(Qos {
@@ -1324,13 +1337,6 @@ async fn a_job_blocked_only_by_a_full_cap_holds_no_grp_node_quota() {
         },
     );
     let fits = submit_and_wait(&cm, pool(4));
-
-    let single: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-    assert_eq!(
-        single,
-        [capped],
-        "one classification charges capped's claim"
-    );
 
     assert_eq!(run_pass(&cm), [fits]);
     assert_eq!(

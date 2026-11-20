@@ -104,6 +104,37 @@ async fn partitions_sharing_a_partition_qos_add_up_one_users_usage() {
     );
 }
 
+/// "gpu" and "gpu2" share "usercap", with room for one of alice's nodes. Her jobs in
+/// each fit it alone, and only the first starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partitions_sharing_a_partition_qos_add_up_one_passs_starts() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 1).await;
+    cm.create_partition(Partition {
+        name: "gpu2".into(),
+        nodes: "ALL".into(),
+        qos: Some("usercap".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let exclusive = |spec: JobSpec| JobSpec {
+        exclusive: true,
+        ..spec
+    };
+    let first = submit_and_wait(&cm, exclusive(gpu_job("alice", "acct-a", "qa")));
+    let in_gpu2 = JobSpec {
+        partition: Some("gpu2".into()),
+        ..gpu_job("alice", "acct-b", "qb")
+    };
+    let second = submit_and_wait(&cm, exclusive(in_gpu2));
+
+    assert_eq!(one_pass(&cm).started(), vec![first]);
+    assert_eq!(
+        cm.get_job(second).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_suspended_job_keeps_charging_the_partition_qos() {
     let dir = TempDir::new().unwrap();
@@ -194,25 +225,93 @@ async fn another_user_is_not_charged_for_a_capped_users_jobs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_pass_cannot_admit_past_the_cap() {
+async fn one_pass_cannot_start_past_the_cap() {
     let dir = TempDir::new().unwrap();
     let cm = capped_cluster(&dir, 2).await;
-    run_on(&cm, gpu_job("alice", "acct-a", "qa"), "n1");
-    let a = submit_and_wait(&cm, gpu_job("alice", "acct-a", "qa"));
-    let b = submit_and_wait(&cm, gpu_job("alice", "acct-b", "qb"));
+    let exclusive = |account: &str, qos: &str| JobSpec {
+        exclusive: true,
+        ..gpu_job("alice", account, qos)
+    };
+    run_on(&cm, exclusive("acct-a", "qa"), "n1");
+    let a = submit_and_wait(&cm, exclusive("acct-a", "qa"));
+    let b = submit_and_wait(&cm, exclusive("acct-b", "qb"));
 
-    let admitted: Vec<JobId> = cm
-        .pending_jobs_and_tag_reasons()
-        .into_iter()
-        .map(|j| j.job_id)
-        .filter(|id| *id == a || *id == b)
-        .collect();
+    let pass = one_pass(&cm);
 
-    assert_eq!(admitted, vec![a], "the earlier job takes the last slot");
+    assert_eq!(
+        pass.started(),
+        vec![a],
+        "the earlier job takes the last slot"
+    );
     assert_eq!(
         cm.get_job(b).unwrap().pending_reason,
         PendingReason::QosMaxNodePerUserLimit
     );
+}
+
+/// Ten of alice's jobs wait for n1, which bob's job fills, under her one-node cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_waiting_for_a_busy_node_hold_none_of_the_partition_qos() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 1).await;
+    let exclusive = |spec: JobSpec| JobSpec {
+        exclusive: true,
+        ..spec
+    };
+    let elsewhere = JobSpec {
+        partition: Some("default".into()),
+        ..gpu_job("bob", "acct-b", "qb")
+    };
+    run_on(&cm, exclusive(elsewhere), "n1");
+    for _ in 0..10 {
+        let pinned = JobSpec {
+            nodelist: Some("n1".into()),
+            ..gpu_job("alice", "acct-a", "qa")
+        };
+        submit_and_wait(&cm, exclusive(pinned));
+    }
+    let behind = submit_and_wait(&cm, exclusive(gpu_job("alice", "acct-b", "qb")));
+
+    assert_eq!(one_pass(&cm).started(), vec![behind]);
+}
+
+/// "pool" has room for the preemptor and its sibling, but their partition QOS has
+/// room for one node of theirs. While the victim stops, the preemptor holds that room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_preemptor_holds_its_partition_qos_room_while_its_victim_drains() {
+    let dir = TempDir::new().unwrap();
+    let cm = pool_over_burst_cluster(&dir).await;
+    cm.qos_cache().insert(Qos {
+        name: "usercap".into(),
+        limits: node_cap(1),
+        ..Default::default()
+    });
+    cm.create_partition(Partition {
+        name: "gpu".into(),
+        nodes: "ALL".into(),
+        qos: Some("usercap".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let in_gpu = |spec: JobSpec| JobSpec {
+        partition: Some("gpu".into()),
+        ..spec
+    };
+    let victim = run_burst_job(&cm, "n2");
+    let preemptor = submit_and_wait(&cm, in_gpu(pool_job("preemptor", 1, Some("n2"))));
+    let sibling = submit_and_wait(&cm, in_gpu(pool_job("sibling", 1, None)));
+    evict_for(&cm, preemptor, victim).await;
+
+    assert!(one_pass(&cm).started().is_empty());
+    assert_eq!(
+        cm.get_job(sibling).unwrap().pending_reason,
+        PendingReason::QosMaxNodePerUserLimit
+    );
+
+    report_nodes_released(&cm, victim);
+    settle(&cm, victim, JobState::Cancelled);
+    cm.tick_preempt_freed_earmarks();
+    assert_eq!(one_pass(&cm).started(), vec![preemptor]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -238,13 +337,14 @@ async fn an_undefined_partition_qos_holds_jobs_when_accounting_is_on() {
         unknown_blocks: true,
         ..Default::default()
     };
-    let mut job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
+    let job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
 
     assert_eq!(
         view.admit(
-            &mut job,
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default()
+            &job,
+            &QuotaLedger::default(),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default()
         )
         .map(|_| ()),
         Err(PendingReason::InvalidQOS)
@@ -299,25 +399,58 @@ async fn a_job_too_big_for_the_held_node_is_held_at_the_group_node_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_jobs_in_one_pass_do_not_both_claim_the_held_node() {
+async fn jobs_that_fit_on_the_held_node_all_start_there_in_one_pass() {
     let dir = TempDir::new().unwrap();
     let cm = one_node_group_cap(&dir).await;
 
     let first = submit_and_wait(&cm, gpu_job("bob", "acct-b", "qb"));
     let second = submit_and_wait(&cm, gpu_job("carol", "acct-b", "qb"));
 
-    let kept = cm
-        .pending_jobs_and_tag_reasons()
+    let pass = one_pass(&cm);
+    assert_eq!(pass.started(), vec![first, second]);
+    assert!(pass.assignments.iter().all(|a| a.nodes == ["n1"]));
+}
+
+/// The held node has room for one of the two jobs. The other, hinted to it too, waits
+/// for it rather than start on a second node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_jobs_in_one_pass_do_not_both_start_on_the_held_nodes_room() {
+    let dir = TempDir::new().unwrap();
+    let cm = one_node_group_cap(&dir).await;
+    let half_a_node = |user: &str| JobSpec {
+        cpus_per_task: 4,
+        ..gpu_job(user, "acct-b", "qb")
+    };
+
+    let first = submit_and_wait(&cm, half_a_node("bob"));
+    let second = submit_and_wait(&cm, half_a_node("carol"));
+
+    let pass = one_pass(&cm);
+    assert_eq!(pass.admitted(), vec![first, second]);
+    assert_eq!(pass.started(), vec![first]);
+    assert_eq!(pass.assignments[0].nodes, ["n1"]);
+    assert!(pass.limits.refusals().is_empty());
+}
+
+/// `user` running on two nodes under "usercap".
+fn two_nodes_under_usercap(user: &str) -> QuotaLedger {
+    let running: Vec<Job> = ["n1", "n2"]
         .into_iter()
-        .filter(|j| j.job_id == first || j.job_id == second)
-        .count();
-    assert_eq!(kept, 1);
+        .zip(100..)
+        .map(|(node, id)| {
+            let mut job = Job::new(id, gpu_job(user, "acct-a", "qa"));
+            job.state = JobState::Running;
+            job.allocated_nodes = vec![node.to_string()];
+            job
+        })
+        .collect();
+    let mut ledger = QuotaLedger::default();
+    ledger.add_partition_qos(&running, |_| Some("usercap"));
+    ledger
 }
 
 #[test]
 fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
-    let mut at_cap = TresRecord::new();
-    at_cap.set(TresType::Node, 2);
     let view = PartitionQosView {
         by_partition: HashMap::from([(
             "gpu".to_string(),
@@ -330,17 +463,10 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
                 }),
             ),
         )]),
-        usage: HashMap::from([(
-            "usercap".to_string(),
-            PartitionQosUsage {
-                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
-                ..Default::default()
-            },
-        )]),
         defaults: vec!["gpu".to_string()],
         ..Default::default()
     };
-    let mut job = Job::new(
+    let job = Job::new(
         1,
         JobSpec {
             partition: None,
@@ -350,9 +476,10 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
 
     assert_eq!(
         view.admit(
-            &mut job,
-            &ReuseView::uncapped(&HashMap::new()),
-            &PassReservations::default()
+            &job,
+            &two_nodes_under_usercap("alice"),
+            Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+            &EvictionHolds::default()
         )
         .map(|_| ()),
         Err(PendingReason::QosMaxNodePerUserLimit)
@@ -364,9 +491,41 @@ fn a_job_with_no_partition_is_checked_against_the_default_partitions_qos() {
 }
 
 #[test]
+fn a_start_placed_in_no_partition_is_checked_by_no_partition_qos() {
+    let view = PartitionQosView {
+        by_partition: HashMap::from([(
+            "gpu".to_string(),
+            (
+                "usercap".to_string(),
+                Some(Qos {
+                    name: "usercap".into(),
+                    limits: node_cap(2),
+                    ..Default::default()
+                }),
+            ),
+        )]),
+        defaults: vec!["gpu".to_string()],
+        ..Default::default()
+    };
+    let job = Job::new(1, gpu_job("alice", "acct-a", "qa"));
+    let nodes = ["n3".to_string()];
+    let on = |partition| Placement::On {
+        nodes: &nodes,
+        partition,
+    };
+    let ledger = two_nodes_under_usercap("alice");
+    let held = EvictionHolds::default();
+
+    assert!(view.admit(&job, &ledger, on(None), &held).is_ok());
+    assert_eq!(
+        view.admit(&job, &ledger, on(Some("gpu")), &held)
+            .map(|_| ()),
+        Err(PendingReason::QosMaxNodePerUserLimit)
+    );
+}
+
+#[test]
 fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
-    let mut at_cap = TresRecord::new();
-    at_cap.set(TresType::Node, 2);
     let partitions = vec![
         Partition {
             name: "gpu".into(),
@@ -394,16 +553,10 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
                 }),
             ),
         )]),
-        usage: HashMap::from([(
-            "usercap".to_string(),
-            PartitionQosUsage {
-                user_tres: HashMap::from([("alice".to_string(), at_cap)]),
-                ..Default::default()
-            },
-        )]),
         defaults: vec!["gpu".to_string(), "cpu".to_string()],
         ..Default::default()
     };
+    let ledger = two_nodes_under_usercap("alice");
     let mut job = Job::new(
         1,
         JobSpec {
@@ -414,21 +567,26 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
 
     let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(&job, &partitions)
         .into_iter()
-        .map(|mut probe| {
-            assert!(view
+        .map(|probe| {
+            let partition_qos = view
                 .admit(
-                    &mut probe,
-                    &ReuseView::uncapped(&HashMap::new()),
-                    &PassReservations::default()
+                    &probe,
+                    &ledger,
+                    Placement::Packing(&ReuseView::uncapped(&HashMap::new())),
+                    &EvictionHolds::default(),
                 )
-                .is_ok());
-            let admitted = QuotaVerdict::Admitted {
-                account: AccountAdmitted {
-                    charge: 1,
-                    admits_without_credit: true,
+                .expect("the default without a QOS admits it");
+            let gate = || GateAdmitted {
+                charge: NodeCharge {
+                    nodes: 1,
+                    credited: HashSet::new(),
                 },
-                partition_qos: PartitionQosAdmitted::default(),
-                qos_charge: 1,
+                admits_without_credit: true,
+            };
+            let admitted = QuotaVerdict::Admitted {
+                account: gate(),
+                partition_qos,
+                qos: gate(),
             };
             (probe, admitted)
         })
@@ -438,12 +596,12 @@ fn a_job_with_no_partition_keeps_only_the_defaults_whose_qos_admits_it() {
     assert_eq!(job.spec.partition.as_deref(), Some("cpu"));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
-    let dir = TempDir::new().unwrap();
+/// Idle-fill on, "qa" capped at one node for its group and "usercap" at one node per
+/// user.
+async fn team_capped_idle_fill_cluster(dir: &TempDir) -> Arc<ClusterManager> {
     let mut config = test_config();
     config.scheduler.idle_fill_enabled = true;
-    let cm = test_cluster_with_config(&dir, config).await;
+    let cm = test_cluster_with_config(dir, config).await;
     for n in ["n1", "n2", "n3", "n4"] {
         register_node(&cm, n, 8, 16000);
     }
@@ -469,6 +627,13 @@ async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
         ..Default::default()
     })
     .unwrap();
+    cm
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = team_capped_idle_fill_cluster(&dir).await;
     let exclusive = |spec: JobSpec| JobSpec {
         exclusive: true,
         ..spec
@@ -483,6 +648,139 @@ async fn a_job_over_its_team_node_cap_is_not_lent_past_the_partition_cap() {
         cm.get_job(over).unwrap().pending_reason,
         PendingReason::QosMaxNodePerUserLimit
     );
+}
+
+/// alice's "qa" job fills n1, her team's one node, and her "qb" job is on n2, the one
+/// node "usercap" lets its jobs hold. Her next "qa" job fits "usercap" only by joining
+/// n2, and a borrower can't be steered there, so it is not lent a node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_its_partition_qos_admits_only_on_a_node_it_holds_is_not_lent() {
+    let dir = TempDir::new().unwrap();
+    let cm = team_capped_idle_fill_cluster(&dir).await;
+    let mut one_node = TresRecord::new();
+    one_node.set(TresType::Node, 1);
+    cm.qos_cache().insert(Qos {
+        name: "usercap".into(),
+        limits: QosLimits {
+            grp_tres: Some(one_node),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    cm.qos_cache().insert(Qos {
+        name: "qb".into(),
+        ..Default::default()
+    });
+    let filling = JobSpec {
+        partition: Some("default".into()),
+        cpus_per_task: 8,
+        ..gpu_job("alice", "acct-a", "qa")
+    };
+    start_on(&cm, submit_and_wait(&cm, filling), "n1");
+    run_on(&cm, gpu_job("alice", "acct-a", "qb"), "n2");
+
+    let over = JobSpec {
+        cpus_per_task: 4,
+        time_limit: Some(chrono::Duration::hours(1)),
+        ..gpu_job("alice", "acct-a", "qa")
+    };
+    let over = submit_and_wait(&cm, over);
+    let (_, lent) = cm.pending_jobs_with_idle_fill_candidates();
+
+    assert!(lent.iter().all(|j| j.job_id != over));
+    assert_eq!(
+        cm.get_job(over).unwrap().pending_reason,
+        PendingReason::QosGrpNodeLimit
+    );
+}
+
+/// "qa" holds n1, in "gpu", with room to share. alice is at "usercap" in "gpu", so her
+/// next "qa" job may run only in "cpu", where it needs a node "qa" has no room for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_gets_no_packing_credit_in_a_partition_its_partition_qos_refuses() {
+    let dir = TempDir::new().unwrap();
+    let cm = test_cluster(&dir).await;
+    for n in ["n1", "n2", "n3", "n4"] {
+        register_node(&cm, n, 8, 16000);
+    }
+    let mut one_node = TresRecord::new();
+    one_node.set(TresType::Node, 1);
+    for (name, limits) in [
+        ("usercap", node_cap(1)),
+        (
+            "qa",
+            QosLimits {
+                grp_tres: Some(one_node),
+                ..Default::default()
+            },
+        ),
+        ("qb", QosLimits::default()),
+    ] {
+        cm.qos_cache().insert(Qos {
+            name: name.into(),
+            limits,
+            ..Default::default()
+        });
+    }
+    for (name, nodes, qos) in [("gpu", "n[1-2]", Some("usercap")), ("cpu", "n[3-4]", None)] {
+        cm.create_partition(Partition {
+            name: name.into(),
+            nodes: nodes.into(),
+            qos: qos.map(Into::into),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    run_on(&cm, gpu_job("bob", "acct-b", "qa"), "n1");
+    run_on(&cm, gpu_job("alice", "acct-a", "qb"), "n2");
+
+    let over = JobSpec {
+        partition: Some("gpu,cpu".into()),
+        ..gpu_job("alice", "acct-a", "qa")
+    };
+    let over = submit_and_wait(&cm, over);
+
+    assert!(schedulable(&cm, over).is_none());
+    assert_eq!(
+        cm.get_job(over).unwrap().pending_reason,
+        PendingReason::QosGrpNodeLimit
+    );
+}
+
+/// alice is at "usercap" in "gpu", and bob's "qa" job fills the team's one node. Her
+/// next "qa" job may borrow, but only in "cpu", which carries no partition QOS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lent_job_keeps_only_the_partitions_whose_qos_admits_it() {
+    let dir = TempDir::new().unwrap();
+    let cm = team_capped_idle_fill_cluster(&dir).await;
+    cm.qos_cache().insert(Qos {
+        name: "qb".into(),
+        ..Default::default()
+    });
+    cm.create_partition(Partition {
+        name: "cpu".into(),
+        nodes: "ALL".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    run_on(&cm, gpu_job("alice", "acct-a", "qb"), "n1");
+    let filling = JobSpec {
+        partition: Some("default".into()),
+        cpus_per_task: 8,
+        ..gpu_job("bob", "acct-b", "qa")
+    };
+    start_on(&cm, submit_and_wait(&cm, filling), "n2");
+
+    let over = JobSpec {
+        partition: Some("gpu,cpu".into()),
+        time_limit: Some(chrono::Duration::hours(1)),
+        ..gpu_job("alice", "acct-a", "qa")
+    };
+    let over = submit_and_wait(&cm, over);
+    let (_, lent) = cm.pending_jobs_with_idle_fill_candidates();
+
+    let lent = lent.iter().find(|j| j.job_id == over).expect("lent a node");
+    assert_eq!(lent.spec.partition.as_deref(), Some("cpu"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -518,6 +816,31 @@ async fn a_partition_qos_that_is_also_the_job_qos_still_applies_as_the_job_qos()
     assert_eq!(
         cm.get_job(in_gpu).unwrap().pending_reason,
         PendingReason::QosMaxNodePerUserLimit
+    );
+}
+
+/// "usercap" is both the partition QOS of "gpu" and the job QOS, with room for two of
+/// alice's jobs. Each start counts once in each role, so two start and the third waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_counts_once_under_a_qos_that_is_both_its_partition_qos_and_job_qos() {
+    let dir = TempDir::new().unwrap();
+    let cm = capped_cluster(&dir, 4).await;
+    cm.qos_cache().insert(Qos {
+        name: "usercap".into(),
+        limits: QosLimits {
+            max_jobs_per_user: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let jobs: Vec<JobId> = (0..3)
+        .map(|_| submit_and_wait(&cm, gpu_job("alice", "acct-a", "usercap")))
+        .collect();
+
+    assert_eq!(one_pass(&cm).started(), jobs[..2]);
+    assert_eq!(
+        cm.get_job(jobs[2]).unwrap().pending_reason,
+        PendingReason::QoSMaxJobsPerUser
     );
 }
 

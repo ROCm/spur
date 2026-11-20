@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration, Utc};
 use tracing::{debug, info};
@@ -82,7 +82,7 @@ enum UnplacedKind {
     /// Every candidate partition's cap is below what the job needs on a node,
     /// even with the partition idle there.
     PartitionCapNeverFits,
-    /// Placeable now, but the caller's admission refused the start.
+    /// Placeable, but the caller's admission refused the start or the future slot.
     RefusedAtStart,
 }
 
@@ -117,6 +117,9 @@ impl Unplaced {
         self.kind == other.kind && self.needed_nodes == other.needed_nodes
     }
 }
+
+/// A heterogeneous job's components placed to start now, each with its end.
+type HetStarts = Vec<(Job, chrono::DateTime<Utc>)>;
 
 /// Bundles the reservation-authorization inputs shared by every candidate
 /// node check for one job, to keep `earliest_valid_start` under clippy's arg limit.
@@ -924,6 +927,8 @@ impl BackfillScheduler {
                 Some(JobStart {
                     job,
                     nodes: &assignment.nodes,
+                    partition: assignment.partition.as_deref(),
+                    memory_adjustment: assignment.memory_adjustment,
                     start: now,
                     end: *end,
                 })
@@ -1016,11 +1021,8 @@ impl BackfillScheduler {
         // For each group, ALL components must be schedulable or NONE are scheduled.
         let mut het_groups: HashMap<JobId, Vec<usize>> = HashMap::new();
         for (idx, job) in pending.iter().enumerate() {
-            if let Some(het_id) = job.het_job_id {
+            if let Some(het_id) = job.het_key() {
                 het_groups.entry(het_id).or_default().push(idx);
-            } else if job.het_group == Some(0) {
-                // The anchor component (group 0) uses its own job_id as the key
-                het_groups.entry(job.job_id).or_default().push(idx);
             }
         }
 
@@ -1046,26 +1048,22 @@ impl BackfillScheduler {
         let mut assignments = Vec::new();
         let mut unplaced: HashMap<JobId, Unplaced> = HashMap::new();
         let mut cap_blocks: HashMap<JobId, PartitionCapBlock> = HashMap::new();
-        let limit = pending.len().min(self.max_jobs);
+        let order = grouped_order(pending.len(), &group_of, &het_groups);
+        let limit = order.len().min(self.max_jobs);
 
         // A heterogeneous job's components that can start now are reserved as they are
         // placed, then admitted together once its last component is placed (or the
-        // pass ends first), keyed by that last component's index.
-        let het_last: HashMap<usize, usize> = het_groups
-            .values()
-            .filter(|components| components.len() > 1)
-            .filter_map(|components| components.iter().max().map(|&last| (components, last)))
-            .flat_map(|(components, last)| components.iter().map(move |&i| (i, last)))
-            .collect();
-        let mut het_starts: BTreeMap<usize, Vec<(Job, chrono::DateTime<Utc>)>> = BTreeMap::new();
+        // pass ends first). They are adjacent in `order`, so at most one heterogeneous
+        // job awaits admission.
+        let mut het_open: Option<(JobId, HetStarts)> = None;
 
-        for (job_idx, job) in pending.iter().enumerate().take(limit) {
-            while let Some(entry) = het_starts
-                .first_entry()
-                .filter(|entry| *entry.key() < job_idx)
+        for &job_idx in order.iter().take(limit) {
+            let job = &pending[job_idx];
+            if let Some((_, components)) =
+                het_open.take_if(|(group, _)| group_of.get(&job_idx) != Some(group))
             {
                 self.admit_het_components(
-                    &entry.remove(),
+                    &components,
                     now,
                     admission,
                     &mut handoffs,
@@ -1127,14 +1125,24 @@ impl BackfillScheduler {
                 match self.plan_gpu_job(job, cluster, context, &handoffs, now) {
                     Some((assignment, start)) => {
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
-                        if start <= now
-                            && !admission.admit(&[JobStart {
-                                job,
-                                nodes: &assignment.nodes,
+                        let slot = JobStart {
+                            job,
+                            nodes: &assignment.nodes,
+                            partition: assignment.partition.as_deref(),
+                            memory_adjustment: assignment.memory_adjustment,
+                            start,
+                            end: start + duration,
+                        };
+                        let admitted = if start <= now {
+                            admission.admit(&[JobStart {
                                 start: now,
                                 end: now + duration,
+                                ..slot
                             }])
-                        {
+                        } else {
+                            admission.may_reserve(&slot)
+                        };
+                        if !admitted {
                             handoffs.owner_refused(job.job_id, now);
                             note(UnplacedKind::RefusedAtStart, assignment.nodes.len(), None);
                             continue;
@@ -1216,18 +1224,25 @@ impl BackfillScheduler {
                 partition: partition.as_deref(),
                 typed_gpu: typed_gpu.as_deref(),
             };
+            let node_names: Vec<String> = plan
+                .nodes
+                .iter()
+                .map(|ni| cluster.nodes[*ni].name.clone())
+                .collect();
+            let memory_adjustment =
+                planned_adjustment(job, partition.as_deref(), cluster.partitions);
             if plan.start <= now {
-                let node_names: Vec<String> = plan
-                    .nodes
-                    .iter()
-                    .map(|ni| cluster.nodes[*ni].name.clone())
-                    .collect();
                 let end = now + duration;
-                if let Some(&last) = het_last.get(&job_idx) {
-                    het_starts.entry(last).or_default().push((job.clone(), end));
+                if let Some(&group) = group_of.get(&job_idx) {
+                    het_open
+                        .get_or_insert_with(|| (group, Vec::new()))
+                        .1
+                        .push((job.clone(), end));
                 } else if admission.admit(&[JobStart {
                     job,
                     nodes: &node_names,
+                    partition: partition.as_deref(),
+                    memory_adjustment,
                     start: now,
                     end,
                 }]) {
@@ -1248,11 +1263,7 @@ impl BackfillScheduler {
                     job_id: job.job_id,
                     nodes: node_names,
                     per_node_alloc: plan.per_node_alloc,
-                    memory_adjustment: planned_adjustment(
-                        job,
-                        partition.as_deref(),
-                        cluster.partitions,
-                    ),
+                    memory_adjustment,
                     partition,
                 });
             } else if job.idle_fill {
@@ -1263,6 +1274,16 @@ impl BackfillScheduler {
                 // jobs behind a borrow candidate are other borrow candidates (D15).
                 // Without a slot it must not release or hold handoff nodes either.
                 note(UnplacedKind::NoCapacityAtStart, plan.nodes.len(), None);
+            } else if !admission.may_reserve(&JobStart {
+                job,
+                nodes: &node_names,
+                partition: partition.as_deref(),
+                memory_adjustment,
+                start: plan.start,
+                end: plan.start + duration,
+            }) {
+                handoffs.owner_refused(job.job_id, now);
+                note(UnplacedKind::RefusedAtStart, plan.nodes.len(), None);
             } else {
                 handoffs.owner_planned(job.job_id, picked, plan.start, now);
                 self.reserve_plan(job, cluster, &plan, plan.start, duration, charge);
@@ -1273,7 +1294,7 @@ impl BackfillScheduler {
                 );
             }
         }
-        for components in het_starts.into_values() {
+        if let Some((_, components)) = het_open {
             self.admit_het_components(
                 &components,
                 now,
@@ -1930,6 +1951,28 @@ fn homogeneous_per_node(demand: &GpuDemand) -> Option<u32> {
         }
         GpuDemand::Total { .. } => None,
     }
+}
+
+/// The pending indices in queue order, each heterogeneous job's components moved up
+/// behind its first, so no job is planned while they hold nodes a refusal would free.
+fn grouped_order(
+    len: usize,
+    group_of: &HashMap<usize, JobId>,
+    het_groups: &HashMap<JobId, Vec<usize>>,
+) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::with_capacity(len);
+    for idx in 0..len {
+        match group_of.get(&idx) {
+            Some(group) => {
+                if seen.insert(*group) {
+                    order.extend_from_slice(&het_groups[group]);
+                }
+            }
+            None => order.push(idx),
+        }
+    }
+    order
 }
 
 /// Whether a job's per-node CPU demand is non-uniform, so it must take the
@@ -4442,12 +4485,25 @@ mod tests {
         pub(super) end: chrono::DateTime<Utc>,
     }
 
+    impl From<&JobStart<'_>> for Asked {
+        fn from(start: &JobStart<'_>) -> Self {
+            Self {
+                job_id: start.job.job_id,
+                nodes: start.nodes.to_vec(),
+                start: start.start,
+                end: start.end,
+            }
+        }
+    }
+
     /// Records every batch of starts it is asked about and refuses any batch that
-    /// holds one of `refused`.
+    /// holds one of `refused`; likewise each future slot, refusing `refused_slots`.
     #[derive(Default)]
     pub(super) struct Recorder {
         pub(super) refused: HashSet<JobId>,
         pub(super) asked: Vec<Vec<Asked>>,
+        pub(super) refused_slots: HashSet<JobId>,
+        pub(super) slots_asked: Vec<Asked>,
     }
 
     impl Recorder {
@@ -4468,18 +4524,13 @@ mod tests {
 
     impl StartAdmission for Recorder {
         fn admit(&mut self, starts: &[JobStart<'_>]) -> bool {
-            self.asked.push(
-                starts
-                    .iter()
-                    .map(|s| Asked {
-                        job_id: s.job.job_id,
-                        nodes: s.nodes.to_vec(),
-                        start: s.start,
-                        end: s.end,
-                    })
-                    .collect(),
-            );
+            self.asked.push(starts.iter().map(Asked::from).collect());
             starts.iter().all(|s| !self.refused.contains(&s.job.job_id))
+        }
+
+        fn may_reserve(&mut self, slot: &JobStart<'_>) -> bool {
+            self.slots_asked.push(Asked::from(slot));
+            !self.refused_slots.contains(&slot.job.job_id)
         }
     }
 
@@ -4695,10 +4746,10 @@ mod tests {
             &mut admission,
         );
 
-        assert_eq!(admission.batches(), [vec![2], vec![1, 3], vec![4]]);
+        assert_eq!(admission.batches(), [vec![1, 3], vec![2], vec![4]]);
         assert_eq!(
             started(&assignments),
-            [(2, vec!["node002"]), (4, vec!["node001", "node003"])]
+            [(2, vec!["node001"]), (4, vec!["node002", "node003"])]
         );
         for component in [1, 3] {
             assert_eq!(
@@ -4740,6 +4791,106 @@ mod tests {
     }
 
     #[test]
+    fn a_het_jobs_components_are_placed_before_a_job_queued_between_them() {
+        let mut sched = BackfillScheduler::new(100);
+
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            make_job(2, 1, 64),
+            het_component(make_job(3, 1, 64), 1, 1),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(2),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut AdmitAll,
+        );
+
+        assert_eq!(
+            started(&assignments),
+            [(1, vec!["node001"]), (3, vec!["node002"])]
+        );
+        assert_eq!(
+            sched.last_outcome[&2].kind,
+            UnplacedKind::FutureSlotReserved
+        );
+    }
+
+    #[test]
+    fn the_depth_limit_counts_a_het_jobs_components_where_they_are_placed() {
+        let mut sched = BackfillScheduler::new(2);
+
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            make_job(2, 1, 64),
+            het_component(make_job(3, 1, 64), 1, 1),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(2),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut AdmitAll,
+        );
+
+        assert_eq!(
+            started(&assignments),
+            [(1, vec!["node001"]), (3, vec!["node002"])]
+        );
+        assert!(!sched.last_outcome.contains_key(&2));
+    }
+
+    #[test]
+    fn grouped_order_moves_each_het_jobs_components_up_behind_its_first() {
+        let het_groups: HashMap<JobId, Vec<usize>> =
+            HashMap::from([(10, vec![0, 4]), (20, vec![2, 3, 6]), (30, vec![5])]);
+        let group_of: HashMap<usize, JobId> = het_groups
+            .iter()
+            .filter(|(_, components)| components.len() > 1)
+            .flat_map(|(group, components)| components.iter().map(move |&idx| (idx, *group)))
+            .collect();
+
+        assert_eq!(
+            grouped_order(7, &group_of, &het_groups),
+            [0, 4, 1, 2, 3, 6, 5]
+        );
+    }
+
+    #[test]
+    fn a_job_queued_between_a_refused_het_jobs_components_starts_on_their_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(3);
+
+        // Job 2 needs both nodes, so it can start only once the het job's are free.
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            make_job(2, 2, 64),
+            het_component(make_job(3, 1, 64), 1, 1),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(2),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![1, 3], vec![2]]);
+        assert_eq!(started(&assignments), [(2, vec!["node001", "node002"])]);
+        for component in [1, 3] {
+            assert_eq!(
+                sched.last_outcome[&component].kind,
+                UnplacedKind::RefusedAtStart
+            );
+            assert!(!holds_a_slot(&sched, component));
+        }
+    }
+
+    #[test]
     fn a_refused_handoff_owner_leaves_its_node_to_the_next_job() {
         let nodes = make_nodes(1);
         let handoffs = owned(&[("node001", 1)]);
@@ -4760,6 +4911,67 @@ mod tests {
         assert_eq!(started(&assignments), [(2, vec!["node001"])]);
         assert_eq!(sched.last_outcome[&1].kind, UnplacedKind::RefusedAtStart);
         assert_eq!(sched.released_handoffs(), [("node001".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_job_refused_its_future_slot_holds_none_and_releases_its_handoff() {
+        let mut nodes = make_nodes(2);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = owned(&[("node001", 1)]);
+        let busy_until =
+            HashMap::from([("node001".to_string(), Utc::now() + Duration::minutes(5))]);
+        let mut owner = job_for(1, 1, Duration::hours(1));
+        owner.spec.nodelist = Some("node001".into());
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder {
+            refused_slots: HashSet::from([1]),
+            ..Default::default()
+        };
+
+        let assignments = sched.schedule_with(
+            &[owner, job_for(2, 1, Duration::hours(1))],
+            &handoff_state(&nodes, &busy_until, &handoffs),
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(started(&assignments), [(2, vec!["node002"])]);
+        assert_eq!(admission.slots_asked.len(), 1);
+        assert_eq!(admission.slots_asked[0].job_id, 1);
+        assert_eq!(admission.slots_asked[0].nodes, ["node001"]);
+        assert_eq!(sched.last_outcome[&1].kind, UnplacedKind::RefusedAtStart);
+        assert!(plan_of(&sched, 1).is_none());
+        assert!(!holds_a_slot(&sched, 1));
+        assert_eq!(sched.released_handoffs(), [("node001".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_job_admitted_its_future_slot_keeps_it_and_its_handoff() {
+        let mut nodes = make_nodes(1);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = owned(&[("node001", 1)]);
+        let busy_until =
+            HashMap::from([("node001".to_string(), Utc::now() + Duration::minutes(5))]);
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::default();
+
+        let assignments = sched.schedule_with(
+            &[job_for(1, 1, Duration::hours(1))],
+            &handoff_state(&nodes, &busy_until, &handoffs),
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert!(assignments.is_empty());
+        assert_eq!(admission.slots_asked.len(), 1);
+        assert_eq!(admission.slots_asked[0].job_id, 1);
+        assert_eq!(admission.slots_asked[0].nodes, ["node001"]);
+        assert_eq!(
+            sched.last_outcome[&1].kind,
+            UnplacedKind::FutureSlotReserved
+        );
+        assert!(plan_of(&sched, 1).is_some());
+        assert!(sched.released_handoffs().is_empty());
     }
 
     #[test]
@@ -4809,7 +5021,7 @@ mod tests {
         assert_eq!(admission.batches(), [vec![1, 3], vec![2, 4]]);
         assert_eq!(
             started(&assignments),
-            [(1, vec!["node001"]), (3, vec!["node003"])]
+            [(1, vec!["node001"]), (3, vec!["node002"])]
         );
         for component in [2, 4] {
             assert_eq!(
@@ -4821,8 +5033,8 @@ mod tests {
     }
 
     #[test]
-    fn het_jobs_cut_by_the_depth_limit_are_admitted_separately() {
-        let mut sched = BackfillScheduler::new(2);
+    fn a_het_job_cut_by_the_depth_limit_is_admitted_on_its_own() {
+        let mut sched = BackfillScheduler::new(3);
         let mut admission = Recorder::refusing(2);
 
         let pending = [
@@ -4840,8 +5052,11 @@ mod tests {
             &mut admission,
         );
 
-        assert_eq!(admission.batches(), [vec![1], vec![2]]);
-        assert_eq!(started(&assignments), [(1, vec!["node001"])]);
+        assert_eq!(admission.batches(), [vec![1, 3], vec![2]]);
+        assert_eq!(
+            started(&assignments),
+            [(1, vec!["node001"]), (3, vec!["node002"])]
+        );
         assert_eq!(sched.last_outcome[&2].kind, UnplacedKind::RefusedAtStart);
         assert!(!holds_a_slot(&sched, 2));
     }

@@ -79,6 +79,11 @@ therefore decided by re-running the full limit check with the node cap lifted, a
 treating the job as eligible only if it then passes — not by reading the reason
 code the job reports, which names only the first breach found.
 
+Eligibility is decided before placement. When a borrowed job starts, its limits
+are checked again on the nodes it got, after the jobs started earlier in the same
+pass: it still runs outside its QOS group node cap, but its account limits and
+every other QOS limit must hold, or it does not start.
+
 Four kinds of job are never lent capacity:
 
 - **Jobs with no effective time limit.** A borrowed job with no bound would make
@@ -110,7 +115,14 @@ Quota accounting
 
 A borrowed run is held outside **every** quota aggregate, at both the association
 and the QOS gate: node and other TRES totals, occupied-node counts, running and
-submitted job counts, and array concurrency.
+submitted job counts, and array concurrency. Only a :ref:`partition QOS
+<partition-qos>` counts it, as it counts every run in its partition.
+
+The one exception is the scheduling pass that starts it. Limits are charged when
+a job starts (see :ref:`limits-charged-at-start`), and a borrowed job is charged
+like any other start except for its QOS group node count, so the starts after it
+in that pass see what it uses. From the next pass on it is outside the job QOS and
+association aggregates again.
 
 This is not cosmetic. If a borrowed job counted toward its own team's quota, it
 would block that team's *next legitimate job* at an admission gate — and a job
@@ -118,9 +130,11 @@ blocked there is removed from the pending list before the scheduler ever sees it
 so it could never trigger reclaim. The lent capacity could then never be recovered,
 which is the exact failure the feature exists to prevent.
 
-One consequence to plan for: because borrowed nodes leave the aggregates, neither
-the QOS group node cap nor the association node cap bounds how much a scope may
-borrow. Only the amount of genuinely idle capacity does.
+One consequence to plan for: each borrowed job must fit its account limits when it
+starts, but because borrowed nodes then leave the aggregates, neither the QOS group
+node cap nor the association node cap bounds how much a scope may borrow in total.
+Only the amount of genuinely idle capacity does, and a partition QOS, which bounds
+what a user holds in the partitions it is attached to, borrowed or not.
 
 .. note::
 
@@ -133,7 +147,9 @@ Reclaim
 -------
 
 When a job holding a quota claim cannot be placed, Spur looks for borrowed jobs
-whose eviction would let it run.
+whose eviction would let it run. It looks only while the job still fits its limits
+after the jobs started earlier in the same pass, since freeing nodes for a job its
+limits would refuse evicts a borrowed run for nothing.
 
 The set of jobs to evict must **provably close the shortfall, or nothing is evicted**. A node
 counts as recovered only when every job on it is reclaimable, so the outcome is
