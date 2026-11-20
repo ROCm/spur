@@ -555,8 +555,10 @@ Inspired by Enroot.
   ones at the sanitized name, under `container_dir()` (`$SPUR_CONTAINER_DIR` >
   `/var/spool/spur/containers` > `$HOME/.spur/containers`). Normal teardown
   (`cleanup_rootfs`) removes them; leftovers from a crash are removed by the
-  startup orphan pass, which unmounts layers first (no lazy detach) and keeps a
-  rootfs held as a process root or bound anywhere (per-namespace mountinfo).
+  startup orphan pass, which unmounts layers first (no lazy detach), keeps a
+  rootfs held as a process root or bound from the container dir's filesystem
+  (per-namespace mountinfo), and moves it into `spur:trash` under the job lock
+  before deleting it unlocked.
 
 ---
 

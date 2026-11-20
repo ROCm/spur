@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::spool_fs::TRASH_NAME;
 use crate::startup_spool::{
-    delete_pending_rootfs, ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET,
+    delete_pending_rootfs, delete_trashed, move_pending_aside, ActivityPaths, CleanupSummary,
+    RootfsTally, STARTUP_CLEANUP_BUDGET,
 };
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -1145,15 +1147,113 @@ async fn background_rootfs_deletion_stops_for_shutdown() {
     )
     .await;
     assert!(rootfs.join("usr/lib/python3/site.py").is_file());
+}
 
-    let handle = RootfsCleanup {
+#[tokio::test]
+async fn dropping_the_cleanup_handle_stops_the_running_task() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    fixture.rootfs("job_1");
+    fixture.rootfs("job_2");
+    let summary = fixture.run().await;
+    let held = fixture.agent.lifecycle.acquire(2).await;
+    let mut handle = RootfsCleanup {
         owners: fixture.agent.spool_ownership(),
-        pending: Vec::new(),
+        pending: summary.pending_rootfs,
     }
     .spawn();
-    let stop = handle.stop.clone();
+    while fixture.containers().join("job_1").exists() {
+        tokio::task::yield_now().await;
+    }
+    // The task now waits for job 2's lock; dropping the handle must stop what is left.
+    let task = std::mem::replace(&mut handle.task, tokio::spawn(async {}));
     drop(handle);
-    assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+    drop(held);
+    task.await.unwrap();
+    let trash = fixture.containers().join(TRASH_NAME);
+    assert_eq!(
+        fs::read_dir(&trash).unwrap().count(),
+        2,
+        "moved, then left by the stop"
+    );
+    fixture.run_and_drain().await;
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn background_deletion_frees_the_job_path_before_deleting_the_tree() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    let rootfs = fixture.rootfs("job_1");
+    let summary = fixture.run().await;
+    let owners = fixture.agent.spool_ownership();
+    let (stop, mut tally) = (no_stop(), RootfsTally::default());
+    let trashed = move_pending_aside(&owners, summary.pending_rootfs, &stop, &mut tally).await;
+    assert!(trashed.len() == 1 && trashed[0].is_trashed());
+    assert!(!rootfs.exists());
+    // A relaunch takes the lock and rebuilds its rootfs while the old tree waits in the trash.
+    let relaunch = owners.guard(1).await;
+    fs::create_dir(&rootfs).unwrap();
+    fs::write(rootfs.join("new"), "relaunch").unwrap();
+    delete_trashed(trashed, &stop, &mut tally).await;
+    drop(relaunch);
+    assert_eq!(tally.deleted, 1);
+    assert_eq!(fs::read_to_string(rootfs.join("new")).unwrap(), "relaunch");
+    let trash = fixture.containers().join(TRASH_NAME);
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(&trash).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[tokio::test]
+async fn trash_left_by_an_interrupted_run_is_deleted_without_the_controller() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, false, &[]);
+    let fixture = SpoolFixture::new(&controller, &[]);
+    fixture.rootfs("job_1");
+    let trash = fixture.containers().join(TRASH_NAME);
+    fs::create_dir(&trash).unwrap();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(fixture.containers().join("job_1"), trash.join("job_1.7.0")).unwrap();
+    fixture.rootfs("job_2");
+    fixture.run_and_drain().await;
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
+    assert!(
+        fixture.containers().join("job_2").is_dir(),
+        "unconfirmed ids stay"
+    );
+}
+
+#[tokio::test]
+async fn an_unsafe_trash_is_never_used_and_orphans_are_deleted_in_place() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    for unsafe_trash in ["symlink", "group-writable"] {
+        let fixture = SpoolFixture::new(&controller, &[]);
+        let outside = fixture.directory.path().join("outside");
+        fs::create_dir_all(outside.join("job_9.1.0")).unwrap();
+        fs::write(outside.join("job_9.1.0/sentinel"), "keep").unwrap();
+        let trash = fixture.containers().join(TRASH_NAME);
+        fs::create_dir_all(fixture.containers()).unwrap();
+        if unsafe_trash == "symlink" {
+            symlink(&outside, &trash).unwrap();
+        } else {
+            fs::rename(&outside, &trash).unwrap();
+            fs::set_permissions(&trash, fs::Permissions::from_mode(0o770)).unwrap();
+        }
+        let rootfs = fixture.rootfs("job_1");
+        fixture.run_and_drain().await;
+        assert!(!rootfs.exists(), "{unsafe_trash}");
+        assert_eq!(
+            fs::read_to_string(trash.join("job_9.1.0/sentinel")).unwrap(),
+            "keep",
+            "{unsafe_trash}"
+        );
+    }
 }
 
 #[tokio::test]

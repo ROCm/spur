@@ -4530,21 +4530,29 @@ pub struct RootfsCleanup {
 }
 
 impl RootfsCleanup {
-    /// Starts the deletions; dropping the returned handle stops them between entries.
+    /// Starts the deletions; dropping the returned handle stops them, mid-walk included.
     pub fn spawn(self) -> RootfsCleanupHandle {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(crate::startup_spool::delete_pending_rootfs(
+        let task = tokio::spawn(crate::startup_spool::delete_pending_rootfs(
             self.owners,
             self.pending,
             stop.clone(),
         ));
-        RootfsCleanupHandle { stop }
+        #[cfg(not(test))]
+        drop(task);
+        RootfsCleanupHandle {
+            stop,
+            #[cfg(test)]
+            task,
+        }
     }
 }
 
 /// Keeps the background deletion bounded by the agent's lifetime, however `main` exits.
 pub struct RootfsCleanupHandle {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for RootfsCleanupHandle {

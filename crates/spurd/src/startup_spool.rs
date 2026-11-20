@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::agent_server::{AgentService, SpoolOwnership};
+use crate::job_lifecycle::KeyedLifecycleGuard;
 use crate::spool_fs::{
     budget_exhausted, directory_names, inode_identity, kept_reason, open_child, open_directory,
     read_mounts, Bound, JobSpool, Mount, SpoolKind, SpoolRoot,
@@ -70,22 +71,46 @@ struct Candidate {
     path: PathBuf,
 }
 
-/// An orphan container rootfs the controller confirmed, unmounted and left for background deletion.
-pub(crate) struct PendingRootfs(Candidate);
-
-impl std::fmt::Debug for PendingRootfs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingRootfs")
-            .field("job_id", &self.0.spool.job_id)
-            .field("path", &self.0.path)
-            .finish()
-    }
+/// A container rootfs left for background deletion.
+pub(crate) struct PendingRootfs {
+    candidate: Candidate,
+    /// Already in the trash, so its job's path is free and no lock is needed to delete it.
+    trashed: bool,
 }
 
 impl PendingRootfs {
+    fn orphan(candidate: Candidate) -> Self {
+        Self {
+            candidate,
+            trashed: false,
+        }
+    }
+
+    fn trashed(candidate: Candidate) -> Self {
+        Self {
+            candidate,
+            trashed: true,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
-        &self.0.path
+        &self.candidate.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_trashed(&self) -> bool {
+        self.trashed
+    }
+}
+
+impl std::fmt::Debug for PendingRootfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidate = &self.candidate;
+        f.debug_struct("PendingRootfs")
+            .field("job_id", &candidate.spool.job_id)
+            .field("path", &candidate.path)
+            .finish()
     }
 }
 
@@ -113,7 +138,12 @@ pub(crate) async fn run(
     }
     let discovery = tokio::task::spawn_blocking(move || discover(roots));
     let candidates = match tokio::time::timeout_at(deadline.into(), discovery).await {
-        Ok(Ok(candidates)) => candidates,
+        Ok(Ok((candidates, leftovers))) => {
+            summary
+                .pending_rootfs
+                .extend(leftovers.into_iter().map(PendingRootfs::trashed));
+            candidates
+        }
         Ok(Err(error)) => {
             warn!(%error, "startup spool discovery failed");
             summary.errors += 1;
@@ -315,8 +345,9 @@ pub(crate) fn controller_confirmed(response: &GetJobsResponse, batch: &[u32]) ->
         .collect()
 }
 
-fn discover(paths: Vec<(PathBuf, SpoolKind)>) -> Vec<Candidate> {
+fn discover(paths: Vec<(PathBuf, SpoolKind)>) -> (Vec<Candidate>, Vec<Candidate>) {
     let mut candidates = Vec::new();
+    let mut leftovers = Vec::new();
     let mut roots = HashSet::new();
     for (path, kind) in paths {
         let root = match SpoolRoot::open(path.clone()) {
@@ -344,8 +375,31 @@ fn discover(paths: Vec<(PathBuf, SpoolKind)>) -> Vec<Candidate> {
             root: root.clone(),
             spool,
         }));
+        if kind == SpoolKind::Rootfs {
+            leftovers.extend(trash_leftovers(&root));
+        }
     }
-    candidates
+    (candidates, leftovers)
+}
+
+fn trash_leftovers(root: &SpoolRoot) -> Vec<Candidate> {
+    let (trash, spools) = match root.trash_leftovers() {
+        Ok(Some(found)) => found,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            warn!(root = %root.path.display(), %error, "skipped unsafe or unreadable container trash");
+            return Vec::new();
+        }
+    };
+    let trash = Arc::new(trash);
+    spools
+        .into_iter()
+        .map(|spool| Candidate {
+            path: trash.entry_path(&spool),
+            root: trash.clone(),
+            spool,
+        })
+        .collect()
 }
 
 fn clean_inactive(
@@ -400,7 +454,7 @@ fn clean_inactive(
                         info!(job_id, path = %path.display(), detached, "queued orphan container rootfs for background deletion");
                         summary
                             .pending_rootfs
-                            .push(PendingRootfs(Candidate { spool, ..candidate }));
+                            .push(PendingRootfs::orphan(Candidate { spool, ..candidate }));
                         continue;
                     }
                     Ok(None) => {
@@ -444,65 +498,135 @@ fn unmount_rootfs(
         .root
         .unmount_beneath(&candidate.spool, mountinfo)?;
     let spool = candidate.root.reopen(&candidate.spool, unmounted)?;
-    // The directory a mount hid was never inventoried under its own identity.
+    // The directory a mount hid is not among the identities discovered for the entry.
     if spool.identities().any(|id| held.contains(&id)) {
         return Ok(None);
     }
     Ok(Some((unmounted.count, spool)))
 }
 
-/// Deletes confirmed orphan container rootfs dirs after the agent serves; each holds its job's lifecycle lock.
+/// Deletes confirmed orphan container rootfs dirs after the agent serves.
 pub(crate) async fn delete_pending_rootfs(
     owners: SpoolOwnership,
     pending: Vec<PendingRootfs>,
     stop: Arc<AtomicBool>,
 ) {
-    let (mut deleted, mut kept, mut failed) = (0, 0, 0);
-    for PendingRootfs(candidate) in pending {
+    let mut tally = RootfsTally::default();
+    let trashed = move_pending_aside(&owners, pending, &stop, &mut tally).await;
+    delete_trashed(trashed, &stop, &mut tally).await;
+    info!(
+        deleted = tally.deleted,
+        kept = tally.kept,
+        failed = tally.failed,
+        "background container rootfs cleanup finished"
+    );
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RootfsTally {
+    pub(crate) deleted: usize,
+    pub(crate) kept: usize,
+    pub(crate) failed: usize,
+}
+
+/// Moves each orphan into the trash under its job's lock, so the lock is never held while a
+/// large tree is deleted; an entry that cannot be moved is deleted in place under the lock.
+pub(crate) async fn move_pending_aside(
+    owners: &SpoolOwnership,
+    pending: Vec<PendingRootfs>,
+    stop: &Arc<AtomicBool>,
+    tally: &mut RootfsTally,
+) -> Vec<PendingRootfs> {
+    let mut trashed = Vec::new();
+    for entry in pending {
+        if entry.trashed {
+            trashed.push(entry);
+            continue;
+        }
+        let candidate = entry.candidate;
         if stop.load(Ordering::Relaxed) {
-            kept += 1;
+            tally.kept += 1;
             continue;
         }
         let job_id = candidate.spool.job_id;
         let guard = owners.guard(job_id).await;
         if let Some(reason) = owners.local_owner(job_id).await {
             info!(job_id, path = %candidate.path.display(), reason, "kept container rootfs: the job is active again");
-            kept += 1;
+            tally.kept += 1;
             continue;
         }
-        info!(job_id, path = %candidate.path.display(), "deleting orphan container rootfs");
-        let path = candidate.path.clone();
-        let bound = Bound::until_stopped(stop.clone());
-        let result = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            candidate.root.delete(&candidate.spool, &bound)
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {
-                deleted += 1;
-                info!(job_id, path = %path.display(), "deleted orphan container rootfs");
+        let moved = candidate
+            .root
+            .trash()
+            .and_then(|trash| Ok((candidate.root.move_to(&candidate.spool, &trash)?, trash)));
+        match moved {
+            Ok((spool, trash)) => {
+                debug!(job_id, path = %candidate.path.display(), "moved orphan container rootfs to the trash");
+                trashed.push(PendingRootfs::trashed(Candidate {
+                    path: trash.entry_path(&spool),
+                    root: Arc::new(trash),
+                    spool,
+                }));
             }
-            Ok(Err(error)) => match kept_reason(&error) {
-                Some(reason) => {
-                    kept += 1;
-                    warn!(job_id, path = %path.display(), "kept container rootfs: {reason}");
-                }
-                None => {
-                    failed += 1;
-                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup");
-                }
-            },
             Err(error) => {
-                failed += 1;
-                warn!(job_id, %error, "container rootfs deletion task failed");
+                warn!(job_id, path = %candidate.path.display(), %error, "could not move container rootfs aside; deleting it in place");
+                delete_rootfs(candidate, Some(guard), stop, tally).await;
             }
         }
     }
-    info!(
-        deleted,
-        kept, failed, "background container rootfs cleanup finished"
-    );
+    trashed
+}
+
+/// Deletes rootfs trees already in the trash; no job lock is needed there.
+pub(crate) async fn delete_trashed(
+    trashed: Vec<PendingRootfs>,
+    stop: &Arc<AtomicBool>,
+    tally: &mut RootfsTally,
+) {
+    for entry in trashed {
+        if stop.load(Ordering::Relaxed) {
+            tally.kept += 1;
+            continue;
+        }
+        delete_rootfs(entry.candidate, None, stop, tally).await;
+    }
+}
+
+async fn delete_rootfs(
+    candidate: Candidate,
+    guard: Option<KeyedLifecycleGuard<u32>>,
+    stop: &Arc<AtomicBool>,
+    tally: &mut RootfsTally,
+) {
+    let job_id = candidate.spool.job_id;
+    let path = candidate.path.clone();
+    info!(job_id, path = %path.display(), "deleting orphan container rootfs");
+    let bound = Bound::until_stopped(stop.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        candidate.root.delete(&candidate.spool, &bound)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            tally.deleted += 1;
+            info!(job_id, path = %path.display(), "deleted orphan container rootfs");
+        }
+        Ok(Err(error)) => match kept_reason(&error) {
+            Some(reason) => {
+                tally.kept += 1;
+                warn!(job_id, path = %path.display(), "kept container rootfs: {reason}");
+            }
+            None => {
+                tally.failed += 1;
+                warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup");
+            }
+        },
+        Err(error) => {
+            tally.failed += 1;
+            warn!(job_id, %error, "container rootfs deletion task failed");
+        }
+    }
 }
 
 struct Inventory {
@@ -750,7 +874,7 @@ struct HolderFilter<'a> {
     mounts: &'a MountTable,
 }
 
-/// A mount namespace's mounts, used to avoid stat-ing network and FUSE files, which can block indefinitely.
+/// A mount namespace's mounts: which files are on network or FUSE mounts (never stat-ed), and binds.
 struct MountTable {
     mounts: Vec<Mount>,
 }

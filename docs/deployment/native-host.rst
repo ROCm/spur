@@ -221,31 +221,36 @@ owned by the ``spurd`` user and not writable by group or others.
 * The controller confirmation and the job checks above apply. As with spools,
   a process whose working directory, root or open file is inside the rootfs
   keeps it; a process in another mount namespace (such as the container
-  itself) is checked against its own mount table, and a bind mount of any part
-  of the rootfs in the agent's or a running process's mount namespace keeps
-  it. A mount table that cannot be read keeps every directory in the batch.
+  itself) is checked against its own mount table, and a bind mount of the
+  rootfs directory or anything under it on the same filesystem, in the agent's
+  or a running process's mount namespace, keeps it. A mount table that cannot be
+  read keeps every directory in the batch.
 * Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
   ``merged``, or a mount on the directory itself) is unmounted first, without a
   lazy detach. If one stays mounted the directory is kept and ``kept container
   rootfs: a mount beneath it could not be unmounted`` is logged; the next start
   tries again.
 * Deletion runs in the background after ``spurd`` starts serving, one directory
-  at a time, with no time limit, so a large image does not delay startup. A job
-  relaunched on the node with the same id waits, without a time limit, for
-  that deletion, or keeps the directory if it got there first. Stopping
-  ``spurd`` halts the deletion and the next start finishes it.
+  at a time, with no time limit, so a large image does not delay startup. Each
+  directory is first moved, under its job's lock, into ``spur:trash`` inside the
+  container directory (owner-only), so a relaunch of the same job id does not
+  wait for the deletion. If the move fails the directory is deleted in place
+  and a relaunch waits for it. Until it is emptied the trash holds the disk
+  space. Stopping ``spurd`` halts the deletion and the next start finishes it.
 
 Container rootfs decisions are logged as ``retained container rootfs:
-<reason>``, ``queued orphan container rootfs for background deletion``,
-``deleting orphan container rootfs``, ``deleted orphan container rootfs`` or
-``kept container rootfs: <reason>``; a finished background run logs
-``background container rootfs cleanup finished deleted=<n> kept=<n>
-failed=<n>``.
+<reason>``, ``retained locally owned container rootfs``, ``queued orphan
+container rootfs for background deletion``, ``could not move container rootfs
+aside; deleting it in place``, ``deleting orphan container rootfs``, ``deleted
+orphan container rootfs``, ``kept container rootfs: <reason>`` or ``failed to
+delete orphan container rootfs; will reconsider on next startup``; a finished
+background run logs ``background container rootfs cleanup finished
+deleted=<n> kept=<n> failed=<n>``.
 
 Directories kept because the controller did not confirm them or the activity
 inventory was uncertain are logged with a count per batch of 128 job ids
-(``retained job spools: <reason>``); directories left when the time runs out
-log ``retained remaining job spools`` with the reason. Each path is logged at
+(``retained directories: <reason>``); directories left when the time runs out
+log ``retained remaining directories`` with the reason. Each path is logged at
 debug level. Directories still in use log ``retained locally owned job spool``
 or ``retained job spool: runtime session, cgroup or process still holds it``;
 removals log ``deleted orphan job spool``. The pass ends with ``startup job

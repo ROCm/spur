@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use nix::errno::Errno;
-use nix::fcntl::{openat, openat2, AtFlags, OFlag, OpenHow, ResolveFlag};
+use nix::fcntl::{openat, openat2, renameat2, AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag};
 use nix::mount::{umount2, MntFlags};
-use nix::sys::stat::{fstatat, Mode};
+use nix::sys::stat::{fstatat, mkdirat, Mode};
 use nix::unistd::{unlinkat, UnlinkatFlags};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -14,11 +14,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+// A rootfs moved here frees its job's path at once; `:` never occurs in a container name.
+pub(crate) const TRASH_NAME: &str = "spur:trash";
 // Bounds descriptors held by one walk; a deeper user tree is kept, not deleted.
 pub(crate) const MAX_SPOOL_DEPTH: usize = 256;
 const READ_CHUNK: usize = 1024;
@@ -357,7 +359,8 @@ impl SpoolRoot {
         Ok(inode_identity(&self.directory.metadata()?))
     }
 
-    /// Unmounts every mount at or beneath the entry, deepest first; any that remain keep it.
+    /// Unmounts every mount at or beneath the entry in the agent's namespace, deepest first;
+    /// any that remain keep it.
     pub(crate) fn unmount_beneath(
         &self,
         spool: &JobSpool,
@@ -484,6 +487,87 @@ impl SpoolRoot {
             metadata,
             ..spool.clone()
         })
+    }
+
+    /// The private directory that rootfs entries are moved into before deletion.
+    pub(crate) fn trash(&self) -> io::Result<SpoolRoot> {
+        match mkdirat(&self.directory, TRASH_NAME, Mode::S_IRWXU) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.open_trash()
+    }
+
+    fn open_trash(&self) -> io::Result<SpoolRoot> {
+        let name = OsStr::new(TRASH_NAME);
+        let directory = open_child(&self.directory, name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
+        verify_root(&directory)?;
+        Ok(SpoolRoot {
+            path: self.path.join(name),
+            real_path: self.real_path.join(name),
+            directory,
+        })
+    }
+
+    /// Moves the entry into `trash` under a fresh name; the moved entry keeps its identity.
+    pub(crate) fn move_to(&self, spool: &JobSpool, trash: &SpoolRoot) -> io::Result<JobSpool> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        require_identity(&self.directory, &spool.name, &spool.metadata)?;
+        let mut name = spool.name.clone();
+        name.push(format!(
+            ".{}.{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        renameat2(
+            &self.directory,
+            spool.name.as_os_str(),
+            &trash.directory,
+            name.as_os_str(),
+            RenameFlags::RENAME_NOREPLACE,
+        )?;
+        require_identity(&trash.directory, &name, &spool.metadata)?;
+        Ok(JobSpool {
+            name,
+            ..spool.clone()
+        })
+    }
+
+    /// Entries an interrupted run left in the trash; none if there is no trash yet.
+    pub(crate) fn trash_leftovers(&self) -> io::Result<Option<(SpoolRoot, Vec<JobSpool>)>> {
+        let trash = match self.open_trash() {
+            Ok(trash) => trash,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut leftovers = Vec::new();
+        for name in directory_names(&trash.directory)? {
+            let job_id = name
+                .to_str()
+                .and_then(|name| name.split_once('.'))
+                .and_then(|(original, _)| canonical_rootfs_job_id(OsStr::new(original)))
+                .unwrap_or(0);
+            let directory = match open_child(
+                &trash.directory,
+                &name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            ) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    tracing::warn!(root = %trash.path.display(), entry = ?name, %error,
+                            "skipped unexpected container trash entry");
+                    continue;
+                }
+            };
+            leftovers.push(JobSpool {
+                job_id,
+                kind: SpoolKind::Rootfs,
+                metadata: directory.metadata()?,
+                roots: Vec::new(),
+                name,
+            });
+        }
+        Ok(Some((trash, leftovers)))
     }
 
     pub(crate) fn device(&self) -> io::Result<u64> {
@@ -697,7 +781,6 @@ impl TraversalFrame {
         }
     }
 
-    // Each refill reads from the start: every name already returned has been unlinked.
     fn next_name(&mut self) -> io::Result<Option<OsString>> {
         if let Some(name) = self.pending.next() {
             return Ok(Some(name));
@@ -706,7 +789,8 @@ impl TraversalFrame {
         if names.is_empty() {
             return Ok(None);
         }
-        // Every name returned before was unlinked, so seeing one again means no progress.
+        // Each refill reads from the start; every name returned before was unlinked, so a repeat
+        // means no progress.
         if names.iter().any(|name| self.previous.contains(name)) {
             return Err(io::Error::other(Kept("kept changing during cleanup")));
         }
