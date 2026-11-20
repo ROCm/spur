@@ -583,7 +583,7 @@ async fn a_worker_released_after_the_budget_deletes_nothing() {
         let barriers = barriers.clone();
         async move {
             let mut paths = fixture.paths();
-            paths.budget = std::time::Duration::from_millis(100);
+            paths.budget = std::time::Duration::from_secs(1);
             paths.worker_barriers = Some(barriers);
             fixture
                 .agent

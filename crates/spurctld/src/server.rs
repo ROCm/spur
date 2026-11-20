@@ -10476,6 +10476,10 @@ mod tests {
             ));
         let status = svc.get_jobs(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+        assert!(
+            status.message().contains("did not establish authoritative"),
+            "{status}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

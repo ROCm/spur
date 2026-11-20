@@ -169,9 +169,8 @@ Orphan job spool cleanup
 Each job keeps its script and step output in ``/var/spool/spur/job<id>``. A
 ``spurd`` not running as root falls back to ``/tmp/spur/job<id>``
 (``$TMPDIR/spur`` if set) when the first cannot be created. The directory is
-removed when the job finishes. Directories left
-behind by a crash or a lost job are removed once, each time ``spurd`` starts,
-before it accepts work:
+removed when the job finishes. Directories left behind by a crash or a lost job
+are removed once, each time ``spurd`` starts, before it accepts work:
 
 * A directory is removed only after the leader controller confirms the job has
   finished, or confirms it no longer exists and its id is below the next id the

@@ -1435,8 +1435,7 @@ async fn run_completion_hooks_and_report(
     }
 }
 
-/// Bounded so a hung teardown can't stall the cancel RPC past the
-/// controller's own CancelJob timeout.
+/// Bounds only the wait for the job to exit; teardown after it (lock, file removal) is unbounded.
 const CANCEL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A cancel only warrants an active wait if the signal is expected to end
@@ -22390,7 +22389,8 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let job_id = 906;
+        // Teardown removes this id's host spool, rootfs and cgroup, so use one no real job has.
+        let job_id = 4_000_000_906;
         let child = tokio::process::Command::new("/bin/true")
             .process_group(0)
             .spawn()
@@ -22432,13 +22432,16 @@ mod tests {
         while svc.running.lock().await.contains_key(&job_id) {
             tokio::task::yield_now().await;
         }
+        tokio::task::yield_now().await;
         // Teardown now waits on the held lock; dropping the wait models a timed-out cancel RPC.
         wait.abort();
         let _ = wait.await;
         drop(held);
+        // The lock is fair, so this is granted only after a queued teardown releases it.
+        drop(svc.lifecycle.acquire(job_id).await);
+        assert_eq!(svc.free_gpu_count().await, 1);
         gate.started.notified().await;
         gate.release.notify_one();
-        assert_eq!(svc.free_gpu_count().await, 1);
         assert_eq!(reports.lock().unwrap()[0].job_id, job_id);
     }
 

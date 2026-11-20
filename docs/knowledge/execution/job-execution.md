@@ -396,9 +396,8 @@ The supervisor is unaffected by the restart -- it runs in its own session
 
 After initial completion replay, runtime pruning, supervisor adoption and
 stale-session settlement, `spurd` makes one pass over direct `job<id>`
-directories under `/var/spool/spur` and, for a non-root agent, the temporary-directory `spur`
-fallback.
-This pass finishes before the agent starts its RPC server and background runtime
+directories under `/var/spool/spur` and, for a non-root agent, the
+temporary-directory `spur` fallback. This pass finishes before the agent starts its RPC server and background runtime
 pruning, and is bounded by a 60-second budget; anything not decided by then is
 retained and logged. Heartbeats continue throughout startup. The roots are fixed
 and not configurable; the configured controller state directory does not add a
@@ -437,14 +436,16 @@ reports keep their existing retry behavior; startup cleanup does not wait for
 them. Read-only cgroup population checks and a process inventory also protect
 surviving workloads:
 
-- a `spurstepd` supervisor, recognised by comm, argv[0] or exe name only when its real and effective
-  uid are the daemon's, protects the job in its arguments, even if its runtime
-  record disappeared; such a process without a job id retains every candidate in the batch;
+- a `spurstepd` supervisor, recognised by comm, argv[0] or exe name only when
+  its real and effective uid are the daemon's, protects the job in its
+  arguments, even if its runtime record disappeared; such a process without a
+  job id retains every candidate in the batch;
 - a valid `SPUR_JOB_ID`, `SPUR_JOBID`, `SLURM_JOB_ID` or `SLURM_JOBID` in a
   process environment protects that job id; unparsable values are ignored;
 - a working directory or open file inside a spool protects it, matched by path
   and by inode (for holders on the spool's filesystem), so hardlinks and bind
-  mounts are recognised; targets on network or FUSE mounts are never stat-ed.
+  mounts are recognised; targets on recognised network and FUSE filesystems
+  are not stat-ed.
   A process that is exiting mid-scan is skipped. Reading other processes needs
   `CAP_SYS_PTRACE`.
 
