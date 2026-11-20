@@ -214,6 +214,58 @@ pub fn devices_from_proto(
 
 #[cfg(test)]
 mod tests {
+    use super::{devices_from_proto, devices_to_proto, Device, LegacyGpu};
+
+    #[test]
+    fn legacy_gpu_writes_back_numa_and_affinity() {
+        let device = Device {
+            numa_node: Some(0),
+            affinity_cpus: vec![2, 3],
+            ..Device::gpu(7, "mi355x", 0)
+        };
+        let json = serde_json::to_value(LegacyGpu::from(&device)).unwrap();
+        assert_eq!(json["numa_node"], 0);
+        assert_eq!(json["affinity_cpus"], serde_json::json!([2, 3]));
+    }
+
+    #[test]
+    fn proto_devices_round_trip_numa_and_affinity() {
+        let devices = vec![
+            Device {
+                numa_node: Some(1),
+                affinity_cpus: vec![4],
+                ..Device::gpu(9, "mi355x", 0)
+            },
+            Device::new("nic", "pollara400", 3, 0),
+        ];
+        let (wire, legacy) = devices_to_proto(&devices);
+        assert_eq!(wire[0].numa_node, Some(1));
+        assert_eq!(wire[0].affinity_cpus, vec![4]);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].numa_node, Some(1));
+        assert_eq!(legacy[0].affinity_cpus, vec![4]);
+        assert_eq!(devices_from_proto(wire, Vec::new()), devices);
+        assert_eq!(
+            devices_from_proto(Vec::new(), legacy)[0].affinity_cpus,
+            vec![4]
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn a_legacy_gpu_without_topology_keeps_its_memory() {
+        let legacy = spur_proto::proto::GpuResource {
+            memory_mb: 65536,
+            topology: None,
+            ..Default::default()
+        };
+        let devices = devices_from_proto(Vec::new(), vec![legacy]);
+        assert_eq!(
+            devices[0].topology.as_ref().and_then(|t| t.vram_bytes),
+            Some(65536 << 20)
+        );
+    }
+
     #[test]
     fn proto_devices_round_trip_the_gpu_topology() {
         let topology = super::DeviceTopology {

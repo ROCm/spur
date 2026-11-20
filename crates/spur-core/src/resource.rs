@@ -1965,7 +1965,12 @@ mod device_inventory_tests {
 
     #[test]
     fn a_new_inventory_still_reads_with_the_previous_build() {
-        let json = serde_json::to_string(&gpu_and_nic_node()).unwrap();
+        let mut node = gpu_and_nic_node();
+        for (numa, gpu) in node.devices.iter_mut().filter(|d| d.is_gpu()).enumerate() {
+            gpu.numa_node = Some(numa as u32);
+            gpu.affinity_cpus = vec![numa as u32 * 8, numa as u32 * 8 + 1];
+        }
+        let json = serde_json::to_string(&node).unwrap();
         let old: prev::ResourceSet =
             serde_json::from_str(&json).expect("a rolled-back controller must replay it");
         let ids: Vec<u64> = old.gpus.iter().map(|g| g.stable_id).collect();
@@ -1975,6 +1980,8 @@ mod device_inventory_tests {
             "only GPUs, which it understands"
         );
         assert_eq!(old.gpus[1].device_id, 1);
+        assert_eq!(old.gpus[1].numa_node, Some(1));
+        assert_eq!(old.gpus[1].affinity_cpus, vec![8, 9]);
     }
 
     #[test]
