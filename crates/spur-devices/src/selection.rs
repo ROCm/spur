@@ -47,6 +47,12 @@ impl DeviceSelection {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn excluding(&self, gres_name: &str) -> Self {
+        let mut rest = self.clone();
+        rest.0.remove(gres_name);
+        rest
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +83,17 @@ mod tests {
         let json = serde_json::to_string(&sel).unwrap();
         assert_eq!(json, r#"{"nic":[7]}"#);
         assert_eq!(serde_json::from_str::<DeviceSelection>(&json).unwrap(), sel);
+    }
+
+    #[test]
+    fn excluding_a_kind_keeps_every_other() {
+        let sel = DeviceSelection::new()
+            .with("gpu", vec![1])
+            .with("nic", vec![2]);
+        assert_eq!(
+            sel.excluding("gpu"),
+            DeviceSelection::new().with("nic", vec![2])
+        );
     }
 
     #[test]

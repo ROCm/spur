@@ -887,6 +887,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hooks_see_the_jobs_gpu_stable_ids() {
+        let ctx = HookContext {
+            gpu_devices: vec![0x0005_0000, 0x0006_0000],
+            ..test_ctx()
+        };
+        assert_eq!(
+            ctx.environment().get("SPUR_JOB_GPUS").map(String::as_str),
+            Some("327680,393216")
+        );
+    }
+
     #[tokio::test]
     #[serial(run_hooks)]
     async fn hook_success() {
