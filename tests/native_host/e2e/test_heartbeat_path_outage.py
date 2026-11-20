@@ -50,6 +50,12 @@ def _wait_out_grace(cluster):
         time.sleep(remaining)
 
 
+def _silenced_node(cluster, leader: int) -> int:
+    """Neither the leader nor nodes[0]: the test's CLI runs on nodes[0], and
+    blocking a node's outbound controller port would cut it off too."""
+    return max(i for i in range(1, len(cluster.nodes)) if i != leader)
+
+
 def _start_long_job(cluster, node_name: str, label: str) -> int:
     script = cluster.write_file(f"{label}.sh", f"#!/bin/bash\nsleep {JOB_SECS}\n")
     out = cluster.sbatch(["-J", label, "-N", "1", "-w", node_name, script])
@@ -106,9 +112,7 @@ class TestHeartbeatPathOutage:
         cluster = ha_cluster
         leader = _settled_leader(cluster)
         _wait_out_grace(cluster)
-        target = len(cluster.nodes) - 1
-        if target == leader:
-            target = (leader + 1) % len(cluster.nodes)
+        target = _silenced_node(cluster, leader)
         name = cluster.node_names[target]
         job_id = _start_long_job(cluster, name, "hb-path-survivor")
         log_start = len(cluster.spurctld_log(leader))
