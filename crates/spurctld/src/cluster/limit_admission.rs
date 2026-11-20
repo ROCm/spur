@@ -581,6 +581,7 @@ mod tests {
                 memory_per_node_mb: None,
                 memory_per_cpu_mb: None,
                 memory_per_gpu_mb: None,
+                cpus_per_gpu: None,
             }),
             ..start(job, nodes)
         }
