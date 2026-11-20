@@ -304,13 +304,13 @@ K8s E2E tests use the Python `kubernetes` client. `k8s_cluster.py` provides:
 | `k8s_suite` | session | Verifies kubeconfig, loads manifests, creates namespace. |
 | `cluster` | class | Single-node cluster via operator manifests. |
 | `ha_cluster` | class | Multi-replica Raft HA cluster. |
-| `_cleanup_between_tests` | per-test (auto) | Deletes test workloads, ensures controllers are ready. |
+| `_cleanup_between_tests` | per-test (auto) | Deletes test workloads, ensures controllers are ready. Job Pods are left to stop gracefully and only stragglers are force-deleted: a force-deleted Pod is never reported, so its node would be held, then drained. |
 
 ### 5.3. Test files
 
 | File | What it tests |
 |---|---|
-| `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node, `scancel` releasing every node). |
+| `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node, `scancel` releasing every node only after its Pod has stopped). |
 | `test_raft_ha.py` | Raft HA under K8s: leader election, pod restart recovery. |
 
 Constants: `SPUR_JOB_GROUP = "spur.amd.com"`, `SPUR_JOB_VERSION = "v1alpha1"`,

@@ -6,7 +6,9 @@ Deploy Spur on an existing Kubernetes cluster. The controller runs as a Stateful
 Prerequisites
 -------------
 
-- Kubernetes cluster with ``kubectl`` configured
+- Kubernetes 1.27 or newer, with ``kubectl`` configured. From 1.27 the kubelet
+  marks a deleted Pod ``Failed`` or ``Succeeded`` once its containers stop, which
+  is when the operator tells the controller that a cancelled job's node is free.
 
 Build and load container images:
 

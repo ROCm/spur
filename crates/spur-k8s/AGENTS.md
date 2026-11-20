@@ -71,6 +71,17 @@ Succeeded/Failed/OOMKilled/ImagePullBackOff, reports to spurctld via
 `ReportJobStatus`. OOM encoded via signal sentinel. Orphan Pod cleanup on
 startup.
 
+The watcher's report (`watch_pods`) is the only one that releases a Pod's node,
+deleted Pods included: spurctld frees a node the moment it reports, and a DELETE
+only starts the grace period, which the containers may run out. So neither
+`CancelJob` nor SpurJob deletion reports the Pods it deletes. Since Kubernetes
+1.27 the kubelet marks a gracefully deleted Pod Failed or Succeeded once its
+containers stop, and the watcher reports it then. Pods are pinned with
+`nodeName`, so a successor launched before that would meet kubelet admission
+while the old Pod still holds the node. A force-deleted Pod gets no terminal
+phase and is never reported, so a stopping job's node is quarantined after
+`complete_wait_secs`.
+
 ## Virtual agent (`agent.rs`)
 
 Implements `SlurmAgent` gRPC trait. Key RPCs:
@@ -85,11 +96,8 @@ Implements `SlurmAgent` gRPC trait. Key RPCs:
   volume mounts (hostPath and PVC), shared memory, security context. For
   multi-node jobs: creates a headless Service for peer DNS discovery
   (`<sanitized-node>.spur-job-<id>.<ns>.svc.cluster.local`).
-- `CancelJob` -- deletes the job's unfinished Pods (by label) and its headless
-  Service, reporting each deleted Pod to spurctld as released
-  (`report_pod_released`): a deleted Pod never reaches a terminal phase, and
-  spurctld drains a node that never reports. Finished Pods are left for the job
-  controller, whose report carries their real result.
+- `CancelJob` -- deletes all Pods by label + headless Service. The Pod watcher
+  reports each Pod once it has stopped (see the job controller above).
 - `ExecInJob` -- `kubectl exec` equivalent via kube-rs attach.
 - `StreamJobOutput` -- Pod log streaming.
 - Execution credential verification (Ed25519 JWKS) when native auth is
@@ -182,8 +190,8 @@ or native JWKS from spur.conf. Forged credentials are logged with peer address.
 canned responses (one default, plus optional routes by method and path) and
 records requests, yielding a `kube::Client` without a real cluster -- and
 `ControllerStub`, a spurctld on a loopback port that records the cancels and
-status reports it receives. Used by `resolve_job_tests` and `cancel_job_tests`
-in `agent.rs` and the deletion tests in `job_controller.rs`.
+status reports it receives. Used by `resolve_job_tests` in `agent.rs` and the
+deletion tests in `job_controller.rs`.
 
 Unit tests cover: backoff arithmetic, terminal state detection, CRD
 serialization, resource extraction, GPU vendor detection, name sanitization,

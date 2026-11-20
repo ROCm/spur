@@ -550,10 +550,12 @@ class ClusterFixture:
             if name:
                 self.delete_spurjob(name)
 
-        self._force_delete_pods("spur.amd.com/job-name")
+        # A force-deleted Pod is never reported, so the controller would hold its node
+        # for complete_wait_secs and then drain it. Only stragglers are forced.
         self._wait_pods_gone(
-            "spur.amd.com/job-name", timeout=30, raise_on_timeout=False
+            "spur.amd.com/job-name", timeout=60, raise_on_timeout=False
         )
+        self._force_delete_pods("spur.amd.com/job-name")
 
     def ensure_controllers_ready(self, timeout: int = 90) -> None:
         expected = self.config.replicas

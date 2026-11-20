@@ -100,6 +100,17 @@ class TestSpurJobLifecycle:
 
         # Unreported nodes are drained once complete_wait_secs (300 s) runs out.
         wait_spurjob_state(cluster, "it-scancel", "Cancelled", timeout=90)
+        # As PID 1, sleep ignores SIGTERM, so each Pod runs out its grace period.
+        # A node may be released only once its Pod has stopped.
+        pods = cluster.core_v1.list_namespaced_pod(
+            cluster.namespace, label_selector=f"spur.amd.com/job-id={job_id}"
+        ).items
+        unstopped = [
+            p.metadata.name
+            for p in pods
+            if p.status.phase not in ("Succeeded", "Failed")
+        ]
+        assert not unstopped, f"the job ended while these Pods still ran: {unstopped}"
         states = exec_in_pod(
             cluster.namespace,
             "spurctld-0",
