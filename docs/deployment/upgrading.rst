@@ -1318,10 +1318,9 @@ upgrade, which lacks their placement.
 **Upgrade agents before relying on a placement.** A node whose ``spurd`` predates
 this release places the script by the text scan. The scheduler keeps a job off such
 nodes when the scan would launch it differently, which only happens for a
-multi-node or ``--mpi=pmix`` job. A job that can also land on Kubernetes operator
-nodes counts as running on every node. Such a job waits until enough upgraded nodes
-are free, including any node it names with ``--nodelist``. Every other job still
-runs on any node.
+multi-node or ``--mpi=pmix`` job. Such a job waits until enough upgraded nodes are
+free, including any node it names with ``--nodelist``. Every other job still runs
+on any node.
 
 See Also
 --------

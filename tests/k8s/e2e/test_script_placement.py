@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for where a batch script runs (``--script-placement``) on Kubernetes nodes."""
+"""E2E tests that batch scripts stay off Kubernetes operator nodes while SpurJobs run on every node."""
 
 import dataclasses
 import re
@@ -17,8 +17,8 @@ from k8s_cluster import (
     wait_spurjob_state,
 )
 
-BATCH_HOST_K8S_UNSUPPORTED = (
-    "batch-host script placement is not supported on K8s virtual agents"
+BATCH_SCRIPT_K8S_UNSUPPORTED = (
+    "batch scripts cannot run on K8s virtual agents, which launch only SpurJobs"
 )
 
 
@@ -80,24 +80,18 @@ class TestScriptPlacementOnK8s:
         logs = _all_pod_logs(cluster, "it-placement")
         assert "done-rank=0" in logs and "done-rank=1" in logs, logs
 
-    def test_an_explicit_batch_host_job_pinned_to_k8s_nodes_is_refused(self, cluster):
+    def test_a_batch_job_pinned_to_a_k8s_node_is_refused(self, cluster):
         nodes = _node_names(cluster)
-        assert len(nodes) >= 2, f"needs two registered nodes, found {nodes}"
+        assert nodes, "needs a registered node"
 
-        out = _spur(
-            cluster,
-            "sbatch --script-placement=batch-host --nodes=2 "
-            f"--nodelist={nodes[0]},{nodes[1]} --wrap='echo hi'",
-        )
+        out = _spur(cluster, f"sbatch --nodelist={nodes[0]} --wrap='echo hi'")
 
-        assert BATCH_HOST_K8S_UNSUPPORTED in out, out
+        assert BATCH_SCRIPT_K8S_UNSUPPORTED in out, out
         assert "Submitted batch job" not in out, out
         assert not out.rstrip().endswith("exit=0"), out
 
-    def test_an_unpinned_batch_host_job_waits_and_says_why(self, cluster):
-        out = _spur(
-            cluster, "sbatch --script-placement=batch-host --nodes=2 --wrap='echo hi'"
-        )
+    def test_an_unpinned_batch_job_waits_and_says_why(self, cluster):
+        out = _spur(cluster, "sbatch --wrap='echo hi'")
         submitted = re.search(r"Submitted batch job (\d+)", out)
         assert submitted, out
         job_id = submitted.group(1)
@@ -107,7 +101,7 @@ class TestScriptPlacementOnK8s:
                 60,
                 2,
                 f"job {job_id} never reported why it cannot run on K8s nodes",
-                lambda: BATCH_HOST_K8S_UNSUPPORTED
+                lambda: BATCH_SCRIPT_K8S_UNSUPPORTED
                 in _spur(cluster, f"scontrol show job {job_id}"),
             )
         finally:

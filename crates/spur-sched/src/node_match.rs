@@ -131,11 +131,10 @@ impl<'a> NodePlacement<'a> {
         mut candidates: Vec<usize>,
         script_placement_default: ScriptPlacement,
     ) -> Option<Vec<usize>> {
-        let k8s_candidates = candidates.iter().any(|&i| nodes[i].is_kubernetes());
         if !self
             .job
             .spec
-            .needs_placement_aware_agents(script_placement_default, k8s_candidates)
+            .needs_placement_aware_agents(script_placement_default)
         {
             return Some(candidates);
         }
@@ -170,8 +169,8 @@ impl<'a> NodePlacement<'a> {
     }
 
     /// Load-independent placement identity (nodelist/exclude, partition,
-    /// features, reservation, native-only placement), ignoring node state and
-    /// free capacity.
+    /// features, reservation, native nodes for a batch job), ignoring node state
+    /// and free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
         self.eligible_on_any_agent(node, reservations, now)
             && !(node.is_kubernetes() && self.job.spec.needs_native_nodes())
@@ -684,45 +683,29 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_multi_node_batch_host_job_is_not_eligible_for_k8s_nodes() {
+    fn a_batch_job_is_not_eligible_for_k8s_nodes() {
         let mut k8s = node("k1");
         k8s.source = NodeSource::Kubernetes {
             namespace: "spur".into(),
         };
         let now = Utc::now();
 
-        let runner = batch_host_runner(2, None);
-        let p = NodePlacement::new(&runner);
+        let batch = job_with(JobSpec {
+            script: Some("#!/bin/bash\n./train\n".into()),
+            ..base_spec()
+        });
+        let p = NodePlacement::new(&batch);
         assert!(!p.eligible(&k8s, &[], now));
         assert!(p.eligible_on_any_agent(&k8s, &[], now));
         assert!(p.eligible(&node("n1"), &[], now));
 
-        let single = batch_host_runner(1, None);
-        assert!(NodePlacement::new(&single).eligible(&k8s, &[], now));
-    }
-
-    #[test]
-    fn a_k8s_candidate_can_put_a_driver_script_on_every_node() {
-        let mut k8s = node("k1");
-        k8s.source = NodeSource::Kubernetes {
-            namespace: "spur".into(),
-        };
-        let nodes = [k8s, node("n1"), placement_aware(node("n2"))];
-        let driver = job_with(JobSpec {
-            script: Some("#!/bin/bash\nsrun ./train\n".into()),
-            num_nodes: 2,
+        let spurjob = job_with(JobSpec {
+            argv: vec!["./train".into()],
             ..base_spec()
         });
-        let p = NodePlacement::new(&driver);
-
-        assert_eq!(
-            p.without_misplacing_agents(&nodes, vec![0, 1, 2], ScriptPlacement::Auto),
-            Some(vec![0, 2]),
-            "with k1 in the run every node runs the script, which n1 would not"
-        );
-        assert_eq!(
-            p.without_misplacing_agents(&nodes, vec![1, 2], ScriptPlacement::Auto),
-            Some(vec![1, 2])
+        assert!(
+            NodePlacement::new(&spurjob).eligible(&k8s, &[], now),
+            "a SpurJob carries no script, so the operator can launch it"
         );
     }
 }
