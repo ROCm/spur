@@ -2289,6 +2289,30 @@ fn rebind_unserved_socket(socket_path: &Path) -> io::Result<UnixListener> {
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
      Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
 
+/// `spurstepd` arguments after the executable, in the order `run_process` parses them.
+pub(crate) fn process_args(
+    state_dir: &Path,
+    job_id: u32,
+    run_attempt: u32,
+    launch_spec: PathBuf,
+) -> Vec<PathBuf> {
+    vec![
+        state_dir.to_path_buf(),
+        PathBuf::from(job_id.to_string()),
+        PathBuf::from(run_attempt.to_string()),
+        launch_spec,
+    ]
+}
+
+/// Job id of a running supervisor from its full argv, executable first.
+pub(crate) fn job_id_from_argv(argv: &[&[u8]]) -> Option<u32> {
+    std::str::from_utf8(argv.get(2)?)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
 pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{STEPD_USAGE}");
@@ -3943,6 +3967,23 @@ mod launch_spec_compat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_job_id_is_read_back_from_the_spawned_argv() {
+        let args = process_args(
+            Path::new("/var/spool/spur"),
+            42,
+            3,
+            "/run/launch.json".into(),
+        );
+        let argv: Vec<Vec<u8>> = std::iter::once(PathBuf::from("/usr/bin/spurstepd"))
+            .chain(args)
+            .map(|arg| arg.into_os_string().into_encoded_bytes())
+            .collect();
+        let argv: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+        assert_eq!(job_id_from_argv(&argv), Some(42));
+        assert_eq!(job_id_from_argv(&argv[..2]), None);
+    }
 
     // A nonexistent pid has no /proc entry, so stepd_liveness reports Stale
     // regardless of the stored ticks value — 0 is fine for that case.
@@ -6568,12 +6609,10 @@ mod tests {
         fs::write(&spec_path, serde_json::to_vec(&spec).expect("encode spec"))
             .expect("write launch spec");
 
-        let args = vec![
-            state_dir.path().display().to_string(),
-            job_id.to_string(),
-            run_attempt.to_string(),
-            spec_path.display().to_string(),
-        ];
+        let args: Vec<_> = process_args(state_dir.path(), job_id, run_attempt, spec_path)
+            .iter()
+            .map(|arg| arg.display().to_string())
+            .collect();
         let supervisor = tokio::spawn(async move { run_process(&args).await });
 
         // The supervisor binds its socket before it publishes, so this covers both.

@@ -16,6 +16,61 @@ pub mod codec;
 
 pub use proto::*;
 
+#[cfg(test)]
+mod compatibility_tests {
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyGetJobsRequest {
+        #[prost(uint32, repeated, tag = "5")]
+        job_ids: Vec<u32>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyGetJobsResponse {
+        #[prost(message, repeated, tag = "1")]
+        jobs: Vec<super::JobInfo>,
+    }
+
+    #[test]
+    fn get_jobs_authority_fields_stay_compatible_with_old_peers() {
+        let legacy_request = LegacyGetJobsRequest {
+            job_ids: vec![1, 2],
+        };
+        let request = super::GetJobsRequest::decode(legacy_request.encode_to_vec().as_slice())
+            .expect("new controller reads old query");
+        assert!(!request.require_authoritative);
+        let strict = super::GetJobsRequest {
+            require_authoritative: true,
+            ..request
+        };
+        let decoded = LegacyGetJobsRequest::decode(strict.encode_to_vec().as_slice())
+            .expect("old controller reads new query");
+        assert_eq!(decoded, legacy_request);
+
+        let legacy_response = LegacyGetJobsResponse {
+            jobs: vec![super::JobInfo {
+                job_id: 1,
+                state: super::JobState::JobCancelled as i32,
+                ..Default::default()
+            }],
+        };
+        let mut response =
+            super::GetJobsResponse::decode(legacy_response.encode_to_vec().as_slice())
+                .expect("new agent reads old response");
+        assert!(!response.authoritative);
+        assert!(!response.unrestricted_visibility);
+        assert_eq!(response.next_job_id, 0);
+        assert_eq!(response.jobs, legacy_response.jobs);
+        response.authoritative = true;
+        response.unrestricted_visibility = true;
+        response.next_job_id = 7;
+        let decoded = LegacyGetJobsResponse::decode(response.encode_to_vec().as_slice())
+            .expect("old agent reads new response");
+        assert_eq!(decoded, legacy_response);
+    }
+}
+
 /// Maximum size of a gRPC *response* (server encode / client decode), in bytes.
 /// Large `GetJobs`/`GetNodes` responses can exceed tonic's default 4 MiB on big
 /// clusters. The Raft-internal service uses a separate constant in `raft.rs`.

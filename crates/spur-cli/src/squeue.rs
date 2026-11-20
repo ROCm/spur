@@ -224,6 +224,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             nodes,
             qos: args.qos.unwrap_or_default(),
             reservation: args.reservation.unwrap_or_default(),
+            ..Default::default()
         })
         .await
         .context("failed to get jobs")?;

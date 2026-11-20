@@ -106,6 +106,7 @@ openraft messages; spur-proto does not interpret them.
 | `GpuCpus` | One GPU's reserved picks and nearby CPUs as CPU-list strings (empty = none/unknown); `NodeInfo.gpu_cpus` (tag 68). `NodeInfo.capabilities` (tag 69) echoes the agent's registration capabilities |
 | `StepResources` | A typed step's own CPU/memory/GPU ask on a node, carried on the `RunStep`/`RunCommand` request messages |
 | `GpuBlockedCpus` | Per GPU, reserved CPUs a non-holder still holds under `core_layout_fingerprint`; carried on the `Heartbeat` RPC's `layout_blocked_cpus` field (tag 11, empty = none blocked, also what an older agent sends) |
+| `GetJobs` request/response | `require_authoritative` asks for a quorum-confirmed leader read; the response's `authoritative`, `unrestricted_visibility` and `next_job_id` let spurd's startup spool cleanup treat a missing job as absent. All default to false/0, so older peers never establish authority |
 
 ## Capability negotiation
 

@@ -33,6 +33,8 @@ use crate::step_claims;
 use spur_core::native_peer::FORWARDED_HEADER;
 const LEADER_HEADER: &str = "x-spur-leader";
 const STEPD_RECOVERY_COHORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+// Below spurd's default controller RPC timeout so the forwarding error reaches it.
+const AUTHORITATIVE_JOB_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Where a request should run: locally on the leader, or forwarded to it.
 enum Route {
@@ -545,7 +547,7 @@ impl ControllerService {
             || request.metadata().get(FORWARDED_HEADER).is_some()
     }
 
-    /// Forward a write RPC to the leader, driving it over the leader channel with a
+    /// Forward an RPC requiring the leader, driving it over the leader channel with a
     /// [`PassthroughCodec`] so the bytes signed are the bytes sent.
     async fn forward_to_leader<Req, Resp>(
         &self,
@@ -976,9 +978,8 @@ impl ControllerService {
         }
     }
 
-    /// Reads never require the leader (every node applies the committed log),
-    /// so forwarding is only an optional freshness hop. Skipping already-
-    /// forwarded requests avoids forward loops between non-leaders.
+    /// Ordinary reads use forwarding only for best-effort freshness. Skipping
+    /// already-forwarded requests avoids loops between non-leaders.
     fn read_should_forward<T>(&self, request: &Request<T>) -> bool {
         read_forwarding_policy(
             self.raft.is_leader(),
@@ -1781,7 +1782,27 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        let forward = self.prepare_read(&request);
+        let authoritative = request.get_ref().require_authoritative;
+        if authoritative && !self.raft.is_leader() {
+            let response: Response<GetJobsResponse> = tokio::time::timeout(
+                AUTHORITATIVE_JOB_FORWARD_TIMEOUT,
+                self.forward_to_leader(request),
+            )
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("authoritative job query forwarding timed out")
+            })??;
+            if !response.get_ref().authoritative {
+                return Err(Status::unavailable(
+                    "leader did not establish authoritative job state",
+                ));
+            }
+            return Ok(response);
+        }
+        if authoritative && !self.raft.ensure_leader().await {
+            return Err(self.not_leader_status());
+        }
+        let forward = !authoritative && self.prepare_read(&request);
         let meta = request.metadata().clone();
         let path = rpc_path(&request);
         let __identity = Self::verified_identity(&request).cloned();
@@ -1797,9 +1818,21 @@ impl SlurmController for ControllerService {
         // user the caller may not see returns an empty list, matching Slurm's
         // `squeue -u other`.
         let scope = job_read_scope(&self.cluster, __identity.as_ref());
+        let unrestricted_visibility = matches!(scope, spur_core::rbac::ReadScope::All);
+        // Read before the scan: ids at or above it were never allocated, so none can have run.
+        let next_job_id = if authoritative {
+            self.cluster.peek_next_job_id()
+        } else {
+            0
+        };
         let requested_user = (!req.user.is_empty()).then_some(req.user.as_str());
         let Some(scoped_user) = scope.job_user_filter(requested_user) else {
-            return Ok(Response::new(GetJobsResponse { jobs: Vec::new() }));
+            return Ok(Response::new(GetJobsResponse {
+                jobs: Vec::new(),
+                unrestricted_visibility,
+                authoritative,
+                next_job_id,
+            }));
         };
 
         let states: Vec<spur_core::job::JobState> = req
@@ -1853,7 +1886,12 @@ impl SlurmController for ControllerService {
             proto_jobs.iter_mut().for_each(hide_actors);
         }
 
-        Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
+        Ok(Response::new(GetJobsResponse {
+            jobs: proto_jobs,
+            unrestricted_visibility,
+            authoritative,
+            next_job_id,
+        }))
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
@@ -7650,6 +7688,246 @@ mod tests {
         assert_eq!(jobs[0].job_id, 1);
     }
 
+    #[tokio::test]
+    async fn get_jobs_refuses_authority_for_stale_terminal_and_absent_replica_state() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobState;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::tempdir().expect("replica state directory");
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(test_slurm_config(), dir.path())
+                .expect("replica cluster"),
+        );
+        for operation in [
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(owned_job("alice", "/tmp")),
+            },
+            WalOperation::job_complete(1, 0, JobState::Cancelled),
+        ] {
+            cluster.apply_operation(&operation);
+        }
+        let service = no_leader_service(cluster, dir.path()).await;
+        for already_forwarded in [false, true] {
+            for job_id in [1, 2] {
+                let request = |require_authoritative| {
+                    let mut request = Request::new(GetJobsRequest {
+                        job_ids: vec![job_id],
+                        require_authoritative,
+                        ..Default::default()
+                    });
+                    if already_forwarded {
+                        request
+                            .metadata_mut()
+                            .insert(FORWARDED_HEADER, "true".parse().expect("forward marker"));
+                    }
+                    request
+                };
+                let stale = service
+                    .get_jobs(request(false))
+                    .await
+                    .expect("ordinary reads retain local availability")
+                    .into_inner();
+                assert!(!stale.authoritative);
+                assert!(stale.unrestricted_visibility);
+                if job_id == 1 {
+                    assert_eq!(stale.jobs.len(), 1);
+                    assert_eq!(stale.jobs[0].state, JobState::Cancelled.to_proto_i32());
+                } else {
+                    assert!(stale.jobs.is_empty());
+                }
+                let status = service
+                    .get_jobs(request(true))
+                    .await
+                    .expect_err("strict reads cannot use stale terminality or absence");
+                assert_eq!(status.code(), Code::Unavailable);
+            }
+        }
+        service.raft.raft.shutdown().await.expect("stop replica");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_authority_is_independent_of_caller_visibility() {
+        let dir = tempfile::tempdir().expect("leader state directory");
+        let service = test_service_with(&dir, jobs_private_config()).await;
+        let job_id = service
+            .cluster
+            .submit_job(owned_job("alice", "/tmp"))
+            .expect("submit through Raft")
+            .job_id;
+        service
+            .raft
+            .raft
+            .client_write(spur_core::wal::WalOperation::job_complete(
+                job_id,
+                0,
+                spur_core::job::JobState::Cancelled,
+            ))
+            .await
+            .expect("commit terminal state");
+        for (identity, user, visible, unrestricted) in [
+            (viewer("alice", false), "", true, false),
+            (viewer("bob", false), "", false, false),
+            (viewer("bob", false), "alice", false, false),
+            (viewer("carol", true), "", true, true),
+        ] {
+            let mut request = Request::new(GetJobsRequest {
+                job_ids: vec![job_id, job_id + 1],
+                user: user.into(),
+                require_authoritative: true,
+                ..Default::default()
+            });
+            request.extensions_mut().insert(identity);
+            let response = service
+                .get_jobs(request)
+                .await
+                .expect("fresh leader read")
+                .into_inner();
+            assert!(response.authoritative);
+            assert_eq!(response.next_job_id, job_id + 1);
+            assert_eq!(response.unrestricted_visibility, unrestricted);
+            assert_eq!(response.jobs.len(), usize::from(visible));
+            if visible {
+                assert_eq!(response.jobs[0].job_id, job_id);
+                assert_eq!(
+                    response.jobs[0].state,
+                    spur_proto::proto::JobState::JobCancelled as i32
+                );
+            }
+        }
+        let response = service
+            .get_jobs(Request::new(GetJobsRequest::default()))
+            .await
+            .expect("ordinary leader read")
+            .into_inner();
+        assert!(!response.authoritative);
+        assert_eq!(response.next_job_id, 0);
+        service.raft.raft.shutdown().await.expect("stop leader");
+        let status = service
+            .get_jobs(Request::new(GetJobsRequest {
+                require_authoritative: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("stopped leader cannot confirm freshness");
+        assert_eq!(status.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_jobs_authority_waits_for_committed_terminal_and_absent_state_to_catch_up() {
+        use crate::raft::{ClientResponse, StateMachineApply};
+        use spur_core::job::JobState;
+        use spur_core::wal::WalOperation;
+        use std::future::Future;
+        use std::task::Poll;
+
+        struct GatedCluster {
+            cluster: Arc<crate::cluster::ClusterManager>,
+            gate: Arc<crate::raft::test_support::ApplyGate>,
+        }
+
+        impl StateMachineApply for GatedCluster {
+            fn apply_operation(&self, operation: &WalOperation) -> ClientResponse {
+                self.gate.wait_open();
+                self.cluster.apply_operation(operation)
+            }
+
+            fn snapshot_state(&self) -> anyhow::Result<Vec<u8>> {
+                self.cluster.snapshot_state()
+            }
+
+            fn restore_from_snapshot(&self, data: &[u8]) -> anyhow::Result<()> {
+                self.cluster.restore_from_snapshot(data)
+            }
+        }
+
+        for stale_terminal in [false, true] {
+            let dir = tempfile::tempdir().expect("gated controller state directory");
+            let cluster = Arc::new(
+                crate::cluster::ClusterManager::new(step_test_config(), dir.path())
+                    .expect("gated cluster"),
+            );
+            let gate = Arc::new(crate::raft::test_support::ApplyGate::default());
+            let applier = Arc::new(GatedCluster {
+                cluster: cluster.clone(),
+                gate: gate.clone(),
+            });
+            let service = test_service_with_applier(&dir, cluster, applier).await;
+            let submission = || WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(owned_job("alice", "/tmp")),
+            };
+            if stale_terminal {
+                for operation in [
+                    submission(),
+                    WalOperation::job_complete(1, 0, JobState::Cancelled),
+                ] {
+                    service
+                        .raft
+                        .raft
+                        .client_write(operation)
+                        .await
+                        .expect("commit terminal fixture");
+                }
+            }
+            let operation = if stale_terminal {
+                WalOperation::JobUserRequeue {
+                    job_id: 1,
+                    hold: false,
+                    begin_time: None,
+                    by: None,
+                    at: None,
+                }
+            } else {
+                submission()
+            };
+            let closed = gate.close();
+            let raft = service.raft.raft.clone();
+            let write = tokio::spawn(async move { raft.client_write(operation).await });
+            gate.apply_held().await;
+            assert!(service.raft.is_leader());
+            let stale = service
+                .get_jobs(Request::new(GetJobsRequest {
+                    job_ids: vec![1],
+                    ..Default::default()
+                }))
+                .await
+                .expect("ordinary read while apply is held")
+                .into_inner();
+            assert!(!stale.authoritative);
+            assert_eq!(stale.jobs.len(), usize::from(stale_terminal));
+            if stale_terminal {
+                assert_eq!(stale.jobs[0].state, JobState::Cancelled.to_proto_i32());
+            }
+            let mut strict = std::pin::pin!(service.get_jobs(Request::new(GetJobsRequest {
+                job_ids: vec![1],
+                require_authoritative: true,
+                ..Default::default()
+            })));
+            std::future::poll_fn(|context| {
+                assert!(matches!(strict.as_mut().poll(context), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            drop(closed);
+            write
+                .await
+                .expect("held write task")
+                .expect("apply committed update");
+            let fresh = strict.await.expect("caught-up strict read").into_inner();
+            assert!(fresh.authoritative);
+            assert_eq!(fresh.jobs.len(), 1);
+            assert_eq!(fresh.jobs[0].state, JobState::Pending.to_proto_i32());
+            service
+                .raft
+                .raft
+                .shutdown()
+                .await
+                .expect("stop gated leader");
+        }
+    }
+
     /// `scontrol show job` and `squeue` both read through `get_jobs`. Under
     /// `private_data = ["jobs"]`, spoofing the wire `user` field, and naming the
     /// job id outright, must both come back empty.
@@ -7700,7 +7978,9 @@ mod tests {
         ] {
             let mut req = Request::new(req_fields);
             req.extensions_mut().insert(viewer("bob", false));
-            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            let response = service.get_jobs(req).await.unwrap().into_inner();
+            assert!(!response.unrestricted_visibility);
+            let jobs = response.jobs;
             assert!(
                 jobs.is_empty(),
                 "{label} let bob read alice's job: {jobs:?}"
@@ -7713,7 +7993,9 @@ mod tests {
                 ..Default::default()
             });
             req.extensions_mut().insert(viewer("carol", true));
-            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            let response = service.get_jobs(req).await.unwrap().into_inner();
+            assert!(response.unrestricted_visibility);
+            let jobs = response.jobs;
             assert_eq!(
                 jobs.iter().map(|j| j.job_id).collect::<Vec<_>>(),
                 vec![1],
@@ -7801,7 +8083,9 @@ mod tests {
 
         let mut bare = Request::new(GetJobsRequest::default());
         bare.extensions_mut().insert(viewer("bob", false));
-        let jobs = service.get_jobs(bare).await.unwrap().into_inner().jobs;
+        let response = service.get_jobs(bare).await.unwrap().into_inner();
+        assert!(response.unrestricted_visibility);
+        let jobs = response.jobs;
         assert_eq!(jobs.len(), 1, "a bare query lists every user's jobs");
         assert_eq!(jobs[0].user, "alice");
 
@@ -7810,9 +8094,47 @@ mod tests {
             ..Default::default()
         });
         by_user.extensions_mut().insert(viewer("bob", false));
-        let jobs = service.get_jobs(by_user).await.unwrap().into_inner().jobs;
+        let response = service.get_jobs(by_user).await.unwrap().into_inner();
+        assert!(response.unrestricted_visibility);
+        let jobs = response.jobs;
         assert_eq!(jobs.len(), 1, "bob may filter to alice's jobs");
         assert_eq!(jobs[0].user, "alice");
+    }
+
+    #[tokio::test]
+    async fn get_jobs_unrestricted_visibility_does_not_override_request_filters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let service = no_leader_service(cluster, dir.path()).await;
+        <crate::cluster::ClusterManager as crate::raft::StateMachineApply>::apply_operation(
+            service.cluster.as_ref(),
+            &spur_core::wal::WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(owned_job("alice", "/tmp")),
+            },
+        );
+        let mut request = Request::new(GetJobsRequest {
+            job_ids: vec![1],
+            user: "alice".into(),
+            states: vec![spur_proto::proto::JobState::JobCompleted as i32],
+            ..Default::default()
+        });
+        request.extensions_mut().insert(viewer("bob", false));
+        let response = service.get_jobs(request).await.unwrap().into_inner();
+        assert!(response.unrestricted_visibility);
+        assert!(response.jobs.is_empty());
+        let response = service
+            .get_jobs(Request::new(GetJobsRequest {
+                job_ids: vec![1],
+                user: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.unrestricted_visibility);
+        assert_eq!(response.jobs.len(), 1);
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
@@ -9201,7 +9523,15 @@ mod tests {
         let cluster = std::sync::Arc::new(
             ClusterManager::new_with_config_path(config, dir.path(), config_path).unwrap(),
         );
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+        test_service_with_applier(dir, cluster.clone(), cluster).await
+    }
+
+    async fn test_service_with_applier(
+        dir: &tempfile::TempDir,
+        cluster: Arc<crate::cluster::ClusterManager>,
+        applier: Arc<dyn crate::raft::StateMachineApply>,
+    ) -> ControllerService {
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), applier)
             .await
             .unwrap();
         handle
@@ -9709,7 +10039,7 @@ mod tests {
             &self,
             _request: Request<GetJobsRequest>,
         ) -> Result<Response<GetJobsResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            Ok(Response::new(GetJobsResponse::default()))
         }
         async fn get_job(
             &self,
@@ -10127,6 +10457,29 @@ mod tests {
         svc.leader_proxy = LeaderProxy::new(follower_raft.clone(), client_addrs);
         svc.raft = follower_raft;
         svc
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follower_refuses_authority_when_the_leader_reply_lacks_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub_addr = spawn_probe_controller_server(Vec::new()).await;
+        let svc = follower_service_with_leader_addr(&dir, stub_addr).await;
+        let mut request = Request::new(GetJobsRequest {
+            job_ids: vec![1],
+            require_authoritative: true,
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/GetJobs".into(),
+            ));
+        let status = svc.get_jobs(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+        assert!(
+            status.message().contains("did not establish authoritative"),
+            "{status}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
