@@ -4,8 +4,7 @@
 use super::*;
 use crate::spool_fs::TRASH_NAME;
 use crate::startup_spool::{
-    delete_pending_rootfs, delete_trashed, move_pending_aside, ActivityPaths, CleanupSummary,
-    RootfsTally, STARTUP_CLEANUP_BUDGET,
+    delete_pending_rootfs, ActivityPaths, CleanupSummary, STARTUP_CLEANUP_BUDGET,
 };
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -152,7 +151,7 @@ impl SpoolFixture {
     async fn run_and_drain(&self) -> CleanupSummary {
         let mut summary = self.run().await;
         let pending = std::mem::take(&mut summary.pending_rootfs);
-        delete_pending_rootfs(self.agent.spool_ownership(), pending, no_stop()).await;
+        delete_pending_rootfs(pending, no_stop()).await;
         summary
     }
 
@@ -938,33 +937,26 @@ async fn startup_removes_confirmed_orphan_container_rootfs_in_the_background() {
     let named = fixture.rootfs("my-image");
     let noncanonical = fixture.rootfs("job_01");
     let summary = fixture.run().await;
-    let mut queued: Vec<_> = summary
-        .pending_rootfs
-        .iter()
-        .map(|p| p.path().to_owned())
-        .collect();
-    queued.sort();
-    assert_eq!(
-        queued,
-        [
-            fs::canonicalize(&job).unwrap(),
-            fs::canonicalize(&step).unwrap()
-        ]
-    );
+    assert_eq!(summary.pending_rootfs.len(), 2);
     assert!(
-        job.join("usr/lib/python3/site.py").is_file(),
-        "deletion waits for the background task"
+        !job.exists() && !step.exists(),
+        "the startup pass moves them aside"
     );
+    let mut trashed: Vec<_> = fs::read_dir(fixture.containers().join(TRASH_NAME))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    trashed.sort();
+    assert!(trashed[0].starts_with("job_1.") && trashed[1].starts_with("step_2_3."));
     let queries = controller.state.spool_queries.lock().unwrap().clone();
     assert_eq!(queries[0].job_ids, [1, 2, 4]);
-    delete_pending_rootfs(
-        fixture.agent.spool_ownership(),
-        summary.pending_rootfs,
-        no_stop(),
-    )
-    .await;
-    assert!(!job.exists());
-    assert!(!step.exists());
+    delete_pending_rootfs(summary.pending_rootfs, no_stop()).await;
+    assert_eq!(
+        fs::read_dir(fixture.containers().join(TRASH_NAME))
+            .unwrap()
+            .count(),
+        0
+    );
     assert!(running.is_dir());
     assert!(named.is_dir());
     assert!(noncanonical.is_dir());
@@ -1135,18 +1127,13 @@ async fn background_rootfs_deletion_stops_for_shutdown() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = SpoolFixture::new(&controller, &[]);
-    let rootfs = fixture.rootfs("job_1");
+    fixture.rootfs("job_1");
     let summary = fixture.run().await;
-    assert_eq!(summary.pending_rootfs.len(), 1);
+    let trashed = summary.pending_rootfs[0].path().to_owned();
     let stop = no_stop();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    delete_pending_rootfs(
-        fixture.agent.spool_ownership(),
-        summary.pending_rootfs,
-        stop,
-    )
-    .await;
-    assert!(rootfs.join("usr/lib/python3/site.py").is_file());
+    delete_pending_rootfs(summary.pending_rootfs, stop).await;
+    assert!(trashed.join("usr/lib/python3/site.py").is_file());
 }
 
 #[tokio::test]
@@ -1157,49 +1144,31 @@ async fn dropping_the_cleanup_handle_stops_the_running_task() {
     fixture.rootfs("job_1");
     fixture.rootfs("job_2");
     let summary = fixture.run().await;
-    let held = fixture.agent.lifecycle.acquire(2).await;
     let mut handle = RootfsCleanup {
-        owners: fixture.agent.spool_ownership(),
         pending: summary.pending_rootfs,
     }
     .spawn();
-    while fixture.containers().join("job_1").exists() {
-        tokio::task::yield_now().await;
-    }
-    // The task now waits for job 2's lock; dropping the handle must stop what is left.
+    // Dropped before the task first runs, so it must delete nothing.
     let task = std::mem::replace(&mut handle.task, tokio::spawn(async {}));
     drop(handle);
-    drop(held);
     task.await.unwrap();
     let trash = fixture.containers().join(TRASH_NAME);
-    assert_eq!(
-        fs::read_dir(&trash).unwrap().count(),
-        2,
-        "moved, then left by the stop"
-    );
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 2);
     fixture.run_and_drain().await;
     assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
 }
 
 #[tokio::test]
-async fn background_deletion_frees_the_job_path_before_deleting_the_tree() {
+async fn a_relaunch_after_startup_never_sees_the_old_rootfs() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = SpoolFixture::new(&controller, &[]);
     let rootfs = fixture.rootfs("job_1");
     let summary = fixture.run().await;
-    let owners = fixture.agent.spool_ownership();
-    let (stop, mut tally) = (no_stop(), RootfsTally::default());
-    let trashed = move_pending_aside(&owners, summary.pending_rootfs, &stop, &mut tally).await;
-    assert!(trashed.len() == 1 && trashed[0].is_trashed());
     assert!(!rootfs.exists());
-    // A relaunch takes the lock and rebuilds its rootfs while the old tree waits in the trash.
-    let relaunch = owners.guard(1).await;
     fs::create_dir(&rootfs).unwrap();
     fs::write(rootfs.join("new"), "relaunch").unwrap();
-    delete_trashed(trashed, &stop, &mut tally).await;
-    drop(relaunch);
-    assert_eq!(tally.deleted, 1);
+    delete_pending_rootfs(summary.pending_rootfs, no_stop()).await;
     assert_eq!(fs::read_to_string(rootfs.join("new")).unwrap(), "relaunch");
     let trash = fixture.containers().join(TRASH_NAME);
     assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
@@ -1229,25 +1198,38 @@ async fn trash_left_by_an_interrupted_run_is_deleted_without_the_controller() {
 }
 
 #[tokio::test]
-async fn an_unsafe_trash_is_never_used_and_orphans_are_deleted_in_place() {
+async fn an_unsafe_trash_is_never_used_and_its_rootfs_is_kept() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
-    for unsafe_trash in ["symlink", "group-writable"] {
+    for (unsafe_trash, mode) in [
+        ("symlink", 0),
+        ("group-writable", 0o770),
+        ("readable", 0o755),
+    ] {
         let fixture = SpoolFixture::new(&controller, &[]);
         let outside = fixture.directory.path().join("outside");
         fs::create_dir_all(outside.join("job_9.1.0")).unwrap();
         fs::write(outside.join("job_9.1.0/sentinel"), "keep").unwrap();
         let trash = fixture.containers().join(TRASH_NAME);
         fs::create_dir_all(fixture.containers()).unwrap();
-        if unsafe_trash == "symlink" {
+        if mode == 0 {
             symlink(&outside, &trash).unwrap();
         } else {
             fs::rename(&outside, &trash).unwrap();
-            fs::set_permissions(&trash, fs::Permissions::from_mode(0o770)).unwrap();
+            fs::set_permissions(&trash, fs::Permissions::from_mode(mode)).unwrap();
         }
         let rootfs = fixture.rootfs("job_1");
-        fixture.run_and_drain().await;
-        assert!(!rootfs.exists(), "{unsafe_trash}");
+        let summary = fixture.run_and_drain().await;
+        assert_eq!(summary.retained, 1, "{unsafe_trash}");
+        assert!(
+            rootfs.join("usr/lib/python3/site.py").is_file(),
+            "{unsafe_trash}"
+        );
+        let names: Vec<_> = fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["job_9.1.0"], "{unsafe_trash}");
         assert_eq!(
             fs::read_to_string(trash.join("job_9.1.0/sentinel")).unwrap(),
             "keep",
@@ -1257,32 +1239,19 @@ async fn an_unsafe_trash_is_never_used_and_orphans_are_deleted_in_place() {
 }
 
 #[tokio::test]
-async fn background_rootfs_deletion_rechecks_ownership_and_identity() {
+async fn a_trash_entry_replaced_before_deletion_is_kept() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);
     let fixture = SpoolFixture::new(&controller, &[]);
-    let relaunched = fixture.rootfs("job_1");
-    let replaced = fixture.rootfs("job_2");
+    fixture.rootfs("job_1");
     let summary = fixture.run().await;
-    assert_eq!(summary.pending_rootfs.len(), 2);
-    fixture
-        .agent
-        .running
-        .lock()
-        .await
-        .insert(1, TrackedJob::allocation_only(None));
+    let trashed = summary.pending_rootfs[0].path().to_owned();
     let saved = fixture.directory.path().join("saved-rootfs");
-    fs::rename(&replaced, &saved).unwrap();
-    fs::create_dir(&replaced).unwrap();
-    fs::write(replaced.join("new-generation"), "fresh").unwrap();
-    delete_pending_rootfs(
-        fixture.agent.spool_ownership(),
-        summary.pending_rootfs,
-        no_stop(),
-    )
-    .await;
-    assert!(relaunched.join("usr/lib/python3/site.py").is_file());
-    assert!(replaced.join("new-generation").is_file());
+    fs::rename(&trashed, &saved).unwrap();
+    fs::create_dir(&trashed).unwrap();
+    fs::write(trashed.join("other"), "not ours").unwrap();
+    delete_pending_rootfs(summary.pending_rootfs, no_stop()).await;
+    assert!(trashed.join("other").is_file());
     assert!(saved.join("usr/lib/python3/site.py").is_file());
 }
 
@@ -1343,12 +1312,7 @@ async fn orphan_rootfs_mounts_are_unmounted_before_deletion_and_kept_if_one_stay
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(!mounts.contains(layers[0].to_str().unwrap()));
     assert!(mounts.contains(layers[1].join("upper").to_str().unwrap()));
-    delete_pending_rootfs(
-        fixture.agent.spool_ownership(),
-        summary.pending_rootfs,
-        no_stop(),
-    )
-    .await;
+    delete_pending_rootfs(summary.pending_rootfs, no_stop()).await;
     assert!(!layers[0].exists());
     assert!(
         !mounted_base.exists(),

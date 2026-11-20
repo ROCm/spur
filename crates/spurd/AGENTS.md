@@ -558,7 +558,7 @@ Inspired by Enroot.
   startup orphan pass, which unmounts layers first (no lazy detach), keeps a
   rootfs held as a process root or bound from the container dir's filesystem
   (per-namespace mountinfo), and moves it into `spur:trash` under the job lock
-  before deleting it unlocked.
+  during the pass; the trash is emptied unlocked after the agent serves.
 
 ---
 

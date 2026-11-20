@@ -502,6 +502,12 @@ impl SpoolRoot {
         let name = OsStr::new(TRASH_NAME);
         let directory = open_child(&self.directory, name, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
         verify_root(&directory)?;
+        if directory.metadata()?.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "container trash must be accessible only by its owner",
+            ));
+        }
         Ok(SpoolRoot {
             path: self.path.join(name),
             real_path: self.real_path.join(name),
@@ -513,10 +519,14 @@ impl SpoolRoot {
     pub(crate) fn move_to(&self, spool: &JobSpool, trash: &SpoolRoot) -> io::Result<JobSpool> {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         require_identity(&self.directory, &spool.name, &spool.metadata)?;
+        // The wall clock keeps names unique across restarts that reuse a pid.
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let mut name = spool.name.clone();
         name.push(format!(
-            ".{}.{}",
-            std::process::id(),
+            ".{started}.{}",
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         renameat2(
@@ -526,7 +536,16 @@ impl SpoolRoot {
             name.as_os_str(),
             RenameFlags::RENAME_NOREPLACE,
         )?;
-        require_identity(&trash.directory, &name, &spool.metadata)?;
+        if require_identity(&trash.directory, &name, &spool.metadata).is_err() {
+            let _ = renameat2(
+                &trash.directory,
+                name.as_os_str(),
+                &self.directory,
+                spool.name.as_os_str(),
+                RenameFlags::RENAME_NOREPLACE,
+            );
+            return Err(io::Error::other(Kept(CHANGED)));
+        }
         Ok(JobSpool {
             name,
             ..spool.clone()
@@ -547,12 +566,14 @@ impl SpoolRoot {
                 .and_then(|name| name.split_once('.'))
                 .and_then(|(original, _)| canonical_rootfs_job_id(OsStr::new(original)))
                 .unwrap_or(0);
-            let directory = match open_child(
+            let opened = open_child(
                 &trash.directory,
                 &name,
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY,
-            ) {
-                Ok(directory) => directory,
+            )
+            .and_then(|directory| directory.metadata());
+            let metadata = match opened {
+                Ok(metadata) => metadata,
                 Err(error) => {
                     tracing::warn!(root = %trash.path.display(), entry = ?name, %error,
                             "skipped unexpected container trash entry");
@@ -562,7 +583,7 @@ impl SpoolRoot {
             leftovers.push(JobSpool {
                 job_id,
                 kind: SpoolKind::Rootfs,
-                metadata: directory.metadata()?,
+                metadata,
                 roots: Vec::new(),
                 name,
             });

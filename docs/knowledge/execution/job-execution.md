@@ -481,14 +481,16 @@ device, `root` field under the rootfs path) keeps it. Mounts at or beneath the
 base are unmounted deepest-first without `MNT_DETACH`, for up to four rounds;
 any that remain keep it. The entry is then reopened: its identity may change
 only when a mount on the entry itself was removed, and the uncovered directory
-is checked against held inodes. Confirmed rootfs dirs are handled after the
-agent serves, one at a time: under its job's lifecycle lock, with a fresh
-local-ownership and identity check, the entry is renamed (`RENAME_NOREPLACE`)
-into `spur:trash` in the container dir (owner-only, opened beneath the root,
-same checks as a spool root); the tree is then deleted without the lock, with
-no time budget and a stop flag set when the agent exits by any path. If the
-rename fails it is deleted in place under the lock. Trash left by an
-interrupted run is deleted at the next start without asking the controller.
+is checked against held inodes. Still in the startup worker, under the job's
+lifecycle lock, the entry is renamed (`RENAME_NOREPLACE`, a wall-clock suffix)
+into `spur:trash` in the container dir (opened beneath the root, owner-only:
+spool-root checks plus no group/other access), so a relaunch never finds the
+old tree at its path; a rename that fails, or whose moved entry no longer
+matches, keeps it in place for the next start. The trash is emptied after the
+agent serves, one entry at a time, without the lock, with no time budget and a
+stop flag set when the agent exits by any path. Entries left by an
+interrupted run are found by discovery and deleted without asking the
+controller.
 Binds are matched only on the container dir's filesystem, so a bind of an
 overlay layer's subtree is not detected.
 

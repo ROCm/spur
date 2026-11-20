@@ -163,8 +163,8 @@ The two daemons are configured with command-line flags. The most common are belo
    in use. ``[devices]`` inventory is also re-discovered periodically after
    startup; see :doc:`../admin-guide/configuration`.
 
-Orphan job spool cleanup
-^^^^^^^^^^^^^^^^^^^^^^^^
+Orphan job spool and container rootfs cleanup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Each job keeps its script and step output in ``/var/spool/spur/job<id>``. A
 ``spurd`` not running as root falls back to ``/tmp/spur/job<id>``
@@ -184,7 +184,7 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   writable by group or others; otherwise ``skipped unsafe or unreadable spool
   root`` is logged and it is left alone.
 * The pass is skipped when ``[cgroup] enabled = false``; on a cgroup v1 host it
-  runs but removes nothing. It stops after 60 seconds, keeping whatever it has
+  runs but removes nothing except leftover container trash. It stops after 60 seconds, keeping whatever it has
   not decided, and the next start continues. Heartbeats run during the pass, so
   a launch sent to the node in that window is refused and retried later,
   possibly on the same node, and new steps of jobs already running there fail
@@ -217,10 +217,10 @@ owned by the ``spurd`` user and not writable by group or others.
 * Only unnamed rootfs directories are considered: ``job_<id>`` for a job and
   ``step_<id>_<step>`` for a step. A named container (``--container-name``)
   whose name is exactly one of those forms is treated as that job's rootfs;
-  other names are never touched.
+  other names outside ``spur:trash`` (below) are never touched.
 * The controller confirmation and the job checks above apply. As with spools,
-  a process whose working directory, root or open file is inside the rootfs
-  keeps it; a process in another mount namespace (such as the container
+  a process whose working directory or open file is under the rootfs path, or
+  whose root directory is the rootfs, keeps it; a process in another mount namespace (such as the container
   itself) is checked against its own mount table, and a bind mount of the
   rootfs directory or anything under it on the same filesystem, in the agent's
   or a running process's mount namespace, keeps it. A mount table that cannot be
@@ -230,22 +230,27 @@ owned by the ``spurd`` user and not writable by group or others.
   lazy detach. If one stays mounted the directory is kept and ``kept container
   rootfs: a mount beneath it could not be unmounted`` is logged; the next start
   tries again.
-* Deletion runs in the background after ``spurd`` starts serving, one directory
-  at a time, with no time limit, so a large image does not delay startup. Each
-  directory is first moved, under its job's lock, into ``spur:trash`` inside the
-  container directory (owner-only), so a relaunch of the same job id does not
-  wait for the deletion. If the move fails the directory is deleted in place
-  and a relaunch waits for it. Until it is emptied the trash holds the disk
-  space. Stopping ``spurd`` halts the deletion and the next start finishes it.
+* The pass then moves the directory, still under its job's lock, into
+  ``spur:trash`` inside the container directory, so its job's path is free
+  before the agent accepts work. The trash must be owned by the ``spurd`` user
+  and accessible only to it; ``spurd`` creates it that way. If the move fails
+  the directory is kept for the next start.
+* The trash is emptied in the background after ``spurd`` starts serving, one
+  directory at a time, with no time limit, so a large image does not delay
+  startup; until then it holds the disk space. Stopping ``spurd`` halts the
+  deletion. The next start deletes whatever is left in the trash without asking
+  the controller, as long as the pass runs (cgroups enabled and the container
+  directory readable).
 
 Container rootfs decisions are logged as ``retained container rootfs:
-<reason>``, ``retained locally owned container rootfs``, ``queued orphan
-container rootfs for background deletion``, ``could not move container rootfs
-aside; deleting it in place``, ``deleting orphan container rootfs``, ``deleted
-orphan container rootfs``, ``kept container rootfs: <reason>`` or ``failed to
-delete orphan container rootfs; will reconsider on next startup``; a finished
-background run logs ``background container rootfs cleanup finished
-deleted=<n> kept=<n> failed=<n>``.
+<reason>``, ``retained locally owned container rootfs``, ``kept container
+rootfs: <reason>``, ``queued orphan container rootfs for background
+deletion``, ``deleting orphan container rootfs``, ``deleted orphan container
+rootfs`` or ``failed to delete orphan container rootfs; the next start
+retries``. A trash that is unsafe logs ``skipped unsafe or unreadable container
+trash`` and an entry in it that cannot be opened logs ``skipped unexpected
+container trash entry``. A finished background run logs ``background container
+rootfs cleanup finished deleted=<n> kept=<n> failed=<n>``.
 
 Directories kept because the controller did not confirm them or the activity
 inventory was uncertain are logged with a count per batch of 128 job ids
@@ -254,7 +259,9 @@ log ``retained remaining directories`` with the reason. Each path is logged at
 debug level. Directories still in use log ``retained locally owned job spool``
 or ``retained job spool: runtime session, cgroup or process still holds it``;
 removals log ``deleted orphan job spool``. The pass ends with ``startup job
-spool cleanup finished deleted=<n> retained=<n> errors=<n> queued_rootfs=<n>``.
+spool cleanup finished deleted=<n> retained=<n> errors=<n> queued_rootfs=<n>``,
+where ``queued_rootfs`` counts trash entries left for the background run,
+including those from an earlier start.
 
 Quick Start: Two-Node Cluster
 -----------------------------

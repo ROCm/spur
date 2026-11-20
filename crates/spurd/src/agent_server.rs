@@ -4525,7 +4525,6 @@ async fn run_containerized_step(
 
 /// Background deletion of orphan container rootfs dirs, started after the agent serves.
 pub struct RootfsCleanup {
-    owners: SpoolOwnership,
     pending: Vec<crate::startup_spool::PendingRootfs>,
 }
 
@@ -4534,7 +4533,6 @@ impl RootfsCleanup {
     pub fn spawn(self) -> RootfsCleanupHandle {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = tokio::spawn(crate::startup_spool::delete_pending_rootfs(
-            self.owners,
             self.pending,
             stop.clone(),
         ));
@@ -5167,7 +5165,6 @@ impl AgentService {
             })
             .await;
         RootfsCleanup {
-            owners: self.spool_ownership(),
             pending: summary.pending_rootfs,
         }
     }
