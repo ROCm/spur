@@ -215,7 +215,7 @@ fn retain_remaining(
     summary.retained += count;
 }
 
-/// Ids in `batch` the controller reports terminal, or with full visibility has issued and no longer keeps.
+/// Ids in `batch` the controller reports terminal, or with full visibility no longer keeps below its next id.
 pub(crate) fn controller_confirmed(response: &GetJobsResponse, batch: &[u32]) -> HashSet<u32> {
     if !response.authoritative {
         return HashSet::new();

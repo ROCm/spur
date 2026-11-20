@@ -1819,7 +1819,7 @@ impl SlurmController for ControllerService {
         // `squeue -u other`.
         let scope = job_read_scope(&self.cluster, __identity.as_ref());
         let unrestricted_visibility = matches!(scope, spur_core::rbac::ReadScope::All);
-        // Read before the job scan so every id below it was issued before the scan began.
+        // Read before the scan: ids at or above it were never allocated, so none can have run.
         let next_job_id = if authoritative {
             self.cluster.peek_next_job_id()
         } else {
@@ -10039,7 +10039,7 @@ mod tests {
             &self,
             _request: Request<GetJobsRequest>,
         ) -> Result<Response<GetJobsResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            Ok(Response::new(GetJobsResponse::default()))
         }
         async fn get_job(
             &self,
@@ -10457,6 +10457,25 @@ mod tests {
         svc.leader_proxy = LeaderProxy::new(follower_raft.clone(), client_addrs);
         svc.raft = follower_raft;
         svc
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follower_refuses_authority_when_the_leader_reply_lacks_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub_addr = spawn_probe_controller_server(Vec::new()).await;
+        let svc = follower_service_with_leader_addr(&dir, stub_addr).await;
+        let mut request = Request::new(GetJobsRequest {
+            job_ids: vec![1],
+            require_authoritative: true,
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/GetJobs".into(),
+            ));
+        let status = svc.get_jobs(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

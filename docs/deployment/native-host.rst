@@ -184,14 +184,17 @@ before it accepts work:
 * A spool root is scanned only if it is owned by the ``spurd`` user and not
   writable by group or others; otherwise ``skipped unsafe or unreadable spool
   root`` is logged and it is left alone.
-* The pass is skipped when ``[cgroup] enabled = false`` (it needs cgroup v2),
-  and it stops after 60 seconds, keeping whatever it has not decided. The next
-  start continues. Heartbeats run during the pass, so a launch sent to the node
-  in that window is refused and placed elsewhere.
+* The pass is skipped when ``[cgroup] enabled = false``; on a cgroup v1 host it
+  runs but removes nothing. It stops after 60 seconds, keeping whatever it has
+  not decided, and the next start continues. Heartbeats run during the pass, so
+  a launch sent to the node in that window is refused and retried later,
+  possibly on the same node, and new steps of jobs already running there fail
+  until the pass ends.
 * ``spurd`` reads every process's environment, working directory and open
   files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
-  fail and nothing is removed; the agent logs ``retained job spools: activity
-  inventory uncertain`` with the number of directories kept.
+  fail and nothing in the affected batch is removed; the agent logs
+  ``retained job spools: activity inventory uncertain`` with the number of
+  directories kept.
 * Symlinks in the spool path (for example ``/var/spool`` on another disk) are
   followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
   mount point, or a tree deeper than 256 levels is logged with ``kept job
@@ -206,12 +209,14 @@ before it accepts work:
   agent from another cluster on the same host could remove the first agent's
   leftover directories.
 
-Directories kept because the controller did not confirm them, the activity
-inventory was uncertain or the time ran out are logged once per reason with a
-count (each path at debug level). Directories still in use log ``retained job
-spool: <reason>``; removals log ``deleted orphan job spool``. The pass ends
-with ``startup job spool cleanup finished deleted=<n> retained=<n>
-errors=<n>``.
+Directories kept because the controller did not confirm them or the activity
+inventory was uncertain are logged with a count per batch of 128 job ids
+(``retained job spools: <reason>``); directories left when the time runs out
+log ``retained remaining job spools`` with the reason. Each path is logged at
+debug level. Directories still in use log ``retained locally owned job spool``
+or ``retained job spool: runtime session, cgroup or process still holds it``;
+removals log ``deleted orphan job spool``. The pass ends with ``startup job
+spool cleanup finished deleted=<n> retained=<n> errors=<n>``.
 
 Quick Start: Two-Node Cluster
 -----------------------------

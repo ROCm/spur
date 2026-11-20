@@ -1295,7 +1295,7 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
-/// A large spool can take up to a minute to remove, so this stays off the async workers.
+/// Removal can take long (the rootfs has no time bound), so it stays off the async workers.
 async fn remove_job_files(
     job_id: u32,
     rootfs_mode: crate::container::RootfsMode,
@@ -1457,7 +1457,7 @@ async fn wait_for_exit_and_teardown(
     running: &RunningJobs,
     lifecycle: &crate::job_lifecycle::JobLifecycle,
     allocation: &Arc<Mutex<NodeAllocation>>,
-    mpi_host: &MpiPluginHost,
+    mpi_host: &Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     spank: Arc<Option<SpankHost>>,
     controller_addr: String,
@@ -1511,8 +1511,14 @@ async fn wait_for_exit_and_teardown(
             }
         };
         if let Some(c) = completed {
-            teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
+            // The job has left `running`: a dropped cancel RPC must not cut teardown short
+            // or lose the report, so both run in a task of their own.
+            let (torn_down, done) = tokio::sync::oneshot::channel();
+            let (running, lifecycle) = (running.clone(), lifecycle.clone());
+            let (allocation, mpi_host) = (allocation.clone(), mpi_host.clone());
             tokio::spawn(async move {
+                teardown_completed_job(&c, &lifecycle, &running, &allocation, &mpi_host).await;
+                let _ = torn_down.send(());
                 run_completion_hooks_and_report(
                     &[c],
                     &hooks,
@@ -1522,6 +1528,7 @@ async fn wait_for_exit_and_teardown(
                 )
                 .await;
             });
+            let _ = done.await;
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -22372,6 +22379,67 @@ mod tests {
             0,
             "a stale wait must not release the newer attempt's GPU"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cancel_wait_still_finishes_teardown_and_reports() {
+        let (controller_addr, reports, _drains, gate) = spawn_gated_mock_controller();
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 906;
+        let child = tokio::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived job");
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.job = executor::RunningJob::Managed { child };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 1);
+        }
+        let held = svc.lifecycle.acquire(job_id).await;
+        let wait = tokio::spawn({
+            let (running, lifecycle) = (svc.running.clone(), svc.lifecycle.clone());
+            let (allocation, mpi_host) = (svc.allocation.clone(), svc.mpi_host.clone());
+            let (hooks, spank, token) = (
+                svc.hooks.clone(),
+                svc.spank.clone(),
+                svc.reporter.node_token(),
+            );
+            async move {
+                wait_for_exit_and_teardown(
+                    job_id,
+                    1,
+                    &running,
+                    &lifecycle,
+                    &allocation,
+                    &mpi_host,
+                    hooks,
+                    spank,
+                    controller_addr,
+                    token,
+                )
+                .await
+            }
+        });
+        while svc.running.lock().await.contains_key(&job_id) {
+            tokio::task::yield_now().await;
+        }
+        // Teardown now waits on the held lock; dropping the wait models a timed-out cancel RPC.
+        wait.abort();
+        let _ = wait.await;
+        drop(held);
+        gate.started.notified().await;
+        gate.release.notify_one();
+        assert_eq!(svc.free_gpu_count().await, 1);
+        assert_eq!(reports.lock().unwrap()[0].job_id, job_id);
     }
 
     // A launch that aborts before entering `running` must tear down its PMI

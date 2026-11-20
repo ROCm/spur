@@ -573,6 +573,39 @@ async fn startup_spool_retains_everything_once_its_budget_is_spent() {
 }
 
 #[tokio::test]
+async fn a_worker_released_after_the_budget_deletes_nothing() {
+    let controller = ControllerFixture::new(true);
+    spool_response(&controller, true, &[]);
+    let fixture = Arc::new(SpoolFixture::new(&controller, &[1]));
+    let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    let cleanup = tokio::spawn({
+        let fixture = fixture.clone();
+        let barriers = barriers.clone();
+        async move {
+            let mut paths = fixture.paths();
+            paths.budget = std::time::Duration::from_millis(100);
+            paths.worker_barriers = Some(barriers);
+            fixture
+                .agent
+                .cleanup_startup_job_spools_with_inventory(paths)
+                .await
+        }
+    });
+    let reached = barriers.clone();
+    tokio::task::spawn_blocking(move || reached.0.wait())
+        .await
+        .unwrap();
+    // The pass returns at its deadline while the worker is still parked.
+    assert_eq!(cleanup.await.unwrap().deleted, 0);
+    let release = barriers.clone();
+    tokio::task::spawn_blocking(move || release.1.wait())
+        .await
+        .unwrap();
+    let _guard = fixture.agent.lifecycle.acquire(1).await;
+    assert!(fixture.exists(1));
+}
+
+#[tokio::test]
 async fn startup_spool_skips_processes_that_exit_mid_inventory() {
     let controller = ControllerFixture::new(true);
     spool_response(&controller, true, &[]);

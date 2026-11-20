@@ -21,7 +21,7 @@ const READ_CHUNK: usize = 1024;
 const MAX_RESCANS: u8 = 2;
 const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
 
-/// Opens a spool root, following symlinks in its path; nothing beneath it is followed.
+/// Opens a root (spool, cgroup or session), following symlinks in its path; nothing beneath it is followed.
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)

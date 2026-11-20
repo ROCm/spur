@@ -329,12 +329,13 @@ src/
 10. Create `NodeReporter`, call `reporter.register()` (gRPC `RegisterAgent`).
 11. Spawn `heartbeat_loop` immediately -- before completion replay, so a slow
     replay never looks like a dead node.
-12. Replay unacknowledged stepd completions, spawn retry background task.
+12. Replay unacknowledged stepd completions.
 13. Build `AgentService`, adopt recovered stepds, replay allocations (then
     `request_heartbeat()`), settle stale stepds, then run the one-shot orphan
     job-spool cleanup (`startup_spool::run`, bounded by a 60 s budget) before
     anything serves.
-14. Bind agent-socket Unix listener for supervisor completion notifications.
+14. Bind agent-socket Unix listener for supervisor completion notifications,
+    spawn the completion retry background task.
 15. Adopt any running spurd-owned k0s unit, spawn the k0s supervise loop.
 16. Start the reaper/monitor loop (`start_monitor`).
 17. Spawn periodic inventory-refresh loop (debounced, seen-twice).
