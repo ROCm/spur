@@ -36,6 +36,7 @@ src/
     mod.rs                 Bring-up orchestration: connect-with-retry, activate caches/loops
     db.rs                  PostgreSQL schema (sqlx migrations), CRUD for jobs/users/accounts/QOS/usage
     grpc.rs                SlurmAccounting gRPC service impl
+    qos_level.rs           QOS edit encoding and inheritance down the account tree
     fairshare.rs           Fairshare factor computation (half-life decay)
     reconcile.rs           Leader-gated job reconciliation loop (db vs in-memory drift)
     notifier.rs            Async accounting write dispatch (job start/end records)
@@ -260,7 +261,7 @@ sqlx-driven migrations create tables for users, accounts, associations, QOS defi
 | Table | Key | Purpose |
 |---|---|---|
 | `jobs` | `job_id (BIGINT)` | Job history: state, exit code, node list, timings, preemption info |
-| `accounts` | `name` | Account hierarchy (parent_account), fairshare weight, grp_tres |
+| `accounts` | `name` | Account hierarchy (parent_account), fairshare weight, grp_tres, QOS edit and default ([model](../../docs/knowledge/accounting/accounting.md#qos-lists-and-defaults)) |
 | `users` | `(name, account)` | User-account membership, admin_level, default_account |
 | `associations` | `(user_name, account, partition_name)` | Per-association limits: max_running_jobs, max_submit_jobs, grp_submit_jobs, TRES limits, max_wall |
 | `qos` | `name` | QOS definitions: priority, preempt mode, per-user/account/group limits, idle_fill_preemptable |
