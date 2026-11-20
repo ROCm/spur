@@ -1,4 +1,5 @@
 pytest==9.0.3
+grpcio==1.83.0
 paramiko==5.0.0
 tomli-w==1.2.0
 kubernetes==32.0.1

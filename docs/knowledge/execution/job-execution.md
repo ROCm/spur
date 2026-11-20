@@ -378,7 +378,7 @@ fd, and a restarted agent reclaims it via `CUSTODY_RECLAIM_ANY`.
 
 ## 10. Recovery after agent restart
 
-On startup, the agent scans `<state_dir>/` for session directories:
+On startup, the agent scans `<state_dir>/runtime/` for session directories:
 
 1. Loads each `descriptor.json` to find live supervisors.
 2. Validates liveness via `pid + process_start_ticks` (from
@@ -391,6 +391,113 @@ On startup, the agent scans `<state_dir>/` for session directories:
 
 The supervisor is unaffected by the restart -- it runs in its own session
 (via `setsid`), and the agent reconnects to its Unix socket.
+
+### Orphan job spools
+
+After initial completion replay, runtime pruning, supervisor adoption and
+stale-session settlement, `spurd` makes one pass over direct `job<id>`
+directories under `/var/spool/spur` and, for a non-root agent, the
+temporary-directory `spur` fallback. This pass finishes before the agent starts
+its RPC server and background runtime pruning, and is bounded by a 60-second budget; anything not decided by then is
+retained and logged. Heartbeats continue throughout startup. The roots are fixed
+and not configurable; the configured controller state directory does not add a
+spool root, and no periodic spool scan is installed (restarting `spurd` is the
+only trigger).
+
+Symlinks in a root's path are followed, as for normal completion cleanup; nothing
+beneath the root is followed. A `job<id>` entry that is itself a symlink, or a
+spool containing a mount point, is kept and logged so an admin can clean it by
+hand. Startup only scans roots whose resolved directory is owned by the daemon
+and not group- or world-writable. Normal completion cleanup of a known job
+folder skips that ownership check, so it also cleans user-owned fallback roots.
+
+The agent queries the controller in sorted batches of 128 job IDs without other
+filters and with `GetJobsRequest.require_authoritative` enabled. These strict
+reads forward to the leader and require a bounded quorum confirmation and apply
+catch-up; ordinary job queries retain their existing local fallback. Terminal
+jobs are eligible for cleanup only when `GetJobsResponse.authoritative` confirms
+fresh controller state. Missing jobs also require
+`GetJobsResponse.unrestricted_visibility` and an id below
+`GetJobsResponse.next_job_id`, the controller's issue high-water mark. A
+freshly bootstrapped or wiped controller cannot confirm ids it has not reached
+yet; ids below a raised `first_job_id` count as issued and purged. Upgrade
+controllers before agents to enable automatic spool cleanup. Older controllers
+default the authority flag to false, so every candidate remains protected.
+
+With `[auth] plugin = "spur"` and `private_data` including `jobs`, spurd's root
+identity sees only root's jobs unless it is an Operator or Administrator, so
+other users' spools are retained and a log line says why.
+
+Local ownership takes precedence: tracked jobs, reserved allocations, active
+steps, supervisors and every retained runtime session protect the entire job
+spool across attempts and sibling steps. Completed sessions still waiting for
+completion or output replay are retained. Asynchronous supervisor recovery
+reports keep their existing retry behavior; startup cleanup does not wait for
+them. Read-only cgroup population checks and a process inventory also protect
+surviving workloads:
+
+- a `spurstepd` supervisor, recognised by comm, argv[0] or exe name only when
+  its real and effective uid are the daemon's, protects the job in its
+  arguments, even if its runtime record disappeared; such a process without a
+  job id retains every candidate;
+- a valid `SPUR_JOB_ID`, `SPUR_JOBID`, `SLURM_JOB_ID` or `SLURM_JOBID` in a
+  process environment protects that job id; unparsable values are ignored;
+- a working directory or open file inside a spool protects it, matched by path
+  and by inode (for holders on the spool's filesystem), so hardlinks and bind
+  mounts are recognised; targets on recognised network and FUSE filesystems
+  are not stat-ed.
+  A process that is exiting mid-scan is skipped. Reading other processes needs
+  `CAP_SYS_PTRACE`. The inventory is read once, before any job's lifecycle lock
+  is taken, so a read blocked on a hung process strands no lock.
+
+Unsafe or unreadable roots, uncertain activity information, unknown job states,
+non-authoritative responses and restricted missing-job responses cause folders
+to be retained with a log message. A failed controller query stops further
+batches and startup continues.
+
+Automatic deletion is skipped when cgroups are disabled. Traversal streams
+directory entries and stops at 256 levels (the inode check holds two
+descriptors per level, deletion one); deletion is depth-first, so a deeper tree
+may be partly removed before it is kept. A directory that keeps refilling is
+kept. Completion cleanup has its own 60-second budget. Traversal uses `openat2`
+where available and otherwise combines `openat` with no-follow opens and
+descriptor mount IDs. Deletion follows neither symlinks nor mount points and
+shares the per-job launch/teardown lock, except for container rootfs trees
+already moved into the trash.
+One spool that cannot be walked or deleted does not hold back the others.
+
+Logs record deletions, retention reasons, errors and the final count. A failed
+or partial deletion is reconsidered on the next startup; the container trash is
+the only persistent queue, deleted without asking the controller again.
+
+Unnamed container rootfs dirs (`job_<id>`, `step_<id>_<step>`, step ids from
+0) under `container::container_dir()` are candidates too, keyed by the same job
+id and gated the same way; `/proc/<pid>/root` joins the inventory, and a rootfs
+counts as held when its base or overlay `merged` root inode is held (no full
+walk). A process in another mount namespace has its links classified against
+its own `/proc/<pid>/mountinfo` (fds by `fdinfo` `mnt_id`), so network and FUSE
+files are never stat-ed and a pivoted container's root is. A mount in the host
+or any scanned namespace whose source is the rootfs or a subtree of it (same
+device, `root` field under the rootfs path) keeps it. Mounts at or beneath the
+base are unmounted deepest-first without `MNT_DETACH`, for up to four rounds;
+any that remain keep it. The entry is then reopened: its identity may change
+only when a mount on the entry itself was removed, and the uncovered directory
+is checked against held inodes. Still in the startup worker, under the job's
+lifecycle lock, the entry is renamed (`RENAME_NOREPLACE`, a wall-clock suffix)
+into `spur:trash` in the container dir (opened beneath the root, owner-only:
+spool-root checks plus no group/other access), so a relaunch never finds the
+old tree at its path; a rename that fails, or whose moved entry no longer
+matches, keeps it in place for the next start (unless moving it back fails too,
+which is logged and leaves it in the trash). The trash is emptied after the
+agent serves, one entry at a time, without the lock, with no time budget and a
+stop flag set when the agent exits by any path. Entries left by an
+interrupted run are found by discovery and deleted without asking the
+controller.
+Binds are matched only on the container dir's filesystem, so a bind of an
+overlay layer's subtree is not detected.
+
+This pass does not roll back failed launches or run epilogs. Deleting a spool
+does not establish epilog completion or change node-drain policy.
 
 ## 11. Common pitfalls
 

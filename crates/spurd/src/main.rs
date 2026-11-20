@@ -766,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
+    let rootfs_cleanup = agent_service.cleanup_startup_job_spools().await;
     // Shared with spurctld's state_dir unless --state-dir is set, so spurd owns
     // only the runtime/ subdir here; the parent must still be root-owned (see
     // log_root_trusted_dirs), or whoever owns it can swap in their own runtime/.
@@ -875,6 +876,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
     let server_task = tokio::spawn(server_future);
+    let _rootfs_cleanup = rootfs_cleanup.spawn();
 
     if !recovered_stepds.is_empty() {
         for descriptor in recovered_stepds {

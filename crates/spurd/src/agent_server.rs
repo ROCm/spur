@@ -315,12 +315,7 @@ async fn launch_stepd(
     claim_session_provisionally(&store, &mut descriptor, &launch_path, state_dir)?;
     let executable = resolve_stepd_executable();
     info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
-    let spawn_args = vec![
-        state_dir.to_path_buf(),
-        std::path::PathBuf::from(config.job_id.to_string()),
-        std::path::PathBuf::from(run_attempt.to_string()),
-        launch_path,
-    ];
+    let spawn_args = crate::stepd::process_args(state_dir, config.job_id, run_attempt, launch_path);
     let spawn_executable = executable.clone();
     let pid =
         tokio::task::spawn_blocking(move || spawn_stepd_process(&spawn_executable, &spawn_args))
@@ -1300,6 +1295,24 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+/// Removal can take long (the rootfs has no time bound), so it stays off the async workers.
+async fn remove_job_files(
+    job_id: u32,
+    rootfs_mode: crate::container::RootfsMode,
+    cgroups: Vec<std::path::PathBuf>,
+) {
+    let removal = tokio::task::spawn_blocking(move || {
+        crate::container::cleanup_rootfs(&crate::container::job_rootfs_base(job_id), &rootfs_mode);
+        crate::executor::cleanup_job_spool(job_id);
+        for cgroup in &cgroups {
+            crate::executor::cleanup_cgroup(cgroup);
+        }
+    });
+    if let Err(error) = removal.await {
+        warn!(job_id, %error, "job file cleanup failed");
+    }
+}
+
 /// Release what a finished run owned, once the monitor has dropped it from
 /// `running`. Skipped if the id is tracked again: it is all keyed by job id.
 async fn teardown_completed_job(
@@ -1322,21 +1335,15 @@ async fn teardown_completed_job(
         return;
     }
 
-    crate::container::cleanup_rootfs(
-        &crate::container::job_rootfs_base(job_id),
-        &completed.rootfs_mode,
-    );
-    crate::executor::cleanup_job_spool(job_id);
-    if let Some(ref cgroup) = completed.cgroup {
-        crate::executor::cleanup_cgroup(cgroup);
-    }
+    let mut cgroups: Vec<_> = completed.cgroup.iter().cloned().collect();
     // The node above whatever was recorded: an allocation's is a step's leaf,
     // and nothing else removes the job's own. Derived from identity because the
     // recorded path is a leaf in one shape and absent in another.
-    crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+    cgroups.push(crate::executor::expected_cgroup_path(
         job_id,
         completed.run_attempt,
     ));
+    remove_job_files(job_id, completed.rootfs_mode.clone(), cgroups).await;
     allocation.lock().await.release_job(job_id);
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
@@ -1428,8 +1435,7 @@ async fn run_completion_hooks_and_report(
     }
 }
 
-/// Bounded so a hung teardown can't stall the cancel RPC past the
-/// controller's own CancelJob timeout.
+/// Bounds only the wait for the job to exit; teardown after it (lock, file removal) is unbounded.
 const CANCEL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A cancel only warrants an active wait if the signal is expected to end
@@ -1450,7 +1456,7 @@ async fn wait_for_exit_and_teardown(
     running: &RunningJobs,
     lifecycle: &crate::job_lifecycle::JobLifecycle,
     allocation: &Arc<Mutex<NodeAllocation>>,
-    mpi_host: &MpiPluginHost,
+    mpi_host: &Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     spank: Arc<Option<SpankHost>>,
     controller_addr: String,
@@ -1504,8 +1510,14 @@ async fn wait_for_exit_and_teardown(
             }
         };
         if let Some(c) = completed {
-            teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
+            // The job has left `running`: a dropped cancel RPC must not cut teardown short
+            // or lose the report, so both run in a task of their own.
+            let (torn_down, done) = tokio::sync::oneshot::channel();
+            let (running, lifecycle) = (running.clone(), lifecycle.clone());
+            let (allocation, mpi_host) = (allocation.clone(), mpi_host.clone());
             tokio::spawn(async move {
+                teardown_completed_job(&c, &lifecycle, &running, &allocation, &mpi_host).await;
+                let _ = torn_down.send(());
                 run_completion_hooks_and_report(
                     &[c],
                     &hooks,
@@ -1515,6 +1527,7 @@ async fn wait_for_exit_and_teardown(
                 )
                 .await;
             });
+            let _ = done.await;
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -4510,6 +4523,81 @@ async fn run_containerized_step(
     }
 }
 
+/// Background deletion of orphan container rootfs dirs, started after the agent serves.
+pub struct RootfsCleanup {
+    pending: Vec<crate::startup_spool::PendingRootfs>,
+}
+
+impl RootfsCleanup {
+    /// Starts the deletions; dropping the returned handle stops them, mid-walk included.
+    pub fn spawn(self) -> RootfsCleanupHandle {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn(crate::startup_spool::delete_pending_rootfs(
+            self.pending,
+            stop.clone(),
+        ));
+        #[cfg(not(test))]
+        drop(task);
+        RootfsCleanupHandle {
+            stop,
+            #[cfg(test)]
+            task,
+        }
+    }
+}
+
+/// Keeps the background deletion bounded by the agent's lifetime, however `main` exits.
+pub struct RootfsCleanupHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RootfsCleanupHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct SpoolOwnership {
+    lifecycle: crate::job_lifecycle::JobLifecycle,
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    stepds: Arc<Mutex<StepdMap>>,
+}
+
+impl SpoolOwnership {
+    pub(crate) async fn guard(
+        &self,
+        job_id: u32,
+    ) -> crate::job_lifecycle::KeyedLifecycleGuard<u32> {
+        self.lifecycle.acquire(job_id).await
+    }
+
+    pub(crate) async fn local_owner(&self, job_id: u32) -> Option<&'static str> {
+        if self.running.lock().await.contains_key(&job_id) {
+            return Some("tracked job");
+        }
+        if self.allocation.lock().await.owner_attempt(job_id).is_some() {
+            return Some("reserved allocation");
+        }
+        if self
+            .active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(id, _)| *id == job_id)
+        {
+            return Some("active step");
+        }
+        if self.stepds.lock().await.keys().any(|(id, _)| *id == job_id) {
+            return Some("retained supervisor");
+        }
+        None
+    }
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     /// In-memory only: starts empty on every spurd start/restart, regardless
@@ -5056,6 +5144,46 @@ impl AgentService {
             }
         }
         BatchWorkload::Gated
+    }
+
+    /// Runs the startup pass; container rootfs dirs it queued are deleted by [`RootfsCleanup::spawn`].
+    pub async fn cleanup_startup_job_spools(&self) -> RootfsCleanup {
+        let summary = self
+            .cleanup_startup_job_spools_with_inventory(crate::startup_spool::ActivityPaths {
+                proc_root: "/proc".into(),
+                cgroup_root: executor::CGROUP_ROOT.into(),
+                runtime_root: crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                    .root()
+                    .to_owned(),
+                cgroups_enabled: self.cgroup.enabled,
+                supervisor_uid: nix::unistd::geteuid().as_raw(),
+                budget: crate::startup_spool::STARTUP_CLEANUP_BUDGET,
+                container_root: Some(crate::container::container_dir()),
+                #[cfg(test)]
+                worker_gate: None,
+            })
+            .await;
+        RootfsCleanup {
+            pending: summary.pending_rootfs,
+        }
+    }
+
+    pub(crate) async fn cleanup_startup_job_spools_with_inventory(
+        &self,
+        paths: crate::startup_spool::ActivityPaths,
+    ) -> crate::startup_spool::CleanupSummary {
+        crate::startup_spool::run(self, self.job_spool_roots.clone(), paths).await
+    }
+
+    /// What decides whether a job's on-disk state is still in use.
+    pub(crate) fn spool_ownership(&self) -> SpoolOwnership {
+        SpoolOwnership {
+            lifecycle: self.lifecycle.clone(),
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+            active_steps: self.active_steps.clone(),
+            stepds: self.stepds.clone(),
+        }
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -7499,14 +7627,8 @@ impl SlurmAgent for AgentService {
                         // job_id, so a re-dispatch of that id reuses them: tearing
                         // any of them down now would destroy the live run.
                         if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(
-                                &crate::container::job_rootfs_base(job_id),
-                                &rootfs_mode,
-                            );
-                            crate::executor::cleanup_job_spool(job_id);
-                            if let Some(ref cg) = cgroup {
-                                crate::executor::cleanup_cgroup(cg);
-                            }
+                            remove_job_files(job_id, rootfs_mode, cgroup.into_iter().collect())
+                                .await;
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
@@ -22319,6 +22441,75 @@ mod tests {
             0,
             "a stale wait must not release the newer attempt's GPU"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_cancel_wait_still_finishes_teardown_and_reports() {
+        let (controller_addr, reports, _drains, gate) = spawn_gated_mock_controller();
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // Teardown removes this id's host spool, rootfs and cgroup, so use one no real job has.
+        let job_id = 4_000_000_906;
+        let child = tokio::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived job");
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.job = executor::RunningJob::Managed { child };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 1);
+        }
+        let held = svc.lifecycle.acquire(job_id).await;
+        let wait = tokio::spawn({
+            let (running, lifecycle) = (svc.running.clone(), svc.lifecycle.clone());
+            let (allocation, mpi_host) = (svc.allocation.clone(), svc.mpi_host.clone());
+            let (hooks, spank, token) = (
+                svc.hooks.clone(),
+                svc.spank.clone(),
+                svc.reporter.node_token(),
+            );
+            async move {
+                wait_for_exit_and_teardown(
+                    job_id,
+                    1,
+                    &running,
+                    &lifecycle,
+                    &allocation,
+                    &mpi_host,
+                    hooks,
+                    spank,
+                    controller_addr,
+                    token,
+                )
+                .await
+            }
+        });
+        while svc.running.lock().await.contains_key(&job_id) {
+            assert!(
+                !wait.is_finished(),
+                "the cancel wait gave up before the job exited"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        // Teardown now waits on the held lock; dropping the wait models a timed-out cancel RPC.
+        wait.abort();
+        let _ = wait.await;
+        drop(held);
+        // The lock is fair, so this is granted only after a queued teardown releases it.
+        drop(svc.lifecycle.acquire(job_id).await);
+        assert_eq!(svc.free_gpu_count().await, 1);
+        gate.started.notified().await;
+        gate.release.notify_one();
+        assert_eq!(reports.lock().unwrap()[0].job_id, job_id);
     }
 
     // A launch that aborts before entering `running` must tear down its PMI
