@@ -131,7 +131,7 @@ against candidate nodes:
 | Name allow/deny | `allows_name()` | `--nodelist` and `--exclude`, hostlist-expanded |
 | Partition membership | `in_partition()` | OR across `--partition` values |
 | Feature constraints | `has_features()` | AND across `--constraint` features |
-| Native-only placement | `eligible()` | An explicit multi-node `batch-host` job (`needs_native_nodes()`) skips K8s virtual nodes |
+| Native-only batch jobs | `eligible()` | A batch job (`needs_native_nodes()`) skips K8s virtual nodes, which launch only SpurJobs |
 | Reservation authorization | `reservation_ok()` | Active reservations block unreserved jobs |
 | k0s cluster exclusion | `matches()` | Nodes with a k0s role are never scheduled |
 | Schedulable state | `is_schedulable()` | Node must be Idle/Mixed and no layout block |

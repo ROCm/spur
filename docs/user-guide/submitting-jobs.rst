@@ -193,11 +193,10 @@ step, as in Slurm:
 requested value while the job is pending and the one it runs with once it
 starts, and from then ``BatchHost=`` names the node the script runs on.
 
-Nodes managed by the Kubernetes operator run one Pod per node and cannot run
-``srun`` steps, so a job placed on them always runs the script on every node.
-A multi-node ``--script-placement=batch-host`` job never runs on them: it runs on
-other nodes in its partition, and waits with a reason saying so when there are
-too few. Submitting one whose ``--nodelist`` leaves too few other nodes fails.
+Nodes managed by the Kubernetes operator launch only SpurJobs, one Pod per node,
+so a batch job never runs on them, whatever its placement: it runs on other nodes
+in its partition, and waits with a reason saying so when there are too few.
+Submitting one whose ``--nodelist`` leaves too few other nodes fails.
 
 Common Options
 --------------

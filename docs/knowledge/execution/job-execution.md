@@ -89,16 +89,16 @@ the first allocated node) or on every allocated node (`AllNodes`). The controlle
 decides once per run at dispatch (`script_placement::resolve_run_placement` in
 `spurctld`) and records the result in `WalOperation::JobStart.resolved_placement`:
 
-1. Any K8s virtual node in the allocation gives `AllNodes`: a Pod per node, with
-   no step support. A multi-node job that explicitly asks for `batch-host`
-   (`JobSpec::needs_native_nodes`) is not eligible for K8s nodes
-   (`NodePlacement::eligible`): it waits as `BadConstraints` with the reason
-   `BATCH_HOST_K8S_UNSUPPORTED` while too few other nodes exist, submit rejects a
-   `--nodelist` that leaves too few, and dispatch still holds a run that includes one.
+1. A batch job (`JobSpec::needs_native_nodes`) never runs on K8s virtual nodes:
+   their agents launch only SpurJobs, which carry no script. It is not eligible for
+   them (`NodePlacement::eligible`), waits as `BadConstraints` with the reason
+   `BATCH_SCRIPT_K8S_UNSUPPORTED` while too few other nodes exist, submit rejects a
+   `--nodelist` that leaves too few (`validate_batch_nodelist`), and dispatch holds
+   a run that still includes one.
 2. Otherwise the job's `JobSpec.script_placement`, else `[controller]
    script_placement` (default `auto`). `auto` is a text scan: `BatchHost` when
    the script itself calls `srun`, `mpirun`, or `mpiexec`. srun and salloc jobs
-   always use the scan.
+   always use the scan, as do SpurJobs, whose missing script scans as `AllNodes`.
 
 On `BatchHost`, every node but the one at `task_offset` 0 runs
 `batch_companion_hold_script` with stdio on `/dev/null`, holding its slice for
@@ -112,11 +112,10 @@ applies the scan (`Node::reads_placement_off_script`). That changes the launch o
 on a multi-node or PMIx run (`ResolvedPlacement::launches_differently_from`): off
 the batch host a node runs the script or holds, and on it only a PMIx launch depends
 on the placement. For a job where it does (`JobSpec::needs_placement_aware_agents`,
-given `ClusterState.script_placement_default`; a K8s candidate counts, since a run
-that includes one is `AllNodes`), backfill and the victim search drop such nodes from
-the candidates (`NodePlacement::without_misplacing_agents`), and a job whose
-additive `--nodelist` names one waits. Dispatch backs off a run that still lands on
-one.
+given `ClusterState.script_placement_default`), backfill and the victim search drop
+such nodes from the candidates (`NodePlacement::without_misplacing_agents`), and a
+job whose additive `--nodelist` names one waits. Dispatch backs off a run that still
+lands on one.
 
 ### Prolog hooks
 
