@@ -48,8 +48,23 @@ use crate::reporter::NodeReporter;
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
 /// devices" so they cannot inherit the runtime's all-visible default.
-fn gpu_selection(gpu_ids: &[u64]) -> spur_devices::DeviceSelection {
-    spur_devices::DeviceSelection::new().with("gpu", gpu_ids.to_vec())
+/// The devices a dispatch names that this node injects into the job: its GPUs,
+/// plus every other kind the registry holds devices for. Countable pools have
+/// nothing to inject.
+fn allocated_selection(
+    allocated: Option<&ResourceAllocations>,
+    registry: &DeviceRegistry,
+) -> spur_devices::DeviceSelection {
+    let mut selection = spur_devices::DeviceSelection::new();
+    let Some(allocated) = allocated else {
+        return selection;
+    };
+    for (gres, held) in &allocated.devices {
+        if gres == "gpu" || registry.has_injectable(gres) {
+            selection.set(gres, held.devices.iter().map(|d| d.device_id).collect());
+        }
+    }
+    selection
 }
 
 fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
@@ -673,7 +688,7 @@ fn rewrite_descriptor_gpu_ids(
     stable_ids: Vec<u64>,
 ) {
     let mut rewritten = descriptor.clone();
-    rewritten.resources.gpu_devices = stable_ids;
+    rewritten.resources.devices.set("gpu", stable_ids);
     if let Err(error) = store.publish(&rewritten) {
         warn!(
             job_id = descriptor.job_id,
@@ -699,11 +714,11 @@ pub fn startup_held_gpu_ids(
     descriptors
         .iter()
         .flat_map(|d| {
-            let recorded = &d.resources.gpu_devices;
+            let recorded = d.resources.devices.gpus();
             may_record_positional_gpu_ids(&d.resources)
                 .then(|| translate_legacy_gpu_ids(recorded, current_gpus))
                 .flatten()
-                .unwrap_or_else(|| recorded.clone())
+                .unwrap_or_else(|| recorded.to_vec())
         })
         .collect()
 }
@@ -736,7 +751,7 @@ pub fn rename_descriptor_gpu_ids(state_dir: &std::path::Path, renamed: &HashMap<
         let mut rewritten = descriptor.clone();
         let resources = &mut rewritten.resources;
         rename_job_gpu_ids(
-            &mut resources.gpu_devices,
+            &mut resources.devices,
             &mut resources.fabric_binding,
             &mut resources.gpu_binding,
             renamed,
@@ -756,12 +771,13 @@ pub fn rename_descriptor_gpu_ids(state_dir: &std::path::Path, renamed: &HashMap<
 
 /// A binding names the job's ids too, so it moves with them and stays valid.
 fn rename_job_gpu_ids(
-    gpu_devices: &mut Vec<u64>,
+    devices: &mut spur_devices::DeviceSelection,
     fabric_binding: &mut Option<spur_core::fabric_binding::FabricBinding>,
     gpu_binding: &mut Option<spur_core::gpu_binding::GpuBinding>,
     renamed: &HashMap<u64, u64>,
 ) {
-    *gpu_devices = renamed_gpu_ids(gpu_devices, renamed);
+    let gpus = renamed_gpu_ids(devices.gpus(), renamed);
+    devices.set("gpu", gpus);
     if let Some(binding) = fabric_binding {
         binding.rename_gpus(renamed);
     }
@@ -779,7 +795,7 @@ pub async fn rename_tracked_gpu_ids(running: &RunningJobs, renamed: &HashMap<u64
     let mut jobs = running.lock().await;
     for tracked in jobs.values_mut() {
         rename_job_gpu_ids(
-            &mut tracked.gpu_devices,
+            &mut tracked.devices,
             &mut tracked.fabric_binding,
             &mut tracked.gpu_binding,
             renamed,
@@ -818,7 +834,7 @@ fn follow_ledger_renames(
         return;
     }
     rename_job_gpu_ids(
-        &mut tracked.gpu_devices,
+        &mut tracked.devices,
         &mut tracked.fabric_binding,
         &mut tracked.gpu_binding,
         renamed,
@@ -1249,7 +1265,7 @@ pub struct TrackedJob {
     /// at the agent without passing through the controller.
     user: String,
     partition: String,
-    gpu_devices: Vec<u64>,
+    devices: spur_devices::DeviceSelection,
     cpus: u32,
     memory_mb: u64,
     /// The node's schedulable memory, for a typed step's ceiling check when
@@ -1493,7 +1509,7 @@ async fn wait_for_exit_and_teardown(
                         uid: tracked.uid,
                         gid: tracked.gid,
                         partition: tracked.partition,
-                        gpu_devices: tracked.gpu_devices,
+                        gpu_devices: tracked.devices.gpus().to_vec(),
                         cpus: tracked.cpus,
                         memory_mb: tracked.memory_mb,
                         nodelist: tracked.nodelist,
@@ -2238,7 +2254,7 @@ fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bo
         gid: descriptor.gid,
         user: own(&descriptor.owner),
         partition: descriptor.resources.partition.clone(),
-        gpu_devices: descriptor.resources.gpu_devices.clone(),
+        devices: descriptor.resources.devices.clone(),
         cpus: descriptor.resources.cpus,
         memory_mb: descriptor.resources.memory_mb,
         memory_ceiling_mb: descriptor.resources.memory_ceiling_mb,
@@ -4834,7 +4850,7 @@ impl AgentService {
         for descriptor in replayable_allocations(descriptors) {
             let resources = &descriptor.resources;
             // The ledger carries the current encoding for every job, bound or not.
-            let recorded = renamed_gpu_ids(&resources.gpu_devices, renamed);
+            let recorded = renamed_gpu_ids(resources.devices.gpus(), renamed);
             // A legacy descriptor holds positional ids that no longer match the
             // BDF-anchored stable_ids; translate through the live inventory so
             // the adopt succeeds instead of leaving the job's GPUs reading free.
@@ -4847,7 +4863,7 @@ impl AgentService {
                 Some(stable_ids) => {
                     info!(
                         job_id = descriptor.job_id,
-                        recorded = ?resources.gpu_devices,
+                        recorded = ?resources.devices.gpus(),
                         stable_ids = ?stable_ids,
                         "translated a legacy positional gpu recording to stable_ids on adopt"
                     );
@@ -4925,6 +4941,12 @@ impl AgentService {
                 }
                 other => other.map(|_| gpu_ids),
             };
+            let others = resources.devices.excluding("gpu");
+            let restored = restored.and_then(|gpu_ids| {
+                allocation
+                    .claim_devices(descriptor.job_id, descriptor.run_attempt, &others)
+                    .map(|()| gpu_ids)
+            });
             match restored {
                 Ok(gpu_ids) => {
                     // Rewrite the descriptor forward so the translation is
@@ -5643,7 +5665,7 @@ impl AgentService {
                                 uid: tracked.uid,
                                 gid: tracked.gid,
                                 partition: tracked.partition.clone(),
-                                gpu_devices: tracked.gpu_devices.clone(),
+                                gpu_devices: tracked.devices.gpus().to_vec(),
                                 cpus: tracked.cpus,
                                 memory_mb: tracked.memory_mb,
                                 nodelist: tracked.nodelist.clone(),
@@ -7174,7 +7196,7 @@ impl SlurmAgent for AgentService {
         // The generation check is performed inside `allocate_local_resources`
         // under the same allocation lock as the allocate, so a refresh publish
         // cannot slip a newer topology between the check and the bind.
-        let (alloc_result, allocated_device_ids) = self
+        let (alloc_result, devices) = self
             .allocate_local_resources(
                 job_id,
                 run_attempt,
@@ -7192,7 +7214,7 @@ impl SlurmAgent for AgentService {
 
         let injection = {
             let reg = self.device_registry.lock().await;
-            reg.build_job_injection_plans(&gpu_selection(&allocated_device_ids), spec.uid, spec.gid)
+            reg.build_job_injection_plans(&devices, spec.uid, spec.gid)
         };
         let (host_device_plan, container_device_plan) = match injection {
             Ok(plans) => plans,
@@ -7207,7 +7229,7 @@ impl SlurmAgent for AgentService {
 
         // Wire allocated device IDs and injection plan into container config.
         if let Some(ref mut cfg) = container_config {
-            cfg.gpu_devices = allocated_device_ids.clone();
+            cfg.gpu_devices = devices.gpus().to_vec();
             cfg.device_plan = Some(container_device_plan);
         }
 
@@ -7220,7 +7242,7 @@ impl SlurmAgent for AgentService {
                 partition: spec.partition.clone(),
                 nodelist: spec.nodelist.clone(),
                 script_context: "prolog_slurmd".into(),
-                gpu_devices: allocated_device_ids.clone(),
+                gpu_devices: devices.gpus().to_vec(),
                 cpus,
                 memory_mb,
             };
@@ -7247,13 +7269,13 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        maybe_deny_gpu_env(&mut env, &allocated_device_ids);
+        maybe_deny_gpu_env(&mut env, devices.gpus());
 
         if let Some(ref mut cfg) = container_config {
             cfg.environment = env.clone();
             // container_env (user `--container-env`) is layered over environment
             // at launch, so a zero-GPU job could re-enable visibility through it.
-            maybe_deny_gpu_env(&mut cfg.container_env, &allocated_device_ids);
+            maybe_deny_gpu_env(&mut cfg.container_env, devices.gpus());
         }
 
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
@@ -7332,7 +7354,7 @@ impl SlurmAgent for AgentService {
             cpus,
             memory_mb,
             memory_ceiling_mb,
-            gpu_devices: allocated_device_ids,
+            devices,
             cpu_ids,
             open_mode: if spec.open_mode.is_empty() {
                 None
@@ -7466,7 +7488,7 @@ impl SlurmAgent for AgentService {
                     &mut *self.allocation.lock().await,
                     job_id,
                     run_attempt,
-                    &launch_cfg.gpu_devices,
+                    launch_cfg.devices.gpus(),
                 );
                 reservation_guard.disarm();
 
@@ -7522,7 +7544,7 @@ impl SlurmAgent for AgentService {
                     }));
                 };
 
-                info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
+                info!(job_id, devices = ?launch_cfg.devices, "job launched successfully");
                 let namespaces = launch_namespaces(&launch_cfg, nix::unistd::geteuid().is_root());
                 let job_container = launch_cfg
                     .container
@@ -7553,7 +7575,7 @@ impl SlurmAgent for AgentService {
                         gid: launch_cfg.gid,
                         user: launch_cfg.user,
                         partition: launch_cfg.partition,
-                        gpu_devices: launch_cfg.gpu_devices,
+                        devices: launch_cfg.devices,
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
                         memory_ceiling_mb: launch_cfg.memory_ceiling_mb,
@@ -7700,16 +7722,15 @@ impl SlurmAgent for AgentService {
                     gpu_binding: descriptor.resources.gpu_binding.clone(),
                     ..Default::default()
                 };
-                allocation.devices.insert(
-                    "gpu".into(),
-                    descriptor
-                        .resources
-                        .gpu_devices
-                        .iter()
-                        .copied()
-                        .map(spur_core::resource::AllocatedDevice::injectable)
-                        .collect(),
-                );
+                for (gres, ids) in descriptor.resources.devices.iter() {
+                    allocation.devices.insert(
+                        gres.to_string(),
+                        ids.iter()
+                            .copied()
+                            .map(spur_core::resource::AllocatedDevice::injectable)
+                            .collect(),
+                    );
+                }
                 if let Err(error) = self
                     .check_dispatch_allocation(&crate::reporter::allocations_to_proto(&allocation))
                     .await
@@ -7944,7 +7965,7 @@ impl SlurmAgent for AgentService {
                 tracked.cpus,
                 tracked.memory_mb,
                 tracked.memory_ceiling_mb,
-                tracked.gpu_devices.clone(),
+                tracked.devices.gpus().to_vec(),
                 tracked.run_attempt,
             )
         };
@@ -8155,17 +8176,17 @@ impl SlurmAgent for AgentService {
         }
         // The generation check is performed under the allocation lock below, so a
         // refresh publish cannot slip a newer topology between it and the bind.
-        let mut controller_gpu_ids: Vec<u64> = allocated
-            .and_then(|a| a.devices.get("gpu"))
-            .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
-            .unwrap_or_default();
-        if controller_gpu_ids.is_empty() {
-            controller_gpu_ids = req
+        let mut devices = allocated_selection(allocated, &*self.device_registry.lock().await);
+        if devices.gpus().is_empty() {
+            #[allow(deprecated)]
+            let legacy = req
                 .gpu_devices
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
+            devices.set("gpu", legacy);
         }
+        let controller_gpu_ids = devices.gpus().to_vec();
 
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
@@ -8174,7 +8195,7 @@ impl SlurmAgent for AgentService {
         // Resolved before the running lock and the reservation: this is the one
         // step that awaits another lock, and failing here needs no release.
         let host_device_plan = self
-            .resolve_host_device_plan(req.job_id, &controller_gpu_ids, req.uid, req.gid)
+            .resolve_host_device_plan(req.job_id, &devices, req.uid, req.gid)
             .await?;
         let device_paths = host_device_plan
             .as_ref()
@@ -8254,6 +8275,14 @@ impl SlurmAgent for AgentService {
                         "controller-allocated {gres} devices unavailable on this node"
                     )),
                 })?;
+            if let Err(error) =
+                alloc.claim_devices(req.job_id, req.run_attempt, &devices.excluding("gpu"))
+            {
+                alloc.release_job_if(req.job_id, req.run_attempt);
+                return Err(Status::resource_exhausted(format!(
+                    "controller-allocated devices unavailable on this node: {error:?}"
+                )));
+            }
             result
         };
         // Releases the allocation on any exit that does not record the job,
@@ -8316,7 +8345,7 @@ impl SlurmAgent for AgentService {
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 script_context: "prolog_slurmd".into(),
-                gpu_devices: controller_gpu_ids.clone(),
+                gpu_devices: devices.gpus().to_vec(),
                 cpus,
                 memory_mb,
             };
@@ -8361,7 +8390,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
                 memory_ceiling_mb,
-                gpu_devices: controller_gpu_ids.clone(),
+                devices: devices.clone(),
                 cpu_ids: alloc_result.cpu_ids.clone(),
                 open_mode: None,
                 uid: req.uid,
@@ -8483,7 +8512,7 @@ impl SlurmAgent for AgentService {
                 gid: req.gid,
                 user: req.user,
                 partition: req.partition,
-                gpu_devices: controller_gpu_ids.clone(),
+                devices: devices.clone(),
                 cpus,
                 memory_mb,
                 memory_ceiling_mb,
@@ -8766,7 +8795,7 @@ impl SlurmAgent for AgentService {
             .map(|state| std::path::PathBuf::from(&state.cgroup_path))
             .filter(|path| !path.as_os_str().is_empty());
         let (
-            gpu_devices,
+            job_devices,
             partition,
             cpus,
             memory_mb,
@@ -8813,7 +8842,7 @@ impl SlurmAgent for AgentService {
                     .or_else(|| supervised_cgroup.clone()),
             };
             (
-                tracked.gpu_devices.clone(),
+                tracked.devices.clone(),
                 tracked.partition.clone(),
                 tracked.cpus,
                 tracked.memory_mb,
@@ -8856,6 +8885,7 @@ impl SlurmAgent for AgentService {
             .count()
             .max(1) as u32;
 
+        let gpu_devices = job_devices.gpus().to_vec();
         // Held until this RPC returns. Once the step's supervisor is tracked, its
         // descriptor holds the share too, so a dropped RPC cannot free it early.
         let gpu_types = self.reporter.gpu_types();
@@ -8892,14 +8922,15 @@ impl SlurmAgent for AgentService {
             .clone()
             .unwrap_or_else(|| gpu_devices.clone());
 
-        let (mut gpu_env, host_device_plan, container_device_plan) = if launch_gpus.is_empty() {
+        let launch_devices = job_devices.clone().with("gpu", launch_gpus.clone());
+        let (mut gpu_env, host_device_plan, container_device_plan) = if launch_devices.is_empty() {
             (HashMap::new(), None, None)
         } else {
             let (mut host_plan, container_plan) = self
                 .device_registry
                 .lock()
                 .await
-                .build_job_injection_plans(&gpu_selection(&launch_gpus), req.uid, req.gid)
+                .build_job_injection_plans(&launch_devices, req.uid, req.gid)
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
                 })?;
@@ -9267,7 +9298,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
                 memory_ceiling_mb,
-                gpu_devices: gpu_devices.clone(),
+                devices: job_devices.clone(),
                 cpu_ids: Vec::new(),
                 uid: req.uid,
                 gid: req.gid,
@@ -9626,7 +9657,7 @@ impl SlurmAgent for AgentService {
                     partition,
                     nodelist: job_nodelist,
                     script_context: "epilog_task".into(),
-                    gpu_devices,
+                    gpu_devices: gpu_devices.clone(),
                     cpus,
                     memory_mb,
                 };
@@ -10092,7 +10123,7 @@ impl SlurmAgent for AgentService {
             cpus,
             memory_mb,
             memory_ceiling_mb,
-            gpu_devices,
+            job_devices,
             partition,
             nodelist,
             user,
@@ -10110,7 +10141,7 @@ impl SlurmAgent for AgentService {
                 tracked.cpus,
                 tracked.memory_mb,
                 tracked.memory_ceiling_mb,
-                tracked.gpu_devices.clone(),
+                tracked.devices.clone(),
                 tracked.partition.clone(),
                 tracked.nodelist.clone(),
                 tracked.user.clone(),
@@ -10253,7 +10284,7 @@ impl SlurmAgent for AgentService {
                             host_device_plan = self
                                 .resolve_host_device_plan(
                                     init.job_id,
-                                    &gpu_devices,
+                                    &job_devices,
                                     entry.uid,
                                     entry.gid,
                                 )
@@ -10261,18 +10292,14 @@ impl SlurmAgent for AgentService {
                             None
                         }
                         StepContainerPlan::Fresh(c) => {
-                            let (gpu_env, container_device_plan) = if gpu_devices.is_empty() {
+                            let (gpu_env, container_device_plan) = if job_devices.is_empty() {
                                 (HashMap::new(), None)
                             } else {
                                 let (host_plan, container_plan) = self
                                     .device_registry
                                     .lock()
                                     .await
-                                    .build_job_injection_plans(
-                                        &gpu_selection(&gpu_devices),
-                                        entry.uid,
-                                        entry.gid,
-                                    )
+                                    .build_job_injection_plans(&job_devices, entry.uid, entry.gid)
                                     .map_err(|e| {
                                         Status::failed_precondition(format!(
                                             "GPU injection plan failed: {e}"
@@ -10308,7 +10335,7 @@ impl SlurmAgent for AgentService {
                                 self.allow_root_jobs,
                                 c,
                                 FreshContainerContext {
-                                    gpu_devices: gpu_devices.clone(),
+                                    gpu_devices: job_devices.gpus().to_vec(),
                                     device_plan: container_device_plan,
                                     uid: entry.uid,
                                     gid: entry.gid,
@@ -10357,7 +10384,7 @@ impl SlurmAgent for AgentService {
                         cpus,
                         memory_mb,
                         memory_ceiling_mb,
-                        gpu_devices,
+                        devices: job_devices,
                         cpu_ids: Vec::new(),
                         open_mode: None,
                         uid: entry.uid,
@@ -10878,22 +10905,22 @@ impl AgentService {
     }
 
     /// Host-side device injection plan for a launch that has no container of
-    /// its own. `None` for a zero-GPU launch (an empty plan either way).
+    /// its own. `None` for a launch holding no devices (an empty plan either way).
     async fn resolve_host_device_plan(
         &self,
         job_id: u32,
-        gpu_devices: &[u64],
+        devices: &spur_devices::DeviceSelection,
         uid: u32,
         gid: u32,
     ) -> Result<Option<spur_devices::inject::HostInjectionPlan>, Status> {
-        if gpu_devices.is_empty() {
+        if devices.is_empty() {
             return Ok(None);
         }
         let (host_plan, _) = self
             .device_registry
             .lock()
             .await
-            .build_job_injection_plans(&gpu_selection(gpu_devices), uid, gid)
+            .build_job_injection_plans(devices, uid, gid)
             .map_err(|e| {
                 error!(job_id, error = %e, "device registry resolution failed");
                 Status::failed_precondition(format!("device resolution failed: {}", e))
@@ -10992,15 +11019,15 @@ impl AgentService {
             gpu_binding: tracked.gpu_binding.clone(),
             ..Default::default()
         };
-        allocation.devices.insert(
-            "gpu".into(),
-            tracked
-                .gpu_devices
-                .iter()
-                .copied()
-                .map(spur_core::resource::AllocatedDevice::injectable)
-                .collect(),
-        );
+        for (gres, ids) in tracked.devices.iter() {
+            allocation.devices.insert(
+                gres.to_string(),
+                ids.iter()
+                    .copied()
+                    .map(spur_core::resource::AllocatedDevice::injectable)
+                    .collect(),
+            );
+        }
         crate::reporter::allocations_to_proto(&allocation)
     }
 
@@ -11019,12 +11046,10 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+    ) -> Result<(AllocationResult, spur_devices::DeviceSelection), Status> {
         self.ensure_node_cleanup_ready()?;
-        let controller_gpu_ids: Vec<u64> = allocated
-            .and_then(|a| a.devices.get("gpu"))
-            .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
-            .unwrap_or_default();
+        let selection = allocated_selection(allocated, &*self.device_registry.lock().await);
+        let controller_gpu_ids = selection.gpus().to_vec();
 
         let (gres_gpu_count, gres_gpu_type) = Self::parse_gpu_gres(&spec.gres);
 
@@ -11172,8 +11197,21 @@ impl AgentService {
             }
         };
 
-        let gpu_ids = controller_gpu_ids;
-        Ok((result, gpu_ids))
+        // Under the same lock as the reservation, so two dispatches naming one
+        // device cannot both pass; a refused claim must not leave this one held.
+        if let Err(error) = alloc.claim_devices(job_id, run_attempt, &selection.excluding("gpu")) {
+            alloc.release_job_if(job_id, run_attempt);
+            let AllocError::DevicesUnavailable { gres } = error else {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} lost its reservation while claiming devices"
+                )));
+            };
+            warn!(job_id, %gres, "rejecting dispatch: controller-allocated devices already held");
+            return Err(Status::resource_exhausted(format!(
+                "controller-allocated {gres} devices unavailable on this node"
+            )));
+        }
+        Ok((result, selection))
     }
 
     /// Resolve the per-node budget the way `launch_job` does, then reserve, so
@@ -11184,7 +11222,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+    ) -> Result<(AllocationResult, spur_devices::DeviceSelection), Status> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -12248,7 +12286,7 @@ impl TrackedJob {
             gid: 0,
             user: "testuser".into(),
             partition: String::new(),
-            gpu_devices: Vec::new(),
+            devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
             fabric_binding: None,
             gpu_binding: None,
             cpus: 1,
@@ -12594,7 +12632,10 @@ mod tests {
     ) -> crate::stepd::StepdDescriptor {
         let mut session = session_for(run_attempt, step_id);
         session.uid = 1000 + run_attempt;
-        session.resources.gpu_devices = vec![u64::from(run_attempt)];
+        session
+            .resources
+            .devices
+            .set("gpu", vec![u64::from(run_attempt)]);
         session.resources.cpus = run_attempt;
         session
     }
@@ -12618,7 +12659,7 @@ mod tests {
                 (
                     tracked.run_attempt,
                     tracked.uid,
-                    tracked.gpu_devices.clone(),
+                    tracked.devices.gpus().to_vec(),
                     tracked.cpus
                 ),
                 (2, 1002, vec![2], 2),
@@ -16960,6 +17001,134 @@ mod tests {
         assert_eq!(service.stepd_state_dir, configured);
     }
 
+    fn gpu_selection(gpu_ids: &[u64]) -> spur_devices::DeviceSelection {
+        spur_devices::DeviceSelection::new().with("gpu", gpu_ids.to_vec())
+    }
+
+    /// GPUs on renderD128-129 and NICs on uverbs0-1, all from GRES `File=`.
+    fn test_gpu_and_nic_registry() -> DeviceRegistry {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let gres = vec![
+            GresEntry {
+                name: "gpu".into(),
+                r#type: Some("mi300x".into()),
+                file: Some("/dev/dri/renderD[128-129]".into()),
+                flags: vec!["amd_gpu_env".into()],
+                ..Default::default()
+            },
+            GresEntry {
+                name: "nic".into(),
+                r#type: Some("pollara400".into()),
+                file: Some("/dev/infiniband/uverbs[0-1]".into()),
+                ..Default::default()
+            },
+        ];
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&CdiCache::new(), &GresCache::from_entries(&gres));
+        reg
+    }
+
+    fn nic_dispatch(nic: u64) -> (JobSpec, ResourceAllocations) {
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["nic:1".into()],
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            devices: [(
+                "nic".to_string(),
+                DeviceAllocations {
+                    devices: vec![AllocatedDevice {
+                        device_id: nic,
+                        count: 1,
+                    }],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        (spec, allocated)
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_naming_a_nic_another_job_holds_is_refused() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (spec, allocated) = nic_dispatch(1);
+        let (_, held) = svc
+            .allocate_local_for_test(100, &spec, Some(&allocated))
+            .await
+            .expect("the first job takes the NIC");
+        assert_eq!(held.of("nic"), &[1]);
+
+        let refused = svc
+            .allocate_local_for_test(101, &spec, Some(&allocated))
+            .await
+            .expect_err("a second job must not get the same NIC");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(101),
+            None,
+            "the refused dispatch must not keep its reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_nic_reaches_the_host_injection_plan() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_and_nic_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (spec, allocated) = nic_dispatch(1);
+        let (_, devices) = svc
+            .allocate_local_for_test(100, &spec, Some(&allocated))
+            .await
+            .unwrap();
+        let plan = svc
+            .resolve_host_device_plan(100, &devices, 0, 0)
+            .await
+            .unwrap()
+            .expect("a NIC-only job still gets a plan");
+        assert_eq!(plan.device_paths, vec!["/dev/infiniband/uverbs1"]);
+        assert!(!plan.env.contains_key("ROCR_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn a_launch_injects_only_the_kinds_this_node_can_inject() {
+        let held = |ids: &[(u64, u64)]| DeviceAllocations {
+            devices: ids
+                .iter()
+                .map(|&(device_id, count)| AllocatedDevice { device_id, count })
+                .collect(),
+        };
+        let allocated = ResourceAllocations {
+            devices: [
+                ("gpu".to_string(), held(&[(0, 1)])),
+                ("nic".to_string(), held(&[(1, 1)])),
+                ("bandwidth:lustre".to_string(), held(&[(0, 64)])),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let selection = super::allocated_selection(Some(&allocated), &test_gpu_and_nic_registry());
+        assert_eq!(
+            selection,
+            spur_devices::DeviceSelection::new()
+                .with("gpu", vec![0])
+                .with("nic", vec![1])
+        );
+    }
+
     fn test_gpu_registry() -> DeviceRegistry {
         use spur_devices::cdi::cache::CdiCache;
         use spur_devices::{GresCache, GresEntry};
@@ -17651,7 +17820,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             memory_ceiling_mb: 0,
-            gpu_devices: Vec::new(),
+            devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
             cpu_ids: Vec::new(),
             open_mode: None,
             uid: 1000,
@@ -17812,7 +17981,7 @@ mod tests {
             cpus: 8,
             memory_mb: 4096,
             memory_ceiling_mb: 0,
-            gpu_devices: vec![2, 3],
+            devices: spur_devices::DeviceSelection::new().with("gpu", vec![2, 3]),
             cpu_ids: vec![0, 1, 2, 3, 4, 5, 6, 7],
             partition: "gpu".into(),
             nodelist: "node-a,node-b".into(),
@@ -17824,7 +17993,7 @@ mod tests {
 
         let jobs = running.lock().await;
         let adopted = jobs.get(&78).expect("adopted");
-        assert_eq!(adopted.gpu_devices, vec![2, 3]);
+        assert_eq!(adopted.devices.gpus().to_vec(), vec![2, 3]);
         assert_eq!(adopted.cpus, 8);
         assert_eq!(adopted.memory_mb, 4096);
         assert_eq!(adopted.partition, "gpu");
@@ -20634,7 +20803,7 @@ mod tests {
                 .allocated_gpu_ids()
                 .is_empty());
             let mut tracked = TrackedJob::allocation_only(None);
-            tracked.gpu_devices = vec![42];
+            tracked.devices.set("gpu", vec![42]);
             tracked.gpu_binding = Some(binding);
             let step = service
                 .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
@@ -20648,7 +20817,7 @@ mod tests {
         let (service, binding, _) = gpu_dispatch_fixture();
         let mut descriptor = gated_descriptor(501, 1, spur_core::step::STEP_BATCH);
         descriptor.resources.gpu_binding = Some(binding);
-        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.devices.set("gpu", vec![42]);
         service
             .stepds
             .lock()
@@ -20677,7 +20846,7 @@ mod tests {
             "/tmp/unused.sock".into(),
             std::path::PathBuf::new(),
         );
-        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.devices.set("gpu", vec![42]);
         descriptor.resources.gpu_binding = Some(binding.clone());
         let restored = serde_json::from_str(&serde_json::to_string(&descriptor).unwrap()).unwrap();
         recover_stepds(&service.running, vec![restored]).await;
@@ -20736,7 +20905,7 @@ mod tests {
             .allocated_gpu_ids()
             .is_empty());
         let mut tracked = TrackedJob::allocation_only(None);
-        tracked.gpu_devices = vec![42];
+        tracked.devices.set("gpu", vec![42]);
         tracked.fabric_binding = Some(binding);
         assert!(service
             .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
@@ -20830,7 +20999,7 @@ mod tests {
             .unwrap();
         service.allocation.lock().await.release_job(501);
         let mut tracked = TrackedJob::allocation_only(None);
-        tracked.gpu_devices = vec![42];
+        tracked.devices.set("gpu", vec![42]);
         tracked.fabric_binding = Some(binding);
         let step = AgentService::tracked_allocation(&tracked);
         std::fs::write(&path, "# reordered\nNodes=test-node BlockName=a\n").unwrap();
@@ -20898,7 +21067,7 @@ mod tests {
         service.reporter.update_resources(live.clone());
         binding.members[0].device.stable_id = 1;
         let mut tracked = TrackedJob::dummy(0);
-        tracked.gpu_devices = vec![1];
+        tracked.devices.set("gpu", vec![1]);
         tracked.fabric_binding = Some(binding);
         service.insert_test_job(901, tracked).await;
         let step = || {
@@ -20978,7 +21147,7 @@ mod tests {
         let (service, binding, _) = fabric_dispatch_fixture();
         let mut descriptor = gated_descriptor(501, 1, spur_core::step::STEP_BATCH);
         descriptor.resources.fabric_binding = Some(binding);
-        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.devices.set("gpu", vec![42]);
         service
             .stepds
             .lock()
@@ -21007,7 +21176,7 @@ mod tests {
             "/tmp/unused.sock".into(),
             std::path::PathBuf::new(),
         );
-        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.devices.set("gpu", vec![42]);
         descriptor.resources.fabric_binding = Some(binding.clone());
         let encoded = serde_json::to_string(&descriptor).unwrap();
         let restored = serde_json::from_str(&encoded).unwrap();
@@ -22498,7 +22667,7 @@ mod tests {
 
         let job_id = 700;
         let mut tracked = TrackedJob::dummy(0);
-        tracked.gpu_devices = vec![0, 1];
+        tracked.devices.set("gpu", vec![0, 1]);
         tracked.partition = "gpu".into();
         tracked.cpus = 8;
         tracked.memory_mb = 16384;
@@ -23255,7 +23424,10 @@ mod tests {
             Arc::new(Mutex::new(test_gpu_registry())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let plan = svc.resolve_host_device_plan(700, &[], 0, 0).await.unwrap();
+        let plan = svc
+            .resolve_host_device_plan(700, &spur_devices::DeviceSelection::new(), 0, 0)
+            .await
+            .unwrap();
         assert!(plan.is_none());
     }
 
@@ -23271,7 +23443,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         let plan = svc
-            .resolve_host_device_plan(700, &[0, 1], 0, 0)
+            .resolve_host_device_plan(700, &gpu_selection(&[0, 1]), 0, 0)
             .await
             .unwrap()
             .expect("a non-empty gpu_devices list must produce a host device plan");
@@ -23715,7 +23887,7 @@ mod tests {
             gid: 0,
             user: "testuser".into(),
             partition: String::new(),
-            gpu_devices: Vec::new(),
+            devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
             cpus: 1,
             memory_mb: 0,
             memory_ceiling_mb: 0,
@@ -25166,7 +25338,7 @@ mod tests {
                 gid: 0,
                 user: "testuser".into(),
                 partition: String::new(),
-                gpu_devices: Vec::new(),
+                devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -25719,7 +25891,7 @@ mod tests {
                 gid: 0,
                 user: "testuser".into(),
                 partition: String::new(),
-                gpu_devices: Vec::new(),
+                devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -25809,7 +25981,7 @@ mod tests {
                 gid: 0,
                 user: "testuser".into(),
                 partition: String::new(),
-                gpu_devices: Vec::new(),
+                devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
                 cpus: 1,
                 memory_mb: 0,
                 memory_ceiling_mb: 0,
@@ -26090,6 +26262,7 @@ mod tests {
 
     fn completed_job(job_id: u32, cgroup: std::path::PathBuf) -> CompletedJob {
         CompletedJob {
+            gpu_devices: Vec::new(),
             job_id,
             exit_code: 0,
             signal: 0,
@@ -26100,7 +26273,6 @@ mod tests {
             uid: 0,
             gid: 0,
             partition: String::new(),
-            gpu_devices: Vec::new(),
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
@@ -26315,7 +26487,7 @@ mod tests {
             descriptor.resources = crate::stepd::StepdJobResources {
                 cpus: cpu_ids.len() as u32,
                 memory_mb: 1024,
-                gpu_devices: vec![gpu],
+                devices: spur_devices::DeviceSelection::new().with("gpu", vec![gpu]),
                 cpu_ids,
                 ..Default::default()
             };
@@ -26441,7 +26613,7 @@ mod tests {
         descriptor.resources = crate::stepd::StepdJobResources {
             cpus: 2,
             memory_mb: 1024,
-            gpu_devices: vec![0, 1],
+            devices: spur_devices::DeviceSelection::new().with("gpu", vec![0, 1]),
             cpu_ids: vec![0, 1],
             ..Default::default()
         };
@@ -26466,7 +26638,7 @@ mod tests {
             .load_descriptor(&session_dir)
             .expect("reload rewritten descriptor");
         assert_eq!(
-            reloaded.resources.gpu_devices,
+            reloaded.resources.devices.gpus().to_vec(),
             vec![0x0063_0000, 0x0083_0000]
         );
     }
@@ -26697,7 +26869,7 @@ mod tests {
         descriptor.resources = crate::stepd::StepdJobResources {
             cpus: 2,
             memory_mb: 1024,
-            gpu_devices: vec![1],
+            devices: spur_devices::DeviceSelection::new().with("gpu", vec![1]),
             cpu_ids: vec![2, 3],
             ..Default::default()
         };
@@ -26830,7 +27002,7 @@ mod tests {
             batch.resources = crate::stepd::StepdJobResources {
                 cpus: 2,
                 memory_mb: 1024,
-                gpu_devices: vec![0],
+                devices: spur_devices::DeviceSelection::new().with("gpu", vec![0]),
                 cpu_ids: vec![2, 3],
                 ..Default::default()
             };
@@ -26883,7 +27055,7 @@ mod tests {
         batch.resources = crate::stepd::StepdJobResources {
             cpus: 2,
             memory_mb: 1024,
-            gpu_devices: vec![0],
+            devices: spur_devices::DeviceSelection::new().with("gpu", vec![0]),
             cpu_ids: vec![0, 1],
             ..Default::default()
         };
@@ -26923,7 +27095,7 @@ mod tests {
         descriptor.resources = crate::stepd::StepdJobResources {
             cpus: 2,
             memory_mb: 1024,
-            gpu_devices,
+            devices: spur_devices::DeviceSelection::new().with("gpu", gpu_devices),
             cpu_ids: vec![2, 3],
             ..Default::default()
         };
@@ -26958,7 +27130,10 @@ mod tests {
         let reloaded = store
             .load_descriptor(&store.session_dir(930, 1, spur_core::step::STEP_BATCH))
             .expect("reload renamed descriptor");
-        assert_eq!(reloaded.resources.gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            reloaded.resources.devices.gpus().to_vec(),
+            vec![partition_sid(0x11, 1)]
+        );
     }
 
     // The job is still running on this node's cores and memory whether or not
@@ -27008,7 +27183,10 @@ mod tests {
 
         let running = svc.running.lock().await;
         let tracked = &running[&932];
-        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            tracked.devices.gpus().to_vec(),
+            vec![partition_sid(0x11, 1)]
+        );
         let allocation = AgentService::tracked_allocation(tracked);
         let gpus: Vec<u64> = allocation.devices["gpu"]
             .devices
@@ -27161,7 +27339,10 @@ mod tests {
         let reloaded = store
             .load_descriptor(&store.session_dir(961, 1, spur_core::step::STEP_BATCH))
             .expect("reload descriptor");
-        assert_eq!(reloaded.resources.gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            reloaded.resources.devices.gpus().to_vec(),
+            vec![partition_sid(0x11, 1)]
+        );
     }
 
     // A refresh can rename the ledger while a launch sits between its
@@ -27191,14 +27372,20 @@ mod tests {
         let renamed = commit_reservation(&mut allocation, 970, 1, &requested)
             .expect("the reservation is still held");
         let mut tracked = TrackedJob::allocation_only(None);
-        tracked.gpu_devices = requested.clone();
+        tracked.devices.set("gpu", requested.clone());
         follow_ledger_renames(state.path(), &mut tracked, &renamed);
 
-        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x12, 0), new]);
+        assert_eq!(
+            tracked.devices.gpus().to_vec(),
+            vec![partition_sid(0x12, 0), new]
+        );
         let reloaded = store
             .load_descriptor(&store.session_dir(970, 1, spur_core::step::STEP_BATCH))
             .expect("reload descriptor");
-        assert_eq!(reloaded.resources.gpu_devices, tracked.gpu_devices);
+        assert_eq!(
+            reloaded.resources.devices.gpus().to_vec(),
+            tracked.devices.gpus().to_vec()
+        );
         assert_eq!(
             commit_reservation(&mut allocation, 970, 2, &requested),
             None
@@ -27222,14 +27409,17 @@ mod tests {
         let state = tempfile::tempdir().expect("runtime state directory");
         let old = (0x11 << 16) | (1 << 8);
         let mut tracked = TrackedJob::allocation_only(None);
-        tracked.gpu_devices = vec![old];
+        tracked.devices.set("gpu", vec![old]);
         tracked.gpu_binding = Some(bound_gpu(old));
         follow_ledger_renames(
             state.path(),
             &mut tracked,
             &HashMap::from([(old, partition_sid(0x11, 1))]),
         );
-        assert_eq!(tracked.gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            tracked.devices.gpus().to_vec(),
+            vec![partition_sid(0x11, 1)]
+        );
         assert_eq!(tracked.gpu_binding, Some(bound_gpu(partition_sid(0x11, 1))));
     }
 
@@ -27238,9 +27428,9 @@ mod tests {
         let running = new_running_jobs();
         let old = (0x11 << 16) | (1 << 8);
         let mut plain = TrackedJob::allocation_only(None);
-        plain.gpu_devices = vec![old, partition_sid(0x12, 0)];
+        plain.devices.set("gpu", vec![old, partition_sid(0x12, 0)]);
         let mut bound = TrackedJob::allocation_only(None);
-        bound.gpu_devices = vec![old];
+        bound.devices.set("gpu", vec![old]);
         bound.gpu_binding = Some(bound_gpu(old));
         running.lock().await.extend([(950, plain), (951, bound)]);
 
@@ -27248,10 +27438,13 @@ mod tests {
 
         let jobs = running.lock().await;
         assert_eq!(
-            jobs[&950].gpu_devices,
+            jobs[&950].devices.gpus().to_vec(),
             vec![partition_sid(0x11, 1), partition_sid(0x12, 0)]
         );
-        assert_eq!(jobs[&951].gpu_devices, vec![partition_sid(0x11, 1)]);
+        assert_eq!(
+            jobs[&951].devices.gpus().to_vec(),
+            vec![partition_sid(0x11, 1)]
+        );
         assert_eq!(
             jobs[&951].gpu_binding,
             Some(bound_gpu(partition_sid(0x11, 1)))
@@ -27286,7 +27479,9 @@ mod tests {
                 .load_descriptor(&store.session_dir(job_id, 1, spur_core::step::STEP_BATCH))
                 .expect("reload descriptor")
                 .resources
-                .gpu_devices
+                .devices
+                .gpus()
+                .to_vec()
         };
         assert_eq!(load(940), vec![partition_sid(0x11, 1)]);
         assert_eq!(load(941), vec![partition_sid(0x12, 0)]);

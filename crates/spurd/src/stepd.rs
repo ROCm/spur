@@ -44,8 +44,6 @@ pub struct StepdLaunchSpec {
     #[serde(default)]
     pub memory_ceiling_mb: u64,
     pub cpu_ids: Vec<u32>,
-    #[serde(default)]
-    pub gpu_devices: Vec<u64>,
     pub open_mode: Option<String>,
     pub uid: u32,
     pub gid: u32,
@@ -156,35 +154,97 @@ impl From<StepdMemlock> for spur_core::config::MemlockLimit {
 /// supervisor cannot derive it, and an agent that restarts has nowhere else to
 /// read it back from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StepdJobResourcesRepr", into = "StepdJobResourcesRepr")]
 pub struct StepdJobResources {
-    #[serde(default)]
     pub fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
-    #[serde(default)]
     pub gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
-    #[serde(default)]
     pub cpus: u32,
-    #[serde(default)]
     pub memory_mb: u64,
     /// The node's schedulable memory, for a typed step's ceiling check when
     /// `memory_mb` is 0; 0 = unknown. Persisted so a restart recovers it.
-    #[serde(default)]
     pub memory_ceiling_mb: u64,
-    #[serde(default)]
-    pub gpu_devices: Vec<u64>,
+    /// Every device the job holds, by kind, as stable ids.
+    pub devices: spur_devices::DeviceSelection,
     /// The exact cores, so a restart replays the binding the job is pinned to
     /// instead of re-deriving one that overlaps it.
-    #[serde(default)]
     pub cpu_ids: Vec<u32>,
-    #[serde(default)]
     pub partition: String,
-    #[serde(default)]
     pub nodelist: String,
-    #[serde(default)]
     pub mpi: String,
     /// What a numbered step narrows the job's share to. Its GPUs stay off-limits
     /// to other steps for as long as a descriptor carrying them is live.
-    #[serde(default)]
     pub step_limits: crate::step_resources::StepLimits,
+}
+
+/// The on-disk shape. `gpu_devices` is what agents before `devices` read and
+/// wrote; it is still written so a rolled-back agent sees the GPUs jobs hold.
+#[derive(Serialize, Deserialize)]
+struct StepdJobResourcesRepr {
+    #[serde(default)]
+    fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    #[serde(default)]
+    gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
+    #[serde(default)]
+    cpus: u32,
+    #[serde(default)]
+    memory_mb: u64,
+    #[serde(default)]
+    memory_ceiling_mb: u64,
+    #[serde(default)]
+    gpu_devices: Vec<u64>,
+    #[serde(default)]
+    devices: spur_devices::DeviceSelection,
+    #[serde(default)]
+    cpu_ids: Vec<u32>,
+    #[serde(default)]
+    partition: String,
+    #[serde(default)]
+    nodelist: String,
+    #[serde(default)]
+    mpi: String,
+    #[serde(default)]
+    step_limits: crate::step_resources::StepLimits,
+}
+
+impl From<StepdJobResourcesRepr> for StepdJobResources {
+    fn from(raw: StepdJobResourcesRepr) -> Self {
+        let mut devices = raw.devices;
+        if devices.gpus().is_empty() {
+            devices.set("gpu", raw.gpu_devices);
+        }
+        Self {
+            fabric_binding: raw.fabric_binding,
+            gpu_binding: raw.gpu_binding,
+            cpus: raw.cpus,
+            memory_mb: raw.memory_mb,
+            memory_ceiling_mb: raw.memory_ceiling_mb,
+            devices,
+            cpu_ids: raw.cpu_ids,
+            partition: raw.partition,
+            nodelist: raw.nodelist,
+            mpi: raw.mpi,
+            step_limits: raw.step_limits,
+        }
+    }
+}
+
+impl From<StepdJobResources> for StepdJobResourcesRepr {
+    fn from(r: StepdJobResources) -> Self {
+        Self {
+            fabric_binding: r.fabric_binding,
+            gpu_binding: r.gpu_binding,
+            cpus: r.cpus,
+            memory_mb: r.memory_mb,
+            memory_ceiling_mb: r.memory_ceiling_mb,
+            gpu_devices: r.devices.gpus().to_vec(),
+            devices: r.devices,
+            cpu_ids: r.cpu_ids,
+            partition: r.partition,
+            nodelist: r.nodelist,
+            mpi: r.mpi,
+            step_limits: r.step_limits,
+        }
+    }
 }
 
 impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
@@ -210,7 +270,6 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             memory_ceiling_mb: config.memory_ceiling_mb,
-            gpu_devices: config.gpu_devices.clone(),
             cpu_ids: config.cpu_ids.clone(),
             open_mode: config.open_mode.clone(),
             uid: config.uid,
@@ -242,7 +301,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
                 memory_ceiling_mb: config.memory_ceiling_mb,
-                gpu_devices: config.gpu_devices.clone(),
+                devices: config.devices.clone(),
                 cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
@@ -280,7 +339,7 @@ impl StepdLaunchSpec {
             cpus: self.cpus,
             memory_mb: self.memory_mb,
             memory_ceiling_mb: self.memory_ceiling_mb,
-            gpu_devices: self.gpu_devices,
+            devices: self.resources.devices.clone(),
             cpu_ids: self.cpu_ids,
             open_mode: self.open_mode,
             uid: self.uid,
@@ -2372,7 +2431,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         partition: launch_spec.partition.clone(),
         nodelist: launch_spec.nodelist.clone(),
         script_context: "epilog_slurmd".into(),
-        gpu_devices: launch_spec.gpu_devices.clone(),
+        gpu_devices: launch_spec.resources.devices.gpus().to_vec(),
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
@@ -2387,7 +2446,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         partition: launch_spec.partition.clone(),
         nodelist: launch_spec.nodelist.clone(),
         script_context: "epilog_task".into(),
-        gpu_devices: launch_spec.gpu_devices.clone(),
+        gpu_devices: launch_spec.resources.devices.gpus().to_vec(),
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
@@ -4163,12 +4222,46 @@ mod device_state_compat {
         "pty_step_id": null
     }"##;
 
+    fn gpu_and_nic_resources() -> super::StepdJobResources {
+        super::StepdJobResources {
+            devices: spur_devices::DeviceSelection::new()
+                .with("gpu", vec![0x110000])
+                .with("nic", vec![0x050000]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn job_resources_round_trip_every_device_kind() {
+        let resources = gpu_and_nic_resources();
+        let json = serde_json::to_string(&resources).unwrap();
+        let back: super::StepdJobResources = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resources);
+    }
+
+    #[test]
+    fn job_resources_still_write_the_gpus_an_older_agent_reads() {
+        let json = serde_json::to_value(gpu_and_nic_resources()).unwrap();
+        assert_eq!(json["gpu_devices"], serde_json::json!([0x110000]));
+    }
+
+    #[test]
+    fn a_descriptor_with_nics_and_gated_rdma_keeps_the_memory_ceiling() {
+        let resources = super::StepdJobResources {
+            memory_ceiling_mb: 4096,
+            ..gpu_and_nic_resources()
+        };
+        let json = serde_json::to_string(&resources).unwrap();
+        let back: super::StepdJobResources = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resources);
+    }
+
     #[test]
     fn a_descriptor_holding_gpus_from_an_older_build_keeps_them() {
         let d: StepdDescriptor =
             serde_json::from_str(FROZEN_GPU_DESCRIPTOR_JSON).expect("older descriptor.json");
 
-        assert_eq!(d.resources.gpu_devices, vec![0x110000, 0x120000]);
+        assert_eq!(d.resources.devices.gpus(), &[0x110000, 0x120000]);
         let binding = d
             .resources
             .gpu_binding
@@ -4187,7 +4280,7 @@ mod device_state_compat {
         let spec: StepdLaunchSpec =
             serde_json::from_str(FROZEN_GPU_LAUNCH_JSON).expect("older launch.json");
 
-        assert_eq!(spec.resources.gpu_devices, vec![0x110000, 0x120000]);
+        assert_eq!(spec.resources.devices.gpus(), &[0x110000, 0x120000]);
         let host = spec.host_device_plan.expect("the host plan must survive");
         assert_eq!(host.device_paths, vec!["/dev/dri/renderD128", "/dev/kfd"]);
         assert_eq!(
@@ -4609,7 +4702,6 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             memory_ceiling_mb: 0,
-            gpu_devices: Vec::new(),
             cpu_ids: Vec::new(),
             open_mode: None,
             uid: nix::unistd::geteuid().as_raw(),
@@ -4891,7 +4983,7 @@ mod tests {
     #[test]
     fn launch_spec_persists_gpu_injection_plan() {
         let mut spec = launch_spec();
-        spec.gpu_devices = vec![3, 7];
+        spec.resources.devices.set("gpu", vec![3, 7]);
         spec.host_device_plan = Some(spur_devices::inject::HostInjectionPlan {
             env: HashMap::from([("ROCR_VISIBLE_DEVICES".into(), "3,7".into())]),
             visible_devices: vec!["/dev/dri/renderD128".into()],
@@ -4901,7 +4993,7 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
                 .expect("decode launch spec");
         let config = restored.into_launch_config();
-        assert_eq!(config.gpu_devices, vec![3, 7]);
+        assert_eq!(config.devices.gpus().to_vec(), vec![3, 7]);
         assert_eq!(
             config
                 .host_device_plan
@@ -4917,7 +5009,7 @@ mod tests {
     #[test]
     fn a_steps_own_limits_survive_the_launch_spec_beside_its_jobs_share() {
         let mut config = launch_spec().into_launch_config();
-        config.gpu_devices = vec![3, 5, 7];
+        config.devices.set("gpu", vec![3, 5, 7]);
         config.step_limits = crate::step_resources::StepLimits {
             cpus: Some(2),
             memory_mb: Some(512),
@@ -4926,13 +5018,13 @@ mod tests {
         };
 
         let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
-        assert_eq!(spec.resources.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(spec.resources.devices.gpus().to_vec(), vec![3, 5, 7]);
         assert_eq!(spec.resources.step_limits, config.step_limits);
         let restored: StepdLaunchSpec =
             serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
                 .expect("decode launch spec");
         let restored = restored.into_launch_config();
-        assert_eq!(restored.gpu_devices, vec![3, 5, 7]);
+        assert_eq!(restored.devices.gpus().to_vec(), vec![3, 5, 7]);
         assert_eq!(restored.step_limits, config.step_limits);
     }
 
@@ -4999,7 +5091,7 @@ mod tests {
         let restored: StepdLaunchSpec =
             serde_json::from_value(serialized).expect("decode legacy launch spec");
         assert_eq!(restored.step_id, spur_core::step::STEP_BATCH);
-        assert!(restored.gpu_devices.is_empty());
+        assert!(restored.resources.devices.is_empty());
         assert!(restored.container.is_none());
         assert!(restored.host_device_plan.is_none());
         assert!(restored.container_rootfs_mode.is_none());
