@@ -296,14 +296,14 @@ release's step resources rather than let it silently ignore the carve-out:
 
 .. note::
 
-   A step with GPUs of its own reaches only those and the node's shared
-   infrastructure devices; a non-GPU device allocated to the job is not part of
-   its filter. The filter governs opening a device: it does not stop two
-   cooperating processes in different steps from handing an already-open
-   descriptor to each other over a Unix socket. The controller refuses a typed
-   step on a node whose ``spurd`` predates step shares, with "upgrade spurd on
-   <node>"; a job started before its node was upgraded cannot give a step
-   GPUs of its own.
+   A step with GPUs of its own reaches only those GPUs, every non-GPU device
+   allocated to the job (its NICs, for example), and the node's
+   shared infrastructure devices; only the GPUs are narrowed. The filter
+   governs opening a device: it does not stop two cooperating processes in
+   different steps from handing an already-open descriptor to each other over a
+   Unix socket. The controller refuses a typed step on a node whose ``spurd``
+   predates step shares, with "upgrade spurd on <node>"; a job started before
+   its node was upgraded cannot give a step GPUs of its own.
 
 The ``-N``/``-n`` defaults of 1 apply when ``srun`` submits a **new** job, not
 when it runs as a step inside ``salloc``/``sbatch``. Common options: ``--nodes``/
