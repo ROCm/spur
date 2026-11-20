@@ -2565,7 +2565,8 @@ converges to hardware changes without an agent restart — see
    * - ``auto_detect``
      - bool
      - ``true``
-     - Discover devices from sysfs (AMD GPUs via KFD) for every device kind
+     - Discover devices from sysfs (AMD GPUs via KFD, AMD Pollara AI NICs as
+       ``nic`` and their virtual functions as ``vnic``) for every device kind
        that has no on-disk CDI spec; an on-disk spec of one kind does not stop
        discovery of another. For a kind with an on-disk spec, only refresh
        topology for its matching AMD devices; see :doc:`fabric-observation`.
@@ -2910,6 +2911,18 @@ statistics.
        ``ROCR_VISIBLE_DEVICES`` to. Installing the filter needs ``CAP_BPF`` and
        ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``) — ``CAP_BPF`` alone is insufficient for a
        cgroup-device program; without them the job runs with no device isolation.
+   * - ``constrain_rdma_devices``
+     - bool
+     - ``true``
+     - Agent restart
+     - On a node that hands out RDMA devices per job (AI NICs, or a
+       ``[[devices.gres]]`` entry with files under ``/dev/infiniband/``), a job
+       can open those RDMA devices only if they are allocated to it; other
+       ``/dev/infiniband/`` nodes stay open. ``false`` keeps all of
+       ``/dev/infiniband/`` open to every job. The devices a job cannot open
+       are fixed when it starts. No effect
+       on other nodes, or with ``constrain_devices = false``, or when the device
+       filter cannot be installed (see ``required``). See :doc:`ai-nics`.
    * - ``extra_device_paths``
      - [string]
      - ``[]``
@@ -2986,6 +2999,8 @@ isolation boundary and worth knowing:
   ``/dev/infiniband/`` (RDMA verbs, for MPI and for NCCL or RCCL over InfiniBand),
   and the MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by
   path when the filter is built, so a node without that hardware grants nothing extra.
+  On a node that hands out RDMA devices per job, ``constrain_rdma_devices`` takes
+  those devices out of this set, so each comes only with an allocation.
 
 The vendor control nodes a GPU runtime initializes through — ``/dev/nvidiactl``,
 ``/dev/nvidia-uvm`` and the like — are **not** in this set. They reach a job through

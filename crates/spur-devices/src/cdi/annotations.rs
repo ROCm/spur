@@ -34,6 +34,13 @@ pub const TOPOLOGY: &str = "spur.amd.com/topology";
 
 pub const STABLE_ID: &str = "spur.amd.com/stable-id";
 
+/// Model of a non-GPU device; GPUs keep `GPU_TYPE`.
+pub const DEVICE_TYPE: &str = "spur.amd.com/device-type";
+
+pub const RDMA_DEVICE: &str = "spur.amd.com/rdma-device";
+
+pub const NETDEV: &str = "spur.amd.com/netdev";
+
 pub fn parse_link_type(s: &str) -> Option<LinkType> {
     match s.trim().to_lowercase().as_str() {
         "pcie" => Some(LinkType::Pcie),

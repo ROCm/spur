@@ -154,6 +154,22 @@ impl DeviceRegistry {
         Ok(build_injection_plans(&devices, job_uid, job_gid))
     }
 
+    /// RDMA device nodes jobs here get only by allocation, so a job that was
+    /// not allocated one can be denied it. Sorted for a stable launch spec.
+    pub fn allocation_gated_rdma_nodes(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|e| e.is_injectable())
+            .flat_map(|e| e.node_paths())
+            .filter(|path| path.starts_with("/dev/infiniband/"))
+            .map(str::to_owned)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Whether `key` (`name` or `name:type`) names one of this node's countable pools.
     pub fn has_countable_pool(&self, key: &str) -> bool {
         self.devices
@@ -254,6 +270,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         shared_edits: expanded.shared_edits.clone(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
         numa_node: None,
         cores: expanded.cores.clone(),
     }
@@ -274,6 +291,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         shared_edits: Default::default(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
         numa_node: None,
         cores: None,
     }
@@ -313,16 +331,6 @@ fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
 /// The CDI cache iterates in hash order, so the qualified name settles ties.
 fn sort_cdi_entries(entries: &mut [(String, DeviceEntry)]) {
     entries.sort_by(|(a_name, a), (b_name, b)| cdi_sort_key(a, b).then_with(|| a_name.cmp(b_name)));
-}
-
-fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
-    entry.is_injectable()
-        && entry_matches_gres_name(entry, gres_name)
-        && entry.stable_id == stable_id
-}
-
-fn primary_device_path(entry: &DeviceEntry) -> &str {
-    entry.node_paths().next().unwrap_or("")
 }
 
 enum Merge {
@@ -416,6 +424,16 @@ fn merge_targets<'a>(
         .map(|(path, _)| *path)
         .collect();
     MergeTargets { targets, dropped }
+}
+
+fn is_injectable_id(entry: &DeviceEntry, gres_name: &str, stable_id: u64) -> bool {
+    entry.is_injectable()
+        && entry_matches_gres_name(entry, gres_name)
+        && entry.stable_id == stable_id
+}
+
+fn primary_device_path(entry: &DeviceEntry) -> &str {
+    entry.node_paths().next().unwrap_or("")
 }
 
 const GRES_KIND: &str = "spur.internal/gres";
@@ -638,6 +656,36 @@ mod tests {
             .fold(DeviceSelection::new(), |sel, (gres, ids)| {
                 sel.with(gres, ids.to_vec())
             })
+    }
+
+    #[test]
+    fn only_the_rdma_nodes_the_registry_hands_out_are_gated() {
+        let gres = |name: &str, file: &str| GresEntry {
+            name: name.into(),
+            file: Some(file.into()),
+            ..Default::default()
+        };
+        let gated = |entries: &[GresEntry]| {
+            let mut reg = DeviceRegistry::new();
+            populate_registry(&mut reg, &CdiCache::new(), entries);
+            reg.allocation_gated_rdma_nodes()
+        };
+        assert!(gated(&[]).is_empty());
+        assert!(gated(&[gres("gpu", "/dev/dri/renderD128")]).is_empty());
+        assert!(gated(&[GresEntry {
+            name: "hca".into(),
+            count: Some(4),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }])
+        .is_empty());
+        assert_eq!(
+            gated(&[
+                gres("nic", "/dev/infiniband/uverbs[1-2]"),
+                gres("gpu", "/dev/dri/renderD128"),
+            ]),
+            ["/dev/infiniband/uverbs1", "/dev/infiniband/uverbs2"]
+        );
     }
 
     #[test]

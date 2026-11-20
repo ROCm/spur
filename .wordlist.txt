@@ -122,6 +122,7 @@ GrpWall
 handoff
 handoffs
 hardcoded
+HCAs
 Healthcheck
 hmac
 HMAC
@@ -401,6 +402,7 @@ unlaunched
 unschedulable
 unsets
 untrusted
+untyped
 upsert
 upserts
 UsageResetPeriod
@@ -426,3 +428,8 @@ WireGuard
 XCP
 yml
 zstd
+Pollara
+Pensando
+ionic
+uverbs
+HCA

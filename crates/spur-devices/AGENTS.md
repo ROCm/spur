@@ -15,8 +15,9 @@ src/
   pci.rs              -- PCI identity, stable-id encoding (BDF + partition rank), PCI host bridge lookup
   sysfs.rs            -- sysfs and /dev readers shared by every discovery (root-relative for fixtures)
   discovery/
-    mod.rs            -- discover_all_cdi(): every kind found on this host
+    mod.rs            -- discover_all_cdi() -> Discovery: specs of every kind found on this host, plus the NIC scan
     amd_gpu.rs        -- KFD-based AMD GPU auto-detection -> CdiSpec (discover_gpu_cdi)
+    amd_nic.rs        -- Pollara AI NICs (ionic + RDMA) from PCI sysfs -> amd.com/nic, amd.com/vnic, plus a NicScan of every function's outcome; NicLog reports only changes
   cdi/
     spec.rs           -- CDI spec data model (CdiSpec, CdiDevice, ContainerEdits, DeviceNode, Mount, Hook)
     cache.rs          -- CdiCache: load specs from /etc/cdi, /var/run/cdi, or in-memory
@@ -54,8 +55,10 @@ priority (same qualified name -> later dir wins).
 
 `CdiCache::load()` optionally runs auto-detection when `auto_detect` is true:
 live specs fill every kind with no on-disk spec, and only refresh topology for
-kinds that have one. `CdiCache::load_with()` takes the spec
-directories and live specs explicitly, so tests never read the host.
+kinds that have one. It then hands the NIC scan, narrowed to the kinds
+discovery supplied (`discovered_kinds()`), to the caller's `NicLog`.
+`CdiCache::load_with()` takes the spec directories and live specs explicitly,
+so tests never read the host.
 
 ## GPU auto-detection (discovery/amd_gpu.rs)
 

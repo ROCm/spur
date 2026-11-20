@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::cdi::annotations::DeviceMetadata;
+use crate::cdi::annotations::{self, DeviceMetadata};
 use crate::cdi::cache::CachedDevice;
 use crate::cdi::spec::{vendor_from_kind, ContainerEdits};
 use crate::inject::{gpu_visibility_for_vendor, InjectActions};
@@ -48,6 +48,8 @@ pub struct DeviceEntry {
     pub numa_node: Option<u32>,
     /// CPUs near the device (`[[devices.gres]] cores=`); feeds per-GPU core placement.
     pub cores: Option<Vec<u32>>,
+    /// RDMA device name (`ionic_0`) of a NIC, as NCCL and RCCL select HCAs by it.
+    pub rdma_device: Option<String>,
 }
 
 impl DeviceEntry {
@@ -99,9 +101,13 @@ pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
         gpu_visibility_vars,
     };
 
+    let annotation = |key: &str| cached.device.annotations.get(key).cloned();
     DeviceEntry {
         gres_name,
-        resource_type: meta.gpu_type.clone(),
+        resource_type: meta
+            .gpu_type
+            .clone()
+            .or_else(|| annotation(annotations::DEVICE_TYPE)),
         kind: cached.kind.clone(),
         device_id: 0,
         capability: DeviceCapability::Injectable,
@@ -113,6 +119,7 @@ pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
         shared_edits,
         topology: meta.topology,
         stable_id: meta.stable_id.unwrap_or(0),
+        rdma_device: annotation(annotations::RDMA_DEVICE),
         numa_node: meta.numa_node,
         cores: meta.cores,
     }
