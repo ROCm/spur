@@ -424,17 +424,29 @@ fn clean_inactive(
             }
             Ok(false) if Instant::now() >= deadline => Err(budget_exhausted()),
             Ok(false) if candidate.spool.kind == SpoolKind::Rootfs => {
+                // Checked before unmounting, so an unusable trash leaves the rootfs as it was.
+                let trash = match candidate.root.trash() {
+                    Ok(trash) => Arc::new(trash),
+                    Err(error) => {
+                        warn!(job_id, path = %path.display(), %error, "kept container rootfs: the trash is unusable");
+                        summary.errors += 1;
+                        continue;
+                    }
+                };
                 let mountinfo = paths.proc_root.join("self/mountinfo");
                 match unmount_rootfs(&candidate, &inventory.held, &mountinfo) {
                     Ok(Some((detached, spool))) => {
-                        match move_to_trash(&candidate.root, &spool) {
+                        match move_to_trash(&candidate.root, &spool, trash) {
                             Ok(trashed) => {
                                 info!(job_id, path = %path.display(), detached, trash = %trashed.path.display(), "queued orphan container rootfs for background deletion");
                                 summary.pending_rootfs.push(PendingRootfs(trashed));
                             }
                             Err(error) => {
                                 warn!(job_id, path = %path.display(), %error, "kept container rootfs: could not move it to the trash");
-                                summary.retained += 1;
+                                match kept_reason(&error) {
+                                    Some(_) => summary.retained += 1,
+                                    None => summary.errors += 1,
+                                }
                             }
                         }
                         continue;
@@ -471,8 +483,11 @@ fn clean_inactive(
 }
 
 // Freeing the job's path here, under its lock, keeps a relaunch from reusing the old tree.
-fn move_to_trash(root: &SpoolRoot, spool: &JobSpool) -> io::Result<Candidate> {
-    let trash = Arc::new(root.trash()?);
+fn move_to_trash(
+    root: &SpoolRoot,
+    spool: &JobSpool,
+    trash: Arc<SpoolRoot>,
+) -> io::Result<Candidate> {
     let spool = root.move_to(spool, &trash)?;
     Ok(Candidate {
         path: trash.entry_path(&spool),
@@ -525,7 +540,7 @@ pub(crate) async fn delete_pending_rootfs(pending: Vec<PendingRootfs>, stop: Arc
                 }
                 None => {
                     failed += 1;
-                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; the next start retries");
+                    warn!(job_id, path = %path.display(), %error, "failed to delete orphan container rootfs; will reconsider on next startup");
                 }
             },
             Err(error) => {

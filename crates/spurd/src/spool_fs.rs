@@ -519,14 +519,14 @@ impl SpoolRoot {
     pub(crate) fn move_to(&self, spool: &JobSpool, trash: &SpoolRoot) -> io::Result<JobSpool> {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         require_identity(&self.directory, &spool.name, &spool.metadata)?;
-        // The wall clock keeps names unique across restarts that reuse a pid.
-        let started = std::time::SystemTime::now()
+        // The counter restarts with the agent, so the time of the move keeps names unique across runs.
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let mut name = spool.name.clone();
         name.push(format!(
-            ".{started}.{}",
+            ".{now}.{}",
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         renameat2(
@@ -537,13 +537,16 @@ impl SpoolRoot {
             RenameFlags::RENAME_NOREPLACE,
         )?;
         if require_identity(&trash.directory, &name, &spool.metadata).is_err() {
-            let _ = renameat2(
+            if let Err(error) = renameat2(
                 &trash.directory,
                 name.as_os_str(),
                 &self.directory,
                 spool.name.as_os_str(),
                 RenameFlags::RENAME_NOREPLACE,
-            );
+            ) {
+                tracing::error!(job_id = spool.job_id, entry = ?name, root = %trash.path.display(), %error,
+                    "a changed entry could not be moved back out of the trash; the next start deletes it");
+            }
             return Err(io::Error::other(Kept(CHANGED)));
         }
         Ok(JobSpool {

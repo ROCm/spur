@@ -184,11 +184,11 @@ are removed once, each time ``spurd`` starts, before it accepts work:
   writable by group or others; otherwise ``skipped unsafe or unreadable spool
   root`` is logged and it is left alone.
 * The pass is skipped when ``[cgroup] enabled = false``; on a cgroup v1 host it
-  runs but removes nothing except leftover container trash. It stops after 60 seconds, keeping whatever it has
-  not decided, and the next start continues. Heartbeats run during the pass, so
-  a launch sent to the node in that window is refused and retried later,
-  possibly on the same node, and new steps of jobs already running there fail
-  until the pass ends.
+  runs but removes nothing except leftover container trash. It stops after 60
+  seconds, keeping whatever it has not decided, and the next start continues.
+  Heartbeats run during the pass, so a launch sent to the node in that window is
+  refused and retried later, possibly on the same node, and new steps of jobs
+  already running there fail until the pass ends.
 * ``spurd`` reads every process's environment, working directory and open
   files. Without ``CAP_SYS_PTRACE`` (for example in a container) these reads
   fail and nothing in the affected batch is removed; the agent logs
@@ -218,13 +218,13 @@ owned by the ``spurd`` user and not writable by group or others.
   ``step_<id>_<step>`` for a step. A named container (``--container-name``)
   whose name is exactly one of those forms is treated as that job's rootfs;
   other names outside ``spur:trash`` (below) are never touched.
-* The controller confirmation and the job checks above apply. As with spools,
-  a process whose working directory or open file is under the rootfs path, or
-  whose root directory is the rootfs, keeps it; a process in another mount namespace (such as the container
-  itself) is checked against its own mount table, and a bind mount of the
-  rootfs directory or anything under it on the same filesystem, in the agent's
-  or a running process's mount namespace, keeps it. A mount table that cannot be
-  read keeps every directory in the batch.
+* The controller confirmation and the job checks above apply. As with spools, a
+  process whose working directory or open file is under the rootfs path, or
+  whose root directory is the rootfs, keeps it; a process in another mount
+  namespace (such as the container itself) is checked against its own mount
+  table, and a bind mount of the rootfs directory or anything under it on the
+  same filesystem, in the agent's or a running process's mount namespace, keeps
+  it. A mount table that cannot be read keeps every directory in the batch.
 * Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
   ``merged``, or a mount on the directory itself) is unmounted first, without a
   lazy detach. If one stays mounted the directory is kept and ``kept container
@@ -239,18 +239,20 @@ owned by the ``spurd`` user and not writable by group or others.
   directory at a time, with no time limit, so a large image does not delay
   startup; until then it holds the disk space. Stopping ``spurd`` halts the
   deletion. The next start deletes whatever is left in the trash without asking
-  the controller, as long as the pass runs (cgroups enabled and the container
-  directory readable).
+  the controller, as long as the pass runs: cgroups enabled, and the container
+  directory passes the ownership check above and can be listed in time. An entry
+  moved after the 60-second budget ran out also waits for the next start.
 
 Container rootfs decisions are logged as ``retained container rootfs:
 <reason>``, ``retained locally owned container rootfs``, ``kept container
-rootfs: <reason>``, ``queued orphan container rootfs for background
-deletion``, ``deleting orphan container rootfs``, ``deleted orphan container
-rootfs`` or ``failed to delete orphan container rootfs; the next start
-retries``. A trash that is unsafe logs ``skipped unsafe or unreadable container
-trash`` and an entry in it that cannot be opened logs ``skipped unexpected
-container trash entry``. A finished background run logs ``background container
-rootfs cleanup finished deleted=<n> kept=<n> failed=<n>``.
+rootfs: <reason>``, ``queued orphan container rootfs for background deletion``,
+``deleting orphan container rootfs``, ``deleted orphan container rootfs`` or
+``failed to delete orphan container rootfs; will reconsider on next startup``. A
+trash that is unsafe logs ``kept container rootfs: the trash is unusable`` for
+each rootfs (left as it was) and ``skipped unsafe or unreadable container
+trash`` for its contents; an entry in it that cannot be opened logs ``skipped
+unexpected container trash entry``. A finished background run logs ``background
+container rootfs cleanup finished deleted=<n> kept=<n> failed=<n>``.
 
 Directories kept because the controller did not confirm them or the activity
 inventory was uncertain are logged with a count per batch of 128 job ids

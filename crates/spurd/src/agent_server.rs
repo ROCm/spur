@@ -4559,7 +4559,6 @@ impl Drop for RootfsCleanupHandle {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct SpoolOwnership {
     lifecycle: crate::job_lifecycle::JobLifecycle,
     running: RunningJobs,
@@ -5176,7 +5175,7 @@ impl AgentService {
         crate::startup_spool::run(self, self.job_spool_roots.clone(), paths).await
     }
 
-    /// What decides whether a job's on-disk state is still in use, detached for work after serving.
+    /// What decides whether a job's on-disk state is still in use.
     pub(crate) fn spool_ownership(&self) -> SpoolOwnership {
         SpoolOwnership {
             lifecycle: self.lifecycle.clone(),

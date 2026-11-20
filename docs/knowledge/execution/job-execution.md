@@ -461,13 +461,14 @@ descriptors per level, deletion one); deletion is depth-first, so a deeper tree
 may be partly removed before it is kept. A directory that keeps refilling is
 kept. Completion cleanup has its own 60-second budget. Traversal uses `openat2`
 where available and otherwise combines `openat` with no-follow opens and
-descriptor mount IDs. Deletion follows
-neither symlinks nor mount points and shares the per-job launch/teardown lock.
+descriptor mount IDs. Deletion follows neither symlinks nor mount points and
+shares the per-job launch/teardown lock, except for container rootfs trees
+already moved into the trash.
 One spool that cannot be walked or deleted does not hold back the others.
 
 Logs record deletions, retention reasons, errors and the final count. A failed
-or partial deletion is reconsidered on the next startup without a persistent
-retry queue.
+or partial deletion is reconsidered on the next startup; the container trash is
+the only persistent queue, deleted without asking the controller again.
 
 Unnamed container rootfs dirs (`job_<id>`, `step_<id>_<step>`, step ids from
 0) under `container::container_dir()` are candidates too, keyed by the same job
@@ -494,8 +495,8 @@ controller.
 Binds are matched only on the container dir's filesystem, so a bind of an
 overlay layer's subtree is not detected.
 
-This pass does not roll back failed launches or run epilogs. Deleting a spool does not establish epilog
-completion or change node-drain policy.
+This pass does not roll back failed launches or run epilogs. Deleting a spool
+does not establish epilog completion or change node-drain policy.
 
 ## 11. Common pitfalls
 

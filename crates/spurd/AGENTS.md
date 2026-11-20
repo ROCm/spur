@@ -172,8 +172,9 @@ src/
                       populated cgroup, or held by a process (/proc scan), then
                       deletes the rest. 60 s budget; any doubt keeps the dir.
                       Also unnamed container rootfs dirs (`job_<N>`,
-                      `step_<N>_<M>` in container_dir()): unmounted in the pass,
-                      then deleted by a background task after serving.
+                      `step_<N>_<M>` in container_dir()): unmounted and moved
+                      into `spur:trash` under the job lock in the pass; the
+                      trash is emptied by a background task after serving.
 
   spool_fs.rs         Descriptor-relative spool deletion shared by startup and
                       completion cleanup: follows symlinks only in the root path,
@@ -556,9 +557,10 @@ Inspired by Enroot.
   `/var/spool/spur/containers` > `$HOME/.spur/containers`). Normal teardown
   (`cleanup_rootfs`) removes them; leftovers from a crash are removed by the
   startup orphan pass, which unmounts layers first (no lazy detach), keeps a
-  rootfs held as a process root or bound from the container dir's filesystem
-  (per-namespace mountinfo), and moves it into `spur:trash` under the job lock
-  during the pass; the trash is emptied unlocked after the agent serves.
+  rootfs a process uses (cwd, open file or root) or that is bound from the
+  container dir's filesystem (per-namespace mountinfo), and moves it into
+  `spur:trash` under the job lock during the pass; the trash is emptied
+  unlocked after the agent serves.
 
 ---
 

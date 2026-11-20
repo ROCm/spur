@@ -1181,7 +1181,8 @@ async fn a_relaunch_after_startup_never_sees_the_old_rootfs() {
 #[tokio::test]
 async fn trash_left_by_an_interrupted_run_is_deleted_without_the_controller() {
     let controller = ControllerFixture::new(true);
-    spool_response(&controller, false, &[]);
+    spool_response(&controller, true, &[]);
+    controller.state.spool_fail_at.store(1, Ordering::SeqCst);
     let fixture = SpoolFixture::new(&controller, &[]);
     fixture.rootfs("job_1");
     let trash = fixture.containers().join(TRASH_NAME);
@@ -1220,7 +1221,7 @@ async fn an_unsafe_trash_is_never_used_and_its_rootfs_is_kept() {
         }
         let rootfs = fixture.rootfs("job_1");
         let summary = fixture.run_and_drain().await;
-        assert_eq!(summary.retained, 1, "{unsafe_trash}");
+        assert_eq!(summary.errors, 1, "{unsafe_trash}");
         assert!(
             rootfs.join("usr/lib/python3/site.py").is_file(),
             "{unsafe_trash}"
