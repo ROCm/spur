@@ -1190,6 +1190,7 @@ pub(crate) async fn preempt_unstarted(cluster: &Arc<ClusterManager>, pass: &mut 
         &unstarted,
         &pass.assignments,
         &cluster.config().scheduler,
+        &mut SearchBudget::default(),
         |job| limits.fits(job),
     )
     .await
@@ -1234,6 +1235,7 @@ pub(crate) async fn reclaim_unstarted(
         &state,
         &sched,
         &pass.assignments,
+        &mut SearchBudget::default(),
         |job| pass.limits.fits(job),
     )
     .await
@@ -1740,9 +1742,6 @@ async fn try_preempt_with_handoffs<'j>(
         .collect();
 
     for pending in unscheduled {
-        if !fits(pending) {
-            continue;
-        }
         let preemptor = *pending;
         let Some(prepared) = spur_sched::immediate::PlacementRequest::new(pending, state, budget)
         else {
@@ -1760,9 +1759,7 @@ async fn try_preempt_with_handoffs<'j>(
             if preemptor_awaiting_release(victim) != Some(pending.job_id) {
                 continue;
             }
-            let Some(overlaps) = prepared.scope().overlaps(victim, budget) else {
-                return None;
-            };
+            let overlaps = prepared.scope().overlaps(victim, budget)?;
             if overlaps {
                 waiting_on_release = true;
                 break;
@@ -1781,9 +1778,7 @@ async fn try_preempt_with_handoffs<'j>(
         // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
-            let Some(overlaps) = prepared.scope().overlaps(candidate, budget) else {
-                return None;
-            };
+            let overlaps = prepared.scope().overlaps(candidate, budget)?;
             if !overlaps {
                 continue;
             }
@@ -1824,7 +1819,7 @@ async fn try_preempt_with_handoffs<'j>(
             eligible.push((candidate, mode));
         }
         // Evicting for a job its limits would refuse at start preempts its victims for nothing.
-        if eligible.is_empty() || !fits(pending) {
+        if eligible.is_empty() || !fits(preemptor) {
             continue;
         }
 
@@ -2324,6 +2319,10 @@ fn reclaim_may_help(
 /// reclaimer sits under a QOS priority ceiling, and the eviction is always
 /// `Requeue`. Both prove the shortfall closes first (D2, §8.1), and reclaim only for a
 /// job that `fits` its limits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "search budget and start admission are independent constraints on the pass"
+)]
 pub(crate) async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],

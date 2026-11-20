@@ -1912,7 +1912,8 @@ async fn reclaim_without_borrowers_skips_snapshot_work() {
             &f.state(),
             &Default::default(),
             &[],
-            &mut budget
+            &mut budget,
+            |_| true,
         )
         .await,
         (Vec::new(), None)
