@@ -1507,7 +1507,7 @@ impl ClusterManager {
             |name| self.nodes.read().get(name).map(|node| node.source.clone()),
         )
         .map_err(SubmitError::invalid)?;
-        crate::script_placement::validate_script_placement_nodelist(&spec, |name| {
+        crate::script_placement::validate_batch_nodelist(&spec, |name| {
             self.nodes.read().get(name).map(|node| node.source.clone())
         })
         .map_err(SubmitError::invalid)?;
@@ -8044,7 +8044,7 @@ impl ClusterManager {
                 if needed <= partition_size && k8s_would_fit {
                     job_entry.set_pending_reason_desc(
                         PendingReason::BadConstraints,
-                        crate::script_placement::BATCH_HOST_K8S_UNSUPPORTED,
+                        crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED,
                     );
                     continue;
                 }
@@ -25412,7 +25412,7 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_batch_host_job_with_only_k8s_nodes_says_why_it_waits() {
+    async fn a_batch_job_with_only_k8s_nodes_says_why_it_waits() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "k1", 4, 8000);
@@ -25421,8 +25421,7 @@ state = "UP"
         let mut spec = basic_spec("driver");
         spec.num_nodes = 2;
         spec.num_tasks = 2;
-        spec.script = Some("#!/bin/bash\n./runner.sh\n".into());
-        spec.script_placement = Some(spur_core::script_placement::ScriptPlacement::BatchHost);
+        spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
         let job_id = submit_and_wait(&cm, spec);
         let snapshot = cm.get_job(job_id).unwrap();
 
@@ -25450,7 +25449,7 @@ state = "UP"
         assert_eq!(job.pending_reason, PendingReason::BadConstraints);
         assert_eq!(
             job.state_reason(),
-            crate::script_placement::BATCH_HOST_K8S_UNSUPPORTED
+            crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED
         );
     }
 

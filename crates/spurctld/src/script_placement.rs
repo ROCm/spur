@@ -9,8 +9,8 @@ use spur_core::job::JobSpec;
 use spur_core::node::{Node, NodeSource};
 use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
 
-pub const BATCH_HOST_K8S_UNSUPPORTED: &str =
-    "batch-host script placement is not supported on K8s virtual agents";
+pub const BATCH_SCRIPT_K8S_UNSUPPORTED: &str =
+    "batch scripts cannot run on K8s virtual agents, which launch only SpurJobs";
 
 /// Why a run cannot be dispatched with the placement it resolved to.
 #[derive(Debug, PartialEq, Eq)]
@@ -21,8 +21,8 @@ pub enum PlacementRefusal {
     Backoff(String),
 }
 
-/// Where a run's batch script runs on `nodes`. K8s virtual agents run a Pod per
-/// node and cannot host steps, so a run on them always places on every node.
+/// Where a run's batch script runs on `nodes`. K8s virtual agents launch only
+/// SpurJobs, which carry no script, so a batch run that includes one is refused.
 pub fn resolve_run_placement(
     spec: &JobSpec,
     nodes: &[Node],
@@ -33,16 +33,13 @@ pub fn resolve_run_placement(
     if !spec.is_batch() {
         return Ok(scanned);
     }
-    let resolved = if nodes.iter().any(Node::is_kubernetes) {
-        if spec.needs_native_nodes() {
-            return Err(PlacementRefusal::Hold(BATCH_HOST_K8S_UNSUPPORTED.into()));
-        }
-        ResolvedPlacement::AllNodes
-    } else {
-        spec.script_placement
-            .unwrap_or(cluster_default)
-            .resolve(script)
-    };
+    if nodes.iter().any(Node::is_kubernetes) {
+        return Err(PlacementRefusal::Hold(BATCH_SCRIPT_K8S_UNSUPPORTED.into()));
+    }
+    let resolved = spec
+        .script_placement
+        .unwrap_or(cluster_default)
+        .resolve(script);
     let outdated: Vec<&str> = nodes
         .iter()
         .filter(|node| node.reads_placement_off_script())
@@ -59,9 +56,9 @@ pub fn resolve_run_placement(
     Ok(resolved)
 }
 
-/// Reject at submit a job that needs native nodes when its `--nodelist` leaves too
-/// few: an additive list must all be used, and a candidate pool must hold enough.
-pub fn validate_script_placement_nodelist(
+/// Reject at submit a batch job whose `--nodelist` leaves too few native nodes: an
+/// additive list must all be used, and a candidate pool must hold enough.
+pub fn validate_batch_nodelist(
     spec: &JobSpec,
     node_source: impl Fn(&str) -> Option<NodeSource>,
 ) -> Result<(), String> {
@@ -85,7 +82,7 @@ pub fn validate_script_placement_nodelist(
         listed.len() - k8s < needed
     };
     if impossible {
-        return Err(BATCH_HOST_K8S_UNSUPPORTED.into());
+        return Err(BATCH_SCRIPT_K8S_UNSUPPORTED.into());
     }
     Ok(())
 }
@@ -176,39 +173,44 @@ mod tests {
     }
 
     #[test]
-    fn k8s_virtual_agents_run_the_script_on_every_node() {
-        let nodes = [k8s("k1"), k8s("k2")];
+    fn a_batch_run_that_includes_a_k8s_node_is_held() {
+        let held = Err(PlacementRefusal::Hold(BATCH_SCRIPT_K8S_UNSUPPORTED.into()));
 
         assert_eq!(
             resolve_run_placement(
                 &spec("srun ./train\n", None),
-                &nodes,
-                ScriptPlacement::BatchHost
+                &[current("n1"), k8s("k1")],
+                ScriptPlacement::Auto
             ),
-            Ok(ResolvedPlacement::AllNodes),
-            "neither the script nor the cluster default moves a K8s job to one node"
+            held
+        );
+        assert_eq!(
+            resolve_run_placement(
+                &spec("./train\n", None),
+                &[k8s("k1")],
+                ScriptPlacement::Auto
+            ),
+            held,
+            "even on one node"
         );
     }
 
     #[test]
-    fn an_explicit_batch_host_on_k8s_virtual_agents_is_held() {
-        let runner = |num_nodes| JobSpec {
-            num_nodes,
-            ..spec("./runner.sh\n", Some(ScriptPlacement::BatchHost))
+    fn a_spurjob_on_k8s_virtual_agents_runs_on_every_node() {
+        let spurjob = JobSpec {
+            argv: vec!["./train".into()],
+            num_nodes: 2,
+            ..Default::default()
         };
 
         assert_eq!(
             resolve_run_placement(
-                &runner(2),
-                &[current("n1"), k8s("k1")],
-                ScriptPlacement::Auto
+                &spurjob,
+                &[k8s("k1"), k8s("k2")],
+                ScriptPlacement::BatchHost
             ),
-            Err(PlacementRefusal::Hold(BATCH_HOST_K8S_UNSUPPORTED.into()))
-        );
-        assert_eq!(
-            resolve_run_placement(&runner(1), &[k8s("k1")], ScriptPlacement::Auto),
             Ok(ResolvedPlacement::AllNodes),
-            "on one node both placements run the script once"
+            "a SpurJob carries no script, so no placement applies to it"
         );
     }
 
@@ -268,33 +270,33 @@ mod tests {
             }),
             _ => Some(NodeSource::NativeHost),
         };
-        let pinned = |nodelist: &str, requested| JobSpec {
-            num_nodes: 2,
+        let pinned = |nodelist: &str, num_nodes| JobSpec {
+            num_nodes,
             nodelist: Some(nodelist.into()),
-            ..spec("./runner.sh\n", requested)
+            ..spec("./runner.sh\n", None)
         };
-        let check = |nodelist| {
-            validate_script_placement_nodelist(
-                &pinned(nodelist, Some(ScriptPlacement::BatchHost)),
-                source,
-            )
-        };
+        let check =
+            |nodelist, num_nodes| validate_batch_nodelist(&pinned(nodelist, num_nodes), source);
 
-        let rejected = Err(BATCH_HOST_K8S_UNSUPPORTED.to_string());
-        assert_eq!(check("k[1-2]"), rejected);
-        assert_eq!(check("k1,n1"), rejected, "a pool with one native node");
-        assert_eq!(check("k1"), rejected, "an additive list must use k1");
-        assert!(check("n1,n2").is_ok());
-        assert!(check("k1,n1,n2").is_ok(), "the pool holds two native nodes");
-        assert!(check("n1").is_ok(), "the rest may come from native nodes");
-        assert!(validate_script_placement_nodelist(&pinned("k1,k2", None), source).is_ok());
-        assert!(validate_script_placement_nodelist(
-            &JobSpec {
-                num_nodes: 1,
-                ..pinned("k1", Some(ScriptPlacement::BatchHost))
-            },
-            source
-        )
-        .is_ok());
+        let rejected = Err(BATCH_SCRIPT_K8S_UNSUPPORTED.to_string());
+        assert_eq!(check("k[1-2]", 2), rejected);
+        assert_eq!(check("k1,n1", 2), rejected, "a pool with one native node");
+        assert_eq!(check("k1", 2), rejected, "an additive list must use k1");
+        assert_eq!(check("k1", 1), rejected, "a single K8s node too");
+        assert!(check("n1,n2", 2).is_ok());
+        assert!(
+            check("k1,n1,n2", 2).is_ok(),
+            "the pool holds two native nodes"
+        );
+        assert!(
+            check("n1", 2).is_ok(),
+            "the rest may come from native nodes"
+        );
+        let spurjob = JobSpec {
+            script: None,
+            argv: vec!["./train".into()],
+            ..pinned("k1,k2", 2)
+        };
+        assert!(validate_batch_nodelist(&spurjob, source).is_ok());
     }
 }

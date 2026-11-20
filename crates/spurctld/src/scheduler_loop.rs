@@ -10740,9 +10740,8 @@ pub(crate) mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn process_assignment_holds_a_batch_host_job_placed_on_k8s_agents() {
+        async fn process_assignment_holds_a_batch_job_placed_on_k8s_agents() {
             use spur_core::job::{JobState, PendingReason};
-            use spur_core::script_placement::ScriptPlacement;
 
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
@@ -10751,9 +10750,7 @@ pub(crate) mod tests {
             register_k8s_node_at(&cm, "k1", k1);
             register_k8s_node_at(&cm, "k2", k2);
 
-            let mut spec = runner_spec("k8s-runner", 2);
-            spec.script_placement = Some(ScriptPlacement::BatchHost);
-            let job_id = submit_and_wait(&cm, spec);
+            let job_id = submit_and_wait(&cm, runner_spec("k8s-runner", 2));
 
             assert!(
                 !process_assignment(cm.clone(), assignment(job_id, &["k1", "k2"]), false).await

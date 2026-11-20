@@ -309,7 +309,7 @@ K8s E2E tests use the Python `kubernetes` client. `k8s_cluster.py` provides:
 |---|---|
 | `test_spurjob.py` | SpurJob CRD lifecycle (submit, complete, env passthrough, multi-node). |
 | `test_raft_ha.py` | Raft HA under K8s: leader election, pod restart recovery. |
-| `test_script_placement.py` | Script placement on K8s nodes, under a `batch-host` cluster default (overrides `cluster`): SpurJobs still run per node, and an explicit `batch-host` job is refused at submit when pinned to K8s nodes or waits with the reason otherwise. |
+| `test_script_placement.py` | Batch scripts on K8s nodes, under a `batch-host` cluster default (overrides `cluster`): SpurJobs still run per node, and a batch job is refused at submit when pinned to a K8s node or waits with the reason otherwise. |
 
 Constants: `SPUR_JOB_GROUP = "spur.amd.com"`, `SPUR_JOB_VERSION = "v1alpha1"`,
 `SPUR_JOB_PLURAL = "spurjobs"`. The operator image defaults to

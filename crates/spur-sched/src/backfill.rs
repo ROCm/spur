@@ -4596,42 +4596,37 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_batch_host_job_runs_on_native_nodes_beside_k8s_ones() {
+    fn a_driver_script_runs_on_older_native_agents_beside_a_k8s_node() {
         let mut nodes = make_nodes(3);
-        nodes[0].source = NodeSource::Kubernetes {
-            namespace: "spur".into(),
-        };
-        for node in &mut nodes[1..] {
-            node.capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
-        }
-        let runner = runner_job(1, 2, Some(ScriptPlacement::BatchHost));
-
-        let assignments = schedule_with_placement_default(&runner, &nodes, ScriptPlacement::Auto);
-        assert_eq!(assignments.len(), 1);
-        let mut placed = assignments[0].nodes.clone();
-        placed.sort();
-        assert_eq!(placed, ["node002", "node003"]);
-    }
-
-    #[test]
-    fn a_driver_script_that_can_reach_k8s_nodes_skips_older_agents() {
-        let mut nodes = make_nodes(2);
         nodes[0].source = NodeSource::Kubernetes {
             namespace: "spur".into(),
         };
         let mut driver = runner_job(1, 2, None);
         driver.spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
 
-        assert!(
-            schedule_with_placement_default(&driver, &nodes, ScriptPlacement::Auto).is_empty(),
-            "with node001 in the run node002 would hold instead of running the script"
-        );
+        let assignments = schedule_with_placement_default(&driver, &nodes, ScriptPlacement::Auto);
+        assert_eq!(assignments.len(), 1, "the two native nodes launch it alike");
+        let mut placed = assignments[0].nodes.clone();
+        placed.sort();
+        assert_eq!(placed, ["node002", "node003"]);
+    }
 
-        nodes[0].source = NodeSource::NativeHost;
-        assert_eq!(
-            schedule_with_placement_default(&driver, &nodes, ScriptPlacement::Auto).len(),
-            1
+    #[test]
+    fn a_batch_job_never_lands_on_a_k8s_node() {
+        let mut nodes = make_nodes(2);
+        nodes[0].source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+
+        assert!(
+            schedule_with_placement_default(&runner_job(1, 2, None), &nodes, ScriptPlacement::Auto)
+                .is_empty(),
+            "one native node is too few"
         );
+        let single =
+            schedule_with_placement_default(&runner_job(2, 1, None), &nodes, ScriptPlacement::Auto);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].nodes, ["node002"]);
     }
 
     #[test]
