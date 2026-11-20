@@ -45,3 +45,4 @@ subtrees:
               - file: developer/documentation
               - file: developer/contributing
               - file: developer/native-credential-mint
+              - file: developer/preemption-workflow
