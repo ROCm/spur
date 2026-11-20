@@ -92,6 +92,9 @@ pub enum WalOperation {
         /// changed anything.
         #[serde(default)]
         memory_adjustment: Option<MemoryAdjustment>,
+        /// Where the run's batch script runs. `None` in pre-upgrade entries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_placement: Option<crate::script_placement::ResolvedPlacement>,
         /// Stamped on the leader so a replay dates the run from the dispatch
         /// rather than from its own clock. `None` in pre-upgrade entries.
         #[serde(default)]
@@ -112,6 +115,10 @@ pub enum WalOperation {
         /// turn such a completion into the preemption outcome.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         controller_initiated: bool,
+        /// The exit signal a force-finish read from the deciding node's report.
+        /// Absent leaves the job's signal as it is, as older controllers do.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -535,6 +542,17 @@ pub enum WalOperation {
     NodeInventoryUpdate {
         inventory: crate::config::NodeInventory,
     },
+    /// One node's copy exited in a multi-node run whose script runs on every
+    /// node. Not a `JobNodeComplete`, so a controller that predates per-node
+    /// endings stops replicating instead of ending the run the old way.
+    JobCopyExited {
+        job_id: JobId,
+        node_name: String,
+        exit_code: i32,
+        signal: i32,
+        run_attempt: u32,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 impl WalOperation {
@@ -546,6 +564,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         }
     }
@@ -560,6 +579,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: true,
+            signal: None,
             at: None,
         }
     }
@@ -572,6 +592,7 @@ impl WalOperation {
             unreported_nodes: Vec::new(),
             cancel: Some(cancel),
             controller_initiated: false,
+            signal: None,
             at: None,
         }
     }
@@ -685,6 +706,7 @@ impl WalOperation {
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         }
     }
@@ -699,6 +721,7 @@ impl WalOperation {
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
+            | Self::JobCopyExited { at, .. }
             | Self::JobPreemptRequeue { at, .. }
             | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
@@ -750,6 +773,7 @@ impl WalOperation {
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
+            | Self::JobCopyExited { at, .. }
             | Self::JobPreemptRequeue { at, .. }
             | Self::JobPreemptCancel { at, .. }
             | Self::JobUserRequeue { at, .. }
@@ -1310,6 +1334,7 @@ mod tests {
             idle_fill: true,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1348,6 +1373,7 @@ mod tests {
             effective_partition: Some("cpu".into()),
             memory_adjustment: Some(adjustment),
             preemption_observation: Some(7),
+            resolved_placement: None,
             at: None,
         };
         let back: WalOperation =
@@ -1383,6 +1409,52 @@ mod tests {
                 assert_eq!(name, "cpu");
                 assert_eq!(resource_limits, None);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen JobStart entry from before script placement was recorded. Never regenerate.
+    #[test]
+    fn job_start_pre_script_placement_payload_still_deserializes() {
+        const JOB_START_PRE_PLACEMENT: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1,"idle_fill":false,"effective_partition":null,"memory_adjustment":null,"at":null}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_PLACEMENT)
+            .expect("pre-placement JobStart must deserialize");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                resolved_placement,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert_eq!(resolved_placement, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_resolved_placement_round_trips() {
+        let mut op = WalOperation::job_start(
+            9,
+            vec!["n1".into()],
+            ResourceAllocations::default(),
+            HashMap::new(),
+        );
+        if let WalOperation::JobStart {
+            resolved_placement, ..
+        } = &mut op
+        {
+            *resolved_placement = Some(crate::script_placement::ResolvedPlacement::BatchHost);
+        }
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::JobStart {
+                resolved_placement, ..
+            } => assert_eq!(
+                resolved_placement,
+                Some(crate::script_placement::ResolvedPlacement::BatchHost)
+            ),
             _ => panic!("wrong variant"),
         }
     }
@@ -1463,6 +1535,40 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_exit_is_its_own_stamped_entry() {
+        let mut op = WalOperation::JobCopyExited {
+            job_id: 7,
+            node_name: "n2".into(),
+            exit_code: 3,
+            signal: 0,
+            run_attempt: 2,
+            at: None,
+        };
+        let now = chrono::Utc::now();
+        op.stamp_occurred_at(now);
+        assert_eq!(op.occurred_at(), Some(now));
+
+        let json = serde_json::to_value(&op).unwrap();
+        assert!(
+            json.get("JobCopyExited").is_some(),
+            "an older controller must not read it as a JobNodeComplete: {json}"
+        );
+        match serde_json::from_value(json).unwrap() {
+            WalOperation::JobCopyExited {
+                job_id,
+                node_name,
+                exit_code,
+                run_attempt,
+                ..
+            } => assert_eq!(
+                (job_id, node_name.as_str(), exit_code, run_attempt),
+                (7, "n2", 3, 2)
+            ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn job_start_frozen_payload_still_deserializes() {
         const START: &str = r#"{"JobStart":{"job_id":7,"nodes":["n1"],"resources":{"cpus":2,"memory_mb":1000,"devices":{}}}}"#;
         let op: WalOperation = serde_json::from_str(START)
@@ -1513,6 +1619,7 @@ mod tests {
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         };
         op.stamp_occurred_at(at);
@@ -2379,6 +2486,28 @@ mod suspend_wal_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_job_complete_written_before_its_signal_existed_carries_none() {
+        let old = r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(op, WalOperation::JobComplete { signal: None, .. }));
+    }
+
+    #[test]
+    fn a_job_complete_with_a_signal_has_a_frozen_wire_form() {
+        let frozen = r#"{"JobComplete":{"job_id":5,"exit_code":0,"state":"FAILED","signal":9}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                exit_code: 0,
+                signal: Some(9),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
     }
 
     #[test]

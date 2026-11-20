@@ -1283,6 +1283,7 @@ Submitting Jobs
    #SBATCH --ntasks-per-node=8
    #SBATCH --gres=gpu:mi300x:8
    #SBATCH --time=4:00:00
+   #SBATCH --script-placement=all-nodes
 
    torchrun \
        --nnodes=$SPUR_NNODES \
@@ -1295,10 +1296,15 @@ Submitting Jobs
 
    spur submit train.sh
 
+The script starts one ``torchrun`` per node, so it asks to run on every node.
+Without ``--script-placement=all-nodes`` a cluster whose default is
+``batch-host`` would run it on the first node only, and ``torchrun`` would wait
+forever for the other ranks. See :ref:`submit-script-placement`.
+
 Environment Variables
 ---------------------
 
-Each node in a multi-node job receives:
+Each node that runs the script in a multi-node job receives:
 
 .. list-table::
    :header-rows: 1

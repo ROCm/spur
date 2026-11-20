@@ -664,6 +664,7 @@ impl ClusterManager {
             | WalOperation::JobStart { job_id, .. }
             | WalOperation::JobComplete { job_id, .. }
             | WalOperation::JobNodeComplete { job_id, .. }
+            | WalOperation::JobCopyExited { job_id, .. }
             | WalOperation::JobCancelSignaled { job_id, .. }
             | WalOperation::JobTimeLimitExpired { job_id, .. }
             | WalOperation::JobDispatchBackoff { job_id, .. }
@@ -788,6 +789,7 @@ impl ClusterManager {
             let after = jobs.get(&id).map(ObservedJob::from);
             let completed_node = match op {
                 WalOperation::JobNodeComplete { node_name, .. }
+                | WalOperation::JobCopyExited { node_name, .. }
                     if jobs
                         .get(&id)
                         .is_some_and(|job| job.node_completions.contains_key(node_name)) =>

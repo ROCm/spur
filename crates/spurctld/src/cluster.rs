@@ -110,6 +110,9 @@ pub enum NodeCompleteResult {
     /// Node recorded and freed, but the job is a preemption victim still inside
     /// its grace: it keeps running on the other nodes, which must be left alone.
     InGrace,
+    /// Node recorded and freed; its copy of a per-node script ended cleanly, so
+    /// the job keeps running on the other nodes, which must be left alone.
+    StillRunning,
     /// All allocated nodes have reported; job is now terminal.
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
@@ -870,7 +873,25 @@ fn epilog_hook_context(job_id: JobId, job: Option<&Job>) -> spur_core::hooks::Ho
     }
 }
 
-/// What a run is charged to, recorded with its placement.
+/// Whether each node runs its own copy of the run's script, whose exit stands on
+/// its own: a clean one leaves the others running and the first failure ends the
+/// run. salloc and native srun allocations run no script of their own.
+fn runs_per_node(job: &Job) -> bool {
+    job.script_placement() == spur_core::script_placement::ResolvedPlacement::AllNodes
+        && !job.srun_step_dispatch
+        && !job.spec.interactive
+}
+
+/// A node's exit that ends only its own copy, reported as `JobCopyExited`. A
+/// lone copy ends the run either way, so it keeps the entry older controllers read.
+fn ends_copy_by_copy(job: &Job) -> bool {
+    job.allocated_nodes.len() > 1
+        && job.state == JobState::Running
+        && job.preempt_grace().is_none()
+        && runs_per_node(job)
+}
+
+/// What a run is charged to and how it runs, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
     /// Started on spare capacity outside the QOS group node quota.
@@ -879,6 +900,8 @@ pub struct RunAttribution {
     pub effective_partition: Option<String>,
     /// The request as that partition's memory policy reshaped it.
     pub memory_adjustment: Option<spur_core::partition_limits::MemoryAdjustment>,
+    /// Where its batch script runs.
+    pub resolved_placement: Option<spur_core::script_placement::ResolvedPlacement>,
 }
 
 impl RunAttribution {
@@ -888,6 +911,7 @@ impl RunAttribution {
             idle_fill,
             effective_partition: assignment.partition.clone(),
             memory_adjustment: assignment.memory_adjustment,
+            resolved_placement: None,
         }
     }
 }
@@ -998,6 +1022,8 @@ struct PendingJobCandidate {
 pub struct JobEndFacts {
     pub unreported_nodes: Vec<String>,
     pub cancel: Option<CancelProvenance>,
+    /// The exit signal the deciding node reported; `None` keeps the job's.
+    pub signal: Option<i32>,
 }
 
 /// Who is asking to cancel a job, before the owner is known.
@@ -1493,6 +1519,10 @@ impl ClusterManager {
             spec.nodelist.as_deref(),
             |name| self.nodes.read().get(name).map(|node| node.source.clone()),
         )
+        .map_err(SubmitError::invalid)?;
+        crate::script_placement::validate_batch_nodelist(&spec, |name| {
+            self.nodes.read().get(name).map(|node| node.source.clone())
+        })
         .map_err(SubmitError::invalid)?;
 
         // Bound the spec before the hook forks/parses it; the hook only edits
@@ -3053,6 +3083,7 @@ impl ClusterManager {
             idle_fill: attribution.idle_fill,
             effective_partition: attribution.effective_partition,
             memory_adjustment: attribution.memory_adjustment,
+            resolved_placement: attribution.resolved_placement,
             at: None,
         })?;
         // The read-then-propose above is not atomic: a second reservation or a new
@@ -3294,7 +3325,7 @@ impl ClusterManager {
         signal: i32,
         run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
-        {
+        let copy_exit = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -3324,17 +3355,47 @@ impl ClusterManager {
                     node: node_name.to_string(),
                 });
             }
-        }
+            // A node's first report is its exit. A repeat is still answered, since
+            // it may be retrying what the first set off, such as stopping the rest.
+            if let Some(first) = job.node_completions.get(node_name) {
+                if (first.code, first.signal) != (exit_code, signal) {
+                    warn!(
+                        job_id,
+                        node = %node_name,
+                        exit_code,
+                        signal,
+                        first_exit_code = first.code,
+                        first_signal = first.signal,
+                        "ignoring a repeat completion report that contradicts the node's first"
+                    );
+                }
+                return Ok(Self::report_outcome(job));
+            }
+            ends_copy_by_copy(job)
+        };
 
-        let resp = self
-            .propose(WalOperation::JobNodeComplete {
+        let node_name = node_name.to_string();
+        let report = if copy_exit {
+            WalOperation::JobCopyExited {
                 job_id,
-                node_name: node_name.to_string(),
+                node_name,
                 exit_code,
                 signal,
                 run_attempt,
                 at: None,
-            })
+            }
+        } else {
+            WalOperation::JobNodeComplete {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+                run_attempt,
+                at: None,
+            }
+        };
+        let resp = self
+            .propose(report)
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
         self.run_all_finalized_side_effects(&resp);
@@ -3346,17 +3407,22 @@ impl ClusterManager {
         }
 
         let jobs = self.jobs.read();
-        let Some(job) = jobs.get(&job_id) else {
-            return Ok(NodeCompleteResult::Completing);
-        };
-        if job.state.is_terminal() {
-            return Ok(NodeCompleteResult::AlreadyTerminal);
-        }
-        if job.state == JobState::Running && job.preempt_grace().is_some() {
-            return Ok(NodeCompleteResult::InGrace);
-        }
+        Ok(jobs
+            .get(&job_id)
+            .map_or(NodeCompleteResult::Completing, Self::report_outcome))
+    }
 
-        Ok(NodeCompleteResult::Completing)
+    /// Where a run stands once a node has reported, for the reporter's follow-up.
+    fn report_outcome(job: &Job) -> NodeCompleteResult {
+        if job.state.is_terminal() {
+            NodeCompleteResult::AlreadyTerminal
+        } else if job.state == JobState::Running && job.preempt_grace().is_some() {
+            NodeCompleteResult::InGrace
+        } else if job.state == JobState::Running {
+            NodeCompleteResult::StillRunning
+        } else {
+            NodeCompleteResult::Completing
+        }
     }
 
     /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
@@ -3415,6 +3481,7 @@ impl ClusterManager {
             unreported_nodes: facts.unreported_nodes,
             cancel: facts.cancel,
             controller_initiated: false,
+            signal: facts.signal,
             at: None,
         })?;
         self.run_all_finalized_side_effects(&resp);
@@ -4830,7 +4897,7 @@ impl ClusterManager {
     /// live stable_id, so availability matching reads the held GPUs as free and
     /// churns dispatches for the job's lifetime. Correcting the per-job slice
     /// (not the aggregate blindly) keeps `alloc_resources` the exact sum of the
-    /// jobs' slices, so a later JobNodeComplete still balances.
+    /// jobs' slices, so a later node report still balances.
     ///
     /// Live-view convergence only: the WAL keeps the legacy ids, but every
     /// heartbeat re-applies the reported set, so it self-heals with no persisted
@@ -4884,7 +4951,7 @@ impl ClusterManager {
                 node.alloc_resources
                     .add(&ResourceAllocations::from_device_ids("gpu", &to_add));
             }
-            // Rewrite the job's slice so a later JobNodeComplete subtracts the
+            // Rewrite the job's slice so a later node report subtracts the
             // ids the job actually held, keeping the aggregate balanced.
             slice.devices.insert(
                 "gpu".to_string(),
@@ -5888,7 +5955,7 @@ impl ClusterManager {
                     matches!(
                         j.state,
                         JobState::Running | JobState::Completing | JobState::Suspended
-                    ) && j.allocated_nodes.iter().any(|n| n == name)
+                    ) && j.is_held_on(name)
                 })
                 .count() as u32;
             (node.state, count)
@@ -5913,8 +5980,8 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node that
-    /// already reported its part of a run is free. Shared by
+    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node whose
+    /// slice already went back is free. Shared by
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
@@ -6411,7 +6478,7 @@ impl ClusterManager {
                 }
                 if let Some(qos) = job.spec.qos.as_deref() {
                     *borrowed_by_qos.entry(qos.to_string()).or_insert(0) +=
-                        job.allocated_nodes.len() as u64;
+                        job.held_node_names().count() as u64;
                 }
             }
             let ledger = QuotaLedger::from_jobs(jobs.values());
@@ -7966,6 +8033,18 @@ impl ClusterManager {
                     .iter()
                     .filter(|n| placement.in_partition(n))
                     .count();
+                let k8s_would_fit = job.spec.needs_native_nodes()
+                    && cluster_state.nodes.iter().any(|n| {
+                        n.is_kubernetes()
+                            && placement.eligible_on_any_agent(n, cluster_state.reservations, now)
+                    });
+                if needed <= partition_size && k8s_would_fit {
+                    job_entry.set_pending_reason_desc(
+                        PendingReason::BadConstraints,
+                        crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED,
+                    );
+                    continue;
+                }
 
                 job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
@@ -8628,6 +8707,23 @@ impl ClusterManager {
         }
     }
 
+    /// Return one node's slice of a running job to that node.
+    fn release_node_slice(job: &Job, nodes: &mut HashMap<String, Node>, node_name: &str) {
+        let Some(total) = job.allocated_resources.as_ref() else {
+            return;
+        };
+        let Some(node) = nodes.get_mut(node_name) else {
+            return;
+        };
+        let node_count = job.allocated_nodes.len().max(1) as u32;
+        let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
+            warn!(job_id = job.job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
+            ResourceAllocations::with_scalar(total.cpus / node_count, total.memory_mb / node_count as u64)
+        });
+        node.release(&slice);
+        node.update_state_from_alloc();
+    }
+
     /// Return a finished job's per-node slice to each node it held, skipping any
     /// in `already_deallocated`; pass `allocated_resources = None` if freed already.
     fn deallocate_job_slices(
@@ -8815,7 +8911,7 @@ impl ClusterManager {
         job.exit_code = Some(-1);
         job.end_time = Some(at);
         job.end_suspension(at);
-        job.node_completions.clear();
+        job.clear_node_reports();
 
         // Capture run_time before reset clears start_time.
         // run_time() excludes suspended intervals.
@@ -8844,35 +8940,24 @@ impl ClusterManager {
     /// Finalize a Completing run whose nodes have all reported, from the
     /// verdict their completions imply. `None` when the state machine refuses.
     fn finalize_reported_run(job: &mut Job, at: DateTime<Utc>) -> Option<JobFinalized> {
-        // Primary = batch node (allocated_nodes[0]); empty when none allocated,
-        // where derived_completion falls back to the worst completion.
-        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-        // spurd flags an OOM kill via a sentinel bit in the signal; detect it,
-        // then strip the bit so the stored signal is the real SIGKILL and the
-        // job reports OUT_OF_MEMORY.
-        let oom = job.reported_oom();
-        let (derived_state, final_exit, raw_signal) =
-            Job::derived_completion(&job.node_completions, &primary);
-        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-        let (final_state, final_reason) =
-            job.completion_verdict(derived_state, final_exit, final_signal, oom);
-        if let Err(e) = job.transition(final_state) {
+        let outcome = job.reported_outcome();
+        if let Err(e) = job.transition(outcome.state) {
             warn!(job_id = job.job_id, error = %e, "invalid final completion transition");
             return None;
         }
-        job.exit_code = Some(final_exit);
-        job.exit_signal = final_signal;
+        job.exit_code = Some(outcome.exit_code);
+        job.exit_signal = outcome.signal;
         // DerivedExitCode is the running max over srun steps, accumulated live
         // by JobStepComplete; a job with no srun steps keeps 0 (Slurm parity),
         // not the batch exit. Left as-is here.
-        job.set_pending_reason(final_reason);
+        job.set_pending_reason(outcome.reason);
         job.end_time = Some(at);
         job.preempt_pending = None;
-        job.node_completions.clear();
+        job.clear_node_reports();
         Some(JobFinalized::for_job(
             job,
-            job.end_of_run_state(final_state),
-            final_exit,
+            job.end_of_run_state(outcome.state),
+            outcome.exit_code,
         ))
     }
 
@@ -8882,10 +8967,12 @@ impl ClusterManager {
         job.start_time = None;
         job.exit_code = None;
         job.allocated_nodes.clear();
+        job.resolved_placement = None;
+        job.first_failed_node = None;
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.leave_partition();
-        job.node_completions.clear();
+        job.clear_node_reports();
         job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
@@ -8946,8 +9033,7 @@ impl ClusterManager {
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
-    /// Nodes that already reported completion via `JobNodeComplete` (which
-    /// frees a node's slice as it arrives, ahead of the whole job finishing)
+    /// Nodes whose slice already went back at their report (`Job::released_nodes`)
     /// are skipped so their resources aren't subtracted twice.
     fn evict_job_locked(
         job_id: JobId,
@@ -8990,14 +9076,14 @@ impl ClusterManager {
             JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
             _ => {}
         }
-        let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
-        job.node_completions.clear();
+        let already_deallocated = job.released_nodes();
+        job.clear_node_reports();
 
         // A preempt victim finalized here (a node failed mid-drain or mid-grace)
         // frees its remaining healthy nodes without passing through
         // JobNodeComplete/JobComplete, so the earmark that keeps those nodes for
-        // the preemptor must be collected on this path too. Only the not-yet-
-        // reported nodes are freed now, so only those are claimable.
+        // the preemptor must be collected on this path too. Only the nodes
+        // still charged are freed now, so only those are claimable.
         let cancel_preemptor = (job.preempt_mode.as_deref() == Some("Cancel"))
             .then_some(job.preempted_by)
             .flatten();
@@ -9050,7 +9136,7 @@ impl ClusterManager {
                 matches!(
                     j.state,
                     JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.is_held_on(node_name)
+                ) && j.still_runs_on(node_name)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -9271,7 +9357,7 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
                     // Nodes that reported during a grace were freed at their report.
-                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    already_deallocated = job.released_nodes();
                     let Some(done) = Self::repend_after_preemption(
                         job,
                         *begin_time,
@@ -9352,8 +9438,7 @@ impl ClusterManager {
                             allocated_resources = job.allocated_resources.clone();
                             per_node_map = job.per_node_alloc.clone();
                             // Nodes that reported during a grace were freed at their report.
-                            already_deallocated =
-                                job.node_completions.keys().cloned().collect::<Vec<_>>();
+                            already_deallocated = job.released_nodes();
                         }
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
@@ -9466,7 +9551,7 @@ impl ClusterManager {
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
-                    job.node_completions.clear();
+                    job.clear_node_reports();
                     // Cancelled is terminal (dependents/arrays unblock); Preempted
                     // is reported to accounting via jobs_finalized.
                     if let Err(e) = job.transition(JobState::Cancelled) {
@@ -9579,6 +9664,7 @@ impl ClusterManager {
                 idle_fill,
                 effective_partition,
                 memory_adjustment,
+                resolved_placement,
                 at: _,
             } => {
                 // Only a saved node_names list fences placement; earlier log entries keep
@@ -9617,6 +9703,7 @@ impl ClusterManager {
                     job.per_node_alloc = per_node_alloc.clone();
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
+                    job.resolved_placement = *resolved_placement;
                     job.run_attempt = (*run_attempt).max(job.run_attempt);
                     job.idle_fill = *idle_fill;
                     job.start_in_partition(effective_partition.clone(), *memory_adjustment);
@@ -9663,6 +9750,14 @@ impl ClusterManager {
                 signal,
                 run_attempt,
                 ..
+            }
+            | WalOperation::JobCopyExited {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+                run_attempt,
+                ..
             } => {
                 // A node a preempting victim frees here is claimed for its
                 // preemptor in the same critical section that releases it, so no
@@ -9692,15 +9787,26 @@ impl ClusterManager {
                         .filter(|_| job.state == JobState::Running);
                     let in_grace = grace.is_some();
                     let already_reported = job.node_completions.contains_key(node_name);
-                    freed_for_preemptor = if already_reported {
-                        None
-                    } else if let Some(pending) = &grace {
+                    // A repeat proposed before the first report applied. Only JobCopyExited
+                    // may drop it: an older controller still lets a JobNodeComplete overwrite.
+                    if already_reported && matches!(op, WalOperation::JobCopyExited { .. }) {
+                        return ClientResponse::default();
+                    }
+                    let preemptor = if let Some(pending) = &grace {
                         Some(pending.preempted_by)
                     } else if job.preempt_mode.as_deref() == Some("Cancel") {
                         job.preempted_by
                     } else {
                         None
                     };
+                    // Only JobCopyExited ends a per-node run node by node: an older
+                    // controller applies JobNodeComplete the old way, so this must too.
+                    let per_node =
+                        matches!(op, WalOperation::JobCopyExited { .. }) && ends_copy_by_copy(job);
+                    if per_node && (*exit_code != 0 || *signal != 0) {
+                        job.first_failed_node
+                            .get_or_insert_with(|| node_name.clone());
+                    }
                     job.node_completions.insert(
                         node_name.clone(),
                         spur_core::job::NodeCompletion {
@@ -9709,25 +9815,29 @@ impl ClusterManager {
                         },
                     );
 
-                    if let Some(ref total) = job.allocated_resources {
+                    let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
+                    let released = if per_node && others_run_on && !job.all_nodes_completed() {
+                        // spurd keeps the slice while any of the job's steps run there,
+                        // so the node stays charged until the run ends.
+                        job.retained_nodes.insert(node_name.clone());
+                        Vec::new()
+                    } else {
+                        let mut released: Vec<String> = std::mem::take(&mut job.retained_nodes)
+                            .into_iter()
+                            .collect();
                         if !already_reported {
-                            let node_count = job.allocated_nodes.len().max(1) as u32;
-                            if let Some(node) = nodes.get_mut(node_name) {
-                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
-                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
-                                    ResourceAllocations::with_scalar(
-                                        total.cpus / node_count,
-                                        total.memory_mb / node_count as u64,
-                                    )
-                                });
-                                node.release(&slice);
-                                node.update_state_from_alloc();
-                            }
+                            released.push(node_name.clone());
                         }
-                    }
-
+                        for node in &released {
+                            Self::release_node_slice(job, &mut nodes, node);
+                        }
+                        released
+                    };
+                    freed_for_preemptor = preemptor
+                        .filter(|_| !released.is_empty())
+                        .map(|preemptor| (preemptor, released));
                     // A claim carries every node's allocation; only the final report needs a copy.
-                    if in_grace && !job.all_nodes_completed() {
+                    if others_run_on && !job.all_nodes_completed() {
                         None
                     } else {
                         let grace = job.preempt_grace().filter(|_| in_grace).cloned();
@@ -9735,12 +9845,8 @@ impl ClusterManager {
                     }
                 };
 
-                if let Some(preemptor) = freed_for_preemptor {
-                    self.record_preempt_freed_nodes(
-                        &jobs,
-                        std::slice::from_ref(node_name),
-                        preemptor,
-                    );
+                if let Some((preemptor, released)) = freed_for_preemptor {
+                    self.record_preempt_freed_nodes(&jobs, &released, preemptor);
                 }
 
                 if let Some(finalized) = finalized {
@@ -9830,6 +9936,7 @@ impl ClusterManager {
                 unreported_nodes,
                 cancel,
                 controller_initiated,
+                signal,
                 ..
             } => {
                 let freed_nodes;
@@ -9878,7 +9985,7 @@ impl ClusterManager {
                     });
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
-                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    already_deallocated = job.released_nodes();
                     per_node_map = job.per_node_alloc.clone();
 
                     if let Some(pending) = grace.filter(|p| p.mode == PreemptMode::Requeue) {
@@ -9909,6 +10016,9 @@ impl ClusterManager {
                             job.cancelled_by = cancel.clone();
                         }
                         job.exit_code = Some(*exit_code);
+                        if let Some(signal) = signal {
+                            job.exit_signal = *signal;
+                        }
                         job.end_time = Some(timestamp);
                         // Derived from the replicated entry, so every replica reports
                         // the same reason for a job the watchdog had to force-kill or
@@ -9930,7 +10040,7 @@ impl ClusterManager {
                         // Suspended -> terminal: fold the final suspended interval in
                         // and clear suspended_at so it never lingers on a terminal job.
                         job.end_suspension(timestamp);
-                        job.node_completions.clear();
+                        job.clear_node_reports();
                     }
                 } else {
                     return ClientResponse::default();
@@ -12511,8 +12621,8 @@ fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a
 }
 
 /// Running-TRES accumulation with the distinct-node rule applied when read.
-/// Node TRES is the count of distinct nodes occupied (union of
-/// `allocated_nodes`), not summed `num_nodes` — a node packed by two jobs counts
+/// Node TRES is the count of distinct nodes occupied (union of the nodes each job
+/// still holds), not summed `num_nodes` — a node packed by two jobs counts
 /// once; CPU/Memory/GPU stay additive. A running job without recorded placement
 /// falls back to its requested `num_nodes` so the limit is never under-counted.
 ///
@@ -12533,12 +12643,7 @@ impl<'a> RunningTresAccumulator<'a> {
         if job.allocated_nodes.is_empty() {
             self.unplaced_nodes += job.spec.num_nodes as u64;
         } else {
-            self.distinct_nodes.extend(
-                job.allocated_nodes
-                    .iter()
-                    .filter(|node| job.is_held_on(node))
-                    .map(String::as_str),
-            );
+            self.distinct_nodes.extend(job.held_node_names());
         }
     }
 
@@ -12725,7 +12830,7 @@ fn scope_usage(
 fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> HashSet<String> {
     jobs.values()
         .filter(|j| j.occupies_resources() && pred(j))
-        .flat_map(|j| j.allocated_nodes.iter().cloned())
+        .flat_map(|j| j.held_node_names().map(str::to_string))
         .collect()
 }
 
@@ -15978,6 +16083,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
 
@@ -16254,6 +16360,44 @@ state = "UP"
             cm.get_node("n1").unwrap().alloc_resources.cpus,
             4,
             "a Running job's charge must survive a hold whose precheck raced activation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_records_where_the_script_runs_until_the_run_ends() {
+        use spur_core::script_placement::ResolvedPlacement;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("placed"));
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm
+            .reserve_attributed_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+                false,
+                RunAttribution {
+                    resolved_placement: Some(ResolvedPlacement::BatchHost),
+                    ..Default::default()
+                },
+            )
+            .expect("reserve");
+        assert_eq!(
+            cm.get_job(id).unwrap().resolved_placement,
+            Some(ResolvedPlacement::BatchHost)
+        );
+
+        cm.abort_placement(id, attempt, false).expect("abort");
+        wait_for("placement released", || {
+            cm.get_job(id).is_some_and(|j| !j.holds_a_placement())
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().resolved_placement,
+            None,
+            "the next run resolves its own placement"
         );
     }
 
@@ -17433,6 +17577,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -17639,6 +17784,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -17755,6 +17901,7 @@ state = "UP"
                 effective_partition: None,
                 memory_adjustment: None,
                 preemption_observation: None,
+                resolved_placement: None,
                 at: None,
             },
             WalOperation::NodeUpdate {
@@ -18049,6 +18196,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -18084,6 +18232,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -19143,6 +19292,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -19188,6 +19338,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         for step_id in [0, 1, 2] {
@@ -19271,6 +19422,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         for step_id in [1, 2] {
@@ -19349,6 +19501,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19442,6 +19595,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let step_create = WalOperation::JobStepCreate {
@@ -19582,6 +19736,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let step_create = WalOperation::JobStepCreate {
@@ -19673,6 +19828,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19745,6 +19901,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19840,6 +19997,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -19889,6 +20047,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -19965,6 +20124,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20039,6 +20199,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -20116,6 +20277,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
 
@@ -20235,6 +20397,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -20294,6 +20457,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20334,6 +20498,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20388,6 +20553,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -20436,6 +20602,7 @@ state = "UP"
             idle_fill: true,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
@@ -20499,6 +20666,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20536,6 +20704,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20972,6 +21141,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21012,6 +21182,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21055,6 +21226,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21099,6 +21271,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             at: None,
         });
 
@@ -21182,6 +21355,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -21870,13 +22044,14 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_primary_node_decides_a_multi_node_outcome() {
+    async fn the_batch_host_decides_a_batch_host_outcome() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         register_node(&cm, "worker2", 8, 16000);
         let mut spec = basic_spec("two-node");
         spec.num_nodes = 2;
+        spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
         let job_id = submit_and_wait(&cm, spec);
         let resources = scalar_alloc(2, 4000);
         cm.start_job(
@@ -21908,6 +22083,482 @@ state = "UP"
         let fin = &resp.jobs_finalized[0];
         assert_eq!(fin.state, JobState::Completed);
         assert_eq!(fin.reason, EndReason::None);
+    }
+
+    fn running_per_node_job(cm: &ClusterManager, nodes: &[&str]) -> JobId {
+        for node in nodes {
+            register_node(cm, node, 8, 16000);
+        }
+        let mut spec = basic_spec("per-node");
+        spec.num_nodes = nodes.len() as u32;
+        spec.script = Some("#!/bin/bash\n./train\n".into());
+        let job_id = submit_and_wait(cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            nodes.iter().map(|n| n.to_string()).collect(),
+            resources.clone(),
+            per_node_for(nodes, resources),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_per_node_job_keeps_running_while_its_copies_finish_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        let early = cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+        assert_eq!(early, NodeCompleteResult::StillRunning);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(
+            job.end_time.is_none(),
+            "nothing starts the completing clock"
+        );
+        assert_eq!(job.running_nodes(), ["n1".to_string(), "n3".to_string()]);
+        assert_eq!(
+            cpus_in_use(&cm, "n2"),
+            2,
+            "its steps may still run there, so the node stays the job's"
+        );
+
+        let next = cm.node_complete(job_id, "n3", 0, 0, 0).unwrap();
+        assert_eq!(next, NodeCompleteResult::StillRunning);
+        let last = cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        assert_eq!(
+            last,
+            NodeCompleteResult::AllDone {
+                state: JobState::Completed,
+                exit_code: 0
+            }
+        );
+        for node in ["n1", "n2", "n3"] {
+            assert_eq!(cpus_in_use(&cm, node), 0, "{node}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_failed_copy_ends_a_per_node_job_with_its_exit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        let failed = cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+        assert_eq!(failed, NodeCompleteResult::Completing);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+
+        // The copies stopped after it end by signal; the run keeps the first failure.
+        cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+        let done = cm.node_complete(job_id, "n3", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+        assert_eq!(cm.get_job(job_id).unwrap().exit_signal, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_leaders_node_report_ends_a_per_node_run_as_it_did_there() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "n2".into(),
+            exit_code: 3,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.state,
+            JobState::Completing,
+            "every replica must apply the same entry the same way"
+        );
+        assert_eq!(job.first_failed_node, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_copy_returns_the_finished_copies_nodes_with_its_own() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(cpus_in_use(&cm, "n3"), 2, "its copy is still being stopped");
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(job.running_nodes(), ["n3".to_string()]);
+    }
+
+    /// A one-cpu job shares `n1` with each run below, so a slice freed twice
+    /// would take that job's cpu with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_report_from_a_finished_copy_frees_its_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_report_cannot_erase_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        let repeat = cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+        assert_eq!(
+            repeat,
+            NodeCompleteResult::Completing,
+            "the reporter still stops the other copies"
+        );
+
+        cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+        let done = cm.node_complete(job_id, "n3", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_node_its_run_already_released_waits_for_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+
+        assert_eq!(
+            cm.drain_node("n2", None, None).unwrap(),
+            (NodeState::Drain, 0)
+        );
+        assert_eq!(
+            cm.drain_node("n3", None, None).unwrap(),
+            (NodeState::Draining, 1),
+            "its copy is still being stopped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_finished_copys_node_waits_for_the_run_to_end() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        assert_eq!(
+            cm.drain_node("n1", None, None).unwrap(),
+            (NodeState::Draining, 1)
+        );
+        cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_kill_of_a_stopped_copy_cannot_override_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n2", 3, 0, 0).unwrap();
+        cm.node_complete(job_id, "n3", 0, 9 | spur_core::job::OOM_SIGNAL_FLAG, 0)
+            .unwrap();
+
+        let done = cm.node_complete(job_id, "n1", 0, 15, 0).unwrap();
+
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Failed);
+    }
+
+    /// Both were proposed while the run was still Running, before either applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_copy_exit_cannot_erase_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        let copy_exit = |exit_code| WalOperation::JobCopyExited {
+            job_id,
+            node_name: "n2".into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        };
+
+        cm.apply_operation(&copy_exit(3));
+        cm.apply_operation(&copy_exit(0));
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.node_completions["n2"].code, 3);
+        assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_failure_from_a_finished_copy_does_not_end_the_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        let repeat = cm.node_complete(job_id, "n1", 3, 0, 0).unwrap();
+
+        assert_eq!(repeat, NodeCompleteResult::StillRunning);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.first_failed_node, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeat_report_cannot_rewrite_the_batch_hosts_exit() {
+        use spur_core::script_placement::ResolvedPlacement;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.jobs.write().get_mut(&job_id).unwrap().resolved_placement =
+            Some(ResolvedPlacement::BatchHost);
+        cm.node_complete(job_id, "n1", 3, 0, 0).unwrap();
+
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        let done = cm.node_complete(job_id, "n2", 0, 15, 0).unwrap();
+        assert_eq!(
+            done,
+            NodeCompleteResult::AllDone {
+                state: JobState::Failed,
+                exit_code: 3
+            }
+        );
+    }
+
+    /// The leader drops repeats now, but an older one wrote them, and every
+    /// replica must replay a JobNodeComplete as it applied there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_leaders_repeat_report_replays_as_it_did_there() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        let node_report = |exit_code| WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "n1".into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+        };
+
+        cm.apply_operation(&node_report(3));
+        take_over_node(&cm, "n1");
+        cm.apply_operation(&node_report(0));
+
+        assert_eq!(cm.get_job(job_id).unwrap().node_completions["n1"].code, 0);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "its slice went back once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_per_node_run_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().running_nodes(),
+            ["n2".to_string()],
+            "a finished copy is not waited for"
+        );
+        cm.node_complete(job_id, "n2", 0, 15, 0).unwrap();
+
+        assert!(cm.get_job(job_id).unwrap().state.is_terminal());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeued_per_node_run_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_running_copys_node_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        lose_node(&cm, "n2");
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(!job.state.is_active(), "{:?}", job.state);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_finished_copys_node_does_not_end_the_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+
+        lose_node(&cm, "n1");
+
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_hands_a_finished_copys_node_to_the_preemptor() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2", "n3"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        signal_grace(&cm, job_id, PreemptMode::Cancel);
+
+        cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Running,
+            "n3 is still inside its grace"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forced_finish_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            controller_initiated: true,
+            signal: None,
+            at: None,
+        });
+
+        assert!(cm.get_job(job_id).unwrap().retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_complete_records_the_signal_it_carries() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let with_signal = running_per_node_job(&cm, &["n1"]);
+        let without = running_per_node_job(&cm, &["n2"]);
+        cm.jobs.write().get_mut(&without).unwrap().exit_signal = 7;
+        let complete = |job_id, signal| WalOperation::JobComplete {
+            job_id,
+            exit_code: 0,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            signal,
+            at: None,
+        };
+
+        cm.apply_operation(&complete(with_signal, Some(9)));
+        cm.apply_operation(&complete(without, None));
+
+        assert_eq!(cm.get_job(with_signal).unwrap().exit_signal, 9);
+        assert_eq!(
+            cm.get_job(without).unwrap().exit_signal,
+            7,
+            "an older leader's entry leaves the signal as it was"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_requeue_frees_a_finished_copys_node_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.retained_nodes.is_empty());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23562,6 +24213,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -23603,6 +24255,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -23758,6 +24411,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -23847,6 +24501,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -24426,6 +25081,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -24506,6 +25162,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -24738,6 +25395,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -24772,6 +25430,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24792,6 +25451,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24824,6 +25484,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24847,6 +25508,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let mut excl_spec = basic_spec("excl");
         excl_spec.exclusive = true;
@@ -24888,6 +25550,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24921,6 +25584,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24959,6 +25623,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25001,6 +25666,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25054,6 +25720,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25107,6 +25774,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25141,6 +25809,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25172,11 +25841,54 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BadConstraints
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_job_with_only_k8s_nodes_says_why_it_waits() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "k1", 4, 8000);
+        register_node(&cm, "k2", 4, 8000);
+
+        let mut spec = basic_spec("driver");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let k8s = |name: &str| {
+            let mut node = cm.get_node(name).unwrap();
+            node.source = spur_core::node::NodeSource::Kubernetes {
+                namespace: "spur".into(),
+            };
+            node
+        };
+        let nodes = vec![k8s("k1"), k8s("k2")];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
+            busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            script_placement_default: Default::default(),
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::BadConstraints);
+        assert_eq!(
+            job.state_reason(),
+            crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED
         );
     }
 
@@ -25352,6 +26064,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -26684,6 +27397,7 @@ state = "UP"
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(
             cm.config().scheduler.max_jobs_per_cycle as usize,
@@ -27167,6 +27881,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: Some(Utc::now()),
         });
         assert!(cm.preempt_freed_nodes_raw().is_empty());
@@ -27560,6 +28275,7 @@ state = "UP"
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
         let assignments = crate::scheduler_loop::claimed_assignments(
@@ -31221,6 +31937,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -31323,6 +32040,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::claimed_assignments(
@@ -32080,6 +32798,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -32162,6 +32881,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -34824,6 +35544,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snap = cm.get_job(job).unwrap();
         cm.update_pending_reasons(&[&snap], &state);
@@ -35987,6 +36708,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
         assert_eq!(cm.allocate_step_id(1), 0);
@@ -37522,6 +38244,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
 
@@ -37547,6 +38270,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
 
@@ -37912,17 +38636,31 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_partial_exit_without_a_grace_is_reported_as_completing() {
+    async fn a_partial_exit_without_a_grace_follows_the_script_placement() {
+        use spur_core::script_placement::ResolvedPlacement;
+
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
-        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
-        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let per_node = run_job_in_grace_across(&cm, &["n1", "n2"], PreemptMode::Cancel);
+        let batch_host = run_job_in_grace_across(&cm, &["n3", "n4"], PreemptMode::Cancel);
+        for id in [per_node, batch_host] {
+            cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
+        }
+        cm.jobs
+            .write()
+            .get_mut(&batch_host)
+            .unwrap()
+            .resolved_placement = Some(ResolvedPlacement::BatchHost);
 
-        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+        let attempt = cm.get_job(per_node).unwrap().run_attempt;
+        let first = cm.node_complete(per_node, "n1", 0, 0, attempt).unwrap();
+        assert_eq!(first, NodeCompleteResult::StillRunning);
+        assert_eq!(cm.get_job(per_node).unwrap().state, JobState::Running);
 
+        let attempt = cm.get_job(batch_host).unwrap().run_attempt;
+        let first = cm.node_complete(batch_host, "n3", 0, 0, attempt).unwrap();
         assert_eq!(first, NodeCompleteResult::Completing);
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+        assert_eq!(cm.get_job(batch_host).unwrap().state, JobState::Completing);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -37996,6 +38734,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: None,
         });
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
@@ -38134,6 +38873,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
 
@@ -38270,6 +39010,7 @@ state = "UP"
             unreported_nodes: Vec::new(),
             cancel: Some(CancelProvenance::system()),
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at()),
         });
 
@@ -38349,6 +39090,7 @@ state = "UP"
                 unreported_nodes: Vec::new(),
                 cancel: None,
                 controller_initiated: false,
+                signal: None,
                 at: Some(grace_exit_at()),
             });
             cm.run_all_finalized_side_effects(&resp);
@@ -38477,6 +39219,7 @@ state = "UP"
             unreported_nodes: vec!["n2".into()],
             cancel: None,
             controller_initiated: false,
+            signal: None,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
         cm.run_all_finalized_side_effects(&resp);
@@ -40523,6 +41266,7 @@ state = "UP"
 
         let mut spec_a = basic_spec("job-a-shares-n1");
         spec_a.num_nodes = 2;
+        spec_a.script = Some("#!/bin/bash\nsrun ./a\n".into());
         let job_a = submit_and_wait(&cm, spec_a);
         cm.start_job(
             job_a,
@@ -43869,6 +44613,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -43890,6 +44635,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -44968,6 +45714,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -46750,6 +47497,26 @@ mod idle_fill_aggregate_tests {
             !team_over_quota(cap, 0, borrowed),
             "a single borrower on a cap of 1 is within quota and must be spared"
         );
+    }
+
+    /// A node that reported its part during a grace was handed back, so it no
+    /// longer counts against the group the run is charged to.
+    #[test]
+    fn a_node_its_run_already_released_is_no_longer_occupied() {
+        let mut job = running_in_qos(1, "alice", "team", &["n1", "n2"], false);
+        job.node_completions.insert(
+            "n1".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+        let jobs = HashMap::from([(1, job)]);
+
+        assert_eq!(
+            occupied_nodes(&jobs, |_| true),
+            HashSet::from(["n2".to_string()])
+        );
+        let mut running = RunningTresAccumulator::default();
+        running.add(&jobs[&1]);
+        assert_eq!(running.tres().get(TresType::Node), 1);
     }
 
     #[test]

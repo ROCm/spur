@@ -562,6 +562,7 @@ async fn effective_partition_and_adjusted_request_survive_a_controller_restart()
                     memory_per_gpu_mb: None,
                     cpus_per_gpu: None,
                 }),
+                resolved_placement: None,
             },
         )
         .unwrap();
@@ -1069,6 +1070,7 @@ fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
         busy_until: &busy_until,
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
+        script_placement_default: Default::default(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let assignments =
@@ -1801,6 +1803,7 @@ async fn a_node_the_job_finished_on_no_longer_charges_the_cap() {
         &per_node_for(&["n1", "n2"], scalar_alloc(8, GIB)),
         RunAttribution {
             effective_partition: Some("cpu".into()),
+            resolved_placement: Some(spur_core::script_placement::ResolvedPlacement::BatchHost),
             ..Default::default()
         },
     );

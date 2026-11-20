@@ -752,6 +752,7 @@ address = "http://peer-a:6817"
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         // This should NOT panic
         let assignments = sched.schedule(&[job], &cluster);

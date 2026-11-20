@@ -229,8 +229,9 @@ for the pending job and every occupant is eligible in that pool. Suspended,
 completing, protected, and newly assigned jobs remain in the occupant map, so
 evicting a running neighbour cannot make their node count as empty.
 
-`NodePlacement`, `node_request`, handoff ownership, and partition caps filter
-the candidate nodes. `node_request` requires a one-node GPU-total request to
+`NodePlacement`, `node_request`, handoff ownership, partition caps, and the
+[script placement](../execution/job-execution.md#script-placement) agent check
+filter the candidate nodes. `node_request` requires a one-node GPU-total request to
 fit entirely on that node, including memory derived from the GPU count.
 The shortfall is the requested node count (at least one) minus suitable empty
 nodes. A non-positive shortfall or too few evacuable nodes returns no set

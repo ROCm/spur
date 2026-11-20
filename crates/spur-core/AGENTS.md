@@ -18,7 +18,7 @@ upgrade replay.
 
 ```
 src/
-  lib.rs                 -- pub mod declarations (50 modules)
+  lib.rs                 -- pub mod declarations (53 modules)
   config.rs              -- SlurmConfig (TOML), all config sections (~5000 lines)
   job.rs                 -- JobSpec, Job, JobState, PendingReason, state machine
   node.rs                -- Node, NodeState, NodeEvent, NodeSource, NodeOverlay
@@ -61,6 +61,7 @@ src/
   quota_names.rs         -- K8s quota namespace/SA naming (account_namespace, sanitize_dns_label)
   audit_metrics.rs       -- Counters for the OpenMetrics audit surface
   task_launch.rs         -- Multi-task/multi-node step launch helpers (batch + srun dispatch)
+  script_placement.rs    -- ScriptPlacement (requested), ResolvedPlacement (per run), the `auto` text scan
   native_cred.rs         -- Native per-RPC credential structure (HMAC-signed)
   native_jwks.rs         -- JWKS key set loading and rotation
   native_mint.rs         -- Credential minting (sign a UserRpcCredential)
@@ -169,10 +170,29 @@ separate path for admin requeue so nothing else can resurrect a terminal job.
 
 Held in controller memory. Key fields beyond the spec:
 - `run_attempt`: monotonic epoch, bumped per dispatch. Guards stale completion reports.
-- `node_completions`: per-node exit status, drives `derived_completion()`.
+- `allocated_nodes`: the run's whole allocation, kept until the run is reset. A node that
+  reported may already be handed back (in a preemption grace, or once the run is
+  Completing), so code asking whether the job occupies a node now reads
+  `is_held_on`/`held_node_names`, never `allocated_nodes`.
+- `node_completions`: per-node exit status. `reported_outcome()` turns them into the run's
+  state, exit code, and signal, decided by `first_failed_node` else the first allocated
+  node; both the last report and the completing timeout's force-finish use it. An OOM
+  kill counts from `first_failed_node` alone once one is recorded, else from any node,
+  as older controllers apply it to the logs they write.
 - `time_limit_signaled_at`, `cancel_signaled_at`: replicated instants for deterministic verdicts.
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
+- `first_failed_node`: on a per-node run, the first node whose copy failed. It ended the
+  run, so its exit is the run's. Cleared on requeue.
+- `retained_nodes`: on a per-node run, nodes whose copy exited cleanly while the run went
+  on. They reported, but stay charged until the run ends, so "reported" and "charged"
+  differ: `is_held_on`/`held_node_names` (charged) include them, `still_runs_on`/`running_nodes`
+  (not yet reported) and `released_nodes` (slice returned) do not. `clear_node_reports`
+  clears them with `node_completions`, after the caller has freed their slices.
+- `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
+  and cleared on requeue. `Job::script_placement()` falls back to the `auto` text scan when
+  it is unset (a run dispatched before placements were recorded), which is what agents
+  without the `script-placement` capability apply.
 - `preferred_nodes`, `last_sched_eval`: transient per-scheduling-pass hints (`#[serde(skip)]`).
 
 `Job::run_time_at(now)` returns the current run's duration from `start_time`

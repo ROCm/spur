@@ -1282,6 +1282,71 @@ change, so add the field after every controller is upgraded. Restarts and agent
 registrations never write it. A rollback after the entry has been written is not
 supported because older controllers cannot replay it: roll forward.
 
+.. _upgrading-script-placement:
+
+Batch script placement (``script_placement``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds ``sbatch --script-placement`` and the ``[controller]
+script_placement`` default (see :ref:`submit-script-placement`). Until a job asks for
+a placement or a default is set, every job runs its script where it did before,
+whatever release each controller, agent, and client runs. No new Raft entry type is
+added, so replication never stalls: existing entries only gain optional fields.
+
+**Upgrade every controller before using a placement**: before setting the
+``[controller]`` default, and before users get an ``sbatch`` that accepts
+``--script-placement``. A controller that predates this release ignores the new
+fields in requests, Raft log entries, and snapshots, and places the script by the
+text scan that ``auto`` uses:
+
+- A job submitted through it loses its placement, even when it only forwards the
+  request to an upgraded leader.
+- If it becomes leader before such a job starts, the script runs where the scan
+  says, so a script whose launcher is hidden in another script runs on every node.
+- If it becomes leader while a ``batch-host`` job runs, it stops the job's other
+  nodes when the script exits only if the script itself calls ``srun``,
+  ``mpirun``, or ``mpiexec``. Otherwise the job stays ``COMPLETING`` for
+  ``scheduler.complete_wait_secs`` (default 300 seconds), then ends ``FAILED``,
+  and those nodes are drained until an administrator resumes them. An
+  ``all-nodes`` job whose script calls ``srun`` has the reverse problem: the first
+  copy to finish stops the others.
+
+Jobs that used a placement during the upgrade can stay affected after it: a
+controller upgraded partway through restarts from the snapshot it wrote before its
+upgrade, which lacks their placement.
+
+**Upgrade agents before relying on a placement.** A node whose ``spurd`` predates
+this release places the script by the text scan. The scheduler keeps a job off such
+nodes when the scan would launch it differently, which only happens for a
+multi-node or ``--mpi=pmix`` job. Such a job waits until enough upgraded nodes are
+free, including any node it names with ``--nodelist``. Every other job still runs
+on any node.
+
+.. _upgrading-per-node-runs:
+
+Batch scripts that run on every node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes how a job ends when its script runs on every node, which
+includes an ``auto`` job whose script does not call ``srun``, ``mpirun``, or
+``mpiexec`` (see :ref:`submit-script-placement`). A copy that exits cleanly now
+leaves the job running, its node still allocated to the job until the job ends,
+and the first copy that fails ends the job with its exit code. No configuration
+change is needed.
+
+**Upgrade the leader last.** When a job's script runs on more than one node, each
+copy that exits while the job is still running writes a new Raft log entry,
+``JobCopyExited``. A controller that predates it
+cannot parse the entry and stops replicating until it is upgraded, so the order
+in :ref:`upgrading-leader-last` applies, and a rollback after the entry has been
+written is not supported: roll forward.
+
+Until the leader runs this release, such a job still ends when its first copy
+exits: it moves to ``COMPLETING``, then after ``scheduler.complete_wait_secs``
+fails and drains the nodes still running a copy. Its outcome is taken from the
+first node alone. Every controller applies these older entries the same way, so
+controllers on different releases never disagree about a job.
+
 See Also
 --------
 

@@ -19,6 +19,8 @@ agent (`spurd`). The request carries:
   node, attempt, uid/gid, command digest, and the allocated slice. (HMAC is
   used for user-RPC credentials, not execution credentials.)
 - `peer_nodes`, `task_offset`, `pmix_plan` -- multi-node topology.
+- `script_placement` -- where this run's batch script runs (see
+  [Script placement](#script-placement)); empty from controllers that predate it.
 
 The agent validates the credential (`native_exec::verify_execution`), refuses
 root uid unless `allow_root_jobs` is set, and confirms the request targets
@@ -79,6 +81,64 @@ The user's script is wrapped depending on the launch shape:
 For `--mpi=pmix`, the per-rank wrapper is deferred to the supervisor
 (`start_supervised_pmix`) because only the PMIx server process can hand out
 each rank's bootstrap environment.
+
+### Script placement
+
+A batch script runs either on the batch host only (`ResolvedPlacement::BatchHost`,
+the first allocated node) or on every allocated node (`AllNodes`). The controller
+decides once per run at dispatch (`script_placement::resolve_run_placement` in
+`spurctld`) and records the result in `WalOperation::JobStart.resolved_placement`:
+
+1. A batch job (`JobSpec::needs_native_nodes`) never runs on K8s virtual nodes:
+   their agents launch only SpurJobs, which carry no script. It is not eligible for
+   them (`NodePlacement::eligible`), waits as `BadConstraints` with the reason
+   `BATCH_SCRIPT_K8S_UNSUPPORTED` while too few other nodes exist, submit rejects a
+   `--nodelist` that leaves too few (`validate_batch_nodelist`), and dispatch holds
+   a run that still includes one.
+2. Otherwise the job's `JobSpec.script_placement`, else `[controller]
+   script_placement` (default `auto`). `auto` is a text scan: `BatchHost` when
+   the script itself calls `srun`, `mpirun`, or `mpiexec`. srun and salloc jobs
+   always use the scan, as do SpurJobs, whose missing script scans as `AllNodes`.
+
+On `BatchHost`, every node but the one at `task_offset` 0 runs
+`batch_companion_hold_script` with stdio on `/dev/null`, holding its slice for
+the steps the script launches. The controller stops those nodes when the batch
+host reports (`ended_run_stragglers`), and the batch host's exit is the job's.
+
+On `AllNodes`, each copy's exit stands on its own (`runs_per_node` in
+`cluster.rs`; salloc and native srun allocations run no script and are left
+out). While such a job spans more than one node and is Running outside a
+preemption grace (`ends_copy_by_copy`), `node_complete` proposes the exit as
+`WalOperation::JobCopyExited`. `JobNodeComplete` keeps its
+older meaning (the first report ends the run), so every controller replays a
+log an older leader wrote the same way. A clean exit leaves the job Running
+(`NodeCompleteResult::StillRunning`) but keeps the node's slice charged
+(`Job.retained_nodes`): `spurd` keeps a job's allocation until its last
+supervisor on the node exits, steps included, so a node given back at its copy's
+exit could be dispatched to while the agent still holds it. Kept slices go back
+when the run ends: the report that ends it frees them, and every other ending
+frees all but `Job::released_nodes()`. The first failed copy is recorded in
+`Job.first_failed_node`, moves the job to Completing, has the nodes still
+running stopped, and supplies the job's state, exit, and signal, which a copy
+OOM-killed while being stopped cannot change (`Job::reported_outcome`, which the
+completing timeout's force-finish reads too). The apply
+drops a repeat `JobCopyExited`, one proposed before the first applied, so it
+cannot overwrite that failure; a repeat `JobNodeComplete` still overwrites, as
+on older controllers. Steps can no longer target a node that finished.
+Preemption grace and suspend keep their own handling; a grace hands kept nodes
+to the preemptor with the first report.
+A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
+and prepare are skipped.
+
+Agents advertise `CAP_SCRIPT_PLACEMENT`. An agent without it ignores the field and
+applies the scan (`Node::reads_placement_off_script`). That changes the launch only
+on a multi-node or PMIx run (`ResolvedPlacement::launches_differently_from`): off
+the batch host a node runs the script or holds, and on it only a PMIx launch depends
+on the placement. For a job where it does (`JobSpec::needs_placement_aware_agents`,
+given `ClusterState.script_placement_default`), backfill and the victim search drop
+such nodes from the candidates (`NodePlacement::without_misplacing_agents`), and a
+job whose additive `--nodelist` names one waits. Dispatch backs off a run that still
+lands on one.
 
 ### Prolog hooks
 
