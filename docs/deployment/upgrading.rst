@@ -1314,7 +1314,7 @@ Generic device inventory
 
 Node inventory now lists every allocatable device, of every kind, in
 ``ResourceSet.devices`` (``gres_name``, ``device_type``, ``stable_id``,
-``index``, ``topology``). GPUs are entries with ``gres_name = "gpu"``.
+``index``, ``topology``, ``numa_node``, ``affinity_cpus``). GPUs are entries with ``gres_name = "gpu"``.
 
 * **Deprecated: ``ResourceSet.gpus``, ``GpuResource`` and ``GpuLinkType``.** The gRPC API still
   fills the GPU-only ``gpus`` list for this release, so existing clients keep
@@ -1341,6 +1341,14 @@ Node inventory now lists every allocatable device, of every kind, in
 * **Kubernetes GPU lines.** On a Kubernetes node with
   ``spur.amd.com/gpu-memory-mb`` set, ``scontrol show node`` prints one
   ``GPUDevice=`` line per GPU, with only its type and VRAM known.
+* **Per-GPU CPU placement is carried by every device.** A device's NUMA node
+  and its ``cores=`` CPUs are reported on the generic ``Device`` (gRPC fields
+  ``numa_node`` and ``affinity_cpus``) and still written to the legacy
+  ``GpuResource``, so reserved cores per GPU keep working while controllers and
+  agents of both versions run. Only GPUs reserve cores; NIC-only jobs use the
+  general pool. Set ``restricted_cores_per_gpu`` or ``def_cpu_per_gpu`` only
+  after every controller and agent is upgraded; see
+  :ref:`gpu-cores-upgrade-notes`.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``. The
