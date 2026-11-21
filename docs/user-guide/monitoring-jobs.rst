@@ -1600,7 +1600,11 @@ The whole request is rejected, with a non-zero exit and nothing changed, if any
 key is unknown or belongs to the other kind of update (``State=`` on a job,
 ``TimeLimit=`` beside ``NodeName=``), any value is malformed, or a job update
 names no field to change. ``TimeLimit=UNLIMITED``, which Slurm accepts, is
-refused: give an explicit limit.
+refused: give an explicit limit. Once a job has started, or the scheduler has
+already reserved nodes for it, only an operator or administrator can raise
+``TimeLimit``; the owner can still lower it, and can still raise it while the
+job is pending with no nodes reserved. A refused raise changes nothing else in
+the same request.
 
 .. code-block:: bash
 

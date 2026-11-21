@@ -2123,6 +2123,7 @@ impl SlurmController for ControllerService {
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
+        let operates_jobs = self.caller_is_operator(__identity.as_ref());
         let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
@@ -2151,13 +2152,8 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(
-            &req.user,
-            self.caller_is_operator(__identity.as_ref()),
-            &job.spec.user,
-            "modify",
-        )
-        .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(&req.user, operates_jobs, &job.spec.user, "modify")
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -2196,6 +2192,7 @@ impl SlurmController for ControllerService {
                 req.account,
                 req.qos,
                 req.exclude,
+                operates_jobs,
             )
             .map_err(update_job_err_to_status)?;
 
@@ -6725,6 +6722,7 @@ fn update_job_err_to_status(err: anyhow::Error) -> Status {
         Some(crate::cluster::JobUpdateRefusal::FailedPrecondition(m)) => {
             Status::failed_precondition(m)
         }
+        Some(crate::cluster::JobUpdateRefusal::PermissionDenied(m)) => Status::permission_denied(m),
         None => Status::internal(err.to_string()),
     }
 }
@@ -14385,6 +14383,77 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_time_limit_raise_follows_the_verified_operator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let day = chrono::Duration::hours(24);
+        svc.cluster
+            .update_job(job_id, Some(day), None, None, None, None, None, None, true)
+            .unwrap();
+
+        let mut owner_req = Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: 72 * 3600,
+                nanos: 0,
+            }),
+            user: "root".into(),
+            ..Default::default()
+        });
+        owner_req.extensions_mut().insert(viewer("ubuntu", false));
+        let err = svc
+            .update_job(owner_req)
+            .await
+            .expect_err("a verified owner must not raise a running job's time limit");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(
+            err.message().contains("only an operator may increase"),
+            "refused by the time-limit gate, not the owner check: {}",
+            err.message()
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(day),
+            "a refused raise must not change the limit"
+        );
+
+        svc.update_job(Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: 3600,
+                nanos: 0,
+            }),
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may lower a running job's time limit");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::hours(1))
+        );
+
+        let mut admin_req = Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: 72 * 3600,
+                nanos: 0,
+            }),
+            user: "root".into(),
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        svc.update_job(admin_req)
+            .await
+            .expect("a verified operator may raise a running job's time limit");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::hours(72))
+        );
+    }
+
     /// The owner check must key off the *authenticated* identity, not the
     /// wire-asserted `user`: a caller cannot spoof the owner's name to slip past
     /// the gate. `authoritative_user` overwrites the field before the check.
@@ -18205,6 +18274,10 @@ mod tests {
             (
                 anyhow::Error::from(JobUpdateRefusal::InvalidArgument("bad list".into())),
                 Code::InvalidArgument,
+            ),
+            (
+                anyhow::Error::from(JobUpdateRefusal::PermissionDenied("not an operator".into())),
+                Code::PermissionDenied,
             ),
             (anyhow::anyhow!("raft write failed"), Code::Internal),
         ];
