@@ -658,10 +658,11 @@ pub fn placement_job(job: &Job) -> Job {
 fn request_job(job: &Job) -> Job {
     let s = &job.spec;
     let mut copy = placement_job(job);
-    copy.spec.script = s
-        .script
-        .as_deref()
-        .map(|script| ResolvedPlacement::scanned(Some(script)).stand_in_script().into());
+    copy.spec.script = s.script.as_deref().map(|script| {
+        ResolvedPlacement::scanned(Some(script))
+            .stand_in_script()
+            .into()
+    });
     copy.spec.script_placement = s.script_placement;
     copy.spec.mpi = s.mpi.clone();
     copy.spec.srun_job = s.srun_job;
