@@ -927,7 +927,15 @@ the job is preempted immediately.
 * **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
   process in the job, waits up to the kill wait (5 seconds by default), then
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
-  The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+  The wait does not reach ``srun`` steps once the batch script exits
+  (:ref:`kill wait note <kill-wait-steps-caveat>`).
+* **In a container, install a SIGTERM handler.** When a job or step creates its
+  container, your command runs as PID 1 of it, which sees SIGTERM only if it
+  installs a handler. Without one it runs until the SIGKILL. A step joins its
+  job's container only on the node that runs the job's own process (the batch
+  node), and there it is not PID 1: a SIGTERM it does not trap ends it. On the
+  job's other nodes a step with ``--container-image`` creates its own container,
+  and its command is PID 1.
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
@@ -1553,6 +1561,19 @@ time limit, where earlier releases gave it 2 seconds.
    outlive the job and keep running beside a newly placed job. This affects every
    stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
    and the final kill of a preempted job. The preemption grace is not affected.
+
+   So a step gets the kill wait only while the job is still running. The
+   ``srun`` client handles only Ctrl-C, so the SIGTERM of a stop ends a
+   foreground ``srun``, and a batch script that is just ``srun my_app`` then
+   exits and ends the job. A step that handles SIGTERM gets the wait when the
+   batch script keeps running, for example because it traps SIGTERM and keeps
+   running after the ``srun`` client exits.
+
+   In a container that a job or step creates, your command runs as PID 1 and
+   sees SIGTERM only if it installs a handler. Otherwise it runs until the
+   SIGKILL. A step joins its job's container only on the batch node, and there it
+   is not PID 1; on the job's other nodes a step with ``--container-image``
+   creates its own.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

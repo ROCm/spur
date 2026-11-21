@@ -641,8 +641,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        requeue-mode preemption. A requeued job itself is held out of the queue
        for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
        seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
-       Mirrors Slurm's ``KillWait`` for these stops, but does not yet reach
-       ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       Mirrors Slurm's ``KillWait`` for these stops, but does not reach
+       ``srun`` steps once the batch script exits
+       (:ref:`kill wait note <kill-wait-steps-caveat>`).
        ``scontrol show config`` prints the value in effect, floor applied, as
        ``KillWait``.
    * - ``timeout_kill_wait_secs``
@@ -657,7 +658,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs`` and
        the epilog bound. In
        Slurm, ``KillWait`` also covers time limits; here that part is this
-       setting. Does not yet reach ``srun`` steps
+       setting. Does not reach ``srun`` steps once the batch script exits
        (:ref:`kill wait note <kill-wait-steps-caveat>`). ``scontrol show config``
        prints the value in effect, floor applied, as ``TimeoutKillWait``.
    * - ``max_user_priority``

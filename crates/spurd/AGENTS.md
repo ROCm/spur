@@ -649,7 +649,76 @@ metrics).
 
 ### Job execution
 - Jobs are forked as their own process-group leaders. Signals go to the
-  negative PID (the whole group), not just the tracked process.
+  negative PID (the whole group), not just the tracked process, except under
+  the **launcher rule**. The tracked process is sometimes a *launcher*, not the
+  workload: `unshare` (rootful batch script or standalone `srun`), `nsenter` (an
+  `srun` step joining its job), or a container's waiting parent, which is a
+  launcher whether or not `spurd` is root (`TrackedProcess::of_launch`, derived
+  from the launch config). A launcher dies on signals it has no handler for, so
+  the supervisor would report the step finished while the workload still runs.
+  `executor::deliver_signal` and `RunningJob::signal_workload` therefore deliver
+  every signal except KILL to the cgroup's members minus the launcher's pid, or
+  without a cgroup to the launcher's descendants (children of every thread, not
+  only the main one) plus, when it leads a process group (a container's waiting
+  parent does not), the rest of that group, instead of signalling the group,
+  which takes the launcher with it.
+  Whether the launcher gets the signal too is per signal
+  (`TrackedProcess::spares_launcher`):
+  - SIGKILL reaches it first, so it cannot relay the dying workload's status as
+    its own exit.
+  - SIGCONT reaches it after the workload, because an `nsenter` that has
+    mirrored its child's stop stays stopped until it is continued. The workload
+    goes first, so an `nsenter` that has not yet read the child's stop report
+    never reads it.
+  - SIGSTOP skips it: `nsenter` mirrors its child's stop itself, and a second,
+    external stop can leave it stopped for good. Only while nothing is behind it
+    yet (a stop right after launch, before it forks) does it get the stop too, or
+    it would fork a running workload into a suspended job. A per-pid stop only
+    queues, and a process inside `fork()` publishes its child after any scan, so
+    `stop_to_fixpoint` waits until everything it stopped is really stopped (every
+    thread in `T`/`t`, a zombie, or gone) and rescans until a rescan finds
+    nothing new. The wait is bounded by `STOP_SETTLE_BUDGET` (1 s); on expiry it
+    stops what a last scan finds and warns. The cgroup path of `deliver_signal`
+    delivers per pid without this wait.
+  - Every other signal skips it.
+
+  The launcher exits on its own once the workload does, relaying its status. On
+  a rootful node the batch shell is PID 1 of its namespace, so it reacts only to
+  a signal it traps. The same holds for the command of a freshly created
+  container (a job's, or an `srun` step's own `StepContainerPlan::Fresh`), on
+  rootless agents too: the signal used to kill the waiting parent and end the
+  step, but now an unhandled SIGTERM leaves the command running until the
+  SIGKILL, so it ends with signal 9 rather than 15. A step joins its job's
+  container (`StepContainerPlan::JoinParent`) only where the job's own process
+  runs (`JobEntry::is_enterable`, the batch node; a step naming another image is
+  refused): it enters the PID namespace through `nsenter`, is not PID 1, and
+  ends on an unhandled SIGTERM. On the job's other nodes, which hold only an
+  `AllocationOnly` placeholder, a step with an image gets `Fresh` and its
+  command is PID 1.
+- The agent signals processes itself in two places and applies the same rule
+  there. `CancelStep`, and the replay of a cancel that arrived while the step
+  was launching, run as one detached task (`run_step_cancel`), so the
+  controller dropping the RPC cancels none of it. The step's own process gets a
+  SIGKILL after `STEP_CANCEL_ESCALATION` (`MIN_KILL_WAIT`, 5 s) whatever its
+  supervisor does: the command of a freshly created container is PID 1 and
+  ignores unhandled signals, and a step cancel keeps the allocation, so nothing
+  else reclaims it.
+  The signal itself goes through the supervisor (`SignalAllocation`), which is
+  also asked for a delayed SIGKILL, and directly with `signal_step_tree` and the
+  `TrackedProcess` recorded on the `ActiveStep` (a supervised step's tracked pid
+  is the supervisor's workload pid, so it can be a launcher) if the supervisor
+  is unreachable, has not answered within `StepCancelTimings::supervisor_wait`
+  (shorter than the escalation, so the step still gets its SIGTERM before the
+  SIGKILL), or the step has none. Every direct signal first re-checks, under the
+  `active_steps` lock, that the step still has the same epoch, pid and process
+  start time (`StepTarget::is_current`): the entry outlives its process, so a
+  pid the kernel has reused must not be hit. For a supervised step the start
+  time is the one the supervisor published for the workload it forked; for a
+  step spurd launches as its own child, spurd reads it from `/proc` itself
+  (`record_step_pid`). A step without one has no direct signal and no direct
+  SIGKILL.
+  Unsupervised jobs (test-only legacy launch) use `RunningJob::signal_workload`
+  with `TrackedJob::tracked_process`, which reads `has_pid_namespace`.
 - Container jobs use raw `fork()`, not `tokio::Command`. The PID is tracked
   via `pidfd_open` on kernels >= 5.3 to prevent PID recycling races.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it, a

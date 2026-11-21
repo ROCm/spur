@@ -1200,6 +1200,40 @@ The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
 ignores it.
 
+.. _launcher-signal-upgrade-notes:
+
+Signals reach the workload, not its launcher
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On agents running as root, and for container jobs and steps on any agent, the
+process ``spurstepd`` tracks is a launcher (``unshare``, ``nsenter``, or the
+parent that waits for a container) and not the workload. Every signal except
+SIGKILL used to go to that launcher, which could die on it and end the step
+while the workload ran on. Signals now go to the workload and skip the launcher.
+
+- **A step that traps SIGTERM keeps its grace and kill wait.** The preemption
+  grace warning and the SIGTERM of a cancel or time limit used to end a job's
+  ``srun`` steps at once behind ``nsenter`` (steps on the batch node), and
+  behind ``unshare`` on ``util-linux`` 2.34 but not 2.39. A step that traps SIGTERM
+  now runs through its grace, and while its job is still running a stop waits up
+  to the kill wait before the SIGKILL. Expect longer ``COMPLETING`` times, and a
+  preemptor that starts later.
+- **A container command without a SIGTERM handler runs until the SIGKILL.** In a
+  container that is created fresh, the command is PID 1 of its PID namespace, so
+  it ignores a signal it has no handler for. It used to end when SIGTERM killed
+  the waiting parent, with signal 15; it now ends at the SIGKILL, with signal 9,
+  as under ``docker stop``. This applies to rootless agents too, and to an
+  ``srun --container-image=`` step that creates a container of its own. A step
+  joins its job's container only on the node that runs the job's own process (the
+  batch node); there it is not PID 1, so a SIGTERM it does not trap ends it as
+  usual. On the job's other nodes even a step with the job's image creates its own
+  container, and its command is PID 1.
+- **The fix needs upgraded agents.** A job or ``srun`` step launched before its
+  node's agent was upgraded keeps the old behavior until it ends, because its
+  supervisor keeps running through the upgrade. A step launched after the upgrade
+  inside such a job gets its grace, but a stop still ends it at once: the job's
+  older supervisor ends the batch script.
+
 Preemption handoff
 ~~~~~~~~~~~~~~~~~~
 

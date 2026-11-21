@@ -16,10 +16,15 @@ instead of relying on an actual deadlock, and asserts the node is usable
 again within the force-reclaim window instead of never.
 """
 
+import re
 import threading
 import time
 
-from cluster import parse_job_id, wait_job_state
+import pytest
+
+from cluster import (
+    block_agent_port, job_state, parse_job_id, wait_job_state, wait_until,
+)
 
 
 def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
@@ -184,3 +189,134 @@ class TestWedgedInteractiveStepdReclaim:
             for job_id in submitted_jobs:
                 cluster.scancel(job_id)
             thread.join(timeout=60)
+
+
+# The controller's dial budget to the unreachable node. A step's launch there fails exactly
+# this long after it starts, which is what delays the step cancel. It dwarfs the few seconds
+# the test needs to freeze the supervisor, so the ordering holds with room to spare.
+_DIAL_BUDGET_SECS = 60
+# The agent SIGKILLs a cancelled step this long after the cancel (STEP_CANCEL_ESCALATION).
+_STEP_ESCALATION_SECS = 5
+# Time for the agent to have recorded the step's pid with its supervisor before that is frozen.
+_PID_RECORDED_SETTLE_SECS = 3
+# Polling and scheduling headroom on top of the escalation.
+_STEP_CANCEL_SLACK_SECS = 20
+_STEP_SLEEP_SECS = 617
+
+
+def _step_sleep_pids(node) -> list[str]:
+    """Host pids of the step's `sleep` (found by its unique duration), which also sees
+    processes inside a job's pid namespace."""
+    return node.exec_allow_fail(
+        "for p in $(pgrep -x sleep); do "
+        "tr '\\0' ' ' 2>/dev/null < /proc/$p/cmdline "
+        f"| grep -qE 'sleep {_STEP_SLEEP_SECS}( |$)' && echo $p; done"
+    ).split()
+
+
+def _cancel_steps_sent(cluster, job_id: int) -> int:
+    return len(
+        re.findall(
+            rf"sent CancelStep.*job_id={job_id}(?!\d)|job_id={job_id}(?!\d).*sent CancelStep",
+            cluster.spurctld_log(),
+        )
+    )
+
+
+class TestStepCancelWithAFrozenSupervisor:
+    """A cancelled step must die even when its supervisor cannot be reached.
+
+    The cancel is made to arrive late and on purpose: one node of a two-node srun is
+    unreachable from the controller, so its launch fails only once the controller's dial
+    budget runs out and the step on the other node is cancelled then. That leaves the
+    test the whole budget to freeze the surviving step's supervisor first, so the
+    ordering does not depend on a race. The step ignores SIGTERM, so only the agent's own
+    SIGKILL after the escalation delay can end it.
+    """
+
+    @pytest.fixture(params=[False, True], ids=["user-spurd", "root-spurd"])
+    def agent_as_root(self, request):
+        return request.param
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            "auth": {"allow_root_jobs": True},
+            "controller": {"agent_connect_timeout_secs": _DIAL_BUDGET_SECS},
+        }
+
+    def test_the_agent_kills_the_surviving_step_without_its_supervisor(self, cluster):
+        if len(cluster.nodes) < 2:
+            pytest.skip("needs two nodes: one to run the step, one to fail its launch")
+        go = f"{cluster.remote_dir}/step-cancel.go"
+        host_marker = f"{cluster.remote_dir}/step-cancel.host"
+        step = cluster.write_file(
+            "step-cancel-step.sh",
+            f"#!/bin/bash\ntrap '' TERM\nsleep {_STEP_SLEEP_SECS}\n",
+            all_nodes=True,
+        )
+        batch = cluster.write_file(
+            "step-cancel.sh",
+            "#!/bin/bash\n"
+            # Written on whichever node runs the batch script, which Spur does not report.
+            f"touch '{host_marker}'\n"
+            f"while [ ! -e '{go}' ]; do sleep 1; done\n"
+            f"srun -N2 '{step}'\n"
+            "sleep 600\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "step-cancel", "-N", "2", "-w", ",".join(cluster.node_names[:2]), batch]
+            )
+        )
+        assert job_id is not None, "sbatch failed"
+        frozen: set[str] = set()
+        node = cluster.nodes[0]
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            batch_index = wait_until(
+                lambda: [
+                    index for index, member in enumerate(cluster.nodes[:2])
+                    if member.exec_allow_fail(f"test -e '{host_marker}' && echo yes").strip()
+                ],
+                timeout_s=30, interval_s=1,
+                desc="the batch script to start on one of the job's nodes",
+            )[0]
+            node = cluster.nodes[batch_index]
+            job_supervisors = _supervisor_pids(cluster, batch_index)
+            # The other node is the one whose step launch fails, delaying the cancel.
+            with block_agent_port(cluster, node_index=1 - batch_index):
+                node.exec(f"touch '{go}'")
+                started = time.time()
+                wait_until(
+                    lambda: _step_sleep_pids(node),
+                    timeout_s=30, interval_s=1,
+                    desc=f"the srun step to start on node {batch_index}",
+                )
+                time.sleep(_PID_RECORDED_SETTLE_SECS)
+                frozen = _supervisor_pids(cluster, batch_index) - job_supervisors
+                assert frozen, "the step must have a supervisor of its own"
+                for pid in frozen:
+                    node.exec(f"sudo kill -STOP {pid}")
+                assert _cancel_steps_sent(cluster, job_id) == 0, (
+                    "the step was cancelled before its supervisor was frozen, which "
+                    "would prove nothing"
+                )
+
+                budget = _DIAL_BUDGET_SECS + _STEP_ESCALATION_SECS + _STEP_CANCEL_SLACK_SECS
+                wait_until(
+                    lambda: not _step_sleep_pids(node),
+                    timeout_s=max(1, int(started + budget - time.time())), interval_s=1,
+                    desc="the cancelled step to be SIGKILLed with its supervisor frozen",
+                )
+            assert _cancel_steps_sent(cluster, job_id) > 0, (
+                "the step ended, but not by the controller's cancel"
+            )
+            assert job_state(cluster.squeue_all(), job_id) == "R", (
+                "a step cancel must keep the job's allocation"
+            )
+        finally:
+            for pid in frozen:
+                node.exec_allow_fail(f"sudo kill -CONT {pid}")
+                node.exec_allow_fail(f"sudo kill -9 {pid}")
+            cluster.scancel(job_id)

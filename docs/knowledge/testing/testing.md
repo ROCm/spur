@@ -408,6 +408,15 @@ from persisting across tests.
   run as root. The `agent_as_root=True` parameter wraps the launch in
   `sudo`. `root_agent_preflight()` checks passwordless sudo before proceeding.
 
+- **Running a module as user and as root**: the `cluster` and
+  `accounting_cluster` fixtures read the `agent_as_root` fixture (default
+  `False`). A module overrides it with `params=[False, True]` to run each of its
+  tests twice, ids `user-spurd` and `root-spurd`, as `test_preemption_grace.py`
+  does. A rootful `spurd` runs batch scripts and `srun` steps behind namespace
+  launchers (`unshare`, `nsenter`), which only the root variants exercise;
+  `_assert_agent_runs_as_root` fails the run if `spurd` is not root, so a root
+  variant cannot pass without them.
+
 - **Container image tests**: `build_container_image()` builds a minimal
   squashfs rootfs locally (needs `mksquashfs`) and uploads it to all nodes.
   `build_imported_container_image()` goes through the real `spur image import`

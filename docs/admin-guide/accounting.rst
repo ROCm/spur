@@ -1117,7 +1117,7 @@ When a pending job selects a victim that has a grace:
 #. At the deadline the normal preemption runs: SIGTERM to every process of the
    job, a wait of up to ``kill_wait_secs`` (default 5 seconds; see
    :doc:`configuration`; it ends early once the processes exit), then SIGKILL.
-   The wait does not yet reach ``srun`` steps
+   The wait does not reach ``srun`` steps once the batch script exits
    (:ref:`kill wait note <kill-wait-steps-caveat>`). The job therefore receives a
    second SIGTERM and should tolerate it. In ``cancel`` mode the job ends
    ``CANCELLED`` (``PREEMPTED`` in ``sacct``, with ``PreemptedBy``); in
