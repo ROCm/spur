@@ -213,6 +213,7 @@ mod tests {
             fairshare_weight: weight,
             max_running_jobs: None,
             grp_tres: None,
+            default_qos: None,
             allowed_qos: None,
         }
     }
@@ -634,6 +635,7 @@ mod tests {
             fairshare_weight: 100,
             max_running_jobs: None,
             grp_tres: None,
+            default_qos: None,
             allowed_qos: None,
         }];
         let mut user_weights = HashMap::new();
@@ -687,6 +689,7 @@ mod tests {
             fairshare_weight: 100,
             max_running_jobs: None,
             grp_tres: None,
+            default_qos: None,
             allowed_qos: None,
         }];
         let mut user_weights = HashMap::new();

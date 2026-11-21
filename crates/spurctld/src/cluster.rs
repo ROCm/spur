@@ -1771,7 +1771,9 @@ impl ClusterManager {
                     if let Some(qos) = spec.qos.as_deref().filter(|q| !q.is_empty()) {
                         if let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) {
                             self.association_cache
-                                .check_qos_authorized(&spec.user, account, qos)
+                                .check_qos_authorized(&spec.user, account, qos, |q| {
+                                    self.qos_cache.get(q).is_some()
+                                })
                                 .map_err(SubmitError::invalid)?;
                         }
                     }
@@ -5309,7 +5311,9 @@ impl ClusterManager {
                     .or(job_account.as_deref());
                 if let Some(acct) = effective_account {
                     self.association_cache
-                        .check_qos_authorized(&job_user, acct, &q)
+                        .check_qos_authorized(&job_user, acct, &q, |q| {
+                            self.qos_cache.get(q).is_some()
+                        })
                         .map_err(JobUpdateRefusal::InvalidArgument)?;
                 }
                 Some(q)
@@ -13866,7 +13870,7 @@ const QOS_ACCOUNTING_HINT: &str =
 
 /// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
 /// exist and be permitted for the association) → association default →
-/// cluster fallback (`accounting.default_qos`, also gated by the
+/// account default → cluster fallback (`accounting.default_qos`, also gated by the
 /// association's allow-list) → reject if `accounting.require_qos`, else
 /// accept with no QOS.
 fn apply_default_qos(
@@ -13880,15 +13884,22 @@ fn apply_default_qos(
     // the account, default QOS, and allow-list under a single lock, so a
     // concurrent cache refresh can't validate one against the other's
     // stale snapshot.
-    let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
-    // A stale pinned default (removed from qos_cache since it was set) is
-    // treated as unset for authorization, matching how the fallback chain
-    // below already ignores it rather than letting it block every explicit
-    // `--qos` a user could otherwise submit.
-    let default_qos_for_auth = default_qos
-        .as_deref()
-        .filter(|d| qos_cache.get(d).is_some())
-        .map(str::to_owned);
+    let (account, default_candidates, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
+    // A stale default (removed from qos_cache since it was set) is skipped so
+    // the next candidate applies, for both assignment and authorization.
+    let mut default_qos = None;
+    for candidate in default_candidates {
+        if qos_cache.get(&candidate).is_some() {
+            default_qos = Some(candidate);
+            break;
+        }
+        warn!(
+            user = %spec.user,
+            account = account.as_deref().unwrap_or_default(),
+            qos = %candidate,
+            "default QOS no longer exists, ignoring"
+        );
+    }
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
@@ -13901,7 +13912,7 @@ fn apply_default_qos(
                 "QOS '{name}' does not exist{hint}"
             )));
         }
-        if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
+        if !qos_permitted(&allowed_qos, default_qos.as_deref(), name) {
             return Err(SubmitError::invalid(format!(
                 "QOS '{name}' is not permitted for user '{}' under account '{}'",
                 spec.user,
@@ -13912,16 +13923,8 @@ fn apply_default_qos(
     }
 
     if let Some(default_qos) = default_qos {
-        if qos_cache.get(&default_qos).is_some() {
-            spec.qos = Some(default_qos);
-            return Ok(());
-        }
-        warn!(
-            user = %spec.user,
-            account = account.as_deref().unwrap_or_default(),
-            qos = %default_qos,
-            "association default QOS no longer exists, ignoring"
-        );
+        spec.qos = Some(default_qos);
+        return Ok(());
     }
 
     // A configured fallback naming a nonexistent QOS is a hard error — silently
@@ -13941,7 +13944,7 @@ fn apply_default_qos(
                 "configured default QOS '{fallback}' does not exist{hint}"
             )));
         }
-        if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
+        if qos_permitted(&allowed_qos, None, fallback) {
             spec.qos = Some(fallback.to_string());
             return Ok(());
         }
@@ -42070,6 +42073,53 @@ state = "UP"
 
         super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn apply_default_qos_inherits_account_default() {
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        assoc.insert_account_default_qos("research", "batch");
+        let qos = qos_cache_with(&["batch", "normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn apply_default_qos_stale_association_default_falls_back_to_account_default() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "deleted-qos");
+        assoc.insert_account_default_qos("research", "batch");
+        let qos = qos_cache_with(&["batch"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("", true)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn apply_default_qos_account_default_outside_user_allow_list_is_not_inherited() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["normal"]);
+        assoc.insert_account_default_qos("research", "highprio");
+        let qos = qos_cache_with(&["normal", "highprio"]);
+
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(
+            spec.qos, None,
+            "account default must not bypass the allow-list"
+        );
+
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("highprio".into());
+        assert!(super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).is_err());
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────
