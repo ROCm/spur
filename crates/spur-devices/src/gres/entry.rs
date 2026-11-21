@@ -137,7 +137,10 @@ pub(crate) fn build_device_edits(paths: &[String]) -> ContainerEdits {
 
 pub(crate) fn build_shared_edits(paths: &[String]) -> ContainerEdits {
     let mut shared_edits = ContainerEdits::default();
-    if paths.iter().any(|p| p.contains("/dev/dri/")) {
+    if paths
+        .iter()
+        .any(|p| p.contains("/dev/dri/") || p == "/dev/kfd")
+    {
         shared_edits.device_nodes.push(DeviceNode {
             path: "/dev/kfd".into(),
             host_path: None,

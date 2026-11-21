@@ -13,29 +13,45 @@ pub enum DeviceCapability {
     CountablePool,
 }
 
+/// What a device is for, which decides the runtime env a job gets for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceClass {
+    Gpu,
+    Nic,
+    Other,
+}
+
+impl DeviceClass {
+    pub fn of(gres_name: &str) -> Self {
+        match gres_name {
+            "gpu" => Self::Gpu,
+            "nic" | "vnic" => Self::Nic,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviceEntry {
-    pub index: u32,
     pub gres_name: String,
     pub resource_type: Option<String>,
     pub kind: String,
     pub device_id: u32,
     pub capability: DeviceCapability,
     pub memory_mb: u64,
-    pub numa_node: Option<u32>,
-    pub cores: Option<Vec<u32>>,
     pub links: Option<Vec<i32>>,
     pub link_type: Option<LinkType>,
     pub pci_bdf: Option<String>,
     pub vendor: Option<String>,
     pub inject_actions: InjectActions,
     pub capacity: u64,
-    pub allocated: u64,
     pub device_edits: ContainerEdits,
     pub shared_edits: ContainerEdits,
-    pub device_paths: Vec<String>,
     pub stable_id: u64,
     pub topology: Option<crate::topology::DeviceTopology>,
+    pub numa_node: Option<u32>,
+    /// CPUs near the device (`[[devices.gres]] cores=`); feeds per-GPU core placement.
+    pub cores: Option<Vec<u32>>,
 }
 
 impl DeviceEntry {
@@ -46,42 +62,66 @@ impl DeviceEntry {
     pub fn is_countable_pool(&self) -> bool {
         self.capability == DeviceCapability::CountablePool
     }
+
+    pub fn class(&self) -> DeviceClass {
+        DeviceClass::of(&self.gres_name)
+    }
+
+    /// Host paths of this device's own nodes, excluding nodes shared by its kind.
+    pub fn node_paths(&self) -> impl Iterator<Item = &str> {
+        self.device_edits
+            .device_nodes
+            .iter()
+            .map(|dn| dn.effective_host_path())
+    }
+
+    /// Its node paths minus any its kind shares (a GRES entry's `/dev/kfd`), so
+    /// only nodes that identify this one device.
+    pub fn own_node_paths(&self) -> impl Iterator<Item = &str> {
+        self.node_paths().filter(move |path| {
+            !self
+                .shared_edits
+                .device_nodes
+                .iter()
+                .any(|dn| dn.effective_host_path() == *path)
+        })
+    }
 }
 
 pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
     let meta = DeviceMetadata::from_annotations(&cached.device.annotations);
     let device_edits = cached.device.container_edits.clone().unwrap_or_default();
     let shared_edits = cached.shared_edits.clone().unwrap_or_default();
-    let device_paths = collect_device_paths(&device_edits, &shared_edits);
     let gres_name = kind_to_gres_name(&cached.kind);
 
     let vendor = vendor_from_kind(&cached.kind);
+    let gpu_visibility_vars = match DeviceClass::of(&gres_name) {
+        DeviceClass::Gpu => gpu_visibility_for_vendor(vendor.as_deref()),
+        DeviceClass::Nic | DeviceClass::Other => Default::default(),
+    };
     let inject_actions = InjectActions {
-        gpu_visibility_vars: gpu_visibility_for_vendor(vendor.as_deref()),
+        gpu_visibility_vars,
     };
 
     DeviceEntry {
-        index: 0,
         gres_name,
         resource_type: meta.gpu_type.clone(),
         kind: cached.kind.clone(),
         device_id: 0,
         capability: DeviceCapability::Injectable,
         memory_mb: meta.memory_mb,
-        numa_node: meta.numa_node,
-        cores: meta.cores,
         links: meta.links,
         link_type: meta.link_type,
         pci_bdf: meta.pci_bdf,
         vendor,
         inject_actions,
         capacity: 1,
-        allocated: 0,
         device_edits,
         shared_edits,
-        device_paths,
         topology: meta.topology,
         stable_id: meta.stable_id.unwrap_or(0),
+        numa_node: meta.numa_node,
+        cores: meta.cores,
     }
 }
 
@@ -99,24 +139,6 @@ pub fn resolve_link_type(entry: &DeviceEntry) -> LinkType {
         }
     }
     LinkType::Pcie
-}
-
-pub(crate) fn collect_device_paths(
-    device_edits: &ContainerEdits,
-    shared_edits: &ContainerEdits,
-) -> Vec<String> {
-    let mut paths: Vec<String> = device_edits
-        .device_nodes
-        .iter()
-        .map(|dn| dn.effective_host_path().to_owned())
-        .collect();
-    paths.extend(
-        shared_edits
-            .device_nodes
-            .iter()
-            .map(|dn| dn.effective_host_path().to_owned()),
-    );
-    paths
 }
 
 pub fn kind_to_gres_name(kind: &str) -> String {
@@ -185,25 +207,22 @@ mod tests {
 
     fn test_gpu_entry() -> DeviceEntry {
         DeviceEntry {
-            index: 0,
+            numa_node: None,
+            cores: None,
             gres_name: "gpu".into(),
             resource_type: None,
             kind: "amd.com/gpu".into(),
             device_id: 0,
             capability: DeviceCapability::Injectable,
             memory_mb: 0,
-            numa_node: None,
-            cores: None,
             links: None,
             link_type: None,
             pci_bdf: None,
             vendor: None,
             inject_actions: InjectActions::default(),
             capacity: 1,
-            allocated: 0,
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
-            device_paths: Vec::new(),
             topology: None,
             stable_id: 0,
         }
