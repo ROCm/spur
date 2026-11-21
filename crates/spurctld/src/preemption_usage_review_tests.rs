@@ -73,6 +73,7 @@ fn requester_reservation(observation: u64, allocation: ResourceAllocations) -> W
         srun_step_dispatch: false,
         run_attempt: 1,
         idle_fill: false,
+        resolved_placement: None,
         at: Some(chrono::DateTime::UNIX_EPOCH),
     }
 }

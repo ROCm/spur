@@ -279,6 +279,9 @@ pub const CAP_STEP_RESOURCES: &str = "step-resources";
 /// the job with 1 CPU per task), so the CLI refuses those options instead.
 pub const CAP_PER_GPU_OPTIONS: &str = "per-gpu-options";
 
+/// Agent capability: the agent places a batch script by `LaunchJobRequest.script_placement`.
+pub const CAP_SCRIPT_PLACEMENT: &str = "script-placement";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 
@@ -547,6 +550,17 @@ impl Node {
             .collect()
     }
 
+    /// A virtual node the spur-k8s operator registered, running jobs as Pods.
+    pub fn is_kubernetes(&self) -> bool {
+        matches!(self.source, NodeSource::Kubernetes { .. })
+    }
+
+    /// Whether the agent places a batch script by its text because it predates
+    /// `script-placement`. K8s virtual agents run every script once per node.
+    pub fn reads_placement_off_script(&self) -> bool {
+        !self.is_kubernetes() && !self.supports(CAP_SCRIPT_PLACEMENT)
+    }
+
     /// Reset config-derived scheduling policy (features, weight) to defaults.
     /// Used when a node no longer matches any `NodeConfig` so stale policy does
     /// not persist. Keeps the "no match" state identical to a freshly created node.
@@ -801,6 +815,21 @@ mod tests {
         node.capabilities = vec![CAP_SIGNAL_JOB.to_string()];
         assert!(node.supports(CAP_SIGNAL_JOB));
         assert!(!node.supports("other"));
+    }
+
+    #[test]
+    fn only_a_native_agent_without_the_capability_reads_placement_off_the_script() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        assert!(node.reads_placement_off_script());
+
+        node.capabilities = vec![CAP_SCRIPT_PLACEMENT.to_string()];
+        assert!(!node.reads_placement_off_script());
+
+        node.capabilities.clear();
+        node.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        assert!(!node.reads_placement_off_script());
     }
 
     #[test]

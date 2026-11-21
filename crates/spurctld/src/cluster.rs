@@ -873,7 +873,7 @@ fn epilog_hook_context(job_id: JobId, job: Option<&Job>) -> spur_core::hooks::Ho
     }
 }
 
-/// What a run is charged to, recorded with its placement.
+/// What a run is charged to and how it runs, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
     /// Started on spare capacity outside the QOS group node quota.
@@ -882,6 +882,8 @@ pub struct RunAttribution {
     pub effective_partition: Option<String>,
     /// The request as that partition's memory policy reshaped it.
     pub memory_adjustment: Option<spur_core::partition_limits::MemoryAdjustment>,
+    /// Where its batch script runs.
+    pub resolved_placement: Option<spur_core::script_placement::ResolvedPlacement>,
 }
 
 impl RunAttribution {
@@ -891,6 +893,7 @@ impl RunAttribution {
             idle_fill,
             effective_partition: assignment.partition.clone(),
             memory_adjustment: assignment.memory_adjustment,
+            resolved_placement: None,
         }
     }
 }
@@ -1503,6 +1506,10 @@ impl ClusterManager {
             spec.nodelist.as_deref(),
             |name| self.nodes.read().get(name).map(|node| node.source.clone()),
         )
+        .map_err(SubmitError::invalid)?;
+        crate::script_placement::validate_batch_nodelist(&spec, |name| {
+            self.nodes.read().get(name).map(|node| node.source.clone())
+        })
         .map_err(SubmitError::invalid)?;
 
         // Bound the spec before the hook forks/parses it; the hook only edits
@@ -3063,6 +3070,7 @@ impl ClusterManager {
             idle_fill: attribution.idle_fill,
             effective_partition: attribution.effective_partition,
             memory_adjustment: attribution.memory_adjustment,
+            resolved_placement: attribution.resolved_placement,
             at: None,
         })?;
         // The read-then-propose above is not atomic: a second reservation or a new
@@ -8028,6 +8036,18 @@ impl ClusterManager {
                     .iter()
                     .filter(|n| placement.in_partition(n))
                     .count();
+                let k8s_would_fit = job.spec.needs_native_nodes()
+                    && cluster_state.nodes.iter().any(|n| {
+                        n.is_kubernetes()
+                            && placement.eligible_on_any_agent(n, cluster_state.reservations, now)
+                    });
+                if needed <= partition_size && k8s_would_fit {
+                    job_entry.set_pending_reason_desc(
+                        PendingReason::BadConstraints,
+                        crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED,
+                    );
+                    continue;
+                }
 
                 job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
@@ -8954,6 +8974,7 @@ impl ClusterManager {
         job.start_time = None;
         job.exit_code = None;
         job.allocated_nodes.clear();
+        job.resolved_placement = None;
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.leave_partition();
@@ -9651,6 +9672,7 @@ impl ClusterManager {
                 idle_fill,
                 effective_partition,
                 memory_adjustment,
+                resolved_placement,
                 at: _,
             } => {
                 // Only a saved node_names list fences placement; earlier log entries keep
@@ -9689,6 +9711,7 @@ impl ClusterManager {
                     job.per_node_alloc = per_node_alloc.clone();
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
+                    job.resolved_placement = *resolved_placement;
                     job.run_attempt = (*run_attempt).max(job.run_attempt);
                     job.idle_fill = *idle_fill;
                     job.start_in_partition(effective_partition.clone(), *memory_adjustment);
@@ -16098,6 +16121,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
 
@@ -16374,6 +16398,44 @@ state = "UP"
             cm.get_node("n1").unwrap().alloc_resources.cpus,
             4,
             "a Running job's charge must survive a hold whose precheck raced activation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_records_where_the_script_runs_until_the_run_ends() {
+        use spur_core::script_placement::ResolvedPlacement;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("placed"));
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm
+            .reserve_attributed_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+                false,
+                RunAttribution {
+                    resolved_placement: Some(ResolvedPlacement::BatchHost),
+                    ..Default::default()
+                },
+            )
+            .expect("reserve");
+        assert_eq!(
+            cm.get_job(id).unwrap().resolved_placement,
+            Some(ResolvedPlacement::BatchHost)
+        );
+
+        cm.abort_placement(id, attempt, false).expect("abort");
+        wait_for("placement released", || {
+            cm.get_job(id).is_some_and(|j| !j.holds_a_placement())
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().resolved_placement,
+            None,
+            "the next run resolves its own placement"
         );
     }
 
@@ -17553,6 +17615,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -17759,6 +17822,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -17875,6 +17939,7 @@ state = "UP"
                 effective_partition: None,
                 memory_adjustment: None,
                 preemption_observation: None,
+                resolved_placement: None,
                 at: None,
             },
             WalOperation::NodeUpdate {
@@ -18169,6 +18234,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -18204,6 +18270,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -19263,6 +19330,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -19308,6 +19376,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         for step_id in [0, 1, 2] {
@@ -19391,6 +19460,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         for step_id in [1, 2] {
@@ -19469,6 +19539,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19562,6 +19633,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let step_create = WalOperation::JobStepCreate {
@@ -19702,6 +19774,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let step_create = WalOperation::JobStepCreate {
@@ -19793,6 +19866,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19865,6 +19939,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -19960,6 +20035,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20009,6 +20085,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20085,6 +20162,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20159,6 +20237,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -20236,6 +20315,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
 
@@ -20355,6 +20435,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20414,6 +20495,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20454,6 +20536,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20508,6 +20591,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -20556,6 +20640,7 @@ state = "UP"
             idle_fill: true,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
@@ -20619,6 +20704,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -20656,6 +20742,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21092,6 +21179,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21132,6 +21220,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21175,6 +21264,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21219,6 +21309,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
 
@@ -21302,6 +21393,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -23682,6 +23774,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -23723,6 +23816,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -23878,6 +23972,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -23967,6 +24062,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -24546,6 +24642,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -24626,6 +24723,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -24858,6 +24956,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -24892,6 +24991,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24912,6 +25012,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24944,6 +25045,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -24967,6 +25069,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let mut excl_spec = basic_spec("excl");
         excl_spec.exclusive = true;
@@ -25008,6 +25111,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25041,6 +25145,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25079,6 +25184,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25121,6 +25227,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25174,6 +25281,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25227,6 +25335,7 @@ state = "UP"
             partitions: &[],
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25261,6 +25370,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
@@ -25292,11 +25402,54 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BadConstraints
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_job_with_only_k8s_nodes_says_why_it_waits() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "k1", 4, 8000);
+        register_node(&cm, "k2", 4, 8000);
+
+        let mut spec = basic_spec("driver");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        spec.script = Some("#!/bin/bash\nsrun ./train\n".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let k8s = |name: &str| {
+            let mut node = cm.get_node(name).unwrap();
+            node.source = spur_core::node::NodeSource::Kubernetes {
+                namespace: "spur".into(),
+            };
+            node
+        };
+        let nodes = vec![k8s("k1"), k8s("k2")];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
+            busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            script_placement_default: Default::default(),
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::BadConstraints);
+        assert_eq!(
+            job.state_reason(),
+            crate::script_placement::BATCH_SCRIPT_K8S_UNSUPPORTED
         );
     }
 
@@ -25472,6 +25625,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snapshot = cm.get_job(job_id).unwrap();
         cm.update_pending_reasons(&[&snapshot], &empty_state);
@@ -27325,6 +27479,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: Some(Utc::now()),
         });
         assert!(cm.preempt_freed_nodes_raw().is_empty());
@@ -27719,6 +27874,7 @@ state = "UP"
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
@@ -31351,6 +31507,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -32100,6 +32257,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -32182,6 +32340,7 @@ state = "UP"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            script_placement_default: Default::default(),
         };
         use spur_sched::traits::Scheduler as _;
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
@@ -34844,6 +35003,7 @@ state = "UP"
             partitions: &[],
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let snap = cm.get_job(job).unwrap();
         cm.update_pending_reasons(&[&snap], &state);
@@ -43889,6 +44049,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -43910,6 +44071,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -44988,6 +45150,7 @@ state = "UP"
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }

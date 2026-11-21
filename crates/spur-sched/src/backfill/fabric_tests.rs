@@ -140,6 +140,7 @@ fn run_admitting(
         fabric: enforce.then_some(&context),
         busy_until: &busy,
         partition_node_usage: &Default::default(),
+        script_placement_default: Default::default(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let jobs: Vec<_> = jobs
@@ -745,6 +746,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
         fabric: Some(&context),
         busy_until: &busy,
         partition_node_usage: &Default::default(),
+        script_placement_default: Default::default(),
     };
     let plain = job(1, 4, 6);
     let mut scheduler = BackfillScheduler::new(100);
@@ -853,6 +855,7 @@ fn property_run_in(
         fabric: Some(&context),
         busy_until: &busy,
         partition_node_usage: &Default::default(),
+        script_placement_default: Default::default(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let assignments = scheduler.schedule_with(jobs, &cluster, now(), &mut AdmitAll);

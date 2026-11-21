@@ -374,6 +374,10 @@ message JobSpec {
   bool container_auth_socket = 87;
   optional uint32 cpus_per_gpu = 88;  // `--cpus-per-gpu`
   uint64 memory_per_gpu_mb = 89;  // `--mem-per-gpu`; 0 = not given
+
+  // Where the batch script runs: "auto", "batch-host", or "all-nodes".
+  // Empty leaves it to the cluster's [controller] script_placement.
+  string script_placement = 90;
 }
 
 message JobInfo {
@@ -516,6 +520,13 @@ message JobInfo {
   // CPUs a finished run held across its nodes, from accounting history; unset
   // on live jobs and on history rows recorded before it was kept.
   optional uint64 alloc_cpus = 95;
+
+  // The node a batch job's script runs on (Slurm's BatchHost); empty until the run starts.
+  string batch_host = 96;
+  // Batch script placement as requested ("" when left to the cluster default)
+  // and as resolved for the current run ("" until the run starts).
+  string script_placement = 97;
+  string resolved_script_placement = 98;
 }
 
 // Slurm's Sockets/CoresPerSocket/ThreadsPerCore, from the agent's CPU topology
@@ -1345,6 +1356,10 @@ message LaunchJobRequest {
   // its own gets, Slurm-parity. 0 = unknown (older controller); the agent
   // falls back to its own detected total.
   uint64 node_memory_ceiling_mb = 16;
+  // Where the batch script runs, resolved by the controller: "batch-host" runs
+  // it on the node at task_offset 0 only, "all-nodes" on every node. Empty from
+  // controllers that predate it; the agent then reads it off the script.
+  string script_placement = 17;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
