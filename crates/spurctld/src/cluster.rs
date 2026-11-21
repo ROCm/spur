@@ -8398,6 +8398,16 @@ impl ClusterManager {
         }
     }
 
+    pub(crate) fn with_allocation_records<T>(
+        &self,
+        read: impl FnOnce(&HashMap<JobId, Job>, &HashMap<String, Node>) -> T,
+    ) -> T {
+        // Placement apply holds jobs before nodes; readers need the same coherent pair.
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        read(&jobs, &nodes)
+    }
+
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
@@ -26588,6 +26598,75 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_node_preemption_keeps_protected_and_unneeded_tenants() {
+        let dir = TempDir::new().unwrap();
+        let mut config = preempting_config();
+        config.scheduler.preempt_victim_order.clear();
+        config.scheduler.preempt_exempt_time = 0;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 4, 100);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let mut tenants = Vec::new();
+        for (name, qos, cpus, mem) in [
+            ("protected", "high", 2, 60),
+            ("eligible-a", "low", 1, 20),
+            ("eligible-b", "low", 1, 20),
+        ] {
+            let mut spec = basic_spec(name);
+            spec.qos = Some(qos.into());
+            spec.cpus_per_task = cpus;
+            spec.memory_per_node_mb = Some(mem);
+            let id = submit_and_wait(&cm, spec);
+            let allocation = scalar_alloc(cpus, mem);
+            cm.start_job(
+                id,
+                vec!["n1".into()],
+                allocation.clone(),
+                per_node_for(&["n1"], allocation),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            tenants.push(cm.get_job(id).unwrap());
+        }
+        let mut spec = basic_spec("preemptor");
+        spec.qos = Some("high".into());
+        spec.memory_per_node_mb = Some(20);
+        let id = submit_and_wait(&cm, spec);
+        let pending = cm.get_job(id).unwrap();
+        assert!(!pending.spec.exclusive);
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&pending],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(&cm, tenants[1].job_id, JobState::Completing);
+        assert_eq!(
+            cm.get_job(tenants[1].job_id).unwrap().preempted_by,
+            Some(id)
+        );
+        for before in [&tenants[0], &tenants[2]] {
+            let after = cm.get_job(before.job_id).unwrap();
+            assert_eq!(after.state, JobState::Running);
+            assert_eq!(after.per_node_alloc, before.per_node_alloc);
+            assert_eq!(after.run_attempt, before.run_attempt);
+            assert_eq!(after.preempted_by, None);
+        }
+        report_nodes_released(&cm, tenants[1].job_id);
+        settle(&cm, tenants[1].job_id, JobState::Cancelled);
+        let assignments = run_one_scheduling_pass(&cm);
+        let assignment = assignments
+            .iter()
+            .find(|a| a.job_id == id)
+            .expect("shared placement");
+        assert_eq!(assignment.nodes, ["n1"]);
+        assert_eq!(assignment.per_node_alloc["n1"].cpus, 1);
+        assert_eq!(assignment.per_node_alloc["n1"].memory_mb, 20);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_skips_jobs_in_active_reservation_at_same_tier() {
         let dir = TempDir::new().unwrap();
         let config = preempting_config();
@@ -26644,10 +26723,6 @@ state = "UP"
         let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         insert_preempting_qos_pair(&cm, "low", "high");
-        // One victim per node: the atomic per-node eviction search vacates a
-        // node only when every occupant on it is evictable, so two victims
-        // sharing one node would both go in the same tick and never exercise
-        // the drain guard this test targets.
         register_node(&cm, "n1", 4, 8000);
         register_node(&cm, "n2", 4, 8000);
 
@@ -26759,6 +26834,7 @@ state = "UP"
 
         let mut high = basic_spec("high");
         high.qos = Some("high".into());
+        high.exclusive = true;
         submit_and_wait(&cm, high);
 
         let pending = cm.pending_jobs();
@@ -26830,6 +26906,7 @@ state = "UP"
 
         let mut hunter = basic_spec("hunter");
         hunter.qos = Some(hunter_qos.into());
+        hunter.exclusive = true;
         hunter.nodelist = Some(node.into());
         let hunter_id = submit_and_wait(cm, hunter);
         (victim_id, hunter_id)
@@ -27487,6 +27564,7 @@ state = "UP"
         let blocker = run_with_qos(&cm, "blocker", "low", "n2", 2);
         let mut hunter = basic_spec("hunter");
         hunter.qos = Some("high".into());
+        hunter.exclusive = true;
         hunter.nodelist = Some("n1,n2".into());
         hunter.num_nodes = 2;
         hunter.num_tasks = 2;
@@ -27684,6 +27762,7 @@ state = "UP"
         cm.jobs.write().get_mut(&victim).unwrap().spec.qos = Some("low".into());
         let mut owner = basic_spec("owner");
         owner.qos = Some("high".into());
+        owner.exclusive = true;
         owner.nodelist = Some("n1".into());
         owner.time_limit = Some(chrono::Duration::minutes(1));
         let owner = submit_and_wait(&cm, owner);
@@ -28427,6 +28506,7 @@ state = "UP"
 
         let mut primus = basic_spec("primus");
         primus.qos = Some("primus".into());
+        primus.exclusive = true;
         submit_and_wait(&cm, primus);
 
         let pending = cm.pending_jobs();
@@ -28478,6 +28558,7 @@ state = "UP"
         let mut primus = basic_spec("primus");
         primus.priority = Some(1000);
         primus.qos = Some("primus".into());
+        primus.exclusive = true;
         submit_and_wait(&cm, primus);
 
         let pending = cm.pending_jobs();
@@ -28596,6 +28677,7 @@ state = "UP"
 
         let mut high = basic_spec("high");
         high.qos = Some("high".into());
+        high.exclusive = true;
         submit_and_wait(&cm, high);
 
         let pending = cm.pending_jobs();
@@ -28856,6 +28938,7 @@ state = "UP"
         let mut unplaceable = basic_spec("unplaceable");
         unplaceable.priority = Some(10_000);
         unplaceable.qos = Some("high".into());
+        unplaceable.exclusive = true;
         unplaceable.gres = vec!["1".into()];
         let unplaceable_id = submit_and_wait(&cm, unplaceable);
         let unplaceable_job = cm.get_job(unplaceable_id).unwrap();
@@ -28882,6 +28965,7 @@ state = "UP"
         let mut placeable = basic_spec("placeable");
         placeable.priority = Some(10_000);
         placeable.qos = Some("high".into());
+        placeable.exclusive = true;
         let placeable_id = submit_and_wait(&cm, placeable);
         let placeable_job = cm.get_job(placeable_id).unwrap();
         crate::scheduler_loop::try_preempt(
@@ -28926,6 +29010,7 @@ state = "UP"
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
         high.qos = Some("high".into());
+        high.exclusive = true;
         high.num_nodes = 2;
         high.num_tasks = 2;
         let high_id = submit_and_wait(&cm, high);
@@ -28990,7 +29075,9 @@ state = "UP"
         register_node(&cm, "n2", 8, 16000);
         insert_preempting_qos_pair(&cm, "low", "high");
         let ids = start_jobs_in_qos(&cm, "low", jobs);
-        preempt_for_high(&cm, basic_spec("high")).await;
+        let mut high = basic_spec("high");
+        high.exclusive = true;
+        preempt_for_high(&cm, high).await;
         assert_draining(&cm, &ids, expected);
     }
 
@@ -29077,7 +29164,9 @@ state = "UP"
         .unwrap();
         settle(&cm, ids[0], JobState::Running);
 
-        preempt_for_high(&cm, basic_spec("high")).await;
+        let mut high = basic_spec("high");
+        high.exclusive = true;
+        preempt_for_high(&cm, high).await;
         assert_draining(&cm, &ids, &[0]);
     }
 
@@ -29167,6 +29256,7 @@ state = "UP"
 
         let mut claim = basic_spec("claim");
         claim.qos = Some("claim".into());
+        claim.exclusive = true;
         let claim_id = submit_and_wait(&cm, claim);
         let claimer = cm.get_job(claim_id).unwrap();
         let freed = crate::scheduler_loop::reclaim_for(&cm, &[&claimer]).await;

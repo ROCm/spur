@@ -81,6 +81,10 @@ impl TresCharge {
         self.0.is_empty()
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
     pub fn add(&mut self, other: &TresCharge) {
         for (key, amount) in &other.0 {
             let entry = self.0.entry(key.clone()).or_insert(0);

@@ -151,12 +151,18 @@ whose eviction would let it run. It looks only while the job still fits its limi
 after the jobs started earlier in the same pass, since freeing nodes for a job its
 limits would refuse evicts a borrowed run for nothing.
 
-The set of jobs to evict must **provably close the shortfall, or nothing is evicted**. A node
-counts as recovered only when every job on it is reclaimable, so the outcome is
-all-or-nothing: the waiting job gets a full allocation, or the cluster is left
-untouched. A partial eviction would destroy work without helping anyone, and a job
-that can never be placed anywhere — asking for more GPUs than any node has, say —
-can never assemble such a set, and so evicts nothing, ever.
+The set of jobs to evict must **provably close the shortfall, or nothing is evicted**.
+On a shared node, protected jobs keep their CPU, memory, and GPU allocations while
+eligible co-residents are evaluated. Spur selects enough eligible jobs for the
+waiting job's complete placement, including every requested node and partition
+resource limit. A small request can therefore reclaim one job while the other
+jobs on that node continue running.
+
+The search uses deterministic QOS-priority ordering and removes unnecessary
+victims from a sufficient set. It does not promise a globally smallest set.
+Internal memory, work, and placement-call limits bound the search; exceeding a
+limit leaves the waiting job pending and evicts nobody. This can defer large
+valid requests as well as requests that cannot fit.
 
 Reclaimed jobs are **requeued, not cancelled**. The job returns to the queue with
 its spec intact and starts again when capacity allows, so the user loses the
@@ -192,8 +198,8 @@ opportunistic tier. Within it, QOS priority decides what happens, under two rule
 
 **A reclaim takes the cheapest opportunistic run first.** A job with a quota claim
 evicts the lowest-priority opportunistic run available — typically a burst job — and
-climbs to a dearer borrowed run only if that was not enough. Only as many nodes as
-the claim needs are taken.
+climbs to a dearer borrowed run only if that was not enough. Unnecessary victims
+are spared once the full CPU, memory, and GPU request can be placed.
 
 **An opportunistic job may only displace work cheaper than itself.** A borrowed job
 that needs nodes can reclaim from an ``idlefillpreemptable`` QOS of strictly lower

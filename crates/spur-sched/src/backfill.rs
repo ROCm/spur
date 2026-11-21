@@ -44,6 +44,7 @@ pub struct BackfillScheduler {
     last_outcome: HashMap<JobId, Unplaced>,
     /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
     report_unplaced: bool,
+    immediate: bool,
     /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
     released_handoffs: Vec<(String, JobId)>,
     /// Jobs the last pass did not start now while a partition cap was exceeded.
@@ -222,12 +223,124 @@ impl<'a> HandoffGate<'a> {
 }
 
 impl BackfillScheduler {
+    pub fn place_releasing(
+        &mut self,
+        projection: &crate::immediate::PlacementProjection<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        let flags = (self.immediate, self.report_unplaced);
+        self.immediate = true;
+        self.report_unplaced = false;
+        let result = self.place_now_prepared(&projection.request, &projection.state(), now, budget);
+        (self.immediate, self.report_unplaced) = flags;
+        result
+    }
+
+    pub fn immediate_candidates(
+        &self,
+        request: &crate::immediate::PlacementProjection<'_>,
+        now: chrono::DateTime<Utc>,
+    ) -> Vec<usize> {
+        let state = request.state();
+        self.find_suitable_nodes(
+            request.job(),
+            &state,
+            &HandoffGate::new(state.preemption_handoffs),
+            now,
+        )
+    }
+
+    /// Checks only the current window, sharing allocation and partition resolution.
+    pub fn place_now(
+        &mut self,
+        request: &crate::immediate::PlacementRequest,
+        cluster: &ClusterState<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        let request = crate::immediate::PlacementRequest::new(request.job(), cluster, budget)?;
+        let flags = (self.immediate, self.report_unplaced);
+        self.immediate = true;
+        self.report_unplaced = false;
+        let result = self.place_now_prepared(&request, cluster, now, budget);
+        (self.immediate, self.report_unplaced) = flags;
+        result
+    }
+
+    fn place_now_prepared(
+        &mut self,
+        request: &crate::immediate::PlacementRequest,
+        cluster: &ClusterState<'_>,
+        now: chrono::DateTime<Utc>,
+        budget: &mut crate::immediate::SearchBudget,
+    ) -> Option<Option<Assignment>> {
+        budget.trial(request.trial_work)?;
+        self.init_timelines(cluster.nodes);
+        let until = now + UNLIMITED_JOB_DURATION;
+        for (index, node) in cluster.nodes.iter().enumerate() {
+            if !node.alloc_resources.is_empty() {
+                self.timelines[index].reserve(now, until, node.alloc_resources.clone());
+            }
+            if let Some(blocked) = node.layout_blocked_alloc() {
+                self.timelines[index].reserve(now, until, blocked);
+            }
+        }
+        self.seed_partition_usage(cluster, now);
+        let Some(job) = job_in_eligible_partitions(&request.job, cluster.partitions) else {
+            return Some(None);
+        };
+        let typed_gpu = job_typed_gpu(&job);
+        let candidates = candidate_partitions(&job, cluster.partitions);
+        let handoffs = HandoffGate::new(cluster.preemption_handoffs);
+        let per_partition = candidates
+            .iter()
+            .any(|p| is_capped(p) || p.has_memory_policy() || p.max_mem_per_node.is_some());
+        let resolved = if per_partition {
+            self.resolve_partition(
+                &job,
+                cluster,
+                &handoffs,
+                now,
+                &candidates,
+                typed_gpu.as_deref(),
+            )
+        } else {
+            self.plan_placement(&job, cluster, &handoffs, now, None)
+                .map(|plan| {
+                    let partition = attributed_partition(&candidates, cluster.nodes, &plan.nodes);
+                    (plan, partition)
+                })
+        };
+        Some(
+            resolved
+                .ok()
+                .filter(|(plan, _)| plan.start <= now)
+                .map(|(plan, partition)| Assignment {
+                    job_id: job.job_id,
+                    nodes: plan
+                        .nodes
+                        .into_iter()
+                        .map(|i| cluster.nodes[i].name.clone())
+                        .collect(),
+                    per_node_alloc: plan.per_node_alloc,
+                    memory_adjustment: planned_adjustment(
+                        &job,
+                        partition.as_deref(),
+                        cluster.partitions,
+                    ),
+                    partition,
+                }),
+        )
+    }
+
     pub fn new(max_jobs: usize) -> Self {
         Self {
             timelines: Vec::new(),
             max_jobs,
             last_outcome: HashMap::new(),
             report_unplaced: true,
+            immediate: false,
             released_handoffs: Vec::new(),
             cap_blocks: HashMap::new(),
         }
@@ -377,6 +490,15 @@ impl BackfillScheduler {
 
     /// Initialize or reset timelines from current cluster state.
     fn init_timelines(&mut self, nodes: &[Node]) {
+        if self.timelines.len() == nodes.len() {
+            for (timeline, node) in self.timelines.iter_mut().zip(nodes) {
+                timeline.node_name.clone_from(&node.name);
+                timeline.total.clone_from(&node.total_resources);
+                timeline.pools = node.cpu_pools();
+                timeline.intervals.clear();
+            }
+            return;
+        }
         self.timelines = nodes
             .iter()
             .map(|n| {
@@ -421,6 +543,13 @@ impl BackfillScheduler {
         floor: chrono::DateTime<Utc>,
     ) -> chrono::DateTime<Utc> {
         let max_check = floor + chrono::Duration::days(365);
+        if self.immediate {
+            let allocated = self.timelines[ni].accumulated_at(floor);
+            let fits = self.timelines[ni].admits(&allocated, request)
+                && cap.is_none_or(|cap| self.timelines[ni].cap_admits(cap, floor, duration))
+                && Self::reservation_blocker(res_check, floor, duration).is_none();
+            return if fits { floor } else { max_check };
+        }
         let mut candidate = floor;
         loop {
             if candidate > max_check {
@@ -713,6 +842,7 @@ impl BackfillScheduler {
                 let mut floor = now;
                 loop {
                     let mut trial = Self {
+                        immediate: false,
                         timelines: self.timelines.clone(),
                         max_jobs: 1,
                         last_outcome: HashMap::new(),
@@ -999,7 +1129,7 @@ impl BackfillScheduler {
                     .get(&node.name)
                     .copied()
                     .unwrap_or(now + Duration::hours(24));
-                if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
+                if !node.alloc_resources.is_empty() {
                     self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
                 }
                 // Older-layout jobs on these GPUs' reserved CPUs end by
@@ -1007,12 +1137,14 @@ impl BackfillScheduler {
                 if let Some(blocked) = node.layout_blocked_alloc() {
                     self.timelines[i].reserve(now, free_at, blocked);
                 }
-                debug!(
-                    node = %node.name,
-                    alloc_cpus = node.alloc_resources.cpus,
-                    alloc_gpus = node.alloc_resources.total_device_count("gpu"),
-                    "node allocation state"
-                );
+                if self.report_unplaced {
+                    debug!(
+                        node = %node.name,
+                        alloc_cpus = node.alloc_resources.cpus,
+                        alloc_gpus = node.alloc_resources.total_device_count("gpu"),
+                        "node allocation state"
+                    );
+                }
             }
             self.seed_partition_usage(cluster, now);
         }
@@ -1246,12 +1378,14 @@ impl BackfillScheduler {
                     start: now,
                     end,
                 }]) {
-                    debug!(
-                        job_id = job.job_id,
-                        nodes = ?node_names,
-                        partition = ?partition,
-                        "scheduling job"
-                    );
+                    if self.report_unplaced {
+                        debug!(
+                            job_id = job.job_id,
+                            nodes = ?node_names,
+                            partition = ?partition,
+                            "scheduling job"
+                        );
+                    }
                 } else {
                     handoffs.owner_refused(job.job_id, now);
                     note(UnplacedKind::RefusedAtStart, plan.nodes.len(), None);
@@ -1461,6 +1595,7 @@ impl BackfillScheduler {
                 partition_cap_ok(partition, &node.name, &used, &charge).err()
             })
             .collect();
+
         (!overshoots.is_empty()).then(|| PartitionCapBlock {
             partition: partition.name.clone(),
             overshoots,
@@ -1591,16 +1726,22 @@ impl BackfillScheduler {
                     duration,
                     floor,
                 );
-                debug!(
-                    job_id = job.job_id,
-                    node = %cluster.nodes[ni].name,
-                    earliest_start = %start,
-                    is_now = (start <= now),
-                    "earliest start for node"
-                );
+                if self.report_unplaced {
+                    debug!(
+                        job_id = job.job_id,
+                        node = %cluster.nodes[ni].name,
+                        earliest_start = %start,
+                        is_now = (start <= now),
+                        "earliest start for node"
+                    );
+                }
                 (ni, start)
             })
             .collect();
+
+        if self.immediate {
+            node_starts.retain(|(_, start)| *start <= now);
+        }
 
         // Free GPUs per candidate, evaluated at each node's own
         // earliest_start (not `now`, which can be stale by then).
@@ -1671,8 +1812,11 @@ impl BackfillScheduler {
             if let Some(topo) = &cluster.topology {
                 let wants_topo = job.spec.topology.as_deref();
                 if matches!(wants_topo, Some("tree") | Some("block")) {
+                    // Locality must not delay a placement that can start sooner.
+                    let earliest_window = node_starts[needed_nodes - 1].1;
                     let candidate_names: Vec<&str> = node_starts
                         .iter()
+                        .take_while(|(_, start)| *start <= earliest_window)
                         .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
                         .collect();
                     let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
@@ -1687,7 +1831,6 @@ impl BackfillScheduler {
                             reordered.push(node_starts.remove(pos));
                         }
                     }
-                    // Append any remaining (shouldn't happen, but safety)
                     reordered.extend(node_starts);
                     node_starts = reordered;
                 }
@@ -1748,6 +1891,9 @@ impl BackfillScheduler {
             ) {
                 per_node_alloc = allocations;
                 break;
+            }
+            if self.immediate {
+                return Err((UnplacedKind::NoCapacityAtStart, assigned_nodes.len()));
             }
 
             // Per-node timing floors can fit before the full GPU total or
@@ -1989,14 +2135,16 @@ fn cpu_is_heterogeneous(job: &Job) -> bool {
 
 /// The single-node resource request used for feasibility filtering and
 /// earliest-start computation. For homogeneous demand this carries the exact
-/// per-node GPU count; for heterogeneous demand it carries the minimum (one
-/// GPU per node), with the concrete per-node counts resolved at allocation.
+/// per-node GPU count, including the whole GPU total for a one-node job.
+/// Multi-node heterogeneous demand carries the minimum (one GPU per node),
+/// with concrete per-node counts resolved at allocation.
 pub fn job_resource_request(job: &Job) -> ResourceSet {
     let mut rs = base_node_request(job);
     let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
-    // Heterogeneous demand needs at least one GPU per node for feasibility;
-    // homogeneous demand carries its exact per-node count.
-    let per_node = homogeneous_per_node(&demand).unwrap_or(1);
+    let per_node = match &demand {
+        GpuDemand::Total { count, .. } if job.spec.num_nodes <= 1 => *count,
+        _ => homogeneous_per_node(&demand).unwrap_or(1),
+    };
     rs.cpus = rs
         .cpus
         .max(job.spec.cpus_on_node(min_node_tasks(&job.spec), per_node));
@@ -2863,6 +3011,52 @@ mod tests {
         node.state = NodeState::Idle;
         node.partitions = vec!["default".into()];
         node
+    }
+
+    #[test]
+    fn one_node_gpu_total_rejects_insufficient_inventory_before_exclusive_placement() {
+        for exclusive in [false, true] {
+            for gpu_type in [None, Some("mi300x"), Some("other")] {
+                let mut nodes = [make_gpu_node(1), make_gpu_node(2)];
+                nodes[0].name = "small".into();
+                nodes[1].name = "big".into();
+                let job = Job::new(
+                    1,
+                    JobSpec {
+                        exclusive,
+                        gpus: Some(spur_core::gpu_request::GpuRequest::new(
+                            2,
+                            gpu_type.map(str::to_owned),
+                        )),
+                        memory_per_gpu_mb: Some(1000),
+                        ..Default::default()
+                    },
+                );
+                for available in [1, 2] {
+                    let cluster = ClusterState {
+                        nodes: &nodes[..available],
+                        partitions: &[],
+                        reservations: &[],
+                        topology: None,
+                        fabric: None,
+                        busy_until: &HashMap::new(),
+                        preemption_handoffs: &HashMap::new(),
+                        partition_node_usage: &HashMap::new(),
+                    };
+                    let assignments =
+                        BackfillScheduler::new(1).schedule(std::slice::from_ref(&job), &cluster);
+                    if available == 1 || gpu_type == Some("other") {
+                        assert!(assignments.is_empty(), "{exclusive} {gpu_type:?}");
+                    } else {
+                        assert_eq!(assignments.len(), 1);
+                        assert_eq!(assignments[0].nodes, vec!["big"]);
+                        let allocation = &assignments[0].per_node_alloc["big"];
+                        assert_eq!(allocation.total_device_count("gpu"), 2);
+                        assert_eq!(allocation.memory_mb, 2000);
+                    }
+                }
+            }
+        }
     }
 
     fn make_gpu_job(id: u32, gpu_count: u32) -> Job {
@@ -3877,6 +4071,73 @@ mod tests {
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
         assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn topology_prefers_locality_within_the_earliest_start_window() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture time");
+        for mode in ["tree", "block"] {
+            for delay in [0, 10] {
+                for require_busy in [false, true] {
+                    let mut sched = BackfillScheduler::new(1);
+                    let mut nodes = make_nodes(3);
+                    nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 0);
+                    if delay > 0 {
+                        nodes[2].alloc_resources = ResourceAllocations::with_scalar(64, 0);
+                    }
+                    let busy_until = HashMap::from([
+                        ("node002".into(), now + Duration::minutes(60)),
+                        ("node003".into(), now + Duration::minutes(delay)),
+                    ]);
+                    let topology = TopologyTree::from_blocks(
+                        &["node001".into(), "node002".into(), "node003".into()],
+                        2,
+                    );
+                    let partitions = vec![Partition {
+                        name: "default".into(),
+                        ..Default::default()
+                    }];
+                    let cluster = ClusterState {
+                        nodes: &nodes,
+                        partitions: &partitions,
+                        reservations: &[],
+                        topology: Some(&topology),
+                        fabric: None,
+                        busy_until: &busy_until,
+                        preemption_handoffs: &HashMap::new(),
+                        partition_node_usage: &Default::default(),
+                    };
+                    let mut job = make_job(1, 2, 1);
+                    job.spec.topology = Some(mode.into());
+                    if require_busy {
+                        job.spec.nodelist = Some("node002".into());
+                    }
+                    let assignments =
+                        sched.schedule_jobs(&[job], &cluster, now, true, &mut AdmitAll);
+                    if delay == 0 && !require_busy {
+                        assert_eq!(assignments.len(), 1, "{mode}");
+                        assert_eq!(
+                            HashSet::from_iter(assignments[0].nodes.iter().map(String::as_str)),
+                            HashSet::from(["node001", "node003"])
+                        );
+                        continue;
+                    }
+                    assert!(assignments.is_empty());
+                    let plan = sched.planned_job_starts();
+                    let (chosen, start) = &plan[&1];
+                    if require_busy {
+                        assert!(chosen.iter().any(|name| name == "node002"));
+                        assert_eq!(*start, now + Duration::minutes(60));
+                    } else {
+                        assert_eq!(
+                            HashSet::from_iter(chosen.iter().map(String::as_str)),
+                            HashSet::from(["node001", "node003"])
+                        );
+                        assert_eq!(*start, now + Duration::minutes(delay));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

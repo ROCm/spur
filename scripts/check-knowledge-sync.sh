@@ -142,10 +142,10 @@ check_enum_reverse() {
         case "$dv" in
             Job|Node|"${enum_name}") continue ;;
         esac
-        if ! echo "$source_variants" | grep -qx "$dv"; then
+        if ! grep -qx "$dv" <<< "$source_variants"; then
             # Only flag if the name doesn't appear anywhere else in the source
             # (it may be a variant of a related enum mentioned in context)
-            if ! echo "$all_source_names" | grep -qx "$dv"; then
+            if ! grep -qx "$dv" <<< "$all_source_names"; then
                 fail "ENUM: variant '$dv' documented for $enum_name in $agents_file but not found in source $source_file (stale doc?)"
             fi
         fi
@@ -295,7 +295,7 @@ check_rpc_names() {
                 Served|Backed|Connects|Called|Networking|Diagnostics|Admission|Signals) continue ;;
                 Job|Node|Partition|Cluster|Fairshare|Audit|QOS|WireGuard|Reservation|Entity) continue ;;
             esac
-            if ! echo "$proto_rpcs" | grep -qx "$rpc"; then
+            if ! grep -qx "$rpc" <<< "$proto_rpcs"; then
                 fail "RPC: $rpc listed in $arch gRPC services section but not found in $proto"
             fi
         done <<< "$arch_rpcs"
@@ -316,7 +316,7 @@ check_rpc_names() {
             case "$rpc" in
                 Cancelled|Started|Completed|Running|Suspended|Starts|Creates|Deletes|Returns|Registers|Updates|Reports|Streams|Releases|Prepares|Stops|Resets|Attaches|Drains|Lists|Submits|Gets|Runs|Cancels|Executes|Completes|Resumes|Suspends|Revokes|Applies|Reconfigures|Deregisters|Signals|InteractiveInput) continue ;;
             esac
-            if ! echo "$proto_rpcs" | grep -qx "$rpc"; then
+            if ! grep -qx "$rpc" <<< "$proto_rpcs"; then
                 fail "RPC: $rpc listed in $proto_agents but not found in $proto"
             fi
         done

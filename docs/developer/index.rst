@@ -10,3 +10,5 @@ Spur is a Rust workspace (Cargo) that builds ``spurctld``,
 - :doc:`contributing` — commit and pull-request conventions, license headers, and
   the pre-commit hook.
 - :doc:`native-credential-mint` — Unix-socket service that mints native user credentials.
+- :doc:`preemption-workflow` — ordinary placement and preemption loops,
+  with a shared-node GPU example.

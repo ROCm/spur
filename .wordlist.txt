@@ -1,4 +1,5 @@
 adminlevel
+allocator
 AllowedIPs
 allowlisted
 allow_non_loopback
@@ -20,6 +21,7 @@ BGP
 billable
 BPF
 cAdvisor
+canonicalized
 Cargo
 CDI
 Ceph
@@ -32,6 +34,7 @@ chown
 CIDR
 CIDRs
 CLI
+clippy
 CLIs
 ClusterIP
 CNI
@@ -135,6 +138,7 @@ hyperconverged
 idempotency
 InfiniBand
 init
+injectable
 InternalIPs
 IPIP
 IPs
@@ -151,6 +155,7 @@ k0s
 keepalive
 keepalives
 KFD
+KiB
 konnectivity
 kube
 kubeconfig
@@ -175,6 +180,7 @@ MaxTRESPerUser
 MaxWall
 memlock
 MiB
+microbenchmark
 modex
 mpi
 MPI
@@ -287,6 +293,7 @@ rootful
 routable
 RPC
 RPCs
+RSS
 runnable
 runtimes
 RWO
@@ -298,6 +305,7 @@ sbatch
 Scaffolded
 scancel
 schedulable
+scheduler's
 scontrol
 SCP
 scraper
@@ -394,6 +402,8 @@ uninstall
 uninstallation
 unioned
 unlaunched
+unoptimized
+Unplaceable
 unschedulable
 unsets
 untrusted

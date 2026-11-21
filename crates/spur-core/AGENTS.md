@@ -181,6 +181,13 @@ clamping at zero. It returns `None` before the run starts. `run_time()` uses
 the current clock; callers comparing several jobs can pass one instant to
 `run_time_at` for a consistent view. Requeue resets the run clock.
 
+`Job::held_allocations()` indexes allocated node names temporarily for jobs wider
+than two nodes and visits each allocation once, excluding completion reports and
+unassigned map entries. One-/two-node jobs need no temporary membership index.
+`held_nodes()` retains allocation order, and `holds_a_placement()` checks
+completion membership without rescanning the allocation list. These helpers
+do not change the persisted job representation.
+
 ### PendingReason
 
 60+ variants covering Slurm's WAIT_*/FAIL_* reason codes. Display strings are

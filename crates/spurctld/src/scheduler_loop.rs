@@ -10,7 +10,6 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
-use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -19,8 +18,7 @@ use spur_proto::proto::{
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::partition_cap::{
-    candidate_partitions, cap_admits_on, is_capped, job_typed_gpu, PartitionNodeUsage,
-    RunningCharge, TresCharge,
+    candidate_partitions, is_capped, job_typed_gpu, PartitionNodeUsage, RunningCharge, TresCharge,
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
@@ -28,6 +26,10 @@ use crate::cluster::{ClassifiedPass, ClusterManager, JobEndFacts, JobFilter, Lim
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::victim_order::{victim_facts, RankKey, VictimOrder};
+
+mod preemption;
+use preemption::{satisfiable_victim_set, Snapshot as PreemptionSnapshot, VictimPool};
+use spur_sched::immediate::SearchBudget;
 
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
@@ -446,6 +448,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &preempt_state,
                         &sched_cfg,
                         &assignments,
+                        &mut SearchBudget::default(),
                         |job| limits.fits(job),
                     )
                     .await;
@@ -481,6 +484,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     &unscheduled,
                     &assignments,
                     &cluster.config().scheduler,
+                    &mut SearchBudget::default(),
                     |job| limits.fits(job),
                 )
                 .await;
@@ -1186,6 +1190,7 @@ pub(crate) async fn preempt_unstarted(cluster: &Arc<ClusterManager>, pass: &mut 
         &unstarted,
         &pass.assignments,
         &cluster.config().scheduler,
+        &mut SearchBudget::default(),
         |job| limits.fits(job),
     )
     .await
@@ -1230,6 +1235,7 @@ pub(crate) async fn reclaim_unstarted(
         &state,
         &sched,
         &pass.assignments,
+        &mut SearchBudget::default(),
         |job| pass.limits.fits(job),
     )
     .await
@@ -1414,11 +1420,7 @@ fn partition_usage_from_jobs<'a>(
             .max(now + chrono::Duration::seconds(BUSY_UNTIL_MARGIN_SECS));
         let typed_gpu = job_typed_gpu(job);
         let by_node = usage.entry(partition.name.clone()).or_default();
-        let held = job
-            .per_node_alloc
-            .iter()
-            .filter(|(node, _)| job.is_held_on(node));
-        for (node, alloc) in held {
+        for (node, alloc) in job.held_allocations() {
             by_node
                 .entry(node.clone())
                 .or_default()
@@ -1590,30 +1592,16 @@ pub(crate) async fn try_preempt_beside(
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
     };
-    try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched, |_| true).await;
-}
-
-/// Node -> jobs holding it: running, suspended and draining jobs on the nodes they still
-/// hold, plus this pass's assignments, which hold their nodes before they are dispatched.
-fn node_occupants<'a>(
-    holders: &'a [spur_core::job::Job],
-    assigned: &'a [Assignment],
-) -> HashMap<&'a str, Vec<spur_core::job::JobId>> {
-    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in holders {
-        for node in job.allocated_nodes.iter().filter(|n| job.is_held_on(n)) {
-            occupants.entry(node.as_str()).or_default().push(job.job_id);
-        }
-    }
-    for assignment in assigned {
-        for node in &assignment.nodes {
-            occupants
-                .entry(node.as_str())
-                .or_default()
-                .push(assignment.job_id);
-        }
-    }
-    occupants
+    try_preempt_with_handoffs(
+        cluster,
+        &state,
+        unscheduled,
+        assigned,
+        sched,
+        &mut SearchBudget::default(),
+        |_| true,
+    )
+    .await;
 }
 
 /// Idle-fill reclaim for `unplaced` over the cluster's current state, as the loop runs it.
@@ -1645,6 +1633,7 @@ pub(crate) async fn reclaim_for(
         &state,
         &sched,
         &[],
+        &mut SearchBudget::default(),
         |_| true,
     )
     .await
@@ -1660,7 +1649,16 @@ pub(crate) async fn try_preempt_in(
     assigned: &[Assignment],
 ) {
     let sched = cluster.config().scheduler.clone();
-    try_preempt_with_handoffs(cluster, state, unscheduled, assigned, &sched, |_| true).await;
+    try_preempt_with_handoffs(
+        cluster,
+        state,
+        unscheduled,
+        assigned,
+        &sched,
+        &mut SearchBudget::default(),
+        |_| true,
+    )
+    .await;
 }
 
 /// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).
@@ -1672,6 +1670,7 @@ async fn try_preempt_with_handoffs<'j>(
     unscheduled: &[&'j spur_core::job::Job],
     assigned: &[Assignment],
     sched: &spur_core::config::SchedulerConfig,
+    budget: &mut SearchBudget,
     fits: impl Fn(&spur_core::job::Job) -> bool,
 ) -> Option<&'j spur_core::job::Job> {
     use spur_core::job::JobState;
@@ -1695,33 +1694,24 @@ async fn try_preempt_with_handoffs<'j>(
             .max_by_key(|partition| partition.priority_tier)
     };
 
-    // Suspended and completing jobs still hold their allocation, so a node one of
-    // them sits on cannot be handed over by evicting the running jobs beside it.
-    // One read covers both: a job finishing between two separate reads would
-    // otherwise appear as a running candidate but vanish from the occupant map,
-    // making its node look falsely empty to `satisfiable_victim_set`.
-    let holders = cluster.get_jobs(&JobFilter {
-        states: &[JobState::Running, JobState::Suspended, JobState::Completing],
-        ..Default::default()
-    });
-    // A job already in its grace is not a candidate (a second preemptor must not
-    // evict someone else for the same nodes), yet stays in `holders` so its
-    // nodes still count as occupied.
-    let mut running: Vec<spur_core::job::Job> = holders
+    let Some(snapshot) = PreemptionSnapshot::capture(cluster, state, assigned, now, budget) else {
+        warn!("preemption snapshot deferred: input limit, work limit, or inconsistent allocation records");
+        return None;
+    };
+    let snapshot_state = snapshot.state(state);
+    let state = &snapshot_state;
+    let holders = &snapshot.holders;
+    let mut running: Vec<_> = holders
         .iter()
         .filter(|j| j.state == JobState::Running && j.preempt_grace().is_none())
-        .cloned()
         .collect();
-    let occupants = node_occupants(&holders, assigned);
-    // Resolve once, reused for the occupant map, the policy checks, and the
-    // action decision below.
+    // Ranking and eviction must use the same resolved QOS policy.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
         running
             .iter()
             .map(|j| (j.job_id, cluster.resolve_qos(j)))
             .collect();
-    // `get_jobs` iterates a HashMap, so without this the victim picked among
-    // equally eligible candidates varies run to run. Least important first.
+    // Snapshot holders come from a HashMap; stable ordering breaks eligibility ties.
     running.sort_by_key(|j| (running_qos[&j.job_id].priority, j.job_id));
     // Lets the satisfiability search spend the lowest-QOS-priority victims
     // first; eligibility already proved each candidate a legal victim, so
@@ -1731,7 +1721,7 @@ async fn try_preempt_with_handoffs<'j>(
         .map(|(id, qos)| (*id, qos.priority))
         .collect();
     let victim_keys = &sched.preempt_victim_order;
-    let facts = (!victim_keys.is_empty()).then(|| victim_facts(&running, now));
+    let facts = (!victim_keys.is_empty()).then(|| victim_facts(holders, now));
 
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
@@ -1746,19 +1736,35 @@ async fn try_preempt_with_handoffs<'j>(
     // Victims of an earlier tick that are still tearing down or running out their
     // grace. Their nodes stay allocated until each agent reports, so their
     // preemptor must not kill again.
-    let draining_victims: Vec<spur_core::job::Job> = holders
+    let draining_victims: Vec<_> = holders
         .iter()
         .filter(|j| preemptor_awaiting_release(j).is_some())
-        .cloned()
         .collect();
 
     for pending in unscheduled {
+        let preemptor = *pending;
+        let Some(prepared) = spur_sched::immediate::PlacementRequest::new(pending, state, budget)
+        else {
+            warn!(
+                job_id = pending.job_id,
+                "preemption request deferred: unsupported input or search limit"
+            );
+            continue;
+        };
+        let pending = prepared.job();
         // Scoped to the nodes this job could actually use: a victim wedged
         // elsewhere must not block preemption across the whole cluster.
-        let waiting_on_release = draining_victims.iter().any(|victim| {
-            preemptor_awaiting_release(victim) == Some(pending.job_id)
-                && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
-        });
+        let mut waiting_on_release = false;
+        for victim in &draining_victims {
+            if preemptor_awaiting_release(victim) != Some(pending.job_id) {
+                continue;
+            }
+            let overlaps = prepared.scope().overlaps(victim, budget)?;
+            if overlaps {
+                waiting_on_release = true;
+                break;
+            }
+        }
         if waiting_on_release {
             continue;
         }
@@ -1772,7 +1778,8 @@ async fn try_preempt_with_handoffs<'j>(
         // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
-            if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
+            let overlaps = prepared.scope().overlaps(candidate, budget)?;
+            if !overlaps {
                 continue;
             }
 
@@ -1806,54 +1813,41 @@ async fn try_preempt_with_handoffs<'j>(
             }
 
             let mode = job_preempt_mode(candidate, partitions, candidate_qos);
-            if mode == PreemptMode::Off {
+            if matches!(mode, PreemptMode::Off | PreemptMode::Suspend) {
                 continue;
             }
             eligible.push((candidate, mode));
         }
         // Evicting for a job its limits would refuse at start preempts its victims for nothing.
-        if eligible.is_empty() || !fits(pending) {
+        if eligible.is_empty() || !fits(preemptor) {
             continue;
         }
 
-        // Suspend keeps the allocation, so it is a configured outcome rather than a
-        // way to free a node: searched alone, never mixed into a releasing set.
-        let by_mode = |suspend: bool| -> HashSet<spur_core::job::JobId> {
-            eligible
-                .iter()
-                .filter(|(_, m)| (*m == PreemptMode::Suspend) == suspend)
-                .map(|(j, _)| j.job_id)
-                .collect()
-        };
-        // A job no node can host finds no set in either pool, so it stops spending a
-        // victim per cycle on a placement that will never happen. A set found in
-        // the suspend pool is discarded rather than acted on: suspend never frees
-        // the node, so it could not place the pending job either.
-        let mut found = None;
-        for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
-            if pool_ids.is_empty() {
-                continue;
-            }
-            let set = satisfiable_victim_set(
-                pending,
-                &VictimPool {
-                    evictable: &pool_ids,
-                    occupants: &occupants,
-                    priority: &victim_cost,
-                    max_priority: None,
-                    order: facts
-                        .as_ref()
-                        .map(|facts| VictimOrder::new(victim_keys, facts, pending.job_id)),
-                },
-                state,
-                now,
+        let pool_ids = eligible.iter().map(|(job, _)| job.job_id).collect();
+        let Some(victims) = satisfiable_victim_set(
+            pending,
+            &VictimPool {
+                evictable: &pool_ids,
+                holders,
+                priority: &victim_cost,
+                max_priority: None,
+                order: facts
+                    .as_ref()
+                    .map(|facts| VictimOrder::new(victim_keys, facts, pending.job_id)),
+            },
+            state,
+            now,
+            budget,
+        )
+        .unwrap_or_else(|_| {
+            warn!(
+                job_id = pending.job_id,
+                work_left = budget.work_left,
+                calls_left = budget.calls_left,
+                "preemption selection deferred: input or search limit"
             );
-            if set.is_some() {
-                found = if is_suspend_pool { None } else { set };
-                break;
-            }
-        }
-        let Some(victims) = found else {
+            None
+        }) else {
             continue;
         };
 
@@ -1923,9 +1917,8 @@ async fn try_preempt_with_handoffs<'j>(
             }
         }
         if preempted {
-            // `occupants` is now stale, so a second pending job could otherwise
-            // prove placement on nodes already promised away.
-            return Some(*pending);
+            // Rebuild after a real mutation before promising capacity to another job.
+            return Some(preemptor);
         }
     }
     None
@@ -2282,6 +2275,42 @@ pub(crate) fn federation_candidates(
         .collect()
 }
 
+fn reclaim_may_help(
+    cluster: &ClusterManager,
+    exempt_secs: u32,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let (preemptable, stamped_qos) = cluster.with_allocation_records(|jobs, _| {
+        let mut stamped_qos = HashSet::new();
+        for job in jobs
+            .values()
+            .filter(|job| job.state == spur_core::job::JobState::Running)
+        {
+            if job.allocated_nodes.is_empty()
+                || job.preempt_grace().is_some()
+                || job
+                    .start_time
+                    .map_or(0, |start| (now - start).num_seconds())
+                    < idle_fill_exempt_window(exempt_secs, job.preempt_requeue_count)
+            {
+                continue;
+            }
+            if job.idle_fill {
+                if let Some(qos) = &job.spec.qos {
+                    stamped_qos.insert(qos.clone());
+                }
+            } else if cluster.resolve_qos(job).idle_fill_preemptable {
+                return (true, stamped_qos);
+            }
+        }
+        (false, stamped_qos)
+    });
+    preemptable
+        || stamped_qos
+            .iter()
+            .any(|qos| cluster.qos_over_node_quota(qos))
+}
+
 /// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
 /// not place. Returns the nodes freed, which the caller holds out of the next cycle
 /// until the agents have confirmed the kill.
@@ -2290,6 +2319,10 @@ pub(crate) fn federation_candidates(
 /// reclaimer sits under a QOS priority ceiling, and the eviction is always
 /// `Requeue`. Both prove the shortfall closes first (D2, §8.1), and reclaim only for a
 /// job that `fits` its limits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "search budget and start admission are independent constraints on the pass"
+)]
 pub(crate) async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
@@ -2300,14 +2333,25 @@ pub(crate) async fn reclaim_for_unplaced(
     cluster_state: &ClusterState<'_>,
     sched: &spur_core::config::SchedulerConfig,
     assigned: &[Assignment],
+    budget: &mut SearchBudget,
     fits: impl Fn(&spur_core::job::Job) -> bool,
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
     let exempt_secs = sched.idle_fill_exempt_secs;
     let now = Utc::now();
-    let running = cluster.get_jobs(&JobFilter {
-        states: &[spur_core::job::JobState::Running],
-        ..Default::default()
-    });
+    if unplaced.is_empty() || !reclaim_may_help(cluster, exempt_secs, now) {
+        return (Vec::new(), None);
+    }
+    let Some(snapshot) = PreemptionSnapshot::capture(cluster, cluster_state, assigned, now, budget)
+    else {
+        warn!("reclaim snapshot deferred: input limit, work limit, or inconsistent allocation records");
+        return (Vec::new(), None);
+    };
+    let snapshot_state = snapshot.state(cluster_state);
+    let cluster_state = &snapshot_state;
+    let holders = &snapshot.holders;
+    let running = holders
+        .iter()
+        .filter(|job| job.state == spur_core::job::JobState::Running);
 
     // Both sources of "borrowed" (§4.1): jobs stamped `idle_fill` because they
     // exceeded their own quota, and jobs whose QOS is marked
@@ -2320,7 +2364,7 @@ pub(crate) async fn reclaim_for_unplaced(
     // runs usually share a QOS and the answer walks every job.
     let mut over_quota: HashMap<String, bool> = HashMap::new();
     let mut reclaimable: Vec<ReclaimableRun> = Vec::new();
-    for job in &running {
+    for job in running {
         // Requeuing a run in its grace would end the grace early; its preemptor
         // waits for the deadline like any other.
         if job.allocated_nodes.is_empty() || job.preempt_grace().is_some() {
@@ -2358,23 +2402,12 @@ pub(crate) async fn reclaim_for_unplaced(
         return (Vec::new(), None);
     }
 
-    // Suspended and completing jobs hold their nodes too, so a node they sit on is
-    // not free for the reclaimer even once every running job on it is evicted.
-    let holders = cluster.get_jobs(&JobFilter {
-        states: &[
-            spur_core::job::JobState::Running,
-            spur_core::job::JobState::Suspended,
-            spur_core::job::JobState::Completing,
-        ],
-        ..Default::default()
-    });
-    let occupants = node_occupants(&holders, assigned);
     let reclaimable_ids: HashSet<spur_core::job::JobId> =
         reclaimable.iter().map(|r| r.job_id).collect();
     let victim_priority: HashMap<spur_core::job::JobId, i32> =
         reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
     let victim_keys = &sched.preempt_victim_order;
-    let facts = (!victim_keys.is_empty()).then(|| victim_facts(&running, now));
+    let facts = (!victim_keys.is_empty()).then(|| victim_facts(holders, now));
 
     for reclaimer in unplaced {
         if !fits(reclaimer) {
@@ -2391,7 +2424,7 @@ pub(crate) async fn reclaim_for_unplaced(
             reclaimer,
             &VictimPool {
                 evictable: &reclaimable_ids,
-                occupants: &occupants,
+                holders,
                 priority: &victim_priority,
                 max_priority: ceiling,
                 order: facts
@@ -2400,7 +2433,17 @@ pub(crate) async fn reclaim_for_unplaced(
             },
             cluster_state,
             now,
-        ) else {
+            budget,
+        )
+        .unwrap_or_else(|_| {
+            warn!(
+                job_id = reclaimer.job_id,
+                work_left = budget.work_left,
+                calls_left = budget.calls_left,
+                "reclaim selection deferred: input or search limit"
+            );
+            None
+        }) else {
             continue;
         };
 
@@ -2464,186 +2507,11 @@ pub(crate) async fn reclaim_for_unplaced(
     (Vec::new(), None)
 }
 
-/// The candidate victims a satisfiability search is allowed to spend.
-struct VictimPool<'a> {
-    /// Jobs the caller's own eligibility rules already cleared for eviction.
-    evictable: &'a HashSet<spur_core::job::JobId>,
-    /// Every job holding each node, evictable or not, so a node only counts as
-    /// recovered when the whole set on it is being evicted.
-    occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
-    /// What each victim costs, so lower-priority victims are spent first.
-    priority: &'a HashMap<spur_core::job::JobId, i32>,
-    /// Set for an opportunistic reclaimer, which may only displace opportunistic
-    /// work of strictly lower priority. `None` when `evictable` is already final.
-    max_priority: Option<i32>,
-    /// Ranks nodes of equal cost before node name does. `None` is node-name order.
-    order: Option<VictimOrder<'a>>,
-}
-
-/// The set of evictable jobs whose removal would let `reclaimer` actually run, or
-/// `None` when no such set exists. Shared by reclaim and preemption.
-///
-/// Atomic by construction: a node counts as recovered only when every job on it is
-/// evictable, so the reclaimer either gets a full allocation or nothing is
-/// touched. A partial eviction destroys work without helping anyone, and an
-/// unplaceable job has no satisfiable set at all — which is what stops a job that
-/// can never be placed from evicting one victim per cycle forever (§8.2).
-fn satisfiable_victim_set(
-    reclaimer: &spur_core::job::Job,
-    pool: &VictimPool<'_>,
-    state: &ClusterState<'_>,
-    now: DateTime<Utc>,
-) -> Option<HashSet<spur_core::job::JobId>> {
-    let (nodes, reservations) = (state.nodes, state.reservations);
-    let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
-    if state.listed_node_handed_off(reclaimer, &placement) {
-        return None;
-    }
-    let required = node_request(reclaimer);
-    // Total rather than currently-free resources: an evacuated node is empty, so
-    // what matters is whether the whole node can host the job. Same suitability
-    // rules the scheduler applies, so reclaim cannot free a node placement would
-    // then refuse — including reservations and the k0s gate.
-    let suitable = |node: &spur_core::node::Node| {
-        placement.matches_for_reservation(node, reservations, now)
-            && node.can_ever_satisfy(&required)
-            && state.handoff_allows(reclaimer, &node.name)
-    };
-    // Evicting a node frees its partition caps only of what the victims held there.
-    let cap_frees = |node: &spur_core::node::Node, evicted: &[spur_core::job::JobId]| {
-        cap_admits_on(reclaimer, state.partitions, node, |partition| {
-            usage_without(state.partition_node_usage, partition, node, evicted, now)
-        })
-    };
-
-    let needed = (reclaimer.spec.num_nodes as usize).max(1);
-    let mut empty: Vec<&Node> = Vec::new();
-    let mut evacuable: Vec<(&Node, &[spur_core::job::JobId])> = Vec::new();
-    for node in nodes {
-        if !suitable(node) {
-            continue;
-        }
-        match pool.occupants.get(node.name.as_str()) {
-            None if cap_frees(node, &[]) => empty.push(node),
-            None => {}
-            Some(on_node)
-                if on_node.iter().all(|id| {
-                    pool.evictable.contains(id)
-                        && pool
-                            .max_priority
-                            .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
-                }) && cap_frees(node, on_node) =>
-            {
-                evacuable.push((node, on_node.as_slice()));
-            }
-            Some(_) => {}
-        }
-    }
-
-    // Empty nodes alone never place the job (the pass already tried), and every pick
-    // frees at least one node, so a shortfall above the evacuable count cannot close.
-    let short = needed.checked_sub(empty.len()).filter(|&short| short > 0)?;
-    if evacuable.len() < short {
-        return None;
-    }
-    let (victims, emptied) = VictimSearch::new(&evacuable, pool).run(short)?;
-    if places_once_emptied(reclaimer, state, &empty, &emptied, &victims) {
-        return Some(victims);
-    }
-    // Debug, not info: the same refusal repeats every pass until the layout changes.
-    let mut refused: Vec<_> = victims.into_iter().collect();
-    refused.sort_unstable();
-    debug!(
-        job_id = reclaimer.job_id,
-        victims = ?refused,
-        "victim set frees enough nodes but the job would not start on them; evicting nobody"
-    );
-    None
-}
-
-/// What one node must hold for `job`: the per-node minimum, except that a one-node
-/// job needs its whole GPU total on that node.
-fn node_request(job: &spur_core::job::Job) -> spur_core::resource::ResourceSet {
-    use spur_core::gpu_request::{resolve_gpu_demand, GpuDemand};
-
-    let mut request = backfill::job_resource_request(job);
-    let total = match resolve_gpu_demand(&job.spec) {
-        Ok(GpuDemand::Total { count, .. }) if job.spec.num_nodes <= 1 => count,
-        _ => return request,
-    };
-    if let Some(gpu) = request.gpus.first().cloned() {
-        request.gpus = vec![gpu; total as usize];
-    }
-    request.memory_mb = spur_core::partition_limits::node_memory_mb(
-        &job.spec,
-        u64::from(request.cpus),
-        u64::from(total),
-    );
-    request
-}
-
-/// Whether `job` starts under the real placement rules on `empty` plus `emptied`
-/// once `victims` are gone. Node counts alone miss uneven needs such as a GPU total.
-fn places_once_emptied(
-    job: &spur_core::job::Job,
-    state: &ClusterState<'_>,
-    empty: &[&Node],
-    emptied: &[&Node],
-    victims: &HashSet<spur_core::job::JobId>,
-) -> bool {
-    let cleared = emptied.iter().map(|node| {
-        let mut node = (*node).clone();
-        node.alloc_resources = Default::default();
-        node.state = spur_core::node::NodeState::Idle;
-        node
-    });
-    let nodes: Vec<Node> = empty.iter().map(|n| (*n).clone()).chain(cleared).collect();
-    let usage = usage_on(state.partition_node_usage, &nodes, victims);
-    let trial = ClusterState {
-        nodes: &nodes,
-        partitions: state.partitions,
-        reservations: state.reservations,
-        topology: state.topology,
-        fabric: state.fabric,
-        busy_until: &HashMap::new(),
-        preemption_handoffs: state.preemption_handoffs,
-        partition_node_usage: &usage,
-    };
-    BackfillScheduler::new(1)
-        .for_trial()
-        .schedule(std::slice::from_ref(job), &trial)
-        .iter()
-        .any(|a| a.job_id == job.job_id)
-}
-
-/// `usage` restricted to `nodes`, without the charges of `victims`.
-fn usage_on(
-    usage: &PartitionNodeUsage,
-    nodes: &[Node],
-    victims: &HashSet<spur_core::job::JobId>,
-) -> PartitionNodeUsage {
-    usage
-        .iter()
-        .map(|(partition, by_node)| {
-            let kept = nodes.iter().filter_map(|node| {
-                let charges = by_node.get(&node.name)?;
-                let left: Vec<RunningCharge> = charges
-                    .iter()
-                    .filter(|c| !victims.contains(&c.job_id))
-                    .cloned()
-                    .collect();
-                Some((node.name.clone(), left))
-            });
-            (partition.clone(), kept.collect())
-        })
-        .collect()
-}
-
 /// A heap entry: QOS cost, then the configured order, then node name. The index and
 /// version identify the entry, so a re-ranked node's older entries are skipped.
 type SearchEntry<'a> = std::cmp::Reverse<(i32, Option<RankKey>, &'a str, usize, u32)>;
 
-/// Greedy pick over evacuable nodes, re-ranking only the nodes a pick changes.
+/// Greedy pick over per-node victim groups, re-ranking only groups a pick changes.
 struct VictimSearch<'s, 'a> {
     evacuable: &'s [(&'a Node, &'a [spur_core::job::JobId])],
     order: Option<&'s VictimOrder<'s>>,
@@ -2660,14 +2528,15 @@ struct VictimSearch<'s, 'a> {
 impl<'s, 'a> VictimSearch<'s, 'a> {
     fn new(
         evacuable: &'s [(&'a Node, &'a [spur_core::job::JobId])],
-        pool: &'s VictimPool<'s>,
+        priority: &HashMap<spur_core::job::JobId, i32>,
+        order: Option<&'s VictimOrder<'s>>,
     ) -> Self {
-        // A node costs the highest QOS priority it carries: evacuating it forfeits every run on it.
+        // Rank by the most expensive victim so cheaper tenants cannot hide a costly one.
         let costs = evacuable
             .iter()
             .map(|(_, jobs)| {
                 jobs.iter()
-                    .map(|id| pool.priority.get(id).copied().unwrap_or(0))
+                    .map(|id| priority.get(id).copied().unwrap_or(0))
                     .max()
                     .unwrap_or(0)
             })
@@ -2680,7 +2549,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         }
         Self {
             evacuable,
-            order: pool.order.as_ref(),
+            order,
             costs,
             nodes_of_job,
             taken: vec![false; evacuable.len()],
@@ -2693,8 +2562,12 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
     }
 
     /// Picks nodes until `short` more are free: the victims and the nodes they empty.
-    fn run(mut self, short: usize) -> Option<(HashSet<spur_core::job::JobId>, Vec<&'a Node>)> {
-        self.pick(short)?;
+    fn run(
+        mut self,
+        short: usize,
+        budget: &mut SearchBudget,
+    ) -> Option<(HashSet<spur_core::job::JobId>, Vec<&'a Node>)> {
+        self.pick(short, budget)?;
         let emptied = (0..self.evacuable.len())
             .filter(|&i| self.taken[i])
             .map(|i| self.evacuable[i].0)
@@ -2702,27 +2575,29 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         Some((self.victims, emptied))
     }
 
-    fn pick(&mut self, mut short: usize) -> Option<()> {
+    fn pick(&mut self, mut short: usize, budget: &mut SearchBudget) -> Option<()> {
         let n = self.evacuable.len();
         let mut version = vec![0u32; n];
         let mut freed_of = vec![1u32; n];
         let mut heap = std::collections::BinaryHeap::with_capacity(n);
         let mut memo = HashMap::new();
         for i in 0..n {
-            heap.push(self.entry(i, short, 0, &mut memo, &mut freed_of));
+            heap.push(self.entry(i, short, 0, &mut memo, &mut freed_of, budget)?);
         }
         let mut wide: HashSet<usize> = (0..n).filter(|&i| freed_of[i] > 1).collect();
         while short > 0 {
+            budget.spend(1)?;
             let std::cmp::Reverse((.., i, ver)) = heap.pop()?;
             if self.taken[i] || ver != version[i] {
                 continue;
             }
-            let (freed, touched) = self.take(i);
+            let (freed, touched) = self.take(i, budget)?;
             short = short.saturating_sub(freed);
             if short == 0 || self.order.is_none() {
                 continue;
             }
             // A pick changes what nearby nodes add and free; a smaller shortfall caps wide picks.
+            budget.spend(wide.len())?;
             wide.retain(|&j| !self.taken[j] && freed_of[j] > 1);
             let mut stale: HashSet<usize> = touched.into_iter().collect();
             stale.extend(
@@ -2733,7 +2608,14 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
             memo.clear();
             for j in stale.into_iter().filter(|&j| !self.taken[j]) {
                 version[j] += 1;
-                heap.push(self.entry(j, short, version[j], &mut memo, &mut freed_of));
+                // Retired ranks must not accumulate across overlapping picks.
+                if heap.len() >= n * 2 {
+                    budget.spend(heap.len())?;
+                    heap.retain(|std::cmp::Reverse((.., index, generation))| {
+                        !self.taken[*index] && *generation == version[*index]
+                    });
+                }
+                heap.push(self.entry(j, short, version[j], &mut memo, &mut freed_of, budget)?);
                 if freed_of[j] > 1 {
                     wide.insert(j);
                 }
@@ -2749,18 +2631,33 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         version: u32,
         memo: &mut HashMap<&'a [spur_core::job::JobId], usize>,
         freed_of: &mut [u32],
-    ) -> SearchEntry<'a> {
+        budget: &mut SearchBudget,
+    ) -> Option<SearchEntry<'a>> {
         let (node, jobs) = self.evacuable[i];
+        budget.spend(jobs.len().checked_add(node.name.len())?.checked_add(1)?)?;
         #[cfg(test)]
         self.ranked.set(self.ranked.get() + 1);
-        let key = self.order.map(|order| {
-            // Nodes holding the same jobs free the same count, so one wide job is walked once.
-            let freed = *memo.entry(jobs).or_insert_with(|| self.freed_by(i, short));
+        let key = if let Some(order) = self.order {
+            let freed = if let Some(&freed) = memo.get(jobs) {
+                freed
+            } else {
+                let freed = self.freed_by(i, short, budget)?;
+                memo.insert(jobs, freed);
+                freed
+            };
             freed_of[i] = freed as u32;
             let new_jobs: Vec<_> = self.new_jobs(i).collect();
-            order.key(&order.rank(order.hash(&node.name), &new_jobs, freed as u32))
-        });
-        std::cmp::Reverse((self.costs[i], key, node.name.as_str(), i, version))
+            Some(order.key(&order.rank(order.hash(&node.name), &new_jobs, freed as u32)))
+        } else {
+            None
+        };
+        Some(std::cmp::Reverse((
+            self.costs[i],
+            key,
+            node.name.as_str(),
+            i,
+            version,
+        )))
     }
 
     fn new_jobs(&self, i: usize) -> impl Iterator<Item = spur_core::job::JobId> + '_ {
@@ -2780,7 +2677,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
 
     /// Nodes that taking `i` empties, itself included, counted up to `cap`: nodes past
     /// what the preemptor still needs free nothing it uses.
-    fn freed_by(&self, i: usize, cap: usize) -> usize {
+    fn freed_by(&self, i: usize, cap: usize, budget: &mut SearchBudget) -> Option<usize> {
         let adding: Vec<_> = self.new_jobs(i).collect();
         let mut counted = HashSet::from([i]);
         for j in adding
@@ -2790,19 +2687,29 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
             if counted.len() >= cap {
                 break;
             }
+            budget.spend(
+                self.evacuable[*j]
+                    .1
+                    .len()
+                    .checked_mul(adding.len().checked_add(1)?)?
+                    .checked_add(1)?,
+            )?;
             #[cfg(test)]
             self.walked.set(self.walked.get() + 1);
             if !self.taken[*j] && self.covered(*j, &adding) {
                 counted.insert(*j);
             }
         }
-        counted.len().min(cap)
+        Some(counted.len().min(cap))
     }
 
-    /// Evicts `i`'s jobs: returns how many nodes it emptied and the untaken nodes whose
-    /// rank that may change, those sharing a job with a node it left partly empty included.
-    fn take(&mut self, i: usize) -> (usize, Vec<usize>) {
+    /// Credit only complete victim groups; partially covered neighbours also need re-ranking.
+    fn take(&mut self, i: usize, budget: &mut SearchBudget) -> Option<(usize, Vec<usize>)> {
         let adding: Vec<_> = self.new_jobs(i).collect();
+        budget.spend(adding.len())?;
+        for id in &adding {
+            budget.spend(self.nodes_of_job.get(id).map_or(0, Vec::len))?;
+        }
         self.victims.extend(adding.iter().copied());
         let neighbours: HashSet<usize> = adding
             .iter()
@@ -2811,6 +2718,7 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
         let mut freed = 0;
         let mut touched = HashSet::new();
         for j in neighbours {
+            budget.spend(self.evacuable[j].1.len().checked_add(1)?)?;
             if self.taken[j] {
                 continue;
             }
@@ -2825,32 +2733,13 @@ impl<'s, 'a> VictimSearch<'s, 'a> {
                 .iter()
                 .filter(|id| !self.victims.contains(id))
             {
+                budget.spend(self.nodes_of_job.get(id).map_or(0, Vec::len))?;
                 touched.extend(self.nodes_of_job.get(id).into_iter().flatten().copied());
             }
         }
         touched.retain(|&j| !self.taken[j]);
-        (freed, touched.into_iter().collect())
+        Some((freed, touched.into_iter().collect()))
     }
-}
-
-/// What `partition`'s jobs other than `evicted` hold on `node` at `now`.
-fn usage_without(
-    usage: &PartitionNodeUsage,
-    partition: &spur_core::partition::Partition,
-    node: &spur_core::node::Node,
-    evicted: &[spur_core::job::JobId],
-    now: DateTime<Utc>,
-) -> TresCharge {
-    let mut held = TresCharge::default();
-    let charges = usage
-        .get(&partition.name)
-        .and_then(|by_node| by_node.get(&node.name))
-        .into_iter()
-        .flatten();
-    for charge in charges.filter(|c| c.until > now && !evicted.contains(&c.job_id)) {
-        held.add(&charge.tres);
-    }
-    held
 }
 
 /// The pending job a victim is being cleared out for while it still holds its
@@ -2873,36 +2762,10 @@ pub(crate) fn preempt_overlaps_pending_nodes(
     candidate: &spur_core::job::Job,
     nodes: &[spur_core::node::Node],
 ) -> bool {
-    if candidate.allocated_nodes.is_empty() {
-        return false;
-    }
-    let occupied: HashSet<&str> = candidate
-        .allocated_nodes
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    if let Some(ref nodelist) = pending.spec.nodelist {
-        return nodelist
-            .split(',')
-            .map(str::trim)
-            .any(|n| occupied.contains(n));
-    }
-
-    let partitions: Vec<&str> =
-        requested_partition_names(pending.spec.partition.as_deref()).collect();
-
-    nodes.iter().any(|node| {
-        if !occupied.contains(node.name.as_str()) {
-            return false;
-        }
-        if partitions.is_empty() {
-            return true;
-        }
-        partitions
-            .iter()
-            .any(|p| node.partitions.iter().any(|np| np == p))
-    })
+    let mut budget = SearchBudget::default();
+    spur_sched::immediate::PlacementScope::new(pending, nodes, &mut budget)
+        .and_then(|scope| scope.overlaps(candidate, &mut budget))
+        .unwrap_or(false)
 }
 
 /// Forward unschedulable jobs to federation peer clusters.
@@ -6518,19 +6381,102 @@ pub(crate) mod tests {
         use crate::victim_order::VictimFacts;
         use spur_core::partition::{VictimOrderKey, DEFAULT_VICTIM_ORDER};
 
+        struct TestVictimPool<'a> {
+            evictable: &'a HashSet<spur_core::job::JobId>,
+            occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
+            priority: &'a HashMap<spur_core::job::JobId, i32>,
+            max_priority: Option<i32>,
+            order: Option<VictimOrder<'a>>,
+        }
+
+        fn allocation_fixture(pool: &TestVictimPool<'_>, nodes: &[Node]) -> (Vec<Node>, Vec<Job>) {
+            let mut nodes = nodes.to_vec();
+            let mut holders = HashMap::new();
+            for node in &mut nodes {
+                let Some(ids) = pool.occupants.get(node.name.as_str()) else {
+                    continue;
+                };
+                node.alloc_resources = Default::default();
+                for (index, id) in ids.iter().enumerate() {
+                    let cpus = node.total_resources.cpus / ids.len() as u32
+                        + u32::from((index as u32) < node.total_resources.cpus % ids.len() as u32);
+                    let mut allocation =
+                        spur_core::resource::ResourceAllocations::with_scalar(cpus, 0);
+                    let gpus: Vec<_> = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .enumerate()
+                        .filter(|(gpu, _)| gpu % ids.len() == index)
+                        .map(|(_, gpu)| gpu.stable_id)
+                        .collect();
+                    allocation.add(&spur_core::resource::ResourceAllocations::from_device_ids(
+                        "gpu", &gpus,
+                    ));
+                    node.alloc_resources.add(&allocation);
+                    let job = holders
+                        .entry(*id)
+                        .or_insert_with(|| Job::new(*id, JobSpec::default()));
+                    job.state = spur_core::job::JobState::Running;
+                    job.allocated_nodes.push(node.name.clone());
+                    job.per_node_alloc.insert(node.name.clone(), allocation);
+                }
+            }
+            (nodes, holders.into_values().collect())
+        }
+
+        #[test]
+        fn protected_cotenant_does_not_shield_reclaimable_cpu() {
+            let mut nodes = vec![node("n1", 4)];
+            nodes[0].alloc_resources.cpus = 4;
+            let occupants = HashMap::from([("n1", vec![7, 9])]);
+            let reclaimable = HashSet::from([7]);
+            let pool = TestVictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+                order: None,
+            };
+            assert_eq!(
+                victim_set_without_handoffs(&reclaimer(1, 1), &pool, &nodes, &[], Utc::now()),
+                Some(HashSet::from([7]))
+            );
+        }
+
+        #[test]
+        fn small_cpu_request_spares_unnecessary_cotenants() {
+            let mut nodes = vec![node("n1", 4)];
+            nodes[0].alloc_resources.cpus = 4;
+            let occupants = HashMap::from([("n1", vec![7, 8, 9, 10])]);
+            let reclaimable = HashSet::from([7, 8, 9, 10]);
+            let pool = TestVictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+                order: None,
+            };
+            assert_eq!(
+                victim_set_without_handoffs(&reclaimer(1, 1), &pool, &nodes, &[], Utc::now()),
+                Some(HashSet::from([7]))
+            );
+        }
+
         fn no_priorities() -> HashMap<spur_core::job::JobId, i32> {
             HashMap::new()
         }
 
         fn victim_set_with_handoffs(
             reclaimer: &Job,
-            pool: &VictimPool<'_>,
+            pool: &TestVictimPool<'_>,
             nodes: &[Node],
             handoffs: &HashMap<String, Vec<spur_core::job::JobId>>,
         ) -> Option<HashSet<spur_core::job::JobId>> {
+            let (nodes, holders) = allocation_fixture(pool, nodes);
             let state = ClusterState {
                 fabric: None,
-                nodes,
+                nodes: &nodes,
                 partitions: &[],
                 reservations: &[],
                 topology: None,
@@ -6538,19 +6484,34 @@ pub(crate) mod tests {
                 preemption_handoffs: handoffs,
                 partition_node_usage: &Default::default(),
             };
-            satisfiable_victim_set(reclaimer, pool, &state, Utc::now())
+            satisfiable_victim_set(
+                reclaimer,
+                &VictimPool {
+                    evictable: pool.evictable,
+                    holders: &holders,
+                    priority: pool.priority,
+                    max_priority: pool.max_priority,
+                    order: pool.order,
+                },
+                &state,
+                Utc::now(),
+                &mut SearchBudget::default(),
+            )
+            .ok()
+            .flatten()
         }
 
         fn victim_set_without_handoffs(
             reclaimer: &Job,
-            pool: &VictimPool<'_>,
+            pool: &TestVictimPool<'_>,
             nodes: &[Node],
             reservations: &[spur_core::reservation::Reservation],
             now: DateTime<Utc>,
         ) -> Option<HashSet<spur_core::job::JobId>> {
+            let (nodes, holders) = allocation_fixture(pool, nodes);
             let state = ClusterState {
                 fabric: None,
-                nodes,
+                nodes: &nodes,
                 partitions: &[],
                 reservations,
                 topology: None,
@@ -6558,7 +6519,21 @@ pub(crate) mod tests {
                 preemption_handoffs: &HashMap::new(),
                 partition_node_usage: &Default::default(),
             };
-            satisfiable_victim_set(reclaimer, pool, &state, now)
+            satisfiable_victim_set(
+                reclaimer,
+                &VictimPool {
+                    evictable: pool.evictable,
+                    holders: &holders,
+                    priority: pool.priority,
+                    max_priority: pool.max_priority,
+                    order: pool.order,
+                },
+                &state,
+                now,
+                &mut SearchBudget::default(),
+            )
+            .ok()
+            .flatten()
         }
 
         #[test]
@@ -6567,7 +6542,7 @@ pub(crate) mod tests {
             let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
                 [("n2", vec![7])].into_iter().collect();
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &reclaimable,
                 occupants: &occupants,
                 priority: &no_priorities(),
@@ -6629,7 +6604,7 @@ pub(crate) mod tests {
             let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
                 [("n1", vec![7])].into_iter().collect();
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &reclaimable,
                 occupants: &occupants,
                 priority: &no_priorities(),
@@ -6658,7 +6633,7 @@ pub(crate) mod tests {
             assert!(
                 victim_set_without_handoffs(
                     &greedy,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &no_priorities(),
@@ -6679,7 +6654,7 @@ pub(crate) mod tests {
             assert_eq!(
                 victim_set_without_handoffs(
                     &fits,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &no_priorities(),
@@ -6707,7 +6682,7 @@ pub(crate) mod tests {
             assert!(
                 victim_set_without_handoffs(
                     &reclaimer(2, 1),
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &no_priorities(),
@@ -6729,7 +6704,7 @@ pub(crate) mod tests {
             let reclaimable: HashSet<spur_core::job::JobId> = [7, 8].into_iter().collect();
             let victims = victim_set_without_handoffs(
                 &reclaimer(2, 1),
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &reclaimable,
                     occupants: &occupants,
                     priority: &no_priorities(),
@@ -6762,7 +6737,7 @@ pub(crate) mod tests {
             // One node needed, so exactly one victim: the cheaper one.
             let victims = victim_set_without_handoffs(
                 &reclaimer(1, 1),
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &reclaimable,
                     occupants: &occupants,
                     priority: &priorities,
@@ -6802,7 +6777,7 @@ pub(crate) mod tests {
 
             let victims = victim_set_without_handoffs(
                 &reclaimer(2, 1),
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &reclaimable,
                     occupants: &occupants,
                     priority: &priorities,
@@ -6833,7 +6808,7 @@ pub(crate) mod tests {
             assert!(
                 victim_set_without_handoffs(
                     &cheap,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &priorities,
@@ -6855,7 +6830,7 @@ pub(crate) mod tests {
             assert_eq!(
                 victim_set_without_handoffs(
                     &cheap,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &priorities,
@@ -6886,7 +6861,7 @@ pub(crate) mod tests {
             assert_eq!(
                 victim_set_without_handoffs(
                     &dear,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &priorities,
@@ -6905,7 +6880,7 @@ pub(crate) mod tests {
             assert!(
                 victim_set_without_handoffs(
                     &dear,
-                    &VictimPool {
+                    &TestVictimPool {
                         evictable: &reclaimable,
                         occupants: &occupants,
                         priority: &priorities,
@@ -6934,7 +6909,7 @@ pub(crate) mod tests {
 
             let victims = victim_set_without_handoffs(
                 &reclaimer(1, 1),
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &reclaimable,
                     occupants: &occupants,
                     priority: &priorities,
@@ -6985,11 +6960,11 @@ pub(crate) mod tests {
                 .chain(priorities.iter().copied())
                 .collect();
             let facts: HashMap<_, _> = facts.iter().copied().collect();
-            let mut pending = reclaimer(needed, 1);
+            let mut pending = reclaimer(needed, 4);
             pending.job_id = preemptor;
             victim_set_without_handoffs(
                 &pending,
-                &VictimPool {
+                &TestVictimPool {
                     evictable: &evictable,
                     occupants: &occupants,
                     priority: &priority,
@@ -7192,15 +7167,17 @@ pub(crate) mod tests {
                 .map(|(node, (_, jobs))| (node, jobs.as_slice()))
                 .collect();
             let facts = HashMap::new();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &HashSet::new(),
                 occupants: &HashMap::new(),
                 priority: &HashMap::new(),
                 max_priority: None,
                 order: Some(VictimOrder::new(keys, &facts, 1)),
             };
-            let mut search = VictimSearch::new(&evacuable, &pool);
-            search.pick(short).expect("the layout has enough nodes");
+            let mut search = VictimSearch::new(&evacuable, pool.priority, pool.order.as_ref());
+            search
+                .pick(short, &mut SearchBudget::default())
+                .expect("the layout has enough nodes");
             (search.ranked.get(), search.walked.get())
         }
 
@@ -7236,33 +7213,6 @@ pub(crate) mod tests {
                 .collect();
             let (ranked, _) = search_work(&DEFAULT_VICTIM_ORDER, &layout, 1000);
             assert_eq!(ranked, 3000);
-        }
-
-        /// Runs `f` with debug logs captured, returning its result and the log text.
-        fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let writer = buf.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .with_writer(move || CapturedLog(writer.clone()))
-                .finish();
-            let out = tracing::subscriber::with_default(subscriber, f);
-            let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-            (out, text)
-        }
-
-        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
         }
 
         /// The same greedy choice without the search's shortcuts: every node re-ranked
@@ -7360,15 +7310,17 @@ pub(crate) mod tests {
                     .collect();
                 let keys = orders[case % orders.len()];
                 let short = 1 + next(n as u64) as usize;
-                let pool = VictimPool {
+                let pool = TestVictimPool {
                     evictable: &HashSet::new(),
                     occupants: &HashMap::new(),
                     priority: &HashMap::new(),
                     max_priority: None,
                     order: Some(VictimOrder::new(keys, &facts_of, 1)),
                 };
-                let mut search = VictimSearch::new(&evacuable, &pool);
-                search.pick(short).expect("every node is evacuable");
+                let mut search = VictimSearch::new(&evacuable, pool.priority, pool.order.as_ref());
+                search
+                    .pick(short, &mut SearchBudget::default())
+                    .expect("every node is evacuable");
                 let expected = full_re_rank(&evacuable, pool.order.as_ref().unwrap(), short);
                 assert_eq!(
                     search.victims, expected,
@@ -7382,12 +7334,12 @@ pub(crate) mod tests {
             let mut one = reclaimer(1, 1);
             one.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
             one.spec.memory_per_gpu_mb = Some(1000);
-            let request = node_request(&one);
+            let request = backfill::job_resource_request(&one);
             assert_eq!((request.gpus.len(), request.memory_mb), (8, 8000));
 
             let mut two = one.clone();
             two.spec.num_nodes = 2;
-            let request = node_request(&two);
+            let request = backfill::job_resource_request(&two);
             assert_eq!(
                 (request.gpus.len(), request.memory_mb),
                 (1, 1000),
@@ -7396,9 +7348,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn a_set_that_frees_enough_nodes_but_cannot_place_the_job_evicts_nobody() {
-            // a1 and a2 sort first and free two nodes but two GPUs; a1 + z9 would fit, but the
-            // search never revisits a pick, so nothing is evicted (a documented limit).
+        fn victim_search_continues_when_its_ranked_seed_cannot_place_the_job() {
             let gpu_node = |name: &str, count: u32| {
                 let mut n = node(name, 4);
                 n.total_resources.gpus = (0..count)
@@ -7422,7 +7372,7 @@ pub(crate) mod tests {
                     .into_iter()
                     .collect();
             let evictable: HashSet<spur_core::job::JobId> = [1, 2, 3].into_iter().collect();
-            let pool = VictimPool {
+            let pool = TestVictimPool {
                 evictable: &evictable,
                 occupants: &occupants,
                 priority: &no_priorities(),
@@ -7431,16 +7381,8 @@ pub(crate) mod tests {
             };
             let mut wants = reclaimer(2, 1);
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(9, None));
-            let (set, logs) = with_captured_logs(|| {
-                victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now())
-            });
-            assert_eq!(set, None);
-            assert!(
-                logs.contains("the job would not start on them")
-                    && logs.contains(&format!("job_id={}", wants.job_id))
-                    && logs.contains("victims=[1, 2]"),
-                "a refused set must say which job and victims: {logs}"
-            );
+            let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());
+            assert_eq!(set, Some(ids(&[1, 3])));
 
             wants.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
             let set = victim_set_without_handoffs(&wants, &pool, &nodes, &[], Utc::now());
@@ -7466,17 +7408,15 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn a_node_sharing_with_an_in_quota_job_is_never_counted_as_recovered() {
-            // Evicting the borrowed job would not empty the node, so it must not count
-            // toward closing the shortfall.
+        fn protected_cpu_allocation_cannot_be_recovered() {
             let nodes = vec![node("n1", 4)];
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7, 9]); // 7 borrowed, 9 has a claim
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
 
             assert!(victim_set_without_handoffs(
-                &reclaimer(1, 1),
-                &VictimPool {
+                &reclaimer(1, 3),
+                &TestVictimPool {
                     evictable: &reclaimable,
                     occupants: &occupants,
                     priority: &no_priorities(),
@@ -11542,11 +11482,16 @@ pub(crate) mod tests {
             }
 
             fn submit_preemptor(cm: &ClusterManager) -> Job {
+                submit_preemptor_with_exclusive(cm, true)
+            }
+
+            fn submit_preemptor_with_exclusive(cm: &ClusterManager, exclusive: bool) -> Job {
                 let spec = JobSpec {
                     name: "hunter".into(),
                     user: "testuser".into(),
                     work_dir: "/tmp".into(),
                     qos: Some("high".into()),
+                    exclusive,
                     ..Default::default()
                 };
                 let job_id = submit_and_wait(cm, spec);
@@ -11724,7 +11669,7 @@ pub(crate) mod tests {
                 );
                 insert_qos_pair(&cm, 600);
                 let victim = run_victim(&cm, "victim", "n1", None);
-                let hunter = submit_preemptor(&cm);
+                let hunter = submit_preemptor_with_exclusive(&cm, false);
 
                 preempt_for(&cm, &hunter).await;
 
@@ -11951,6 +11896,7 @@ pub(crate) mod tests {
                     &state,
                     &sched,
                     &[],
+                    &mut SearchBudget::default(),
                     |_| true,
                 )
                 .await;

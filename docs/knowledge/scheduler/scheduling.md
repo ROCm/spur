@@ -224,84 +224,173 @@ be preempted by a job from the same or lower partition tier.
 
 ### Victim selection
 
-`satisfiable_victim_set` is shared by QOS preemption and idle-fill reclaim.
-Each caller supplies a `VictimPool` after its own eligibility checks; reclaim
-also applies a strict QOS-priority ceiling for an opportunistic reclaimer.
-The search simulates freeing whole nodes. A node counts only if it is suitable
-for the pending job and every occupant is eligible in that pool. Suspended,
-completing, protected, and newly assigned jobs remain in the occupant map, so
-evicting a running neighbour cannot make their node count as empty.
+`scheduler_loop/preemption.rs` captures a coherent jobs/nodes
+snapshot in the state machine's lock order and retains only placement/policy
+metadata (including suspension timing and live node responsiveness) and still-held
+resource slices. Both compact node copies preserve `not_responding`, so trials
+reject unresponsive nodes through the same placement gate as normal scheduling.
+`placement_job` retains `cpus_per_gpu`; `placement_node` retains `core_layout`
+and `layout_blocked_cpus`. Allocation copies and trial resets preserve
+`reserved_cpus` and `layout_fingerprint`. Release credit follows the node's
+current layout, so an older-layout victim cannot release another holder's
+reserved CPU charge. Immediate trials seed blocked GPUs and refresh timeline
+CPU pools using the same rules as normal placement. Layout lists and blocked
+GPU entries count toward the input and work bounds.
+Protected, reserved-pending, suspended, completing, grace-period, and same-cycle
+allocations remain charged. Unaccounted occupancy is retained; missing or
+inconsistent slices grant no release credit.
 
-`NodePlacement`, `node_request`, handoff ownership, and partition caps filter
-the candidate nodes. `node_request` requires a one-node GPU-total request to
-fit entirely on that node, including memory derived from the GPU count.
-The shortfall is the requested node count (at least one) minus suitable empty
-nodes. A non-positive shortfall or too few evacuable nodes returns no set
-before constructing the search heap.
+For supported uniform or exclusive requests with single-node victims,
+`direct_victims` uses the real `find_suitable_nodes` filter and calculates each
+node's CPU, memory, typed/stable GPU and partition-cap shortfall. It examines
+nodes sequentially, removes eligible allocations in QOS/configured order,
+prunes unnecessary local victims, and ranks
+the sufficient node groups with `VictimSearch`. The combined set gets one real
+placement verification. Protected allocations and charges stay present. A
+zero-victim result also needs verification.
 
-```mermaid
-flowchart TD
-    pool["Caller supplies eligible victims and all node occupants"]
-    filter["Apply placement, resource, reservation, handoff and cap checks"]
-    possible{"Positive shortfall and enough evacuable nodes?"}
-    rank["Rank evacuable nodes in a heap"]
-    pick["Pick the lowest-ranked current entry; add its new victims"]
-    recount["Credit every candidate node whose occupants are all selected"]
-    enough{"Node shortfall closed?"}
-    rerank["Refresh affected ranks and gains capped by the remaining shortfall"]
-    trial["Run trial placement on suitable empty and simulated emptied nodes"]
-    fits{"Pending job starts in the trial?"}
-    selected["Return victim set to caller"]
-    none["Return no set; evict nobody from this search"]
+#### Direct-selection eligibility
 
-    pool --> filter --> possible
-    possible -->|No| none
-    possible -->|Yes| rank --> pick --> recount --> enough
-    enough -->|No| rerank --> pick
-    enough -->|Yes| trial --> fits
-    fits -->|No| none
-    fits -->|Yes| selected
+`direct_victims` checks these conditions after candidate validation and before
+building local groups. Any matching condition chooses fallback:
+
+| Condition | Scope |
+| --- | --- |
+| Unequal per-node CPU or GPU counts | Non-exclusive incoming jobs only |
+| Positive `GpuDemand::Total` across multiple nodes | Non-exclusive incoming jobs, even when the total divides evenly |
+| A candidate victim holds allocations on multiple nodes | Any job in the validated eligible list, even if it would not be selected |
+| `NodePlacement::nodelist_is_additive()` | The incoming job requires named nodes plus additional nodes |
+| A partition has a memory-policy field listed below | Any partition in the supplied scheduler state, including unrelated partitions |
+
+The victim-width gate concerns the eligible list, not the incoming job's node
+count. A protected multi-node holder does not trigger that gate, but its slices
+remain allocated. `--exclusive` bypasses only the uneven-resource and GPU-total
+shape gates; it does not bypass the victim-width, additive-list or memory-policy
+gates. Node inventory must still satisfy the request.
+
+#### Partition memory-policy gates
+
+The memory-policy gate tests field presence, even when the job already specifies
+memory or needs no adjustment. `Partition::has_memory_policy()` covers the first
+four fields; `direct_victims` also checks `max_mem_per_node`. Values are in MiB.
+
+| Partition field | Placement effect |
+| --- | --- |
+| `def_mem_per_node` | Supplies default memory per node when memory is omitted |
+| `def_mem_per_cpu` | Supplies default memory per CPU when memory is omitted |
+| `def_mem_per_gpu` | Supplies default memory per GPU when memory is omitted |
+| `max_mem_per_cpu` | Can raise the job's CPU requirement to satisfy the memory-per-CPU limit |
+| `max_mem_per_node` | Limits one job's memory request on one node |
+
+An explicit job memory request and the cumulative partition cap
+`max_tres_per_node.mem` do not trigger fallback by themselves. Local selection
+already checks cumulative partition charges. The presence-based check over all
+partitions is broader than checking whether the incoming request needs adjustment
+in one of its candidate partitions.
+
+#### Fallback search
+
+Too few sufficient local groups or a failed final placement verification also
+choose fallback. It checks unchanged and all-eligible projections, bisects an
+ordered prefix while retaining a proven sufficient set, then repeatedly prunes
+unnecessary victims. Placement is not assumed monotone under scheduler heuristics;
+every accepted set has its own placement proof. The node-ranking heap supplies the
+preferred group using QOS priority, `scheduler.preempt_victim_order`, then node
+name. Suspension-aware work facts come from held jobs without accounting queries.
+There is no globally minimum-victim guarantee.
+
+#### Trial state and bounds
+
+`PlacementProjection` owns the bounded `PlacementRequest`, compact node copies
+and partition usage. Its static inputs cannot change between trials; only held
+allocations and charges can decrease. `BackfillScheduler::place_releasing` reuses
+prepared sizing and the production partition/allocation helpers without future
+convergence or trial logs. Trial timelines are reused. `PlacementScope` reuses
+name/partition/feature matching for overlap checks, including preferred-node
+fallback. Injectable GPU counts and expanded placeholder type text are bounded
+before allocation.
+
+`MAX_NODES` (4096) bounds the node domain; `MAX_VICTIMS` (1024) bounds the final
+selected set, not the eligible candidate pool. Candidate scanning and sorting
+consume the work budget, and candidate references count toward copied metadata.
+`InputSize` counts entries and text, with `MAX_ENTRIES` (327680, 64 per
+node/victim allowance) and `MAX_TEXT` (5 MiB, 1024 bytes per node/victim allowance).
+These are aggregate metadata limits, not an RSS estimate or a guarantee for every
+possible node description. `MAX_HOSTS` (8192) and `MAX_NAME` (255 bytes) bound
+hostlist expansion. A 4096-node, eight-GPU fixture exercises capture and selection
+under the default limits.
+
+Held-allocation traversal uses temporary membership sets for jobs wider than two
+nodes, avoiding repeated long node-list scans. Snapshot construction, ownership
+validation, and partition charges retain only allocated nodes without completion
+reports. No additional persisted allocation index is introduced.
+
+Each reclaim and QOS-preemption pass has its own `SearchBudget` with `MAX_TRIALS`
+(2064, `2 * MAX_VICTIMS + 16`) placement calls and `MAX_WORK` (2000000) work units.
+Requests within one pass share that budget. Snapshot/request rejection is logged;
+`SelectionDeferred` distinguishes incomplete selection from a proven no-op and is
+logged with the job ID. Incomplete searches evict nothing, even if pruning had a
+sufficient intermediate set. Complex requests can still defer at these limits.
+Reclaim skips snapshot construction when no pending request or eligible borrower
+exists. Heterogeneous job groups and GPU property/fabric-binding requests defer.
+
+#### Performance assessment
+
+All releases in this comparison are hypothetical; only a verified final victim
+set can authorize eviction. The eligibility gates above decide the current path.
+
+```text
+Earlier linear search                 Current search
+---------------------                 --------------
+Full trial: none, then all             Direct-path gates pass?
+  |                                     | yes                | no
+Add one victim                          v                    |
+  -> full trial                       Per-node local checks  |
+Repeat until fit                      + local pruning        |
+  |                                   (sequential)           |
+Restore each selected victim            |                    |
+  -> full trial                       Rank enough groups     |
+Repeat pruning until stable             |                    |
+  |                                   One full verification  |
+Accept verified set                     | fits     | fails   |
+                                        v          v         v
+                                      Accept      Bounded fallback:
+                                                  none/all full trials
+                                                  + prefix bisection
+                                                  + full-trial pruning
 ```
 
-The rank is lexicographic: the **highest** victim QOS priority on the node,
-then `scheduler.preempt_victim_order`, then node name, all ascending. Thus
-evacuating a node is charged for its highest-priority occupant. The
-[key list, default, and reload rules](../../../crates/spur-core/AGENTS.md#victim-ordering)
-are defined with `SchedulerConfig`; an empty list leaves QOS priority and
-node name as the ranking keys, while recounting and the placement check still
-apply.
+**CPU trade-off:** local checks reduce full placement calls when the common path
+succeeds, especially with many necessary victims. They still scan candidate
+nodes and rank groups. Bisection reduces fallback growth checks for large
+necessary prefixes, but can need more full calls than linear growth when one
+early victim suffices. Incoming node count alone does not predict the winner:
+eligible victim widths and partition policies determine which path runs.
+For a supported one-node request needing all 64 victims, the loop counts are
+130 full trials versus 130 local checks plus one full trial. Those operations
+have different costs; this is not a measured 130-fold speedup.
 
-| Key | Cost of adding a pick to the current victim set |
-|---|---|
-| `least_work` | Sum of each new victim's unsuspended current-run seconds times its allocated node count, divided by credited nodes freed. |
-| `fewest_jobs` | Number of new victims divided by credited nodes freed. |
-| `hash` | Stable hash of the preemptor's job ID and candidate node name. |
+**Memory trade-off:** selection uses temporary snapshots, per-node groups and
+indices; it adds no persisted controller allocation map or Raft record. Trial
+state is reused, so more calls do not mean more simultaneous snapshots. All
+preparation and pruning remain bounded; metadata limits and selected payload
+sizes are not total RSS limits or measurements of the net memory increase.
 
-Credited nodes include every additional candidate node the pick empties, capped
-at the remaining shortfall. Already selected jobs add no further cost. The
-recount uses the full newly emptied count, so a two-node shortfall behind two
-four-node jobs closes after selecting either job: its cost is divided by two,
-and all four emptied nodes are available to trial placement. The search uses
-controller memory only; fair-share and accounting history do not rank victims.
-See [heap maintenance](../../../crates/spurctld/AGENTS.md#victim-search-internals)
-for the rank invalidation rules.
+**Performance verdict:** fewer full placement calls are established; an overall
+latency win for mostly one-/two-node workloads is not. Existing mixed-workload
+measurements compare the later candidate/index processing within the current
+algorithm, use fallback, and show similar selection latency and process RSS.
+They exclude snapshot construction and dispatch, use an unoptimized build, and
+do not compare the original linear search against the current method. A direct
+comparison still needs identical victim layouts and partition policies, including
+cases needing only one or two victims.
 
-`places_once_emptied` removes victim resource usage and partition charges from
-a cloned trial state, then calls `BackfillScheduler::for_trial()` for the
-pending job. A sufficient node count alone is not proof of placement: GPU
-totals, topology, and the other placement rules must still admit the job.
-A refused trial logs at debug level and returns no set; the search does not
-try alternative sets within that pool invocation. Picks are greedy and never
-undone, so the returned set is not guaranteed to minimize total victims or
-lost work. Selection performs no eviction; after it returns, a caller failure
-partway through eviction can leave earlier victims evicted.
+The [worked search-cost comparisons](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-search-cost-comparisons),
+[temporary-memory calculations](../../plans/2026-11-16-resource-aware-victim-selection.md#worked-temporary-memory-example),
+and [recorded measurement scope](../../plans/2026-11-16-resource-aware-victim-selection.md#recorded-measurements-of-the-later-indexing-follow-up)
+separate analytic operation counts, build-specific layouts and observed timings.
 
-QOS preemption searches releasing modes (`Cancel`/`Requeue`) separately from
-`Suspend`. A set found only in the suspend pool is discarded, because
-suspension retains allocations and cannot make room for the pending job.
-Idle-fill reclaim requeues selected victims.
-
-### Capacity handoff
+#### Reclaim ordering
 
 **Reclaim vs preempt** -- reclaim (recovering idle-fill borrowed capacity) runs
 before preemption. When reclaim frees nodes, the scheduler skips dispatching
@@ -412,9 +501,11 @@ restrictive (candidate pool), not additive, because `num_nodes(1) <=
 len(nodelist)(4)`.
 
 **Topology-aware placement** -- for multi-node jobs with `--topology=tree` or
-`--topology=block`, the scheduler reorders candidates by switch-tree locality
-after the initial sort. Additive nodelist members are re-pinned after topology
-reordering to prevent displacement.
+`--topology=block`, the scheduler prefers switch-tree locality among nodes
+available by the earliest sufficient start time. Future nodes cannot displace
+a set that can start now, so immediate victim trials and normal placement use
+the same locality preference. Remaining candidates stay available for additive
+nodelist pinning: required nodes still force the job to wait when busy.
 
 **Future reservation convergence** -- a multi-node job's per-node earliest
 starts are independently computed, then converged to a common start. The
