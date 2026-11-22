@@ -63,7 +63,8 @@ inherited values on the user.
 
 A QOS name starting with ``+`` or ``-`` can no longer be created or modified,
 since those mark an add or remove. Rename any such QOS before upgrading. A
-stored list that mixes one with plain names reads as exactly the names listed.
+stored list that mixes one with plain names reads as exactly the names listed,
+and ``qos+=``/``qos-=`` on it is refused until it is replaced with ``qos=``.
 
 **Rollback.** An older controller leaves the columns in place but does not read
 them. Users who have no ``qos=`` of their own stop inheriting the account's

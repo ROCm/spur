@@ -121,8 +121,8 @@ with no list above starts from every existing QOS name (`list_qos_names`) and
 an add there leaves access open. An exact list left empty by `-` or by QOS
 deletion inherits again. `default_qos` is the user's own (an empty string
 counts as unset), else the nearest account's. A stored cell that does not
-parse reads as the exact names stored (`parse_level`), and `strip_name` leaves
-it untouched. A parent missing from `accounts` ends the walk, treating the
+parse reads as the exact names stored (`parse_level`); `strip_name` leaves it
+untouched and `apply_write` refuses a `qos+=`/`qos-=` on it. A parent missing from `accounts` ends the walk, treating the
 account as top of the tree.
 
 Every write that changes QOS grants takes one transaction-scoped advisory lock,

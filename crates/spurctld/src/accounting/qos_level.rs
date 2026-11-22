@@ -151,14 +151,28 @@ pub(crate) fn parse_write(field: Option<&str>) -> Result<Option<QosWrite>, Strin
     Ok(Some(QosWrite::Delta { add, remove }))
 }
 
-/// The column value to store. `None` is SQL NULL, which means inherit.
-pub(crate) fn apply_write(current: Option<&str>, write: &QosWrite) -> Option<String> {
+/// The column value to store. `None` is SQL NULL, which means inherit. A
+/// delta on a stored value that does not parse is refused: re-encoding it
+/// could turn a legacy `-name` into a removal.
+pub(crate) fn apply_write(
+    current: Option<&str>,
+    write: &QosWrite,
+) -> Result<Option<String>, String> {
     let level = match write {
         QosWrite::Clear => QosLevel::Inherit,
         QosWrite::Exact(names) => QosLevel::Exact(names.clone()),
-        QosWrite::Delta { add, remove } => apply_delta(&parse_level(current), add, remove),
+        QosWrite::Delta { add, remove } => {
+            let current_level = try_parse_level(current).map_err(|_| {
+                format!(
+                    "the stored qos list '{}' cannot be edited with qos+= or qos-=; \
+                     replace it with qos=",
+                    current.unwrap_or_default()
+                )
+            })?;
+            apply_delta(&current_level, add, remove)
+        }
     };
-    encode(&level)
+    Ok(encode(&level))
 }
 
 /// The stored edit with `name` dropped, which Slurm does to every
@@ -724,7 +738,8 @@ mod tests {
                 add: vec!["expedite".into()],
                 remove: Vec::new(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(stored.as_deref(), Some("burst,expedite"));
     }
 
@@ -736,13 +751,14 @@ mod tests {
                 add: vec!["expedite".into()],
                 remove: Vec::new(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(stored.as_deref(), Some("+expedite"));
     }
 
     #[test]
     fn clearing_and_an_empty_value_both_inherit() {
-        assert_eq!(apply_write(Some("burst"), &QosWrite::Clear), None);
+        assert_eq!(apply_write(Some("burst"), &QosWrite::Clear), Ok(None));
         assert_eq!(parse_write(Some("")).unwrap(), Some(QosWrite::Clear));
         assert_eq!(parse_write(None).unwrap(), None);
     }
@@ -770,7 +786,24 @@ mod tests {
             add: Vec::new(),
             remove: vec!["burst".to_string()],
         };
-        assert_eq!(apply_write(Some("burst"), &write), None);
+        assert_eq!(apply_write(Some("burst"), &write), Ok(None));
+    }
+
+    #[test]
+    fn a_delta_on_an_unparsable_stored_value_is_refused() {
+        let write = QosWrite::Delta {
+            add: Vec::new(),
+            remove: vec!["normal".to_string()],
+        };
+        let err = apply_write(Some("normal,-lowprio"), &write).unwrap_err();
+        assert!(err.contains("replace it with qos="), "{err}");
+        assert_eq!(
+            apply_write(
+                Some("normal,-lowprio"),
+                &QosWrite::Exact(vec!["normal".into()])
+            ),
+            Ok(Some("normal".into()))
+        );
     }
 
     #[test]
@@ -808,8 +841,8 @@ mod tests {
             remove: vec!["expedite".to_string()],
         };
         assert_eq!(
-            apply_write(Some("normal,burst"), &write).as_deref(),
-            Some("normal,burst")
+            apply_write(Some("normal,burst"), &write),
+            Ok(Some("normal,burst".into()))
         );
     }
 

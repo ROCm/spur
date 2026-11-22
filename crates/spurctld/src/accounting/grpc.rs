@@ -213,7 +213,8 @@ async fn stage_qos_write(
     } else {
         None
     };
-    let stored = qos_level::apply_write(current.as_deref(), write);
+    let stored =
+        qos_level::apply_write(current.as_deref(), write).map_err(Status::invalid_argument)?;
     let emptied = write.needs_current()
         && qos_level::emptied_exact_list(current.as_deref(), stored.as_deref());
     Ok(StagedQos {
