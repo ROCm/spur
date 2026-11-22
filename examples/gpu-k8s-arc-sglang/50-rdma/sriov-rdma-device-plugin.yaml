@@ -1,0 +1,34 @@
+# SR-IOV Network Device Plugin — advertises the 8 Pensando (ionic) RoCE NICs as a schedulable,
+# RDMA-capable resource so pods can request them and get /dev/infiniband injected.
+# Pair with Multus (install separately) + the NetworkAttachmentDefinitions in roce-net-attach-def.yaml.
+# Upstream: github.com/k8snetworkplumbingwg/sriov-network-device-plugin  (PIN the image digest).
+#
+# NOTE (confirm at deploy): Pensando PCI vendor id is 0x1dd8, driver "ionic". Verify with
+#   `lspci -nn | grep -i pensando` and `ls -l /sys/class/net/enP*/device/driver`.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sriovdp-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "resourceList": [
+        {
+          "resourceName": "roce_ionic",
+          "resourcePrefix": "amd.com",
+          "isRdma": true,
+          "selectors": {
+            "vendors": ["1dd8"],
+            "drivers": ["ionic"],
+            "isRdma": true
+          }
+        }
+      ]
+    }
+---
+# The DaemonSet itself is the upstream sriovdp; install it referencing this ConfigMap, e.g.:
+#   kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/sriov-network-device-plugin/master/deployments/sriovdp-daemonset.yaml
+# (pin the version). It mounts /var/lib/k0s/kubelet/device-plugins on k0s — verify the hostPath in
+# the DaemonSet matches the k0s kubelet root (same delta as ../20-gpu/amd-device-plugin.yaml).

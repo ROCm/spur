@@ -1,0 +1,86 @@
+# AMD GPU device plugin + node-labeller, adapted from github.com/ROCm/k8s-device-plugin for k0s.
+# Device-plugin socket dir is the STANDARD /var/lib/kubelet/device-plugins (verified on hw 2026-07-09:
+# k0s root-dir is /var/lib/k0s/kubelet but the pluginwatcher socket stays at /var/lib/kubelet/device-plugins).
+# Hosts already have the amdgpu kernel driver + ROCm in-box (Ubuntu 24.04 / kernel 6.8), so this is
+# the device-plugin-only path (no driver management / gpu-operator needed).
+# Apply:  kubectl apply -f amd-device-plugin.yaml
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: amdgpu-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector: { matchLabels: { name: amdgpu-dp-ds } }
+  template:
+    metadata: { labels: { name: amdgpu-dp-ds } }
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - { key: CriticalAddonsOnly, operator: Exists }
+      nodeSelector: { spur.amd.com/compute: "true" }   # GPU workers only (set by node-labels.sh)
+      containers:
+        - name: amdgpu-dp-cntr
+          image: rocm/k8s-device-plugin:latest          # PIN by digest in versions.lock.md
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: dp, mountPath: /var/lib/kubelet/device-plugins }  # plugin writes its socket here…
+            - { name: sys, mountPath: /sys }
+      volumes:
+        - name: dp
+          hostPath: { path: /var/lib/kubelet/device-plugins }           # VERIFIED on hw: k0s keeps the device-plugin
+                                                                # socket at the STANDARD path (root-dir is /var/lib/k0s/kubelet)
+        - name: sys
+          hostPath: { path: /sys }
+---
+# node-labeller: advertises amd.com/gpu.family / .device-id / .vram etc. so GPU-family nodeSelectors
+# work without hand-labeling. (Upstream: k8s-ds-amdgpu-labeller.yaml)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: amdgpu-node-labeller
+  namespace: kube-system
+spec:
+  selector: { matchLabels: { name: amdgpu-lbl-ds } }
+  template:
+    metadata: { labels: { name: amdgpu-lbl-ds } }
+    spec:
+      priorityClassName: system-node-critical
+      serviceAccountName: amdgpu-node-labeller
+      nodeSelector: { spur.amd.com/compute: "true" }
+      containers:
+        - name: amdgpu-lbl-cntr
+          image: rocm/k8s-device-plugin:labeller-latest  # PIN by digest
+          command: ["./k8s-node-labeller"]
+          args: ["-family", "-device-id", "-vram", "-compute-partitioning-supported"]
+          securityContext:
+            privileged: true                              # reads /sys sysfs GPU topology
+          env:
+            - name: DS_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          volumeMounts:
+            - { name: sys, mountPath: /sys }
+      volumes:
+        - name: sys
+          hostPath: { path: /sys }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: amdgpu-node-labeller, namespace: kube-system }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: amdgpu-node-labeller }
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: amdgpu-node-labeller }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: amdgpu-node-labeller }
+subjects:
+  - { kind: ServiceAccount, name: amdgpu-node-labeller, namespace: kube-system }

@@ -1,0 +1,70 @@
+# k0s cluster definition — the single declarative source of truth for the control/worker layout.
+# Bring up / upgrade with:  k0sctl apply --config k0sctl.yaml
+# Get kubeconfig with:      k0sctl kubeconfig --config k0sctl.yaml > ../kubeconfig
+#
+# Node addressing model (mesh-first, SPUR-native):
+#   - ssh.address       = UNDERLAY ip (how k0sctl reaches the box; real IPs kept out of git — fill locally)
+#   - privateAddress    = spur0 MESH ip (what k8s uses as the node InternalIP)
+#   - --node-ip         = same mesh ip, so kubelet + calico advertise over the encrypted mesh
+# If you defer the WireGuard mesh (00-network), set privateAddress/--node-ip to the underlay ip instead;
+# the flat routed underlay works directly (see plan §1 note).
+apiVersion: k0sctl.k0sproject.io/v1beta1
+kind: Cluster
+metadata:
+  name: spur-mi355x
+spec:
+  hosts:
+    - role: controller                       # head-node (CPU-only) — control plane only, no kubelet/workloads
+      ssh: { address: HEAD_UNDERLAY_IP, user: LOGIN, keyPath: ~/.ssh/id_ed25519 }
+      privateAddress: 10.44.0.1
+
+    - role: worker                           # gpu-node-1 — 8x MI355X (gfx950)
+      ssh: { address: GPU1_UNDERLAY_IP, user: LOGIN, keyPath: ~/.ssh/id_ed25519 }
+      privateAddress: 10.44.0.2
+      installFlags: ["--kubelet-extra-args=--node-ip=10.44.0.2"]
+    - role: worker                           # gpu-node-2
+      ssh: { address: GPU2_UNDERLAY_IP, user: LOGIN, keyPath: ~/.ssh/id_ed25519 }
+      privateAddress: 10.44.0.3
+      installFlags: ["--kubelet-extra-args=--node-ip=10.44.0.3"]
+    - role: worker                           # gpu-node-3
+      ssh: { address: GPU3_UNDERLAY_IP, user: LOGIN, keyPath: ~/.ssh/id_ed25519 }
+      privateAddress: 10.44.0.4
+      installFlags: ["--kubelet-extra-args=--node-ip=10.44.0.4"]
+    - role: worker                           # gpu-node-4
+      ssh: { address: GPU4_UNDERLAY_IP, user: LOGIN, keyPath: ~/.ssh/id_ed25519 }
+      privateAddress: 10.44.0.5
+      installFlags: ["--kubelet-extra-args=--node-ip=10.44.0.5"]
+
+  k0s:
+    version: v1.32.4+k0s.0                     # PIN exactly in versions.lock.md (>=1.32 for the AMD DRA path)
+    dynamicConfig: false
+    config:
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata: { name: k0s }
+      spec:
+        network:
+          provider: calico                   # pure-upstream Calico (k0s ships it unmodified); NOT kube-router
+          podCIDR: 10.42.0.0/16              # clear of mesh 10.44.0.0/16
+          serviceCIDR: 10.43.0.0/16
+          calico:
+            mode: bird                         # BGP native routing — NO VXLAN/IPIP overlay: pods route straight
+                                               # over the WireGuard mesh (one overlay, not overlay-on-overlay).
+            wireguard: false                   # spur0 already encrypts; do NOT enable Calico's own WireGuard.
+            ipAutodetectionMethod: "interface=spur0"  # peer BGP + advertise routes over spur0 (real k0s field;
+                                               # Calico's default 'first-found' would wrongly pick the underlay NIC).
+            overlay: Never                     # disable Calico's own encap. NOTE (verified on hw 2026-07-09):
+                                               # k0s `mode: bird` ALONE leaves the IPPool at ipipMode:Always
+                                               # (IPIP-over-WireGuard = a 2nd overlay). If pods still route via
+                                               # tunl0 after install, patch it: `kubectl patch ippool
+                                               # default-ipv4-ippool --type merge -p '{"spec":{"ipipMode":"Never"}}'`.
+            mtu: 1420                          # ~ spur0 MTU (no VXLAN/IPIP header to subtract); DERIVE from real spur0.
+        # REQUIRES the SPUR mesh to CARRY pod CIDRs (see ../00-network): each peer's WireGuard AllowedIPs must
+        # include that node's pod /24, and per-node pod CIDRs must be deterministic (kube-controller-manager
+        # --allocate-node-cidrs -> node.spec.podCIDR). Otherwise BGP advertises routes but WireGuard drops the
+        # raw pod packets. This is the spur-net enhancement (plan gap: pod-CIDR-aware mesh + full mesh).
+        # FALLBACK (works with stock SPUR, no AllowedIPs change, ~50B more MTU) — a self-contained VXLAN overlay:
+        #   calico: { mode: vxlan, overlay: Always, mtu: 1370, ipAutodetectionMethod: "interface=spur0" }
+        # NOTE: k0s kubelet root is /var/lib/k0s/kubelet — device-plugin sockets live in
+        #       /var/lib/k0s/kubelet/device-plugins (see 20-gpu/amd-device-plugin.yaml).
+        telemetry: { enabled: false }
