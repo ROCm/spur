@@ -179,9 +179,8 @@ impl Job {
     }
 
     fn failure_reason(&self) -> (EndReason, Option<String>) {
-        // Set only when this run's supervisor died before the batch script
-        // started. An exit code cannot say that: the same 127 is a missing
-        // command inside the script.
+        // Only the supervisor knows the script never started: an exit code
+        // cannot, since the same 127 is a missing command inside the script.
         if self.pending_reason == PendingReason::JobLaunchFailure {
             return (
                 EndReason::JobLaunchFailure,
@@ -213,9 +212,8 @@ impl Job {
     }
 }
 
-/// Prefix on `ReportJobStatusRequest.message` when the node accepted the job
-/// and the supervisor then died before the batch script started. Anything else
-/// in that field (including `exit_code=N`) is not a launch failure.
+/// Prefix on `ReportJobStatusRequest.message` when the supervisor died before
+/// the batch script started; any other message is not a launch failure.
 pub const LAUNCH_FAILURE_MESSAGE_PREFIX: &str = "launch_failure:";
 
 pub fn format_launch_failure_message(reason: &str) -> String {

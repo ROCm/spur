@@ -1262,6 +1262,26 @@ pub(crate) fn record_launch_failure(
         tracing::warn!(%write_error, path = %failure_path.display(),
             "failed to record stepd failure");
     }
+    report_to_job_stderr(stderr_path, uid, gid, error);
+}
+
+/// The agent reads `failure.txt` as "the script never started", so an error
+/// raised once the workload was spawned only goes to the job's own stream.
+pub(crate) fn record_executor_failure(
+    session_dir: &Path,
+    stderr_path: &str,
+    uid: u32,
+    gid: u32,
+    error: &crate::executor::LaunchError,
+) {
+    if error.workload_spawned() {
+        report_to_job_stderr(stderr_path, uid, gid, error);
+    } else {
+        record_launch_failure(session_dir, stderr_path, uid, gid, error);
+    }
+}
+
+fn report_to_job_stderr(stderr_path: &str, uid: u32, gid: u32, error: &dyn std::fmt::Display) {
     if stderr_path.is_empty() {
         return;
     }
@@ -2419,10 +2439,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     }
-    // The workload never ran, so nothing will report an exit and the watchdog
-    // synthesises a SIGKILL — record the real reason the way a failed spawn does.
-    let cleanup_failed_launch = |error: &dyn std::fmt::Display| {
-        record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, error);
+    // A failed launch reports no exit, so the agent synthesises a SIGKILL
+    // unless the reason was recorded before this cleanup.
+    let cleanup_failed_launch = || {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
@@ -2437,7 +2456,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let pmix = match start_supervised_pmix(&mut launch_spec) {
         Ok(pmix) => pmix,
         Err(error) => {
-            cleanup_failed_launch(&error);
+            record_launch_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
+            cleanup_failed_launch();
             return Err(error);
         }
     };
@@ -2458,7 +2478,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
                 if let Some(pmix) = pmix.as_ref() {
                     pmix.stop();
                 }
-                cleanup_failed_launch(&error);
+                record_executor_failure(&session_dir, &stderr_path, fail_uid, fail_gid, &error);
+                cleanup_failed_launch();
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
@@ -2575,9 +2596,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     };
     if let Err(error) = result {
         teardown(cgroup).await?;
-        // The workload was already launched. The failure file is read back as
-        // "the script never started", so a supervisor error after that must not
-        // be stored there.
+        // The workload ran, so this stays out of the failure file, which the
+        // agent reads as "the script never started".
         tracing::warn!(job_id, %error, "supervisor failed after the workload was launched");
         return Err(error.into());
     }
@@ -2880,6 +2900,24 @@ impl StepdStore {
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
+    /// The recorded reason, only while no workload was ever published: older
+    /// supervisors also wrote the file for errors after the script started.
+    pub(crate) fn launch_failure(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> Option<String> {
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        if self
+            .load_descriptor(&session_dir)
+            .is_ok_and(|descriptor| descriptor.workload_pid > 0)
+        {
+            return None;
+        }
+        self.recorded_failure(job_id, run_attempt, step_id)
+    }
+
     /// Invent the exit a supervisor that died while the agent was down never
     /// recorded, so the ordinary completion replay can report its loss.
     pub fn record_lost_supervisor_exit(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
@@ -2905,7 +2943,7 @@ impl StepdStore {
         // A failure file means the workload never started. A synthesized kill
         // would be read later as the real outcome, and the reason dropped.
         let launch_failed = self
-            .recorded_failure(
+            .launch_failure(
                 descriptor.job_id,
                 descriptor.run_attempt,
                 descriptor.step_id,
@@ -6330,6 +6368,50 @@ mod tests {
             store.recorded_failure(21, 1, 4).as_deref(),
             Some("the node cannot host this plugin")
         );
+    }
+
+    #[test]
+    fn a_failure_file_beside_a_published_workload_is_not_a_launch_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut launched = descriptor(45, 1, 999_999);
+        let session_dir = write_descriptor(&store, &launched);
+        fs::write(session_dir.join(FAILURE_FILE), b"supervisor polling failed")
+            .expect("write failure file");
+        assert_eq!(
+            store
+                .launch_failure(45, 1, spur_core::step::STEP_BATCH)
+                .as_deref(),
+            Some("supervisor polling failed")
+        );
+
+        launched.workload_pid = 4242;
+        write_descriptor(&store, &launched);
+        assert_eq!(
+            store.launch_failure(45, 1, spur_core::step::STEP_BATCH),
+            None
+        );
+    }
+
+    #[test]
+    fn an_error_after_spawn_reaches_the_job_s_stream_but_not_the_failure_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session directory");
+        let stderr_path = temp.path().join("job.err");
+        fs::write(&stderr_path, b"").expect("seed the error stream");
+
+        record_executor_failure(
+            &session_dir,
+            stderr_path.to_str().expect("utf-8 path"),
+            0,
+            0,
+            &crate::executor::LaunchError::AfterSpawn(anyhow::anyhow!("did not join its cgroup")),
+        );
+
+        assert!(!session_dir.join(FAILURE_FILE).exists());
+        let reported = fs::read_to_string(&stderr_path).expect("read the error stream");
+        assert!(reported.contains("did not join its cgroup"));
     }
 
     #[test]

@@ -2734,11 +2734,8 @@ fn settle_lost_teardown(
     }
 }
 
-/// What a dead supervisor is reported as.
-///
 /// A real workload exit wins, so a failure file cannot relabel a script that
-/// ran. A failure file with no real exit, including the exit an agent restart
-/// invents, is a launch failure.
+/// ran; with only an invented exit or none, the failure file is the outcome.
 fn completion_for_dead_supervisor(
     recorded_exit: Option<(i32, i32)>,
     exit_was_synthesized: bool,
@@ -2784,6 +2781,65 @@ mod dead_supervisor_completion {
         let (code, signal, reason) = completion_for_dead_supervisor(None, false, None);
         assert_eq!((code, signal), (0, 9));
         assert!(reason.is_none());
+    }
+
+    fn dead_supervisor_outcome(
+        store: &crate::stepd::StepdStore,
+        error: &crate::executor::LaunchError,
+    ) -> (i32, i32, Option<String>) {
+        let session_dir = store
+            .prepare_session_dir(46, 1, spur_core::step::STEP_BATCH)
+            .expect("prepare session directory");
+        crate::stepd::record_executor_failure(&session_dir, "", 0, 0, error);
+        let launch_failure = store.launch_failure(46, 1, spur_core::step::STEP_BATCH);
+        completion_for_dead_supervisor(None, false, launch_failure)
+    }
+
+    #[tokio::test]
+    async fn a_script_that_ran_before_a_post_spawn_error_is_not_a_launch_failure() {
+        use tokio::io::AsyncReadExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("script-ran");
+        let cgroup = temp.path().join("cgroup");
+        std::fs::create_dir(&cgroup).expect("create cgroup directory");
+        std::fs::write(cgroup.join("cgroup.procs"), b"").expect("write cgroup.procs");
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("touch '{}'", marker.display()))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the script");
+        // EOF on stdout means the script exited; it stays unreaped, as in the race.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        stdout
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect("read stdout");
+        assert!(marker.exists(), "the script must have run");
+
+        let error =
+            crate::executor::refuse_unjoined_workload(true, Some(cgroup.as_path()), &mut child)
+                .await
+                .expect_err("an exited script is not in its cgroup");
+        let store = crate::stepd::StepdStore::new(temp.path().join("state"));
+        let (code, signal, reason) = dead_supervisor_outcome(&store, &error);
+
+        assert!(error.workload_spawned());
+        assert_eq!((code, signal), (0, 9));
+        assert!(reason.is_none(), "reported as a launch failure: {reason:?}");
+    }
+
+    #[test]
+    fn an_error_before_spawn_is_still_a_launch_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = crate::stepd::StepdStore::new(temp.path());
+        let error = crate::executor::LaunchError::Other(anyhow::anyhow!("open stdout: denied"));
+
+        let (code, signal, reason) = dead_supervisor_outcome(&store, &error);
+
+        assert_eq!((code, signal), (1, 0));
+        assert_eq!(reason.as_deref(), Some("open stdout: denied"));
     }
 }
 
@@ -2831,7 +2887,7 @@ async fn fence_dead_stepd(
             descriptor.step_id,
         )
         .unwrap_or(false);
-    let recorded_failure = store.recorded_failure(
+    let recorded_failure = store.launch_failure(
         descriptor.job_id,
         descriptor.run_attempt,
         descriptor.step_id,
@@ -3126,7 +3182,7 @@ async fn replay_runtime_completions(
                 .epilog_failed
                 .then(|| drain_for(EPILOG_FAILED_DRAIN_REASON)),
         };
-        let recorded_failure = store.recorded_failure(
+        let recorded_failure = store.launch_failure(
             completion.job_id,
             completion.run_attempt,
             completion.step_id,
