@@ -1378,7 +1378,7 @@ class TestSacctmgrQosAuthorization:
         assert job_id is not None, "explicit --qos must succeed despite a stale pinned default"
         wait_job(c, job_id, timeout=30)
 
-    def test_cluster_fallback_qos_withheld_when_outside_association_allow_list(self, accounting_cluster):
+    def test_no_qos_job_under_a_list_gets_its_only_qos_or_is_rejected(self, accounting_cluster):
         # A restricted association omitting --qos must never receive a
         # cluster fallback that isn't on its list. As in Slurm, a list of one
         # resolves to that QOS, and a longer list with no usable default
@@ -1442,6 +1442,59 @@ class TestSacctmgrQosAuthorization:
         shown = c.sacctmgr(["show", "user", f"user={user}"])
         row = next(ln for ln in shown.splitlines() if "deflist" in ln)
         assert "deflistb" in row and "deflista" not in row, f"expected the new list:\n{shown}"
+
+    def test_account_tree_qos_flows_down_to_submit(self, accounting_cluster):
+        # A leaf user with nothing of their own gets the list and default set
+        # two accounts up, and a later qos-= on that account reaches them.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        for qos in ("treenormal", "treeburst", "treeextra"):
+            c.sacctmgr(["add", "qos", f"name={qos}"])
+        c.sacctmgr(
+            ["add", "account", "name=treetop", "qos=treenormal,treeburst,treeextra",
+             "defaultqos=treenormal"]
+        )
+        c.sacctmgr(["add", "account", "name=treemid", "parent=treetop"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=treemid"])
+        time.sleep(15)
+
+        script = c.write_file("qos-tree.sh", "#!/bin/bash\ntrue\n")
+        job_id = parse_job_id(c.sbatch(["-J", "qos-tree-default", "-N", "1", "-A", "treemid", script]))
+        assert job_id is not None, "the inherited default must resolve"
+        wait_job(c, job_id, timeout=30)
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=treenormal" in show, f"expected the default set two levels up: {show!r}"
+
+        c.sacctmgr(["modify", "account", "name=treetop", "set", "qos-=treeextra"])
+        time.sleep(15)
+        out = c.cli_allow_fail(
+            ["sbatch", "-J", "qos-tree-removed", "-N", "1", "-A", "treemid", "--qos=treeextra", script]
+        )
+        assert "not permitted" in out, f"a name removed above must not reach the leaf: {out!r}"
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-tree-kept", "-N", "1", "-A", "treemid", "--qos=treeburst", script])
+        )
+        assert job_id is not None, "a name still inherited must be usable"
+        wait_job(c, job_id, timeout=30)
+
+    def test_qos_writes_never_open_or_orphan_the_tree(self, accounting_cluster):
+        c = accounting_cluster
+
+        c.sacctmgr(["add", "qos", "name=openonly"])
+        c.sacctmgr(["add", "account", "name=opentop", "qos=openonly"])
+        c.sacctmgr(["add", "account", "name=openchild", "parent=opentop"])
+
+        out = c.cli_allow_fail(["sacctmgr", "modify", "account", "name=opentop", "set", "qos-=openonly"])
+        assert "every QOS" in out, f"emptying the top list must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "delete", "qos", "name=openonly"])
+        assert "every QOS" in out, f"deleting the top list's only QOS must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "-i", "delete", "account", "name=opentop"])
+        assert "sub-accounts" in out, f"deleting a parent must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "add", "account", "name=openstray", "parent=opentpo"])
+        assert "does not exist" in out, f"an unknown parent must be refused: {out!r}"
+
+        c.sacctmgr(["add", "account", "name=openroot", "parent=root"])
 
     def test_update_job_qos_rejects_unauthorized_and_account_spoofing(self, accounting_cluster):
         # scontrol update job qos= must enforce the same per-association

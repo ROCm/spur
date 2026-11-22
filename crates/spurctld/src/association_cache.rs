@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn check_qos_authorized_permissive_when_association_has_no_default_pinned() {
+    fn check_qos_authorized_permissive_when_no_list_applies() {
         let cache = AssociationCache::new();
         cache.insert_association("alice", "research");
         assert!(cache

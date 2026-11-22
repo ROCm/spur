@@ -2063,6 +2063,8 @@ message CreateAccountRequest {
   string name = 1;
   optional string description = 2;
   optional string organization = 3;
+  // Must name an existing account, or "root" for the top of the tree, and may
+  // not be one of this account's own sub-accounts.
   optional string parent_account = 4;
   optional double fairshare_weight = 5;
   // Unset preserves the stored value; the INFINITE sentinel (4294967295) clears
@@ -2073,7 +2075,9 @@ message CreateAccountRequest {
   // from the parent again. "a,b" replaces the parent's list. "+a,-b" adds and
   // removes names without forgetting the parent, so a later change above still
   // flows down. A user with no edit of their own is the last step of the same
-  // walk. Reads return the evaluated names, not this raw edit.
+  // walk. Reads return the evaluated names, not this raw edit. A removal that
+  // empties a "a,b" list with no list above it is rejected, since inheriting
+  // would allow every QOS.
   optional string allowed_qos = 8;
   // Default QOS for this account and its children, used when a user has none
   // of their own. Unset preserves it; empty clears it back to the parent's.

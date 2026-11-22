@@ -7,7 +7,7 @@
 //! An edit is one of three things. Nothing stored means "use the parent".
 //! `normal,burst` replaces the parent. `+expedite,-standby` adds and removes
 //! without forgetting the parent, so a later change above still flows down.
-//! A person is the last step, applied on top of their account.
+//! A user is the last step, applied on top of their account.
 //!
 //! Slurm's root association always carries a list. Spur's top of the tree is
 //! "every QOS" instead, so a removal there starts from every QOS that exists.
@@ -163,8 +163,13 @@ pub(crate) fn apply_write(current: Option<&str>, write: &QosWrite) -> Option<Str
 
 /// The stored edit with `name` dropped, which Slurm does to every
 /// association when a QOS is deleted. An exact list left empty inherits.
+/// A value that does not parse is kept as is: re-encoding it could turn a
+/// legacy `-name` into a removal.
 pub(crate) fn strip_name(raw: Option<&str>, name: &str) -> Option<String> {
-    let level = match parse_level(raw) {
+    let Ok(level) = try_parse_level(raw) else {
+        return raw.map(str::to_owned);
+    };
+    let level = match level {
         QosLevel::Inherit => QosLevel::Inherit,
         QosLevel::Exact(mut names) => {
             names.retain(|existing| existing != name);
@@ -180,6 +185,44 @@ pub(crate) fn strip_name(raw: Option<&str>, name: &str) -> Option<String> {
         }
     };
     encode(&level)
+}
+
+/// Whether a removal turned an exact list into "inherit". Under a parent with
+/// no list that grants every QOS, so callers refuse it there.
+pub(crate) fn emptied_exact_list(before: Option<&str>, after: Option<&str>) -> bool {
+    after.is_none() && matches!(parse_level(before), QosLevel::Exact(names) if !names.is_empty())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParentProblem {
+    Missing(String),
+    Cycle,
+}
+
+/// Slurm's root account. Spur shows a parentless account under it, so naming
+/// it without creating it means the top of the tree, as in Slurm scripts.
+const IMPLICIT_ROOT: &str = "root";
+
+/// A parent link that would break the walk up the tree. Only the direct
+/// parent must exist: an older missing ancestor further up is left alone.
+pub(crate) fn parent_problem(nodes: &[AccountNode<'_>], name: &str) -> Option<ParentProblem> {
+    let parent_of: HashMap<&str, Option<&str>> = nodes
+        .iter()
+        .map(|node| (node.name, node.parent.filter(|parent| !parent.is_empty())))
+        .collect();
+    let parent = parent_of.get(name).copied().flatten()?;
+    if !parent_of.contains_key(parent) {
+        return (parent != IMPLICIT_ROOT).then(|| ParentProblem::Missing(parent.to_owned()));
+    }
+    let mut seen = HashSet::from([name]);
+    let mut cursor = Some(parent);
+    while let Some(current) = cursor {
+        if !seen.insert(current) {
+            return Some(ParentProblem::Cycle);
+        }
+        cursor = parent_of.get(current).copied().flatten();
+    }
+    None
 }
 
 /// `universe` is every QOS that exists. It is the starting point for a
@@ -330,23 +373,14 @@ fn apply_delta(current: &QosLevel, add: &[String], remove: &[String]) -> QosLeve
         // A delta on an inherited list must stay a delta. Copying the
         // parent's names would freeze them and stop later parent edits
         // from reaching this level.
-        QosLevel::Inherit => {
-            let add_names = dedup(add.iter().map(String::as_str));
-            let mut remove_names = Vec::new();
-            for name in remove {
-                if !add_names.iter().any(|kept| kept == name) {
-                    push_unique(&mut remove_names, name);
-                }
-            }
-            if add_names.is_empty() && remove_names.is_empty() {
-                QosLevel::Inherit
-            } else {
-                QosLevel::Adjust {
-                    add: add_names,
-                    remove: remove_names,
-                }
-            }
-        }
+        QosLevel::Inherit => apply_delta(
+            &QosLevel::Adjust {
+                add: Vec::new(),
+                remove: Vec::new(),
+            },
+            add,
+            remove,
+        ),
         QosLevel::Exact(names) => {
             let mut names = names.clone();
             for name in add {
@@ -386,12 +420,20 @@ fn apply_delta(current: &QosLevel, add: &[String], remove: &[String]) -> QosLeve
     }
 }
 
+/// A stored value that does not parse (a legacy QOS name starting with `+`
+/// or `-`, next to plain names) reads as the exact names stored, so it never
+/// grants more than it lists.
 fn parse_level(raw: Option<&str>) -> QosLevel {
-    match parse_write(raw) {
-        Ok(Some(QosWrite::Exact(names))) => QosLevel::Exact(names),
-        Ok(Some(QosWrite::Delta { add, remove })) => QosLevel::Adjust { add, remove },
-        _ => QosLevel::Inherit,
-    }
+    try_parse_level(raw)
+        .unwrap_or_else(|_| QosLevel::Exact(dedup(split_tokens(raw.unwrap_or_default()))))
+}
+
+fn try_parse_level(raw: Option<&str>) -> Result<QosLevel, String> {
+    Ok(match parse_write(raw)? {
+        Some(QosWrite::Exact(names)) => QosLevel::Exact(names),
+        Some(QosWrite::Delta { add, remove }) => QosLevel::Adjust { add, remove },
+        Some(QosWrite::Clear) | None => QosLevel::Inherit,
+    })
 }
 
 fn encode(level: &QosLevel) -> Option<String> {
@@ -742,5 +784,113 @@ mod tests {
     fn a_replacement_cannot_be_mixed_with_an_addition() {
         let err = parse_write(Some("normal,+expedite")).unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[test]
+    fn whitespace_and_repeated_names_collapse() {
+        assert_eq!(
+            parse_write(Some(" normal , burst,normal ")).unwrap(),
+            Some(QosWrite::Exact(vec!["normal".into(), "burst".into()]))
+        );
+        assert_eq!(
+            parse_write(Some("+burst, +burst")).unwrap(),
+            Some(QosWrite::Delta {
+                add: vec!["burst".into()],
+                remove: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn removing_a_name_an_exact_list_lacks_changes_nothing() {
+        let write = QosWrite::Delta {
+            add: Vec::new(),
+            remove: vec!["expedite".to_string()],
+        };
+        assert_eq!(
+            apply_write(Some("normal,burst"), &write).as_deref(),
+            Some("normal,burst")
+        );
+    }
+
+    #[test]
+    fn a_removal_from_an_open_tree_includes_qos_created_later() {
+        let nodes = [node("science", None, Some("-burst"), None)];
+        let mut grown = universe();
+        grown.push("overnight".into());
+        let science = evaluate_accounts(&nodes, &grown)
+            .remove("science")
+            .expect("account present");
+        assert!(science.qos.permits("overnight"));
+        assert!(!science.qos.permits("burst"));
+    }
+
+    #[test]
+    fn an_unparsable_stored_value_grants_only_what_it_lists() {
+        let nodes = [node("science", None, Some("normal,-lowprio"), None)];
+        let science = effect(&nodes, "science");
+        assert!(science.qos.limited);
+        assert_eq!(
+            science.qos.names,
+            vec!["normal".to_string(), "-lowprio".to_string()]
+        );
+        assert!(!science.qos.permits("burst"));
+    }
+
+    #[test]
+    fn deleting_a_qos_leaves_an_unparsable_value_alone() {
+        assert_eq!(
+            strip_name(Some("normal,-lowprio"), "normal").as_deref(),
+            Some("normal,-lowprio")
+        );
+    }
+
+    #[test]
+    fn only_emptying_an_exact_list_counts_as_emptied() {
+        assert!(emptied_exact_list(Some("burst"), None));
+        assert!(!emptied_exact_list(Some("burst,normal"), Some("normal")));
+        assert!(!emptied_exact_list(Some("-burst"), None));
+        assert!(!emptied_exact_list(None, None));
+    }
+
+    #[test]
+    fn a_parent_must_exist() {
+        let nodes = [node("physics", Some("sience"), None, None)];
+        assert_eq!(
+            parent_problem(&nodes, "physics"),
+            Some(ParentProblem::Missing("sience".into()))
+        );
+    }
+
+    #[test]
+    fn a_parent_cannot_be_a_descendant() {
+        let nodes = [
+            node("root", Some("physics"), None, None),
+            node("science", Some("root"), None, None),
+            node("physics", Some("science"), None, None),
+        ];
+        assert_eq!(parent_problem(&nodes, "root"), Some(ParentProblem::Cycle));
+        let own = [node("root", Some("root"), None, None)];
+        assert_eq!(parent_problem(&own, "root"), Some(ParentProblem::Cycle));
+    }
+
+    #[test]
+    fn a_valid_chain_or_no_parent_is_fine() {
+        let nodes = [
+            node("root", None, None, None),
+            node("science", Some("root"), None, None),
+            node("physics", Some("science"), None, None),
+            node("orphan_child", Some("orphan"), None, None),
+            node("grandchild", Some("orphan_child"), None, None),
+        ];
+        assert_eq!(parent_problem(&nodes, "physics"), None);
+        assert_eq!(parent_problem(&nodes, "root"), None);
+        assert_eq!(parent_problem(&nodes, "grandchild"), None);
+    }
+
+    #[test]
+    fn slurms_root_is_a_valid_parent_without_being_created() {
+        let nodes = [node("science", Some("root"), None, None)];
+        assert_eq!(parent_problem(&nodes, "science"), None);
     }
 }

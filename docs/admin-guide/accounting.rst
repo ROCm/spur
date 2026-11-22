@@ -162,7 +162,9 @@ Create a child account (hierarchy)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Build the account tree with ``parent=``. An account with no parent renders as a
-child of ``root``.
+child of ``root``, and ``parent=root`` means the same as no parent unless you
+created an account named ``root``. Any other parent must already exist, and an
+account cannot be moved under one of its own sub-accounts.
 
 .. code-block:: bash
 
@@ -181,6 +183,10 @@ Delete an account
 .. code-block:: bash
 
    sacctmgr delete account name=ml
+
+An account that still has sub-accounts cannot be deleted: they would lose the
+QOS list and default they inherit from it. Delete them, or move them under
+another parent, first.
 
 Show accounts
 ~~~~~~~~~~~~~~
@@ -253,10 +259,12 @@ Account keys
        set their own. ``qos+=a`` adds a name and ``qos-=a`` removes one, keeping
        the inherited names. When nothing above sets a list, every QOS is
        allowed: ``qos+=a`` then changes nothing, and ``qos-=a`` allows every
-       existing QOS except ``a``. ``qos=`` with nothing after it inherits
-       again, and so does removing the last name of a list set with ``qos=``
-       (as in Slurm, that widens access to the inherited list). Removing every
-       name you inherited leaves no QOS allowed. A user who sets nothing of
+       QOS except ``a``, including ones created later. ``qos=`` with nothing
+       after it inherits again, and so does removing the last name of a list
+       set with ``qos=`` (as in Slurm, that widens access to the inherited
+       list). When nothing above sets a list, that removal would allow every
+       QOS, so it is refused; use ``qos=`` instead. Removing every name you
+       inherited leaves no QOS allowed. A user who sets nothing of
        their own uses this evaluated list, both in ``sacctmgr show`` and when a
        job is admitted. A QOS name may not start with ``+`` or ``-``, which
        mark an add or remove.
@@ -264,8 +272,10 @@ Account keys
      - unset (inherit)
      - QOS used when a user in this account (or a child account) does not set
        their own and does not name one on the job. The nearest account that
-       sets one wins. A write that leaves this account, or a user in it, with
-       a default that is not on its evaluated list is rejected. Set
+       sets one wins. A write that leaves this account, or a user directly in
+       it, with a default that is not on its evaluated list is rejected. As in
+       Slurm, sub-accounts are not re-checked; their jobs skip a default that
+       is off the list (see `How a job's QOS is resolved`_). Set
        ``defaultqos=`` empty to inherit again.
 
 .. note::
@@ -507,7 +517,9 @@ Delete a QOS
 
 As in Slurm, deleting a QOS also removes it from every account and user
 ``qos`` list and clears every ``defaultqos`` that names it. A list set with
-``qos=`` whose only name was the deleted QOS inherits again.
+``qos=`` whose only name was the deleted QOS inherits again. When nothing
+above that account or user sets a list, inheriting would allow every QOS, so
+the delete is refused and names them; give them another ``qos=`` list first.
 
 Show QOS
 ~~~~~~~~

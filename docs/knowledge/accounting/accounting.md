@@ -119,15 +119,31 @@ the `parent_account` chain, and `effective_user` applies the user's edit last.
 The top of the tree is "every QOS" (`EffectiveQos::unrestricted`), so a removal
 with no list above starts from every existing QOS name (`list_qos_names`) and
 an add there leaves access open. An exact list left empty by `-` or by QOS
-deletion inherits again. `default_qos` is the user's own, else the nearest
-account's.
+deletion inherits again. `default_qos` is the user's own (an empty string
+counts as unset), else the nearest account's. A stored cell that does not
+parse reads as the exact names stored (`parse_level`), and `strip_name` leaves
+it untouched. A parent missing from `accounts` ends the walk, treating the
+account as top of the tree.
 
-Writes validate after the change, inside the write's transaction:
-`check_default_qos_access` (in `grpc.rs`) refuses an `add`/`modify` of an
-account or user that leaves the account or one of its users with a default off
-their evaluated list (`defaults_without_access`). Deleting a QOS calls
-`strip_qos_references`, which drops the name from every edit and clears
-defaults naming it.
+Every write that changes QOS grants takes one transaction-scoped advisory lock,
+`lock_qos_grants` (`SCHEMA_LOCK_CLASS`, `QOS_GRANTS_LOCK_OBJ` = 2): account and
+user writes that restate `qos`, `defaultqos` or `parent`, `delete qos`, and
+`delete account`. Under it, `stage_qos_write` (`grpc.rs`) checks every named
+QOS exists and applies a `qos+=`/`qos-=` to the stored edit. After the write,
+`check_qos_grants` re-evaluates the tree in the same transaction and refuses:
+
+- a parent that does not exist or is a sub-account of the account
+  (`parent_problem`). `root` with no such account means top of the tree
+  (`IMPLICIT_ROOT`);
+- a `qos-=` that emptied an exact list when nothing above sets one
+  (`emptied_exact_list`), since inheriting would allow every QOS;
+- a default off the evaluated list for the account or a user directly in it
+  (`defaults_without_access`). Like Slurm, sub-accounts are not re-checked.
+
+`delete qos` runs `strip_qos_references`, which drops the name from every edit,
+clears defaults naming it, and returns each exact list it emptied
+(`EmptiedList`); the delete is refused if any of them is then unlimited.
+`delete account` is refused while `child_accounts` is non-empty.
 
 At submit, `apply_default_qos` (`cluster.rs`) resolves a job with no `--qos` to
 the first of: the default when permitted, the only existing QOS on the list,
