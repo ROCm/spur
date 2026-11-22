@@ -164,7 +164,9 @@ Create a child account (hierarchy)
 Build the account tree with ``parent=``. An account with no parent renders as a
 child of ``root``, and ``parent=root`` means the same as no parent unless you
 created an account named ``root``. Any other parent must already exist, and an
-account cannot be moved under one of its own sub-accounts.
+account cannot be moved under one of its own sub-accounts. Running ``add
+account`` again for an existing account without ``parent=`` keeps its current
+parent; use ``modify account ... set parent=`` to move it.
 
 .. code-block:: bash
 

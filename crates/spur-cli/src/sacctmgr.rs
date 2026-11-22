@@ -516,54 +516,28 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" => {
-            reject_unknown_keys(&p, ACCOUNT_KEYS)?;
-            let name = p
-                .get("name")
-                .or_else(|| p.get("account"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-            let desc = p.get("description").cloned().unwrap_or_default();
-            let org = p.get("organization").cloned().unwrap_or_default();
-            let parent = p.get("parent").cloned().unwrap_or_default();
-            let fairshare: f64 = p
-                .get("fairshare")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0);
-            let max_jobs: u32 = find_alias(&p, &["maxrunningjobs", "maxjobs"])
-                .map(|(k, v)| parse_limit(k, v))
-                .transpose()?
-                .unwrap_or(spur_core::accounting::INFINITE);
-            let grp_tres = p.get("grptres").cloned().unwrap_or_default();
-            let qos = qos_assignment(&p)?;
-            let default_qos = p.get("defaultqos").cloned();
-
+            let req = build_add_account_request(&p)?;
             let mut client = connect(addr).await?;
             client
-                .create_account(CreateAccountRequest {
-                    name: name.clone(),
-                    description: Some(desc.clone()),
-                    organization: Some(org.clone()),
-                    parent_account: Some(parent.clone()),
-                    fairshare_weight: Some(fairshare),
-                    max_running_jobs: Some(max_jobs),
-                    grp_tres: Some(grp_tres),
-                    allowed_qos: qos.clone(),
-                    default_qos: default_qos.clone(),
-                })
+                .create_account(req.clone())
                 .await
                 .context("CreateAccount RPC failed")?;
 
             println!(
                 " Adding Account(s)\n  Name       = {}\n  Descr      = {}\n  Org        = {}\n  Parent     = {}\n  Fairshare  = {}",
-                name,
-                desc,
-                org,
-                if parent.is_empty() { "root" } else { &parent },
-                fairshare
+                req.name,
+                req.description.unwrap_or_default(),
+                req.organization.unwrap_or_default(),
+                req.parent_account
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("root"),
+                req.fairshare_weight.unwrap_or_default()
             );
-            if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
+            if let Some(q) = req.allowed_qos.as_deref().filter(|q| !q.is_empty()) {
                 println!("  QOS        = {q}");
             }
-            if let Some(q) = default_qos.as_deref().filter(|q| !q.is_empty()) {
+            if let Some(q) = req.default_qos.as_deref().filter(|q| !q.is_empty()) {
                 println!("  DefQOS     = {q}");
             }
             println!(" Account added.");
@@ -849,6 +823,39 @@ fn push_qos_ops(parts: &mut Vec<String>, list: &str, op: char) -> Result<()> {
         parts.push(format!("{op}{name}"));
     }
     Ok(())
+}
+
+/// Build the `CreateAccountRequest` for `add account`. Every field gets its
+/// default, except `parent`, which stays unset when not given: re-adding an
+/// existing account must not move it to the top and drop its inherited QOS.
+fn build_add_account_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<CreateAccountRequest> {
+    reject_unknown_keys(p, ACCOUNT_KEYS)?;
+    let name = p
+        .get("name")
+        .or_else(|| p.get("account"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    let fairshare: f64 = p
+        .get("fairshare")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let max_jobs: u32 = find_alias(p, &["maxrunningjobs", "maxjobs"])
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?
+        .unwrap_or(spur_core::accounting::INFINITE);
+    Ok(CreateAccountRequest {
+        name,
+        description: Some(p.get("description").cloned().unwrap_or_default()),
+        organization: Some(p.get("organization").cloned().unwrap_or_default()),
+        parent_account: p.get("parent").cloned(),
+        fairshare_weight: Some(fairshare),
+        max_running_jobs: Some(max_jobs),
+        grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
+        allowed_qos: qos_assignment(p)?,
+        default_qos: p.get("defaultqos").cloned(),
+    })
 }
 
 /// Build a partial-patch `CreateAccountRequest` for `modify account`: a field
@@ -2909,6 +2916,19 @@ mod tests {
         let p = parse_params(&["name=amd-collectives".into(), "qos=".into()]);
         let req = build_modify_account_request(&p).unwrap();
         assert_eq!(req.allowed_qos.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_add_account_request_leaves_an_unstated_parent_alone() {
+        let p = parse_params(&["name=physics".into()]);
+        let req = build_add_account_request(&p).unwrap();
+        assert_eq!(req.parent_account, None);
+        assert_eq!(req.fairshare_weight, Some(1.0));
+        assert_eq!(req.allowed_qos, None);
+
+        let p = parse_params(&["name=physics".into(), "parent=science".into()]);
+        let req = build_add_account_request(&p).unwrap();
+        assert_eq!(req.parent_account.as_deref(), Some("science"));
     }
 
     #[test]
