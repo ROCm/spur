@@ -22,7 +22,10 @@ use spur_sched::partition_cap::{
 };
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 
-use crate::cluster::{ClassifiedPass, ClusterManager, JobEndFacts, JobFilter, LimitAdmission};
+use crate::cluster::{
+    ClassifiedPass, ClusterManager, JobEndFacts, JobFilter, LimitAdmission,
+    LAUNCH_FAILURE_HELD_DESC,
+};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::victim_order::{victim_facts, RankKey, VictimOrder};
@@ -3427,10 +3430,19 @@ fn settle_prolog_failures(
         if let Err(e) = cluster.cancel_job_as_system(job_id) {
             error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
         }
-    } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
+        return true;
+    }
+    let reason = launch_failure_held_reason(detail);
+    if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&reason), run_attempt) {
         error!(job_id, error = %e, "failed to hold job after prolog failure");
     }
     true
+}
+
+/// Slurm's fixed reason first, so clients can match a launch-failure hold
+/// without parsing the dispatch detail that follows it.
+fn launch_failure_held_reason(detail: &str) -> String {
+    format!("{LAUNCH_FAILURE_HELD_DESC}: {detail}")
 }
 
 /// Register a srun-only allocation on every assigned node.
@@ -9685,11 +9697,11 @@ pub(crate) mod tests {
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "launch failed requeued held: dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
             );
             assert_eq!(
                 job.state_reason(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "launch failed requeued held: dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
@@ -9832,6 +9844,37 @@ pub(crate) mod tests {
                 job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
                 "nohold_on_prolog_fail retries with a backoff, not an unconditional immediate retry"
             );
+            assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_requeueable_job_is_held_like_any_other() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            assert!(cm.config().controller.hold_on_prolog_fail);
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("prolog-requeue", 1);
+            spec.requeue = true;
+            let job_id = submit_and_wait(&cm, spec);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::Held);
+            assert_eq!(job.priority, 0, "--requeue must not skip the hold");
+            assert!(job
+                .state_reason()
+                .starts_with("launch failed requeued held: "));
+            assert_eq!(job.requeue_count, 0);
             assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
         }
 
