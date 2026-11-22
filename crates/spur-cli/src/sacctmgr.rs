@@ -80,7 +80,10 @@ Fields (key=value), by entity:
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
             gracetime, idlefillpreemptable, usagefactor, maxjobsperuser, maxwall,
             maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit,
-            maxtresperuser, grptres, grpwall, flags";
+            maxtresperuser, grptres, grpwall, flags
+
+qos=a,b sets the allow-list. qos+=a adds a name and qos-=a removes one,
+keeping whatever was inherited.";
 
 /// `key=value` fields `modify` accepts. Same as `add` plus the clearing
 /// operations that only make sense against an existing record:
@@ -457,16 +460,6 @@ fn build_add_user_request(
         .unwrap_or_else(|| "none".into());
     let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
     let allowed_qos = qos_assignment(p)?.unwrap_or_default();
-    if assignment_is_exact(&allowed_qos)
-        && !default_qos.is_empty()
-        && !allowed_qos.is_empty()
-        && !allowed_qos
-            .split(',')
-            .map(str::trim)
-            .any(|q| q == default_qos)
-    {
-        bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
-    }
     // An unset numeric limit sends INFINITE (clear/no-limit) on `add`; a literal
     // 0 would mean "block all" under the sentinel semantics.
     let no_limit = spur_core::accounting::INFINITE;
@@ -858,15 +851,6 @@ fn push_qos_ops(parts: &mut Vec<String>, list: &str, op: char) -> Result<()> {
     Ok(())
 }
 
-/// A `qos+=` / `qos-=` value is not the whole list, so it cannot be checked
-/// against defaultqos here. An exact `qos=` list can.
-fn assignment_is_exact(list: &str) -> bool {
-    !list
-        .split(',')
-        .map(str::trim)
-        .any(|token| token.starts_with('+') || token.starts_with('-'))
-}
-
 /// Build a partial-patch `CreateAccountRequest` for `modify account`: a field
 /// is `Some` only when the command restated it (so the server leaves every
 /// other column untouched), and an explicitly empty value clears it.
@@ -1084,15 +1068,6 @@ fn build_modify_user_request(
     let account = resolve_user_account(p)?;
     let default_qos = p.get("defaultqos").cloned();
     let allowed_qos = qos_assignment(p)?;
-    if let (Some(dq), Some(list)) = (default_qos.as_deref(), allowed_qos.as_deref()) {
-        if assignment_is_exact(list)
-            && !dq.is_empty()
-            && !list.is_empty()
-            && !list.split(',').map(str::trim).any(|q| q == dq)
-        {
-            bail!("defaultqos={dq} must be included in qos={list}");
-        }
-    }
     Ok(AddUserRequest {
         user,
         is_default: p.get("defaultaccount").map(|da| da == &account),
@@ -2131,21 +2106,21 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_rejects_default_qos_outside_allow_list() {
+    fn build_add_user_request_leaves_default_qos_access_to_the_controller() {
+        // Only the controller sees the inherited list, so it alone decides
+        // whether the default is usable.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
             "qos=highprio,lowprio".into(),
             "defaultqos=other-teams-qos".into(),
         ]);
-        let err = build_add_user_request(&p).unwrap_err();
-        assert!(err.to_string().contains("must be included in qos="));
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.default_qos, "other-teams-qos");
     }
 
     #[test]
     fn build_add_user_request_allows_defaultqos_alone_without_a_list() {
-        // Pinning only a default (no qos= list) is still valid — it's
-        // single-QOS scoping, not a validation error.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
@@ -3073,17 +3048,6 @@ mod tests {
         let p = parse_params(&["name=alice".into(), "account=physics".into(), "qos=".into()]);
         let req = build_modify_user_request(&p).unwrap();
         assert_eq!(req.allowed_qos, Some(String::new()));
-    }
-
-    #[test]
-    fn build_modify_user_request_rejects_default_outside_restated_list() {
-        let p = parse_params(&[
-            "name=alice".into(),
-            "account=physics".into(),
-            "qos=a,b".into(),
-            "defaultqos=c".into(),
-        ]);
-        assert!(build_modify_user_request(&p).is_err());
     }
 
     #[test]
