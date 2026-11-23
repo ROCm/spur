@@ -10,12 +10,21 @@ against fake nodes.
 
 import hashlib
 import importlib.util
+import logging
 from pathlib import Path
 
 import pytest
 
 import cluster as cluster_module
-from cluster import NodeNetworkError, SshConnectionLost, _assert_node_network, assert_nodes_network
+from cluster import (
+    K0sResetError,
+    NodeNetworkError,
+    SshConnectionLost,
+    _assert_node_network,
+    assert_nodes_network,
+    reset_k0s_all_nodes,
+    reset_k0s_and_assert_network,
+)
 
 pytest_plugins = ["pytester"]
 
@@ -183,11 +192,17 @@ def test_ini_registers_k0s_and_quarantine_markers():
     assert "quarantine:" in ini
 
 
+@pytest.fixture(autouse=True)
+def fresh_loopback_warning(monkeypatch):
+    monkeypatch.setattr(cluster_module, "_loopback_warned", set())
+
+
 class NetFakeNode:
     """Answers the driver-address lookup and the route check with canned results."""
 
     def __init__(self, host, ssh_client=f"{DRIVER_IP} 51234 22", route_exit=0, route_out=None,
-                 reconnect_error=None, run_error=None):
+                 reconnect_error=None, run_error=None, ssh_client_exit=0, reset_error=None,
+                 leftover="CLEAN"):
         self.host = host
         self.address = host
         self.ssh_client = ssh_client
@@ -195,6 +210,10 @@ class NetFakeNode:
         self.route_out = f"{DRIVER_IP} dev eth0 src 10.0.0.2\nok\n" if route_out is None else route_out
         self.reconnect_error = reconnect_error
         self.run_error = run_error
+        self.ssh_client_exit = ssh_client_exit
+        self.reset_error = reset_error
+        self.leftover = leftover
+        self.reset_commands = []
         self.commands = []
         self.timeouts = []
         self.events = []
@@ -214,8 +233,15 @@ class NetFakeNode:
         if self.run_error is not None:
             raise self.run_error
         if "SSH_CLIENT" in cmd:
-            return 0, self.ssh_client + "\n"
+            return self.ssh_client_exit, self.ssh_client + "\n"
         return self.route_exit, self.route_out
+
+    def exec_allow_fail(self, cmd, timeout=600):
+        self.events.append("reset")
+        self.reset_commands.append(cmd)
+        if self.reset_error is not None:
+            raise self.reset_error
+        return self.leftover if "DIRTY" in cmd else ""
 
 
 def test_assert_node_network_runs_route_get_and_echo_on_a_short_timeout():
@@ -286,7 +312,7 @@ def diagnostics_spy(monkeypatch):
     return calls
 
 
-def test_assert_nodes_network_fails_naming_the_broken_node_with_peer_diagnostics(diagnostics_spy):
+def test_assert_nodes_network_fails_naming_the_broken_node_with_every_node_diagnostics(diagnostics_spy):
     broken = NetFakeNode("node-a", route_exit=2, route_out="RTNETLINK answers: Network is unreachable\n")
     nodes = [broken, NetFakeNode("node-b"), NetFakeNode("node-c")]
 
@@ -295,10 +321,10 @@ def test_assert_nodes_network_fails_naming_the_broken_node_with_peer_diagnostics
 
     message = str(info.value)
     assert "node-a" in message and "Network is unreachable" in message
-    assert "state of node-b" in message and "state of node-c" in message
+    assert "state of node-a" in message and "state of node-b" in message and "state of node-c" in message
     [(diag_nodes, diag_names, log_dir, kwargs)] = diagnostics_spy
-    assert [n.host for n in diag_nodes] == ["node-b", "node-c"]
-    assert diag_names == ["spur-b", "spur-c"]
+    assert [n.host for n in diag_nodes] == ["node-a", "node-b", "node-c"]
+    assert diag_names == ["spur-a", "spur-b", "spur-c"]
     assert log_dir is None
     assert kwargs["k0s"] is True
     assert isinstance(kwargs["budget"], cluster_module.DiagnosticsBudget)
@@ -317,4 +343,158 @@ def test_assert_nodes_network_reports_every_broken_node(diagnostics_spy):
     message = str(info.value)
     assert "node-a" in message and "node-c" in message
     [(diag_nodes, _, _, _)] = diagnostics_spy
-    assert [n.host for n in diag_nodes] == ["node-b"]
+    assert [n.host for n in diag_nodes] == ["node-a", "node-b", "node-c"]
+
+
+@pytest.mark.parametrize("error", [OSError("Socket is closed"), EOFError(), SshConnectionLost("gone")])
+def test_assert_nodes_network_keeps_checking_after_an_ssh_error(diagnostics_spy, error):
+    nodes = [NetFakeNode("node-a", run_error=error), NetFakeNode("node-b", route_exit=1, route_out="boom\n")]
+
+    with pytest.raises(pytest.fail.Exception) as info:
+        assert_nodes_network(nodes, ["a", "b"])
+
+    message = str(info.value)
+    assert "node-a" in message and "node-b" in message
+
+
+def test_a_timeout_reading_ssh_client_is_reported_as_a_timeout():
+    node = NetFakeNode("node-a", ssh_client_exit=-1, ssh_client="")
+
+    with pytest.raises(pytest.fail.Exception) as info:
+        assert_nodes_network([node], ["a"])
+
+    assert "timed out after 20s reading SSH_CLIENT" in str(info.value)
+    assert "cannot determine" not in str(info.value)
+
+
+def test_a_loopback_driver_address_warns_once(caplog):
+    nodes = [NetFakeNode("node-a", ssh_client="127.0.0.1 5000 22"),
+             NetFakeNode("node-b", ssh_client="127.0.0.1 5001 22")]
+
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        assert_nodes_network(nodes, ["a", "b"])
+
+    warnings = [r for r in caplog.records if "loopback" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "node-a" in warnings[0].getMessage()
+
+
+def test_a_routable_driver_address_does_not_warn(caplog):
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        assert_nodes_network([NetFakeNode("node-a")], ["a"])
+
+    assert not [r for r in caplog.records if "loopback" in r.getMessage()]
+
+
+def test_reset_runs_the_k0s_commands_on_every_node_and_checks_leftovers():
+    nodes = [NetFakeNode("node-a"), NetFakeNode("node-b")]
+
+    reset_k0s_all_nodes(nodes, "sudo ")
+
+    for node in nodes:
+        assert "sudo k0s reset" in " ".join(node.reset_commands)
+        assert "sudo rm -rf /etc/k0s /var/lib/k0s /run/k0s" in " ".join(node.reset_commands)
+        assert "/var/lib/k0s && echo DIRTY" in node.reset_commands[-1]
+
+
+def test_reset_warns_about_leftover_state(caplog):
+    node = NetFakeNode("node-a", leftover="DIRTY")
+
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        reset_k0s_all_nodes([node], "")
+
+    assert any("node-a" in r.getMessage() and "/var/lib/k0s" in r.getMessage() for r in caplog.records)
+
+
+def test_a_session_loss_on_one_node_still_resets_the_later_nodes():
+    nodes = [NetFakeNode("node-a"), NetFakeNode("node-b", reset_error=SshConnectionLost("node-b dropped")),
+             NetFakeNode("node-c")]
+
+    with pytest.raises(K0sResetError, match="node-b.*SshConnectionLost.*node-b dropped"):
+        reset_k0s_all_nodes(nodes, "sudo ")
+
+    assert nodes[0].reset_commands and nodes[2].reset_commands
+    assert "sudo k0s reset 2>/dev/null || true" in nodes[2].reset_commands
+
+
+def test_raw_ssh_errors_are_isolated_too_and_all_failures_are_named():
+    nodes = [NetFakeNode("node-a", reset_error=OSError("Socket is closed")),
+             NetFakeNode("node-b", reset_error=EOFError("eof")),
+             NetFakeNode("node-c")]
+
+    with pytest.raises(K0sResetError) as info:
+        reset_k0s_all_nodes(nodes, "")
+
+    assert "2 node(s)" in str(info.value)
+    assert "node-a" in str(info.value) and "node-b" in str(info.value)
+    assert nodes[2].reset_commands
+
+
+def test_a_non_ssh_error_is_not_swallowed_by_the_isolation():
+    nodes = [NetFakeNode("node-a", reset_error=ValueError("bug")), NetFakeNode("node-b")]
+
+    with pytest.raises(ValueError):
+        reset_k0s_all_nodes(nodes, "")
+
+
+def test_teardown_tail_passes_when_reset_and_network_are_fine():
+    nodes = [NetFakeNode("node-a"), NetFakeNode("node-b")]
+    ran = []
+
+    reset_k0s_and_assert_network(nodes, ["a", "b"], "", after_reset=lambda: ran.append("mesh"))
+
+    assert ran == ["mesh"]
+
+
+def test_teardown_tail_reports_the_reset_error_when_the_network_is_fine():
+    nodes = [NetFakeNode("node-a", reset_error=SshConnectionLost("node-a dropped")), NetFakeNode("node-b")]
+
+    with pytest.raises(K0sResetError, match="node-a dropped"):
+        reset_k0s_and_assert_network(nodes, ["a", "b"], "")
+
+
+def test_teardown_tail_runs_the_after_reset_step_even_when_the_reset_failed():
+    nodes = [NetFakeNode("node-a", reset_error=SshConnectionLost("node-a dropped")), NetFakeNode("node-b")]
+    ran = []
+
+    with pytest.raises(K0sResetError):
+        reset_k0s_and_assert_network(nodes, ["a", "b"], "", after_reset=lambda: ran.append("mesh"))
+
+    assert ran == ["mesh"]
+    assert nodes[1].reset_commands
+
+
+def test_teardown_tail_orders_reset_then_after_reset_then_network_check():
+    node = NetFakeNode("node-a")
+    seen = []
+
+    reset_k0s_and_assert_network([node], ["a"], "", after_reset=lambda: seen.append(list(node.events)))
+
+    assert seen == [["reset"] * 5]
+    assert node.events[5:] == ["exec", "ensure_connected", "exec"]
+
+
+def test_teardown_tail_keeps_the_reset_error_text_in_a_combined_failure(diagnostics_spy):
+    nodes = [NetFakeNode("node-a", reset_error=SshConnectionLost("node-a dropped"),
+                         route_exit=2, route_out="Network is unreachable\n"),
+             NetFakeNode("node-b")]
+
+    with pytest.raises(pytest.fail.Exception) as info:
+        reset_k0s_and_assert_network(nodes, ["a", "b"], "")
+
+    message = str(info.value)
+    assert "k0s reset failed on 1 node(s)" in message and "node-a dropped" in message
+    assert "node network broken after k0s teardown" in message and "Network is unreachable" in message
+
+
+def test_teardown_tail_keeps_an_after_reset_error_too(diagnostics_spy):
+    def boom():
+        raise RuntimeError("mesh teardown exploded")
+
+    nodes = [NetFakeNode("node-a", route_exit=2, route_out="down\n")]
+
+    with pytest.raises(pytest.fail.Exception, match="mesh teardown exploded"):
+        reset_k0s_and_assert_network(nodes, ["a"], "", after_reset=boom)
+
+    with pytest.raises(RuntimeError, match="mesh teardown exploded"):
+        reset_k0s_and_assert_network([NetFakeNode("node-a")], ["a"], "", after_reset=boom)

@@ -9,6 +9,7 @@ and CLI wrappers for interacting with the running cluster.
 """
 
 import contextlib
+import ipaddress
 import os
 import re
 import shlex
@@ -263,13 +264,69 @@ class NodeNetworkError(RuntimeError):
     """A node is reachable over SSH but fails its network sanity check."""
 
 
+class K0sResetError(RuntimeError):
+    """k0s could not be reset on one or more nodes because their SSH session failed."""
+
+
+_loopback_warned: set[str] = set()
+
+
+def _describe(err: BaseException) -> str:
+    return f"{type(err).__name__}: {err}"
+
+
+def _reset_k0s_node(node: "SshNode", sudo: str) -> None:
+    node.exec_allow_fail(f"{sudo}systemctl stop k0scontroller k0sworker 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}k0s stop 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}k0s reset 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}rm -rf /etc/k0s /var/lib/k0s /run/k0s 2>/dev/null || true")
+    # The reset commands above end in `|| true`, so a silent failure would only
+    # surface as a baffling failure in the next test that inherits the leftovers.
+    leftover = node.exec_allow_fail("test -e /var/lib/k0s && echo DIRTY || echo CLEAN")
+    if "DIRTY" in leftover:
+        logger.warning(
+            "k0s reset left /var/lib/k0s behind on %s; the next k0s test may inherit "
+            "dirty state (stale etcd membership / API refusals)", node.host)
+
+
+def reset_k0s_all_nodes(nodes: list["SshNode"], sudo: str) -> None:
+    """Forcibly reset k0s on every node, independent of the controller.
+
+    A node whose session fails is skipped and the rest are still reset, so one
+    dropped connection cannot leave dirty k0s state on the later nodes. Raises
+    K0sResetError at the end naming every node that failed.
+    """
+    failures = {}
+    for node in nodes:
+        try:
+            _reset_k0s_node(node, sudo)
+        except _NODE_SSH_ERRORS as err:
+            logger.warning("k0s reset on %s failed: %s", node.host, err)
+            failures[node.host] = err
+    if failures:
+        detail = "; ".join(f"{host}: {_describe(err)}" for host, err in failures.items())
+        raise K0sResetError(f"k0s reset failed on {len(failures)} node(s): {detail}")
+
+
 def _node_driver_ip(node: "SshNode") -> str:
     # Read on the node, so it is the address the node itself sees for this driver,
     # also when SSH goes through a tunnel or NAT.
     code, out = node.exec_with_exit("echo $SSH_CLIENT", timeout=NETWORK_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeNetworkError(
+            f"{node.host}: timed out after {NETWORK_CHECK_TIMEOUT_S}s reading SSH_CLIENT")
     fields = out.split()
     if code != 0 or not fields:
         raise NodeNetworkError(f"{node.host}: cannot determine the driver address from SSH_CLIENT: {out.strip()!r}")
+    try:
+        loopback = ipaddress.ip_address(fields[0]).is_loopback
+    except ValueError:
+        raise NodeNetworkError(f"{node.host}: SSH_CLIENT does not start with an address: {out.strip()!r}") from None
+    if loopback and not _loopback_warned:
+        _loopback_warned.add(node.host)
+        logger.warning(
+            "%s sees the driver as %s (loopback): the route check proves little on this bed",
+            node.host, fields[0])
     return fields[0]
 
 
@@ -285,26 +342,55 @@ def _assert_node_network(node: "SshNode", driver_ip: str) -> None:
         raise NodeNetworkError(f"{node.host}: no route to the driver {driver_ip} (exit {code}): {out.strip()}")
 
 
-def assert_nodes_network(nodes: list["SshNode"], names: list[str]) -> None:
-    """Fail the calling fixture teardown when any node lost its network, naming the
-    node and attaching bounded diagnostics from the nodes that are still healthy.
-    For fixtures whose cleanup (k0s reset) can take a node's network down."""
+def network_failure_report(nodes: list["SshNode"], names: list[str]) -> str | None:
+    """None when every node passes the network check; otherwise one line per broken
+    node plus bounded diagnostics for all nodes (a node with a dead session answers
+    instantly with 'unreachable')."""
     failures = {}
     for node in nodes:
         try:
             _assert_node_network(node, _node_driver_ip(node))
-        except (NodeNetworkError, SshConnectionLost) as err:
+        except _NODE_SSH_ERRORS + (NodeNetworkError,) as err:
             failures[node.host] = err
     if not failures:
-        return
-    healthy = [(node, names[i] if i < len(names) else node.host)
-               for i, node in enumerate(nodes) if node.host not in failures]
-    diagnostics = collect_node_diagnostics(
-        [node for node, _ in healthy], [name for _, name in healthy], None, k0s=True,
-        budget=DiagnosticsBudget())
-    lines = [f"node network broken after k0s teardown: {err}" for err in failures.values()]
+        return None
+    diagnostics = collect_node_diagnostics(nodes, names, None, k0s=True, budget=DiagnosticsBudget())
+    lines = [f"node network broken after k0s teardown: {_describe(err)}" for err in failures.values()]
     lines += [f"--- {key} ---\n{text}" for key, text in diagnostics.items()]
-    pytest.fail("\n".join(lines), pytrace=False)
+    return "\n".join(lines)
+
+
+def assert_nodes_network(nodes: list["SshNode"], names: list[str]) -> None:
+    """Fail the calling fixture teardown when any node lost its network, naming the
+    node. For fixtures whose cleanup (k0s reset) can take a node's network down."""
+    report = network_failure_report(nodes, names)
+    if report is not None:
+        pytest.fail(report, pytrace=False)
+
+
+def reset_k0s_and_assert_network(nodes: list["SshNode"], names: list[str], sudo: str,
+                                 after_reset=None) -> None:
+    """The k0s fixture teardown tail: reset every node, run *after_reset* (e.g. mesh
+    teardown) whatever the reset did, then verify each node's network. Every failure
+    is reported together, so a reset error is never hidden behind a network failure."""
+    errors: list[BaseException] = []
+    try:
+        reset_k0s_all_nodes(nodes, sudo)
+    except K0sResetError as err:
+        errors.append(err)
+    if after_reset is not None:
+        try:
+            after_reset()
+        except Exception as err:  # reported below, after the network check has run
+            errors.append(err)
+    report = network_failure_report(nodes, names)
+    if report is None:
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise RuntimeError("\n".join(_describe(err) for err in errors))
+        return
+    pytest.fail("\n".join([*(_describe(err) for err in errors), report]), pytrace=False)
 
 
 @contextlib.contextmanager
@@ -622,6 +708,10 @@ class SshNode:
         if self._sftp:
             self._sftp.close()
         self.client.close()
+
+
+# Per node, a failed SSH session must not end the loop over the other nodes.
+_NODE_SSH_ERRORS = (SshConnectionLost, paramiko.SSHException, EOFError, OSError)
 
 
 def _upload_binary(nodes: list[SshNode], local_path: Path, bin_dir: str, name: str):

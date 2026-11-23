@@ -31,7 +31,15 @@ from pathlib import Path
 
 import pytest
 
-from cluster import BINARIES, SpurCluster, assert_nodes_network, make_remote_dir, parse_job_id, wait_job
+from cluster import (
+    BINARIES,
+    SpurCluster,
+    make_remote_dir,
+    parse_job_id,
+    reset_k0s_all_nodes,
+    reset_k0s_and_assert_network,
+    wait_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -386,17 +394,7 @@ def _drain_and_restart_agent(c: SpurCluster, node_index: int) -> None:
 
 
 def _reset_k0s_all_nodes(c: SpurCluster) -> None:
-    """Forcibly reset k0s on every node (matches conftest._reset_k0s_all_nodes)."""
-    sudo = c._sudo_prefix()
-    for node in c.nodes:
-        node.exec_allow_fail(
-            f"{sudo}systemctl stop k0scontroller k0sworker 2>/dev/null || true"
-        )
-        node.exec_allow_fail(f"{sudo}k0s stop 2>/dev/null || true")
-        node.exec_allow_fail(f"{sudo}k0s reset 2>/dev/null || true")
-        node.exec_allow_fail(
-            f"{sudo}rm -rf /etc/k0s /var/lib/k0s /run/k0s 2>/dev/null || true"
-        )
+    reset_k0s_all_nodes(c.nodes, c._sudo_prefix())
 
 
 # --- fixture ----------------------------------------------------------------
@@ -439,10 +437,7 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
-    try:
-        _reset_k0s_all_nodes(c)
-    finally:
-        assert_nodes_network(c.nodes, c.node_names)
+    reset_k0s_and_assert_network(c.nodes, c.node_names, c._sudo_prefix())
 
 
 # --- tests ------------------------------------------------------------------
