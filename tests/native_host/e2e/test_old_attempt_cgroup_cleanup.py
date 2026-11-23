@@ -37,7 +37,9 @@ def attempt_cleanup_image(ssh_nodes, remote_bin_dir):
         base = shlex.quote(os.environ.get("SPUR_TEST_CGROUP_BASE_IMAGE", "ubuntu:22.04"))
         code, _ = node.exec_with_exit(
             f"docker build --build-arg BASE_IMAGE={base} -t {image} {directory} "
-            f"> {directory}/build.log 2>&1"
+            f"> {directory}/build.log 2>&1",
+            # apt-get and pip install from the network on a cold image cache.
+            timeout=1800,
         )
         assert code == 0, node.read_file(f"{directory}/build.log")
         yield node, image, token, directory

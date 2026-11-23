@@ -123,7 +123,8 @@ class TestForwardedSubmitStress:
 
         # A generous ceiling: the jobs are instant, but they queue on a small
         # cluster and each killed client's job may still run to completion.
-        out = cluster.nodes[0].exec(f"timeout 600 bash -c {_sh_quote(orchestrator)}")
+        # The SSH deadline trails the remote one so `timeout`'s own exit wins.
+        out = cluster.nodes[0].exec(f"timeout 600 bash -c {_sh_quote(orchestrator)}", timeout=660)
 
         killed = {int(line.split("idx=")[1]) for line in out.splitlines() if line.startswith("KILLED")}
         results = {}

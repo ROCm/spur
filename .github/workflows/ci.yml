@@ -124,6 +124,9 @@ jobs:
       - name: Lint pytest e2e suite
         run: flake8 --config tests/.flake8 tests/
 
+      - name: Harness unit tests
+        run: pytest tests/harness -q
+
   build:
     runs-on: ubuntu-latest
     steps:

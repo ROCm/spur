@@ -13,7 +13,9 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess  # nosec B404
+import threading
 import time
 import logging
 from pathlib import Path
@@ -65,6 +67,10 @@ POSTGRES_IMAGES = tuple(
 )
 IMAGE_PULL_ATTEMPTS = 2
 IMAGE_PULL_BACKOFF_SECS = 5
+# Above SshNode.DEFAULT_TIMEOUT_S: these pull from registries or compile on
+# shared CI VMs, where a slow mirror or a loaded host stretches them.
+IMAGE_IMPORT_TIMEOUT_S = 1200
+FIXTURE_BUILD_TIMEOUT_S = 900
 
 
 def log_tail_is_leader(log: str) -> bool:
@@ -224,19 +230,41 @@ def isolate_controller(cluster: "SpurCluster", node_index: int):
             controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
+class SshConnectionLost(RuntimeError):
+    """The SSH session to a node died and could not be safely re-established."""
+
+
 class SshNode:
-    """SSH connection to a single test node."""
+    """SSH connection to a single test node.
+
+    A session found dead before a command is sent is reconnected transparently.
+    One that dies after the command was sent raises SshConnectionLost instead:
+    re-running a non-idempotent command is worse than failing the test."""
+
+    DEFAULT_TIMEOUT_S = 600
+    CONNECT_TIMEOUT_S = 15
+    HANDSHAKE_TIMEOUT_S = 30
+    KEEPALIVE_S = 15
+    CHANNEL_OPEN_TIMEOUT_S = 30
+    RECONNECT_BACKOFF_S = (1, 2, 4)
+    # Caps each blocking read so stderr is drained and the deadline checked
+    # while a command is quiet on stdout.
+    _POLL_S = 1.0
+    _CHUNK_BYTES = 32768
+    _CONNECTION_ERRORS = (paramiko.SSHException, EOFError, OSError)
+
+    _sleep = staticmethod(time.sleep)
+    _clock = staticmethod(time.monotonic)
 
     def __init__(self, host: str, user: str, password: str | None = None,
-                 key_path: str | None = None, port: int = 22, address: str | None = None):
+                 key_path: str | None = None, port: int = 22, address: str | None = None,
+                 client_factory=paramiko.SSHClient):
         self.host = host
         # Where other nodes/daemons reach this node, e.g. the underlay IP
         # behind an SSH tunnel's `localhost`. Defaults to `host`.
         self.address = address or host
         self.user = user
-        self.client = paramiko.SSHClient()
-        # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
+        self._client_factory = client_factory
 
         connect_kwargs = {"hostname": host, "port": port, "username": user}
         if key_path:
@@ -245,38 +273,144 @@ class SshNode:
             connect_kwargs["password"] = password
         else:
             connect_kwargs["allow_agent"] = True
+        self._connect_kwargs = connect_kwargs
 
-        self.client.connect(**connect_kwargs)
+        self._lock = threading.Lock()
         self._sftp = None
+        self.client = self._connect()
+
+    def _connect(self) -> paramiko.SSHClient:
+        client = self._client_factory()
+        # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
+        try:
+            client.connect(
+                **self._connect_kwargs,
+                timeout=self.CONNECT_TIMEOUT_S,
+                banner_timeout=self.HANDSHAKE_TIMEOUT_S,
+                auth_timeout=self.HANDSHAKE_TIMEOUT_S,
+            )
+        except BaseException:
+            client.close()
+            raise
+        # Without keepalives an idle session through NAT or a flapping link
+        # dies silently and is only noticed by the next command.
+        client.get_transport().set_keepalive(self.KEEPALIVE_S)
+        return client
+
+    def is_alive(self) -> bool:
+        """Whether the SSH transport is up. Cheap; does not probe the node."""
+        transport = self.client.get_transport()
+        return transport is not None and transport.is_active()
+
+    def ensure_connected(self) -> None:
+        """Reconnect if the session is dead. Raises SshConnectionLost when every
+        attempt fails. Concurrent callers share a single reconnect."""
+        with self._lock:
+            if self.is_alive():
+                return
+            self._reconnect()
+
+    def _reconnect(self):
+        logger.warning("SSH session to %s is not active; reconnecting", self.host)
+        attempts = len(self.RECONNECT_BACKOFF_S)
+        last_error = None
+        for attempt, delay in enumerate(self.RECONNECT_BACKOFF_S, start=1):
+            self._sleep(delay)
+            try:
+                client = self._connect()
+            except self._CONNECTION_ERRORS as err:
+                last_error = err
+                logger.warning("Reconnect to %s failed (attempt %d/%d): %s",
+                               self.host, attempt, attempts, err)
+                continue
+            stale, self.client = self.client, client
+            self._sftp = None
+            stale.close()
+            return
+        raise SshConnectionLost(
+            f"SSH session to {self.host} lost and {attempts} reconnect attempts failed: {last_error}"
+        ) from last_error
+
+    def _lost(self, cmd: str) -> SshConnectionLost:
+        return SshConnectionLost(f"SSH session to {self.host} dropped while running: {cmd}")
 
     @property
     def sftp(self) -> paramiko.SFTPClient:
+        self.ensure_connected()
         if self._sftp is None:
             self._sftp = self.client.open_sftp()
         return self._sftp
 
-    def _run(self, cmd: str, timeout: int | None = None) -> tuple[int, str, str]:
+    def _open_channel(self) -> paramiko.Channel:
+        """Open a session channel, reconnecting if the transport is dead. Nothing
+        has been sent yet, so reconnecting here cannot repeat a command."""
+        self.ensure_connected()
+        try:
+            return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
+        except self._CONNECTION_ERRORS:
+            if self.is_alive():
+                raise
+        self.ensure_connected()
+        return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
+
+    def _run(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> tuple[int, str, str]:
         """Run a command via SSH. Returns (exit_code, stdout, stderr). The one
         place that drives the channel; higher-level helpers shape the result.
 
-        With *timeout* (seconds), the channel is closed at the deadline and the
-        exit code is -1, with whatever output arrived until then."""
-        # Running shell commands on the disposable test VMs is the harness's job;
-        # inputs come from harness constants and test fixtures.
-        _, stdout, stderr = self.client.exec_command(cmd)  # nosec B601
-        if timeout is not None:
-            deadline = time.time() + timeout
-            while not stdout.channel.exit_status_ready():
-                if time.time() > deadline:
-                    stdout.channel.close()
-                    return -1, stdout.read().decode(), stderr.read().decode()
-                time.sleep(1)
-        exit_code = stdout.channel.recv_exit_status()
-        return exit_code, stdout.read().decode(), stderr.read().decode()
+        At the *timeout* deadline (seconds) the channel is closed and the exit
+        code is -1, with whatever output arrived until then. ``None`` waits
+        forever, so pass it only for commands that cannot hang.
 
-    def exec(self, cmd: str, check: bool = True) -> str:
+        Raises SshConnectionLost if the session dies after the command was sent."""
+        channel = self._open_channel()
+        try:
+            try:
+                # Running shell commands on the disposable test VMs is the harness's job;
+                # inputs come from harness constants and test fixtures.
+                channel.exec_command(cmd)  # nosec B601
+            except self._CONNECTION_ERRORS as err:
+                if self.is_alive():
+                    raise
+                raise self._lost(cmd) from err
+            return self._collect(channel, cmd, timeout)
+        finally:
+            channel.close()
+
+    def _collect(self, channel: paramiko.Channel, cmd: str,
+                 timeout: int | None) -> tuple[int, str, str]:
+        deadline = None if timeout is None else self._clock() + timeout
+        out, err = bytearray(), bytearray()
+        while True:
+            self._drain(channel.recv_stderr_ready, channel.recv_stderr, err)
+            wait = self._POLL_S
+            if deadline is not None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    self._drain(channel.recv_ready, channel.recv, out)
+                    return -1, out.decode(), err.decode()
+                wait = min(wait, remaining)
+            channel.settimeout(wait)
+            try:
+                chunk = channel.recv(self._CHUNK_BYTES)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            out += chunk
+        self._drain(channel.recv_stderr_ready, channel.recv_stderr, err)
+        exit_code = channel.recv_exit_status()
+        if exit_code == -1 and not self.is_alive():
+            raise self._lost(cmd)
+        return exit_code, out.decode(), err.decode()
+
+    def _drain(self, ready, recv, buf: bytearray):
+        while ready():
+            buf += recv(self._CHUNK_BYTES)
+
+    def exec(self, cmd: str, check: bool = True, timeout: int | None = DEFAULT_TIMEOUT_S) -> str:
         """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
-        exit_code, out, err = self._run(cmd)
+        exit_code, out, err = self._run(cmd, timeout=timeout)
         if check and exit_code != 0:
             raise RuntimeError(
                 f"Command failed on {self.host} (exit {exit_code}): {cmd}\n"
@@ -284,12 +418,12 @@ class SshNode:
             )
         return out
 
-    def exec_allow_fail(self, cmd: str) -> str:
+    def exec_allow_fail(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> str:
         """Run a command, returning stdout+stderr regardless of exit code."""
-        _, out, err = self._run(cmd)
+        _, out, err = self._run(cmd, timeout=timeout)
         return out + err
 
-    def exec_with_exit(self, cmd: str, timeout: int | None = None) -> tuple[int, str]:
+    def exec_with_exit(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         """Run a command, returning (exit_code, combined stdout+stderr)."""
         exit_code, out, err = self._run(cmd, timeout=timeout)
         return exit_code, out + err
@@ -682,7 +816,7 @@ class SpurCluster:
         return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
 
     def srun_with_exit(
-        self, args: list[str], *, timeout: int | None = None
+        self, args: list[str], *, timeout: int | None = SshNode.DEFAULT_TIMEOUT_S
     ) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr).
 
@@ -1314,7 +1448,8 @@ class SpurCluster:
         mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
         for node in self.nodes:
             node.exec(
-                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}",
+                timeout=FIXTURE_BUILD_TIMEOUT_S,
             )
             if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
@@ -1366,7 +1501,7 @@ class SpurCluster:
             f"-I{shlex.quote(rocm_include)} -D__HIP_PLATFORM_AMD__ -lrccl"
         )
         for node in self.nodes:
-            node.exec(build)
+            node.exec(build, timeout=FIXTURE_BUILD_TIMEOUT_S)
         return remote_bin
 
     def restart_agent(self, node_index: int = 0):
@@ -1592,7 +1727,8 @@ tar -C "$R" -czf '{local_tar}' .
         image_dir = f"{self.remote_dir}/images/{slug}"
         node.exec(f"mkdir -p '{image_dir}'")
         node.exec(
-            f"SPUR_IMAGE_DIR='{image_dir}' '{self.bin_dir}/spur' image import {shlex.quote(uri)}"
+            f"SPUR_IMAGE_DIR='{image_dir}' '{self.bin_dir}/spur' image import {shlex.quote(uri)}",
+            timeout=IMAGE_IMPORT_TIMEOUT_S,
         )
         images = node.exec(f"ls '{image_dir}'/*.sqsh").split()
         if len(images) != 1:
