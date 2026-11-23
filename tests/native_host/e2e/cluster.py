@@ -38,6 +38,11 @@ AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 CLI_NODE_INDEX = 0
 HEALTH_CHECK_TIMEOUT_S = 20
 DIAGNOSTICS_TIMEOUT_S = 20
+# Just under the SSH-side timeout so a hung journalctl/dmesg is killed on the node
+# instead of lingering after the channel is abandoned.
+DIAGNOSTICS_REMOTE_TIMEOUT_S = 18
+# Wall clock for everything one failing test collects, across all nodes and clusters.
+DIAGNOSTICS_BUDGET_S = 90
 # Hosts already warned about disabled leak detection, so it logs once per session.
 _leak_check_warned: set[str] = set()
 # HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
@@ -686,45 +691,73 @@ def _diagnostics_script(log_dir: str | None, max_lines: int, k0s: bool) -> str:
     )
 
 
-def _node_diagnostics(node: "SshNode", script: str) -> str:
+class DiagnosticsBudget:
+    """Wall-clock allowance shared by every collection one failing test triggers."""
+
+    def __init__(self, seconds: float = DIAGNOSTICS_BUDGET_S, clock=time.monotonic):
+        self._clock = clock
+        self._deadline = clock() + seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self._deadline - self._clock())
+
+    def exhausted(self) -> bool:
+        return self.remaining() <= 0
+
+
+def _remote_diagnostics_command(script: str) -> str:
+    return f"timeout {DIAGNOSTICS_REMOTE_TIMEOUT_S} sh -c {shlex.quote(script)}"
+
+
+def _node_diagnostics(node: "SshNode", script: str, budget: DiagnosticsBudget) -> str:
     # Runs while a test is already failing, so it must report any trouble as text.
+    if budget.exhausted():
+        return f"{node.host}: skipped (diagnostics budget exhausted)"
+    # Reconnecting is node_health_guard's job; doing it here would stall every failure.
+    if not node.is_alive():
+        return f"{node.host}: unreachable (session down)"
+    timeout = min(DIAGNOSTICS_TIMEOUT_S, budget.remaining())
     try:
-        code, out = node.exec_with_exit(script, timeout=DIAGNOSTICS_TIMEOUT_S)
+        code, out = node.exec_with_exit(_remote_diagnostics_command(script), timeout=timeout)
     except SshConnectionLost as err:
         return f"{node.host}: unreachable ({err})"
     except Exception as err:
         return f"{node.host}: diagnostics failed ({type(err).__name__}: {err})"
     if code == -1:
-        return f"{out}\n{node.host}: timed out after {DIAGNOSTICS_TIMEOUT_S}s"
+        return f"{out}\n{node.host}: timed out after {timeout:g}s"
     return out
 
 
 def collect_node_diagnostics(nodes: list["SshNode"], names: list[str], log_dir: str | None,
-                             max_lines: int = 200, k0s: bool = False) -> dict[str, str]:
+                             max_lines: int = 200, k0s: bool = False,
+                             budget: DiagnosticsBudget | None = None) -> dict[str, str]:
     """Per node, keyed ``"<name> (<host>)"``: log tails (when *log_dir* is given),
     network, kernel and ssh state, plus k0s state when *k0s*. A node that cannot
-    be reached or is slow is reported in its entry; this never raises."""
+    be reached, is slow, or comes after *budget* ran out is reported in its
+    entry; this never raises."""
+    budget = budget or DiagnosticsBudget()
     script = _diagnostics_script(log_dir, max_lines, k0s)
     result = {}
     for i, node in enumerate(nodes):
         name = names[i] if i < len(names) else node.host
-        result[f"{name} ({node.host})"] = _node_diagnostics(node, script)
+        result[f"{name} ({node.host})"] = _node_diagnostics(node, script, budget)
     return result
 
 
 def failure_diagnostic_sections(when: str, failed: bool, fixturenames, clusters: list["SpurCluster"],
-                                ssh_nodes: list["SshNode"] | None,
-                                max_lines: int = 200) -> list[tuple[str, str]]:
+                                ssh_nodes: list["SshNode"] | None, max_lines: int = 200,
+                                budget: DiagnosticsBudget | None = None) -> list[tuple[str, str]]:
     """Report sections for a test phase. Only a failed setup or call gets any;
     skips, xfails and teardown failures stay quiet. Without a live cluster, falls
     back to node-level state from *ssh_nodes* when the test used them."""
     if not failed or when not in ("setup", "call"):
         return []
     k0s = any(name.startswith("k8s_") for name in fixturenames)
+    budget = budget or DiagnosticsBudget()
     if clusters:
-        collected = [c.collect_diagnostics(max_lines, k0s=k0s) for c in clusters]
+        collected = [c.collect_diagnostics(max_lines, k0s=k0s, budget=budget) for c in clusters]
     elif ssh_nodes:
-        collected = [collect_node_diagnostics(ssh_nodes, [], None, max_lines, k0s)]
+        collected = [collect_node_diagnostics(ssh_nodes, [], None, max_lines, k0s, budget)]
     else:
         collected = []
     return [(f"diagnostics: {key}", text) for diagnostics in collected
@@ -1321,10 +1354,12 @@ class SpurCluster:
         wait that timed out. Reports a failed read instead of raising so the
         caller's own error is never replaced."""
         path = f"{self.log_dir}/spurctld.log"
+        if not self.nodes[0].is_alive():
+            return "spurctld.log unavailable (session down)"
         try:
             log = self.nodes[0].exec_allow_fail(f"tail -n {K0S_LOG_SCAN_LINES} '{path}'",
                                                 timeout=DIAGNOSTICS_TIMEOUT_S)
-        except Exception as err:
+        except (SshConnectionLost, *SshNode._CONNECTION_ERRORS) as err:
             return f"spurctld.log unavailable ({type(err).__name__}: {err})"
         lines = filter_k0s_log(log)
         return f"spurctld.log (last {K0S_LOG_LINES} k0s/join-token/raft/leader/stop lines):\n{lines}"
@@ -1470,10 +1505,12 @@ class SpurCluster:
             pid = node.exec(cmd).strip()
             logger.info("spurauthd started on %s (pid %s)", name, pid)
 
-    def collect_diagnostics(self, max_lines: int = 200, *, k0s: bool = False) -> dict[str, str]:
+    def collect_diagnostics(self, max_lines: int = 200, *, k0s: bool = False,
+                            budget: DiagnosticsBudget | None = None) -> dict[str, str]:
         """Log tails and node state from every node, keyed ``"<name> (<host>)"``.
         Never raises, so it is safe from a failure hook or a fixture teardown."""
-        return collect_node_diagnostics(self.nodes, self.node_names, self.log_dir, max_lines, k0s)
+        return collect_node_diagnostics(self.nodes, self.node_names, self.log_dir, max_lines, k0s,
+                                        budget)
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""

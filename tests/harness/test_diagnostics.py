@@ -13,6 +13,7 @@ import pytest
 
 import cluster as cluster_module
 from cluster import (
+    DiagnosticsBudget,
     SpurCluster,
     SshConnectionLost,
     collect_node_diagnostics,
@@ -24,30 +25,57 @@ from cluster import (
 )
 
 
-class FakeDiagNode:
-    """Answers the one diagnostics script with canned output, or fails as told."""
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
 
-    def __init__(self, host, output=None, error=None, exit_code=0):
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float):
+        self.now += seconds
+
+
+class FakeDiagNode:
+    """Answers the one diagnostics script with canned output, or fails as told.
+    A dead node (*alive* False) must never be sent a command or asked to reconnect;
+    *elapse* seconds pass on *clock* for every command it runs."""
+
+    def __init__(self, host, output=None, error=None, exit_code=0, alive=True,
+                 clock=None, elapse=0):
         self.host = host
         self.address = host
+        self.alive = alive
+        self.clock = clock
+        self.elapse = elapse
+        self.connect_attempts = 0
         self.output = f"=== uptime ===\nup on {host}\n" if output is None else output
         self.error = error
         self.exit_code = exit_code
         self.commands = []
         self.timeouts = []
 
-    def exec_with_exit(self, cmd, timeout=600):
+    def is_alive(self):
+        return self.alive
+
+    def ensure_connected(self):
+        self.connect_attempts += 1
+
+    def _run(self, cmd, timeout):
+        assert self.alive, f"command sent to dead node {self.host}: {cmd}"
         self.commands.append(cmd)
         self.timeouts.append(timeout)
+        if self.clock is not None:
+            self.clock.advance(self.elapse)
         if self.error is not None:
             raise self.error
+
+    def exec_with_exit(self, cmd, timeout=600):
+        self._run(cmd, timeout)
         return self.exit_code, self.output
 
     def exec_allow_fail(self, cmd, timeout=600):
-        self.commands.append(cmd)
-        self.timeouts.append(timeout)
-        if self.error is not None:
-            raise self.error
+        self._run(cmd, timeout)
         return self.output
 
 
@@ -87,6 +115,7 @@ def test_collect_script_covers_logs_and_node_state_with_sections_that_cannot_fai
 
     collect_node_diagnostics([node], ["alpha"], "/r/log", max_lines=75)
     script = node.commands[0]
+    inner = cluster_module._diagnostics_script("/r/log", 75, False)
 
     for expected in (
         "tail -n 75 /r/log/spurctld.log",
@@ -99,9 +128,19 @@ def test_collect_script_covers_logs_and_node_state_with_sections_that_cannot_fai
         "uptime",
     ):
         assert expected in script
-    commands = [part for part in script.split("; ") if not part.startswith("echo '===")]
+    commands = [part for part in inner.split("; ") if not part.startswith("echo '===")]
     assert commands
     assert all(part.endswith("|| true") for part in commands)
+
+
+def test_collect_wraps_the_script_in_a_remote_timeout_just_under_the_ssh_one():
+    node = FakeDiagNode("node-a")
+
+    collect_node_diagnostics([node], ["alpha"], "/r/log")
+
+    assert node.commands[0].startswith("timeout 18 sh -c ")
+    assert "ip route" in node.commands[0]
+    assert node.timeouts == [20]
 
 
 def test_collect_script_never_uses_a_sudo_that_can_prompt():
@@ -145,6 +184,64 @@ def test_collect_records_an_unreachable_node_and_still_returns_the_healthy_ones(
     assert "reconnect attempts failed" in result["beta (node-b)"]
     assert "up on node-a" in result["alpha (node-a)"]
     assert "up on node-c" in result["gamma (node-c)"]
+
+
+def test_collect_never_reconnects_or_sends_to_a_node_whose_session_is_down():
+    nodes = [FakeDiagNode("node-a", alive=False), FakeDiagNode("node-b")]
+
+    result = collect_node_diagnostics(nodes, ["alpha", "beta"], "/r/log")
+
+    assert result["alpha (node-a)"] == "node-a: unreachable (session down)"
+    assert nodes[0].connect_attempts == 0
+    assert nodes[0].commands == []
+    assert "up on node-b" in result["beta (node-b)"]
+
+
+def test_collect_skips_remaining_nodes_once_the_budget_is_spent():
+    clock = FakeClock()
+    nodes = [FakeDiagNode(f"node-{i}", clock=clock, elapse=50) for i in range(4)]
+
+    result = collect_node_diagnostics(nodes, [], None, budget=DiagnosticsBudget(90, clock))
+
+    texts = list(result.values())
+    assert "up on node-0" in texts[0] and "up on node-1" in texts[1]
+    assert texts[2] == "node-2: skipped (diagnostics budget exhausted)"
+    assert texts[3] == "node-3: skipped (diagnostics budget exhausted)"
+    assert nodes[2].commands == [] and nodes[3].commands == []
+
+
+def test_collect_caps_a_command_timeout_at_the_remaining_budget():
+    clock = FakeClock()
+    node = FakeDiagNode("node-a", clock=clock)
+
+    collect_node_diagnostics([node], [], None, budget=DiagnosticsBudget(8, clock))
+
+    assert node.timeouts == [8]
+
+
+def test_sections_share_one_budget_across_clusters():
+    clock = FakeClock()
+    first = make_cluster([FakeDiagNode("node-a", clock=clock, elapse=100)])
+    second = make_cluster([FakeDiagNode("node-b", clock=clock, elapse=100)])
+
+    sections = failure_diagnostic_sections(
+        "call", True, ["cluster"], [first, second], None, budget=DiagnosticsBudget(90, clock))
+
+    assert [title for title, _ in sections] == [
+        "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
+    assert "up on node-a" in sections[0][1]
+    assert sections[1][1] == "node-b: skipped (diagnostics budget exhausted)"
+    assert second.nodes[0].commands == []
+
+
+def test_a_fresh_budget_allows_the_full_default_window():
+    clock = FakeClock()
+
+    budget = DiagnosticsBudget(clock=clock)
+
+    assert budget.remaining() == 90
+    clock.advance(90)
+    assert budget.exhausted()
 
 
 def test_collect_notes_a_timeout_and_keeps_the_partial_output():
@@ -390,6 +487,21 @@ def test_wait_k8s_phase_timeout_appends_the_controller_log_after_the_original_me
     assert "spurctld.log" in message
     assert "INFO raft: election won" in message
     assert "INFO heartbeat ok" not in message
+
+
+def test_k0s_log_context_does_not_swallow_programming_errors(monkeypatch):
+    cluster = make_cluster([FakeDiagNode("node-a", error=ValueError("bug"))])
+
+    with pytest.raises(ValueError, match="bug"):
+        cluster.k0s_log_context()
+
+
+def test_k0s_log_context_does_not_reconnect_a_dead_session():
+    node = FakeDiagNode("node-a", alive=False)
+    cluster = make_cluster([node])
+
+    assert "session down" in cluster.k0s_log_context()
+    assert node.connect_attempts == 0 and node.commands == []
 
 
 def test_wait_k8s_phase_timeout_keeps_its_message_when_the_log_cannot_be_read(monkeypatch):
