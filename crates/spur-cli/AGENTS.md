@@ -2,9 +2,10 @@
 
 Single `spur` multi-call binary dispatching on argv[0], so Slurm-named
 symlinks (`sbatch`, `squeue`, ...) and native `spur <command>` share one parser
-and one gRPC path. The symlink/alias mapping, `--version` split, and Slurm
-behavioral differences (`-h` is `--noheader`, `--noconvert` no-op, `--gres`
-last-wins, exit codes) live in `docs/knowledge/common/slurm-compatibility.md`.
+and one gRPC path. The `--version` split and Slurm behavioral differences
+(`-h` is `--noheader`, `--noconvert` no-op, `--gres` last-wins, exit codes)
+live in `docs/knowledge/common/slurm-compatibility.md`; the symlink mapping is
+in `docs/user-guide/slurm-compatibility.rst`.
 Auth plugin mechanics live in `docs/knowledge/security/auth-model.md`.
 
 ## Invariants

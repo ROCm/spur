@@ -1,7 +1,8 @@
 # AGENTS.md -- spurauthd
 
 Thin binary over `spur_core::native_mint`; the mint, wire protocol, and verifier
-logic all live in `spur-core`. The credential model, JWKS format, and rotation
+logic all live in `spur-core`. JWKS loader limits are the constants in
+`spur_core::native_jwks`. The credential model and rotation
 are in `docs/knowledge/security/auth-model.md`.
 
 ## Invariants

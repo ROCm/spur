@@ -1,236 +1,78 @@
 # Slurm Compatibility Surface
 
-Spur is a drop-in replacement for Slurm. This document covers the exact
-compatibility surface: what works unchanged, what differs, what is deliberately
-not supported, and how the FFI and REST layers map.
+Maintainer notes on the Slurm-compatible CLI, REST, and FFI surfaces: compat
+hazards and deliberate deviations not obvious from the code. User-facing
+differences and limitations live in `docs/migration-from-slurm.rst`; the
+command map lives in `docs/user-guide/slurm-compatibility.rst`. Keep them there,
+not here.
 
-## CLI Compatibility
+## CLI
 
-### Multi-Call Binary
+- `--version` is split by invocation name: the Slurm symlinks matched in
+  `main()` (`sbatch`, `srun`, `squeue`, ...) print `slurm_version_string()`;
+  other symlinks and native `spur` print `version_string()`. Tools parsing
+  `--version` see different strings depending on argv[0].
+- `-h` is `--noheader` on `squeue`/`sinfo` (Slurm convention), so clap's auto
+  help flag is disabled and `--help` is re-added long-only.
+- `--noconvert` is accepted on `squeue`, `sinfo`, `sacct`, `sstat`, `sshare`,
+  and `sreport` but is a no-op. `sacct -X`/`--allocations` is also a no-op
+  (history has one row per job, no step rows).
+- `sacct -a`/`--allusers` is accepted. The default already shows every job the
+  caller may read, so `-a` only matters against `-u`; the last of `-a`/`-u`
+  wins, as in Slurm.
+- `--gres` is last-wins, not cumulative (`overrides_with`), matching Slurm:
+  commas within one value expand, a second `--gres` replaces the first.
+- Only one GPU request form may be set: `--gpus`, `--gpus-per-node`,
+  `--gpus-per-task`, or a `gpu:` entry in `--gres` (`validate_gpu_flags`,
+  checked client-side).
+- Exit codes match Slurm: completed propagates the job's code, failed is
+  `max(code, 1)`, cancelled/timeout/node-fail/deadline are 1
+  (`terminal_exit_code` in `sbatch`).
 
-`spur-cli` compiles to a single `spur` binary that dispatches based on
-`argv[0]`. Symlinks named after Slurm commands work out of the box:
+## Environment
 
-| Symlink | Spur Native | Description |
-|---------|-------------|-------------|
-| `sbatch` | `spur submit` | Batch job submission |
-| `srun` | `spur run` | Interactive/parallel execution |
-| `salloc` | `spur alloc` | Interactive resource allocation |
-| `squeue` | `spur queue` | Job queue viewer |
-| `scancel` | `spur cancel` | Cancel jobs |
-| `sinfo` | `spur nodes` | Node/partition information |
-| `sacct` | `spur history` | Job accounting history |
-| `sacctmgr` | `spur accounts` | Account/user/QOS management |
-| `scontrol` | `spur show` | Admin show/update/create/delete |
-| `sprio` | `spur priority` | Job priority breakdown |
-| `sshare` | `spur share` | Fair-share information |
-| `sstat` | `spur stat` | Running job statistics |
-| `sdiag` | `spur diag` | Scheduler diagnostics |
-| `sreport` | `spur report` | Usage reports |
-| `strigger` | `spur trigger` | Event triggers |
-| `sattach` | `spur attach` | Attach to job I/O |
-| `scrontab` | `spur crontab` | Recurring cron-style jobs |
-| `smd` | `spur health` | Node health monitoring |
+- Precedence. `sbatch`: CLI > env (`SPUR_*` then `SBATCH_*`) > `#SBATCH`
+  directives > defaults. `srun`: CLI > env (`SPUR_*` then `SLURM_*`) >
+  defaults. In `sbatch`, env is layered after the directive merge
+  (`resolve_sbatch_env` after `merge_resolved`), which is what puts it above
+  directives. Crate-specific exclusions are in `crates/spur-cli/AGENTS.md`.
+- Job environment twins: `SpurEnv::set_with_slurm_twin` adds a `SLURM_*` copy,
+  but variables set with plain `SpurEnv::set` have none (e.g.
+  `SPUR_TASK_OFFSET`, `SPUR_JOB_GPUS`, `SPUR_NODE_RANK`, `SPUR_PEER_NODES`,
+  `SPUR_TARGET_NODE`, `SPUR_BURST_BUFFER`). Not every `SPUR_*` variable has a
+  `SLURM_*` twin.
+- Credential variables are stripped from the job environment
+  (`SpurEnv::into_map`).
 
-Ten symlink names (`srun`, `sbatch`, `sinfo`, `squeue`, `scancel`, `salloc`,
-`scontrol`, `sacct`, `sacctmgr`, `sshare`) report `slurm_version_string()` from
-`--version`; the remaining symlinks and native `spur` binary report
-`version_string()`. Tools parsing `--version` output should be aware of this.
+## Output semantics
 
-### What Works Unchanged
+- `scontrol show job` `ReqTRES` omits Slurm's `billing=` component
+  (`requested_tres`), even though `[scheduler] tres_billing_weights` exists for
+  fair-share.
+- Fair-share factor is capped at 10 (1.0 = exactly fair), not Slurm's 0-1
+  (0.5 = exactly fair); user ranking is the same. The cap is duplicated across
+  crates; see `docs/knowledge/scheduler/scheduling.md` ("Pass structure and
+  ordering").
 
-- **Job script directives.** `#SBATCH` lines are parsed identically. `#PBS`
-  directives are auto-converted on a best-effort basis.
-- **Resource flags.** `-N`, `-n`, `-c`, `--gres`, `--gpus`, `--gpus-per-node`,
-  `--gpus-per-task`, `--mem`, `--mem-per-cpu`, `--time`, `--constraint`,
-  `--container-image`, etc.
-- **Environment variables.** Most `SPUR_*` variables injected into jobs have a
-  `SLURM_*` twin so MPI launchers and training frameworks see the names they
-  expect. Exceptions (no `SLURM_*` counterpart): `SPUR_TASK_OFFSET`,
-  `SPUR_JOB_GPUS`, `SPUR_NODE_RANK`, `SPUR_PEER_NODES`, `SPUR_TARGET_NODE`,
-  and `SPUR_BURST_BUFFER`. Credential variables are stripped from the job
-  environment.
-- **Format strings.** `squeue -o "%.18i %.9P"`, `sinfo`, `sacct` all support
-  Slurm's `%`-specifier syntax: `%[#][.][width]<letter>`.
-- **Env precedence.** `sbatch`: CLI > env (`SPUR_*` then `SBATCH_*`) >
-  `#SBATCH` directives > defaults. `srun`: CLI > env (`SPUR_*` then `SLURM_*`)
-  > defaults.
-- **`sacctmgr`** full CRUD (`add`/`delete`/`modify`/`show`/`list`)
-  for accounts, users, QOS, and coordinators. Associations, TRES, and
-  transactions are show-only (`show`/`list`).
-- **Exit codes.** completed=propagated, failed=max(code,1),
-  cancelled/timeout/nodefail/deadline=1. Matches Slurm.
+## REST API
 
-### Behavioral Differences
+Served in-process by `spurctld` (no `slurmrestd`) and exposes only a subset of
+`slurmrestd` (jobs, nodes, partitions). `rest_auth` applies the same
+`BearerAuth` policy as gRPC: Permissive mode lets anonymous callers through.
+REST-specific invariants are in `crates/spurctld/AGENTS.md`.
 
-**`-h` is `--noheader`** in squeue/sinfo (Slurm convention), not `--help`.
-`--help` is re-added as a long-only flag.
+## FFI (`spur-ffi`)
 
-**`--noconvert`** is accepted on squeue, sinfo, sacct, sstat, sshare, and
-sreport but is a no-op. Spur always reports raw values.
-
-**`--gres` is last-wins** (`overrides_with = "self"`), not cumulative. Comma-
-delimited values within one `--gres=gpu:2,fpga:1` expand, but a second `--gres`
-replaces the first. Matches Slurm.
-
-**Partitions** can be defined in `spur.conf` and also managed at runtime via
-`scontrol create/update/delete partition`. Runtime changes are persisted
-through Raft and survive restarts.
-
-**scontrol show** `-o`/`--oneliner` collapses each
-job/node/partition/reservation record onto one line (`collapse_record`); every
-other entity accepts and ignores it, unlike Slurm, which also applies it to
-`topology` and `assoc_mgr`.
-`NodeList=(null)` on pending jobs (not omitted). `ReqTRES` omits Slurm's
-`billing=` component. `StartTime` shows projected start for pending jobs (check
-`JobState` instead of `StartTime != N/A`).
-
-**sshare/sreport usage units** are cpu-seconds (Slurm uses cpu-minutes in some
-contexts). `sshare -l` includes a `GPURawUsage` column (gpu-seconds). Fair-share
-factor ranges 0-10 (1.0 = exactly fair), not Slurm's 0-1 (0.5 = exactly fair).
-
-**QOS GrpWall** is enforced at scheduling admission only: over-budget QOS stops
-admitting, but running jobs are never killed. Consumption is a trailing window,
-not decayed. Cap exists on QOS only, not on associations.
-
-**sacctmgr -p/-P** delimited output covers `show account`, `show qos`, and
-`show txn`. For `show user`, `show association`, and `show tres` it errors
-instead of printing unparseable output.
-
-**scancel arrays.** Array-element syntax (`123_4`) is not yet supported
-client-side; cancel by plain job ID.
-
-**sacct --jobs** filters are applied server-side: `GetJobHistoryRequest.job_ids`
-is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
-
-**sacct -a/--allusers** is accepted. Spur's default already shows every job the
-caller may read, so `-a` only matters against `-u`; the last of `-a`/`-u` wins,
-as in Slurm.
-
-**scontrol show assoc_mgr** uses a simplified layout. Filters to one user
-(`users=<name>`); Slurm's `accounts=`, `qos=`, and `flags=` selectors are not
-accepted.
-
-### Flags Accepted for Compatibility (No-Op)
-
-- `--noconvert` on squeue, sinfo, sacct, sstat, sshare, sreport
-- `-X`/`--allocations` on sacct (history has one row per job, no step rows)
-- `--container-readonly` (rejected at submission, not silently ignored)
-
-## REST API Parity
-
-The REST API is served directly by the controller (`spurctld`) on port 6820
-(configurable via `controller.rest_addr`). It is disabled by default
-(`rest_api.enabled = false`); enable it in `spur.conf`. When enabled, requests
-are authenticated through the shared BearerAuth layer (JWT or native token);
-Permissive mode lets anonymous callers through. There is no separate
-`slurmrestd` daemon. The API surface matches Slurm's REST endpoints for job
-submission, job query, node listing, and partition listing.
-
-## FFI / libslurm-compatible surface (spur-ffi)
-
-`spur-ffi` builds a `cdylib` shared library (`libspur_compat.so`) that exports
-`extern "C"` functions whose names match a subset of libslurm's API. The
-structs are Spur-specific and not binary-compatible with libslurm. Each
-exported function translates the C call into a gRPC request to the controller
-via `spur-client`, blocking on a lazily-initialized tokio runtime.
-
-### Exported Symbols
-
-**Job management:**
-
-- `slurm_init_job_desc_msg(desc)` -- zero a `SlurmJobDescMsg`
-- `slurm_submit_batch_job(desc, job_id)` -- submit via `SubmitJob` RPC
-- `slurm_kill_job(job_id, signal, flags)` -- cancel via `CancelJob` RPC
-
-**Query:**
-
-- `slurm_load_jobs(update_time, msg, flags)` -- list jobs via `GetJobs`
-- `slurm_load_node(update_time, msg, flags)` -- list nodes via `GetNodes`
-- `slurm_load_partitions(update_time, msg, flags)` -- list partitions
-
-**Memory / error handling:**
-
-- `slurm_free_job_info_msg(msg)` -- free a job info message
-- `slurm_strerror(errnum)` / `slurm_get_errno()` / `slurm_seterrno()` /
-  `slurm_perror(msg)` -- global mutex errno, static error table
-
-### Type Mappings
-
-The `*Msg` container structs
-(`SlurmJobInfoMsg`, `SlurmNodeInfoMsg`, `SlurmPartInfoMsg` in `types.rs`) lack
-`repr(C)` -- they are plain Rust structs with Vec-backed storage to keep
-allocations alive while C pointers are in use. `NO_VAL` (`u32::MAX`) is
-Slurm's "field not set" sentinel; `num_tasks = NO_VAL` maps to proto 0.
-
-### Controller Address
-
-Read from `SLURM_CONTROLLER_ADDR` env var, default `http://localhost:6817`.
-
-### Limitations
-
-Only 7 core functions + error handling are implemented (MVP surface). The FFI
-is not a security boundary. Callers must pass non-null, properly aligned,
-validly allocated pointers. Null checks are present but cannot detect dangling
-or misaligned pointers. Signatures omit `unsafe` to match Slurm's C calling
-convention.
-
-## Configuration Model
-
-Slurm's `slurm.conf` + `slurmdbd.conf` are replaced by a single TOML file,
-`spur.conf` (default `/etc/spur/spur.conf`).
-
-- No `slurmdbd` daemon: accounting is served by the controller under
-  `[accounting]`.
-- No `slurmrestd` daemon: REST API is built into the controller.
-- State is Raft-replicated, not file-based (`StateSaveLocation` does not exist).
-- HA is always on via Raft (openraft); no backup-controller configuration.
-
-### Accounting Config Mapping
-
-| Slurm | Spur |
-|-------|------|
-| `AccountingStorageEnforce=qos` | `[accounting] require_qos = true` |
-| `AccountingStorageEnforce=associations` | `[accounting] require_association = true` |
-| `slurm.conf PrivateData` | `[auth] private_data = ["jobs", "usage"]` |
-| `slurmdbd.conf DbdAddr` | `[accounting] database_url` |
-
-Unlike Slurm, root has no implicit admin exemption. Grant it a role explicitly.
-
-## What Is Deliberately NOT Compatible
-
-- **`slurm.conf` format.** Spur uses TOML, not the Slurm key-value format.
-- **`sstat` per-process metrics.** `Ave*`/`Max*` fields show `N/A`.
-- **TRES billing weights.** `ReqTRES` omits `billing=`.
-- **Fair-share scale.** 0-10 (Spur) vs 0-1 (Slurm); user ranking is identical.
-- **Multiple config files.** No `slurmdbd.conf`, `cgroup.conf`, `topology.conf`
-  as separate files.
-
-## Migration Path
-
-1. Install Spur (`spurctld` + `spurd`) and write `spur.conf` from the existing
-   `slurm.conf` values (see the configuration reference).
-2. Create Slurm-named symlinks for the CLI (`sbatch` -> `spur`, etc.).
-3. Set `SPUR_CONTROLLER_ADDR` or configure `[controller] hosts` in `spur.conf`.
-4. Test the golden path: `sbatch` a job, `squeue`, `scancel`, `sacct`.
-5. Accounting: `sacctmgr add account`, `sacctmgr add user` work as in Slurm.
-6. For FFI consumers: symlink `libslurm.so` to `libspur_compat.so` (or
-   relink the consumer against it); `LD_LIBRARY_PATH` alone does not make
-   `-lslurm` resolve to the compat library.
-
-Spur-only commands (`spur net`, `spur k8s`, `spur image`, `spur exec`,
-`spur token`, `spur auth-keys`, `spur self-update`) have no Slurm equivalents.
-
-## Key Source Files
-
-| File | Purpose |
-|------|---------|
-| `spur-cli/src/main.rs` | Multi-call dispatch, argv[0] routing |
-| `spur-cli/src/sbatch.rs` | sbatch implementation |
-| `spur-cli/src/squeue.rs` | squeue implementation |
-| `spur-cli/src/sacctmgr.rs` | sacctmgr implementation |
-| `spur-cli/src/format_engine.rs` | Slurm %-format string parser |
-| `spur-cli/src/env_defaults.rs` | SPUR_*/SBATCH_*/SLURM_* env resolution |
-| `spur-ffi/src/lib.rs` | FFI exported functions |
-| `spur-ffi/src/types.rs` | FFI struct definitions (inner element structs are `#[repr(C)]`; container `*Msg` structs are not) |
-| `docs/migration-from-slurm.rst` | User-facing migration guide |
+- `libspur_compat.so` exports `extern "C"` functions named after a subset of
+  libslurm's API, forwarding each call over gRPC to `spurctld`. Only that subset
+  is implemented; the rest of libslurm is absent.
+- Not ABI-compatible with libslurm: function names match, struct layouts are
+  Spur-specific. Pitfalls and memory ownership are in `crates/spur-ffi/AGENTS.md`.
+- `slurm_init_job_desc_msg` does not zero the descriptor; it applies
+  `SlurmJobDescMsg::default()` (`min_nodes`/`max_nodes` 1, `cpus_per_task` 1,
+  `num_tasks = NO_VAL` so the controller defaults to one task per node).
+- Controller address comes from `SLURM_CONTROLLER_ADDR` (not
+  `SPUR_CONTROLLER_ADDR`), default `http://localhost:6817`.
+- To use it in place of libslurm, symlink `libslurm.so` to `libspur_compat.so`
+  or relink the consumer; `LD_LIBRARY_PATH` alone does not make `-lslurm`
+  resolve to the compat library.

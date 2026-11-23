@@ -1,7 +1,7 @@
 # AGENTS.md -- spur-stepd
 
 Thin binary over `spurd::stepd::run_process`; all logic lives in `crates/spurd/src/stepd.rs`.
-Spawn, start gate, teardown order, completion reporting, PTY custody opcodes, and restart
+Spawn, start gate, teardown order, completion reporting, PTY custody recovery (full opcode set: `CUSTODY_*` in `crates/spurd/src/stepd.rs`), and restart
 recovery are described in `docs/knowledge/execution/job-execution.md`.
 
 ## Coupling

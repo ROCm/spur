@@ -31,6 +31,5 @@ OpenMetrics 1.0 export for `spurctld`. Routes, leader gating, and the HTTP serve
 ## Coupling
 
 - Metric names are user-facing (dashboards, alert rules). Renaming or removing one is a breaking
-  change. When adding or changing a metric, update `docs/user-guide/monitoring-jobs.rst`,
-  `docs/knowledge/deployment/operations.md` (Monitoring section), and for karma
-  `docs/admin-guide/karma-scoring.rst`.
+  change. When adding or changing a metric, update `docs/user-guide/monitoring-jobs.rst`
+  and, for karma, `docs/admin-guide/karma-scoring.rst`.

@@ -1,6 +1,6 @@
 # AGENTS.md -- spur-sched
 
-Algorithm, node matching, timeline, priority, GPU modes, cons_tres lifecycle, het jobs and
+Algorithm, node matching, timeline, priority, GPU placement, agent-side ledger invariants, het jobs and
 preemption trial bounds are described in
 [docs/knowledge/scheduler/scheduling.md](../../docs/knowledge/scheduler/scheduling.md). This file
 holds only crate-local constraints not stated there.
