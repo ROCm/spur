@@ -4334,7 +4334,7 @@ fn completing_job_is_overdue(
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
-/// unreported nodes in the background so a slow cancel can't race this verdict.
+/// unconfirmed nodes in the background so a slow cancel can't race this verdict.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
@@ -4342,13 +4342,15 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         .filter(|n| !job.node_completions.contains_key(*n))
         .cloned()
         .collect();
+    // A node kept for a step that never ended is as unconfirmed as one that never reported.
+    let unconfirmed: Vec<String> = missing.iter().chain(&job.retained_nodes).cloned().collect();
 
-    for node in &missing {
+    for node in &unconfirmed {
         if let Err(error) = cluster.quarantine_node(
             node,
             "job cleanup was not confirmed before completion timeout",
         ) {
-            warn!(job_id = job.job_id, node, %error, "cannot quarantine unreported node; retaining job resources");
+            warn!(job_id = job.job_id, node, %error, "cannot quarantine unconfirmed node; retaining job resources");
             return;
         }
     }
@@ -4381,13 +4383,13 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         }
     }
 
-    let unreported_nodes = missing.clone();
-    if !missing.is_empty() {
+    let unreported_nodes = missing;
+    if !unconfirmed.is_empty() {
         let cluster = cluster.clone();
         let job_id = job.job_id;
         let run_attempt = job.run_attempt;
         tokio::spawn(async move {
-            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &unconfirmed, 9).await;
         });
     }
 
@@ -9347,6 +9349,47 @@ pub(crate) mod tests {
                 (Some(0), 9),
                 "an exit 1 would hide that the batch host was killed"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_quarantines_a_finished_copys_node_still_running_a_step() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (job_id, attempt) =
+                running_on_mock_agents(&cm, &["n1", "n2"], "#!/bin/bash\n./train\n").await;
+            cm.create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: None,
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .unwrap();
+            cm.node_complete(job_id, "n1", 0, 0, attempt).unwrap();
+            cm.node_complete(job_id, "n2", 0, 0, attempt).unwrap();
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completing);
+            force_finish_completing_job(&cm, &job).await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completed, "every copy exited cleanly");
+            assert!(job.unreported_nodes.is_empty());
+            let kept = cm.get_node("n1").unwrap();
+            assert_eq!(kept.state, NodeState::Drain);
+            assert!(kept.admin_locked);
+            assert!(cm.get_node("n2").unwrap().is_schedulable());
         }
 
         // When no node reported (e.g. a suspended job's tasks died out-of-band),

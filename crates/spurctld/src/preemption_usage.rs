@@ -149,6 +149,7 @@ struct ObservedJob {
     state: JobState,
     run_attempt: u32,
     holds_placement: bool,
+    held: Vec<String>,
     cancelled_by: Option<spur_core::end_reason::CancelProvenance>,
 }
 
@@ -159,6 +160,7 @@ impl From<&Job> for ObservedJob {
             state: job.state,
             run_attempt: job.run_attempt,
             holds_placement: job.holds_a_placement(),
+            held: job.held_node_names().map(str::to_string).collect(),
             cancelled_by: job.cancelled_by.clone(),
         }
     }
@@ -278,7 +280,7 @@ impl UsageLedger {
         &mut self,
         before: &ObservedJob,
         after: Option<&ObservedJob>,
-        completed_node: Option<&str>,
+        released: &[&str],
         jobs: &mut HashMap<JobId, Job>,
     ) {
         let Some(mut victim) = self.take_victim(before.job_id, before.run_attempt) else {
@@ -288,10 +290,13 @@ impl UsageLedger {
             after.is_none_or(|job| job.run_attempt != victim.run_attempt || !job.state.is_active());
         if finished {
             victim.freed.extend(victim.allocations.keys().cloned());
-        } else if let Some(node) =
-            completed_node.filter(|node| victim.allocations.contains_key(*node))
-        {
-            victim.freed.insert(node.to_owned());
+        } else {
+            victim.freed.extend(
+                released
+                    .iter()
+                    .filter(|node| victim.allocations.contains_key(**node))
+                    .map(|node| node.to_string()),
+            );
         }
         if !victim.opened && !victim.freed.is_empty() {
             victim.opened = true;
@@ -665,6 +670,7 @@ impl ClusterManager {
             | WalOperation::JobComplete { job_id, .. }
             | WalOperation::JobNodeComplete { job_id, .. }
             | WalOperation::JobCopyExited { job_id, .. }
+            | WalOperation::JobStepComplete { job_id, .. }
             | WalOperation::JobCancelSignaled { job_id, .. }
             | WalOperation::JobTimeLimitExpired { job_id, .. }
             | WalOperation::JobDispatchBackoff { job_id, .. }
@@ -787,18 +793,23 @@ impl ClusterManager {
         }
         for (id, before) in observation.before {
             let after = jobs.get(&id).map(ObservedJob::from);
-            let completed_node = match op {
-                WalOperation::JobNodeComplete { node_name, .. }
-                | WalOperation::JobCopyExited { node_name, .. }
-                    if jobs
-                        .get(&id)
-                        .is_some_and(|job| job.node_completions.contains_key(node_name)) =>
+            // One report can release nodes besides its own, such as the ones finished
+            // copies kept. A JobNodeComplete also counts its reporter, as older controllers do.
+            let mut released: Vec<&str> = before
+                .held
+                .iter()
+                .filter(|node| after.as_ref().is_some_and(|a| !a.held.contains(node)))
+                .map(String::as_str)
+                .collect();
+            if let WalOperation::JobNodeComplete { node_name, .. } = op {
+                if jobs
+                    .get(&id)
+                    .is_some_and(|job| job.node_completions.contains_key(node_name))
                 {
-                    Some(node_name.as_str())
+                    released.push(node_name);
                 }
-                _ => None,
-            };
-            usage.release(&before, after.as_ref(), completed_node, &mut jobs);
+            }
+            usage.release(&before, after.as_ref(), &released, &mut jobs);
             let Some(after) = after else {
                 self.preemption_confirmations
                     .write()

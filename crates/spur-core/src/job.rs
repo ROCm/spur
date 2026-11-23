@@ -1585,11 +1585,15 @@ impl Job {
 
     /// The allocated nodes still running their part of the run, in allocation order.
     pub fn running_nodes(&self) -> Vec<String> {
+        self.running_node_names().map(str::to_string).collect()
+    }
+
+    /// `running_nodes` without the copies.
+    pub fn running_node_names(&self) -> impl Iterator<Item = &str> + '_ {
         self.allocated_nodes
             .iter()
-            .filter(|node| self.still_runs_on(node))
-            .cloned()
-            .collect()
+            .map(String::as_str)
+            .filter(|node| !self.node_completions.contains_key(*node))
     }
 
     /// The allocated nodes whose slice already went back, in allocation order.

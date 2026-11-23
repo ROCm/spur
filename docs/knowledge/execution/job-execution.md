@@ -115,18 +115,30 @@ log an older leader wrote the same way. A clean exit leaves the job Running
 (`NodeCompleteResult::StillRunning`) but keeps the node's slice charged
 (`Job.retained_nodes`): `spurd` keeps a job's allocation until its last
 supervisor on the node exits, steps included, so a node given back at its copy's
-exit could be dispatched to while the agent still holds it. Kept slices go back
-when the run ends: the report that ends it frees them, and every other ending
-frees all but `Job::released_nodes()`. The first failed copy is recorded in
-`Job.first_failed_node`, moves the job to Completing, has the nodes still
-running stopped, and supplies the job's state, exit, and signal, which a copy
-OOM-killed while being stopped cannot change (`Job::reported_outcome`, which the
-completing timeout's force-finish reads too). The apply
-drops a repeat `JobCopyExited`, one proposed before the first applied, so it
-cannot overwrite that failure; a repeat `JobNodeComplete` still overwrites, as
-on older controllers. Steps can no longer target a node that finished.
-Preemption grace and suspend keep their own handling; a grace hands kept nodes
-to the preemptor with the first report.
+exit could be dispatched to while the agent still holds it. The first failed
+copy is recorded in `Job.first_failed_node`, moves the job to Completing, and
+supplies the job's state, exit, and signal, which a copy OOM-killed while being
+stopped cannot change (`Job::reported_outcome`, which the completing timeout's
+force-finish reads too). The apply drops a repeat `JobCopyExited`, one proposed
+before the first applied, so it cannot overwrite that failure; a repeat
+`JobNodeComplete` still overwrites, as on older controllers. Steps can no longer
+target a node that finished.
+
+When the run ends (its first failure, its last copy, or any report in a
+preemption grace), a kept node goes back only once no live user step of the job
+runs there (`nodes_running_steps`); the copy whose exit ends the run is kept the
+same way. `ended_run_stragglers` stops every node the run still holds
+(`Job::held_nodes()`), kept ones included, and the run waits, Completing or
+still Running in its grace, until each kept node's last step records its
+`JobStepComplete`, which frees the node (`release_after_step_end`) and then ends
+the run (`finish_settled_run`). A grace hands each freed node to the preemptor
+at that point. The completing timeout's force-finish quarantines and kills kept
+nodes like unreported ones without changing the verdict, and a `NodeRemove` drops
+the removed node from `retained_nodes`, ending a run that only waited on it. Every
+other ending (`JobComplete`, requeue, preemption, eviction) frees all but
+`Job::released_nodes()` at once, as it does for unreported nodes. While a run
+holds this state, snapshots are fenced from older controllers (see
+[Raft](../consensus/raft.md)). Suspend keeps its own handling.
 A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 

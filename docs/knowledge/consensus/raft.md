@@ -310,6 +310,14 @@ break replay.
    `JobNodeComplete`), which an older controller cannot parse: it stops
    replicating instead, and the upgrade runs leader last.
 
+7. **A snapshot must not hand an older controller state it would misapply.**
+   It ignores fields it does not know, so state only a new variant produces
+   would reach it silently through a snapshot. While any active job holds such
+   state (`holds_per_node_run_state`: `Job.first_failed_node` or
+   `Job.retained_nodes`), `ClusterSnapshot` writes the jobs under `fenced_jobs`
+   and omits `jobs`, which older controllers require, so they refuse the snapshot
+   and stay stalled as they do on the entry. Restore reads either key.
+
 ---
 
 ## HA Configuration

@@ -6852,17 +6852,17 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once a report has ended the run: the batch host's for a batch-host script, the
-/// first failed copy's for a per-node one. With `primary_only`, only the batch host (the first
-/// allocated node) counts: the others run a hold script that never reports.
+/// Nodes to stop once a report has ended the run (the batch host's for a batch-host script, the
+/// first failed or last copy's for a per-node one), even a finished copy's node held for a step.
+/// With `primary_only`, only the batch host counts: the rest run a hold script that never reports.
 fn ended_run_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
     let ended = match job.script_placement() {
         ResolvedPlacement::BatchHost => primary_only
             .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node)),
-        ResolvedPlacement::AllNodes => job.first_failed_node.is_some(),
+        ResolvedPlacement::AllNodes => job.first_failed_node.is_some() || job.all_nodes_completed(),
     };
     if ended {
-        job.running_nodes()
+        job.held_nodes()
     } else {
         Vec::new()
     }
@@ -12433,23 +12433,65 @@ mod tests {
         );
     }
 
-    /// The batch-host job's cancel is awaited, so a cancel wrongly sent for the
-    /// per-node job, which reported first, would be seen too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_clean_copy_of_a_per_node_script_stops_nothing() {
+    async fn the_last_copy_stops_a_finished_copys_node_still_running_a_step() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service(&dir).await;
         let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
         let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("step");
+        report_node_exit(&svc, job_id, "n1", 0).await;
+
+        report_node_exit(&svc, job_id, "n2", 0).await;
+
+        wait_for_cancel(&n1_cancelled, job_id).await;
+        assert!(
+            n2_cancelled.lock().unwrap().is_empty(),
+            "no step of the job runs there"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_copy_of_a_per_node_script_stops_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
         let per_node = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
         let batch_host = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let clean_exit = |job_id, node| {
+            let attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+            svc.cluster
+                .node_complete(job_id, node, 0, 0, attempt)
+                .expect("report")
+        };
 
-        report_node_finished(&svc, per_node, "n2").await;
-        report_node_finished(&svc, batch_host, "n1").await;
+        let copy = clean_exit(per_node, "n2");
+        let host = clean_exit(batch_host, "n1");
 
-        wait_for_cancel(&n2_cancelled, batch_host).await;
-        assert!(!cancelled_jobs(&n1_cancelled).contains(&per_node));
-        assert!(!cancelled_jobs(&n2_cancelled).contains(&per_node));
+        assert!(remaining_nodes_stop(&svc.cluster, per_node, &copy, "n2").is_none());
+        assert!(
+            remaining_nodes_stop(&svc.cluster, batch_host, &host, "n1").is_some(),
+            "the batch host's exit stops the rest"
+        );
         assert_eq!(
             svc.cluster.get_job(per_node).expect("job").state,
             JobState::Running
