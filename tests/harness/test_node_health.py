@@ -463,7 +463,7 @@ def test_has_sudo_does_not_read_a_hung_probe_as_missing_sudo():
 
 def _sudo_cluster(monkeypatch, nodes):
     monkeypatch.delenv("SPUR_TEST_SSH_PASSWORD", raising=False)
-    cluster = SpurCluster(nodes, "/tmp/spur-test", "/tmp/spur-bin")
+    cluster = SpurCluster(nodes, "/remote/spur-test", "/remote/spur-bin")
     cluster.node_names = [f"name-{node.host}" for node in nodes]
     return cluster
 

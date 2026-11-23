@@ -172,7 +172,7 @@ def remote():
 
 @pytest.fixture
 def node(remote):
-    ssh = SshNode(HOST, "vm", password="vm", client_factory=remote.new_client)
+    ssh = SshNode(HOST, "vm", password="vm", client_factory=remote.new_client)  # nosec B106
     ssh._sleep = remote.sleeps.append
     ssh._clock = remote.clock
     return ssh

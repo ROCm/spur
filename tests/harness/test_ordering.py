@@ -170,7 +170,7 @@ def test_collection_keeps_relative_order_within_each_group(e2e_layout):
 
 
 def _expected_shard(nodeid, count):
-    return int(hashlib.md5(nodeid.encode()).hexdigest(), 16) % count
+    return int(hashlib.md5(nodeid.encode(), usedforsecurity=False).hexdigest(), 16) % count
 
 
 @pytest.mark.parametrize("shard_id", [0, 1, 2])

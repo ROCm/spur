@@ -87,9 +87,9 @@ def empty_registry(monkeypatch):
     monkeypatch.setattr(cluster_module, "_live_clusters", [])
 
 
-def make_cluster(nodes=None, remote_dir="/tmp/spur-test"):
+def make_cluster(nodes=None, remote_dir="/remote/spur-test"):
     nodes = nodes if nodes is not None else [FakeDiagNode("node-a"), FakeDiagNode("node-b")]
-    cluster = SpurCluster(nodes, remote_dir, "/tmp/spur-bin")
+    cluster = SpurCluster(nodes, remote_dir, "/remote/spur-bin")
     cluster.node_names = [f"name-{node.host}" for node in nodes]
     return cluster
 
@@ -315,7 +315,7 @@ def test_cluster_collect_diagnostics_uses_its_log_dir_names_and_line_limit():
     result = cluster.collect_diagnostics(max_lines=50)
 
     assert list(result) == ["name-node-a (node-a)", "name-node-b (node-b)"]
-    assert "tail -n 50 /tmp/spur-test/log/spurctld.log" in cluster.nodes[0].commands[0]
+    assert "tail -n 50 /remote/spur-test/log/spurctld.log" in cluster.nodes[0].commands[0]
     assert "k0s" not in cluster.nodes[0].commands[0]
 
 
@@ -454,27 +454,27 @@ def test_sections_cover_every_live_cluster():
 
 def test_sections_report_a_node_shared_by_several_clusters_once():
     shared = [FakeDiagNode("node-a"), FakeDiagNode("node-b")]
-    stale, current = make_cluster(shared, "/tmp/stale"), make_cluster(shared, "/tmp/current")
+    stale, current = make_cluster(shared, "/remote/stale"), make_cluster(shared, "/remote/current")
 
     sections = failure_diagnostic_sections("call", True, [stale, current], None)
 
     assert [title for title, _ in sections] == [
         "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
     assert [len(node.commands) for node in shared] == [1, 1]
-    assert "/tmp/current/log/spurctld.log" in shared[0].commands[0]
+    assert "/remote/current/log/spurctld.log" in shared[0].commands[0]
 
 
 def test_sections_still_report_the_nodes_only_an_older_cluster_has():
     shared = FakeDiagNode("node-a")
-    older = make_cluster([shared, FakeDiagNode("node-b")], "/tmp/older")
-    newer = make_cluster([shared], "/tmp/newer")
+    older = make_cluster([shared, FakeDiagNode("node-b")], "/remote/older")
+    newer = make_cluster([shared], "/remote/newer")
 
     sections = failure_diagnostic_sections("call", True, [older, newer], None)
 
     assert sorted(title for title, _ in sections) == [
         "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
-    assert len(shared.commands) == 1 and "/tmp/newer/log/" in shared.commands[0]
-    assert "/tmp/older/log/" in older.nodes[1].commands[0]
+    assert len(shared.commands) == 1 and "/remote/newer/log/" in shared.commands[0]
+    assert "/remote/older/log/" in older.nodes[1].commands[0]
 
 
 def test_sections_fall_back_to_node_level_diagnostics_when_no_cluster_is_live():
