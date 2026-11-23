@@ -82,8 +82,8 @@ def pytest_runtest_makereport(item, call):
     # a section instead of raised.
     try:
         report.sections.extend(failure_diagnostic_sections(
-            report.when, report.failed, item.fixturenames, live_clusters(),
-            item.funcargs.get("ssh_nodes")))
+            report.when, report.failed, live_clusters(), item.funcargs.get("ssh_nodes"),
+            k0s=item.get_closest_marker("k0s") is not None))
     except Exception as err:
         report.sections.append(("diagnostics", f"collection failed: {type(err).__name__}: {err}"))
 
@@ -169,8 +169,9 @@ def ssh_nodes():
 
 @pytest.fixture(autouse=True)
 def _node_health(request):
-    """Per-test node guard (see node_health_guard); a no-op for tests that never
-    touch the nodes, so it cannot force SSH setup."""
+    """Per-test node guard (see node_health_guard). The session-autouse _ensure_bins
+    pulls ssh_nodes into every e2e test, so in practice each test pays one
+    `iptables -S` round trip per node before and after it."""
     if "ssh_nodes" not in request.fixturenames:
         yield
         return

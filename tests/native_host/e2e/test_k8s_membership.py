@@ -48,11 +48,13 @@ def k8s_drift_cluster(unstarted_cluster):
     )
     yield unstarted_cluster
     # A teardown that does not converge must fail loudly: it leaves k0s behind for the next run.
+    errors = []
     try:
         unstarted_cluster.k8s_down(reset=True)
         _wait_torn_down(unstarted_cluster)
-    finally:
-        assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names)
+    except Exception as err:  # reported below, together with the network check
+        errors.append(err)
+    assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names, errors)
 
 
 def _wait_torn_down(cluster, timeout: int = 180) -> None:

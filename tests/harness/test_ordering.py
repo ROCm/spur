@@ -357,6 +357,27 @@ def test_assert_nodes_network_keeps_checking_after_an_ssh_error(diagnostics_spy,
     assert "node-a" in message and "node-b" in message
 
 
+def test_assert_nodes_network_reraises_an_earlier_teardown_error_when_the_network_is_fine():
+    timeout = TimeoutError("k0s teardown did not finish within 180s")
+
+    with pytest.raises(TimeoutError) as info:
+        assert_nodes_network([NetFakeNode("node-a")], ["a"], errors=[timeout])
+
+    assert info.value is timeout
+
+
+def test_assert_nodes_network_reports_an_earlier_teardown_error_with_the_network_failure(diagnostics_spy):
+    timeout = TimeoutError("k0s teardown did not finish within 180s")
+    nodes = [NetFakeNode("node-a", route_exit=2, route_out="Network is unreachable\n")]
+
+    with pytest.raises(pytest.fail.Exception) as info:
+        assert_nodes_network(nodes, ["a"], errors=[timeout])
+
+    message = str(info.value)
+    assert "TimeoutError: k0s teardown did not finish within 180s" in message
+    assert "node network broken after k0s teardown" in message and "Network is unreachable" in message
+
+
 def test_a_timeout_reading_ssh_client_is_reported_as_a_timeout():
     node = NetFakeNode("node-a", ssh_client_exit=-1, ssh_client="")
 
@@ -367,16 +388,17 @@ def test_a_timeout_reading_ssh_client_is_reported_as_a_timeout():
     assert "cannot determine" not in str(info.value)
 
 
-def test_a_loopback_driver_address_warns_once(caplog):
+def test_a_loopback_driver_address_warns_once_per_host(caplog):
     nodes = [NetFakeNode("node-a", ssh_client="127.0.0.1 5000 22"),
              NetFakeNode("node-b", ssh_client="127.0.0.1 5001 22")]
 
     with caplog.at_level(logging.WARNING, logger="cluster"):
         assert_nodes_network(nodes, ["a", "b"])
+        assert_nodes_network(nodes, ["a", "b"])
 
-    warnings = [r for r in caplog.records if "loopback" in r.getMessage()]
-    assert len(warnings) == 1
-    assert "node-a" in warnings[0].getMessage()
+    warnings = [r.getMessage() for r in caplog.records if "loopback" in r.getMessage()]
+    assert len(warnings) == 2
+    assert warnings[0].startswith("node-a ") and warnings[1].startswith("node-b ")
 
 
 def test_a_routable_driver_address_does_not_warn(caplog):

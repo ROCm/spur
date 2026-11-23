@@ -3,8 +3,8 @@
 
 """Cluster state attached to a failing K8s E2E test.
 
-The CI diagnostics artifact expires after three days and is not in the pytest
-output, so the same state is collected here and put in the failing test's report.
+The CI diagnostics artifact expires and is not in the pytest output, so the
+same state is collected here and put in the failing test's report.
 """
 
 from __future__ import annotations

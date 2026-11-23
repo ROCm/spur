@@ -8,6 +8,7 @@ Fake nodes stand in for SshNode only; every test drives the real harness code.
 """
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,8 @@ from cluster import (
     register_cluster,
     unregister_cluster,
 )
+
+pytest_plugins = ["pytester"]
 
 
 class FakeClock:
@@ -244,7 +247,7 @@ def test_sections_share_one_budget_across_clusters():
     second = make_cluster([FakeDiagNode("node-b", clock=clock, elapse=100)])
 
     sections = failure_diagnostic_sections(
-        "call", True, ["cluster"], [first, second], None, budget=DiagnosticsBudget(90, clock))
+        "call", True, [first, second], None, budget=DiagnosticsBudget(90, clock))
 
     assert [title for title, _ in sections] == [
         "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
@@ -396,7 +399,7 @@ def test_teardown_unregisters_even_when_stopping_fails(monkeypatch):
 def test_sections_attach_for_a_failed_call_phase():
     cluster = make_cluster()
 
-    sections = failure_diagnostic_sections("call", True, ["cluster"], [cluster], None)
+    sections = failure_diagnostic_sections("call", True, [cluster], None)
 
     assert [title for title, _ in sections] == [
         "diagnostics: name-node-a (node-a)",
@@ -408,7 +411,7 @@ def test_sections_attach_for_a_failed_call_phase():
 def test_sections_attach_for_a_failed_setup_phase():
     cluster = make_cluster()
 
-    assert failure_diagnostic_sections("setup", True, ["cluster"], [cluster], None)
+    assert failure_diagnostic_sections("setup", True, [cluster], None)
 
 
 @pytest.mark.parametrize("when,failed", [
@@ -420,22 +423,22 @@ def test_sections_attach_for_a_failed_setup_phase():
 def test_sections_skip_passes_skips_xfails_and_teardown_failures(when, failed):
     cluster = make_cluster()
 
-    assert failure_diagnostic_sections(when, failed, ["cluster"], [cluster], None) == []
+    assert failure_diagnostic_sections(when, failed, [cluster], None) == []
     assert cluster.nodes[0].commands == []
 
 
-def test_sections_include_k0s_extras_for_a_k8s_fixture():
+def test_sections_include_k0s_extras_when_asked():
     cluster = make_cluster()
 
-    failure_diagnostic_sections("call", True, ["ssh_nodes", "k8s_multicp_cluster"], [cluster], None)
+    failure_diagnostic_sections("call", True, [cluster], None, k0s=True)
 
     assert "k0s status" in cluster.nodes[0].commands[0]
 
 
-def test_sections_leave_out_k0s_extras_for_other_fixtures():
+def test_sections_leave_out_k0s_extras_by_default():
     cluster = make_cluster()
 
-    failure_diagnostic_sections("call", True, ["ssh_nodes", "cluster", "wg_k0s_cluster"], [cluster], None)
+    failure_diagnostic_sections("call", True, [cluster], None)
 
     assert "k0s status" not in cluster.nodes[0].commands[0]
 
@@ -443,16 +446,41 @@ def test_sections_leave_out_k0s_extras_for_other_fixtures():
 def test_sections_cover_every_live_cluster():
     first, second = make_cluster(), make_cluster()
 
-    sections = failure_diagnostic_sections("call", True, ["cluster"], [first, second], None)
+    sections = failure_diagnostic_sections("call", True, [first, second], None)
 
     assert len(sections) == 4
     assert first.nodes[0].commands and second.nodes[0].commands
 
 
+def test_sections_report_a_node_shared_by_several_clusters_once():
+    shared = [FakeDiagNode("node-a"), FakeDiagNode("node-b")]
+    stale, current = make_cluster(shared, "/tmp/stale"), make_cluster(shared, "/tmp/current")
+
+    sections = failure_diagnostic_sections("call", True, [stale, current], None)
+
+    assert [title for title, _ in sections] == [
+        "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
+    assert [len(node.commands) for node in shared] == [1, 1]
+    assert "/tmp/current/log/spurctld.log" in shared[0].commands[0]
+
+
+def test_sections_still_report_the_nodes_only_an_older_cluster_has():
+    shared = FakeDiagNode("node-a")
+    older = make_cluster([shared, FakeDiagNode("node-b")], "/tmp/older")
+    newer = make_cluster([shared], "/tmp/newer")
+
+    sections = failure_diagnostic_sections("call", True, [older, newer], None)
+
+    assert sorted(title for title, _ in sections) == [
+        "diagnostics: name-node-a (node-a)", "diagnostics: name-node-b (node-b)"]
+    assert len(shared.commands) == 1 and "/tmp/newer/log/" in shared.commands[0]
+    assert "/tmp/older/log/" in older.nodes[1].commands[0]
+
+
 def test_sections_fall_back_to_node_level_diagnostics_when_no_cluster_is_live():
     nodes = [FakeDiagNode("node-a"), FakeDiagNode("node-b")]
 
-    sections = failure_diagnostic_sections("call", True, ["ssh_nodes"], [], nodes)
+    sections = failure_diagnostic_sections("call", True, [], nodes)
 
     assert [title for title, _ in sections] == [
         "diagnostics: node-a (node-a)",
@@ -463,17 +491,88 @@ def test_sections_fall_back_to_node_level_diagnostics_when_no_cluster_is_live():
 
 
 def test_sections_are_empty_without_a_live_cluster_or_nodes():
-    assert failure_diagnostic_sections("call", True, ["cluster"], [], None) == []
+    assert failure_diagnostic_sections("call", True, [], None) == []
 
 
 def test_sections_keep_collecting_when_one_node_is_unreachable():
     nodes = [FakeDiagNode("node-a", error=SshConnectionLost("gone")), FakeDiagNode("node-b")]
     cluster = make_cluster(nodes)
 
-    sections = failure_diagnostic_sections("call", True, ["cluster"], [cluster], None)
+    sections = failure_diagnostic_sections("call", True, [cluster], None)
 
     assert len(sections) == 2
     assert "unreachable" in sections[0][1]
+
+
+HOOK_TESTS = """\
+import pytest
+
+
+class EchoNode:
+    host = address = "node-a"
+
+    def is_alive(self):
+        return True
+
+    def ensure_connected(self):
+        pass
+
+    def exec_with_exit(self, cmd, timeout=600):
+        return 0, cmd
+
+
+@pytest.fixture(scope="session")
+def ssh_nodes():
+    return [EchoNode()]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_bins():
+    pass
+
+
+@pytest.fixture
+def wg_k0s_cluster(ssh_nodes):
+    yield
+
+
+@pytest.fixture
+def k8s_multicp_cluster(ssh_nodes):
+    yield
+
+
+def test_wg_fixture(wg_k0s_cluster):
+    assert False
+
+
+def test_k8s_fixture(k8s_multicp_cluster):
+    assert False
+
+
+@pytest.mark.k0s
+def test_marked(ssh_nodes):
+    assert False
+
+
+def test_plain(ssh_nodes):
+    assert False
+"""
+
+
+def test_failure_hook_adds_k0s_diagnostics_exactly_for_k0s_marked_tests(pytester):
+    native_conftest = Path(__file__).resolve().parents[1] / "native_host" / "e2e" / "conftest.py"
+    pytester.makeconftest(native_conftest.read_text())
+    pytester.makepyfile(test_hook=HOOK_TESTS)
+
+    reprec = pytester.inline_run("-p", "no:cacheprovider")
+
+    calls = {r.nodeid.split("::")[-1]: r for r in reprec.getreports("pytest_runtest_logreport")
+             if r.when == "call"}
+    k0s_sections = {name: any("k0s status" in text for title, text in report.sections
+                              if title.startswith("diagnostics: "))
+                    for name, report in calls.items()}
+    assert k0s_sections == {"test_wg_fixture": True, "test_k8s_fixture": True,
+                            "test_marked": True, "test_plain": False}
 
 
 K0S_LOG = "\n".join([

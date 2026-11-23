@@ -21,6 +21,7 @@ import threading
 import time
 import logging
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import paramiko
@@ -360,7 +361,7 @@ def _node_driver_ip(node: "SshNode") -> str:
         loopback = ipaddress.ip_address(fields[0]).is_loopback
     except ValueError:
         raise NodeNetworkError(f"{node.host}: SSH_CLIENT does not start with an address: {out.strip()!r}") from None
-    if loopback and not _loopback_warned:
+    if loopback and node.host not in _loopback_warned:
         _loopback_warned.add(node.host)
         logger.warning(
             "%s sees the driver as %s (loopback): the route check proves little on this bed",
@@ -398,12 +399,20 @@ def network_failure_report(nodes: list["SshNode"], names: list[str]) -> str | No
     return "\n".join(lines)
 
 
-def assert_nodes_network(nodes: list["SshNode"], names: list[str]) -> None:
+def assert_nodes_network(nodes: list["SshNode"], names: list[str],
+                         errors: Sequence[BaseException] = ()) -> None:
     """Fail the calling fixture teardown when any node lost its network, naming the
-    node. For fixtures whose cleanup (k0s reset) can take a node's network down."""
+    node. For fixtures whose cleanup (k0s reset) can take a node's network down.
+    *errors* from earlier cleanup steps are raised or reported along with it, so
+    neither failure hides the other."""
     report = network_failure_report(nodes, names)
-    if report is not None:
-        pytest.fail(report, pytrace=False)
+    if report is None:
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise RuntimeError("\n".join(_describe(err) for err in errors))
+        return
+    pytest.fail("\n".join([*(_describe(err) for err in errors), report]), pytrace=False)
 
 
 def reset_k0s_and_assert_network(nodes: list["SshNode"], names: list[str], sudo: str,
@@ -421,14 +430,7 @@ def reset_k0s_and_assert_network(nodes: list["SshNode"], names: list[str], sudo:
             after_reset()
         except Exception as err:  # reported below, after the network check has run
             errors.append(err)
-    report = network_failure_report(nodes, names)
-    if report is None:
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise RuntimeError("\n".join(_describe(err) for err in errors))
-        return
-    pytest.fail("\n".join([*(_describe(err) for err in errors), report]), pytrace=False)
+    assert_nodes_network(nodes, names, errors)
 
 
 @contextlib.contextmanager
@@ -930,18 +932,29 @@ def collect_node_diagnostics(nodes: list["SshNode"], names: list[str], log_dir: 
     return result
 
 
-def failure_diagnostic_sections(when: str, failed: bool, fixturenames, clusters: list["SpurCluster"],
-                                ssh_nodes: list["SshNode"] | None, max_lines: int = 200,
+def _reported_node_indices(clusters: list["SpurCluster"]) -> list[list[int]]:
+    """Per cluster, the indices of the nodes it reports. Clusters share the session's
+    nodes, so each node is reported once, by the latest-registered cluster holding it:
+    an older registration may be a stale one that never reached teardown."""
+    owner = {id(node): cluster for cluster in clusters for node in cluster.nodes}
+    return [[i for i, node in enumerate(cluster.nodes) if owner[id(node)] is cluster]
+            for cluster in clusters]
+
+
+def failure_diagnostic_sections(when: str, failed: bool, clusters: list["SpurCluster"],
+                                ssh_nodes: list["SshNode"] | None, *, k0s: bool = False,
+                                max_lines: int = 200,
                                 budget: DiagnosticsBudget | None = None) -> list[tuple[str, str]]:
     """Report sections for a test phase. Only a failed setup or call gets any;
     skips, xfails and teardown failures stay quiet. Without a live cluster, falls
-    back to node-level state from *ssh_nodes* when the test used them."""
+    back to node-level state from *ssh_nodes* when the test used them. *k0s* adds
+    the k0s state sections."""
     if not failed or when not in ("setup", "call"):
         return []
-    k0s = any(name.startswith("k8s_") for name in fixturenames)
     budget = budget or DiagnosticsBudget()
     if clusters:
-        collected = [c.collect_diagnostics(max_lines, k0s=k0s, budget=budget) for c in clusters]
+        collected = [c.collect_diagnostics(max_lines, k0s=k0s, budget=budget, indices=indices)
+                     for c, indices in zip(clusters, _reported_node_indices(clusters)) if indices]
     elif ssh_nodes:
         collected = [collect_node_diagnostics(ssh_nodes, [], None, max_lines, k0s, budget)]
     else:
@@ -1692,11 +1705,15 @@ class SpurCluster:
             logger.info("spurauthd started on %s (pid %s)", name, pid)
 
     def collect_diagnostics(self, max_lines: int = 200, *, k0s: bool = False,
-                            budget: DiagnosticsBudget | None = None) -> dict[str, str]:
-        """Log tails and node state from every node, keyed ``"<name> (<host>)"``.
-        Never raises, so it is safe from a failure hook or a fixture teardown."""
-        return collect_node_diagnostics(self.nodes, self.node_names, self.log_dir, max_lines, k0s,
-                                        budget)
+                            budget: DiagnosticsBudget | None = None,
+                            indices: list[int] | None = None) -> dict[str, str]:
+        """Log tails and node state from every node (or only those at *indices*),
+        keyed ``"<name> (<host>)"``. Never raises, so it is safe from a failure hook
+        or a fixture teardown."""
+        picked = range(len(self.nodes)) if indices is None else indices
+        nodes = [self.nodes[i] for i in picked]
+        names = [self.node_names[i] if i < len(self.node_names) else self.nodes[i].host for i in picked]
+        return collect_node_diagnostics(nodes, names, self.log_dir, max_lines, k0s, budget)
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
