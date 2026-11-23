@@ -23,7 +23,7 @@ beautifulsoup4==4.15.0
     # via
     #   pydata-sphinx-theme
     #   pyspelling
-bracex==3.0.1
+bracex==3.2.4
     # via wcmatch
 breathe==4.36.0
     # via rocm-docs-core
@@ -290,7 +290,7 @@ urllib3==2.8.0
     # via
     #   pygithub
     #   requests
-wcmatch==11.0
+wcmatch==11.2
     # via pyspelling
 wcwidth==0.8.2
     # via prompt-toolkit
