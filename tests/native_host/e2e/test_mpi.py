@@ -6,7 +6,7 @@
 import dataclasses
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
@@ -554,15 +554,25 @@ class TestMpiSoak:
 
         def run_one(entry: tuple[list[str], set[int], int]) -> tuple[list[str], set[int], int, int, str]:
             args, expected_ranks, expected_size = entry
-            code, out = cluster.srun_with_exit(args)
+            code, out = cluster.srun_with_exit(args, timeout=300)
             return args, expected_ranks, expected_size, code, out
 
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-            futures = [pool.submit(run_one, entry) for entry in wave]
-            for fut in as_completed(futures):
-                args, expected_ranks, expected_size, code, out = fut.result()
-                assert code == 0, f"srun {args} failed:\n{out}"
+            results = [fut.result() for fut in [pool.submit(run_one, e) for e in wave]]
+
+        # Every member's output is reported so one failure cannot hide another's.
+        failures = []
+        for args, expected_ranks, expected_size, code, out in results:
+            if code != 0:
+                failures.append(f"srun {args} exited {code}:\n{out}")
+                continue
+            try:
                 assert_mpi_ranks(out, expected_ranks, expected_size)
+            except AssertionError as exc:
+                failures.append(f"srun {args} rank check failed: {exc}")
+        assert not failures, (
+            f"{len(failures)}/{len(wave)} wave members failed:\n\n" + "\n\n".join(failures)
+        )
 
 
 @pytest.mark.mpi
