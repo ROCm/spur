@@ -322,7 +322,7 @@ jobs:
         with:
           name: spur-image
           path: /tmp/spur-image.tar
-          retention-days: 1
+          retention-days: 7
 
       - name: Extract release binaries from image
         run: |
@@ -342,7 +342,7 @@ jobs:
         with:
           name: release-binaries
           path: /tmp/release-binaries/
-          retention-days: 1
+          retention-days: 7
 
       - name: Pack E2E test assets
         run: |
@@ -359,7 +359,7 @@ jobs:
         with:
           name: e2e-assets
           path: /tmp/e2e-assets/trusted-repo
-          retention-days: 1
+          retention-days: 7
 
   trivy-image-scan:
     name: Trivy image scan
