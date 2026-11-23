@@ -6,8 +6,11 @@
 Fake nodes stand in for SshNode only; every test drives the real harness functions.
 """
 
+import logging
+
 import pytest
 
+import cluster as cluster_module
 from cluster import (
     CLI_NODE_INDEX,
     SshConnectionLost,
@@ -15,7 +18,9 @@ from cluster import (
     check_nodes_reachable,
     cut_off_node,
     leftover_drop_rules,
-    reap_leftover_drop_rules,
+    node_health_guard,
+    reap_leaked_drop_rules,
+    snapshot_drop_rules,
     unreachable_message,
 )
 
@@ -42,13 +47,14 @@ class FakeNode:
     """Answers `iptables -S` with canned text and records every command."""
 
     def __init__(self, host, iptables_s="", reconnect_error=None, fail_delete=False,
-                 list_exit=0):
+                 list_exit=0, list_error=None):
         self.host = host
         self.address = host
         self.iptables_s = iptables_s
         self.reconnect_error = reconnect_error
         self.fail_delete = fail_delete
         self.list_exit = list_exit
+        self.list_error = list_error
         self.commands = []
         self.timeouts = []
         self.connect_checks = 0
@@ -62,6 +68,8 @@ class FakeNode:
         self.commands.append(cmd)
         self.timeouts.append(timeout)
         if cmd == "sudo iptables -S":
+            if self.list_error is not None:
+                raise self.list_error
             return self.list_exit, self.iptables_s
         if cmd.startswith("sudo iptables -D"):
             if self.fail_delete:
@@ -75,6 +83,11 @@ class FakeNode:
         raise AssertionError(f"helper ran a command before its guard: {cmd}")
 
     exec_allow_fail = exec
+
+
+@pytest.fixture(autouse=True)
+def fresh_warning_state(monkeypatch):
+    monkeypatch.setattr(cluster_module, "_leak_check_warned", set())
 
 
 class FakeCluster:
@@ -114,30 +127,189 @@ def test_leftover_drop_rules_raises_when_iptables_cannot_be_listed():
         leftover_drop_rules(node)
 
 
-def test_reap_removes_each_leaked_rule_and_reports_it():
-    leaky = FakeNode("node-a", IPTABLES_S)
-    clean = FakeNode("node-b")
+def test_reap_removes_rules_added_since_the_baseline_and_reports_them():
+    node = FakeNode("node-a", "-P INPUT ACCEPT\n")
+    baseline = snapshot_drop_rules([node])
+    node.iptables_s = IPTABLES_S
 
-    report = reap_leftover_drop_rules([leaky, clean])
+    report = reap_leaked_drop_rules([node], baseline)
 
-    assert [line.split(": ")[0] for line in report] == ["node-a", "node-a"]
+    assert len(report) == 2
     assert all(rule.removeprefix("-A ") in line for rule, line in zip(LEAKED, report))
-    assert all(line.endswith("removed") for line in report)
-    assert leftover_drop_rules(leaky) == []
-    assert clean.commands == ["sudo iptables -S"]
+    assert all(line.startswith("node-a: ") and line.endswith("removed") for line in report)
+    assert leftover_drop_rules(node) == []
+
+
+def test_reap_leaves_rules_that_predate_the_test_alone():
+    node = FakeNode("node-a", IPTABLES_S)
+    baseline = snapshot_drop_rules([node])
+
+    assert reap_leaked_drop_rules([node], baseline) == []
+
+    assert not any(cmd.startswith("sudo iptables -D") for cmd in node.commands)
+    assert leftover_drop_rules(node) == LEAKED
+
+
+def test_reap_removes_only_the_new_rule_among_preexisting_ones():
+    node = FakeNode("node-a", LEAKED[0] + "\n")
+    baseline = snapshot_drop_rules([node])
+    node.iptables_s = IPTABLES_S
+
+    report = reap_leaked_drop_rules([node], baseline)
+
+    assert len(report) == 1 and LEAKED[1].removeprefix("-A ") in report[0]
+    assert leftover_drop_rules(node) == [LEAKED[0]]
+
+
+def test_reap_removes_a_duplicate_of_a_preexisting_rule():
+    node = FakeNode("node-a", LEAKED[0] + "\n")
+    baseline = snapshot_drop_rules([node])
+    node.iptables_s = LEAKED[0] + "\n" + LEAKED[0] + "\n"
+
+    report = reap_leaked_drop_rules([node], baseline)
+
+    assert len(report) == 1
 
 
 def test_reap_reports_removal_failures():
-    node = FakeNode("node-a", IPTABLES_S, fail_delete=True)
+    node = FakeNode("node-a", fail_delete=True)
+    baseline = snapshot_drop_rules([node])
+    node.iptables_s = IPTABLES_S
 
-    report = reap_leftover_drop_rules([node])
+    report = reap_leaked_drop_rules([node], baseline)
 
     assert len(report) == 2
     assert all("removal failed" in line and "Bad rule" in line for line in report)
 
 
 def test_reap_reports_nothing_when_all_clean():
-    assert reap_leftover_drop_rules([FakeNode("node-a"), FakeNode("node-b")]) == []
+    nodes = [FakeNode("node-a"), FakeNode("node-b")]
+
+    assert reap_leaked_drop_rules(nodes, snapshot_drop_rules(nodes)) == []
+
+
+@pytest.mark.parametrize("error", [
+    SshConnectionLost("SSH session to node-a lost"),
+    RuntimeError("`sudo iptables -S` failed on node-a"),
+])
+def test_reap_continues_to_later_nodes_when_an_earlier_one_fails(error):
+    first = FakeNode("node-a")
+    second = FakeNode("node-b")
+    nodes = [first, second]
+    baseline = snapshot_drop_rules(nodes)
+    first.list_error = error
+    second.iptables_s = IPTABLES_S
+
+    report = reap_leaked_drop_rules(nodes, baseline)
+
+    assert report[0] == f"node-a: could not check for leaked rules: {error}"
+    assert len(report) == 3
+    assert all(line.startswith("node-b: ") and line.endswith("removed") for line in report[1:])
+    assert leftover_drop_rules(second) == []
+
+
+def test_reap_continues_when_a_removal_loses_the_session():
+    first = FakeNode("node-a")
+    second = FakeNode("node-b")
+    nodes = [first, second]
+    baseline = snapshot_drop_rules(nodes)
+    first.iptables_s = IPTABLES_S
+    second.iptables_s = IPTABLES_S
+    real = first.exec_with_exit
+
+    def lose_on_delete(cmd, timeout=600):
+        if cmd.startswith("sudo iptables -D"):
+            raise SshConnectionLost("dropped")
+        return real(cmd, timeout)
+
+    first.exec_with_exit = lose_on_delete
+
+    report = reap_leaked_drop_rules(nodes, baseline)
+
+    assert sum("removal failed" in line and "dropped" in line for line in report) == 2
+    assert leftover_drop_rules(second) == []
+
+
+def test_snapshot_records_each_nodes_current_rules():
+    nodes = [FakeNode("node-a", IPTABLES_S), FakeNode("node-b")]
+
+    baseline = snapshot_drop_rules(nodes)
+
+    assert sorted(baseline[0].elements()) == sorted(LEAKED)
+    assert not baseline[1]
+
+
+def test_snapshot_failure_disables_the_leak_check_for_that_node(caplog):
+    broken = FakeNode("node-a", "sudo: a password is required", list_exit=1)
+    healthy = FakeNode("node-b")
+    nodes = [broken, healthy]
+
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        baseline = snapshot_drop_rules(nodes)
+
+    assert baseline[0] is None and baseline[1] is not None
+    assert "node-a" in caplog.text and "password is required" in caplog.text
+    broken.iptables_s = IPTABLES_S
+    broken.list_exit = 0
+    broken.commands.clear()
+
+    assert reap_leaked_drop_rules(nodes, baseline) == []
+    assert broken.commands == []
+
+
+def test_snapshot_failure_is_warned_once_per_host_per_session(caplog):
+    node = FakeNode("node-a", "no sudo", list_exit=1)
+
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        snapshot_drop_rules([node])
+        snapshot_drop_rules([node])
+
+    assert caplog.text.count("leak detection is disabled on node-a") == 1
+
+
+def test_guard_passes_and_removes_nothing_when_the_test_leaks_nothing():
+    node = FakeNode("node-a", IPTABLES_S)
+
+    with node_health_guard([node]):
+        pass
+
+    assert not any(cmd.startswith("sudo iptables -D") for cmd in node.commands)
+
+
+def test_guard_fails_the_test_that_leaked_after_removing_the_rules():
+    first, second = FakeNode("node-a"), FakeNode("node-b")
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        with node_health_guard([first, second]):
+            second.iptables_s = IPTABLES_S
+
+    assert "node-b" in str(excinfo.value) and "removed" in str(excinfo.value)
+    assert leftover_drop_rules(second) == []
+
+
+def test_guard_does_not_error_when_iptables_is_unavailable():
+    node = FakeNode("node-a", "no sudo", list_exit=1)
+
+    with node_health_guard([node]):
+        node.list_exit = 0
+        node.iptables_s = IPTABLES_S
+
+    assert not any(cmd.startswith("sudo iptables -D") for cmd in node.commands)
+
+
+def test_guard_exits_the_shard_before_the_test_when_a_node_stays_unreachable():
+    lost = SshConnectionLost("reconnect refused")
+    nodes = [FakeNode("node-a"), FakeNode("node-b", reconnect_error=lost)]
+    ran = []
+
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        with node_health_guard(nodes):
+            ran.append(True)
+
+    assert excinfo.value.returncode == 3
+    assert "node-b" in str(excinfo.value) and "reconnect refused" in str(excinfo.value)
+    assert not ran
+    assert nodes[0].commands == []
 
 
 def test_check_nodes_reachable_lists_unreachable_hosts_with_their_errors():

@@ -18,6 +18,7 @@ import subprocess  # nosec B404
 import threading
 import time
 import logging
+from collections import Counter
 from pathlib import Path
 
 import paramiko
@@ -36,6 +37,8 @@ AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 # to the controller port would sever the CLI the test needs to observe the outage.
 CLI_NODE_INDEX = 0
 HEALTH_CHECK_TIMEOUT_S = 20
+# Hosts already warned about disabled leak detection, so it logs once per session.
+_leak_check_warned: set[str] = set()
 # HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
 # and heartbeat_timeout must clear spurd's fixed 30s send interval so ordinary
 # cadence jitter can never be mistaken for the grace-window bug.
@@ -166,15 +169,46 @@ def leftover_drop_rules(node: "SshNode") -> list[str]:
     return [line for line in out.splitlines() if pattern.match(line)]
 
 
-def reap_leftover_drop_rules(nodes: list["SshNode"]) -> list[str]:
-    """Remove every leftover partition rule on *nodes* so it cannot poison later
-    tests. Returns one report line per rule found, with the removal outcome."""
-    report = []
+def snapshot_drop_rules(nodes: list["SshNode"]) -> list[Counter | None]:
+    """Per node (same order), the partition rules present now. None where
+    ``iptables -S`` cannot be listed: leak detection is then skipped for that node."""
+    baseline = []
     for node in nodes:
-        for rule in leftover_drop_rules(node):
+        try:
+            baseline.append(Counter(leftover_drop_rules(node)))
+        except RuntimeError as err:
+            # Tests without partitions must still pass on a bed with no usable
+            # sudo iptables, so warn once instead of erroring every teardown.
+            if node.host not in _leak_check_warned:
+                _leak_check_warned.add(node.host)
+                logger.warning(
+                    "Partition leak detection is disabled on %s: `sudo iptables -S` failed: %s",
+                    node.host, err)
+            baseline.append(None)
+    return baseline
+
+
+def reap_leaked_drop_rules(nodes: list["SshNode"], baseline: list[Counter | None]) -> list[str]:
+    """Remove the partition rules a test added since *baseline* so they cannot
+    poison later tests. Rules already in the baseline are left alone. A failure
+    on one node is reported and does not stop the others. Returns one report
+    line per leaked rule or failure; empty when nothing leaked."""
+    report = []
+    for node, before in zip(nodes, baseline):
+        if before is None:
+            continue
+        try:
+            leaked = list((Counter(leftover_drop_rules(node)) - before).elements())
+        except RuntimeError as err:
+            report.append(f"{node.host}: could not check for leaked rules: {err}")
+            continue
+        for rule in leaked:
             delete = rule.replace("-A ", "-D ", 1)
-            code, out = node.exec_with_exit(f"sudo iptables {delete}",
-                                            timeout=HEALTH_CHECK_TIMEOUT_S)
+            try:
+                code, out = node.exec_with_exit(f"sudo iptables {delete}",
+                                                timeout=HEALTH_CHECK_TIMEOUT_S)
+            except RuntimeError as err:
+                code, out = -1, str(err)
             outcome = "removed" if code == 0 else f"removal failed (exit {code}): {out.strip()}"
             report.append(f"{node.host}: {rule.removeprefix('-A ')} -> {outcome}")
     return report
@@ -196,6 +230,24 @@ def unreachable_message(unreachable: dict[str, "SshConnectionLost"]) -> str:
     hosts = "; ".join(f"node {host} unreachable after reconnect ({err})"
                       for host, err in unreachable.items())
     return f"{hosts}; aborting shard"
+
+
+@contextlib.contextmanager
+def node_health_guard(nodes: list["SshNode"]):
+    """Around one test: reconnect dead sessions first, ending the shard if a node
+    stays unreachable, and afterwards fail on any partition the test leaked
+    (removing it so later tests are unaffected)."""
+    unreachable = check_nodes_reachable(nodes)
+    if unreachable:
+        pytest.exit(unreachable_message(unreachable), returncode=3)
+    baseline = snapshot_drop_rules(nodes)
+
+    yield
+
+    report = reap_leaked_drop_rules(nodes, baseline)
+    if report:
+        pytest.fail("node health check failed after the test:\n" + "\n".join(report),
+                    pytrace=False)
 
 
 @contextlib.contextmanager
@@ -883,7 +935,7 @@ class SpurCluster:
             shlex.quote(f"{self.bin_dir}/sbatch"),
         ]
         cmd_parts.extend(shlex.quote(a) for a in args)
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(" ".join(cmd_parts))
 
     def srun_with_exit(
         self, args: list[str], *, timeout: int | None = SshNode.DEFAULT_TIMEOUT_S
@@ -897,7 +949,7 @@ class SpurCluster:
         cmd_parts = self._cli_env_assignments()
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts), timeout=timeout)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(" ".join(cmd_parts), timeout=timeout)
 
     def srun_in_allocation(
         self,
@@ -923,7 +975,7 @@ class SpurCluster:
         if unset_env:
             unset = " ".join(f"-u {shlex.quote(name)}" for name in unset_env)
             cmd = f"env {unset} {cmd}"
-        return self.nodes[0].exec_with_exit(cmd)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
 
     def salloc_run(
         self,
@@ -946,7 +998,7 @@ class SpurCluster:
                                   extra_env=extra_env, all_nodes=all_nodes)
         if tty:
             cmd = f"script -qec {shlex.quote(cmd)} /dev/null"
-        return self.nodes[0].exec_with_exit(cmd)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
 
     def salloc_command(
         self,
