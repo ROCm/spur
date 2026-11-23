@@ -5,10 +5,10 @@
 
 # Verifies that AGENTS.md knowledge base docs stay in sync with source.
 # Checks: crate AGENTS.md presence, knowledge doc presence, module files
-# named in crate AGENTS.md exist, and RPC names (architecture.md +
-# spur-proto/AGENTS.md vs proto/slurm.proto).
+# named in crate AGENTS.md exist, and RPC names mentioned in
+# spur-proto/AGENTS.md exist in proto/slurm.proto.
 # Does NOT force docs to restate source (enum variants, ports, symbol
-# lists); AGENTS.md holds only what the code cannot show.
+# or RPC lists); the knowledge base holds only what the code cannot show.
 #
 # Usage:
 #   scripts/check-knowledge-sync.sh    # full check
@@ -103,35 +103,6 @@ check_rpc_names() {
     # Extract all RPC names from proto
     local proto_rpcs
     proto_rpcs=$(grep -oP 'rpc\s+\K[A-Za-z0-9]+' "$proto" | sort -u)
-
-    # Check architecture.md RPC lists match proto.
-    # Extract only from the bold-prefixed RPC listing lines (e.g. "**Job management:** SubmitJob, GetJobs, ...").
-    local arch="docs/knowledge/common/architecture.md"
-    if [ -f "$arch" ]; then
-        if ! grep -q '## 5\. gRPC services' "$arch"; then
-            fail "RPC: '## 5. gRPC services' heading not found in $arch (renamed?)"
-            return
-        fi
-        local arch_rpcs
-        arch_rpcs=$(sed -n '/## 5\. gRPC services/,/## 6\./p' "$arch" \
-            | sed -e ':a' -e '/^\*\*/{' -e 'N' -e '/\n[^*#\n]/{ s/\n/ /; ba; }' -e '}' \
-            | grep '^\*\*' \
-            | tr ',' '\n' \
-            | grep -oE '[A-Z][a-zA-Z0-9]+' \
-            | sort -u || true)
-
-        while IFS= read -r rpc; do
-            [ -z "$rpc" ] && continue
-            case "$rpc" in
-                SlurmController|SlurmAccounting|SlurmAgent|PostgreSQL) continue ;;
-                Served|Backed|Connects|Called|Networking|Diagnostics|Admission|Signals) continue ;;
-                Job|Node|Partition|Cluster|Fairshare|Audit|QOS|WireGuard|Reservation|Entity) continue ;;
-            esac
-            if ! grep -qx "$rpc" <<< "$proto_rpcs"; then
-                fail "RPC: $rpc listed in $arch gRPC services section but not found in $proto"
-            fi
-        done <<< "$arch_rpcs"
-    fi
 
     # Check RPC names mentioned in spur-proto/AGENTS.md exist in proto
     local proto_agents="crates/spur-proto/AGENTS.md"
