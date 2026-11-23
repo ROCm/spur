@@ -35,7 +35,7 @@ INTERIM_ELECTION_TIMEOUT_SECS = 10
 RACE_SETTLE_TIMEOUT_SECS = 30
 # Each staging attempt is a lottery the original leader can lose to a peer, so
 # retry for a time budget rather than a fixed count.
-RECLAIM_DEADLINE_SECS = 300
+RECLAIM_DEADLINE_SECS = 600
 RECLAIM_ATTEMPTS_REPORTED = 5
 GRACE_SECS = max(HA_HEARTBEAT_TIMEOUT_SECS, HA_HEALTH_TICK_SECS)
 # Wait past grace plus one full health tick before judging node/job state.
