@@ -46,12 +46,14 @@ use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
+use spur_proto::proto::StepCheckpointRecord;
 
 use crate::accounting::{
     txn, AccountingNotifier, JobEndRecord, JobStartRecord, JobSubmission, TxnAction, TxnEntity,
     TxnOutcome, TxnRecord, TxnSource,
 };
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
+use crate::checkpoint_store::{self, CheckpointStore};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
 use crate::pmix_dispatch;
@@ -748,6 +750,9 @@ pub struct ClusterManager {
     /// Spared retries granted for held-reserved refusals, so a stuck leftover can't
     /// re-dispatch forever without charging `max_batch_requeue`. Leader-local; a failover reset is harmless.
     spared_dispatches: parking_lot::Mutex<HashMap<JobId, u32>>,
+    /// Leader-local; never persisted. Accumulates in-flight checkpoint telemetry
+    /// and finalized run outcomes; see the `checkpoint_store` module doc.
+    checkpoint_store: parking_lot::Mutex<CheckpointStore>,
 }
 
 /// Spared retries a job gets before its held-reserved refusals count against
@@ -1185,6 +1190,9 @@ impl ClusterManager {
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
             spared_dispatches: parking_lot::Mutex::new(HashMap::new()),
+            checkpoint_store: parking_lot::Mutex::new(CheckpointStore::new(
+                spur_metrics::CheckpointMetrics::new(),
+            )),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1996,6 +2004,110 @@ impl ClusterManager {
 
     pub fn reset_karma_stats(&self) {
         self.karma_stats.reset();
+    }
+
+    /// Whether this replica currently believes itself the Raft leader, read
+    /// from its own `raft` handle. `false` when unset (construction, or a test
+    /// that never calls `set_raft`) -- `run_job_finalized_side_effects` falls
+    /// back to a narrower check in that case; see `mark_checkpoint_ended`.
+    fn is_leader(&self) -> bool {
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        let m = raft.metrics().borrow().clone();
+        m.current_leader == Some(m.id)
+    }
+
+    /// Validate and ingest one node's checkpoint-telemetry batch against the
+    /// current job map, capping it at `checkpoint_store::MAX_RECORDS_PER_REQUEST`
+    /// (excess counted rejected without being considered). Returns `(accepted,
+    /// rejected)`.
+    pub fn checkpoint_ingest(
+        &self,
+        hostname: &str,
+        records: Vec<StepCheckpointRecord>,
+    ) -> (u32, u32) {
+        let now = Utc::now();
+        let overflow = (records
+            .len()
+            .saturating_sub(checkpoint_store::MAX_RECORDS_PER_REQUEST))
+            as u32;
+        let mut accepted = 0u32;
+        let mut rejected = overflow;
+        for rec in records
+            .into_iter()
+            .take(checkpoint_store::MAX_RECORDS_PER_REQUEST)
+        {
+            let live = self
+                .jobs
+                .read()
+                .get(&rec.job_id)
+                .filter(|job| job.state.is_active())
+                .map(|job| checkpoint_store::RunInfo {
+                    job_id: job.job_id,
+                    run_attempt: job.run_attempt,
+                    nodes: job.allocated_nodes.clone(),
+                    user: job.spec.user.clone(),
+                    account: job.spec.account.clone().unwrap_or_default(),
+                    job_name: job.spec.name.clone(),
+                });
+            match self
+                .checkpoint_store
+                .lock()
+                .ingest(hostname, rec, live, now)
+            {
+                Ok(()) => accepted += 1,
+                Err(_) => rejected += 1,
+            }
+        }
+        (accepted, rejected)
+    }
+
+    /// Periodic maintenance for the checkpoint store: drop not-yet-ended
+    /// entries for runs that no longer occupy a run (built under a brief
+    /// `jobs.read()`, released before the store is locked), then finalize any
+    /// ended entry past its grace deadline.
+    pub fn checkpoint_sweep(&self) {
+        let live: HashSet<(u32, u32)> = {
+            let jobs = self.jobs.read();
+            jobs.values()
+                .filter(|job| job.state.is_active())
+                .map(|job| (job.job_id, job.run_attempt))
+                .collect()
+        };
+        let mut store = self.checkpoint_store.lock();
+        store.retain_live(&live);
+        store.sweep(Utc::now());
+    }
+
+    /// Test-only: finalize every ended checkpoint run as if `FINALIZE_GRACE`
+    /// had already elapsed, without an actual wall-clock wait.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_finalize_past_grace_for_test(&self) {
+        let now = Utc::now()
+            + chrono::Duration::from_std(checkpoint_store::FINALIZE_GRACE)
+                .expect("FINALIZE_GRACE fits in a chrono::Duration");
+        self.checkpoint_store.lock().sweep(now);
+    }
+
+    /// OpenMetrics body for the long-lived checkpoint counters/histograms,
+    /// appended to `/metrics/jobs`.
+    pub fn checkpoint_metrics_body(&self) -> String {
+        spur_metrics::encode_checkpoint_metrics(self.checkpoint_store.lock().metrics())
+    }
+
+    /// OpenMetrics body for per-job checkpoint gauges plus the per-job
+    /// invalid-event counter, appended to `/metrics/jobs-users-accts`
+    /// (high-cardinality, leader-only).
+    pub fn checkpoint_job_metrics_body(&self) -> String {
+        let store = self.checkpoint_store.lock();
+        let jobs = store.job_snapshots(Utc::now());
+        let failed = store.job_failed_snapshots();
+        drop(store);
+        spur_metrics::export::concat_encoded([
+            spur_metrics::encode_checkpoint_job_metrics(&jobs),
+            spur_metrics::encode_checkpoint_job_failed_metrics(&failed),
+        ])
     }
 
     /// The Running jobs whose preemption grace ends at or before `now`. Filters
@@ -3706,19 +3818,58 @@ impl ClusterManager {
                 stats.record_preempted();
             }
         }
-        {
+        let run_info = {
             let jobs = self.jobs.read();
-            if let Some(job) = jobs.get(&finalized.job_id) {
+            jobs.get(&finalized.job_id).map(|job| {
                 self.karma_stats.record_finalized(
                     &job.spec.user,
                     finalized.state,
                     finalized.actual_secs,
                 );
-            }
+                checkpoint_store::RunInfo {
+                    job_id: finalized.job_id,
+                    run_attempt: finalized.run_attempt,
+                    // `finalized.nodes` is the run's allocation at the moment it
+                    // ended; the job's own current list is a fallback only for a
+                    // (pre-upgrade or test) `JobFinalized` that never set it.
+                    nodes: if finalized.nodes.is_empty() {
+                        job.allocated_nodes.clone()
+                    } else {
+                        finalized.nodes.clone()
+                    },
+                    user: job.spec.user.clone(),
+                    account: job.spec.account.clone().unwrap_or_default(),
+                    job_name: job.spec.name.clone(),
+                }
+            })
+        };
+        if let Some(info) = run_info {
+            self.mark_checkpoint_ended(info, finalized);
         }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized);
         self.react_to_health_job_finalized(finalized.job_id, finalized.state, finalized.exit_code);
+    }
+
+    /// Record a finalized run's checkpoint outcome, gated on leadership when a
+    /// raft handle is reachable (a true follower never counts one). When no
+    /// handle is set at all (construction, or a test that never calls
+    /// `set_raft`), record only if the store already holds an entry for this
+    /// run -- the narrower fallback keeps an untouched job from spontaneously
+    /// gaining an outcome in that environment.
+    fn mark_checkpoint_ended(&self, info: checkpoint_store::RunInfo, finalized: &JobFinalized) {
+        let raft_set = self.raft.read().is_some();
+        if raft_set && !self.is_leader() {
+            return;
+        }
+        let reason = spur_metrics::job_state_metric_suffix(finalized.state);
+        let mut store = self.checkpoint_store.lock();
+        // Raft is set before the gRPC server binds, so without it the store
+        // only holds what a test seeded; startup replay never counts outcomes.
+        if !raft_set && !store.has_entry(info.job_id, info.run_attempt) {
+            return;
+        }
+        store.mark_ended(info, reason, Utc::now(), finalized.grace_started_at);
     }
 
     pub(crate) fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
@@ -8880,6 +9031,13 @@ impl ClusterManager {
         preempt_qos: Option<String>,
         at: DateTime<Utc>,
     ) -> Option<JobFinalized> {
+        // Captured before the reset below clears `preempt_pending`, so the
+        // checkpoint store can tell whether this run ended inside its grace.
+        let grace_started_at = job.preempt_grace().map(|pending| pending.signaled_at);
+        // Captured before `reset_job_for_preempt_requeue` clears `allocated_nodes`,
+        // so the checkpoint store gets the run's real allocation, not the empty
+        // list the job holds once it's back in Pending.
+        let ended_nodes = job.allocated_nodes.clone();
         if let Err(e) = job.transition(JobState::Preempted) {
             warn!(job_id = job.job_id, error = %e, "invalid preempt transition in WAL apply");
             return None;
@@ -8907,7 +9065,10 @@ impl ClusterManager {
         job.preempted_by = preempted_by;
         job.preempt_mode = Some("Requeue".to_string());
         job.preempt_qos = preempt_qos.clone();
-        let finalized = JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
+        let mut finalized =
+            JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
+        finalized.grace_started_at = grace_started_at;
+        finalized.nodes = ended_nodes;
         let desc = spur_core::end_reason::preemption_summary(preempted_by, preempt_qos.as_deref());
         job.set_pending_reason_desc(PendingReason::Preempted, desc);
         Some(finalized)
@@ -9498,7 +9659,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
-                let finalized;
+                let mut finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -9508,6 +9669,9 @@ impl ClusterManager {
                     {
                         return ClientResponse::default();
                     }
+                    // Captured before the clear below, so the checkpoint
+                    // store can tell whether this run ended inside its grace.
+                    let grace_started_at = job.preempt_grace().map(|pending| pending.signaled_at);
                     if let Err(e) = job.transition(JobState::Preempted) {
                         warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition in WAL apply");
                         return ClientResponse::default();
@@ -9521,6 +9685,7 @@ impl ClusterManager {
                     job.cancel_signaled_at = Some(at);
                     job.preempt_pending = None;
                     finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
+                    finalized.grace_started_at = grace_started_at;
 
                     // The killed run still occupies its nodes; wait in Completing
                     // until each reports, then finalize as CANCELLED / PREEMPTED.
@@ -9528,6 +9693,23 @@ impl ClusterManager {
                         if let Err(e) = job.transition(JobState::Completing) {
                             warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition to Completing");
                             return ClientResponse::default();
+                        }
+                        // By the time this run's eventual node reports finalize
+                        // it (via `finalize_reported_run`), `preempt_pending` is
+                        // already cleared above, so note the grace here instead
+                        // -- never take the checkpoint store lock while holding
+                        // the jobs write lock.
+                        let note_grace =
+                            grace_started_at.map(|signaled_at| (job.run_attempt, signaled_at));
+                        drop(jobs);
+                        if self.is_leader() {
+                            if let Some((run_attempt, signaled_at)) = note_grace {
+                                self.checkpoint_store.lock().note_grace(
+                                    *job_id,
+                                    run_attempt,
+                                    signaled_at,
+                                );
+                            }
                         }
                         return ClientResponse {
                             preempt_applied: true,
@@ -37529,6 +37711,58 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_requeue_reports_the_grace_it_ended_inside() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+        let signaled_at = preempt_pending_for(0, 0).signaled_at;
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id: id,
+            begin_time: Utc::now(),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].grace_started_at, Some(signaled_at));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_cancel_reports_the_grace_it_ended_inside() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+        let signaled_at = preempt_pending_for(0, 0).signaled_at;
+        // No nodes left to wait on: the apply finalizes in this same call
+        // instead of waiting in Completing for a node report.
+        cm.jobs
+            .write()
+            .get_mut(&id)
+            .unwrap()
+            .allocated_nodes
+            .clear();
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].grace_started_at, Some(signaled_at));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn force_complete_clears_preempt_pending() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -46214,6 +46448,395 @@ state = "UP"
             Some("premium"),
             "the resolved default QoS must be recorded on the job"
         );
+    }
+
+    // --- checkpoint-store wiring ---
+
+    /// Ingest one accepted checkpoint record for `job_id`'s `run_attempt` from
+    /// `node`, completed and final, timestamped now (after today's fixture
+    /// grace instants, so a grace outcome built from it reads `completed`).
+    fn ingest_checkpoint_record(
+        cm: &ClusterManager,
+        job_id: JobId,
+        run_attempt: u32,
+        node: &str,
+        is_final: bool,
+    ) {
+        let now = Utc::now();
+        let rec = StepCheckpointRecord {
+            job_id,
+            run_attempt,
+            step_id: 0,
+            is_final,
+            completed: 1,
+            failed: 0,
+            last_completed_step: Some(10),
+            last_completed_at: Some(prost_types::Timestamp {
+                seconds: now.timestamp(),
+                nanos: now.timestamp_subsec_nanos() as i32,
+            }),
+            in_progress_step: None,
+            in_progress_since: None,
+            restore_step: None,
+            uid_verified: 0,
+            dropped: HashMap::new(),
+        };
+        assert_eq!(
+            cm.checkpoint_ingest(node, vec![rec]),
+            (1, 0),
+            "checkpoint record must be accepted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_completed_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-completed", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+
+        cm.complete_job(id, 0, JobState::Completed).unwrap();
+        settle(&cm, id, JobState::Completed);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="completed",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_failed_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-failed", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+
+        cm.complete_job(id, 1, JobState::Failed).unwrap();
+        settle(&cm, id, JobState::Failed);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="failed",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_timeout_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-timeout", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+
+        cm.signal_time_limit(id, Utc::now()).unwrap();
+        wait_for("time limit expiry recorded", || {
+            cm.get_job(id)
+                .is_some_and(|j| j.time_limit_signaled_at.is_some())
+        });
+        cm.complete_job(id, 1, JobState::Failed).unwrap();
+        settle(&cm, id, JobState::Timeout);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="timeout",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_cancelled_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-cancelled", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+
+        cm.cancel_job(id, "testuser").unwrap();
+        cm.node_complete(id, "worker1", -1, 15, run_attempt)
+            .unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="cancelled",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_node_failure_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-nodefail", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+
+        lose_node(&cm, "worker1");
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="node_fail",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_an_immediate_preempt_cancel_with_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "ckpt-preempt-cancel-immediate", "n1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "n1", true);
+
+        // No nodes left to wait on: the apply finalizes in this same call
+        // instead of waiting in Completing for a node report (see
+        // `final_preempt_cancel_reports_the_grace_it_ended_inside` above).
+        cm.jobs
+            .write()
+            .get_mut(&id)
+            .unwrap()
+            .allocated_nodes
+            .clear();
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        let body = cm.checkpoint_metrics_body();
+        assert!(body
+            .contains(r#"spur_job_runs_ended_total{reason="preempted",checkpoint="completed"} 1"#));
+        assert!(body.contains(r#"spur_preempt_grace_checkpoint_total{outcome="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_preempt_cancel_that_waits_in_completing_with_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "ckpt-preempt-cancel-wait", "n1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "n1", true);
+
+        // n1 is still allocated: the apply waits in Completing. `note_grace`
+        // is what lets the eventual node-report finalize carry the grace this
+        // run started in, since `finalize_reported_run`'s `JobFinalized` has
+        // already lost `preempt_pending` by then.
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemption_claim: None,
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+        assert!(resp.jobs_finalized.is_empty(), "waits for n1 to report");
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+
+        cm.node_complete(id, "n1", -1, 15, run_attempt).unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        let body = cm.checkpoint_metrics_body();
+        assert!(body
+            .contains(r#"spur_job_runs_ended_total{reason="preempted",checkpoint="completed"} 1"#));
+        assert!(body.contains(r#"spur_preempt_grace_checkpoint_total{outcome="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_records_a_preempt_requeue_with_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "ckpt-preempt-requeue", "n1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "n1", true);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id: id,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+
+        cm.checkpoint_finalize_past_grace_for_test();
+        let body = cm.checkpoint_metrics_body();
+        assert!(body
+            .contains(r#"spur_job_runs_ended_total{reason="preempted",checkpoint="completed"} 1"#));
+        assert!(body.contains(r#"spur_preempt_grace_checkpoint_total{outcome="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_store_keeps_the_real_node_list_through_a_preempt_requeue() {
+        // Regression test: `repend_after_preemption` used to build
+        // `JobFinalized` after `reset_job_for_preempt_requeue` had already
+        // cleared `job.allocated_nodes`, so the checkpoint store's `RunInfo`
+        // lost the run's real allocation and rejected a late final record
+        // from the node that actually ran it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let id = run_job_on(&cm, "ckpt-preempt-requeue-nodes", "worker1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", false);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id: id,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+        assert_eq!(
+            resp.jobs_finalized[0].nodes,
+            vec!["worker1".to_string()],
+            "JobFinalized must carry the run's real allocation"
+        );
+        assert!(
+            cm.get_job(id).unwrap().allocated_nodes.is_empty(),
+            "the job itself is back in Pending with no nodes"
+        );
+        cm.run_all_finalized_side_effects(&resp);
+
+        // A late final record from the node that actually ran the job is
+        // still accepted and counted, not rejected as NodeNotAllocated.
+        ingest_checkpoint_record(&cm, id, run_attempt, "worker1", true);
+        cm.checkpoint_finalize_past_grace_for_test();
+        assert!(cm
+            .checkpoint_metrics_body()
+            .contains(r#"spur_job_runs_ended_total{reason="preempted",checkpoint="completed"} 1"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_sweep_retains_a_live_run_and_drops_a_stale_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+
+        let live_id = run_job_on(&cm, "ckpt-sweep-live", "worker1");
+        let live_attempt = cm.get_job(live_id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, live_id, live_attempt, "worker1", false);
+
+        let stale_id = run_job_on(&cm, "ckpt-sweep-stale", "worker2");
+        let stale_attempt = cm.get_job(stale_id).unwrap().run_attempt;
+        ingest_checkpoint_record(&cm, stale_id, stale_attempt, "worker2", false);
+
+        // Simulate a replica that saw this op applied via Raft replication
+        // without ever running `run_job_finalized_side_effects` (a true
+        // follower never does) -- `mark_ended` never fires, so the store is
+        // left holding a not-yet-ended entry for a job that is no longer active.
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: stale_id,
+            exit_code: 0,
+            state: JobState::Completed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+
+        cm.checkpoint_sweep();
+
+        let jobs_body = cm.checkpoint_job_metrics_body();
+        assert!(
+            jobs_body.contains(&format!("job_id=\"{live_id}\"")),
+            "a run still occupying a run must be retained"
+        );
+        assert!(
+            !jobs_body.contains(&format!("job_id=\"{stale_id}\"")),
+            "a not-yet-ended run no longer occupying a run must be dropped"
+        );
+        assert!(
+            !cm.checkpoint_metrics_body()
+                .contains("spur_job_runs_ended_total"),
+            "a dropped not-yet-ended entry must not be counted as finalized"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follower_never_counts_a_checkpoint_outcome() {
+        let dir = TempDir::new().unwrap();
+        // `ClusterManager::new` with no `set_raft` call: `is_leader()` reads
+        // `false`, matching a real follower (a raft handle is set, but this
+        // replica never wins an election). `register_node` (the production
+        // RPC handler's path) proposes through raft, so the node is
+        // registered directly through `apply_operation` instead.
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "worker1".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
+            labels: HashMap::new(),
+            source: NodeSource::default(),
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("ckpt-no-raft")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(1, 1000);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        // No raft handle set at all here, so the store never saw this job
+        // ingested either: the narrower fallback in `mark_checkpoint_ended`
+        // (record only if the store already holds an entry) also declines.
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+
+        assert_eq!(cm.checkpoint_metrics_body(), "# EOF\n");
     }
 }
 

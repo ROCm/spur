@@ -712,6 +712,9 @@ service SlurmController {
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
 
+  // Batched per-step checkpoint telemetry from spurd; never piggybacks on Heartbeat.
+  rpc ReportCheckpointTelemetry(ReportCheckpointTelemetryRequest) returns (ReportCheckpointTelemetryResponse);
+
   // Partition management
   rpc CreatePartition(CreatePartitionRequest) returns (google.protobuf.Empty);
   rpc UpdatePartition(UpdatePartitionRequest) returns (google.protobuf.Empty);
@@ -2047,6 +2050,34 @@ message ReportJobStatusRequest {
   // job shares the interactive step id, so this names which one exited.
   // Absent from a legacy agent.
   optional uint32 pty_step_id = 12;
+}
+
+message ReportCheckpointTelemetryRequest {
+  string hostname = 1;
+  string node_token = 2;
+  repeated StepCheckpointRecord records = 3;
+}
+
+message StepCheckpointRecord {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  uint32 step_id = 3;
+  bool is_final = 4;
+  uint64 completed = 5;
+  uint64 failed = 6;
+  optional uint64 last_completed_step = 7;
+  google.protobuf.Timestamp last_completed_at = 8;
+  optional uint64 in_progress_step = 9;
+  google.protobuf.Timestamp in_progress_since = 10;
+  optional uint64 restore_step = 11;
+  uint64 uid_verified = 12;
+  // Keyed by the drop reason's stable snake_case name.
+  map<string, uint64> dropped = 13;
+}
+
+message ReportCheckpointTelemetryResponse {
+  uint32 accepted = 1;
+  uint32 rejected = 2;
 }
 
 // ============================================================

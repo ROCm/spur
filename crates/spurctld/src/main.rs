@@ -6,6 +6,7 @@ mod agent_client;
 mod association_cache;
 mod audit;
 mod auth_middleware;
+mod checkpoint_store;
 mod cluster;
 mod cluster_k8s;
 mod dispatch_tracker;

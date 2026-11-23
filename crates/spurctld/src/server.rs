@@ -2928,6 +2928,24 @@ impl SlurmController for ControllerService {
         }
     }
 
+    async fn report_checkpoint_telemetry(
+        &self,
+        request: Request<ReportCheckpointTelemetryRequest>,
+    ) -> Result<Response<ReportCheckpointTelemetryResponse>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+
+        let req = request.into_inner();
+        self.verify_node_identity(&req.hostname, &req.node_token)?;
+
+        let (accepted, rejected) = self.cluster.checkpoint_ingest(&req.hostname, req.records);
+        Ok(Response::new(ReportCheckpointTelemetryResponse {
+            accepted,
+            rejected,
+        }))
+    }
+
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -9885,6 +9903,12 @@ mod tests {
         ) -> Result<Response<HeartbeatResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
+        async fn report_checkpoint_telemetry(
+            &self,
+            _request: Request<ReportCheckpointTelemetryRequest>,
+        ) -> Result<Response<ReportCheckpointTelemetryResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
         async fn report_stepd_recovery(
             &self,
             _request: Request<StepdRecoveryRequest>,
@@ -10229,6 +10253,151 @@ mod tests {
         config.auth.jwt_key = Some("test-node-identity-key".into());
         config.admission.mode = spur_core::config::AdmissionMode::Token;
         test_service_with(dir, config).await
+    }
+
+    /// Submits job `id` and starts it Running on `nodes` under `run_attempt` 0,
+    /// directly against the cluster state (no agents involved), so checkpoint
+    /// RPC tests have a live run to ingest against.
+    fn running_job_for_checkpoints(
+        cluster: &crate::cluster::ClusterManager,
+        id: u32,
+        nodes: &[&str],
+    ) {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+        let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
+        cluster.apply_operation(&WalOperation::JobSubmit {
+            job_id: id,
+            spec: Box::new(JobSpec {
+                name: "ckpt".into(),
+                user: "alice".into(),
+                account: Some("acctA".into()),
+                num_nodes: nodes.len() as u32,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        cluster.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cluster.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: id,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            resources: res,
+            per_node_alloc,
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+    }
+
+    fn checkpoint_record(job_id: u32, step_id: u32) -> StepCheckpointRecord {
+        StepCheckpointRecord {
+            job_id,
+            run_attempt: 0,
+            step_id,
+            is_final: false,
+            completed: 1,
+            failed: 0,
+            last_completed_step: None,
+            last_completed_at: None,
+            in_progress_step: None,
+            in_progress_since: None,
+            restore_step: None,
+            uid_verified: 0,
+            dropped: HashMap::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn report_checkpoint_telemetry_accepts_a_record_from_an_allocated_node() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        running_job_for_checkpoints(&svc.cluster, 1, &["n1"]);
+
+        let resp = svc
+            .report_checkpoint_telemetry(Request::new(ReportCheckpointTelemetryRequest {
+                hostname: "n1".into(),
+                node_token: String::new(),
+                records: vec![checkpoint_record(1, 0)],
+            }))
+            .await
+            .expect("accepted")
+            .into_inner();
+
+        assert_eq!(resp.accepted, 1);
+        assert_eq!(resp.rejected, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn report_checkpoint_telemetry_rejects_a_record_from_an_unallocated_node() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        running_job_for_checkpoints(&svc.cluster, 1, &["n1"]);
+
+        let resp = svc
+            .report_checkpoint_telemetry(Request::new(ReportCheckpointTelemetryRequest {
+                hostname: "n2".into(),
+                node_token: String::new(),
+                records: vec![checkpoint_record(1, 0)],
+            }))
+            .await
+            .expect("rpc succeeds; rejection is reported in the response, not the status")
+            .into_inner();
+
+        assert_eq!(resp.accepted, 0);
+        assert_eq!(resp.rejected, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn report_checkpoint_telemetry_rejects_a_bad_node_token_when_identity_is_enforced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        running_job_for_checkpoints(&svc.cluster, 1, &["n1"]);
+
+        let error = svc
+            .report_checkpoint_telemetry(Request::new(ReportCheckpointTelemetryRequest {
+                hostname: "n1".into(),
+                node_token: "not-a-real-token".into(),
+                records: vec![checkpoint_record(1, 0)],
+            }))
+            .await
+            .expect_err("a bad node token must be rejected");
+
+        assert_eq!(error.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn report_checkpoint_telemetry_caps_a_batch_at_the_per_request_limit() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        running_job_for_checkpoints(&svc.cluster, 1, &["n1"]);
+
+        let records = (0..1030).map(|step| checkpoint_record(1, step)).collect();
+
+        let resp = svc
+            .report_checkpoint_telemetry(Request::new(ReportCheckpointTelemetryRequest {
+                hostname: "n1".into(),
+                node_token: String::new(),
+                records,
+            }))
+            .await
+            .expect("accepted")
+            .into_inner();
+
+        assert_eq!(resp.accepted, 1024);
+        assert_eq!(resp.rejected, 6);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

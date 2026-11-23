@@ -20,6 +20,8 @@ Configuring and operating a Spur cluster.
   hooks.
 - :doc:`karma-scoring` — per-user job lifecycle counters for computing a cluster
   citizenship karma score in Prometheus.
+- :doc:`checkpoint-metrics` — metrics for workload-reported checkpoint events:
+  run outcomes, preemption-grace checkpoint results, and dropped-event counts.
 - :doc:`tres-billing-weights` — configurable TRES billing weights for fairshare,
   so GPU-heavy clusters bill GPU-seconds at a higher rate than CPU-seconds.
 

@@ -1,0 +1,4 @@
+# HELP spur_job_checkpoints_failed Cumulative invalid checkpoint events for a job across every run attempt, by reason.
+# TYPE spur_job_checkpoints_failed counter
+spur_job_checkpoints_failed_total{job_id="10",user="alice",account="teamA",job_name="train",reason="job_mismatch"} 2
+# EOF

@@ -37,7 +37,7 @@ Central scheduler and cluster manager. Raft-replicated.
 - **Partitions:** GetPartitions, CreatePartition, UpdatePartition, DeletePartition,
   Reconfigure
 - **Job steps:** GetJobSteps, CreateJobStep, CompleteJobStep, RunStep
-- **Agent registration:** RegisterAgent, Heartbeat, ReportStepdRecovery
+- **Agent registration:** RegisterAgent, Heartbeat, ReportStepdRecovery, ReportCheckpointTelemetry
 - **Admission tokens:** CreateToken, ListTokens, RevokeToken
 - **Reservations:** CreateReservation, UpdateReservation, DeleteReservation,
   ListReservations
