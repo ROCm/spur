@@ -2747,19 +2747,35 @@ def retry_until_qos_ready(submit, timeout: int = 15) -> str:
         return out
 
 
+_QUEUE_TAIL_LINES = 40
+
+
+def _timeout_with_queue(headline: str, queue_output: str | None) -> TimeoutError:
+    """A TimeoutError whose first line is *headline*, followed by the last
+    queue listing polled, so a failure shows what the scheduler was doing."""
+    if queue_output is None:
+        return TimeoutError(headline)
+    tail = "\n".join(queue_output.rstrip("\n").splitlines()[-_QUEUE_TAIL_LINES:])
+    return TimeoutError(f"{headline}\n{tail}")
+
+
 def wait_job_state(
     cluster: SpurCluster, job_id: int, state: str, timeout: int = 120
 ) -> None:
     """Wait until the job reaches the given squeue state (e.g. PD, R)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        sq = cluster.squeue_all()
-        if job_state(sq, job_id) == state:
-            return
-        time.sleep(2)
-    raise TimeoutError(
-        f"Job {job_id} did not reach state {state} within {timeout}s"
-    )
+    last_queue = None
+
+    def reached():
+        nonlocal last_queue
+        last_queue = cluster.squeue_all()
+        return job_state(last_queue, job_id) == state
+
+    try:
+        wait_until(reached, timeout_s=timeout, interval_s=2)
+    except TimeoutError:
+        raise _timeout_with_queue(
+            f"Job {job_id} did not reach state {state} within {timeout}s", last_queue
+        ) from None
 
 
 def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
@@ -2768,26 +2784,47 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     Returns "GONE" if the job disappears from the queue after being seen.
     Raises TimeoutError if the job doesn't finish within the timeout.
     """
-    deadline = time.time() + timeout
     last = ""
     seen = False
-    while time.time() < deadline:
-        sq = cluster.squeue_all()
-        state = job_state(sq, job_id)
+    last_queue = None
+
+    def finished():
+        nonlocal last, seen, last_queue
+        last_queue = cluster.squeue_all()
+        state = job_state(last_queue, job_id)
         if state in _TERMINAL_STATE_CODES:
             return state
         if state is None:
-            if seen:
-                return last if last else "GONE"
-            # Job not visible yet — give scheduler a moment
-            time.sleep(1)
-            continue
+            # A job not yet visible is still being registered by the scheduler.
+            return (last if last else "GONE") if seen else None
         seen = True
         last = state
-        time.sleep(2)
-    raise TimeoutError(
-        f"Job {job_id} did not finish within {timeout}s (last state: {last})"
-    )
+        return None
+
+    try:
+        return wait_until(finished, timeout_s=timeout, interval_s=2)
+    except TimeoutError:
+        raise _timeout_with_queue(
+            f"Job {job_id} did not finish within {timeout}s (last state: {last})",
+            last_queue,
+        ) from None
+
+
+def wait_job_id_by_name(cluster: SpurCluster, name: str, timeout: int = 30) -> int:
+    """Wait until a job named *name* is in the queue (any state) and return its id.
+
+    Submission can return before the job is visible or scheduled, so callers
+    that look a job up by name must poll rather than sleep."""
+    def first_id():
+        out = cluster.squeue(["-n", name, "-t", "all", "-h", "-o", "%i"])
+        for line in out.splitlines():
+            fields = line.split()
+            if fields and fields[0].isdigit():
+                return int(fields[0])
+        return None
+
+    return wait_until(first_id, timeout_s=timeout, interval_s=1,
+                      desc=f"a job named {name} to appear in the queue")
 
 
 def wait_sacct_row(cluster: SpurCluster, job_id: int, fmt: str,

@@ -5,7 +5,7 @@
 
 import time
 
-from cluster import parse_job_id, job_state, wait_job
+from cluster import parse_job_id, job_state, wait_job, wait_job_state, wait_until
 
 
 def test_job_state_normalizes_truncated_out_of_memory():
@@ -124,13 +124,15 @@ class TestJobLifecycle:
         job_id = parse_job_id(sb)
         assert job_id is not None
 
-        time.sleep(3)
+        wait_job_state(cluster, job_id, "R", timeout=30)
         cluster.scancel(str(job_id))
-        time.sleep(2)
 
-        sq = cluster.squeue_all()
-        state = job_state(sq, job_id)
-        assert state in ("CA", "F", None), f"expected cancelled, got {state}"
+        # A purged job (None) was cancelled too: it was confirmed running above.
+        def cancelled():
+            return job_state(cluster.squeue_all(), job_id) in ("CA", "F", None)
+
+        wait_until(cancelled, timeout_s=30, interval_s=2,
+                   desc=f"job {job_id} to be cancelled")
 
     def test_job_cancel_releases_resources(self, cluster):
         script = cluster.write_file(
@@ -213,9 +215,8 @@ class TestJobLifecycle:
         job_b = parse_job_id(sb_b)
         assert job_b is not None
 
-        time.sleep(3)
+        wait_job_state(cluster, job_a, "R", timeout=30)
         sq = cluster.squeue_all()
-        assert job_state(sq, job_a) == "R"
         assert job_state(sq, job_b) == "PD"
 
         wait_job(cluster, job_a, timeout=60)

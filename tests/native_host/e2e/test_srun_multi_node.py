@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import parse_job_id, wait_job, wait_job_id_by_name, wait_job_state
 
 
 class TestStandaloneSrun:
@@ -62,15 +62,8 @@ class TestStandaloneSrun:
         )
         pid_out = cluster.nodes[0].exec(srun_cmd).strip()
         assert pid_out.isdigit(), f"expected background srun pid, got: {pid_out!r}"
-        time.sleep(2)
 
-        job_ids = cluster.running_job_ids_by_name("srun-hold")
-        assert job_ids, (
-            "expected running srun-hold job in squeue:\n"
-            f"{cluster.squeue(['-n', 'srun-hold', '-t', 'all'])}"
-        )
-        job_id = job_ids[0]
-
+        job_id = wait_job_id_by_name(cluster, "srun-hold")
         wait_job_state(cluster, job_id, "R", timeout=30)
         show = cluster.scontrol("show", "job", str(job_id))
         assert "JobState=RUNNING" in show, f"expected RUNNING job:\n{show}"

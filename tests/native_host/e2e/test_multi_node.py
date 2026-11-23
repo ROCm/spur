@@ -9,7 +9,9 @@ The multi_node_cluster fixture validates this and skips if insufficient.
 
 import time
 
-from cluster import parse_job_id, job_state, wait_job, wait_job_state, wait_node_state
+from cluster import (
+    parse_job_id, job_state, wait_job, wait_job_state, wait_node_state, wait_until,
+)
 
 
 class TestMultiNodeDispatch:
@@ -213,7 +215,7 @@ class TestMultiNodeScheduling:
         out2 = f"{cluster.remote_dir}/con2.out"
         script = cluster.write_file(
             "concurrent.sh",
-            "#!/bin/bash\necho CONCURRENT_START\nsleep 5\necho CONCURRENT_DONE\n",
+            "#!/bin/bash\necho CONCURRENT_START\nsleep 10\necho CONCURRENT_DONE\n",
         )
 
         sb1 = cluster.sbatch(["-J", "con1", "-N", "1", "-o", out1, script])
@@ -222,10 +224,12 @@ class TestMultiNodeScheduling:
         j2 = parse_job_id(sb2)
         assert j1 is not None and j2 is not None
 
-        time.sleep(3)
-        sq = cluster.squeue_all()
-        assert job_state(sq, j1) == "R"
-        assert job_state(sq, j2) == "R"
+        def both_running():
+            sq = cluster.squeue_all()
+            return job_state(sq, j1) == "R" and job_state(sq, j2) == "R"
+
+        wait_until(both_running, timeout_s=30, interval_s=2,
+                   desc=f"jobs {j1} and {j2} running at the same time")
 
         wait_job(cluster, j1, timeout=60)
         wait_job(cluster, j2, timeout=60)
