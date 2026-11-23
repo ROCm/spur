@@ -387,7 +387,7 @@ jobs:
 
       # Only ssh into the VMs and run fixed commands there; output stays plain text on the runner.
       - name: Dump node diagnostics
-        if: failure()
+        if: failure() || cancelled()
         env:
           KEY: ${{ steps.ssh.outputs.privkey }}
           DRIVER_IP: ${{ steps.cluster.outputs.driver_ip }}
