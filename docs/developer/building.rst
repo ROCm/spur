@@ -233,6 +233,22 @@ Running the Tests
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
+Harness Behavior
+~~~~~~~~~~~~~~~~
+
+The harness itself has unit tests that need no cluster, network, or SSH. Run them from the repository root after installing ``tests/requirements.txt``:
+
+.. code-block:: bash
+
+   pytest tests/harness -q
+
+- **Quarantine.** Mark a test that fails because of a known product bug with ``@pytest.mark.quarantine(reason="...")``. It still runs every time, as a non-strict ``xfail``, and is never retried. Its outcome is listed in a ``Quarantined`` section of the summary; an ``XPASS`` means the bug is fixed and the marker should be removed. A missing ``reason`` or a test that also carries ``xfail`` is a usage error. ``--runxfail`` disables the quarantine and the test fails normally.
+- **k0s tests run last.** A test that uses a k0s fixture, or is marked ``k0s``, runs after all other tests in its shard, because ``k0s reset`` can take a node's network down. Each k0s fixture checks every node's network after its teardown and fails naming the broken node.
+- **Node 0 is the CLI host.** CLI commands run on the first node in ``SPUR_TEST_NODES``. The partition helpers (``cut_off_node``, ``block_heartbeats_from``) refuse to target it, since cutting it off would also cut off the test.
+- **Unreachable nodes end the shard.** A dropped SSH session is reconnected before the next command when nothing was sent yet; a session lost while a command runs fails that test instead of re-running the command. Before every test the harness checks each node; if a node stays unreachable after reconnecting, or does not answer a short ``iptables -S``, the run stops with exit code 3 instead of failing every remaining test.
+- **Command timeout.** Every SSH command has a default timeout of 600 seconds. Pass ``timeout=`` for longer commands; ``timeout=None`` waits forever and is only for commands that cannot hang.
+- **Failure diagnostics.** A test whose setup or call fails gets ``diagnostics: <node>`` sections in its report: addresses, routes, ``iptables``, ``dmesg``, and the ``ssh`` journal from every node, the daemon log tails when a cluster is running, plus k0s status for k0s tests. Collection is bounded (20 seconds per node, 90 seconds per failure) and never replaces the test's own error.
+
 Old-attempt cgroup cleanup
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
