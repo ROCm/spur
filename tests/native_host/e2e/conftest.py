@@ -20,6 +20,8 @@ from cluster import (
     SpurCluster,
     deep_merge,
     ensure_bins,
+    failure_diagnostic_sections,
+    live_clusters,
     make_remote_dir,
     node_health_guard,
 )
@@ -56,6 +58,22 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if _GPU_FIXTURES.intersection(getattr(item, "fixturenames", ())):
             item.add_marker("gpu")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not report.failed:
+        return
+    # A failing test must keep its own failure, so a broken collector is shown as
+    # a section instead of raised.
+    try:
+        report.sections.extend(failure_diagnostic_sections(
+            report.when, report.failed, item.fixturenames, live_clusters(),
+            item.funcargs.get("ssh_nodes")))
+    except Exception as err:
+        report.sections.append(("diagnostics", f"collection failed: {type(err).__name__}: {err}"))
 
 
 def _get_nodes_config() -> list[str]:

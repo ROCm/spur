@@ -37,6 +37,7 @@ AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 # to the controller port would sever the CLI the test needs to observe the outage.
 CLI_NODE_INDEX = 0
 HEALTH_CHECK_TIMEOUT_S = 20
+DIAGNOSTICS_TIMEOUT_S = 20
 # Hosts already warned about disabled leak detection, so it logs once per session.
 _leak_check_warned: set[str] = set()
 # HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
@@ -635,6 +636,114 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
     logger.info("Binaries ready at %s on all nodes", bin_dir)
 
 
+# Clusters between provision() and teardown(), so the failure hook can find them
+# without every fixture having to hand its cluster over.
+_live_clusters: list["SpurCluster"] = []
+
+
+def register_cluster(cluster: "SpurCluster"):
+    if not any(live is cluster for live in _live_clusters):
+        _live_clusters.append(cluster)
+
+
+def unregister_cluster(cluster: "SpurCluster"):
+    _live_clusters[:] = [live for live in _live_clusters if live is not cluster]
+
+
+def live_clusters() -> list["SpurCluster"]:
+    return list(_live_clusters)
+
+
+def _diagnostics_commands(log_dir: str | None, max_lines: int, k0s: bool) -> list[tuple[str, str]]:
+    commands = []
+    if log_dir:
+        for log in ("spurctld.log", "spurd.log"):
+            path = shlex.quote(f"{log_dir}/{log}")
+            commands.append((f"{log} (last {max_lines} lines)", f"tail -n {max_lines} {path}"))
+    commands += [
+        ("ip -br addr", "ip -br addr"),
+        ("ip route", "ip route"),
+        ("iptables -S", "sudo -n iptables -S"),
+        ("dmesg (last 50 lines)", "sudo -n dmesg | tail -50"),
+        ("journalctl -u ssh (last 50 lines)", "sudo -n journalctl -u ssh -n 50 --no-pager"),
+        ("uptime", "uptime"),
+    ]
+    if k0s:
+        commands += [
+            ("k0s status", "sudo -n k0s status"),
+            ("k0s etcd member-list", "sudo -n k0s etcd member-list"),
+            ("systemctl status k0scontroller", "systemctl status k0scontroller --no-pager"),
+        ]
+    return commands
+
+
+def _diagnostics_script(log_dir: str | None, max_lines: int, k0s: bool) -> str:
+    """One shell line for a whole node, so the cost is a single round trip. Each
+    command is guarded so a missing tool or passwordless sudo only blanks its section."""
+    return "; ".join(
+        f"echo '=== {title} ==='; ({command}) 2>&1 || true"
+        for title, command in _diagnostics_commands(log_dir, max_lines, k0s)
+    )
+
+
+def _node_diagnostics(node: "SshNode", script: str) -> str:
+    # Runs while a test is already failing, so it must report any trouble as text.
+    try:
+        code, out = node.exec_with_exit(script, timeout=DIAGNOSTICS_TIMEOUT_S)
+    except SshConnectionLost as err:
+        return f"{node.host}: unreachable ({err})"
+    except Exception as err:
+        return f"{node.host}: diagnostics failed ({type(err).__name__}: {err})"
+    if code == -1:
+        return f"{out}\n{node.host}: timed out after {DIAGNOSTICS_TIMEOUT_S}s"
+    return out
+
+
+def collect_node_diagnostics(nodes: list["SshNode"], names: list[str], log_dir: str | None,
+                             max_lines: int = 200, k0s: bool = False) -> dict[str, str]:
+    """Per node, keyed ``"<name> (<host>)"``: log tails (when *log_dir* is given),
+    network, kernel and ssh state, plus k0s state when *k0s*. A node that cannot
+    be reached or is slow is reported in its entry; this never raises."""
+    script = _diagnostics_script(log_dir, max_lines, k0s)
+    result = {}
+    for i, node in enumerate(nodes):
+        name = names[i] if i < len(names) else node.host
+        result[f"{name} ({node.host})"] = _node_diagnostics(node, script)
+    return result
+
+
+def failure_diagnostic_sections(when: str, failed: bool, fixturenames, clusters: list["SpurCluster"],
+                                ssh_nodes: list["SshNode"] | None,
+                                max_lines: int = 200) -> list[tuple[str, str]]:
+    """Report sections for a test phase. Only a failed setup or call gets any;
+    skips, xfails and teardown failures stay quiet. Without a live cluster, falls
+    back to node-level state from *ssh_nodes* when the test used them."""
+    if not failed or when not in ("setup", "call"):
+        return []
+    k0s = any(name.startswith("k8s_") for name in fixturenames)
+    if clusters:
+        collected = [c.collect_diagnostics(max_lines, k0s=k0s) for c in clusters]
+    elif ssh_nodes:
+        collected = [collect_node_diagnostics(ssh_nodes, [], None, max_lines, k0s)]
+    else:
+        collected = []
+    return [(f"diagnostics: {key}", text) for diagnostics in collected
+            for key, text in diagnostics.items()]
+
+
+K0S_LOG_PATTERN = re.compile(r"k0s|join[ -]token|raft|leader|stop", re.IGNORECASE)
+K0S_LOG_LINES = 60
+# Enough history that the matching lines span the whole failed wait.
+K0S_LOG_SCAN_LINES = 5000
+
+
+def filter_k0s_log(text: str, limit: int = K0S_LOG_LINES) -> str:
+    """The last *limit* controller-log lines that concern k0s, join tokens, Raft,
+    leadership or stopping."""
+    matching = [line for line in text.splitlines() if K0S_LOG_PATTERN.search(line)]
+    return "\n".join(matching[-limit:])
+
+
 class SpurCluster:
     """
     Manages a Spur cluster lifecycle on remote nodes.
@@ -712,6 +821,7 @@ class SpurCluster:
         hostnames known) but no daemons are running.  Call :meth:`start`
         to bring up the cluster with a specific configuration.
         """
+        register_cluster(self)
         self._create_dirs()
         self._resolve_hostnames()
         logger.info("Cluster provisioned: %s", self.node_names)
@@ -820,13 +930,16 @@ class SpurCluster:
 
     def teardown(self):
         """Kill all daemons and remove the working directory."""
-        self.stop()
-        # Detached supervisors survive stop(), so reap them or they leak across
-        # tests — at teardown, not stop_agents(), so a test can still watch one survive.
-        rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
-        for node in self.nodes:
-            self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
-            node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
+        try:
+            self.stop()
+            # Detached supervisors survive stop(), so reap them or they leak across
+            # tests — at teardown, not stop_agents(), so a test can still watch one survive.
+            rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
+            for node in self.nodes:
+                self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
+                node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
+        finally:
+            unregister_cluster(self)
         logger.info("Cluster torn down")
 
     # --- CLI wrappers ---
@@ -1199,7 +1312,22 @@ class SpurCluster:
         requirement = f"phase {phase}"
         if active_controllers is not None:
             requirement += f" with active controllers {active_controllers}"
-        raise TimeoutError(f"k0s did not reach {requirement} within {timeout}s:\n{last}")
+        raise TimeoutError(
+            f"k0s did not reach {requirement} within {timeout}s:\n{last}\n{self.k0s_log_context()}"
+        )
+
+    def k0s_log_context(self) -> str:
+        """Controller-log lines about k0s, join tokens, Raft and leadership, for a
+        wait that timed out. Reports a failed read instead of raising so the
+        caller's own error is never replaced."""
+        path = f"{self.log_dir}/spurctld.log"
+        try:
+            log = self.nodes[0].exec_allow_fail(f"tail -n {K0S_LOG_SCAN_LINES} '{path}'",
+                                                timeout=DIAGNOSTICS_TIMEOUT_S)
+        except Exception as err:
+            return f"spurctld.log unavailable ({type(err).__name__}: {err})"
+        lines = filter_k0s_log(log)
+        return f"spurctld.log (last {K0S_LOG_LINES} k0s/join-token/raft/leader/stop lines):\n{lines}"
 
     def etcd_member_count(self) -> int:
         """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
@@ -1226,6 +1354,9 @@ class SpurCluster:
             if last >= count:
                 return last
             time.sleep(3)
+        # Callers assert on the count, so report the context here rather than raise.
+        logger.warning("etcd did not reach %d members within %ds (last seen %d)\n%s",
+                       count, timeout, last, self.k0s_log_context())
         return last
 
     def sacct(self, args: list[str]) -> str:
@@ -1338,6 +1469,11 @@ class SpurCluster:
             )
             pid = node.exec(cmd).strip()
             logger.info("spurauthd started on %s (pid %s)", name, pid)
+
+    def collect_diagnostics(self, max_lines: int = 200, *, k0s: bool = False) -> dict[str, str]:
+        """Log tails and node state from every node, keyed ``"<name> (<host>)"``.
+        Never raises, so it is safe from a failure hook or a fixture teardown."""
+        return collect_node_diagnostics(self.nodes, self.node_names, self.log_dir, max_lines, k0s)
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
