@@ -7,6 +7,7 @@ Pytest configuration and fixtures for Spur native-host E2E tests.
 See docs/developer/building.rst for full environment variable reference.
 """
 
+import fnmatch
 import logging
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from cluster import (
     HA_HEARTBEAT_TIMEOUT_SECS,
     SshNode,
     SpurCluster,
+    assert_nodes_network,
     deep_merge,
     ensure_bins,
     failure_diagnostic_sections,
@@ -36,6 +38,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # test; conftest auto-marks it `gpu` so CI can route it without a manual tag.
 _GPU_FIXTURES = frozenset({"gpu_cluster", "gpu_container_cluster"})
 
+# Fixtures whose teardown resets k0s, which can take a node's network down. The
+# k8s_*cluster family is matched by pattern; these three have other names.
+_K0S_FIXTURES = frozenset({"k0s_native_cluster", "wg_k0s_cluster", "wg_login_cluster"})
+_K0S_FIXTURE_PATTERN = "k8s_*cluster"
+
+
+def _uses_k0s_fixture(fixturenames) -> bool:
+    return any(
+        name in _K0S_FIXTURES or fnmatch.fnmatchcase(name, _K0S_FIXTURE_PATTERN)
+        for name in fixturenames
+    )
+
 
 def pytest_configure(config):
     config.addinivalue_line(
@@ -52,12 +66,16 @@ def pytest_configure(config):
     )
 
 
-# tryfirst so the marker lands before pytest's built-in `-m` deselection runs.
+# tryfirst so the markers land before pytest's built-in `-m` deselection runs and
+# before the root conftest's trylast sharding and k0s-last ordering.
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     for item in items:
-        if _GPU_FIXTURES.intersection(getattr(item, "fixturenames", ())):
+        fixturenames = getattr(item, "fixturenames", ())
+        if _GPU_FIXTURES.intersection(fixturenames):
             item.add_marker("gpu")
+        if _uses_k0s_fixture(fixturenames):
+            item.add_marker("k0s")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -319,6 +337,7 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
+    _reset_k0s_all_nodes(c)
     try:
         c.start(
             config_overrides={"cluster": {"enabled": True, "cni": "kuberouter"}},
@@ -334,6 +353,7 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
+    _reset_k0s_all_nodes_and_check_network(c)
 
 
 @pytest.fixture
@@ -364,7 +384,7 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
-    _reset_k0s_all_nodes(c)
+    _reset_k0s_all_nodes_and_check_network(c)
 
 
 @pytest.fixture
@@ -688,6 +708,19 @@ def _reset_k0s_all_nodes(c):
             )
 
 
+def _assert_k0s_network(c):
+    assert_nodes_network(c.nodes, c.node_names)
+
+
+def _reset_k0s_all_nodes_and_check_network(c):
+    # The check must also run when the reset itself dies on a lost session, so the
+    # failure names the node whose network the reset took down.
+    try:
+        _reset_k0s_all_nodes(c)
+    finally:
+        _assert_k0s_network(c)
+
+
 def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     """Deploy a rootful, WG-enabled, calico k0s cluster over the mesh.
 
@@ -754,10 +787,13 @@ def _teardown_wg_k0s(c):
     # `rm -rf`, that reconcile races the manual cleanup. Tearing the daemons down
     # first leaves nothing contending with it.
     c.teardown()
-    _reset_k0s_all_nodes(c)
-    mesh = getattr(c, "wg_mesh", None)
-    if mesh is not None:
-        mesh.teardown(getattr(c, "wg_mesh_indices", []))
+    try:
+        _reset_k0s_all_nodes(c)
+        mesh = getattr(c, "wg_mesh", None)
+        if mesh is not None:
+            mesh.teardown(getattr(c, "wg_mesh_indices", []))
+    finally:
+        _assert_k0s_network(c)
 
 
 @pytest.fixture

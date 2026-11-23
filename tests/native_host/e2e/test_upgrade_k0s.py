@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from cluster import BINARIES, SpurCluster, make_remote_dir, parse_job_id, wait_job
+from cluster import BINARIES, SpurCluster, assert_nodes_network, make_remote_dir, parse_job_id, wait_job
 
 logger = logging.getLogger(__name__)
 
@@ -439,7 +439,10 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
-    _reset_k0s_all_nodes(c)
+    try:
+        _reset_k0s_all_nodes(c)
+    finally:
+        assert_nodes_network(c.nodes, c.node_names)
 
 
 # --- tests ------------------------------------------------------------------

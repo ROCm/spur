@@ -37,6 +37,7 @@ AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 # to the controller port would sever the CLI the test needs to observe the outage.
 CLI_NODE_INDEX = 0
 HEALTH_CHECK_TIMEOUT_S = 20
+NETWORK_CHECK_TIMEOUT_S = 20
 DIAGNOSTICS_TIMEOUT_S = 20
 # The node-side timeout ends this much before the SSH one, so a hung journalctl/dmesg
 # is killed on the node instead of lingering after the channel is abandoned.
@@ -256,6 +257,54 @@ def node_health_guard(nodes: list["SshNode"]):
     if report:
         pytest.fail("node health check failed after the test:\n" + "\n".join(report),
                     pytrace=False)
+
+
+class NodeNetworkError(RuntimeError):
+    """A node is reachable over SSH but fails its network sanity check."""
+
+
+def _node_driver_ip(node: "SshNode") -> str:
+    # Read on the node, so it is the address the node itself sees for this driver,
+    # also when SSH goes through a tunnel or NAT.
+    code, out = node.exec_with_exit("echo $SSH_CLIENT", timeout=NETWORK_CHECK_TIMEOUT_S)
+    fields = out.split()
+    if code != 0 or not fields:
+        raise NodeNetworkError(f"{node.host}: cannot determine the driver address from SSH_CLIENT: {out.strip()!r}")
+    return fields[0]
+
+
+def _assert_node_network(node: "SshNode", driver_ip: str) -> None:
+    """Raise unless *node* routes to *driver_ip* and answers on a fresh SSH channel.
+    Raises SshConnectionLost when the session cannot be restored."""
+    node.ensure_connected()
+    code, out = node.exec_with_exit(f"ip route get {shlex.quote(driver_ip)} && echo ok",
+                                    timeout=NETWORK_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeNetworkError(f"{node.host}: network check timed out after {NETWORK_CHECK_TIMEOUT_S}s")
+    if code != 0 or out.split()[-1:] != ["ok"]:
+        raise NodeNetworkError(f"{node.host}: no route to the driver {driver_ip} (exit {code}): {out.strip()}")
+
+
+def assert_nodes_network(nodes: list["SshNode"], names: list[str]) -> None:
+    """Fail the calling fixture teardown when any node lost its network, naming the
+    node and attaching bounded diagnostics from the nodes that are still healthy.
+    For fixtures whose cleanup (k0s reset) can take a node's network down."""
+    failures = {}
+    for node in nodes:
+        try:
+            _assert_node_network(node, _node_driver_ip(node))
+        except (NodeNetworkError, SshConnectionLost) as err:
+            failures[node.host] = err
+    if not failures:
+        return
+    healthy = [(node, names[i] if i < len(names) else node.host)
+               for i, node in enumerate(nodes) if node.host not in failures]
+    diagnostics = collect_node_diagnostics(
+        [node for node, _ in healthy], [name for _, name in healthy], None, k0s=True,
+        budget=DiagnosticsBudget())
+    lines = [f"node network broken after k0s teardown: {err}" for err in failures.values()]
+    lines += [f"--- {key} ---\n{text}" for key, text in diagnostics.items()]
+    pytest.fail("\n".join(lines), pytrace=False)
 
 
 @contextlib.contextmanager

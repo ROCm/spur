@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from cluster import parse_job_id, job_state, wait_job
+from cluster import assert_nodes_network, parse_job_id, job_state, wait_job
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ def k8s_enabled_cluster(unstarted_cluster):
         unstarted_cluster.k8s_down(reset=True)
     except Exception:
         logger.warning("k8s_down during teardown failed", exc_info=True)
+    assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names)
 
 
 class TestK8sSchedulingExclusion:

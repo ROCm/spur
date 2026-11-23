@@ -16,6 +16,8 @@ from contextlib import contextmanager
 
 import pytest
 
+from cluster import assert_nodes_network
+
 logger = logging.getLogger(__name__)
 
 STRAY_UNIT = "/run/systemd/system/k0sworker.service"
@@ -32,6 +34,7 @@ def k8s_enabled_cluster(unstarted_cluster):
         unstarted_cluster.k8s_down(reset=True)
     except Exception:
         logger.warning("k8s_down during teardown failed", exc_info=True)
+    assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names)
 
 
 @pytest.fixture
@@ -45,8 +48,11 @@ def k8s_drift_cluster(unstarted_cluster):
     )
     yield unstarted_cluster
     # A teardown that does not converge must fail loudly: it leaves k0s behind for the next run.
-    unstarted_cluster.k8s_down(reset=True)
-    _wait_torn_down(unstarted_cluster)
+    try:
+        unstarted_cluster.k8s_down(reset=True)
+        _wait_torn_down(unstarted_cluster)
+    finally:
+        assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names)
 
 
 def _wait_torn_down(cluster, timeout: int = 180) -> None:

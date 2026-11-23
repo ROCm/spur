@@ -46,27 +46,40 @@ def _shard_of(nodeid: str, count: int) -> int:
     return int(digest, 16) % count
 
 
+def order_k0s_last(items: list) -> list:
+    """Stable partition: non-k0s items first, k0s items after, each in original order.
+
+    `k0s reset` can take a node's network down, so its fallout must only reach
+    other k0s tests, never the rest of the shard.
+    """
+    plain = [item for item in items if item.get_closest_marker("k0s") is None]
+    k0s = [item for item in items if item.get_closest_marker("k0s") is not None]
+    return plain + k0s
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Deterministically keep only the tests belonging to this shard.
+    """Keep only this shard's tests, then run the k0s ones last.
 
     Runs last so sharding divides the already marker-filtered pool
-    (e.g. after ``-m gpu``), giving each shard an even slice of the pool.
+    (e.g. after ``-m gpu``), giving each shard an even slice of the pool, and so
+    every other conftest has already applied its auto-markers (e.g. ``k0s``).
+    Ordering comes after sharding: membership depends only on the node id.
     """
     count = config.getoption("--shard-count")
-    if count <= 1:
-        return
+    if count > 1:
+        index = config.getoption("--shard-id")
+        selected = []
+        deselected = []
+        for item in items:
+            bucket = selected if _shard_of(item.nodeid, count) == index else deselected
+            bucket.append(item)
 
-    index = config.getoption("--shard-id")
-    selected = []
-    deselected = []
-    for item in items:
-        bucket = selected if _shard_of(item.nodeid, count) == index else deselected
-        bucket.append(item)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = selected
 
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-        items[:] = selected
+    items[:] = order_k0s_last(items)
 
 
 def _running_full_suite(config) -> bool:
