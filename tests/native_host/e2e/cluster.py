@@ -252,6 +252,8 @@ class SshNode:
     _POLL_S = 1.0
     _CHUNK_BYTES = 32768
     _CONNECTION_ERRORS = (paramiko.SSHException, EOFError, OSError)
+    # Retrying cannot fix credentials or a changed host key; backoff only delays the failure.
+    _PERMANENT_CONNECT_ERRORS = (paramiko.AuthenticationException, paramiko.BadHostKeyException)
 
     _sleep = staticmethod(time.sleep)
     _clock = staticmethod(time.monotonic)
@@ -319,6 +321,10 @@ class SshNode:
             self._sleep(delay)
             try:
                 client = self._connect()
+            except self._PERMANENT_CONNECT_ERRORS as err:
+                raise SshConnectionLost(
+                    f"SSH session to {self.host} lost and reconnect was refused: {err}"
+                ) from err
             except self._CONNECTION_ERRORS as err:
                 last_error = err
                 logger.warning("Reconnect to %s failed (attempt %d/%d): %s",
@@ -348,9 +354,10 @@ class SshNode:
         self.ensure_connected()
         try:
             return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
-        except self._CONNECTION_ERRORS:
+        except self._CONNECTION_ERRORS as err:
             if self.is_alive():
                 raise
+            logger.warning("Opening a channel to %s failed on a dead transport: %s", self.host, err)
         self.ensure_connected()
         return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
 
@@ -365,15 +372,14 @@ class SshNode:
         Raises SshConnectionLost if the session dies after the command was sent."""
         channel = self._open_channel()
         try:
-            try:
-                # Running shell commands on the disposable test VMs is the harness's job;
-                # inputs come from harness constants and test fixtures.
-                channel.exec_command(cmd)  # nosec B601
-            except self._CONNECTION_ERRORS as err:
-                if self.is_alive():
-                    raise
-                raise self._lost(cmd) from err
+            # Running shell commands on the disposable test VMs is the harness's job;
+            # inputs come from harness constants and test fixtures.
+            channel.exec_command(cmd)  # nosec B601
             return self._collect(channel, cmd, timeout)
+        except self._CONNECTION_ERRORS as err:
+            if self.is_alive():
+                raise
+            raise self._lost(cmd) from err
         finally:
             channel.close()
 

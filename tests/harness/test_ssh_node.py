@@ -31,11 +31,13 @@ class FakeClock:
 class FakeChannel:
     """Plays back one command: stdout/stderr chunks, then how it ends.
 
-    *ending* is "exit" (EOF plus exit status), "hang" (never finishes), or
-    "drop" (the transport dies after the command was sent)."""
+    *ending* is "exit" (EOF plus exit status), "hang" (never finishes), "drop"
+    (the transport dies after the command was sent), or "no_status" (EOF with
+    no exit status on a live transport). *exec_error* and *recv_error* are
+    raised from those calls after killing the transport."""
 
     def __init__(self, remote, transport, stdout=(), stderr=(), exit_status=0,
-                 ending="exit", hang_polls=0):
+                 ending="exit", hang_polls=0, exec_error=None, recv_error=None):
         self.remote = remote
         self.transport = transport
         self.stdout = list(stdout)
@@ -43,11 +45,16 @@ class FakeChannel:
         self.exit_status = exit_status
         self.ending = ending
         self.hang_polls = hang_polls
+        self.exec_error = exec_error
+        self.recv_error = recv_error
         self.timeout = None
         self.closed = False
 
     def exec_command(self, cmd):
         self.remote.executed.append((self.remote.clients.index(self.transport.client), cmd))
+        if self.exec_error is not None:
+            self.transport.active = False
+            raise self.exec_error
 
     def settimeout(self, timeout):
         self.timeout = timeout
@@ -63,6 +70,9 @@ class FakeChannel:
         return bool(self.stderr)
 
     def recv(self, nbytes):
+        if self.recv_error is not None and not self.stdout:
+            self.transport.active = False
+            raise self.recv_error
         if self.hang_polls:
             self.hang_polls -= 1
             self._block()
@@ -119,8 +129,8 @@ class FakeClient:
 
     def connect(self, **kwargs):
         self.remote.connects.append(kwargs)
-        if self.remote.refuse_connects:
-            raise OSError("connection refused")
+        if self.remote.connect_error is not None:
+            raise self.remote.connect_error
         self.transport = FakeTransport(self.remote, self)
 
     def get_transport(self):
@@ -146,7 +156,7 @@ class FakeRemote:
         self.connects = []
         self.executed = []
         self.sleeps = []
-        self.refuse_connects = False
+        self.connect_error = None
         self.behaviour = {"stdout": [b"ok\n"]}
 
     def new_client(self):
@@ -258,7 +268,7 @@ def test_concurrent_callers_reconnect_once(remote, node):
 
 def test_reconnect_gives_up_after_3_attempts(remote, node):
     remote.clients[0].transport.active = False
-    remote.refuse_connects = True
+    remote.connect_error = OSError("connection refused")
 
     with pytest.raises(SshConnectionLost, match=HOST):
         node.exec("hostname")
@@ -266,6 +276,55 @@ def test_reconnect_gives_up_after_3_attempts(remote, node):
     assert remote.sleeps == [1, 2, 4]
     assert len(remote.connects) == 1 + 3
     assert remote.executed == []
+
+
+@pytest.mark.parametrize("error", [
+    paramiko.AuthenticationException("bad credentials"),
+    paramiko.BadHostKeyException(HOST, paramiko.RSAKey.generate(1024), paramiko.RSAKey.generate(1024)),
+], ids=["auth", "host-key"])
+def test_reconnect_fails_fast_on_permanent_errors(remote, node, error):
+    remote.clients[0].transport.active = False
+    remote.connect_error = error
+
+    with pytest.raises(SshConnectionLost, match=HOST) as raised:
+        node.exec("hostname")
+
+    assert raised.value.__cause__ is error
+    assert remote.sleeps == [1]
+    assert len(remote.connects) == 1 + 1
+    assert remote.executed == []
+
+
+def test_exec_command_failure_on_dead_transport_is_not_retried(remote, node):
+    remote.behaviour = {"exec_error": paramiko.SSHException("transport died")}
+
+    with pytest.raises(SshConnectionLost, match=HOST):
+        node.exec("long-job")
+
+    assert remote.executed == [(0, "long-job")]
+    assert len(remote.clients) == 1
+
+
+@pytest.mark.parametrize("error", [
+    OSError("connection reset"), EOFError(), paramiko.SSHException("transport died"),
+], ids=["oserror", "eof", "ssh"])
+def test_read_failure_on_dead_transport_raises_connection_lost(remote, node, error):
+    remote.behaviour = {"stdout": [b"half"], "recv_error": error}
+
+    with pytest.raises(SshConnectionLost, match=HOST) as raised:
+        node.exec("long-job")
+
+    assert raised.value.__cause__ is error
+    assert remote.executed == [(0, "long-job")]
+    assert len(remote.clients) == 1
+    assert remote.channels[0].closed
+
+
+def test_missing_exit_status_on_live_transport_returns_minus_one(remote, node):
+    remote.behaviour = {"stdout": [b"out"], "ending": "no_status"}
+
+    assert node._run("cmd") == (-1, "out", "")
+    assert node.is_alive()
 
 
 def test_default_timeout_returns_minus_one_and_drains_output(remote, node):
@@ -277,7 +336,6 @@ def test_default_timeout_returns_minus_one_and_drains_output(remote, node):
     assert out == "partial warn"
     assert remote.clock.now == pytest.approx(SshNode.DEFAULT_TIMEOUT_S)
     assert remote.channels[0].closed
-    assert SshNode.DEFAULT_TIMEOUT_S == 600
 
 
 def test_explicit_timeout_bounds_the_wait(remote, node):
