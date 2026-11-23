@@ -1,99 +1,29 @@
-# spur-update
+# AGENTS.md -- spur-update
 
-Self-update mechanism for Spur binaries. Checks GitHub releases, downloads
-tarballs (optional SHA-256 verification when a sidecar asset exists), and
-replaces binaries on disk (rename + copy, not atomic — crash mid-copy can
-leave a truncated binary).
+Self-update for Spur binaries from GitHub releases, plus the separate k0s binary installer
+(`k0s.rs`). User-facing behavior is in `docs/knowledge/deployment/operations.md` ("Single-host self-update").
 
-## Modules
+## Pitfalls
 
-| File | Purpose |
-|---|---|
-| `lib.rs` | Public API: `spawn_startup_check`, `do_self_update`, `self_update_cli` |
-| `check.rs` | GitHub releases API client, semver comparison |
-| `download.rs` | Tarball download + SHA-256 verification |
-| `install.rs` | Extract tarball, binary replacement (rename + copy) with rollback |
-| `cache.rs` | Disk-backed update-check cache (1h TTL) |
-| `k0s.rs` | Download + install pinned k0s binary from GitHub |
+- `install::atomic_replace` is NOT atomic, despite its name and doc comments (and the crate docs).
+  It renames each binary to `<name>.spur-old`, then `fs::copy`s the new one in place. On a copy
+  error it renames each `.spur-old` back (errors ignored) and bails; a failed backup rename aborts
+  with no restore, and a crash mid-copy can leave a truncated binary.
+- A binary listed in `SPUR_BINARIES` but absent from the tarball is skipped on copy, yet its
+  `.spur-old` backup is still deleted in cleanup, so the binary vanishes.
+- SHA-256 verification of the Spur tarball is optional: it only runs when the release has a
+  `.tar.gz.sha256` sidecar asset. Without one, verification is skipped with a debug log only.
+- `Channel::from_str` never fails: any string other than `nightly` silently means stable.
+- The nightly channel always reports an update available, regardless of version.
+- The installer and startup auto-update do not restart daemons.
 
-## Update protocol
+## k0s
 
-Three phases, all driven from `lib.rs`:
-
-1. **Check** (`check.rs`): GET GitHub releases API (`/releases/latest` for
-   stable, `/releases/tags/nightly` for nightly). Parses `tag_name` as semver.
-   Stable: update available when remote tag > current version. Nightly: always
-   considered an update . 10s HTTP timeout.
-
-2. **Download** (`download.rs`): Fetch the `.tar.gz` asset from the release.
-   If a `.tar.gz.sha256` sidecar asset exists, download it and verify the
-   tarball hash. Checksum format: `<hex>  <filename>` or bare hex. Mismatched
-   hash deletes the tarball and bails. 300s timeout. No checksum asset = skip
-   verification (debug log only).
-
-3. **Install** (`install.rs`): Three-phase replacement (not atomic — crash
-   mid-copy can leave a truncated binary):
-   - Backup: rename each existing binary to `<name>.spur-old`
-   - Copy: extract tarball, `fs::copy` new binaries from `<root>/bin/`, chmod 0755.
-     A binary absent from the tarball is skipped, but its `.spur-old` backup
-     is still deleted in cleanup — the binary vanishes.
-   - Cleanup: remove `.spur-old` files on success
-   - Rollback: on any copy failure, rename `.spur-old` back and bail
-
-## Binaries managed
-
-Defined in `SPUR_BINARIES`: `spur`, `spurctld`, `spurd`, `spurstepd`, `spurauthd`.
-
-Tarball layout: `spur-{version}-linux-amd64/bin/{binaries}`. The installer
-searches one level deep for a `bin/` directory.
-
-Install directory auto-detected from `std::env::current_exe()` parent.
-
-## Entry points
-
-- `spawn_startup_check()` -- non-blocking tokio task for daemon startup.
-  Checks cache first; fetches GitHub only when cache is stale/missing.
-  If `auto_update` is true, downloads and replaces binaries (does NOT
-  restart daemons).
-
-- `self_update_cli()` -- blocking CLI flow (`spur self-update`). Check +
-  download + replace, with user-facing println output.
-
-- `do_self_update()` -- shared download+install logic used by both paths.
-
-## Cache management
-
-File: `<cache_dir>/update-check.json`. JSON with `checked_at`, `current_version`,
-`latest_tag`, `update_available`, `channel`.
-
-TTL: 1 hour (`CACHE_TTL_HOURS`). Compared against `checked_at` timestamp.
-Stale or missing cache triggers a GitHub API call. Write failures are silently
-ignored (non-critical path).
-
-## k0s handling
-
-`k0s.rs` manages a separate download flow for the k0s Kubernetes binary,
-independent of the Spur self-update pipeline.
-
-- Source: `k0sproject/k0s` GitHub releases. Pinned version lives in
-  `spur_core::k0s::K0S_PINNED_VERSION`, passed by caller.
-- Asset naming: `k0s-{version}-{arch}` where arch is `amd64` or `arm64`.
-- Verification: downloads `sha256sums.txt` manifest first (fails fast on
-  bad version before the ~260MB binary fetch). Parses both standard
-  (`<hex>  <name>`) and binary-mode (`<hex> *<name>`) checksum lines.
-- Install: write to temp sibling on same filesystem, chmod 0755, atomic
-  rename over destination. No rollback (fresh install, not replacement).
-- `ensure_k0s()` is the main entry: no-op if binary already exists at dest,
-  otherwise downloads. 600s timeout.
-- Cosign `.sig` signatures published by k0s are NOT verified.
-
-## Channels
-
-Two channels parsed via `FromStr` on `Channel`:
-- `stable` (default, fallback for any unrecognized string)
-- `nightly`
-
-## Dependencies
-
-reqwest (HTTP), semver (version comparison), sha2 (SHA-256), flate2+tar
-(tarball extraction), chrono (timestamps/TTL), serde_json (cache serialization).
+- Independent of the Spur self-update pipeline. The pinned version lives in
+  `spur_core::k0s::K0S_PINNED_VERSION` and is passed in by the caller.
+- `sha256sums.txt` is fetched before the large binary so a bad version fails fast. The manifest
+  is required (unlike the Spur sidecar); cosign `.sig` signatures are NOT verified.
+- Install is atomic (temp sibling on the same filesystem, then rename) with no rollback, since it
+  is a fresh install, not a replacement.
+- `ensure_k0s` is a no-op whenever a binary already exists at the destination; it does not check
+  the existing binary's version.
