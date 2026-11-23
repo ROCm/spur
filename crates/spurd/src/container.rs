@@ -138,18 +138,32 @@ pub struct BindMount {
 }
 
 /// Container configuration for a job.
+///
+/// Persisted in a supervisor's launch.json. Optional fields default so a file
+/// from another build still loads; identity fields stay required because a
+/// silent default (uid 0, empty image) would be unsafe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub image: String,
+    #[serde(default)]
     pub mounts: Vec<BindMount>,
+    #[serde(default)]
     pub workdir: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub readonly: bool,
+    #[serde(default)]
     pub mount_home: bool,
+    #[serde(default)]
     pub remap_root: bool,
+    #[serde(default)]
     pub gpu_devices: Vec<u64>,
+    #[serde(default)]
     pub environment: HashMap<String, String>,
+    #[serde(default)]
     pub container_env: HashMap<String, String>,
+    #[serde(default)]
     pub entrypoint: Option<String>,
     pub uid: u32,
     pub gid: u32,
@@ -160,6 +174,7 @@ pub struct ContainerConfig {
     #[serde(default)]
     pub withheld_socket: Option<PathBuf>,
     /// Registry-based device injection plan (replaces mount_hw_devices when present).
+    #[serde(default)]
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
 }
 
@@ -1496,6 +1511,27 @@ mod tests {
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
     }
     use std::sync::{Mutex, MutexGuard};
+
+    #[test]
+    fn container_config_with_only_identity_fields_loads() {
+        let cfg: ContainerConfig = serde_json::from_str(
+            r#"{"image":"docker://alpine","uid":1000,"gid":1000,"username":"u","home_dir":"/home/u"}"#,
+        )
+        .expect("a launch.json container block missing optional fields must load");
+        assert_eq!(cfg.image, "docker://alpine");
+        assert_eq!((cfg.uid, cfg.gid), (1000, 1000));
+        assert!(cfg.mounts.is_empty());
+        assert!(cfg.device_plan.is_none());
+        assert!(!cfg.readonly);
+    }
+
+    #[test]
+    fn container_config_without_image_is_rejected() {
+        let missing = serde_json::from_str::<ContainerConfig>(
+            r#"{"uid":1000,"gid":1000,"username":"u","home_dir":"/home/u"}"#,
+        );
+        assert!(missing.is_err(), "the image must never silently default");
+    }
 
     #[test]
     fn the_same_reference_is_the_same_image() {

@@ -22,14 +22,20 @@ const IO_LINK_XGMI: u32 = 2;
 const GPU_SUPPLEMENTARY_GROUPS: [&str; 2] = ["video", "render"];
 
 pub fn discover_to_cdi() -> Vec<CdiSpec> {
-    let gpus = discover_amd_gpus();
+    discover_to_cdi_from_root(Path::new("/"))
+}
+
+/// Reads `sys/`, `dev/`, `opt/rocm/` and `etc/group` under `root`; the spec still
+/// names host paths, since that is where a job will find them.
+fn discover_to_cdi_from_root(root: &Path) -> Vec<CdiSpec> {
+    let gpus = discover_amd_gpus_from_root(&root.join("sys"));
     if gpus.is_empty() {
         return Vec::new();
     }
 
-    let devices: Vec<CdiDevice> = gpus.iter().map(|g| g.to_cdi_device()).collect();
+    let devices: Vec<CdiDevice> = gpus.iter().map(|g| g.to_cdi_device(root)).collect();
 
-    let shared_edits = build_shared_edits();
+    let shared_edits = build_shared_edits(root);
 
     let mut spec_annotations = HashMap::new();
     spec_annotations.insert(annotations::AUTO_DETECTED.into(), "true".into());
@@ -354,9 +360,8 @@ struct DiscoveredGpu {
 }
 
 impl DiscoveredGpu {
-    fn to_cdi_device(&self) -> CdiDevice {
+    fn to_cdi_device(&self, root: &Path) -> CdiDevice {
         let render_path = format!("/dev/dri/renderD{}", self.render_minor);
-        let card_path = format!("/dev/dri/card{}", self.card_id.unwrap_or(self.device_index));
 
         let meta = DeviceMetadata {
             gpu_type: Some(self.gpu_type.clone()),
@@ -375,33 +380,12 @@ impl DiscoveredGpu {
             stable_id: Some(self.stable_id),
         };
 
-        let render_stat = stat_device_node(&render_path);
-        let card_stat = stat_device_node(&card_path);
-
-        let device_nodes = vec![
-            DeviceNode {
-                path: render_path,
-                host_path: None,
-                r#type: Some("c".into()),
-                major: render_stat.as_ref().map(|s| s.major),
-                minor: render_stat.as_ref().map(|s| s.minor),
-                file_mode: render_stat.as_ref().map(|s| s.file_mode),
-                permissions: Some("rwm".into()),
-                uid: render_stat.as_ref().map(|s| s.uid),
-                gid: render_stat.as_ref().map(|s| s.gid),
-            },
-            DeviceNode {
-                path: card_path,
-                host_path: None,
-                r#type: Some("c".into()),
-                major: card_stat.as_ref().map(|s| s.major),
-                minor: card_stat.as_ref().map(|s| s.minor),
-                file_mode: card_stat.as_ref().map(|s| s.file_mode),
-                permissions: Some("rwm".into()),
-                uid: card_stat.as_ref().map(|s| s.uid),
-                gid: card_stat.as_ref().map(|s| s.gid),
-            },
-        ];
+        let mut device_nodes = vec![char_device_node(root, render_path)];
+        // Only a card linked to this render node in sysfs: a guessed index can
+        // name another GPU's card, which the job would then be granted.
+        if let Some(card_id) = self.card_id {
+            device_nodes.push(char_device_node(root, format!("/dev/dri/card{card_id}")));
+        }
 
         CdiDevice {
             name: self.device_index.to_string(),
@@ -414,26 +398,17 @@ impl DiscoveredGpu {
     }
 }
 
-fn build_shared_edits() -> ContainerEdits {
+fn build_shared_edits(root: &Path) -> ContainerEdits {
     let mut edits = ContainerEdits::default();
 
-    if Path::new("/dev/kfd").exists() {
-        let kfd_stat = stat_device_node("/dev/kfd");
-        edits.device_nodes.push(DeviceNode {
-            path: "/dev/kfd".into(),
-            host_path: None,
-            r#type: Some("c".into()),
-            major: kfd_stat.as_ref().map(|s| s.major),
-            minor: kfd_stat.as_ref().map(|s| s.minor),
-            file_mode: kfd_stat.as_ref().map(|s| s.file_mode),
-            permissions: Some("rwm".into()),
-            uid: kfd_stat.as_ref().map(|s| s.uid),
-            gid: kfd_stat.as_ref().map(|s| s.gid),
-        });
+    if under_root(root, "/dev/kfd").exists() {
+        edits
+            .device_nodes
+            .push(char_device_node(root, "/dev/kfd".into()));
     }
 
     for lib_path in &["/opt/rocm/lib", "/opt/rocm/lib64"] {
-        if Path::new(lib_path).is_dir() {
+        if under_root(root, lib_path).is_dir() {
             edits.mounts.push(Mount {
                 host_path: lib_path.to_string(),
                 container_path: lib_path.to_string(),
@@ -448,8 +423,12 @@ fn build_shared_edits() -> ContainerEdits {
         }
     }
 
-    edits.additional_gids = gpu_supplementary_gids_from_group_file("/etc/group");
+    edits.additional_gids = gpu_supplementary_gids_from_group_file(&under_root(root, "/etc/group"));
     edits
+}
+
+fn under_root(root: &Path, host_path: &str) -> std::path::PathBuf {
+    root.join(host_path.trim_start_matches('/'))
 }
 
 fn lookup_group_gid_in(group_file: &str, name: &str) -> Option<u32> {
@@ -462,7 +441,7 @@ fn lookup_group_gid_in(group_file: &str, name: &str) -> Option<u32> {
     None
 }
 
-fn gpu_supplementary_gids_from_group_file(path: &str) -> Vec<u32> {
+fn gpu_supplementary_gids_from_group_file(path: &Path) -> Vec<u32> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut gids: Vec<u32> = GPU_SUPPLEMENTARY_GROUPS
         .iter()
@@ -471,10 +450,6 @@ fn gpu_supplementary_gids_from_group_file(path: &str) -> Vec<u32> {
     gids.sort_unstable();
     gids.dedup();
     gids
-}
-
-fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
-    discover_amd_gpus_from_root(Path::new("/sys"))
 }
 
 fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
@@ -544,6 +519,7 @@ fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
                 memory_mb,
                 numa_node = ?numa_node,
                 pci_bdf = ?pci_bdf,
+                card_id = ?card_id,
                 compute_partition = ?compute_partition,
                 "discovered AMD GPU via KFD topology"
             );
@@ -696,7 +672,7 @@ struct DeviceStat {
 }
 
 #[cfg(unix)]
-fn stat_device_node(path: &str) -> Option<DeviceStat> {
+fn stat_device_node(path: &Path) -> Option<DeviceStat> {
     let meta = std::fs::metadata(path).ok()?;
     let rdev = meta.rdev();
     if rdev == 0 {
@@ -716,6 +692,22 @@ fn stat_device_node(path: &str) -> Option<DeviceStat> {
         uid,
         gid,
     })
+}
+
+/// A character device node with the host's major/minor and ownership, when it exists.
+fn char_device_node(root: &Path, path: String) -> DeviceNode {
+    let stat = stat_device_node(&under_root(root, &path));
+    DeviceNode {
+        path,
+        host_path: None,
+        r#type: Some("c".into()),
+        major: stat.as_ref().map(|s| s.major),
+        minor: stat.as_ref().map(|s| s.minor),
+        file_mode: stat.as_ref().map(|s| s.file_mode),
+        permissions: Some("rwm".into()),
+        uid: stat.as_ref().map(|s| s.uid),
+        gid: stat.as_ref().map(|s| s.gid),
+    }
 }
 
 #[cfg(test)]
@@ -925,15 +917,81 @@ mod tests {
         let group = dir.path().join("group");
         fs::write(&group, "video:x:44:\nrender:x:109:\n").unwrap();
         assert_eq!(
-            gpu_supplementary_gids_from_group_file(group.to_str().unwrap()),
+            gpu_supplementary_gids_from_group_file(&group),
             vec![44, 109]
         );
     }
 
     #[test]
-    fn test_discover_does_not_panic() {
-        let specs = discover_to_cdi();
-        let _ = specs;
+    fn discovery_from_a_fixture_root_builds_one_gpu_spec() {
+        let root = mi300x_cpx_sysfs()
+            .parent()
+            .expect("fixture sys dir has a parent")
+            .to_path_buf();
+
+        let specs = discover_to_cdi_from_root(&root);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, AMD_CDI_KIND);
+        assert_eq!(specs[0].devices.len(), 15);
+        assert!(
+            specs[0].container_edits.is_none(),
+            "the fixture has no /dev/kfd, ROCm libraries or group file"
+        );
+    }
+
+    #[test]
+    fn only_a_card_linked_to_a_gpus_render_node_reaches_its_cdi_device() {
+        let root = tempfile::tempdir().unwrap();
+        let sys = root.path().join("sys");
+        let kfd = sys.join("class/kfd/kfd/topology/nodes");
+        make_kfd_gpu(&kfd, 2, 128, 1280);
+        make_kfd_gpu(&kfd, 3, 129, 10496);
+        let drm = sys.join("class/drm");
+        fs::create_dir_all(drm.join("card0/device/drm/card0")).unwrap();
+        fs::create_dir_all(drm.join("card1/device/drm/renderD128")).unwrap();
+
+        let specs = discover_to_cdi_from_root(root.path());
+        let nodes: Vec<Vec<&str>> = specs[0]
+            .devices
+            .iter()
+            .map(|device| {
+                device
+                    .container_edits
+                    .iter()
+                    .flat_map(|edits| &edits.device_nodes)
+                    .map(|node| node.path.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            nodes,
+            vec![
+                vec!["/dev/dri/renderD128", "/dev/dri/card1"],
+                vec!["/dev/dri/renderD129"],
+            ],
+            "card0 belongs to another PCI device and the second GPU has no linked card"
+        );
+    }
+
+    #[test]
+    fn shared_edits_are_read_from_the_given_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("dev")).unwrap();
+        std::fs::write(root.path().join("dev/kfd"), b"").unwrap();
+        std::fs::create_dir_all(root.path().join("opt/rocm/lib")).unwrap();
+        std::fs::create_dir_all(root.path().join("etc")).unwrap();
+        std::fs::write(
+            root.path().join("etc/group"),
+            "video:x:44:\nrender:x:109:\nusers:x:100:\n",
+        )
+        .unwrap();
+
+        let edits = build_shared_edits(root.path());
+        let nodes: Vec<&str> = edits.device_nodes.iter().map(|n| n.path.as_str()).collect();
+        assert_eq!(nodes, vec!["/dev/kfd"]);
+        let mounts: Vec<&str> = edits.mounts.iter().map(|m| m.host_path.as_str()).collect();
+        assert_eq!(mounts, vec!["/opt/rocm/lib"]);
+        assert_eq!(edits.additional_gids, vec![44, 109]);
     }
 
     #[test]
@@ -955,7 +1013,7 @@ mod tests {
             unique_id: Some("abcdef0123456789".into()),
         };
 
-        let dev = gpu.to_cdi_device();
+        let dev = gpu.to_cdi_device(Path::new("/nonexistent-root"));
         assert_eq!(dev.name, "3");
 
         let edits = dev.container_edits.as_ref().unwrap();
@@ -989,8 +1047,38 @@ mod tests {
     }
 
     #[test]
-    fn test_build_shared_edits_kfd() {
-        let _ = build_shared_edits();
+    fn an_unresolved_card_link_injects_no_card_node() {
+        let gpu = DiscoveredGpu {
+            device_index: 3,
+            render_minor: 131,
+            topology: None,
+            stable_id: 0,
+            card_id: None,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            numa_node: None,
+            pci_bdf: None,
+            link_type: LinkType::Pcie,
+            links: vec![-1],
+            compute_partition: None,
+            memory_partition: None,
+            unique_id: None,
+        };
+
+        let dev = gpu.to_cdi_device(Path::new("/nonexistent-root"));
+        let paths: Vec<&str> = dev
+            .container_edits
+            .as_ref()
+            .unwrap()
+            .device_nodes
+            .iter()
+            .map(|n| n.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/dev/dri/renderD131"],
+            "a guessed card node may belong to another GPU"
+        );
     }
 
     #[test]
@@ -1012,7 +1100,7 @@ mod tests {
             unique_id: None,
         };
 
-        let devices = vec![gpu.to_cdi_device()];
+        let devices = vec![gpu.to_cdi_device(Path::new("/nonexistent-root"))];
         let spec = CdiSpec {
             cdi_version: GENERATED_CDI_VERSION.into(),
             kind: AMD_CDI_KIND.into(),

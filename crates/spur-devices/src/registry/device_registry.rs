@@ -1258,8 +1258,8 @@ mod tests {
         }
     }
 
-    /// Auto-detected GPUs as discovery reports them: `cardN` and `renderD{128+N}`
-    /// each, with an optional CDI cores annotation.
+    /// Auto-detected GPUs with a sysfs-linked card each: `cardN` and
+    /// `renderD{128+N}`, with an optional CDI cores annotation.
     fn discovered_gpus(cores_annotations: &[Option<&str>]) -> CdiCache {
         let devices = cores_annotations
             .iter()
