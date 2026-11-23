@@ -255,8 +255,9 @@ their original exit codes after replacement.
 
    pytest tests/native_host/e2e/test_old_attempt_cgroup_cleanup.py -v
 
-The image defaults to ``ubuntu:22.04``; ``SPUR_TEST_CGROUP_BASE_IMAGE`` can select
-a locally available compatible base. The test builds its Python gRPC bindings
+The image defaults to ``mirror.gcr.io/library/ubuntu:22.04``; ``SPUR_TEST_CGROUP_BASE_IMAGE``
+can select a locally available compatible base. The build is retried up to three
+times to ride out registry rate limits and package-mirror outages. The test builds its Python gRPC bindings
 from the checkout's protocol definition and uses the configured test binaries.
 Containers, the temporary image, and remote build files are removed at teardown.
 The pytest temporary directory retains the result and agent log for each case.

@@ -112,18 +112,28 @@ def ensure_docker_image(node: "SshNode", image: str):
     quoted = shlex.quote(image)
     if node.exec_with_exit(f"docker image inspect {quoted} >/dev/null 2>&1")[0] == 0:
         return
+    exec_with_retry(node, f"docker pull -q {quoted}", what=f"docker pull {image}",
+                    attempts=IMAGE_PULL_ATTEMPTS, timeout=300)
+
+
+def exec_with_retry(node: "SshNode", command: str, *, what: str, attempts: int,
+                    timeout: int, tail_lines: int = 60) -> str:
+    """Run *command* on *node* until it exits 0 and return its output.
+
+    For commands that fetch from registries or package mirrors, where 429s and
+    mirror outages clear on their own. The final error names *what* and keeps
+    the tail of the last attempt's output, which is where the cause is printed."""
     output = ""
-    for attempt in range(1, IMAGE_PULL_ATTEMPTS + 1):
-        code, output = node.exec_with_exit(f"docker pull -q {quoted}", timeout=300)
+    for attempt in range(1, attempts + 1):
+        code, output = node.exec_with_exit(command, timeout=timeout)
         if code == 0:
-            return
-        logger.warning("docker pull %s failed (attempt %d/%d): %s",
-                       image, attempt, IMAGE_PULL_ATTEMPTS, output.strip())
-        if attempt < IMAGE_PULL_ATTEMPTS:
+            return output
+        logger.warning("%s failed (attempt %d/%d): %s",
+                       what, attempt, attempts, output.strip()[-2000:])
+        if attempt < attempts:
             time.sleep(IMAGE_PULL_BACKOFF_SECS * attempt)
-    raise RuntimeError(
-        f"docker pull {image} failed on {node.host} after {IMAGE_PULL_ATTEMPTS} attempts:\n{output}"
-    )
+    tail = "\n".join(output.strip().splitlines()[-tail_lines:])
+    raise RuntimeError(f"{what} failed on {node.host} after {attempts} attempts:\n{tail}")
 
 
 def ensure_any_docker_image(node: "SshNode", images: tuple[str, ...]) -> str:

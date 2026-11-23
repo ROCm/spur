@@ -14,6 +14,10 @@ import uuid
 
 import pytest
 
+from cluster import FIXTURE_BUILD_TIMEOUT_S, exec_with_retry
+
+DOCKER_BUILD_ATTEMPTS = 3
+
 
 @pytest.fixture(scope="module")
 def attempt_cleanup_image(ssh_nodes, remote_bin_dir):
@@ -34,14 +38,15 @@ def attempt_cleanup_image(ssh_nodes, remote_bin_dir):
             node.upload(str(support / name), f"{directory}/{name}")
         node.upload(str(Path(__file__).resolve().parents[3] / "proto/slurm.proto"),
                     f"{directory}/slurm.proto")
-        base = shlex.quote(os.environ.get("SPUR_TEST_CGROUP_BASE_IMAGE", "ubuntu:22.04"))
-        code, _ = node.exec_with_exit(
-            f"docker build --build-arg BASE_IMAGE={base} -t {image} {directory} "
-            f"> {directory}/build.log 2>&1",
-            # apt-get and pip install from the network on a cold image cache.
-            timeout=1800,
+        base = shlex.quote(os.environ.get(
+            "SPUR_TEST_CGROUP_BASE_IMAGE", "mirror.gcr.io/library/ubuntu:22.04"))
+        exec_with_retry(
+            node,
+            f"docker build --build-arg BASE_IMAGE={base} -t {image} {directory} 2>&1",
+            what=f"docker build {image} (base image pull or apt/pip mirror)",
+            attempts=DOCKER_BUILD_ATTEMPTS,
+            timeout=FIXTURE_BUILD_TIMEOUT_S,
         )
-        assert code == 0, node.read_file(f"{directory}/build.log")
         yield node, image, token, directory
     finally:
         node.exec_allow_fail(f"docker image rm {image}")
