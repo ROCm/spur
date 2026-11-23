@@ -13,6 +13,7 @@ import pytest
 
 from cluster import (
     SpurCluster,
+    SshConnectionLost,
     ensure_bins,
     job_state,
     make_remote_dir,
@@ -552,9 +553,14 @@ class TestMpiSoak:
             (["--mpi=pmix", "-N", "2", "-n", "4", hello_mpi], {0, 1, 2, 3}, 4),
         ]
 
-        def run_one(entry: tuple[list[str], set[int], int]) -> tuple[list[str], set[int], int, int, str]:
+        def run_one(
+            entry: tuple[list[str], set[int], int],
+        ) -> tuple[list[str], set[int], int, int | None, str]:
             args, expected_ranks, expected_size = entry
-            code, out = cluster.srun_with_exit(args, timeout=300)
+            try:
+                code, out = cluster.srun_with_exit(args, timeout=300)
+            except SshConnectionLost as err:
+                return args, expected_ranks, expected_size, None, f"SSH session lost: {err}"
             return args, expected_ranks, expected_size, code, out
 
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
