@@ -767,13 +767,16 @@ jobs under the same limit from starting.
 
 A job that fits its limits on its own, but not after the jobs started earlier in
 the same pass, is not started. It holds no future slot and starts no burst-buffer
-stage-in, and pends with its limit reason, for example ``QOSGrpNodeLimit``. A
-heterogeneous job's components that can start in the same pass are checked
-together, and start together or not at all. A pass places all its components one
-after another, at the first component's place in the queue, so the jobs queued
-behind them can use a refused job's nodes in the same pass.
+stage-in. If backfill finds a placement and the start is refused, the job shows
+its limit reason, for example ``QOSGrpNodeLimit``. If backfill cannot place it,
+the job may show ``Resources`` or ``Priority`` for that pass.
 
-The exception is a job that preempted others: it keeps its share of its limits
+A heterogeneous job's components that can start in the same pass are checked
+together and start as a group if admitted. Backfill considers the components
+within its queue depth together, at the highest-ranked component's position.
+If the group is refused, jobs behind it can use its nodes in the same pass.
+
+A job that preempted others keeps its share of its limits
 while its eviction is in flight (see the preemption note in
 :doc:`configuration`), so another job under the same limit can't take that room.
 Preemption, idle-fill reclaim and federation forwarding act only for a job that

@@ -4,6 +4,7 @@
 //! QOS and account limits charged as a scheduling pass starts jobs.
 
 use super::*;
+use crate::scheduler_loop::DispatchDecision;
 
 fn shared_pool_job(name: &str, cpus: u32) -> JobSpec {
     let mut spec = pool_job(name, 1, None);
@@ -254,6 +255,143 @@ async fn a_slot_behind_a_start_on_a_node_its_qos_uses_is_kept() {
     assert!(cm.with_planned_job_starts(|planned| planned.contains_key(&second)));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn future_slots_in_a_capped_qos_can_delay_another_qos_across_all_nodes() {
+    const NODES: u32 = 50;
+    let dir = TempDir::new().unwrap();
+    let cm = test_cluster(&dir).await;
+    let nodes: Vec<_> = (1..=NODES).map(|i| format!("n{i}")).collect();
+    for node in &nodes {
+        register_node(&cm, node, 1, 128000);
+    }
+    cm.qos_cache().insert(grp_node_capped("pool", 2));
+    cm.qos_cache()
+        .insert(capped_qos("open", Default::default()));
+
+    // A single running job gives every node the same release time in both passes.
+    let holder = submit_and_wait(
+        &cm,
+        JobSpec {
+            num_nodes: NODES,
+            num_tasks: NODES,
+            time_limit: Some(chrono::Duration::hours(1)),
+            ..basic_spec("holder")
+        },
+    );
+    let per_node = nodes
+        .iter()
+        .map(|n| (n.clone(), scalar_alloc(1, 0)))
+        .collect();
+    cm.start_job(holder, nodes.clone(), scalar_alloc(NODES, 0), per_node)
+        .unwrap();
+    settle(&cm, holder, JobState::Running);
+
+    let other = submit_and_wait(
+        &cm,
+        JobSpec {
+            qos: Some("open".into()),
+            priority: Some(1),
+            exclusive: true,
+            time_limit: Some(chrono::Duration::hours(1)),
+            ..basic_spec("other")
+        },
+    );
+    assert!(one_pass(&cm).started().is_empty());
+    let free_at = cm.with_planned_job_starts(|planned| planned[&other].1);
+
+    let duration = chrono::Duration::minutes(10);
+    let waiting: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            let id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    priority: Some(1000),
+                    time_limit: Some(duration),
+                    ..pool_job("waiting", 1, Some(node))
+                },
+            );
+            (id, node)
+        })
+        .collect();
+    assert!(one_pass(&cm).started().is_empty());
+    cm.with_planned_job_starts(|planned| {
+        assert_eq!(planned.len(), waiting.len() + 1);
+        for (id, node) in waiting {
+            let (reserved, when) = &planned[&id];
+            assert_eq!(reserved, std::slice::from_ref(node));
+            assert_eq!(*when, free_at);
+        }
+        assert_eq!(planned[&other].1, free_at + duration);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduler_panic_clears_the_plan_and_skips_stage_in_and_refusals() {
+    use crate::scheduler_loop::{plan_pass_with, PassView};
+    use spur_sched::backfill::BackfillScheduler;
+
+    let dir = TempDir::new().unwrap();
+    let cm = test_cluster(&dir).await;
+    for node in ["n1", "n2"] {
+        register_node(&cm, node, 8, 128000);
+    }
+    cm.qos_cache().insert(grp_node_capped("pool", 1));
+    *cm.burst_buffer_total_gb.write() = 100;
+    submit_and_wait(&cm, pool_job("first", 1, Some("n1")));
+    let refused = submit_and_wait(&cm, pool_job("second", 1, Some("n2")));
+    let staged = submit_and_wait(
+        &cm,
+        JobSpec {
+            burst_buffer: Some("capacity=40".into()),
+            ..basic_spec("stage-in")
+        },
+    );
+    let ClassifiedPass {
+        jobs,
+        mut limits,
+        stage_in,
+        ..
+    } = cm.apply_classification(cm.classify_pending_jobs());
+    assert_eq!(
+        stage_in.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+        [staged]
+    );
+    let prior_reason = cm.get_job(refused).unwrap().pending_reason;
+    assert_ne!(prior_reason, PendingReason::QosGrpNodeLimit);
+    let now = Utc::now();
+    let old_start = now + chrono::Duration::hours(1);
+    cm.set_planned_reservations(HashMap::from([("n2".into(), (refused, old_start))]));
+    cm.set_planned_job_starts(HashMap::from([(refused, (vec!["n2".into()], old_start))]));
+
+    let view = PassView::read(&cm, &jobs);
+    let mut scheduler = BackfillScheduler::new(10);
+    let result = plan_pass_with(
+        &cm,
+        &mut scheduler,
+        &mut limits,
+        &stage_in,
+        |scheduler, admission| {
+            scheduler.schedule_with(&jobs, &view.state(), now, admission);
+            panic!("injected scheduling failure");
+        },
+    );
+
+    assert!(result.is_none());
+    assert_eq!(
+        limits.refusals(),
+        [(refused, PendingReason::QosGrpNodeLimit, None)]
+    );
+    assert_eq!(cm.get_job(refused).unwrap().pending_reason, prior_reason);
+    assert_eq!(
+        cm.get_job(staged).unwrap().bb_stage_state,
+        BbStageState::None
+    );
+    assert_eq!(cm.available_bb(), 100);
+    assert!(cm.planned_reservation("n2").is_none());
+    assert!(cm.with_planned_job_starts(|plan| plan.is_empty()));
+}
+
 /// One pass over an exclusive job and an exclusive burst-buffer job in a QOS
 /// capped at `cap` nodes: the first starts, and the second, which fits the empty
 /// running total, is up for stage-in. Returns the burst-buffer job.
@@ -369,6 +507,32 @@ fn submit_het(cm: &ClusterManager, components: Vec<JobSpec>) -> Vec<JobId> {
     ids
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_cut_between_het_components_charges_only_the_component_it_starts() {
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config();
+    config.scheduler.max_jobs_per_cycle = 1;
+    let cm = test_cluster_with_config(&dir, config).await;
+    for node in ["n1", "n2"] {
+        register_node(&cm, node, 8, 128000);
+    }
+    cm.qos_cache().insert(grp_node_capped("pool", 1));
+    let components = submit_het(
+        &cm,
+        vec![
+            pool_job("het", 1, Some("n1")),
+            pool_job("het", 1, Some("n2")),
+        ],
+    );
+
+    let pass = one_pass(&cm);
+    assert_eq!(pass.admitted(), components);
+    assert_eq!(pass.started(), [components[0]]);
+    assert!(pass.limits.refusals().is_empty());
+    assert!(!pass.limits.fits(&cm.get_job(components[1]).unwrap()));
+    assert!(cm.with_planned_job_starts(|planned| !planned.contains_key(&components[1])));
+}
+
 /// Only the second component is in "pool", which is at its one-node cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_het_job_with_one_component_over_its_qos_limit_starts_no_component() {
@@ -424,7 +588,7 @@ async fn a_preemptors_siblings_neither_start_nor_evict_while_its_victim_drains()
 
     let mut pass = one_pass(&cm);
     assert!(pass.started().is_empty());
-    crate::scheduler_loop::preempt_unstarted(&cm, &mut pass).await;
+    pass.after_placement(&cm).await;
     assert_eq!(cm.get_job(bystander).unwrap().state, JobState::Running);
 
     report_nodes_released(&cm, victim);
@@ -432,6 +596,16 @@ async fn a_preemptors_siblings_neither_start_nor_evict_while_its_victim_drains()
     cm.tick_preempt_freed_earmarks();
     assert_eq!(one_pass(&cm).started(), vec![preemptor]);
     assert_eq!(cm.get_job(bystander).unwrap().state, JobState::Running);
+}
+
+fn enable_test_peer(cm: &ClusterManager) {
+    Arc::make_mut(&mut cm.config.write())
+        .federation
+        .clusters
+        .push(spur_core::config::ClusterPeer {
+            name: "peer".into(),
+            address: "http://peer.invalid:6817".into(),
+        });
 }
 
 /// Two jobs with room for one, each pinned behind its own burst job. The pass
@@ -444,23 +618,20 @@ async fn an_eviction_made_in_a_pass_keeps_its_sibling_from_being_forwarded_in_it
     let victims = [run_burst_job(&cm, "n2"), run_burst_job(&cm, "n3")];
     let first = submit_and_wait(&cm, pool_job("first", 1, Some("n2")));
     let second = submit_and_wait(&cm, pool_job("second", 1, Some("n3")));
-    let forwarded = |pass: &crate::scheduler_loop::TestPass<'_>| -> Vec<JobId> {
-        crate::scheduler_loop::federation_candidates(&pass.limits, &pass.unstarted())
-            .iter()
-            .map(|job| job.job_id)
-            .collect()
-    };
+    enable_test_peer(&cm);
 
     let mut pass = one_pass(&cm);
-    assert_eq!(
-        forwarded(&pass),
-        [first, second],
-        "alone, each fits the room"
-    );
-    crate::scheduler_loop::preempt_unstarted(&cm, &mut pass).await;
+    assert!(pass.limits.fits(&cm.get_job(first).unwrap()));
+    assert!(pass.limits.fits(&cm.get_job(second).unwrap()));
+    let DispatchDecision::Dispatch { forward } = pass.after_placement(&cm).await else {
+        panic!("unexpected idle-fill reclaim");
+    };
     settle(&cm, victims[0], JobState::Completing);
     assert_eq!(cm.get_job(victims[0]).unwrap().preempted_by, Some(first));
-    assert_eq!(forwarded(&pass), [first]);
+    assert_eq!(
+        forward.iter().map(|job| job.job_id).collect::<Vec<_>>(),
+        [first]
+    );
 }
 
 /// Two shared jobs that each fill an 8-CPU node, with room under the cap for one
@@ -480,9 +651,11 @@ async fn a_job_that_fits_only_on_a_node_a_start_just_filled_neither_evicts_nor_i
     let mut pass = one_pass(&cm);
     assert_eq!(pass.started(), vec![first]);
     assert!(!pass.limits.fits(&cm.get_job(second).unwrap()));
-    let forwarded = crate::scheduler_loop::federation_candidates(&pass.limits, &pass.unstarted());
-    assert!(forwarded.iter().all(|job| job.job_id != second));
-    crate::scheduler_loop::preempt_unstarted(&cm, &mut pass).await;
+    enable_test_peer(&cm);
+    let DispatchDecision::Dispatch { forward } = pass.after_placement(&cm).await else {
+        panic!("unexpected idle-fill reclaim");
+    };
+    assert!(forward.iter().all(|job| job.job_id != second));
     assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
 }
 
@@ -490,6 +663,7 @@ async fn a_job_that_fits_only_on_a_node_a_start_just_filled_neither_evicts_nor_i
 async fn idle_fill_cluster(dir: &TempDir, pool: Qos) -> Arc<ClusterManager> {
     let mut config = test_config();
     config.scheduler.idle_fill_enabled = true;
+    config.scheduler.idle_fill_exempt_secs = 0;
     let cm = test_cluster_with_config(dir, config).await;
     for n in ["n1", "n2", "n3"] {
         register_node(&cm, n, 8, 128000);
@@ -569,11 +743,11 @@ async fn a_borrower_cannot_take_account_room_from_an_in_quota_job_in_the_same_pa
 
 /// "research", capped at `account_cap` nodes, runs on n1 and starts a job on n3. Only
 /// its limits decide whether reclaim frees n2, held by a preemptable "burst" run, for
-/// its borrower pinned there. Returns the run and the nodes reclaim freed.
+/// its borrower pinned there. Returns the run and the decision after placement.
 async fn reclaim_for_a_borrower_beside_a_start(
     dir: &TempDir,
     account_cap: u64,
-) -> (Arc<ClusterManager>, JobId, Vec<String>) {
+) -> (Arc<ClusterManager>, JobId, DispatchDecision) {
     let mut pool = grp_node_capped("pool", 1);
     pool.priority = 10;
     let cm = idle_fill_cluster(dir, pool).await;
@@ -601,26 +775,27 @@ async fn reclaim_for_a_borrower_beside_a_start(
     borrower.nodelist = Some("n2".into());
     let borrower = submit_and_wait(&cm, borrower);
 
-    let pass = one_pass(&cm);
+    let mut pass = one_pass(&cm);
     assert_eq!(pass.borrowed(), vec![borrower]);
     assert_eq!(pass.started(), vec![in_quota]);
     assert!(!pass.limits.refused(borrower));
-    let freed = crate::scheduler_loop::reclaim_unstarted(&cm, &pass).await;
-    (cm, run, freed)
+    let decision = pass.after_placement(&cm).await;
+    (cm, run, decision)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_frees_no_node_for_a_borrower_over_its_account_cap_after_this_passs_starts() {
     let dir = TempDir::new().unwrap();
-    let (cm, run, freed) = reclaim_for_a_borrower_beside_a_start(&dir, 2).await;
-    assert!(freed.is_empty());
+    let (cm, run, decision) = reclaim_for_a_borrower_beside_a_start(&dir, 2).await;
+    assert!(matches!(decision, DispatchDecision::Dispatch { .. }));
     assert_eq!(cm.get_job(run).unwrap().state, JobState::Running);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_frees_a_node_for_a_borrower_within_its_account_cap_after_this_passs_starts() {
     let dir = TempDir::new().unwrap();
-    let (cm, run, freed) = reclaim_for_a_borrower_beside_a_start(&dir, 3).await;
-    assert_eq!(freed, ["n2"]);
+    let (cm, run, decision) = reclaim_for_a_borrower_beside_a_start(&dir, 3).await;
+    assert!(matches!(decision, DispatchDecision::Reclaimed));
+    assert!(cm.nodes_on_dispatch_cooldown().contains("n2"));
     settle(&cm, run, JobState::Pending);
 }

@@ -21,7 +21,7 @@ use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::partition_cap::{
     candidate_partitions, is_capped, job_typed_gpu, PartitionNodeUsage, RunningCharge, TresCharge,
 };
-use spur_sched::traits::{Assignment, ClusterState, Scheduler};
+use spur_sched::traits::{Assignment, ClusterState, Scheduler, StartAdmission};
 
 use crate::cluster::{ClassifiedPass, ClusterManager, JobEndFacts, JobFilter, LimitAdmission};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
@@ -387,121 +387,28 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
             continue;
         };
-        let preempt_handoffs = without_released(&view.handoffs, scheduler.released_handoffs());
-        let preempt_state = ClusterState {
-            preemption_handoffs: &preempt_handoffs,
-            ..cluster_state
+        let placement = Placement {
+            pending: &pending,
+            assignments: &assignments,
+            borrowers: &borrow_ids,
         };
-
-        // Preemption: if high-priority jobs couldn't be scheduled,
-        // cancel lower-priority running jobs to free resources.
-        if assignments.len() < pending.len() {
-            // An unplaced borrow candidate is deliberately absent from this list. It
-            // has no claim on the capacity it wanted, so it must not evict anyone via
-            // `try_preempt`; `update_pending_reasons` must not relabel it
-            // `NoSuitableNodes` when being over quota is the true reason; and it must
-            // not be exported to a federated peer, since forwarding a job that is over
-            // its local quota is a policy nobody has chosen (§5.4).
-            let unscheduled: Vec<_> = pending
-                .iter()
-                .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
-                .filter(|p| !borrow_ids.contains(&p.job_id))
-                .collect();
-
-            if !unscheduled.is_empty() {
-                // Update pending_reason for unscheduled jobs to reflect actual cause.
-                // This helps users distinguish "waiting for higher-priority jobs" vs
-                // "no suitable nodes at all".
-                report_unscheduled(&cluster, &unscheduled, &limits, &cluster_state, &scheduler);
+        match placement
+            .resolve_unstarted(
+                &cluster,
+                &view,
+                &scheduler,
+                &mut limits,
+                &mut reclaim_in_flight,
+                interval_secs,
+            )
+            .await
+        {
+            DispatchDecision::Reclaimed => continue,
+            DispatchDecision::Dispatch { forward } if !forward.is_empty() => {
+                let cluster = cluster.clone();
+                tokio::spawn(async move { forward_to_federation(&cluster, &forward).await });
             }
-
-            let unscheduled: Vec<_> = unscheduled
-                .into_iter()
-                .filter(|job| !view.fabric.requires_binding(job))
-                .collect();
-            {
-                // Deliberately outside the `unscheduled` guard: that list excludes
-                // borrow candidates, so gating reclaim on it made rule (B) reachable
-                // only when some unrelated in-quota job happened to be pending too.
-                // Reclaim runs before preemption: recovering capacity that was lent
-                // out is always preferable to evicting a job that holds a claim to
-                // it. A job whose shortfall reclaim closes never reaches
-                // `try_preempt` this cycle.
-                let sched_cfg = cluster.config().scheduler.clone();
-                if sched_cfg.idle_fill_enabled {
-                    let now = Utc::now();
-                    reclaim_in_flight.retain(|_, until| *until > now);
-                    // Reclaim considers borrow candidates too, unlike `try_preempt`
-                    // and federation: rule (B) lets a higher-priority idle-fill job
-                    // displace strictly-lower-priority opportunistic work. The
-                    // ceiling inside keeps it from touching anything with a claim.
-                    let reclaimers = reclaimers(
-                        &pending,
-                        &assignments,
-                        &reclaim_in_flight,
-                        &limits,
-                        &view.fabric,
-                    );
-                    let (freed, freed_for) = reclaim_for_unplaced(
-                        &cluster,
-                        &reclaimers,
-                        &borrow_ids,
-                        &preempt_state,
-                        &sched_cfg,
-                        &assignments,
-                        &mut SearchBudget::default(),
-                        |job| limits.fits(job),
-                    )
-                    .await;
-                    if !freed.is_empty() {
-                        // The cancel has been *delivered*, which is not the same as the
-                        // workload being gone: the agent then sends SIGTERM, waits the
-                        // kill wait, and only then SIGKILLs. Hold the freed nodes out for
-                        // that long so the reclaimer is not dispatched onto a node
-                        // whose previous occupant still holds GPU memory and its
-                        // cgroup (D3).
-                        let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
-                        let cooldown = std::time::Duration::from_secs(kill_wait as u64);
-                        for node in &freed {
-                            cluster.cool_down_node_for(node, cooldown);
-                        }
-                        // Give the reclaimer the whole kill wait plus a cycle to be
-                        // dispatched onto what it was just given.
-                        if let Some(job_id) = freed_for {
-                            let settle = chrono::Duration::seconds(
-                                kill_wait as i64 + interval_secs as i64 + 1,
-                            );
-                            reclaim_in_flight.insert(job_id, Utc::now() + settle);
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if !unscheduled.is_empty() {
-                let preemptor = try_preempt_with_handoffs(
-                    &cluster,
-                    &preempt_state,
-                    &unscheduled,
-                    &assignments,
-                    &cluster.config().scheduler,
-                    &mut SearchBudget::default(),
-                    |job| limits.fits(job),
-                )
-                .await;
-                if let Some(preemptor) = preemptor {
-                    limits.record_eviction(preemptor);
-                }
-
-                // Federation: forward still-unschedulable jobs to peer clusters.
-                if !cluster.config().federation.clusters.is_empty() {
-                    let jobs_to_fwd = federation_candidates(&limits, &unscheduled);
-                    let fed_cluster = cluster.clone();
-                    tokio::spawn(async move {
-                        forward_to_federation(&fed_cluster, &jobs_to_fwd).await;
-                    });
-                }
-            }
+            DispatchDecision::Dispatch { .. } => {}
         }
 
         let mut jobs_started_cycle = 0u64;
@@ -1058,9 +965,25 @@ pub(crate) fn plan_pass(
     limits: &mut LimitAdmission<'_>,
     stage_in: &[spur_core::job::Job],
 ) -> Option<Vec<Assignment>> {
-    let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scheduler.schedule_with(pending, state, Utc::now(), limits)
-    }));
+    plan_pass_with(
+        cluster,
+        scheduler,
+        limits,
+        stage_in,
+        |scheduler, admission| scheduler.schedule_with(pending, state, Utc::now(), admission),
+    )
+}
+
+/// [`plan_pass`] with the placement made by `place`.
+pub(crate) fn plan_pass_with(
+    cluster: &ClusterManager,
+    scheduler: &mut BackfillScheduler,
+    limits: &mut LimitAdmission<'_>,
+    stage_in: &[spur_core::job::Job],
+    place: impl FnOnce(&mut BackfillScheduler, &mut dyn StartAdmission) -> Vec<Assignment>,
+) -> Option<Vec<Assignment>> {
+    let placed =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| place(scheduler, limits)));
     match placed {
         Ok(assignments) => {
             cluster.set_planned_reservations(scheduler.planned_starts());
@@ -1101,6 +1024,120 @@ pub(crate) fn report_unscheduled(
     cluster.update_pending_reasons(&unplaced, state);
     cluster.annotate_partition_cap_pending(&unplaced, scheduler.partition_cap_blocks());
     cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
+}
+
+/// A pass's `assignments` for `pending`, whose `borrowers` are its idle-fill candidates.
+struct Placement<'a> {
+    pending: &'a [spur_core::job::Job],
+    assignments: &'a [Assignment],
+    borrowers: &'a HashSet<spur_core::job::JobId>,
+}
+
+/// What the loop does with a pass's assignments after its unstarted jobs are handled.
+pub(crate) enum DispatchDecision {
+    /// Reclaim freed nodes: nothing is dispatched and the next pass replans.
+    Reclaimed,
+    /// Dispatch the assignments and forward `forward` to federated peers.
+    Dispatch { forward: Vec<spur_core::job::Job> },
+}
+
+impl Placement<'_> {
+    /// Reports why the unstarted jobs didn't start, then reclaims idle-fill capacity
+    /// or preempts for them. A preemptor's eviction is charged to `limits` before the
+    /// jobs to forward are chosen.
+    async fn resolve_unstarted(
+        &self,
+        cluster: &Arc<ClusterManager>,
+        view: &PassView,
+        scheduler: &BackfillScheduler,
+        limits: &mut LimitAdmission<'_>,
+        reclaim_in_flight: &mut HashMap<spur_core::job::JobId, DateTime<Utc>>,
+        interval_secs: u64,
+    ) -> DispatchDecision {
+        if self.assignments.len() == self.pending.len() {
+            return DispatchDecision::Dispatch {
+                forward: Vec::new(),
+            };
+        }
+        // Borrowers retain their quota reason and can reclaim opportunistic work,
+        // but have no claim on capacity through preemption or federation.
+        let mut unscheduled: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|job| !self.borrowers.contains(&job.job_id))
+            .filter(|job| !self.assignments.iter().any(|a| a.job_id == job.job_id))
+            .collect();
+        let state = view.state();
+        if !unscheduled.is_empty() {
+            report_unscheduled(cluster, &unscheduled, limits, &state, scheduler);
+        }
+        unscheduled.retain(|job| !view.fabric.requires_binding(job));
+        let handoffs = without_released(&view.handoffs, scheduler.released_handoffs());
+        let state = ClusterState {
+            preemption_handoffs: &handoffs,
+            ..state
+        };
+        // Reclaim runs before preemption, even when only borrowers are unplaced:
+        // recovering lent capacity is preferable to evicting a job with a claim to it.
+        let config = cluster.config();
+        if config.scheduler.idle_fill_enabled {
+            let now = Utc::now();
+            reclaim_in_flight.retain(|_, until| *until > now);
+            let reclaimers = reclaimers(
+                self.pending,
+                self.assignments,
+                reclaim_in_flight,
+                limits,
+                &view.fabric,
+            );
+            let (freed, owner) = reclaim_for_unplaced(
+                cluster,
+                &reclaimers,
+                self.borrowers,
+                &state,
+                &config.scheduler,
+                self.assignments,
+                &mut SearchBudget::default(),
+                |job| limits.fits(job),
+            )
+            .await;
+            if !freed.is_empty() {
+                // Cancel delivery precedes workload exit. Give the owner the kill
+                // grace plus a scheduler tick before looking for another victim.
+                let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
+                for node in &freed {
+                    cluster.cool_down_node_for(node, Duration::from_secs(kill_wait as u64));
+                }
+                if let Some(id) = owner {
+                    let settle =
+                        chrono::Duration::seconds(kill_wait as i64 + interval_secs as i64 + 1);
+                    reclaim_in_flight.insert(id, Utc::now() + settle);
+                }
+                return DispatchDecision::Reclaimed;
+            }
+        }
+
+        let mut forward = Vec::new();
+        if !unscheduled.is_empty() {
+            if let Some(preemptor) = try_preempt_with_handoffs(
+                cluster,
+                &state,
+                &unscheduled,
+                self.assignments,
+                &cluster.config().scheduler,
+                &mut SearchBudget::default(),
+                |job| limits.fits(job),
+            )
+            .await
+            {
+                limits.record_eviction(preemptor);
+            }
+            if !cluster.config().federation.clusters.is_empty() {
+                forward = federation_candidates(limits, &unscheduled);
+            }
+        }
+        DispatchDecision::Dispatch { forward }
+    }
 }
 
 /// The loop's placement of `pending` over the cluster's current state, asking
@@ -1193,73 +1230,35 @@ pub(crate) fn test_pass(cluster: &ClusterManager) -> TestPass<'_> {
     }
 }
 
-/// The loop's evictions after `pass`, for its unstarted jobs that fit their limits,
-/// holding the room an eviction frees for its preemptor.
 #[cfg(test)]
-pub(crate) async fn preempt_unstarted(cluster: &Arc<ClusterManager>, pass: &mut TestPass<'_>) {
-    let handoffs = without_released(&pass.view.handoffs, pass.scheduler.released_handoffs());
-    let state = ClusterState {
-        preemption_handoffs: &handoffs,
-        ..pass.view.state()
-    };
-    let unstarted = pass.unstarted();
-    let limits = &pass.limits;
-    let preemptor = try_preempt_with_handoffs(
-        cluster,
-        &state,
-        &unstarted,
-        &pass.assignments,
-        &cluster.config().scheduler,
-        &mut SearchBudget::default(),
-        |job| limits.fits(job),
-    )
-    .await
-    .cloned();
-    if let Some(preemptor) = preemptor {
-        pass.limits.record_eviction(&preemptor);
+impl TestPass<'_> {
+    /// The loop's decision after this pass, with no reclaim in flight.
+    pub(crate) async fn after_placement(
+        &mut self,
+        cluster: &Arc<ClusterManager>,
+    ) -> DispatchDecision {
+        let pending: Vec<_> = self
+            .pending
+            .iter()
+            .chain(&self.borrowers)
+            .cloned()
+            .collect();
+        let borrowers = self.borrowed().into_iter().collect();
+        Placement {
+            pending: &pending,
+            assignments: &self.assignments,
+            borrowers: &borrowers,
+        }
+        .resolve_unstarted(
+            cluster,
+            &self.view,
+            &self.scheduler,
+            &mut self.limits,
+            &mut HashMap::new(),
+            cluster.config().scheduler.interval_secs.max(1) as u64,
+        )
+        .await
     }
-}
-
-/// The loop's idle-fill reclaim after `pass`, for its jobs that didn't start. Returns
-/// the nodes freed.
-#[cfg(test)]
-pub(crate) async fn reclaim_unstarted(
-    cluster: &Arc<ClusterManager>,
-    pass: &TestPass<'_>,
-) -> Vec<String> {
-    let handoffs = without_released(&pass.view.handoffs, pass.scheduler.released_handoffs());
-    let state = ClusterState {
-        preemption_handoffs: &handoffs,
-        ..pass.view.state()
-    };
-    let pending: Vec<_> = pass
-        .pending
-        .iter()
-        .chain(&pass.borrowers)
-        .cloned()
-        .collect();
-    let reclaimers = reclaimers(
-        &pending,
-        &pass.assignments,
-        &HashMap::new(),
-        &pass.limits,
-        &pass.view.fabric,
-    );
-    let borrowed = pass.borrowed().into_iter().collect();
-    let mut sched = cluster.config().scheduler.clone();
-    sched.idle_fill_exempt_secs = 0;
-    reclaim_for_unplaced(
-        cluster,
-        &reclaimers,
-        &borrowed,
-        &state,
-        &sched,
-        &pass.assignments,
-        &mut SearchBudget::default(),
-        |job| pass.limits.fits(job),
-    )
-    .await
-    .0
 }
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
@@ -2286,7 +2285,7 @@ fn reclaimers<'j>(
 
 /// The unscheduled jobs to forward to federated peers: those still within their
 /// limits after this pass's starts and the evictions in flight.
-pub(crate) fn federation_candidates(
+fn federation_candidates(
     limits: &LimitAdmission<'_>,
     unscheduled: &[&spur_core::job::Job],
 ) -> Vec<spur_core::job::Job> {
