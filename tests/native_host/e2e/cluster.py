@@ -10,6 +10,7 @@ and CLI wrappers for interacting with the running cluster.
 
 import contextlib
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -2644,6 +2645,11 @@ def node_reserved_cpus(show_node: str) -> tuple[int, set[int]]:
 
 
 # --- Job helpers ---
+
+
+def parse_cleanup_records(output: str) -> list[dict]:
+    """Parse spurd pending-cleanup records printed one JSON object per line."""
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
 
 
 def parse_job_id(sbatch_output: str) -> int | None:

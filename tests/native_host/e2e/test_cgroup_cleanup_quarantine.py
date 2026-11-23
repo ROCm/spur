@@ -1,20 +1,19 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test for quarantining a node whose job cgroup cannot be emptied.
+"""E2E test for quarantining a node whose job cgroup cannot be removed.
 
 ``cgroup.kill`` reaps every process, so no workload can hold the cgroup without
 racing the reaper. Bind-mounting the step cgroup onto itself instead makes its
 ``rmdir`` fail with EBUSY on every attempt until it is unmounted.
 """
 
-import json
 import re
 import shlex
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state, wait_until
+from cluster import parse_cleanup_records, parse_job_id, wait_job, wait_job_state, wait_until
 
 CLEANUP_TIMEOUT = 5
 DRAIN_REASON = "job cgroup cleanup incomplete"
@@ -29,9 +28,12 @@ def _node_reason(cluster, name: str) -> str:
 def _pending_cleanup(cluster, node, job_id: int) -> list[dict]:
     """The agent's persisted cleanup obligations for *job_id*, one per step."""
     directory = f"{cluster.state_dir}/runtime/cleanup"
-    script = f'for f in {shlex.quote(directory)}/{job_id}.*.json; do [ -e "$f" ] && cat "$f" && echo; done'
-    out = node.exec(f"{cluster._sudo_prefix()}sh -c {shlex.quote(script)}")
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
+    # An unmatched glob stays literal, and a record can vanish mid-loop once reaped.
+    script = (
+        f'for f in {shlex.quote(directory)}/{job_id}.*.json; do '
+        '[ -e "$f" ] || continue; cat "$f"; echo; done'
+    )
+    return parse_cleanup_records(node.exec(f"{cluster._sudo_prefix()}sh -c {shlex.quote(script)}"))
 
 
 class TestCgroupCleanupQuarantine:
@@ -71,9 +73,9 @@ class TestCgroupCleanupQuarantine:
         assert re.fullmatch(rf"/spur/job_{job_id}_\d+/step_\w+", cgroup), cgroup
 
         pinned = shlex.quote(f"/sys/fs/cgroup{cgroup}")
-        node.exec(f"{sudo}mount --bind {pinned} {pinned}")
         mounted = True
         try:
+            node.exec(f"{sudo}mount --bind {pinned} {pinned}")
             cluster.cli(["scancel", str(job_id)])
 
             wait_until(
