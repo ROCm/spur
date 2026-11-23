@@ -3628,9 +3628,13 @@ fn refuse_run_placement(
         PlacementRefusal::Backoff(detail) => {
             warn!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-            if let Err(e) =
-                cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt, false)
-            {
+            // An agent too old for the placement is not the job's fault.
+            let spare_requeue_budget = cluster.take_spared_dispatch(job_id);
+            if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(
+                job_id,
+                run_attempt,
+                spare_requeue_budget,
+            ) {
                 error!(job_id, error = %e, "failed to back off for an agent without script placement");
             }
         }
@@ -7578,7 +7582,6 @@ pub(crate) mod tests {
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
-            /// Records every `LaunchJobRequest` this agent receives.
             launch_requests:
                 Option<Arc<std::sync::Mutex<Vec<spur_proto::proto::LaunchJobRequest>>>>,
             /// start_job fails, standing in for a node that confirmed its
@@ -8054,7 +8057,6 @@ pub(crate) mod tests {
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
-        /// Mock agent that records every `LaunchJobRequest` it receives.
         async fn spawn_mock_agent_capturing_launches() -> (
             std::net::SocketAddr,
             Arc<std::sync::Mutex<Vec<spur_proto::proto::LaunchJobRequest>>>,
@@ -10787,12 +10789,20 @@ pub(crate) mod tests {
             spec.script_placement = Some(ScriptPlacement::BatchHost);
             let job_id = submit_and_wait(&cm, spec);
 
-            assert!(
-                !process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await
-            );
-            wait_for("backoff applied", || {
-                cm.get_job(job_id).is_some_and(|j| j.requeue_count == 1)
-            });
+            let spared = crate::cluster::MAX_SPARED_DISPATCHES;
+            for refusal in 1..=spared + 1 {
+                assert!(
+                    !process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await
+                );
+                wait_for("backoff applied", || {
+                    cm.get_job(job_id).is_some_and(|j| j.run_attempt == refusal)
+                });
+                assert_eq!(
+                    cm.get_job(job_id).unwrap().requeue_count,
+                    u32::from(refusal > spared),
+                    "only a refusal past the spared ones charges the budget (refusal {refusal})"
+                );
+            }
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
             let reason = job.state_reason();

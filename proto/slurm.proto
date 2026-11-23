@@ -521,7 +521,7 @@ message JobInfo {
   // on live jobs and on history rows recorded before it was kept.
   optional uint64 alloc_cpus = 95;
 
-  // The node a batch job's script runs on (Slurm's BatchHost); empty until the run starts.
+  // The job's first allocated node (Slurm's BatchHost); empty until the run starts.
   string batch_host = 96;
   // Batch script placement as requested ("" when left to the cluster default)
   // and as resolved for the current run ("" until the run starts).
@@ -1356,9 +1356,8 @@ message LaunchJobRequest {
   // its own gets, Slurm-parity. 0 = unknown (older controller); the agent
   // falls back to its own detected total.
   uint64 node_memory_ceiling_mb = 16;
-  // Where the batch script runs, resolved by the controller: "batch-host" runs
-  // it on the node at task_offset 0 only, "all-nodes" on every node. Empty from
-  // controllers that predate it; the agent then reads it off the script.
+  // Where the batch script runs, as the controller resolved it: "batch-host" (task_offset 0
+  // only) or "all-nodes". Empty from older controllers; the agent then reads it off the script.
   string script_placement = 17;
 }
 

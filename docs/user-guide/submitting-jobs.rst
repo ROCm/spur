@@ -191,7 +191,8 @@ step, as in Slurm:
 
 ``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
 requested value while the job is pending and the one it runs with once it
-starts, and from then ``BatchHost=`` names the node the script runs on.
+starts, and from then ``BatchHost=`` names the first allocated node, the one a
+``batch-host`` script runs on.
 
 Nodes managed by the Kubernetes operator launch only SpurJobs, one Pod per node,
 so a batch job never runs on them, whatever its placement: it runs on other nodes

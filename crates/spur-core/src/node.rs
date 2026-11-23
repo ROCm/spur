@@ -556,7 +556,7 @@ impl Node {
     }
 
     /// Whether the agent places a batch script by its text because it predates
-    /// `script-placement`. K8s virtual agents run every script once per node.
+    /// `script-placement`. K8s virtual agents never run a batch script.
     pub fn reads_placement_off_script(&self) -> bool {
         !self.is_kubernetes() && !self.supports(CAP_SCRIPT_PLACEMENT)
     }

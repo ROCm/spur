@@ -12,18 +12,9 @@ use crate::script_placement::ResolvedPlacement;
 use crate::spur_env::SpurEnv;
 use crate::step::{distribute_tasks, CpuBind, GpuBind, TaskDistribution};
 
-/// Whether batch `launch_job` should fan out the user script into per-rank
-/// wrappers on this node.
-///
-/// Batch scripts normally run once per node; multi-rank MPI is the script's
-/// job via an internal `srun`. Spur additionally fans out when `--mpi=pmix`
-/// is set on a script that runs on every node, so a direct batch launch spawns
-/// one rank per task on the node; a batch-host script is a driver, not a rank.
-/// Standalone `srun` routed through the batch path uses `task_fanout`
-/// for the same effect with non-PMIx commands.
-///
-/// `--mpi=mpirun` never fans out: Spur launches exactly one task (mpirun) per
-/// node and mpirun handles rank fan-out internally.
+/// Whether batch `launch_job` fans the script out into one wrapper per task on this node:
+/// with `task_fanout` (srun via the batch path), or with PMIx on an `all-nodes` run. mpirun
+/// fans out its own ranks, and a batch-host script is a driver, not a rank.
 pub fn use_multi_task_launch(
     tasks_per_node: u32,
     task_fanout: bool,
@@ -73,11 +64,8 @@ pub fn batch_launch(
     BatchLaunch::Script
 }
 
-/// True when batch dispatch already ran multi-node PMIx prepare for this job.
-///
-/// Direct `#SBATCH --mpi=pmix` on multiple nodes prepares PMIx before launch.
-/// A batch-host script drives its own steps, so it skips batch prepare; those
-/// steps prepare independently. Must stay aligned with `confirm_dispatch_on_nodes`.
+/// True when batch dispatch already ran PMIx prepare: on a multi-node PMIx `all-nodes` run,
+/// since a batch-host script's steps prepare their own. Must match `confirm_dispatch_on_nodes`.
 pub fn batch_dispatched_multi_node_pmix(
     job_mpi: Option<&str>,
     num_allocated_nodes: u32,
@@ -97,14 +85,8 @@ pub fn step_needs_pmix_prepare(
     step_num_nodes > 1 && !batch_dispatched_multi_node_pmix(job_mpi, num_allocated_nodes, placement)
 }
 
-/// Bash body for the non-primary nodes of a script that runs on the batch host.
-///
-/// The batch script runs only on the first allocated node; companions hold
-/// their slice of the allocation until the controller tears them down.
-///
-/// Backgrounded and waited on: a non-interactive bash defers a signal until its
-/// foreground child exits, so sleeping in the foreground would hold the whole
-/// job in Completing until the current sleep ran out.
+/// Bash body for a batch-host run's other nodes, holding their slice until stopped. Sleeping
+/// in the background lets TERM through at once; bash defers it while a foreground child runs.
 pub fn batch_companion_hold_script() -> &'static str {
     "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile true; do sleep 60 & wait $!; done\n"
 }

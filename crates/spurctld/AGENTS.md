@@ -185,7 +185,7 @@ Read RPCs are forwarded too (consistency with leader state), unless the request 
 6. Classify pending jobs (QOS/account limits, burst-buffer, licenses, idle-fill candidates); no QOS or account limit is charged yet
 7. Build `ClusterState` (nodes off dispatch cooldown, partitions, reservations, topology, busy_until)
 8. `plan_pass`: run `BackfillScheduler::schedule_with()` in `catch_unwind` (a panic skips the cycle, not the loop), with `LimitAdmission` charging QOS, account and partition QOS limits as each job starts, then start burst-buffer stage-in for jobs still within their limits
-9. Dispatch assignments: resolve the run's script placement (`script_placement::resolve_run_placement`: the job's request, else `[controller] script_placement`; `auto` runs the text scan), propose `JobStart` (recording it) via Raft, fan out `LaunchJob` RPCs to agents. A batch run on K8s nodes is held, a fallback since backfill never offers batch jobs K8s nodes; a run that a node without `CAP_SCRIPT_PLACEMENT` would launch differently is backed off, a safety net behind backfill skipping such nodes
+9. Dispatch assignments: resolve the run's script placement (`script_placement::resolve_run_placement`: the job's request, else `[controller] script_placement`; `auto` runs the text scan), propose `JobStart` (recording it) via Raft, fan out `LaunchJob` RPCs to agents. A batch run on K8s nodes is held, a fallback since backfill never offers batch jobs K8s nodes; a run that a node without `CAP_SCRIPT_PLACEMENT` would launch differently is backed off on a spared retry (`take_spared_dispatch`, capped at `MAX_SPARED_DISPATCHES`), a safety net behind backfill skipping such nodes
 10. Record cycle stats
 
 **Companion tasks (spawned alongside):**

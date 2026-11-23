@@ -6822,9 +6822,8 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once one of a job's nodes has reported, for a batch script that
-/// runs on the batch host. With `primary_only`, only the batch script's node
-/// (the first allocated) counts: the others run a hold script that never reports.
+/// Nodes to stop once a node of a batch-host run reports. With `primary_only`, only the batch
+/// host (the first allocated node) counts: the others run a hold script that never reports.
 fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
     let launches_steps = job.script_placement() == ResolvedPlacement::BatchHost;
     let reporter_ended_the_job = primary_only

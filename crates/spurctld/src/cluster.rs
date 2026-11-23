@@ -745,14 +745,13 @@ pub struct ClusterManager {
     /// sweep can tell an abandoned reservation from one still being dispatched.
     /// Leader-local, never persisted: a new leader has issued no launches yet.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
-    /// Spared retries granted for held-reserved refusals, so a stuck leftover can't
-    /// re-dispatch forever without charging `max_batch_requeue`. Leader-local; a failover reset is harmless.
+    /// Spared retries per job for refusals that are not its fault (held-reserved CPUs, an
+    /// old agent). Leader-local; a failover reset is harmless.
     spared_dispatches: parking_lot::Mutex<HashMap<JobId, u32>>,
 }
 
-/// Spared retries a job gets before its held-reserved refusals count against
-/// `max_batch_requeue`, so a stuck leftover cannot re-dispatch it forever.
-const MAX_SPARED_DISPATCHES: u32 = 5;
+/// Cap on spared retries, so a refusal that keeps recurring still reaches `max_batch_requeue`.
+pub(crate) const MAX_SPARED_DISPATCHES: u32 = 5;
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
 /// its finalization can be recognized and users can't spoof one. The full name
@@ -3163,8 +3162,7 @@ impl ClusterManager {
                 job_id
             );
         }
-        // A successful dispatch resets the spared-retries count: the stuck
-        // leftover that earned them is gone.
+        // A successful dispatch resets the spared retries: whatever earned them is gone.
         self.spared_dispatches.lock().remove(&job_id);
 
         let nodelist = spur_core::hostlist::compress(&node_names);
@@ -3290,9 +3288,8 @@ impl ClusterManager {
         &self.dispatch_tracker
     }
 
-    /// Grants one more spared retry for a held-reserved refusal, up to
-    /// [`MAX_SPARED_DISPATCHES`]; past the cap the refusal counts against
-    /// `max_batch_requeue` like any other.
+    /// Grants one more spared retry, up to [`MAX_SPARED_DISPATCHES`]; past the cap a
+    /// refusal counts against `max_batch_requeue` like any other.
     pub(crate) fn take_spared_dispatch(&self, job_id: JobId) -> bool {
         let mut spared = self.spared_dispatches.lock();
         let used = spared.entry(job_id).or_insert(0);

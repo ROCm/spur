@@ -402,11 +402,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        allocated node only, as in Slurm), or ``"all-nodes"``. Users override it
        per job with ``sbatch --script-placement`` or ``SBATCH_SCRIPT_PLACEMENT``.
        Applied when a job is dispatched, so a reconfigure reaches every job that
-       has not started yet. Jobs on Kubernetes-backed nodes always run the script
-       on every node. ``"batch-host"`` and ``"all-nodes"`` need every node's
-       ``spurd`` to be this release or newer: until a node is upgraded, a job whose
-       placement differs from what ``"auto"`` would choose is backed off rather
-       than launched there. See :ref:`submit-script-placement`.
+       has not started yet. Batch jobs never run on Kubernetes operator nodes.
+       ``"batch-host"`` and ``"all-nodes"`` need every node's ``spurd`` to be this
+       release or newer: until a node is upgraded, a job it would launch
+       differently waits for upgraded nodes instead of running there. See
+       :ref:`submit-script-placement` and :ref:`upgrading-script-placement`.
 
 ``[spurd]``
 -----------

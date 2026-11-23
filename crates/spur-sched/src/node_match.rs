@@ -168,9 +168,8 @@ impl<'a> NodePlacement<'a> {
             .all(|f| node.features.iter().any(|nf| nf == f))
     }
 
-    /// Load-independent placement identity (nodelist/exclude, partition,
-    /// features, reservation, native nodes for a batch job), ignoring node state
-    /// and free capacity.
+    /// Load-independent placement identity (nodelist/exclude, partition, features, reservation,
+    /// native nodes for a batch job), ignoring node state and free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
         self.eligible_on_any_agent(node, reservations, now)
             && !(node.is_kubernetes() && self.job.spec.needs_native_nodes())

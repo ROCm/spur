@@ -82,9 +82,8 @@ impl ResolvedPlacement {
         }
     }
 
-    /// Whether an agent that read `scan` off the script would launch a run placed
-    /// `self` differently. Off the batch host a node runs the script or holds; on
-    /// it, only a PMIx job's launch depends on the placement.
+    /// Whether an agent that read `scan` off the script would launch `self` differently: off
+    /// the batch host a node runs or holds; on it, only a PMIx launch depends on placement.
     pub fn launches_differently_from(
         self,
         scan: Self,
@@ -147,9 +146,8 @@ fn hash_starts_shell_comment(line: &str, hash_index: usize) -> bool {
     matches!(prev, ' ' | '\t' | ';' | '&' | '|' | '(' | ')')
 }
 
-/// Build a sanitized copy of a shell line for step-launcher regex matching: quoted
-/// spans collapse to a single placeholder (preserving adjacency with neighbors),
-/// and `#` starts a comment only at a word boundary.
+/// Sanitize a shell line for step-launcher matching: each quoted span becomes one placeholder,
+/// keeping word adjacency, and `#` starts a comment only at a word boundary.
 fn sanitize_shell_line_for_step_launch(line: &str) -> String {
     let mut sanitized = String::with_capacity(line.len());
     let bytes = line.as_bytes();
