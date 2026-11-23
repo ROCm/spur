@@ -211,8 +211,8 @@ def _drain_and_restart_agent(c: SpurCluster, node_index: int) -> None:
 @pytest.mark.k0s
 class TestK8sMultiControlPlane:
     @pytest.mark.quarantine(
-        reason="secondary k0s control planes are stopped after a spurctld restart "
-        "and cannot rejoin without etcd quorum"
+        reason="secondary control planes intermittently fail to become active etcd "
+        "members; root cause not yet identified"
     )
     def test_three_control_planes_form_etcd_quorum(self, k8s_multicp_cluster):
         cluster = k8s_multicp_cluster

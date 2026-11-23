@@ -185,3 +185,46 @@ def test_quarantine_keeps_k0s_last_ordering(quarantine_run):
     out = result.stdout.str()
     assert out.index("test_plain") < out.index("test_k0s_quarantined")
     result.assert_outcomes(passed=1, xfailed=1)
+
+
+@pytest.mark.parametrize("xfail_marker", [
+    "@pytest.mark.xfail(reason='hand written')",
+    "@pytest.mark.xfail",
+])
+def test_xfail_combined_with_quarantine_is_a_usage_error(quarantine_run, xfail_marker):
+    quarantine_run.makepyfile(f"""
+        import pytest
+
+        {xfail_marker}
+        @pytest.mark.quarantine(reason="{REASON}")
+        def test_both():
+            assert False
+    """)
+    result = quarantine_run.runpytest()
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*test_both*both xfail and quarantine*"])
+
+
+def test_marker_deselection_still_works_and_summary_lists_quarantined(quarantine_run):
+    quarantine_run.makeini(
+        "[pytest]\n"
+        "addopts = -p no:xdist\n"
+        "markers =\n"
+        "    quarantine: known-flaky test blocked on a product bug\n"
+        "    gpu: needs a gpu\n"
+    )
+    quarantine_run.makepyfile(f"""
+        import pytest
+
+        @pytest.mark.gpu
+        def test_gpu():
+            assert False
+
+        @pytest.mark.quarantine(reason="{REASON}")
+        def test_quarantined_cpu():
+            assert False
+    """)
+    result = quarantine_run.runpytest("-m", "not gpu")
+    result.assert_outcomes(xfailed=1)
+    assert result.ret == 0
+    result.stdout.fnmatch_lines(["*Quarantined*", "XFAIL*test_quarantined_cpu*"])

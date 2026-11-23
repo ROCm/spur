@@ -101,6 +101,11 @@ def apply_quarantine(item) -> str | None:
             f"{item.nodeid}: the quarantine marker requires a non-empty reason=... "
             "naming the product bug that blocks the test"
         )
+    if item.get_closest_marker("xfail") is not None:
+        raise pytest.UsageError(
+            f"{item.nodeid}: carries both xfail and quarantine; drop the xfail, "
+            "quarantine already implies a non-strict xfail"
+        )
     reason = reason.strip()
     item.add_marker(pytest.mark.xfail(strict=False, run=True, reason=f"quarantined: {reason}"))
     return reason
