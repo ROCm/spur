@@ -895,6 +895,8 @@ class TestMpirunTestMatrix:
                 ["-j", str(job_id), "--format=JobID,State,ExitCode", "-n"]
             )
             assert str(job_id) in sacct_out, f"job {job_id} not in sacct:\n{sacct_out}"
+        except SshConnectionLost:
+            raise
         except RuntimeError:
             scontrol_out = cluster.cli(
                 ["scontrol", "show", "job", str(job_id)]
@@ -917,6 +919,8 @@ class TestMpirunGpuCollective:
             pytest.skip(f"RCCL needs distinct GPU per rank, found {gpus}")
         try:
             rccl_bin = cluster.compile_rccl_fixture("rccl_all_reduce.c")
+        except SshConnectionLost:
+            raise
         except Exception as e:
             pytest.skip(f"RCCL fixture build failed (no GPU toolchain?): {e}")
         code, out = cluster.srun_with_exit(
@@ -935,6 +939,8 @@ class TestMpirunGpuCollective:
             pytest.skip(f"RCCL needs distinct GPU per rank, found {gpus}")
         try:
             rccl_bin = cluster.compile_rccl_fixture("rccl_all_reduce.c")
+        except SshConnectionLost:
+            raise
         except Exception as e:
             pytest.skip(f"RCCL fixture build failed (no GPU toolchain?): {e}")
         out_path = f"{cluster.remote_dir}/rccl-g2.out"

@@ -9,7 +9,7 @@ A fake node stands in for SshNode only; every test drives the real harness funct
 import pytest
 
 import cluster as cluster_module
-from cluster import exec_with_retry
+from cluster import SshConnectionLost, ensure_any_docker_image, exec_with_retry
 
 
 class ScriptedNode:
@@ -63,3 +63,23 @@ def test_final_failure_names_the_operation_and_the_last_output_tail(sleeps):
     assert "step 0\n" not in message
     assert "first" not in message
     assert len(sleeps) == 2
+
+
+class LosingNode:
+    host = "node-a"
+
+    def __init__(self):
+        self.calls = []
+
+    def exec_with_exit(self, command, timeout=None):
+        self.calls.append(command)
+        raise SshConnectionLost("SSH session to node-a dropped")
+
+
+def test_image_fallback_stops_at_a_lost_session_instead_of_trying_the_next_image(sleeps):
+    node = LosingNode()
+
+    with pytest.raises(SshConnectionLost):
+        ensure_any_docker_image(node, ("mirror/a:1", "mirror/b:1"))
+
+    assert len(node.calls) == 1

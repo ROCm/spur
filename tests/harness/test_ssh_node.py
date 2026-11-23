@@ -371,6 +371,24 @@ def test_exec_raises_on_timeout(remote, node):
         node.exec("stuck", timeout=5)
 
 
+def test_exec_names_the_timeout_and_keeps_the_failure_prefix(remote, node):
+    remote.behaviour = {"ending": "hang"}
+
+    with pytest.raises(RuntimeError) as raised:
+        node.exec("stuck", timeout=5)
+
+    assert str(raised.value).startswith(f"Command failed on {HOST} (exit -1, timed out after 5s): stuck")
+
+
+def test_exec_does_not_call_a_missing_exit_status_a_timeout(remote, node):
+    remote.behaviour = {"stdout": [b"out"], "ending": "no_status"}
+
+    with pytest.raises(RuntimeError) as raised:
+        node.exec("cmd", timeout=5)
+
+    assert str(raised.value).startswith(f"Command failed on {HOST} (exit -1): cmd")
+
+
 def test_keepalive_set_on_connect(remote, node):
     connect = remote.connects[0]
     assert connect["timeout"] == 15

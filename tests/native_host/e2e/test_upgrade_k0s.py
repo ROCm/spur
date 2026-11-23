@@ -416,8 +416,8 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    _reset_k0s_all_nodes(c)
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={
                 "cluster": {"enabled": True, "cni": "kuberouter"},

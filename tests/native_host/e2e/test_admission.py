@@ -7,7 +7,7 @@ E2E tests for node admission.
 
 import time
 
-from cluster import wait_until
+from cluster import SshConnectionLost, wait_until
 
 
 def _wait_registered(cluster, timeout=30):
@@ -34,6 +34,8 @@ def _assert_not_registered(cluster, timeout=15):
     while time.time() < deadline:
         try:
             nodes = cluster.sinfo_nodes()
+        except SshConnectionLost:
+            raise
         except Exception:
             time.sleep(2)
             continue

@@ -8,15 +8,19 @@ Fake nodes stand in for SshNode only; every test drives the real harness functio
 
 import logging
 
+import paramiko
 import pytest
 
 import cluster as cluster_module
 from cluster import (
     CLI_NODE_INDEX,
+    NodeUnresponsive,
+    SpurCluster,
     SshConnectionLost,
     block_heartbeats_from,
     check_nodes_reachable,
     cut_off_node,
+    has_sudo,
     leftover_drop_rules,
     node_health_guard,
     reap_leaked_drop_rules,
@@ -312,6 +316,78 @@ def test_guard_exits_the_shard_before_the_test_when_a_node_stays_unreachable():
     assert nodes[0].commands == []
 
 
+@pytest.mark.parametrize("error", [
+    paramiko.SSHException("Timeout opening channel."), EOFError(), OSError("Socket is closed"),
+    SshConnectionLost("SSH session to node-b dropped"),
+], ids=["ssh", "eof", "oserror", "lost"])
+def test_guard_exits_the_shard_when_a_live_looking_session_cannot_list_rules(error):
+    nodes = [FakeNode("node-a"), FakeNode("node-b", list_error=error)]
+    ran = []
+
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        with node_health_guard(nodes):
+            ran.append(True)
+
+    assert excinfo.value.returncode == 3
+    assert "node-b" in str(excinfo.value) and str(error) in str(excinfo.value)
+    assert not ran
+
+
+def test_guard_exits_the_shard_when_listing_rules_times_out():
+    nodes = [FakeNode("node-a", list_exit=-1)]
+    ran = []
+
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        with node_health_guard(nodes):
+            ran.append(True)
+
+    assert excinfo.value.returncode == 3
+    assert "node-a" in str(excinfo.value) and "timed out after 20s" in str(excinfo.value)
+    assert not ran
+
+
+def test_a_timed_out_listing_is_not_mistaken_for_missing_sudo(caplog):
+    node = FakeNode("node-a", list_exit=-1)
+
+    with caplog.at_level(logging.WARNING, logger="cluster"):
+        with pytest.raises(NodeUnresponsive, match="node-a.*timed out"):
+            snapshot_drop_rules([node])
+
+    assert "leak detection is disabled" not in caplog.text
+
+
+def test_reap_reports_an_unresponsive_node_and_continues():
+    first, second = FakeNode("node-a"), FakeNode("node-b")
+    nodes = [first, second]
+    baseline = snapshot_drop_rules(nodes)
+    first.list_error = paramiko.SSHException("Timeout opening channel.")
+    second.iptables_s = IPTABLES_S
+
+    report = reap_leaked_drop_rules(nodes, baseline)
+
+    assert report[0].startswith("node-a: could not check for leaked rules: ")
+    assert "Timeout opening channel." in report[0]
+    assert leftover_drop_rules(second) == []
+
+
+def test_reap_reports_a_raw_ssh_error_during_removal():
+    node = FakeNode("node-a")
+    baseline = snapshot_drop_rules([node])
+    node.iptables_s = LEAKED[0] + "\n"
+    real = node.exec_with_exit
+
+    def fail_on_delete(cmd, timeout=600):
+        if cmd.startswith("sudo iptables -D"):
+            raise paramiko.SSHException("Timeout opening channel.")
+        return real(cmd, timeout)
+
+    node.exec_with_exit = fail_on_delete
+
+    report = reap_leaked_drop_rules([node], baseline)
+
+    assert len(report) == 1 and "removal failed" in report[0] and "Timeout opening channel." in report[0]
+
+
 def test_check_nodes_reachable_lists_unreachable_hosts_with_their_errors():
     lost = SshConnectionLost("SSH session to node-b lost and 3 reconnect attempts failed")
     nodes = [FakeNode("node-a"), FakeNode("node-b", reconnect_error=lost)]
@@ -343,6 +419,67 @@ def test_unreachable_message_names_hosts_and_original_errors():
     assert "node-a" in msg and "reconnect refused" in msg
     assert "node-c" in msg and "timed out" in msg
     assert "aborting shard" in msg
+
+
+class SudoFakeNode:
+    def __init__(self, host, exit_code=0, output="", error=None):
+        self.host = host
+        self.address = host
+        self.exit_code = exit_code
+        self.output = output
+        self.error = error
+        self.commands = []
+        self.timeouts = []
+
+    def exec_with_exit(self, cmd, timeout=600):
+        self.commands.append(cmd)
+        self.timeouts.append(timeout)
+        if self.error is not None:
+            raise self.error
+        return self.exit_code, self.output
+
+
+def test_has_sudo_runs_true_through_the_prefix_on_a_short_timeout():
+    node = SudoFakeNode("node-a")
+
+    assert has_sudo(node, "sudo -n ")
+    assert node.commands == ["sudo -n true"]
+    assert node.timeouts == [20]
+
+
+def test_has_sudo_is_false_when_sudo_refuses():
+    assert not has_sudo(SudoFakeNode("node-a", 1, "sudo: a password is required"), "sudo -n ")
+
+
+def test_has_sudo_does_not_read_a_lost_session_as_missing_sudo():
+    with pytest.raises(SshConnectionLost):
+        has_sudo(SudoFakeNode("node-a", error=SshConnectionLost("dropped")), "sudo -n ")
+
+
+def test_has_sudo_does_not_read_a_hung_probe_as_missing_sudo():
+    with pytest.raises(NodeUnresponsive, match="node-a.*timed out after 20s"):
+        has_sudo(SudoFakeNode("node-a", -1), "sudo -n ")
+
+
+def _sudo_cluster(monkeypatch, nodes):
+    monkeypatch.delenv("SPUR_TEST_SSH_PASSWORD", raising=False)
+    cluster = SpurCluster(nodes, "/tmp/spur-test", "/tmp/spur-bin")
+    cluster.node_names = [f"name-{node.host}" for node in nodes]
+    return cluster
+
+
+def test_root_agent_preflight_skips_naming_the_node_without_sudo(monkeypatch):
+    cluster = _sudo_cluster(monkeypatch, [SudoFakeNode("node-a"), SudoFakeNode("node-b", 1)])
+
+    with pytest.raises(pytest.skip.Exception, match="name-node-b"):
+        cluster.root_agent_preflight()
+
+
+def test_root_agent_preflight_propagates_a_lost_session_instead_of_skipping(monkeypatch):
+    cluster = _sudo_cluster(monkeypatch, [SudoFakeNode("node-a", error=SshConnectionLost("dropped"))])
+
+    with pytest.raises(SshConnectionLost):
+        cluster.root_agent_preflight()
 
 
 @pytest.mark.parametrize("helper", [block_heartbeats_from, cut_off_node])

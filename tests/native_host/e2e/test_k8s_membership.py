@@ -16,7 +16,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from cluster import assert_nodes_network
+from cluster import assert_nodes_network, has_sudo
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,7 @@ def stray_k0s_worker(cluster, node_index: int, spurd_owned: bool = False):
     `spurd_owned` gives the unit the description spurd writes, which makes it stoppable."""
     node, sudo = cluster.nodes[node_index], cluster._sudo_prefix()
     unit_head = "[Unit]\\nDescription=k0s k0sworker (managed by spurd)\\n" if spurd_owned else ""
-    try:
-        node.exec(f"{sudo}true")
-    except RuntimeError:
+    if not has_sudo(node, sudo):
         pytest.skip(f"a stray k0s unit needs sudo on {cluster.node_names[node_index]}")
     if "active" in node.exec_allow_fail("systemctl is-active k0sworker k0scontroller").split():
         pytest.skip(f"{cluster.node_names[node_index]} already runs a k0s unit")

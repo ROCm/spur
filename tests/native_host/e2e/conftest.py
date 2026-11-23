@@ -17,6 +17,7 @@ import pytest
 from cluster import (
     HA_HEALTH_TICK_SECS,
     HA_HEARTBEAT_TIMEOUT_SECS,
+    SshConnectionLost,
     SshNode,
     SpurCluster,
     deep_merge,
@@ -330,8 +331,8 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    _reset_k0s_all_nodes(c)
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={"cluster": {"enabled": True, "cni": "kuberouter"}},
             agent_as_root=True,
@@ -361,8 +362,8 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    _reset_k0s_all_nodes(c)
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={"cluster": {"enabled": True, "cni": "calico"}},
             agent_as_root=True,
@@ -423,6 +424,8 @@ def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         c.enable_accounting()
+    except SshConnectionLost:
+        raise
     except RuntimeError as e:
         pytest.skip(str(e))
     try:
@@ -701,7 +704,11 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
 
     # Start from a clean k0s slate: a prior test (or a crashed run) can leave k0s
     # services + an etcd datadir behind, which corrupts this cluster's membership.
-    _reset_k0s_all_nodes(c)
+    try:
+        _reset_k0s_all_nodes(c)
+    except Exception:
+        c.teardown()
+        raise
 
     # Establish the mesh first (spur0 up on every node) so spurd reads its
     # wg_pubkey + mesh IP at startup and the reconcile has a real mesh to

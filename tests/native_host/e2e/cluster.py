@@ -143,6 +143,8 @@ def ensure_any_docker_image(node: "SshNode", images: tuple[str, ...]) -> str:
         try:
             ensure_docker_image(node, image)
             return image
+        except SshConnectionLost:
+            raise
         except RuntimeError as err:
             logger.warning("%s", err)
     raise RuntimeError(f"none of {images} could be pulled on {node.host}")
@@ -180,10 +182,29 @@ def _drop_rule_pattern() -> re.Pattern:
     return re.compile(rf"^-A .*--dport ({CONTROLLER_PORT}|{AGENT_PORT})\b.* -j DROP$")
 
 
+class NodeUnresponsive(Exception):
+    """A node whose session looks alive did not answer a short command.
+
+    Not a RuntimeError, so a handler for failed commands cannot mistake it for one."""
+
+
+def has_sudo(node: "SshNode", sudo: str) -> bool:
+    """Whether *sudo* (a ``_sudo_prefix()``) works on *node*. A lost session or a
+    hung probe raises instead, so neither can turn into a "needs sudo" skip."""
+    code, out = node.exec_with_exit(f"{sudo}true", timeout=HEALTH_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeUnresponsive(
+            f"node {node.host} unresponsive: sudo probe timed out after {HEALTH_CHECK_TIMEOUT_S}s: {out.strip()}")
+    return code == 0
+
+
 def leftover_drop_rules(node: "SshNode") -> list[str]:
     """Rules in ``iptables -S`` that drop the controller or agent port, i.e. a
     partition a test left behind."""
     code, out = node.exec_with_exit("sudo iptables -S", timeout=HEALTH_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeUnresponsive(
+            f"node {node.host} unresponsive: `sudo iptables -S` timed out after {HEALTH_CHECK_TIMEOUT_S}s")
     if code != 0:
         raise RuntimeError(f"`sudo iptables -S` failed on {node.host} (exit {code}): {out.strip()}")
     pattern = _drop_rule_pattern()
@@ -192,11 +213,14 @@ def leftover_drop_rules(node: "SshNode") -> list[str]:
 
 def snapshot_drop_rules(nodes: list["SshNode"]) -> list[Counter | None]:
     """Per node (same order), the partition rules present now. None where
-    ``iptables -S`` cannot be listed: leak detection is then skipped for that node."""
+    ``iptables -S`` cannot be listed: leak detection is then skipped for that node.
+    Raises NodeUnresponsive when a node's session fails or the listing times out."""
     baseline = []
     for node in nodes:
         try:
             baseline.append(Counter(leftover_drop_rules(node)))
+        except _NODE_SSH_ERRORS as err:
+            raise NodeUnresponsive(f"node {node.host} unresponsive: {_describe(err)}") from err
         except RuntimeError as err:
             # Tests without partitions must still pass on a bed with no usable
             # sudo iptables, so warn once instead of erroring every teardown.
@@ -220,7 +244,7 @@ def reap_leaked_drop_rules(nodes: list["SshNode"], baseline: list[Counter | None
             continue
         try:
             leaked = list((Counter(leftover_drop_rules(node)) - before).elements())
-        except RuntimeError as err:
+        except (RuntimeError, NodeUnresponsive, *_NODE_SSH_ERRORS) as err:
             report.append(f"{node.host}: could not check for leaked rules: {err}")
             continue
         for rule in leaked:
@@ -228,7 +252,7 @@ def reap_leaked_drop_rules(nodes: list["SshNode"], baseline: list[Counter | None
             try:
                 code, out = node.exec_with_exit(f"sudo iptables {delete}",
                                                 timeout=HEALTH_CHECK_TIMEOUT_S)
-            except RuntimeError as err:
+            except _NODE_SSH_ERRORS as err:
                 code, out = -1, str(err)
             outcome = "removed" if code == 0 else f"removal failed (exit {code}): {out.strip()}"
             report.append(f"{node.host}: {rule.removeprefix('-A ')} -> {outcome}")
@@ -256,12 +280,15 @@ def unreachable_message(unreachable: dict[str, "SshConnectionLost"]) -> str:
 @contextlib.contextmanager
 def node_health_guard(nodes: list["SshNode"]):
     """Around one test: reconnect dead sessions first, ending the shard if a node
-    stays unreachable, and afterwards fail on any partition the test leaked
-    (removing it so later tests are unaffected)."""
+    stays unreachable or does not answer, and afterwards fail on any partition the
+    test leaked (removing it so later tests are unaffected)."""
     unreachable = check_nodes_reachable(nodes)
     if unreachable:
         pytest.exit(unreachable_message(unreachable), returncode=3)
-    baseline = snapshot_drop_rules(nodes)
+    try:
+        baseline = snapshot_drop_rules(nodes)
+    except NodeUnresponsive as err:
+        pytest.exit(f"{err}; aborting shard", returncode=3)
 
     yield
 
@@ -682,10 +709,14 @@ class SshNode:
 
     def exec(self, cmd: str, check: bool = True, timeout: int | None = DEFAULT_TIMEOUT_S) -> str:
         """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
+        started = self._clock()
         exit_code, out, err = self._run(cmd, timeout=timeout)
         if check and exit_code != 0:
+            # -1 also means "no exit status", so only a run that used up its timeout is called one.
+            timed_out = exit_code == -1 and timeout is not None and self._clock() - started >= timeout
+            status = f"exit {exit_code}, timed out after {timeout}s" if timed_out else f"exit {exit_code}"
             raise RuntimeError(
-                f"Command failed on {self.host} (exit {exit_code}): {cmd}\n"
+                f"Command failed on {self.host} ({status}): {cmd}\n"
                 f"stdout: {out}\nstderr: {err}"
             )
         return out
@@ -1732,9 +1763,7 @@ class SpurCluster:
     def root_agent_preflight(self):
         """Verify passwordless (or password-backed) sudo for rootful spurd. Skips if not."""
         for i, node in enumerate(self.nodes):
-            try:
-                node.exec(f"{self._sudo_prefix()}true")
-            except RuntimeError:
+            if not has_sudo(node, self._sudo_prefix()):
                 pytest.skip(
                     f"rootful spurd requires sudo on {self.node_names[i]} "
                     f"(set SPUR_TEST_SSH_PASSWORD or configure NOPASSWD sudo)"

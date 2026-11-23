@@ -8,12 +8,15 @@ racing the reaper. Bind-mounting the step cgroup onto itself instead makes its
 ``rmdir`` fail with EBUSY on every attempt until it is unmounted.
 """
 
+import logging
 import re
 import shlex
 
 import pytest
 
 from cluster import parse_cleanup_records, parse_job_id, wait_job, wait_job_state, wait_until
+
+logger = logging.getLogger(__name__)
 
 CLEANUP_TIMEOUT = 5
 DRAIN_REASON = "job cgroup cleanup incomplete"
@@ -113,4 +116,7 @@ class TestCgroupCleanupQuarantine:
             assert not _pending_cleanup(cluster, node, job_id)
         finally:
             if mounted:
-                node.exec_allow_fail(f"{sudo}umount {pinned}")
+                code, out = node.exec_with_exit(f"{sudo}umount {pinned}")
+                if code != 0:
+                    logger.warning("umount of the pinned cgroup %s on %s failed (exit %d): %s",
+                                   pinned, node.host, code, out.strip())
