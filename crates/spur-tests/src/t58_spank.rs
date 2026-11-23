@@ -127,7 +127,7 @@ mod tests {
             ESPANK_SUCCESS
         );
 
-        let mut buf = [0i8; 32];
+        let mut buf = [0; 32];
         assert_eq!(
             spank_getenv(
                 &mut handle,
@@ -153,7 +153,7 @@ mod tests {
         let mut handle = SpankHandle::new(SpankContext::default(), env);
 
         let var = CString::new("SLURM_JOB_ID").unwrap();
-        let mut buf = [0i8; 16];
+        let mut buf = [0; 16];
         assert_eq!(
             spank_getenv(
                 &mut handle,

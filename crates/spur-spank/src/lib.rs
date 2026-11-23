@@ -742,7 +742,7 @@ mod tests {
         let val = std::ffi::CString::new("baz").unwrap();
         spank_setenv(&mut handle, var.as_ptr(), val.as_ptr(), 1);
 
-        let mut buf = [0i8; 16];
+        let mut buf = [0; 16];
         assert_eq!(
             spank_getenv(
                 &mut handle,
@@ -768,7 +768,7 @@ mod tests {
         );
 
         // Buffer too small (value "baz" needs 4 bytes incl. NUL).
-        let mut tiny = [0i8; 2];
+        let mut tiny = [0; 2];
         assert_eq!(
             spank_getenv(
                 &mut handle,
