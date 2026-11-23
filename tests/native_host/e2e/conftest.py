@@ -18,9 +18,12 @@ from cluster import (
     HA_HEARTBEAT_TIMEOUT_SECS,
     SshNode,
     SpurCluster,
+    check_nodes_reachable,
     deep_merge,
     ensure_bins,
     make_remote_dir,
+    reap_leftover_drop_rules,
+    unreachable_message,
 )
 from wg_cluster import MESH_CIDR, WG_IFACE, WgMesh, wg_available
 
@@ -134,6 +137,31 @@ def ssh_nodes():
 
     for node in nodes:
         node.close()
+
+
+@pytest.fixture(autouse=True)
+def _node_health(request):
+    """Per-test guard for tests that use the nodes: reconnect dead sessions
+    before the test, and fail the test that leaks a partition rule after it.
+
+    A node that stays unreachable ends the shard: every later test would only
+    fail on the same dead session."""
+    if "ssh_nodes" not in request.fixturenames:
+        yield
+        return
+    nodes = request.getfixturevalue("ssh_nodes")
+    unreachable = check_nodes_reachable(nodes)
+    if unreachable:
+        pytest.exit(unreachable_message(unreachable), returncode=3)
+
+    yield
+
+    # Removed here, not left for the next test, so one leak fails one test
+    # instead of silently partitioning the rest of the shard.
+    leaked = reap_leftover_drop_rules(nodes)
+    if leaked:
+        pytest.fail("test left iptables partition rules behind:\n" + "\n".join(leaked),
+                    pytrace=False)
 
 
 @pytest.fixture(scope="session")

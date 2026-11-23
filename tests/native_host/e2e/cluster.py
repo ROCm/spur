@@ -32,6 +32,10 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+# SpurCluster.cli() runs on this node, so a partition that cuts its own traffic
+# to the controller port would sever the CLI the test needs to observe the outage.
+CLI_NODE_INDEX = 0
+HEALTH_CHECK_TIMEOUT_S = 20
 # HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
 # and heartbeat_timeout must clear spurd's fixed 30s send interval so ordinary
 # cadence jitter can never be mistaken for the grace-window bug.
@@ -140,6 +144,60 @@ def deep_merge(base: dict, overrides: dict) -> dict:
     return base
 
 
+def _refuse_cli_node(helper: str, node_index: int):
+    if node_index == CLI_NODE_INDEX:
+        raise ValueError(
+            f"{helper} cannot target node {CLI_NODE_INDEX}: the test CLI runs there "
+            f"and the partition would cut it off from the controller"
+        )
+
+
+def _drop_rule_pattern() -> re.Pattern:
+    return re.compile(rf"^-A .*--dport ({CONTROLLER_PORT}|{AGENT_PORT})\b.* -j DROP$")
+
+
+def leftover_drop_rules(node: "SshNode") -> list[str]:
+    """Rules in ``iptables -S`` that drop the controller or agent port, i.e. a
+    partition a test left behind."""
+    code, out = node.exec_with_exit("sudo iptables -S", timeout=HEALTH_CHECK_TIMEOUT_S)
+    if code != 0:
+        raise RuntimeError(f"`sudo iptables -S` failed on {node.host} (exit {code}): {out.strip()}")
+    pattern = _drop_rule_pattern()
+    return [line for line in out.splitlines() if pattern.match(line)]
+
+
+def reap_leftover_drop_rules(nodes: list["SshNode"]) -> list[str]:
+    """Remove every leftover partition rule on *nodes* so it cannot poison later
+    tests. Returns one report line per rule found, with the removal outcome."""
+    report = []
+    for node in nodes:
+        for rule in leftover_drop_rules(node):
+            delete = rule.replace("-A ", "-D ", 1)
+            code, out = node.exec_with_exit(f"sudo iptables {delete}",
+                                            timeout=HEALTH_CHECK_TIMEOUT_S)
+            outcome = "removed" if code == 0 else f"removal failed (exit {code}): {out.strip()}"
+            report.append(f"{node.host}: {rule.removeprefix('-A ')} -> {outcome}")
+    return report
+
+
+def check_nodes_reachable(nodes: list["SshNode"]) -> dict[str, "SshConnectionLost"]:
+    """Reconnect any node whose session died. Returns the nodes that could not be
+    reached, as host -> error; empty when every node is up."""
+    unreachable = {}
+    for node in nodes:
+        try:
+            node.ensure_connected()
+        except SshConnectionLost as err:
+            unreachable[node.host] = err
+    return unreachable
+
+
+def unreachable_message(unreachable: dict[str, "SshConnectionLost"]) -> str:
+    hosts = "; ".join(f"node {host} unreachable after reconnect ({err})"
+                      for host, err in unreachable.items())
+    return f"{hosts}; aborting shard"
+
+
 @contextlib.contextmanager
 def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_PORT):
     """Drop the controller's outbound traffic to one node's agent port.
@@ -164,6 +222,7 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
 def cut_off_node(cluster: "SpurCluster", node_index: int):
     """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
     Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
+    _refuse_cli_node("cut_off_node", node_index)
     controller = cluster.nodes[0]
     target = cluster.nodes[node_index].address
     rules = [
@@ -185,6 +244,7 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
 def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
     """Drop one node's outbound traffic to every controller's client port, so its
     agent cannot heartbeat but controllers can still reach it. Always undone on exit."""
+    _refuse_cli_node("block_heartbeats_from", node_index)
     node = cluster.nodes[node_index]
     rule_args = f"-p tcp --dport {port} -j DROP"
     node.exec(f"sudo iptables -I OUTPUT {rule_args}")
@@ -755,7 +815,7 @@ class SpurCluster:
         *controller_addr* overrides the endpoint(s) passed via
         ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
         """
-        return self.nodes[0].exec(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec(self._cli_command(args, controller_addr))
 
     def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
@@ -763,7 +823,9 @@ class SpurCluster:
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
         """
-        return self.nodes[0].exec_allow_fail(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec_allow_fail(
+            self._cli_command(args, controller_addr)
+        )
 
     def cli_as_user(
         self,
@@ -789,8 +851,8 @@ class SpurCluster:
             args, controller_addr, run_as=run_as, extra_env=extra_env
         )
         if not check:
-            return self.nodes[0].exec_allow_fail(cmd)
-        code, out = self.nodes[0].exec_with_exit(cmd)
+            return self.nodes[CLI_NODE_INDEX].exec_allow_fail(cmd)
+        code, out = self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
         if code != 0:
             raise RuntimeError(
                 f"Command failed as {run_as} (exit {code}): {cmd}\n{out}"
@@ -801,7 +863,9 @@ class SpurCluster:
         self, args: list[str], controller_addr: str | None = None
     ) -> tuple[int, str]:
         """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
-        return self.nodes[0].exec_with_exit(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(
+            self._cli_command(args, controller_addr)
+        )
 
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
