@@ -186,7 +186,8 @@ Held in controller memory. Key fields beyond the spec:
   run, so its exit is the run's. Cleared on requeue.
 - `retained_nodes`: on a per-node run, nodes whose copy exited cleanly while the run went
   on, plus, once it ends, any reported node a live step of the job still runs on. They
-  reported, but stay charged until the run ends and their steps do, so "reported" and
+  reported, but stay charged until the run ends and their steps do, or the node is
+  lost or removed, so "reported" and
   "charged" differ: `is_held_on`/`held_node_names` (charged) include them,
   `still_runs_on`/`running_nodes` (not yet reported) and `released_nodes` (slice returned)
   do not. `clear_node_reports` clears them with `node_completions`, after the caller has

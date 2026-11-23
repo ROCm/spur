@@ -111,7 +111,9 @@ out). While such a job spans more than one node and is Running outside a
 preemption grace (`ends_copy_by_copy`), `node_complete` proposes the exit as
 `WalOperation::JobCopyExited`. `JobNodeComplete` keeps its
 older meaning (the first report ends the run), so every controller replays a
-log an older leader wrote the same way. A clean exit leaves the job Running
+log an older leader wrote the same way. `ClusterManager::apply_node_exit` applies
+both, so its unit tests (`cluster::tests::node_exit`) pin the decision table
+without the WAL. A clean exit leaves the job Running
 (`NodeCompleteResult::StillRunning`) but keeps the node's slice charged
 (`Job.retained_nodes`): `spurd` keeps a job's allocation until its last
 supervisor on the node exits, steps included, so a node given back at its copy's
@@ -128,13 +130,17 @@ When the run ends (its first failure, its last copy, or any report in a
 preemption grace), a kept node goes back only once no live user step of the job
 runs there (`nodes_running_steps`); the copy whose exit ends the run is kept the
 same way. `ended_run_stragglers` stops every node the run still holds
-(`Job::held_nodes()`), kept ones included, and the run waits, Completing or
+(`Job::held_nodes()`), kept ones included, on the report that ends the run or a
+retry of it, never on a stopped copy's own report. The run waits, Completing or
 still Running in its grace, until each kept node's last step records its
 `JobStepComplete`, which frees the node (`release_after_step_end`) and then ends
 the run (`finish_settled_run`). A grace hands each freed node to the preemptor
 at that point. The completing timeout's force-finish quarantines and kills kept
-nodes like unreported ones without changing the verdict, and a `NodeRemove` drops
-the removed node from `retained_nodes`, ending a run that only waited on it. Every
+nodes like unreported ones without changing the verdict. A kept node that goes
+Down or is removed takes its steps with it: `evict_jobs_on_node` frees its slice
+and drops it from `retained_nodes`, at any point in the run, ending a run that
+only waited on it. The steps' records stay open, since a step spanning another
+kept node may still run there. Every
 other ending (`JobComplete`, requeue, preemption, eviction) frees all but
 `Job::released_nodes()` at once, as it does for unreported nodes. While a run
 holds this state, snapshots are fenced from older controllers (see

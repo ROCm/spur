@@ -920,6 +920,25 @@ fn preemptor_of(job: &Job, grace: Option<&PreemptPending>) -> Option<JobId> {
     }
 }
 
+/// One node's completion report, as `JobNodeComplete` or `JobCopyExited` carries it.
+struct NodeExit<'a> {
+    node: &'a str,
+    exit_code: i32,
+    signal: i32,
+    run_attempt: u32,
+    /// Sent as `JobCopyExited`, the only report that ends a per-node run copy by copy.
+    copy_exit: bool,
+}
+
+/// What applying a [`NodeExit`] did beyond its job: the slices it returned, the
+/// preemptor they go to, and the run it ended.
+#[derive(Default)]
+struct NodeExitEffect {
+    released: Vec<String>,
+    preemptor: Option<JobId>,
+    finalized: Option<JobFinalized>,
+}
+
 /// What a run is charged to and how it runs, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
@@ -9115,6 +9134,91 @@ impl ClusterManager {
         Self::finalize_reported_run(job, at)
     }
 
+    /// Apply one node's exit to its job: record it, keep or return node slices,
+    /// and end the run once nothing it waits on remains. A report for an earlier
+    /// run or an ended one, or a repeat `JobCopyExited`, changes nothing.
+    fn apply_node_exit(
+        job: &mut Job,
+        nodes: &mut HashMap<String, Node>,
+        steps: &HashMap<(JobId, u32), JobStep>,
+        exit: &NodeExit<'_>,
+        at: DateTime<Utc>,
+    ) -> NodeExitEffect {
+        // Re-checked here, not just where this was proposed: a requeue
+        // can commit in between, and a stale report must not discharge
+        // the run that replaced the one it was sent for. 0 is legacy
+        // (pre-upgrade entries, and either side never having run this
+        // job more than once), and disables the check.
+        if exit.run_attempt != 0 && job.run_attempt != 0 && exit.run_attempt < job.run_attempt {
+            return NodeExitEffect::default();
+        }
+        // A completion for a non-active job is stale/replayed; skip
+        // it rather than forcing an illegal finalize transition.
+        if !job.state.is_active() {
+            return NodeExitEffect::default();
+        }
+
+        let grace = Self::running_grace(job);
+        let in_grace = grace.is_some();
+        let already_reported = job.node_completions.contains_key(exit.node);
+        // A repeat proposed before the first report applied. Only JobCopyExited
+        // may drop it: an older controller still lets a JobNodeComplete overwrite.
+        if already_reported && exit.copy_exit {
+            return NodeExitEffect::default();
+        }
+        let preemptor = preemptor_of(job, grace);
+        // Only JobCopyExited ends a per-node run node by node: an older
+        // controller applies JobNodeComplete the old way, so this must too.
+        let per_node = exit.copy_exit && ends_copy_by_copy(job);
+        if per_node && (exit.exit_code != 0 || exit.signal != 0) {
+            job.first_failed_node
+                .get_or_insert_with(|| exit.node.to_string());
+        }
+        job.node_completions.insert(
+            exit.node.to_string(),
+            spur_core::job::NodeCompletion {
+                code: exit.exit_code,
+                signal: exit.signal,
+            },
+        );
+
+        let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
+        let released = if per_node && others_run_on && !job.all_nodes_completed() {
+            // spurd keeps the slice while any of the job's steps run there,
+            // so the node stays charged until the run ends.
+            job.retained_nodes.insert(exit.node.to_string());
+            Vec::new()
+        } else {
+            // The run is ending, so a node goes back once no step of the job
+            // runs there; until then it is stopped with the rest.
+            let busy = if job.retained_nodes.is_empty() && !per_node {
+                BTreeSet::new()
+            } else {
+                nodes_running_steps(steps, job.job_id)
+            };
+            let mut released = Self::release_settled_nodes(job, nodes, &busy);
+            if per_node && busy.contains(exit.node) {
+                job.retained_nodes.insert(exit.node.to_string());
+            } else if !already_reported {
+                Self::release_node_slice(job, nodes, exit.node);
+                released.push(exit.node.to_string());
+            }
+            released
+        };
+        // A claim carries every node's allocation; only the final report needs a copy.
+        let finalized = if others_run_on && !job.all_nodes_completed() {
+            None
+        } else {
+            let grace = job.preempt_grace().filter(|_| in_grace).cloned();
+            Self::advance_after_node_report(job, grace.as_ref(), at)
+        };
+        NodeExitEffect {
+            released,
+            preemptor,
+            finalized,
+        }
+    }
+
     /// When a victim re-pended after its grace may run again: the hold recorded
     /// with the warning, never earlier than a later `--begin` the user set.
     fn preempt_hold_until(job: &Job, at: DateTime<Utc>, hold_secs: u32) -> DateTime<Utc> {
@@ -9382,6 +9486,17 @@ impl ClusterManager {
                 freed_for_preemptor,
             ) {
                 response.jobs_finalized.push(fin);
+            }
+        }
+
+        // The node's steps went with it, so a run that kept the node for them stops
+        // waiting; its slice goes back before a replacement can register under the name.
+        for job in jobs.values_mut() {
+            if job.retained_nodes.remove(node_name) {
+                Self::release_node_slice(job, nodes, node_name);
+                response
+                    .jobs_finalized
+                    .extend(Self::finish_settled_run(job, timestamp));
             }
         }
 
@@ -9977,94 +10092,27 @@ impl ClusterManager {
                 run_attempt,
                 ..
             } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let exit = NodeExit {
+                    node: node_name,
+                    exit_code: *exit_code,
+                    signal: *signal,
+                    run_attempt: *run_attempt,
+                    copy_exit: matches!(op, WalOperation::JobCopyExited { .. }),
+                };
+                let effect =
+                    Self::apply_node_exit(job, &mut nodes, &self.steps.read(), &exit, timestamp);
                 // A node a preempting victim frees here is claimed for its
                 // preemptor in the same critical section that releases it, so no
                 // scheduling pass can slip a bystander onto it before the hoist
                 // predicate or the earmark is visible.
-                let freed_for_preemptor;
-                let finalized = {
-                    let Some(job) = jobs.get_mut(job_id) else {
-                        return ClientResponse::default();
-                    };
-                    // Re-checked here, not just where this was proposed: a requeue
-                    // can commit in between, and a stale report must not discharge
-                    // the run that replaced the one it was sent for. 0 is legacy
-                    // (pre-upgrade entries, and either side never having run this
-                    // job more than once), and disables the check.
-                    if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
-                        return ClientResponse::default();
-                    }
-                    // A completion for a non-active job is stale/replayed; skip
-                    // it rather than forcing an illegal finalize transition.
-                    if !job.state.is_active() {
-                        return ClientResponse::default();
-                    }
-
-                    let grace = Self::running_grace(job);
-                    let in_grace = grace.is_some();
-                    let already_reported = job.node_completions.contains_key(node_name);
-                    // A repeat proposed before the first report applied. Only JobCopyExited
-                    // may drop it: an older controller still lets a JobNodeComplete overwrite.
-                    if already_reported && matches!(op, WalOperation::JobCopyExited { .. }) {
-                        return ClientResponse::default();
-                    }
-                    let preemptor = preemptor_of(job, grace);
-                    // Only JobCopyExited ends a per-node run node by node: an older
-                    // controller applies JobNodeComplete the old way, so this must too.
-                    let per_node =
-                        matches!(op, WalOperation::JobCopyExited { .. }) && ends_copy_by_copy(job);
-                    if per_node && (*exit_code != 0 || *signal != 0) {
-                        job.first_failed_node
-                            .get_or_insert_with(|| node_name.clone());
-                    }
-                    job.node_completions.insert(
-                        node_name.clone(),
-                        spur_core::job::NodeCompletion {
-                            code: *exit_code,
-                            signal: *signal,
-                        },
-                    );
-
-                    let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
-                    let released = if per_node && others_run_on && !job.all_nodes_completed() {
-                        // spurd keeps the slice while any of the job's steps run there,
-                        // so the node stays charged until the run ends.
-                        job.retained_nodes.insert(node_name.clone());
-                        Vec::new()
-                    } else {
-                        // The run is ending, so a node goes back once no step of the job
-                        // runs there; until then it is stopped with the rest.
-                        let busy = if job.retained_nodes.is_empty() && !per_node {
-                            BTreeSet::new()
-                        } else {
-                            nodes_running_steps(&self.steps.read(), *job_id)
-                        };
-                        let mut released = Self::release_settled_nodes(job, &mut nodes, &busy);
-                        if per_node && busy.contains(node_name) {
-                            job.retained_nodes.insert(node_name.clone());
-                        } else if !already_reported {
-                            Self::release_node_slice(job, &mut nodes, node_name);
-                            released.push(node_name.clone());
-                        }
-                        released
-                    };
-                    freed_for_preemptor = preemptor
-                        .filter(|_| !released.is_empty())
-                        .map(|preemptor| (preemptor, released));
-                    // A claim carries every node's allocation; only the final report needs a copy.
-                    if others_run_on && !job.all_nodes_completed() {
-                        None
-                    } else {
-                        let grace = job.preempt_grace().filter(|_| in_grace).cloned();
-                        Self::advance_after_node_report(job, grace.as_ref(), timestamp)
-                    }
-                };
-
-                if let Some((preemptor, released)) = freed_for_preemptor {
-                    self.record_preempt_freed_nodes(&jobs, &released, preemptor);
+                if let Some(preemptor) = effect.preemptor {
+                    self.record_preempt_freed_nodes(&jobs, &effect.released, preemptor);
                 }
 
-                if let Some(finalized) = finalized {
+                if let Some(finalized) = effect.finalized {
                     drop(jobs);
                     drop(nodes);
                     let oom = finalized.state == JobState::OutOfMemory;
@@ -10697,15 +10745,6 @@ impl ClusterManager {
                     // A node can be force-removed while still k0s-assigned (no prior `k8s down`).
                     if let Some(role) = node.k0s_role {
                         self.k0s_role_counts.dec(role);
-                    }
-                }
-                // A finished copy's charge leaves with the record, so no later release
-                // takes it from a replacement node registered under the same name.
-                for job in jobs.values_mut() {
-                    if job.retained_nodes.remove(name) {
-                        response
-                            .jobs_finalized
-                            .extend(Self::finish_settled_run(job, timestamp));
                     }
                 }
                 nodes.remove(name);
@@ -22919,6 +22958,11 @@ state = "UP"
         lose_node(&cm, "n1");
 
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+        assert_eq!(
+            cpus_in_use(&cm, "n1"),
+            0,
+            "its steps went down with it, so nothing holds the slice"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23170,6 +23214,198 @@ state = "UP"
 
         assert_eq!(finalized.len(), 1);
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_the_node_a_run_waits_on_ends_the_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = running_per_node_job(&cm, &["n1", "n2"]);
+        start_step_on(&cm, job_id, 0, &["n1"]);
+        cm.node_complete(job_id, "n1", 0, 0, 0).unwrap();
+        cm.node_complete(job_id, "n2", 0, 0, 0).unwrap();
+
+        lose_node(&cm, "n1");
+
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completed);
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+    }
+
+    /// `apply_node_exit` on its own, with no WAL or cluster around it.
+    mod node_exit {
+        use super::*;
+        use spur_core::script_placement::ResolvedPlacement;
+
+        type Steps = HashMap<(JobId, u32), JobStep>;
+
+        /// A Running per-node job on `names`, each node holding its two-cpu slice.
+        fn per_node_run(names: &[&str]) -> (Job, HashMap<String, Node>) {
+            let slice = scalar_alloc(2, 4000);
+            let mut job = Job::new(1, basic_spec("per-node"));
+            job.transition(JobState::Running).unwrap();
+            job.resolved_placement = Some(ResolvedPlacement::AllNodes);
+            job.allocated_nodes = names.iter().map(|n| n.to_string()).collect();
+            let count = names.len() as u32;
+            job.allocated_resources = Some(scalar_alloc(2 * count, 4000 * u64::from(count)));
+            job.per_node_alloc = per_node_for(names, slice.clone());
+            let nodes = names
+                .iter()
+                .map(|name| {
+                    let resources = ResourceSet {
+                        cpus: 8,
+                        memory_mb: 16000,
+                        ..Default::default()
+                    };
+                    let mut node = Node::new(name.to_string(), resources);
+                    node.hold(&slice);
+                    (name.to_string(), node)
+                })
+                .collect();
+            (job, nodes)
+        }
+
+        fn steps_on(job_id: JobId, placed: &[(u32, &str)]) -> Steps {
+            placed
+                .iter()
+                .map(|&(step_id, node)| {
+                    let mut step = user_step(job_id, step_id);
+                    step.nodes = vec![node.into()];
+                    ((job_id, step_id), step)
+                })
+                .collect()
+        }
+
+        fn exit(node: &str, exit_code: i32, copy_exit: bool) -> NodeExit<'_> {
+            NodeExit {
+                node,
+                exit_code,
+                signal: 0,
+                run_attempt: 0,
+                copy_exit,
+            }
+        }
+
+        fn apply(
+            job: &mut Job,
+            nodes: &mut HashMap<String, Node>,
+            steps: &Steps,
+            exit: NodeExit<'_>,
+        ) -> NodeExitEffect {
+            ClusterManager::apply_node_exit(job, nodes, steps, &exit, Utc::now())
+        }
+
+        fn charged(nodes: &HashMap<String, Node>, name: &str) -> u32 {
+            nodes[name].alloc_resources.cpus
+        }
+
+        #[test]
+        fn a_clean_copy_mid_run_keeps_its_node() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2", "n3"]);
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n1", 0, true));
+
+            assert!(effect.released.is_empty() && effect.finalized.is_none());
+            assert_eq!(job.state, JobState::Running);
+            assert!(job.retained_nodes.contains("n1"));
+            assert_eq!(charged(&nodes, "n1"), 2);
+        }
+
+        #[test]
+        fn the_last_clean_copy_frees_every_node_and_ends_the_run() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2"]);
+            apply(&mut job, &mut nodes, &Steps::new(), exit("n1", 0, true));
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n2", 0, true));
+
+            assert_eq!(effect.released, ["n1", "n2"]);
+            assert_eq!(effect.finalized.map(|f| f.state), Some(JobState::Completed));
+            assert_eq!((charged(&nodes, "n1"), charged(&nodes, "n2")), (0, 0));
+        }
+
+        #[test]
+        fn a_first_failure_frees_the_kept_nodes_and_waits_for_the_rest() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2", "n3"]);
+            apply(&mut job, &mut nodes, &Steps::new(), exit("n1", 0, true));
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n2", 3, true));
+
+            assert_eq!(effect.released, ["n1", "n2"]);
+            assert!(effect.finalized.is_none(), "n3 is still being stopped");
+            assert_eq!(job.state, JobState::Completing);
+            assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+        }
+
+        #[test]
+        fn a_live_step_keeps_its_node_and_the_run_past_the_last_copy() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2"]);
+            let steps = steps_on(job.job_id, &[(0, "n1"), (1, "n2")]);
+            apply(&mut job, &mut nodes, &steps, exit("n1", 0, true));
+
+            let effect = apply(&mut job, &mut nodes, &steps, exit("n2", 0, true));
+
+            assert!(effect.released.is_empty() && effect.finalized.is_none());
+            assert_eq!(job.state, JobState::Completing);
+            assert_eq!(
+                job.retained_nodes,
+                BTreeSet::from(["n1".to_string(), "n2".to_string()])
+            );
+        }
+
+        #[test]
+        fn only_a_repeat_node_complete_rewrites_a_reported_exit() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2", "n3"]);
+            apply(&mut job, &mut nodes, &Steps::new(), exit("n2", 3, true));
+
+            apply(&mut job, &mut nodes, &Steps::new(), exit("n2", 0, true));
+            assert_eq!(job.node_completions["n2"].code, 3);
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n2", 0, false));
+            assert_eq!(
+                job.node_completions["n2"].code, 0,
+                "as older controllers apply it"
+            );
+            assert!(effect.released.is_empty(), "its slice already went back");
+            assert_eq!(job.first_failed_node.as_deref(), Some("n2"));
+        }
+
+        #[test]
+        fn a_report_from_an_earlier_run_changes_nothing() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2"]);
+            job.run_attempt = 2;
+            let stale = NodeExit {
+                run_attempt: 1,
+                ..exit("n1", 0, true)
+            };
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), stale);
+
+            assert!(effect.released.is_empty() && effect.finalized.is_none());
+            assert!(job.node_completions.is_empty());
+        }
+
+        #[test]
+        fn a_grace_report_frees_its_node_for_the_preemptor() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2", "n3"]);
+            job.preempt_pending = Some(preempt_pending_for(job.run_attempt, 90));
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n1", 0, true));
+
+            assert_eq!(effect.released, ["n1"]);
+            assert_eq!(effect.preemptor, Some(99));
+            assert!(effect.finalized.is_none());
+            assert_eq!(job.state, JobState::Running);
+        }
+
+        #[test]
+        fn an_older_leaders_report_ends_a_per_node_run_at_once() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2", "n3"]);
+
+            let effect = apply(&mut job, &mut nodes, &Steps::new(), exit("n1", 0, false));
+
+            assert_eq!(effect.released, ["n1"]);
+            assert_eq!(job.state, JobState::Completing);
+            assert!(job.retained_nodes.is_empty());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

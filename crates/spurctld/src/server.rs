@@ -6826,8 +6826,8 @@ fn stragglers_after_report(
     use crate::cluster::NodeCompleteResult;
 
     match result {
-        NodeCompleteResult::Completing => ended_run_stragglers(job, None),
-        NodeCompleteResult::InGrace => ended_run_stragglers(job, Some(reporting_node)),
+        NodeCompleteResult::Completing => ended_run_stragglers(job, reporting_node, false),
+        NodeCompleteResult::InGrace => ended_run_stragglers(job, reporting_node, true),
         _ => Vec::new(),
     }
 }
@@ -6852,14 +6852,21 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once a report has ended the run (the batch host's for a batch-host script, the
-/// first failed or last copy's for a per-node one), even a finished copy's node held for a step.
-/// With `primary_only`, only the batch host counts: the rest run a hold script that never reports.
-fn ended_run_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
+/// Nodes to stop when `reporting_node`'s report ended the run, or retries the one that did, even a
+/// finished copy's node held for a step. A per-node run ends at its first failed or last copy; a
+/// batch-host one at any report, but in a grace only at the batch host's: the rest just hold.
+fn ended_run_stragglers(
+    job: &spur_core::job::Job,
+    reporting_node: &str,
+    in_grace: bool,
+) -> Vec<String> {
     let ended = match job.script_placement() {
-        ResolvedPlacement::BatchHost => primary_only
-            .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node)),
-        ResolvedPlacement::AllNodes => job.first_failed_node.is_some() || job.all_nodes_completed(),
+        ResolvedPlacement::BatchHost => {
+            !in_grace || job.allocated_nodes.first().map(String::as_str) == Some(reporting_node)
+        }
+        ResolvedPlacement::AllNodes => {
+            job.all_nodes_completed() || job.first_failed_node.as_deref() == Some(reporting_node)
+        }
     };
     if ended {
         job.held_nodes()
@@ -12801,31 +12808,36 @@ mod tests {
 
     #[test]
     fn only_a_report_that_ends_the_run_has_stragglers_to_stop() {
+        let exit = |code, signal| spur_core::job::NodeCompletion { code, signal };
         let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
         job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
-        job.node_completions.insert(
-            "n1".into(),
-            spur_core::job::NodeCompletion { code: 0, signal: 0 },
-        );
+        job.node_completions.insert("n1".into(), exit(0, 0));
 
         job.spec.script = Some("./train\n".into());
         assert!(
-            ended_run_stragglers(&job, None).is_empty(),
+            ended_run_stragglers(&job, "n1", false).is_empty(),
             "one copy of a per-node script ending cleanly ends nothing"
         );
         job.first_failed_node = Some("n1".into());
         assert_eq!(
-            ended_run_stragglers(&job, None),
-            ["n2".to_string(), "n3".to_string()],
+            ended_run_stragglers(&job, "n1", false),
+            ["n2", "n3"],
             "the first failed copy ends a per-node run"
+        );
+        job.node_completions.insert("n2".into(), exit(0, 15));
+        assert!(
+            ended_run_stragglers(&job, "n2", false).is_empty(),
+            "a stopped copy's exit stops nothing more"
+        );
+        assert_eq!(
+            ended_run_stragglers(&job, "n1", false),
+            ["n3"],
+            "a retry of the failure stops what is still held"
         );
 
         job.first_failed_node = None;
         job.spec.script = Some("srun ./train\n".into());
-        assert_eq!(
-            ended_run_stragglers(&job, None),
-            ["n2".to_string(), "n3".to_string()]
-        );
+        assert_eq!(ended_run_stragglers(&job, "n2", false), ["n3"]);
     }
 
     #[test]
@@ -12842,11 +12854,11 @@ mod tests {
         };
 
         assert!(
-            ended_run_stragglers(&reported("n2"), Some("n2")).is_empty(),
+            ended_run_stragglers(&reported("n2"), "n2", true).is_empty(),
             "a companion's report signals nobody"
         );
         assert_eq!(
-            ended_run_stragglers(&reported("n1"), Some("n1")),
+            ended_run_stragglers(&reported("n1"), "n1", true),
             ["n2".to_string()],
             "the primary's report stops the rest"
         );
