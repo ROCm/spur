@@ -20,6 +20,7 @@ from cluster import (
     log_tail_is_leader,
     parse_job_id,
     wait_job_state,
+    wait_until,
     job_state,
 )
 
@@ -32,14 +33,15 @@ BLIP_HOLD_SECS = 42
 # seen, so this is a timeout, not an enforced freeze duration.
 INTERIM_ELECTION_TIMEOUT_SECS = 10
 RACE_SETTLE_TIMEOUT_SECS = 30
-# Staging the blip is timing-sensitive and exhausting the attempts now fails the
-# test, so budget more of them than the repro typically needs.
-MAX_RECLAIM_ATTEMPTS = 5
+# Each staging attempt is a lottery the original leader can lose to a peer, so
+# retry for a time budget rather than a fixed count.
+RECLAIM_DEADLINE_SECS = 300
+RECLAIM_ATTEMPTS_REPORTED = 5
 GRACE_SECS = max(HA_HEARTBEAT_TIMEOUT_SECS, HA_HEALTH_TICK_SECS)
 # Wait past grace plus one full health tick before judging node/job state.
 HEALTH_SETTLE_SECS = GRACE_SECS + 2 * HA_HEALTH_TICK_SECS + 10
-# Long enough to outlast MAX_RECLAIM_ATTEMPTS worth of retries plus
-# HEALTH_SETTLE_SECS, so the job can't complete out from under the assertion.
+# Long enough to outlast RECLAIM_DEADLINE_SECS (plus the attempt running when it
+# expires) and HEALTH_SETTLE_SECS, so the job can't complete out from under the assertion.
 SURVIVOR_JOB_SECS = 1800
 
 
@@ -131,9 +133,9 @@ class TestLeadershipBlipHealth:
         if remaining > 0:
             time.sleep(remaining)
 
-        reclaimed = False
         attempts = []
-        for _ in range(MAX_RECLAIM_ATTEMPTS):
+
+        def staged_reclaim() -> bool:
             leader_idx = _wait_initial_leader(cluster)
             # Start just after a tick boundary so the whole blip fits between
             # two ticks (otherwise a mid-blip tick re-arms even the old code)
@@ -148,20 +150,20 @@ class TestLeadershipBlipHealth:
             # Outside this band the run proves nothing: a blip under the
             # heartbeat timeout leaves no node stale enough to be a mark-down
             # candidate, and one over a tick lets the old code re-arm correctly.
-            if (
-                winner == leader_idx
-                and HA_HEARTBEAT_TIMEOUT_SECS < blip < HA_HEALTH_TICK_SECS
-            ):
-                reclaimed = True
-                break
+            return winner == leader_idx and HA_HEARTBEAT_TIMEOUT_SECS < blip < HA_HEALTH_TICK_SECS
 
-        if not reclaimed:
+        try:
+            wait_until(staged_reclaim, timeout_s=RECLAIM_DEADLINE_SECS, interval_s=0,
+                       desc="same-controller reclaim")
+        except TimeoutError as err:
             # Not a skip: the harness ran, so this is the regression scenario
-            # failing to stage rather than a missing prerequisite.
+            # failing to stage rather than a missing prerequisite. *err* tells a
+            # spent budget apart from a cluster that lost its leader outright.
             pytest.fail(
                 "no same-controller reclaim with a blip inside "
-                f"({HA_HEARTBEAT_TIMEOUT_SECS}s, {HA_HEALTH_TICK_SECS}s) in "
-                f"{MAX_RECLAIM_ATTEMPTS} attempts: " + "; ".join(attempts)
+                f"({HA_HEARTBEAT_TIMEOUT_SECS}s, {HA_HEALTH_TICK_SECS}s) within "
+                f"{RECLAIM_DEADLINE_SECS}s ({err}; {len(attempts)} attempts); last "
+                f"{RECLAIM_ATTEMPTS_REPORTED}: " + "; ".join(attempts[-RECLAIM_ATTEMPTS_REPORTED:])
             )
 
         time.sleep(HEALTH_SETTLE_SECS)
