@@ -14,7 +14,10 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use spurd::reporter::NodeReporter;
-use spurd::{agent_server, auth_middleware, cdi_owner, controller_auth, reporter, stepd};
+use spurd::{
+    agent_server, auth_middleware, cdi_owner, checkpoint_collector, checkpoint_dir,
+    controller_auth, reporter, stepd,
+};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -376,6 +379,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Checkpoint telemetry needs a cluster name to scope its socket directory;
+    // without a loaded config (or on a hardening failure) the feature is
+    // simply off for this node — never a reason to refuse to start.
+    let checkpoint_dir = config.as_ref().and_then(|c| {
+        match checkpoint_dir::harden(
+            std::path::Path::new(checkpoint_dir::RUN_ROOT),
+            &c.cluster_name,
+            nix::unistd::geteuid().as_raw(),
+        ) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "failed to harden the checkpoint socket directory; \
+                     checkpoint telemetry is disabled on this node"
+                );
+                None
+            }
+        }
+    });
+    let checkpoint_collector = Arc::new(checkpoint_collector::CheckpointCollector::new());
+
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
     let stepd_state_dir = args.state_dir.clone().unwrap_or_else(|| {
@@ -661,6 +686,8 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
+    reporter.set_checkpoint_collector(checkpoint_collector.clone());
+
     // Start the heartbeat loop right after registration, before the
     // completion-replay step below: replaying unacknowledged completions
     // retries against the controller (bounded, but can add several seconds
@@ -669,6 +696,11 @@ async fn main() -> anyhow::Result<()> {
     let hb_reporter = reporter.clone();
     tokio::spawn(async move {
         hb_reporter.heartbeat_loop().await;
+    });
+
+    let checkpoint_reporter = reporter.clone();
+    tokio::spawn(async move {
+        checkpoint_reporter.checkpoint_report_loop().await;
     });
 
     let unacknowledged_stepd_completions: std::collections::HashSet<_> = stepds
@@ -742,7 +774,9 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
         allow_root_jobs,
     )
-    .with_runtime_state_dir(stepd_state_dir.clone());
+    .with_runtime_state_dir(stepd_state_dir.clone())
+    .with_checkpoint_dir(checkpoint_dir)
+    .with_checkpoint_collector(checkpoint_collector.clone());
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
         agent_service.set_block_file(block_file.clone());

@@ -695,6 +695,7 @@ mock_controller_impl! {
         get_assoc_mgr_info(proto::GetAssocMgrInfoRequest) -> proto::GetAssocMgrInfoResponse;
         register_agent(proto::RegisterAgentRequest) -> proto::RegisterAgentResponse;
         heartbeat(proto::HeartbeatRequest) -> proto::HeartbeatResponse;
+        report_checkpoint_telemetry(proto::ReportCheckpointTelemetryRequest) -> proto::ReportCheckpointTelemetryResponse;
         create_token(proto::CreateTokenRequest) -> proto::CreateTokenResponse;
         list_tokens(proto::ListTokensRequest) -> proto::ListTokensResponse;
         revoke_token(proto::RevokeTokenRequest) -> proto::RevokeTokenResponse;

@@ -1139,7 +1139,8 @@ Endpoints
      - Alias for ``/metrics/jobs``.
    * - ``/metrics/jobs``
      - Live
-     - Job counts by state and aggregate allocated resources.
+     - Job counts by state, aggregate allocated resources, and checkpoint
+       telemetry (see :doc:`/admin-guide/checkpoint-metrics`).
    * - ``/metrics/nodes``
      - Live
      - Node counts by state, cluster resource totals, and per-node gauges.
@@ -1154,9 +1155,10 @@ Endpoints
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
    * - ``/metrics/jobs-users-accts``
      - Live
-     - Per-user/per-account job gauges and karma counters. Requires
-       ``metrics.high_cardinality = true``; returns ``404`` otherwise.
-       See :doc:`/admin-guide/karma-scoring`.
+     - Per-user/per-account job gauges, karma counters, and per-job checkpoint
+       gauges. Requires ``metrics.high_cardinality = true``; returns ``404``
+       otherwise. See :doc:`/admin-guide/karma-scoring` and
+       :doc:`/admin-guide/checkpoint-metrics`.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1182,6 +1184,11 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - Memory (bytes) allocated to running/completing jobs.
    * - ``spur_jobs_gpus_alloc``
      - GPUs allocated to running/completing jobs.
+
+``/metrics/jobs`` also carries workload-reported checkpoint telemetry
+(``spur_job_runs_ended_total`` and related families) and
+``/metrics/jobs-users-accts`` carries per-job checkpoint gauges; see
+:doc:`/admin-guide/checkpoint-metrics`.
 
 Preemption outcomes — ``/metrics/scheduler``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

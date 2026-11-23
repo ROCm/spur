@@ -9,6 +9,7 @@ pub mod audit_metrics;
 pub mod auth;
 pub mod block_file;
 pub mod burst_buffer;
+pub mod checkpoint;
 pub mod config;
 pub mod constraints;
 pub mod core_layout;

@@ -103,6 +103,10 @@ pub struct StepdLaunchSpec {
     pub cred_digest: String,
     #[serde(default)]
     pub pty_step_id: Option<spur_core::step::StepId>,
+    /// Set by the agent once its checkpoint-socket bind succeeds; absent
+    /// means the step runs without one (feature disabled, or the bind failed).
+    #[serde(default)]
+    pub checkpoint_socket: Option<PathBuf>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -254,6 +258,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             cred_kid: String::new(),
             cred_digest: String::new(),
             pty_step_id: None,
+            checkpoint_socket: None,
         })
     }
 }
@@ -1209,11 +1214,38 @@ fn sweep_finalized_session(
     if !finalized_obligations(&obligations.read()?) {
         return Ok(SweptSession::Unfinalized);
     }
-    if let Some(settled_at) = retained_settled_answer(obligations, step_id)? {
+    // Checked before retained_settled_answer: an unacknowledged checkpoint
+    // record must never be classified as a retained answer, or
+    // prune_finalized's over-capacity eviction (which does not itself
+    // re-check acknowledgement) could drop it well before ORPHAN_RETENTION.
+    if checkpoint_unacknowledged(session_dir)? {
+        if !session_is_abandoned(session_dir, SystemTime::now()) {
+            return Ok(SweptSession::Unfinalized);
+        }
+        tracing::warn!(
+            session = %session_dir.display(),
+            "pruning an abandoned session with an unacknowledged checkpoint record; the record is lost"
+        );
+    } else if let Some(settled_at) = retained_settled_answer(obligations, step_id)? {
         return Ok(SweptSession::RetainedAnswer { settled_at });
     }
     fs::remove_dir_all(session_dir)?;
     Ok(SweptSession::Pruned)
+}
+
+/// Whether this session has a `checkpoint.json` the collector has not yet
+/// had acknowledged by the controller — pruning it would lose the record.
+fn checkpoint_unacknowledged(session_dir: &Path) -> io::Result<bool> {
+    if !session_dir
+        .join(crate::checkpoint_listener::RECORD_FILE)
+        .try_exists()?
+    {
+        return Ok(false);
+    }
+    let acked = session_dir
+        .join(crate::checkpoint_collector::ACKED_FILE)
+        .try_exists()?;
+    Ok(!acked)
 }
 
 fn prune_finalized_session(
@@ -2286,6 +2318,46 @@ fn rebind_unserved_socket(socket_path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(socket_path)
 }
 
+/// Clears any checkpoint-socket env a launch spec inherited -- its own
+/// environment, and a container's own copies -- so a nested `srun` never
+/// starts carrying its parent step's (or an unrelated prior step's) value.
+/// Only [`apply_checkpoint_socket_outcome`] may set it again, once this
+/// step's own listener has actually started. Also called from
+/// `agent_server::launch_stepd` right after it forwards the job's
+/// environment into a fresh spec, so an old spurstepd that ignores
+/// `checkpoint_socket` gets no stale value either.
+pub(crate) fn strip_checkpoint_sock_env(launch_spec: &mut StepdLaunchSpec) {
+    launch_spec
+        .environment
+        .remove(spur_core::checkpoint::CHECKPOINT_SOCK_ENV);
+    if let Some(container) = launch_spec.container.as_mut() {
+        container
+            .config
+            .environment
+            .remove(spur_core::checkpoint::CHECKPOINT_SOCK_ENV);
+        container
+            .config
+            .container_env
+            .remove(spur_core::checkpoint::CHECKPOINT_SOCK_ENV);
+    }
+}
+
+/// Records a successfully started checkpoint listener on `launch_spec`. A
+/// container step carries the socket as its own field (mounted best-effort,
+/// never through `config.mounts`, whose errors abort the launch) so the env
+/// var is only added once that mount actually succeeds; a native step has no
+/// separate mount step, so the var is set directly.
+fn apply_checkpoint_socket_outcome(launch_spec: &mut StepdLaunchSpec, socket: &Path) {
+    if let Some(container) = launch_spec.container.as_mut() {
+        container.config.checkpoint_socket = Some(socket.to_path_buf());
+    } else {
+        launch_spec.environment.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            socket.display().to_string(),
+        );
+    }
+}
+
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
      Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
 
@@ -2432,6 +2504,42 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             crate::executor::cleanup_step_spool(job_id, step_id);
         }
     };
+    // Started before the workload execs, so its env var and (for a container)
+    // bind mount are in place before launch_job builds the task's environment.
+    // Unconditional, regardless of checkpoint_socket: a nested srun's spec is
+    // built from the parent job's environment, and an old spurstepd ignoring
+    // checkpoint_socket must still see no stale value from a prior step.
+    strip_checkpoint_sock_env(&mut launch_spec);
+    let mut checkpoint_listener = None;
+    if let Some(socket) = launch_spec.checkpoint_socket.clone() {
+        let cgroup_path = crate::executor::expected_step_cgroup_path(job_id, run_attempt, step_id);
+        // The unified-hierarchy path in /proc/<pid>/cgroup is relative to the
+        // cgroupfs mount, not spurd's own CGROUP_ROOT constant.
+        let expected_cgroup = cgroup_path
+            .strip_prefix("/sys/fs/cgroup")
+            .map(|relative| format!("/{}", relative.display()))
+            .unwrap_or_else(|_| cgroup_path.display().to_string());
+        let listener_spec = crate::checkpoint_listener::ListenerSpec {
+            socket: socket.clone(),
+            session_dir: session_dir.clone(),
+            job_id,
+            step_id,
+            uid: launch_spec.uid,
+            gid: launch_spec.gid,
+            dir_owner_uid: nix::unistd::geteuid().as_raw(),
+            expected_cgroup,
+            cgroup_lookup: crate::checkpoint_listener::proc_cgroup_lookup(),
+        };
+        match crate::checkpoint_listener::CheckpointListener::start(listener_spec) {
+            Ok(listener) => {
+                apply_checkpoint_socket_outcome(&mut launch_spec, &socket);
+                checkpoint_listener = Some(listener);
+            }
+            Err(error) => {
+                tracing::warn!(job_id, %error, "failed to start the checkpoint socket listener");
+            }
+        }
+    }
     // Before the workload execs: the ranks look the server up through the
     // environment this folds into the launch.
     let pmix = match start_supervised_pmix(&mut launch_spec) {
@@ -2508,6 +2616,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let cleanup_timeout_secs = descriptor.cleanup_timeout_secs;
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
+    // The workload has exited, so this is its last chance to report a
+    // checkpoint: write the final record before StepdCompleted is sent.
+    if let Some(checkpoint_listener) = checkpoint_listener.take() {
+        checkpoint_listener.finish().await;
+    }
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
     let cleanup_store = store.cleanup_store();
     let cleanup_lease_dir = session_dir.clone();
@@ -4295,6 +4408,7 @@ mod tests {
                 username: "spur".into(),
                 home_dir: "/home/spur".into(),
                 withheld_socket: None,
+                checkpoint_socket: None,
                 device_plan: None,
             },
             rootfs: PathBuf::from("/tmp/rootfs"),
@@ -4368,7 +4482,158 @@ mod tests {
             cred_kid: String::new(),
             cred_digest: String::new(),
             pty_step_id: None,
+            checkpoint_socket: None,
         }
+    }
+
+    #[test]
+    fn launch_spec_without_checkpoint_socket_deserializes() {
+        let old = r#"{"allocation_holder":false,"allocation_only":false,"array_job_id":null,"array_task_id":null,"capability":"test-capability","cgroup":{"allowed_ram_percent":100,"allowed_swap_percent":0,"cleanup_timeout_secs":60,"constrain_cores":true,"constrain_devices":true,"constrain_ram_space":true,"constrain_swap":false,"cpu_quota":false,"enabled":true,"extra_device_paths":[],"min_ram_mb":30,"oom_kill_job":true,"required":false},"container":null,"container_rootfs_mode":null,"controller_addr":"","cpu_ids":[],"cpus":1,"cred_digest":"","cred_id":"","cred_kid":"","environment":{},"gid":1001,"gpu_devices":[],"has_mount_namespace":false,"has_pid_namespace":false,"has_user_namespace":false,"hooks":{"epilog":null,"epilog_slurmctld":null,"epilog_timeout_secs":120,"job_submit":null,"job_submit_lua":null,"prolog":null,"prolog_slurmctld":null,"srun_epilog":null,"srun_prolog":null,"task_epilog":null,"task_prolog":null},"host_device_plan":null,"io_mode":"File","job_id":42,"joins_parent_namespaces":false,"memlock":"Inherit","memory_ceiling_mb":0,"memory_mb":0,"name":"runtime-test","node":"node-a","nodelist":"node-a","open_mode":null,"partition":"default","plugstack_path":"","pmix":null,"pmix_multi_task":false,"pty_step_id":null,"reporting_node":"","resources":{"cpu_ids":[],"cpus":0,"fabric_binding":null,"gpu_binding":null,"gpu_devices":[],"memory_ceiling_mb":0,"memory_mb":0,"mpi":"","nodelist":"","partition":"","step_limits":{"cpu_ids":[],"cpus":null,"gpus":null,"memory_mb":null,"overlap":false}},"run_attempt":1,"script":"true","stderr_path":"","stdin_path":"","stdout_path":"","step_id":4294967291,"uid":1001,"user":"spur","work_dir":"/tmp"}"#;
+        let restored: StepdLaunchSpec = serde_json::from_str(old)
+            .expect("decode a frozen launch spec without checkpoint_socket");
+        assert!(restored.checkpoint_socket.is_none());
+        assert_eq!(restored.job_id, 42);
+        assert_eq!(restored.uid, 1001);
+    }
+
+    fn container_launch_config() -> crate::executor::ContainerLaunchConfig {
+        crate::executor::ContainerLaunchConfig {
+            config: crate::container::ContainerConfig {
+                image: "docker://job-image".into(),
+                mounts: Vec::new(),
+                workdir: None,
+                name: None,
+                readonly: false,
+                mount_home: false,
+                remap_root: false,
+                gpu_devices: Vec::new(),
+                environment: HashMap::new(),
+                container_env: HashMap::new(),
+                entrypoint: None,
+                uid: 1000,
+                gid: 1000,
+                username: "spur".into(),
+                home_dir: "/home/spur".into(),
+                withheld_socket: None,
+                checkpoint_socket: None,
+                device_plan: None,
+            },
+            rootfs: PathBuf::from("/tmp/rootfs"),
+        }
+    }
+
+    #[test]
+    fn strip_checkpoint_sock_env_clears_the_specs_own_and_container_copies() {
+        let mut spec = launch_spec();
+        let stale = "/run/spur/clusterA/checkpoint/42.1.0.sock".to_string();
+        spec.environment.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            stale.clone(),
+        );
+        let mut container = container_launch_config();
+        container.config.environment.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            stale.clone(),
+        );
+        container.config.container_env.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            stale,
+        );
+        spec.container = Some(container);
+
+        strip_checkpoint_sock_env(&mut spec);
+
+        assert!(!spec
+            .environment
+            .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV));
+        let container = spec.container.as_ref().expect("container kept");
+        assert!(!container
+            .config
+            .environment
+            .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV));
+        assert!(!container
+            .config
+            .container_env
+            .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV));
+    }
+
+    #[test]
+    fn a_stale_checkpoint_env_does_not_survive_a_launch_with_no_socket_of_its_own() {
+        // What run_process does unconditionally before it ever looks at
+        // launch_spec.checkpoint_socket: a nested srun whose own socket is
+        // None (telemetry disabled, or this node hardened no checkpoint dir)
+        // must not keep inheriting whatever its parent step carried.
+        let mut spec = launch_spec();
+        spec.environment.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            "/run/spur/clusterA/checkpoint/42.1.0.sock".to_string(),
+        );
+        spec.checkpoint_socket = None;
+
+        strip_checkpoint_sock_env(&mut spec);
+        // checkpoint_socket is None, so run_process's listener-start block
+        // never runs and apply_checkpoint_socket_outcome is never reached.
+
+        assert!(!spec
+            .environment
+            .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV));
+    }
+
+    #[test]
+    fn a_stale_checkpoint_env_does_not_survive_a_listener_that_fails_to_start() {
+        let mut spec = launch_spec();
+        spec.environment.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            "/run/spur/clusterA/checkpoint/42.1.0.sock".to_string(),
+        );
+
+        strip_checkpoint_sock_env(&mut spec);
+        // Mirrors the Err(error) branch in run_process: the listener failed
+        // to start, so apply_checkpoint_socket_outcome is never called.
+
+        assert!(!spec
+            .environment
+            .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV));
+    }
+
+    #[test]
+    fn apply_checkpoint_socket_outcome_sets_the_env_var_for_a_native_step() {
+        let mut spec = launch_spec();
+        let socket = PathBuf::from("/run/spur/clusterA/checkpoint/42.1.0.sock");
+
+        apply_checkpoint_socket_outcome(&mut spec, &socket);
+
+        assert_eq!(
+            spec.environment
+                .get(spur_core::checkpoint::CHECKPOINT_SOCK_ENV),
+            Some(&socket.display().to_string())
+        );
+    }
+
+    #[test]
+    fn apply_checkpoint_socket_outcome_carries_the_socket_on_the_container_not_the_env() {
+        let mut spec = launch_spec();
+        spec.container = Some(container_launch_config());
+        let socket = PathBuf::from("/run/spur/clusterA/checkpoint/42.1.0.sock");
+
+        apply_checkpoint_socket_outcome(&mut spec, &socket);
+
+        assert!(
+            !spec
+                .environment
+                .contains_key(spur_core::checkpoint::CHECKPOINT_SOCK_ENV),
+            "the container path must not set the env var until its own mount succeeds"
+        );
+        let container = spec.container.as_ref().expect("container kept");
+        assert_eq!(
+            container.config.checkpoint_socket.as_deref(),
+            Some(socket.as_path())
+        );
+        assert!(
+            container.config.mounts.is_empty(),
+            "the checkpoint socket must never go through config.mounts, whose \
+             errors would abort the whole container launch"
+        );
     }
 
     #[test]
@@ -5871,6 +6136,140 @@ mod tests {
         assert!(
             !store.session_dir(21, 1, 3).exists(),
             "an orphan past its window must not hold the job's environment forever"
+        );
+    }
+
+    fn finalized_batch_session(store: &StepdStore) -> PathBuf {
+        user_step_session(
+            store,
+            spur_core::step::STEP_BATCH,
+            &[
+                USER_STEP_EXIT,
+                StepdObligation::CompletionAcknowledged,
+                StepdObligation::ResourcesReleased,
+            ],
+        );
+        store.session_dir(21, 1, spur_core::step::STEP_BATCH)
+    }
+
+    #[test]
+    fn a_finalized_session_with_an_unacknowledged_checkpoint_record_is_not_pruned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let session_dir = finalized_batch_session(&store);
+        fs::write(
+            session_dir.join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+
+        assert_eq!(store.prune_finalized().expect("prune"), 0);
+        assert!(
+            session_dir.exists(),
+            "an unacknowledged checkpoint record must keep a finalized session"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_checkpoint_marker_lets_a_finalized_session_prune() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let session_dir = finalized_batch_session(&store);
+        fs::write(
+            session_dir.join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+        fs::write(
+            session_dir.join(crate::checkpoint_collector::ACKED_FILE),
+            b"",
+        )
+        .expect("write acked marker");
+
+        assert_eq!(store.prune_finalized().expect("prune"), 1);
+        assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn an_abandoned_session_prunes_even_with_an_unacknowledged_checkpoint_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let session_dir = finalized_batch_session(&store);
+        fs::write(
+            session_dir.join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+        date_user_step_session(&store, spur_core::step::STEP_BATCH, abandoned_moment());
+
+        assert_eq!(store.prune_finalized().expect("prune"), 1);
+        assert!(
+            !session_dir.exists(),
+            "an abandoned session must not hold an unacknowledged checkpoint record forever"
+        );
+    }
+
+    #[test]
+    fn a_settled_answer_with_an_unacknowledged_checkpoint_record_is_not_classified_as_retained() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = 4;
+        settled_user_step_session(&store, step_id, SystemTime::now());
+        let session_dir = store.session_dir(21, 1, step_id);
+        fs::write(
+            session_dir.join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+        let obligations = store.obligations(21, 1, step_id);
+
+        let swept =
+            sweep_finalized_session(&session_dir, &obligations, step_id).expect("sweep session");
+
+        assert!(
+            matches!(swept, SweptSession::Unfinalized),
+            "an unacknowledged checkpoint record must outrank a retained settled answer"
+        );
+    }
+
+    #[test]
+    fn an_unacknowledged_checkpoint_record_survives_the_retained_answer_ceiling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let capacity = crate::step_completion::SETTLED_CAPACITY;
+        let excess = 3;
+        let now = SystemTime::now();
+        for index in 0..capacity + excess {
+            let age = (capacity + excess - index) as u64;
+            settled_user_step_session(
+                &store,
+                index as spur_core::step::StepId,
+                now - std::time::Duration::from_millis(age),
+            );
+        }
+        // The oldest excess candidate also holds an unacknowledged checkpoint
+        // record: the over-capacity prune must not be the reason it is lost.
+        let protected_session = store.session_dir(21, 1, 0);
+        fs::write(
+            protected_session.join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+
+        assert_eq!(store.prune_finalized().expect("prune"), excess - 1);
+        assert!(
+            protected_session.exists(),
+            "an unacknowledged checkpoint record must survive the over-capacity prune"
+        );
+        for index in 1..excess {
+            assert!(
+                !store.session_dir(21, 1, index as u32).exists(),
+                "the rest of the oldest excess answers must still go"
+            );
+        }
+        assert!(
+            store.session_dir(21, 1, excess as u32).exists(),
+            "pruning must stop at the ceiling, not sweep the whole retained set"
         );
     }
 

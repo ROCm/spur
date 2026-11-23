@@ -49,6 +49,70 @@ src/
   reporter.rs         NodeReporter: register, heartbeat_loop, deregister,
                       resource discovery, inventory delta classification,
                       debounced refresh, controller failover/deprioritization.
+                      Also owns checkpoint_report_loop (see checkpoint_collector.rs
+                      below).
+
+  checkpoint_dir.rs     Checkpoint socket paths and directory hardening
+                      (0711, owned by the user spurd runs as -- root in a
+                      standard install -- not a symlink), shared by spurd and
+                      spurstepd via the shared lib crate. `harden()` creates
+                      or fixes `<run_root>/<cluster>/checkpoint`;
+                      `validate_socket_parent()` is spurstepd's pre-bind
+                      check of the same invariants, extended one level up to
+                      `<cluster>`. An existing `run_root` or `<cluster>`
+                      segment that is group- or world-writable (mode & 0o022,
+                      sticky bit or not) is refused before anything beneath
+                      it is touched -- otherwise another user holding write
+                      access to that ancestor could swap a child out from
+                      under an ownership check already passed on it.
+
+  checkpoint_listener.rs  spurstepd's per-step checkpoint Unix listener and
+                      `checkpoint.json` persistence. One event per
+                      connection: read <= 513 bytes under `READ_DEADLINE`
+                      (100ms), reply `b"k"`, close. `MAX_IN_FLIGHT` (128)
+                      bounds concurrent connections; a per-step token bucket
+                      (`RATE_BURST` (64), `RATE_PER_SEC` (16) events/s)
+                      rate-limits events. Applied events update an
+                      in-memory `CheckpointRecord` (spur-core); a debounced
+                      ticker persists it to `checkpoint.json` at most every
+                      `PERSIST_INTERVAL` (5s). The accept loop reaps
+                      already-finished connection tasks from its `JoinSet`
+                      before spawning each new one (not only in `finish()`),
+                      so a long training job's accept loop does not
+                      accumulate one entry per connection for its whole
+                      lifetime.
+
+  checkpoint_collector.rs  spurd's per-node map of checkpoint records, read
+                      from live and finished steps' `checkpoint.json`.
+                      mtime-driven `refresh()` only re-reads a step whose
+                      file actually changed; `dirty()` / `acknowledge()`
+                      track what the reporter loop has shipped. An
+                      acknowledged final record is dropped and a
+                      `checkpoint.acked` marker is written into the session
+                      directory -- gating `stepd.rs`'s pruning of that
+                      (otherwise finalized) session until the marker exists,
+                      or the session is abandoned past
+                      `step_completion::ORPHAN_RETENTION` (24h).
+                      `refresh()`/`collect_now()` never apply a read whose
+                      mtime is no newer than the entry's own (an entry with
+                      none yet always accepts), and never downgrade an
+                      entry already holding a final record to a non-final
+                      one -- both guard the race between a periodic refresh
+                      and a `collect_now` landing concurrently. `mark_finished()`
+                      (called from `StepdCompleted` and a stale-session
+                      settle in `agent_server.rs`, never inferred from a
+                      missing file) starts an entry's eviction clock;
+                      `evict_stale()` (called from the report loop) drops an
+                      entry whose session directory is confirmed gone, a
+                      finished entry with no `checkpoint.json` and nothing
+                      dirty, or a finished entry whose final record has sat
+                      unacknowledged past `ORPHAN_RETENTION` with the
+                      directory still present (`warn!`, the record is lost).
+                      A live entry with no file yet, and any entry hit by a
+                      filesystem error other than "not found" (e.g.
+                      permission denied), are left alone -- the first because
+                      a step simply hasn't checkpointed yet, the second
+                      because the error is treated as transient.
 
   executor.rs         Job launch: fork/exec, cgroup setup (cgroupv2), namespace
                       isolation (PID/mount via /usr/bin/unshare for non-container;
@@ -224,6 +288,22 @@ src/
   `gpu_reserved`, snapshotted under one `spec` lock, then counted under a
   blocking ledger `lock()` (never `try_lock`: a miss would read as nothing
   blocked). Runs in the heartbeat's `spawn_blocking` after `apply_spec_layout()`.
+- **`checkpoint_report_loop()`** -- separate from `heartbeat_loop` and never
+  touches `HeartbeatRequest`. Wakes every `CHECKPOINT_REPORT_INTERVAL` (30s)
+  or on an earlier wake from `CheckpointCollector::wake()` (a final record),
+  refreshes the collector, evicts stale entries (`evict_stale`), and ships up
+  to `MAX_RECORDS_PER_REQUEST` (1024) dirty records via
+  `ReportCheckpointTelemetry`. An accepted or explicitly-rejected response
+  acknowledges (drops) the sent records either way -- the controller decided,
+  and resending won't change that. An RPC failure is classified by
+  `spur_proto::controller_rpc_retryable`: a retryable status (Unavailable,
+  Internal, DeadlineExceeded, Unknown, Cancelled) leaves the records dirty
+  for the next attempt; `Unimplemented` logs it once and backs off
+  `CHECKPOINT_UNIMPLEMENTED_BACKOFF` (600s) before retrying, with records
+  staying dirty throughout; any other non-retryable status (e.g.
+  `InvalidArgument`) would repeat forever if left dirty, so it is logged
+  once per status code and the batch is acknowledged (dropped) instead of
+  resent.
 
 ### spec.rs
 - **`SpecEnforcer`** -- holds the layout last delivered and the cgroup root
@@ -433,6 +513,21 @@ Communication uses line-delimited JSON over a Unix socket at
 6. Agent acknowledges the completion to the controller, then marks the session
    finalized. Finalized sessions are pruned on startup and periodically.
 
+Before step 3's listener starts, the supervisor unconditionally strips
+`SPUR_CHECKPOINT_SOCK` from the launch spec's own environment and any
+container env copies (`stepd::strip_checkpoint_sock_env`) -- the agent does
+the same when it forwards a job's environment into a fresh spec
+(`agent_server::launch_stepd`) -- so a nested `srun`, or a step launched from
+a forwarded environment, never inherits a parent step's socket. Only a
+listener this step itself starts re-populates it
+(`stepd::apply_checkpoint_socket_outcome`).
+
+Pruning a finalized session checks `checkpoint_unacknowledged` (an
+unacknowledged `checkpoint.json`) before classifying it as a settled numbered
+step's retained answer: an unacknowledged record keeps the session, overriding
+the retained-answer ceiling's over-capacity eviction, unless the session is
+also abandoned.
+
 ### Recovery after spurd restart
 - `StepdStore::discover_live` classifies sessions by probing supervisor PIDs.
 - Live sessions are re-adopted: the agent monitors them for completion.
@@ -527,7 +622,13 @@ Inspired by Enroot.
   squashfs rootfs. Overlay for writable layers.
 - **GPU passthrough**: AMD = bind-mount `/dev/kfd` + `/dev/dri/renderD*` + ROCm
   libs. NVIDIA = bind-mount `/dev/nvidia*` + driver libs.
-- **Bind mounts**: `ContainerConfig.mounts` (source:target:ro/rw).
+- **Bind mounts**: `ContainerConfig.mounts` (source:target:ro/rw); errors here
+  (`mount_user_binds`) propagate and abort the launch, since these are the
+  job's own requested mounts.
+- **Checkpoint socket**: `ContainerConfig.checkpoint_socket` (never part of
+  `mounts`) is bind-mounted best-effort in `container_init`, after the user's
+  own binds -- a failure only `warn!`s and leaves `SPUR_CHECKPOINT_SOCK` unset
+  for this container, never aborts the launch.
 - **Process model**: raw `fork()` (not tokio::Command) with the container init
   done between fork and exec. PID tracked via `pidfd_open` on kernels >= 5.3.
 

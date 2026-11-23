@@ -1,0 +1,16 @@
+# HELP spur_job_checkpoints_completed Checkpoints completed so far by a job's live (not yet finalized) run.
+# TYPE spur_job_checkpoints_completed gauge
+spur_job_checkpoints_completed{job_id="10",user="alice",account="teamA",job_name="train"} 3
+# HELP spur_job_checkpoint_last_step Training step of a job's most recently completed checkpoint.
+# TYPE spur_job_checkpoint_last_step gauge
+spur_job_checkpoint_last_step{job_id="10",user="alice",account="teamA",job_name="train"} 300
+# HELP spur_job_checkpoint_seconds_since_last Seconds since a job's most recently completed checkpoint.
+# TYPE spur_job_checkpoint_seconds_since_last gauge
+spur_job_checkpoint_seconds_since_last{job_id="10",user="alice",account="teamA",job_name="train"} 45.5
+# HELP spur_job_checkpoint_in_progress Whether a job's live run has a checkpoint in progress past its last completed step.
+# TYPE spur_job_checkpoint_in_progress gauge
+spur_job_checkpoint_in_progress{job_id="10",user="alice",account="teamA",job_name="train"} 1
+# HELP spur_job_checkpoint_events_dropped Checkpoint telemetry events dropped for a job's live run.
+# TYPE spur_job_checkpoint_events_dropped gauge
+spur_job_checkpoint_events_dropped{job_id="10",user="alice",account="teamA",job_name="train"} 0
+# EOF

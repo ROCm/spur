@@ -22,6 +22,7 @@ spur-net = { path = "../spur-net" }
 spur-sched = { path = "../spur-sched" }
 spur-spank = { path = "../spur-spank" }
 spur-devices = { path = "../spur-devices" }
+chrono = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 # agent-side auth middleware (Tower layer over the gRPC surface)

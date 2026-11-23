@@ -12,6 +12,7 @@ subtrees:
               - file: user-guide/submitting-jobs
               - file: user-guide/interactive
               - file: user-guide/monitoring-jobs
+              - file: user-guide/checkpoint-telemetry
               - file: user-guide/running-containers
               - file: user-guide/slurm-compatibility
       - file: admin-guide/index
@@ -25,6 +26,7 @@ subtrees:
               - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
               - file: admin-guide/karma-scoring
+              - file: admin-guide/checkpoint-metrics
               - file: admin-guide/tres-billing-weights
       - file: deployment/index
         subtrees:

@@ -69,7 +69,9 @@ async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    metrics_response(encode_job_metrics(&state.cluster.job_metrics()))
+    let jobs = encode_job_metrics(&state.cluster.job_metrics());
+    let checkpoint = state.cluster.checkpoint_metrics_body();
+    metrics_response(spur_metrics::export::concat_encoded([jobs, checkpoint]))
 }
 
 async fn metrics_nodes(State(state): State<Arc<MetricsState>>) -> Response {
@@ -128,7 +130,12 @@ async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Res
     }
     let gauges = encode_jobs_users_accts_metrics(&state.cluster.user_acct_metrics());
     let counters = encode_karma_metrics(&state.cluster.karma_metrics());
-    metrics_response(spur_metrics::export::concat_encoded([gauges, counters]))
+    let checkpoint_jobs = state.cluster.checkpoint_job_metrics_body();
+    metrics_response(spur_metrics::export::concat_encoded([
+        gauges,
+        counters,
+        checkpoint_jobs,
+    ]))
 }
 
 async fn metrics_auth(_state: State<Arc<MetricsState>>) -> Response {
@@ -533,5 +540,239 @@ mod tests {
                 type_names.push(name);
             }
         }
+    }
+
+    /// A single-node job, started and finalized as `Completed` with one final
+    /// checkpoint record ingested first, all driven directly through
+    /// `apply_operation` (no agents, no RPC) so the test controls timing.
+    async fn cluster_with_finalized_checkpoint_run(
+        dir: &TempDir,
+        config: SlurmConfig,
+    ) -> (Arc<ClusterManager>, crate::raft::RaftHandle) {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::wal::WalOperation;
+
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft.clone());
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
+            labels: HashMap::new(),
+            source: NodeSource::default(),
+            capabilities: Vec::new(),
+            agent_instance: String::new(),
+        });
+
+        let res = ResourceAllocations::with_scalar(1, 0);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(JobSpec {
+                name: "ckpt".into(),
+                user: "alice".into(),
+                account: Some("acctA".into()),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: res.clone(),
+            per_node_alloc: [("n1".to_string(), res)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+
+        let now = chrono::Utc::now();
+        let rec = spur_proto::proto::StepCheckpointRecord {
+            job_id: 1,
+            run_attempt: 0,
+            step_id: 0,
+            is_final: true,
+            completed: 1,
+            failed: 0,
+            last_completed_step: Some(1),
+            last_completed_at: Some(prost_types::Timestamp {
+                seconds: now.timestamp(),
+                nanos: now.timestamp_subsec_nanos() as i32,
+            }),
+            in_progress_step: None,
+            in_progress_since: None,
+            restore_step: None,
+            uid_verified: 0,
+            dropped: HashMap::new(),
+        };
+        assert_eq!(cm.checkpoint_ingest("n1", vec![rec]), (1, 0));
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+        cm.checkpoint_finalize_past_grace_for_test();
+
+        (cm, handle)
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_includes_checkpoint_families_after_a_run_ends() {
+        let dir = TempDir::new().unwrap();
+        let (cm, handle) = cluster_with_finalized_checkpoint_run(&dir, test_config()).await;
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+
+        let resp = metrics_jobs(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("spur_jobs"));
+        assert!(text
+            .contains(r#"spur_job_runs_ended_total{reason="completed",checkpoint="completed"} 1"#));
+    }
+
+    /// A second job, still Running with one in-progress (not final) checkpoint
+    /// record ingested, so it has a live run for `checkpoint_job_metrics_body`
+    /// to report a gauge for -- unlike `cluster_with_finalized_checkpoint_run`'s
+    /// job 1, whose run already finalized and was dropped from the store.
+    async fn add_job_with_a_live_checkpoint(cm: &Arc<ClusterManager>) {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(JobSpec {
+                name: "ckpt2".into(),
+                user: "bob".into(),
+                account: Some("acctB".into()),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let res = ResourceAllocations::with_scalar(1, 0);
+        cm.apply_operation(&WalOperation::JobStart {
+            preemption_observation: None,
+            job_id: 2,
+            nodes: vec!["n1".into()],
+            resources: res.clone(),
+            per_node_alloc: [("n1".to_string(), res)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
+            at: None,
+        });
+        let rec = spur_proto::proto::StepCheckpointRecord {
+            job_id: 2,
+            run_attempt: 0,
+            step_id: 0,
+            is_final: false,
+            completed: 1,
+            failed: 0,
+            last_completed_step: Some(1),
+            last_completed_at: None,
+            in_progress_step: None,
+            in_progress_since: None,
+            restore_step: None,
+            uid_verified: 0,
+            dropped: HashMap::from([("job_mismatch".to_string(), 1)]),
+        };
+        assert_eq!(cm.checkpoint_ingest("n1", vec![rec]), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_users_accts_includes_per_job_checkpoint_gauges_with_high_cardinality() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.metrics.high_cardinality = true;
+        let (cm, handle) = cluster_with_finalized_checkpoint_run(&dir, config).await;
+        add_job_with_a_live_checkpoint(&cm).await;
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+
+        let resp = metrics_jobs_users_accts(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("spur_job_checkpoints_completed{job_id=\"2\""));
+        assert!(text.contains(
+            "spur_job_checkpoints_failed_total{job_id=\"2\",user=\"bob\",account=\"acctB\""
+        ));
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_users_accts_omits_checkpoint_gauges_without_high_cardinality() {
+        let dir = TempDir::new().unwrap();
+        let (cm, handle) = cluster_with_finalized_checkpoint_run(&dir, test_config()).await;
+        add_job_with_a_live_checkpoint(&cm).await;
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+
+        // high_cardinality defaults off: the whole endpoint 404s before any
+        // per-job checkpoint gauge is ever considered.
+        let resp = metrics_jobs_users_accts(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

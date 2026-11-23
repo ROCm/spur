@@ -79,6 +79,7 @@ cleanup_controller_impl! {
         get_assoc_mgr_info(spur_proto::proto::GetAssocMgrInfoRequest) -> spur_proto::proto::GetAssocMgrInfoResponse;
         register_agent(spur_proto::proto::RegisterAgentRequest) -> spur_proto::proto::RegisterAgentResponse;
         heartbeat(spur_proto::proto::HeartbeatRequest) -> spur_proto::proto::HeartbeatResponse;
+        report_checkpoint_telemetry(spur_proto::proto::ReportCheckpointTelemetryRequest) -> spur_proto::proto::ReportCheckpointTelemetryResponse;
         report_stepd_recovery(spur_proto::proto::StepdRecoveryRequest) -> spur_proto::proto::StepdRecoveryResponse;
         create_token(spur_proto::proto::CreateTokenRequest) -> spur_proto::proto::CreateTokenResponse;
         list_tokens(spur_proto::proto::ListTokensRequest) -> spur_proto::proto::ListTokensResponse;

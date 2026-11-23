@@ -3,6 +3,7 @@
 
 //! Cluster metrics aggregation and OpenMetrics 1.0 export for spurctld.
 
+pub mod checkpoint;
 pub mod export;
 pub mod job;
 pub mod k8s;
@@ -13,8 +14,15 @@ pub mod rpc;
 pub mod scheduler;
 pub mod user_acct;
 
+pub use checkpoint::{
+    CheckpointJobFailed, CheckpointJobSnapshot, CheckpointMetrics, CheckpointState, GraceOutcome,
+    RunEnd,
+};
 pub use export::audit::encode_audit_metrics;
 pub use export::auth::encode_auth_metrics;
+pub use export::checkpoint::{
+    encode_checkpoint_job_failed_metrics, encode_checkpoint_job_metrics, encode_checkpoint_metrics,
+};
 pub use export::jobs::{encode_job_metrics, job_state_metric_suffix};
 pub use export::jobs_users_accts::encode_jobs_users_accts_metrics;
 pub use export::k8s_cluster::{encode_k8s_cluster_metrics, encode_k8s_metrics};

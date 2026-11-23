@@ -57,6 +57,35 @@ list is stored.
 it. Users who have no ``qos=`` of their own stop inheriting the account's list
 and may again use any QOS. Lists set directly on users are unaffected.
 
+Checkpoint telemetry compatibility
+-----------------------------------
+
+Workload-reported checkpoint telemetry (see
+:doc:`/user-guide/checkpoint-telemetry` and
+:doc:`/admin-guide/checkpoint-metrics`) adds no config field and no Raft/WAL
+change: ``StepdLaunchSpec.checkpoint_socket`` and the per-step
+``checkpoint.json`` record are both additive and tolerate an old peer that
+does not know about them, and the ``ReportCheckpointTelemetry`` RPC is a new,
+independently-versioned addition to ``SlurmController``.
+
+In a mixed-version cluster the feature simply degrades to no telemetry rather
+than failing:
+
+- An old ``spurstepd`` with a new ``spurd`` ignores the unknown
+  ``checkpoint_socket`` field, so no listener starts and the job's
+  ``SPUR_CHECKPOINT_SOCK`` is never set. The spurd/spurstepd handshake and
+  protocol version are unchanged, so a live step is still re-adopted across
+  this upgrade either way.
+- A new ``spurd`` talking to an old controller that does not yet implement
+  ``ReportCheckpointTelemetry`` logs this once and backs off for 10 minutes
+  before retrying; checkpoint records queue on the node and are never resent
+  once acknowledged, so nothing accumulates unbounded, but nothing reaches the
+  controller's metrics until it is upgraded too.
+
+Upgrade every controller to get checkpoint metrics; there is nothing to
+upgrade on compute nodes to keep ordinary job execution working, since the
+whole feature is best-effort and additive.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 

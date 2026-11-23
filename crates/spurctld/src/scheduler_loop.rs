@@ -204,6 +204,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         enforce_inactive_limits(inactive_cluster, inactive_raft).await;
     });
+    let checkpoint_cluster = cluster.clone();
+    let checkpoint_raft = raft.clone();
+    tokio::spawn(async move {
+        enforce_checkpoint_sweep(checkpoint_cluster, checkpoint_raft).await;
+    });
     // The tick interval and per-cycle job cap require a controller restart;
     // topology is rebuilt from the current configuration each cycle.
     let startup_config = cluster.config();
@@ -4250,6 +4255,22 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
             }
             force_finish_completing_job(&cluster, &job).await;
         }
+    }
+}
+
+/// Finalize ended checkpoint-telemetry runs -- complete, or past their grace
+/// deadline -- and bound the store to runs still occupying a run.
+async fn enforce_checkpoint_sweep(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        if !raft.ensure_leader().await {
+            continue;
+        }
+
+        cluster.checkpoint_sweep();
     }
 }
 

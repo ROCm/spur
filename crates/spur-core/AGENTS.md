@@ -40,6 +40,7 @@ src/
   array.rs               -- Job array spec parsing (0-99%10)
   block_file.rs          -- Fabric block-file parsing (INI-like), DefinedBlock, BlockFile
   burst_buffer.rs        -- BbStageState, burst-buffer capacity reservation
+  checkpoint.rs          -- checkpoint event parsing, per-step CheckpointRecord, DropReason
   constraints.rs         -- GPU constraint expressions (gpu.type==MI300X), Predicate, Constraints
   core_layout.rs         -- Controller CPU partitioning (spec-reserved, GPU-reserved, general pools)
   cpu_topology.rs        -- CpuTopology from sysfs: sockets, NUMA, cores, hyperthread, cpulist notation

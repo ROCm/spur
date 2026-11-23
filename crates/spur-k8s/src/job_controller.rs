@@ -1802,6 +1802,7 @@ mod tests {
         get_assoc_mgr_info(pb::GetAssocMgrInfoRequest) -> pb::GetAssocMgrInfoResponse;
         register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
         heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
+        report_checkpoint_telemetry(pb::ReportCheckpointTelemetryRequest) -> pb::ReportCheckpointTelemetryResponse;
         create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
         list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
         revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;

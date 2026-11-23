@@ -113,7 +113,7 @@ The controller serves two gRPC services on port 6817:
 
 **Job steps:** `GetJobSteps`, `CreateJobStep`, `CompleteJobStep`
 
-**Nodes:** `GetNodes`, `GetNode`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `DeregisterAgent`, `RegisterAgent`, `Heartbeat`, `ReportJobStatus`, `ReportStepdRecovery`
+**Nodes:** `GetNodes`, `GetNode`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `DeregisterAgent`, `RegisterAgent`, `Heartbeat`, `ReportJobStatus`, `ReportStepdRecovery`, `ReportCheckpointTelemetry`
 
 **Partitions:** `GetPartitions`, `CreatePartition`, `UpdatePartition`, `DeletePartition`
 
@@ -192,6 +192,7 @@ Read RPCs are forwarded too (consistency with leader state), unless the request 
 - `enforce_completing_timeout` — reaps jobs stuck in `Completing` past a deadline
 - `manage_power` — node power state management
 - `enforce_inactive_limits` — reaps interactive allocations with no keepalive activity
+- `enforce_checkpoint_sweep` — leader-gated, 10 s tick; calls `ClusterManager::checkpoint_sweep()`
 
 **Topology:** rebuilt each scheduling cycle from live config (`cluster.config()`). `scontrol reconfigure` validates `[topology]` and the updated config is picked up on the next cycle. `TopologyConfig::build()` returns `None` unless `plugin` is `tree` or `block`. Two views:
 - `tree` — `TopologyTree::from_switches(&topo_config.switches)` — explicit switch hierarchy
@@ -407,6 +408,26 @@ OpenMetrics 1.0 HTTP export on port 6822 (configurable). Endpoints:
 `/metrics` (alias `/metrics/jobs`), `/metrics/nodes`, `/metrics/partitions`, `/metrics/rpc`, `/metrics/scheduler`, `/metrics/k8s`, `/metrics/jobs-users-accts`, `/metrics/auth`, `/metrics/audit`
 
 `RpcStatsCollector` and `SchedStatsCollector` accumulate in-memory counters. Cluster state snapshots are derived from `ClusterManager` on each scrape.
+
+`checkpoint_metrics_body()` (long-lived counters/histograms) is appended to `/metrics/jobs`; `checkpoint_job_metrics_body()` (per-job gauges) is appended to `/metrics/jobs-users-accts` under the same `metrics.high_cardinality` gate as the rest of that endpoint. See Checkpoint Store below.
+
+## Checkpoint Store (`checkpoint_store.rs`)
+
+`ClusterManager.checkpoint_store: parking_lot::Mutex<CheckpointStore>` — leader-local, never Raft-replicated, never rebuilt on a leadership change. Keyed `job_id -> run_attempt -> node -> step_id`, holding each node's latest record per step.
+
+`ReportCheckpointTelemetry`'s handler (`server.rs`) calls `ClusterManager::checkpoint_ingest()`, which caps a batch at `MAX_RECORDS_PER_REQUEST` (1024; excess rejected without being considered) and validates each record's `(job_id, run_attempt)`/node against a fresh `jobs.read()` snapshot before locking the store. `MAX_RECORDS_PER_RUN` (4096) bounds distinct `(node, step)` records a single run can hold.
+
+`run_job_finalized_side_effects` calls `mark_ended()` when a committed op finalizes a run, gated on `ClusterManager::is_leader()` (reads its own `raft: RwLock<Option<SpurRaft>>`) when a raft handle is set; when none is set at all it instead requires the store to already hold an entry for that run, so an untouched job never gains one. A run finalizes only once `FINALIZE_GRACE` (60 s) has elapsed since it ended, regardless of how many of its allocated nodes have already sent a final record — checked both inline (on each `ingest`/`mark_ended`) and by the leader-gated `enforce_checkpoint_sweep` companion task (10 s tick, calls `checkpoint_sweep()`). That sweep also calls `retain_live()` with the `(job_id, run_attempt)` set of jobs currently `is_active()` (built under a brief `jobs.read()`, released before the store is locked), dropping any not-yet-ended entry absent from it — bounding what a leadership change can leave behind, since a run that ends while this replica is a follower never reaches `mark_ended`.
+
+`JobPreemptCancel`'s apply arm calls `note_grace()` directly (not through `mark_ended`) when the run waits in `Completing` for node reports: `preempt_pending` is cleared before `finalize_reported_run` eventually builds that run's `JobFinalized`, so the preempt-grace instant would otherwise be lost. `JobFinalized.run_attempt`, `.grace_started_at`, and `.nodes` are apply-response-only (`#[serde(skip)]`) — never part of the persisted WAL/snapshot. `.nodes` is the run's allocation captured at the moment it ended (`for_job`/`for_job_with_elapsed` read it from `job.allocated_nodes`); a path that clears `allocated_nodes` before building the `JobFinalized` (`repend_after_preemption`, for the preempt-requeue case) captures the list first, the same way it already captures `grace_started_at`. `run_job_finalized_side_effects` builds the checkpoint `RunInfo`'s node list from `finalized.nodes`, falling back to the job's current `allocated_nodes` only when that's empty.
+
+`RunInfo` (the allocation/labels a run's checkpoint records are validated against and reported under) carries `job_name` alongside `user`/`account`, captured from `job.spec` at the same `jobs.read()` call site in `checkpoint_ingest()` and `run_job_finalized_side_effects()` that already builds `user`/`account` — no new lock is taken for this. Every per-job checkpoint series (the gauges and the invalid-event counter) uses the same identity label set: `job_id`, `user`, `account`, `job_name` — nothing that isn't part of a job's own identity (`partition`, `qos`) is carried as a label.
+
+A finalized run that reported a restore (any record with `restore_step` set) increments `spur_job_runs_restored_total{reason}` via `CheckpointMetrics::record_run_end`'s `restored` field, using the same `has_any_event` gate as the rest of the run-end family (a restore-only run still counts).
+
+`CheckpointStore` keeps a `failed_totals: HashMap<job_id, HashMap<reason, u64>>` of cumulative invalid-event counts, added to by every run attempt's deltas as `ingest` sees them (never reset when a new `run_attempt` starts), feeding the per-job `spur_job_checkpoints_failed_total{reason}` counter (`job_failed_snapshots()`) — monotonic per `job_id` across a requeue, unlike a fresh-per-attempt count. A separate `failed_jobs: HashMap<job_id, FailedJobEntry>` map only tracks *when* each job last finalized with an invalid event (labels plus `finalized_at`), so `failed_totals` stays scrapeable for `FAILED_SERIES_RETENTION` (1 h) after a job's last run ends even with no live run to report it from. A live run's cumulative total always takes priority over the `failed_jobs` bookkeeping entry for the same `job_id` (`job_failed_snapshots()` skips the retained path whenever a live run exists). `sweep()` prunes `failed_jobs` entries older than `FAILED_SERIES_RETENTION` and drops the matching `failed_totals` entry too, unless that job has gone live again by then; the whole `failed_jobs` map is capped at `MAX_RETAINED_FAILED_JOBS` (10,000), evicting the single oldest `finalized_at` entry (and its `failed_totals` counterpart, same live-job guard) when exceeded.
+
+Lock order: never take the checkpoint store lock while holding the `jobs` write lock.
 
 ## Dispatch Tracker (`dispatch_tracker.rs`)
 

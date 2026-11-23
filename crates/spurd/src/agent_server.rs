@@ -67,6 +67,10 @@ struct StepdLaunchOptions {
     cred_kid: String,
     cred_digest: String,
     pty_step_id: Option<spur_core::step::StepId>,
+    /// `None` when this node never hardened a checkpoint socket directory
+    /// (no `cluster_name`, or `harden()` failed) — the step then runs with
+    /// no checkpoint socket, same as an unmodified spurstepd.
+    checkpoint_dir: Option<std::path::PathBuf>,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -231,6 +235,17 @@ fn claim_session_provisionally(
     ))
 }
 
+/// `None` when this node hardened no checkpoint directory; otherwise the
+/// per-step socket path spurstepd binds its checkpoint listener to.
+fn resolve_checkpoint_socket(
+    checkpoint_dir: Option<&std::path::Path>,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> Option<std::path::PathBuf> {
+    checkpoint_dir.map(|dir| crate::checkpoint_dir::socket_path(dir, job_id, run_attempt, step_id))
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -251,6 +266,11 @@ async fn launch_stepd(
     }
     let mut launch_spec = crate::stepd::StepdLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
+    // config.environment forwards the job's (or a nested srun's parent
+    // step's) environment; a prior step's SPUR_CHECKPOINT_SOCK must not ride
+    // along into this one. run_process strips it again unconditionally, so
+    // this also covers an old spurstepd build that ignores checkpoint_socket.
+    crate::stepd::strip_checkpoint_sock_env(&mut launch_spec);
     launch_spec.resources.fabric_binding = options.fabric_binding;
     launch_spec.resources.gpu_binding = options.gpu_binding;
     launch_spec.controller_addr = controller_addr.into();
@@ -266,6 +286,12 @@ async fn launch_stepd(
     launch_spec.cred_kid = options.cred_kid;
     launch_spec.cred_digest = options.cred_digest;
     launch_spec.pty_step_id = options.pty_step_id;
+    launch_spec.checkpoint_socket = resolve_checkpoint_socket(
+        options.checkpoint_dir.as_deref(),
+        config.job_id,
+        run_attempt,
+        launch_spec.step_id,
+    );
     let store = crate::stepd::StepdStore::new(state_dir);
     let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
@@ -1993,6 +2019,7 @@ pub struct CompletionListenerContext {
     controller_addr: String,
     hostname: String,
     reporter: Arc<NodeReporter>,
+    checkpoint_collector: Arc<crate::checkpoint_collector::CheckpointCollector>,
 }
 
 impl StepdRecoveryCleanup {
@@ -2702,6 +2729,7 @@ async fn fence_dead_stepd(
         controller_addr,
         hostname,
         reporter,
+        ..
     } = context;
     if !claim_stepd(stepds, &descriptor).await {
         return;
@@ -2900,6 +2928,21 @@ async fn handle_completion_notification(
             }
         }
         Some(descriptor) => {
+            // Read now rather than waiting for the next refresh tick: the
+            // session may be pruned once this completion settles, and a
+            // final record is what lets the pruning gate release it.
+            // No `checkpoint_dir` guard needed: with the feature off (or an
+            // old spurstepd) checkpoint.json never exists, so this is a no-op.
+            let checkpoint_key = (job_id, run_attempt, step_id);
+            context.checkpoint_collector.collect_now(
+                checkpoint_key,
+                &context
+                    .stepds_store
+                    .session_dir(job_id, run_attempt, step_id),
+            );
+            // The step is done; start the orphan-retention clock an
+            // unacknowledged final record is evicted against.
+            context.checkpoint_collector.mark_finished(checkpoint_key);
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -3878,6 +3921,7 @@ fn build_container_launch(
         },
         home_dir: req.home_dir,
         withheld_socket: None,
+        checkpoint_socket: None,
         device_plan: req.device_plan,
     };
     crate::container::maybe_bind_auth_socket(
@@ -4568,6 +4612,12 @@ pub struct AgentService {
     launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
     auth_policy: spur_core::config::AuthConfig,
     block_file: Option<std::path::PathBuf>,
+    /// The hardened checkpoint socket directory for this cluster, or `None`
+    /// when this node never hardened one — see `StepdLaunchOptions`.
+    checkpoint_dir: Option<std::path::PathBuf>,
+    /// Shared with `NodeReporter`'s batch reporter loop (Task 4): this
+    /// service feeds it records, the reporter ships and acknowledges them.
+    checkpoint_collector: Arc<crate::checkpoint_collector::CheckpointCollector>,
 }
 
 impl AgentService {
@@ -4707,6 +4757,8 @@ impl AgentService {
             launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
             auth_policy: spur_core::config::AuthConfig::default(),
             block_file: None,
+            checkpoint_dir: None,
+            checkpoint_collector: Arc::new(crate::checkpoint_collector::CheckpointCollector::new()),
         }
     }
 
@@ -4756,6 +4808,52 @@ impl AgentService {
         self
     }
 
+    /// The hardened checkpoint socket directory this node will hand each
+    /// launched step, if any (see `checkpoint_dir::harden`).
+    pub fn with_checkpoint_dir(mut self, checkpoint_dir: Option<std::path::PathBuf>) -> Self {
+        self.checkpoint_dir = checkpoint_dir;
+        self
+    }
+
+    /// Shares one collector with the caller's `NodeReporter`, instead of the
+    /// service's own default, so both sides feed and drain the same map.
+    pub fn with_checkpoint_collector(
+        mut self,
+        checkpoint_collector: Arc<crate::checkpoint_collector::CheckpointCollector>,
+    ) -> Self {
+        self.checkpoint_collector = checkpoint_collector;
+        self
+    }
+
+    /// Shares this service's collector with the caller — Task 4 hands the
+    /// same `Arc` to `NodeReporter` so both sides see the same map.
+    pub fn checkpoint_collector(&self) -> Arc<crate::checkpoint_collector::CheckpointCollector> {
+        self.checkpoint_collector.clone()
+    }
+
+    /// Starts following a just-launched step's checkpoint session, so a
+    /// later `refresh()` notices its `checkpoint.json` without waiting for a
+    /// `StepdCompleted`/re-adoption event. A no-op when this node hardened no
+    /// checkpoint directory: without one, spurstepd never serves a listener
+    /// and `checkpoint.json` is never written, so tracking it would only
+    /// grow the map forever for nothing.
+    fn track_checkpoint_session(&self, descriptor: &crate::stepd::StepdDescriptor) {
+        if self.checkpoint_dir.is_none() {
+            return;
+        }
+        let Some(session_dir) = descriptor.socket_path.parent() else {
+            return;
+        };
+        self.checkpoint_collector.track(
+            (
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            ),
+            session_dir.to_path_buf(),
+        );
+    }
+
     /// Overrides `RunCommand`'s job-spool candidates so a test can force a
     /// deterministic failure without depending on the runner's uid.
     #[cfg(test)]
@@ -4787,6 +4885,25 @@ impl AgentService {
                 continue;
             }
             sessions.insert(stepd_key(&descriptor), descriptor.clone());
+            // Re-adopted at startup: collect any final record left by a
+            // supervisor this agent never saw finish, and keep following a
+            // still-live one's checkpoint.json without waiting for its own
+            // completion notification. Gated like `track_checkpoint_session`:
+            // without a hardened checkpoint directory, no listener ever ran
+            // and checkpoint.json never exists, so tracking it would only
+            // grow the map forever for nothing.
+            if self.checkpoint_dir.is_some() {
+                if let Some(session_dir) = descriptor.socket_path.parent() {
+                    let key = (
+                        descriptor.job_id,
+                        descriptor.run_attempt,
+                        descriptor.step_id,
+                    );
+                    self.checkpoint_collector
+                        .track(key, session_dir.to_path_buf());
+                    self.checkpoint_collector.collect_now(key, session_dir);
+                }
+            }
             if let (Some(id), Some(digest)) = (
                 decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
                     &descriptor.cred_id,
@@ -4967,6 +5084,24 @@ impl AgentService {
                     .unwrap_or(false)
             {
                 continue;
+            }
+            // This stale session is about to be settled and is a pruning
+            // candidate from here on; grab whatever final record its dead
+            // supervisor left before that happens.
+            // No `checkpoint_dir` guard needed: with the feature off (or an
+            // old spurstepd) checkpoint.json never exists, so this is a no-op.
+            if let Some(session_dir) = descriptor.socket_path.parent() {
+                let checkpoint_key = (
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                );
+                self.checkpoint_collector
+                    .collect_now(checkpoint_key, session_dir);
+                // A dead supervisor's session is settled, not re-adopted;
+                // start the orphan-retention clock an unacknowledged final
+                // record is evicted against.
+                self.checkpoint_collector.mark_finished(checkpoint_key);
             }
             match durable_runtime_exit(&store, descriptor) {
                 Ok(Some((exit_code, signal))) => {
@@ -5314,6 +5449,7 @@ impl AgentService {
                 cred_kid: persist_cred.1,
                 cred_digest: persist_cred.2,
                 pty_step_id: None,
+                checkpoint_dir: self.checkpoint_dir.clone(),
             },
             &admission,
         )
@@ -5330,6 +5466,7 @@ impl AgentService {
                 )));
             }
         };
+        self.track_checkpoint_session(&descriptor);
 
         if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
             self.step_completions
@@ -5474,6 +5611,7 @@ impl AgentService {
                 cred_kid: String::new(),
                 cred_digest: String::new(),
                 pty_step_id: Some(pty_step_id),
+                checkpoint_dir: self.checkpoint_dir.clone(),
             },
             &admission,
         )
@@ -5490,6 +5628,7 @@ impl AgentService {
                 )));
             }
         };
+        self.track_checkpoint_session(&descriptor);
 
         if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
             self.step_completions
@@ -5571,6 +5710,7 @@ impl AgentService {
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
             reporter: self.reporter.clone(),
+            checkpoint_collector: self.checkpoint_collector.clone(),
         }
     }
 
@@ -7010,6 +7150,7 @@ impl SlurmAgent for AgentService {
                 },
                 home_dir,
                 withheld_socket: None,
+                checkpoint_socket: None,
                 device_plan: None, // set after GRES allocation
             };
             crate::container::maybe_bind_auth_socket(
@@ -7395,6 +7536,7 @@ impl SlurmAgent for AgentService {
                     cred_kid: persist_cred.1,
                     cred_digest: persist_cred.2,
                     pty_step_id: None,
+                    checkpoint_dir: self.checkpoint_dir.clone(),
                 },
                 &admission,
             )
@@ -7451,6 +7593,9 @@ impl SlurmAgent for AgentService {
                             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                         }));
                     }
+                }
+                if let Some(descriptor) = runtime_descriptor.as_ref() {
+                    self.track_checkpoint_session(descriptor);
                 }
 
                 let mut jobs = self.running.lock().await;
@@ -8393,6 +8538,7 @@ impl SlurmAgent for AgentService {
                     cred_kid: String::new(),
                     cred_digest: String::new(),
                     pty_step_id: None,
+                    checkpoint_dir: self.checkpoint_dir.clone(),
                 },
                 &admission,
             )
@@ -8401,6 +8547,7 @@ impl SlurmAgent for AgentService {
                 self.drain_on_node_fault(&error, req.job_id);
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
+            self.track_checkpoint_session(&descriptor);
 
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
@@ -9476,6 +9623,7 @@ impl SlurmAgent for AgentService {
                 },
                 home_dir,
                 withheld_socket: None,
+                checkpoint_socket: None,
                 device_plan: container_device_plan,
             };
             crate::container::maybe_bind_auth_socket(
@@ -13214,6 +13362,7 @@ mod tests {
                 cred_kid: String::new(),
                 cred_digest: String::new(),
                 pty_step_id: None,
+                checkpoint_dir: None,
             },
             &wrong,
         )
@@ -13231,6 +13380,21 @@ mod tests {
                 .session_dir(42, 7, 0)
                 .exists(),
             "the refused launch must not create a session directory"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_socket_names_the_per_step_socket_under_the_hardened_dir() {
+        let dir = std::path::Path::new("/run/spur/clusterA/checkpoint");
+
+        assert_eq!(
+            resolve_checkpoint_socket(Some(dir), 42, 7, 0),
+            Some(dir.join("42.7.0.sock")),
+        );
+        assert_eq!(
+            resolve_checkpoint_socket(None, 42, 7, 0),
+            None,
+            "a node that hardened no checkpoint directory must hand stepd no socket"
         );
     }
 
@@ -15147,6 +15311,7 @@ mod tests {
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
             reporter: test_reporter(),
+            checkpoint_collector: Arc::new(crate::checkpoint_collector::CheckpointCollector::new()),
         };
         (context, running, sessions, state_dir, completions)
     }
@@ -17735,6 +17900,7 @@ mod tests {
             username: "testuser".into(),
             home_dir: "/home/testuser".into(),
             withheld_socket: None,
+            checkpoint_socket: None,
             device_plan: None,
         };
         let cfg = executor::JobLaunchConfig {
@@ -18306,6 +18472,42 @@ mod tests {
         let batch = publish_session(&store, spur_core::step::STEP_BATCH, None);
         svc.adopt_stepds(&[batch]).await;
         svc
+    }
+
+    #[tokio::test]
+    async fn adopt_stepds_tracks_nothing_when_checkpoint_telemetry_is_off() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        assert!(
+            svc.checkpoint_dir.is_none(),
+            "this node must not have hardened a checkpoint directory"
+        );
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        // Even a session that already has a checkpoint.json must not be
+        // tracked: without a hardened directory this agent never served a
+        // listener, so the file (if present at all) is not this run's to
+        // collect.
+        let descriptor = publish_session(&store, spur_core::step::STEP_BATCH, None);
+        std::fs::write(
+            store
+                .session_dir(44, 1, spur_core::step::STEP_BATCH)
+                .join(crate::checkpoint_listener::RECORD_FILE),
+            b"{}",
+        )
+        .expect("write checkpoint.json");
+
+        svc.adopt_stepds(&[descriptor]).await;
+
+        assert!(
+            svc.checkpoint_collector.is_empty(),
+            "adopt_stepds must not track a session when checkpoint telemetry is off"
+        );
     }
 
     #[tokio::test]
@@ -23379,6 +23581,7 @@ mod tests {
             get_assoc_mgr_info(spur_proto::proto::GetAssocMgrInfoRequest) -> spur_proto::proto::GetAssocMgrInfoResponse;
             register_agent(spur_proto::proto::RegisterAgentRequest) -> spur_proto::proto::RegisterAgentResponse;
             heartbeat(spur_proto::proto::HeartbeatRequest) -> spur_proto::proto::HeartbeatResponse;
+            report_checkpoint_telemetry(spur_proto::proto::ReportCheckpointTelemetryRequest) -> spur_proto::proto::ReportCheckpointTelemetryResponse;
             report_stepd_recovery(spur_proto::proto::StepdRecoveryRequest) -> spur_proto::proto::StepdRecoveryResponse;
             create_token(spur_proto::proto::CreateTokenRequest) -> spur_proto::proto::CreateTokenResponse;
             list_tokens(spur_proto::proto::ListTokensRequest) -> spur_proto::proto::ListTokensResponse;
@@ -23627,6 +23830,7 @@ mod tests {
             controller_addr: "http://127.0.0.1:1".into(),
             hostname: "test-node".into(),
             reporter: test_reporter(),
+            checkpoint_collector: Arc::new(crate::checkpoint_collector::CheckpointCollector::new()),
         }
     }
 

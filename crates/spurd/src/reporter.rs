@@ -3,20 +3,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
+use spur_core::checkpoint::{CheckpointRecord, DropReason};
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
 use spur_proto::proto::{
-    RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus, StepdRecoveryRequest,
-    StepdRecoveryResponse,
+    RegisterAgentRequest, ReportCheckpointTelemetryRequest, ResourceSet as ProtoResourceSet,
+    RunningJobStatus, StepCheckpointRecord, StepdRecoveryRequest, StepdRecoveryResponse,
 };
 use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::checkpoint_collector::{CheckpointCollector, StepKey};
 
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
 /// controller connection. A caller with its own config (spurd's `[spurd]` section) should
@@ -62,6 +65,17 @@ fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 /// How long a heartbeat waits for the running-job set before reporting it
 /// incomplete; well inside the 30-second beat interval.
 const HELD_JOBS_READ_BUDGET: Duration = Duration::from_millis(400);
+
+/// How often the checkpoint-report loop wakes to refresh the collector and
+/// ship dirty records, absent an earlier wake from a final record.
+pub const CHECKPOINT_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the loop waits before retrying after the controller answers
+/// `Unimplemented` — records stay dirty and queue up in the meantime.
+pub const CHECKPOINT_UNIMPLEMENTED_BACKOFF: Duration = Duration::from_secs(600);
+
+/// Per-request cap on how many dirty records one checkpoint report carries.
+pub const MAX_RECORDS_PER_REQUEST: usize = 1024;
 
 /// The run a held job belongs to, so a reclaim can target that run alone.
 pub trait HeldRun {
@@ -116,6 +130,16 @@ pub struct NodeReporter {
     allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// The live per-node checkpoint record collector; wired once after it is
+    /// built in `main.rs`. Unset means the feature is off for this node.
+    checkpoint_collector: std::sync::OnceLock<Arc<CheckpointCollector>>,
+    /// Set once the controller has answered `Unimplemented` to
+    /// `ReportCheckpointTelemetry`, so the loop logs that only the first time.
+    checkpoint_unimplemented_logged: AtomicBool,
+    /// Bitmask of non-retryable, non-`Unimplemented` `ReportCheckpointTelemetry`
+    /// status codes already logged once (`1 << tonic::Code as u32`), so a status
+    /// that recurs every report cycle doesn't warn on every one.
+    checkpoint_rejected_logged: AtomicU32,
     /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
     /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
@@ -174,6 +198,9 @@ impl NodeReporter {
             held_jobs,
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
+            checkpoint_collector: std::sync::OnceLock::new(),
+            checkpoint_unimplemented_logged: AtomicBool::new(false),
+            checkpoint_rejected_logged: AtomicU32::new(0),
             last_failed_endpoint: std::sync::Mutex::new(None),
             spec: std::sync::Mutex::new(crate::spec::SpecEnforcer::new(
                 std::path::PathBuf::from(crate::executor::CGROUP_ROOT),
@@ -538,6 +565,12 @@ impl NodeReporter {
         let _ = self.k0s_status.set(status);
     }
 
+    /// Wire the live checkpoint collector so `checkpoint_report_loop` can ship its
+    /// dirty records. Called once, next to `set_allocation` in `main.rs`.
+    pub fn set_checkpoint_collector(&self, collector: Arc<CheckpointCollector>) {
+        let _ = self.checkpoint_collector.set(collector);
+    }
+
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
     /// Read live from the interface so a key that appears or changes after startup is picked up.
     fn wg_pubkey(&self) -> String {
@@ -840,6 +873,122 @@ impl NodeReporter {
         self.with_controller(move |mut client| async move { client.heartbeat(retry).await })
             .await
     }
+
+    /// Periodic checkpoint-telemetry reporter loop: wakes on the report interval or
+    /// an earlier wake from a final record, and ships whatever is dirty. Returns
+    /// (rather than spinning) once no collector is wired, since that never changes
+    /// after `main.rs` wires it before spawning this loop.
+    pub async fn checkpoint_report_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(CHECKPOINT_REPORT_INTERVAL);
+        loop {
+            let Some(collector) = self.checkpoint_collector.get() else {
+                return;
+            };
+            next_checkpoint_report(&mut interval, collector).await;
+            if self.report_checkpoints_once().await == CheckpointReportOutcome::Unimplemented {
+                tokio::time::sleep(CHECKPOINT_UNIMPLEMENTED_BACKOFF).await;
+            }
+        }
+    }
+
+    /// One reporting attempt: refresh the collector, take up to
+    /// `MAX_RECORDS_PER_REQUEST` dirty records, and send them. Kept separate from
+    /// `checkpoint_report_loop` so a test can drive exactly one iteration without
+    /// the infinite loop or its timing.
+    async fn report_checkpoints_once(&self) -> CheckpointReportOutcome {
+        let Some(collector) = self.checkpoint_collector.get() else {
+            return CheckpointReportOutcome::Empty;
+        };
+        collector.refresh();
+        collector.evict_stale(SystemTime::now());
+        let sent = collector.dirty(MAX_RECORDS_PER_REQUEST);
+        if sent.is_empty() {
+            return CheckpointReportOutcome::Empty;
+        }
+        match self.send_checkpoint_batch(&sent).await {
+            Ok(()) => {
+                collector.acknowledge(&sent);
+                CheckpointReportOutcome::Sent
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                if !self
+                    .checkpoint_unimplemented_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    info!(
+                        "controller does not support ReportCheckpointTelemetry yet; \
+                         checkpoint records will keep accumulating until it does"
+                    );
+                }
+                CheckpointReportOutcome::Unimplemented
+            }
+            // Transient/transport failures: leave the batch dirty for the next attempt.
+            Err(status) if spur_proto::controller_rpc_retryable(&status) => {
+                debug!(%status, "failed to report checkpoint telemetry; records stay queued");
+                CheckpointReportOutcome::Failed
+            }
+            // A permanent rejection (e.g. InvalidArgument) would repeat forever if
+            // left dirty; the controller already told us what it thinks, so drop
+            // the batch the same way an explicit per-record rejection is dropped.
+            Err(status) => {
+                self.warn_checkpoint_status_once(status.code());
+                collector.acknowledge(&sent);
+                CheckpointReportOutcome::Rejected
+            }
+        }
+    }
+
+    /// Logs a non-retryable, non-`Unimplemented` `ReportCheckpointTelemetry`
+    /// status the first time it is seen, so a status that recurs every report
+    /// cycle doesn't warn on every one.
+    fn warn_checkpoint_status_once(&self, code: tonic::Code) {
+        let bit = 1u32 << (code as i32 as u32);
+        let already_logged = self
+            .checkpoint_rejected_logged
+            .fetch_or(bit, Ordering::Relaxed)
+            & bit
+            != 0;
+        if !already_logged {
+            warn!(
+                ?code,
+                "controller rejected checkpoint telemetry with a non-retryable status; \
+                 dropping the batch instead of resending it forever"
+            );
+        }
+    }
+
+    /// Ships one batch of checkpoint records. `Ok(())` covers every outcome the
+    /// controller answered explicitly, including a nonzero `rejected` count —
+    /// the controller decided, and resending the same records won't change that,
+    /// so the caller acknowledges (drops) them either way; only a failure to even
+    /// reach the controller leaves them dirty for the next attempt.
+    async fn send_checkpoint_batch(
+        &self,
+        sent: &[(StepKey, CheckpointRecord)],
+    ) -> Result<(), tonic::Status> {
+        let request = ReportCheckpointTelemetryRequest {
+            hostname: self.hostname.clone(),
+            node_token: read_recover(&self.node_token).clone(),
+            records: sent
+                .iter()
+                .map(|(key, record)| to_proto(*key, record))
+                .collect(),
+        };
+        let response = self
+            .with_controller(move |mut client| async move {
+                client.report_checkpoint_telemetry(request).await
+            })
+            .await
+            .map_err(connect_auth_err_to_status)?;
+        if response.rejected > 0 {
+            debug!(
+                accepted = response.accepted,
+                rejected = response.rejected,
+                "controller rejected some checkpoint records"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// What a heartbeat says about the held layout.
@@ -864,6 +1013,83 @@ async fn next_heartbeat(interval: &mut tokio::time::Interval, wake: &tokio::sync
         () = wake.notified() => {
             interval.reset_immediately();
             interval.tick().await;
+        }
+    }
+}
+
+/// Outcome of one `report_checkpoints_once` attempt, so the loop knows whether
+/// to back off before trying again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointReportOutcome {
+    /// Nothing dirty to send.
+    Empty,
+    Sent,
+    /// The controller doesn't support the RPC yet; records stay dirty.
+    Unimplemented,
+    /// A retryable (transient/transport) failure; records stay dirty.
+    Failed,
+    /// The controller answered with a non-retryable status other than
+    /// `Unimplemented`; the batch was acknowledged (dropped), not resent.
+    Rejected,
+}
+
+/// Same wait pattern as [`next_heartbeat`], woken early by a final record
+/// rather than a layout change.
+async fn next_checkpoint_report(
+    interval: &mut tokio::time::Interval,
+    collector: &CheckpointCollector,
+) {
+    tokio::select! {
+        _ = interval.tick() => {}
+        () = collector.wake().notified() => {
+            interval.reset_immediately();
+            interval.tick().await;
+        }
+    }
+}
+
+/// Maps one collected record to its wire form. `StepKey`'s `(job_id,
+/// run_attempt)` and the `StepId` (already `u32`) go straight across; drop
+/// reasons with a zero count are omitted from the map.
+pub fn to_proto(key: StepKey, record: &CheckpointRecord) -> StepCheckpointRecord {
+    let (job_id, run_attempt, step_id) = key;
+    StepCheckpointRecord {
+        job_id,
+        run_attempt,
+        step_id,
+        is_final: record.is_final,
+        completed: record.completed,
+        failed: record.failed,
+        last_completed_step: record.last_completed_step,
+        last_completed_at: record.last_completed_at.map(datetime_to_proto),
+        in_progress_step: record.in_progress_step,
+        in_progress_since: record.in_progress_since.map(datetime_to_proto),
+        restore_step: record.restore_step,
+        uid_verified: record.uid_verified,
+        dropped: DropReason::ALL
+            .into_iter()
+            .filter_map(|reason| {
+                let count = record.dropped.get(reason);
+                (count > 0).then(|| (reason.as_str().to_string(), count))
+            })
+            .collect(),
+    }
+}
+
+fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+/// Flattens a connect/RPC failure to the `tonic::Status` `send_checkpoint_batch`
+/// reports, since a dial failure never reaches the controller to get one of its own.
+fn connect_auth_err_to_status(error: crate::controller_auth::ConnectAuthError) -> tonic::Status {
+    match error {
+        crate::controller_auth::ConnectAuthError::Status(status) => status,
+        crate::controller_auth::ConnectAuthError::Transport(error) => {
+            tonic::Status::unavailable(error.to_string())
         }
     }
 }
@@ -5023,5 +5249,395 @@ mod tests {
         assert_eq!(load_fences(dir.path()), fences);
         std::fs::write(dir.path().join(FENCES_FILE), b"{").unwrap();
         assert_eq!(load_fences(dir.path()), Fences::default());
+    }
+
+    fn checkpoint_record(completed: u64, is_final: bool) -> CheckpointRecord {
+        CheckpointRecord {
+            completed,
+            is_final,
+            ..CheckpointRecord::default()
+        }
+    }
+
+    fn at_dt(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .timestamp_opt(1_800_000_000 + secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn full_checkpoint_record() -> CheckpointRecord {
+        let mut record = CheckpointRecord {
+            completed: 3,
+            failed: 1,
+            last_completed_step: Some(10),
+            last_completed_at: Some(at_dt(5)),
+            in_progress_step: Some(11),
+            in_progress_since: Some(at_dt(6)),
+            restore_step: Some(2),
+            uid_verified: 4,
+            is_final: true,
+            ..CheckpointRecord::default()
+        };
+        record.dropped.record(DropReason::Busy);
+        record.dropped.record(DropReason::Busy);
+        record
+    }
+
+    #[test]
+    fn to_proto_maps_every_field() {
+        let record = full_checkpoint_record();
+        let proto = to_proto((7, 2, 3), &record);
+        assert_eq!(proto.job_id, 7);
+        assert_eq!(proto.run_attempt, 2);
+        assert_eq!(proto.step_id, 3);
+        assert!(proto.is_final);
+        assert_eq!(proto.completed, 3);
+        assert_eq!(proto.failed, 1);
+        assert_eq!(proto.last_completed_step, Some(10));
+        assert_eq!(proto.last_completed_at, Some(datetime_to_proto(at_dt(5))));
+        assert_eq!(proto.in_progress_step, Some(11));
+        assert_eq!(proto.in_progress_since, Some(datetime_to_proto(at_dt(6))));
+        assert_eq!(proto.restore_step, Some(2));
+        assert_eq!(proto.uid_verified, 4);
+        assert_eq!(proto.dropped.len(), 1);
+        assert_eq!(proto.dropped.get("busy"), Some(&2));
+    }
+
+    #[test]
+    fn to_proto_on_an_empty_record_has_no_options_and_an_empty_map() {
+        let proto = to_proto((1, 1, 0), &CheckpointRecord::default());
+        assert_eq!(proto.job_id, 1);
+        assert_eq!(proto.run_attempt, 1);
+        assert_eq!(proto.step_id, 0);
+        assert!(!proto.is_final);
+        assert_eq!(proto.completed, 0);
+        assert_eq!(proto.failed, 0);
+        assert_eq!(proto.last_completed_step, None);
+        assert_eq!(proto.last_completed_at, None);
+        assert_eq!(proto.in_progress_step, None);
+        assert_eq!(proto.in_progress_since, None);
+        assert_eq!(proto.restore_step, None);
+        assert_eq!(proto.uid_verified, 0);
+        assert!(proto.dropped.is_empty());
+    }
+
+    /// Tracks a record for `collect_now` by writing a real `checkpoint.json`
+    /// under `root`, one session directory per record — exercising the real
+    /// listener file format rather than poking the collector's internals.
+    fn collector_with_records(
+        root: &Path,
+        records: &[(StepKey, CheckpointRecord)],
+    ) -> Arc<CheckpointCollector> {
+        let collector = Arc::new(CheckpointCollector::new());
+        for (i, (key, record)) in records.iter().enumerate() {
+            let session_dir = root.join(format!("session-{i}"));
+            std::fs::create_dir(&session_dir).expect("create session dir");
+            std::fs::write(
+                session_dir.join(crate::checkpoint_listener::RECORD_FILE),
+                serde_json::to_vec(record).expect("encode"),
+            )
+            .expect("write record");
+            collector.collect_now(*key, &session_dir);
+        }
+        collector
+    }
+
+    fn test_reporter_with_checkpoint(
+        addr: std::net::SocketAddr,
+        collector: Arc<CheckpointCollector>,
+    ) -> NodeReporter {
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{addr}"));
+        reporter.set_checkpoint_collector(collector);
+        reporter
+    }
+
+    #[derive(Clone, Copy)]
+    enum CheckpointBehavior {
+        Accept { rejected: u32 },
+        Unimplemented,
+        Error(tonic::Code),
+    }
+
+    #[derive(Default)]
+    struct CheckpointControllerState {
+        heartbeat_calls: AtomicU64,
+        requests: std::sync::Mutex<Vec<ReportCheckpointTelemetryRequest>>,
+        behavior: std::sync::Mutex<Option<CheckpointBehavior>>,
+    }
+
+    struct CheckpointController(Arc<CheckpointControllerState>);
+
+    macro_rules! checkpoint_controller_impl {
+        ($($method:ident($req:ty) -> $resp:ty;)*) => {
+            #[tonic::async_trait]
+            impl spur_proto::proto::slurm_controller_server::SlurmController for CheckpointController {
+                async fn heartbeat(
+                    &self,
+                    _request: tonic::Request<spur_proto::proto::HeartbeatRequest>,
+                ) -> Result<tonic::Response<spur_proto::proto::HeartbeatResponse>, tonic::Status> {
+                    self.0.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(tonic::Response::new(
+                        spur_proto::proto::HeartbeatResponse::default(),
+                    ))
+                }
+
+                async fn report_checkpoint_telemetry(
+                    &self,
+                    request: tonic::Request<ReportCheckpointTelemetryRequest>,
+                ) -> Result<
+                    tonic::Response<spur_proto::proto::ReportCheckpointTelemetryResponse>,
+                    tonic::Status,
+                > {
+                    let request = request.into_inner();
+                    let behavior = self
+                        .0
+                        .behavior
+                        .lock()
+                        .expect("behavior")
+                        .expect("behavior set by fixture");
+                    match behavior {
+                        CheckpointBehavior::Unimplemented => {
+                            Err(tonic::Status::unimplemented("ReportCheckpointTelemetry"))
+                        }
+                        CheckpointBehavior::Error(code) => {
+                            Err(tonic::Status::new(code, "ReportCheckpointTelemetry"))
+                        }
+                        CheckpointBehavior::Accept { rejected } => {
+                            let total = request.records.len() as u32;
+                            let rejected = rejected.min(total);
+                            self.0.requests.lock().expect("requests").push(request);
+                            Ok(tonic::Response::new(
+                                spur_proto::proto::ReportCheckpointTelemetryResponse {
+                                    accepted: total - rejected,
+                                    rejected,
+                                },
+                            ))
+                        }
+                    }
+                }
+
+                $(
+                    async fn $method(
+                        &self,
+                        _request: tonic::Request<$req>,
+                    ) -> Result<tonic::Response<$resp>, tonic::Status> {
+                        Err(tonic::Status::unimplemented(stringify!($method)))
+                    }
+                )*
+            }
+        };
+    }
+
+    checkpoint_controller_impl! {
+        report_job_status(spur_proto::proto::ReportJobStatusRequest) -> ();
+        drain_node(spur_proto::proto::DrainNodeRequest) -> spur_proto::proto::DrainNodeResponse;
+        submit_job(spur_proto::proto::SubmitJobRequest) -> spur_proto::proto::SubmitJobResponse;
+        get_jobs(spur_proto::proto::GetJobsRequest) -> spur_proto::proto::GetJobsResponse;
+        get_job(spur_proto::proto::GetJobRequest) -> spur_proto::proto::JobInfo;
+        cancel_job(spur_proto::proto::CancelJobRequest) -> ();
+        complete_job(spur_proto::proto::CompleteJobRequest) -> ();
+        job_keepalive(spur_proto::proto::JobKeepaliveRequest) -> spur_proto::proto::JobKeepaliveResponse;
+        suspend_job(spur_proto::proto::SuspendJobRequest) -> ();
+        resume_job(spur_proto::proto::ResumeJobRequest) -> ();
+        update_job(spur_proto::proto::UpdateJobRequest) -> ();
+        requeue_job(spur_proto::proto::RequeueJobRequest) -> spur_proto::proto::RequeueJobResponse;
+        get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
+        get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;
+        update_node(spur_proto::proto::UpdateNodeRequest) -> ();
+        deregister_node(spur_proto::proto::DeregisterNodeRequest) -> spur_proto::proto::DeregisterNodeResponse;
+        deregister_agent(spur_proto::proto::DeregisterAgentRequest) -> ();
+        get_partitions(spur_proto::proto::GetPartitionsRequest) -> spur_proto::proto::GetPartitionsResponse;
+        get_job_steps(spur_proto::proto::GetJobStepsRequest) -> spur_proto::proto::GetJobStepsResponse;
+        create_job_step(spur_proto::proto::CreateJobStepRequest) -> spur_proto::proto::CreateJobStepResponse;
+        complete_job_step(spur_proto::proto::CompleteJobStepRequest) -> ();
+        ping(()) -> spur_proto::proto::PingResponse;
+        get_job_metrics(()) -> spur_proto::proto::JobMetrics;
+        get_node_metrics(()) -> spur_proto::proto::NodeMetrics;
+        get_rpc_stats(()) -> spur_proto::proto::RpcStats;
+        reset_diag_stats(()) -> ();
+        get_sched_stats(()) -> spur_proto::proto::SchedStats;
+        get_assoc_mgr_info(spur_proto::proto::GetAssocMgrInfoRequest) -> spur_proto::proto::GetAssocMgrInfoResponse;
+        register_agent(spur_proto::proto::RegisterAgentRequest) -> spur_proto::proto::RegisterAgentResponse;
+        report_stepd_recovery(spur_proto::proto::StepdRecoveryRequest) -> spur_proto::proto::StepdRecoveryResponse;
+        create_token(spur_proto::proto::CreateTokenRequest) -> spur_proto::proto::CreateTokenResponse;
+        list_tokens(spur_proto::proto::ListTokensRequest) -> spur_proto::proto::ListTokensResponse;
+        revoke_token(spur_proto::proto::RevokeTokenRequest) -> spur_proto::proto::RevokeTokenResponse;
+        create_partition(spur_proto::proto::CreatePartitionRequest) -> ();
+        update_partition(spur_proto::proto::UpdatePartitionRequest) -> ();
+        delete_partition(spur_proto::proto::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
+        create_reservation(spur_proto::proto::CreateReservationRequest) -> ();
+        update_reservation(spur_proto::proto::UpdateReservationRequest) -> ();
+        delete_reservation(spur_proto::proto::DeleteReservationRequest) -> ();
+        list_reservations(spur_proto::proto::ListReservationsRequest) -> spur_proto::proto::ListReservationsResponse;
+        exec_in_job(spur_proto::proto::ExecInJobRequest) -> spur_proto::proto::ExecInJobResponse;
+        run_step(spur_proto::proto::RunStepRequest) -> spur_proto::proto::RunStepResponse;
+        cluster_up(spur_proto::proto::ClusterUpRequest) -> spur_proto::proto::ClusterUpResponse;
+        cluster_down(spur_proto::proto::ClusterDownRequest) -> spur_proto::proto::ClusterDownResponse;
+        cluster_status(spur_proto::proto::ClusterStatusRequest) -> spur_proto::proto::ClusterStatusResponse;
+        cluster_kubeconfig(spur_proto::proto::ClusterKubeconfigRequest) -> spur_proto::proto::ClusterKubeconfigResponse;
+        cluster_add_nodes(spur_proto::proto::ClusterAddNodesRequest) -> spur_proto::proto::ClusterAddNodesResponse;
+        cluster_remove_nodes(spur_proto::proto::ClusterRemoveNodesRequest) -> spur_proto::proto::ClusterRemoveNodesResponse;
+        get_fabric_topology(()) -> spur_proto::proto::GetFabricTopologyResponse;
+        validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
+    }
+
+    struct CheckpointControllerFixture {
+        addr: std::net::SocketAddr,
+        state: Arc<CheckpointControllerState>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl CheckpointControllerFixture {
+        async fn new(behavior: CheckpointBehavior) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port");
+            let addr = listener.local_addr().expect("local addr");
+            let state = Arc::new(CheckpointControllerState::default());
+            *state.behavior.lock().expect("behavior") = Some(behavior);
+            let service = CheckpointController(Arc::clone(&state));
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let server = tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(spur_proto::controller_server(service))
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            Self {
+                addr,
+                state,
+                server,
+            }
+        }
+
+        fn requests(&self) -> Vec<ReportCheckpointTelemetryRequest> {
+            self.state.requests.lock().expect("requests").clone()
+        }
+
+        fn heartbeat_calls(&self) -> u64 {
+            self.state.heartbeat_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CheckpointControllerFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_report_acknowledges_accepted_records_and_does_not_resend() {
+        let fixture =
+            CheckpointControllerFixture::new(CheckpointBehavior::Accept { rejected: 0 }).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector =
+            collector_with_records(dir.path(), &[((1, 1, 0), checkpoint_record(1, false))]);
+        let reporter = test_reporter_with_checkpoint(fixture.addr, Arc::clone(&collector));
+
+        let outcome = reporter.report_checkpoints_once().await;
+
+        assert_eq!(outcome, CheckpointReportOutcome::Sent);
+        assert!(
+            collector.dirty(10).is_empty(),
+            "an accepted record must not stay dirty"
+        );
+        assert_eq!(fixture.requests().len(), 1);
+        assert_eq!(
+            fixture.heartbeat_calls(),
+            0,
+            "the heartbeat handler must never be needed to report checkpoints"
+        );
+
+        let outcome = reporter.report_checkpoints_once().await;
+        assert_eq!(outcome, CheckpointReportOutcome::Empty);
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "an already-acknowledged record is not resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_report_keeps_records_dirty_when_the_controller_is_unimplemented() {
+        let fixture = CheckpointControllerFixture::new(CheckpointBehavior::Unimplemented).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector =
+            collector_with_records(dir.path(), &[((2, 1, 0), checkpoint_record(1, false))]);
+        let reporter = test_reporter_with_checkpoint(fixture.addr, Arc::clone(&collector));
+
+        let outcome = reporter.report_checkpoints_once().await;
+
+        assert_eq!(outcome, CheckpointReportOutcome::Unimplemented);
+        assert_eq!(
+            collector.dirty(10).len(),
+            1,
+            "a record must stay dirty when the controller doesn't support the RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_report_drops_records_the_controller_rejects_as_invalid() {
+        let fixture = CheckpointControllerFixture::new(CheckpointBehavior::Error(
+            tonic::Code::InvalidArgument,
+        ))
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector =
+            collector_with_records(dir.path(), &[((12, 1, 0), checkpoint_record(1, false))]);
+        let reporter = test_reporter_with_checkpoint(fixture.addr, Arc::clone(&collector));
+
+        let outcome = reporter.report_checkpoints_once().await;
+
+        assert_eq!(outcome, CheckpointReportOutcome::Rejected);
+        assert!(
+            collector.dirty(10).is_empty(),
+            "a permanently-rejected batch must not be resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_report_keeps_records_dirty_on_a_retryable_failure() {
+        let fixture =
+            CheckpointControllerFixture::new(CheckpointBehavior::Error(tonic::Code::Unavailable))
+                .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let collector =
+            collector_with_records(dir.path(), &[((13, 1, 0), checkpoint_record(1, false))]);
+        let reporter = test_reporter_with_checkpoint(fixture.addr, Arc::clone(&collector));
+
+        let outcome = reporter.report_checkpoints_once().await;
+
+        assert_eq!(outcome, CheckpointReportOutcome::Failed);
+        assert_eq!(
+            collector.dirty(10).len(),
+            1,
+            "a transient/transport failure must leave the record dirty for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_report_caps_one_request_at_max_records_per_request() {
+        let fixture =
+            CheckpointControllerFixture::new(CheckpointBehavior::Accept { rejected: 0 }).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records: Vec<_> = (0..1030u32)
+            .map(|i| ((i, 1, 0), checkpoint_record(1, false)))
+            .collect();
+        let collector = collector_with_records(dir.path(), &records);
+        let reporter = test_reporter_with_checkpoint(fixture.addr, Arc::clone(&collector));
+
+        reporter.report_checkpoints_once().await;
+
+        let sent = fixture.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].records.len(), MAX_RECORDS_PER_REQUEST);
+        assert_eq!(
+            collector.dirty(2000).len(),
+            1030 - MAX_RECORDS_PER_REQUEST,
+            "records past the cap stay dirty for the next attempt"
+        );
     }
 }

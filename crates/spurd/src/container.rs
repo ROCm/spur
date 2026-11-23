@@ -161,6 +161,12 @@ pub struct ContainerConfig {
     pub withheld_socket: Option<PathBuf>,
     /// Registry-based device injection plan (replaces mount_hw_devices when present).
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    /// Set by the agent once its checkpoint-socket bind succeeds. Kept out of
+    /// `mounts` deliberately: that list's errors abort the whole launch via
+    /// `mount_user_binds`'s `?`, but this mount is best-effort -- a failure
+    /// only disables checkpoint telemetry for this container.
+    #[serde(default)]
+    pub checkpoint_socket: Option<PathBuf>,
 }
 
 /// Bind-mount the host mint socket so nested `srun` can mint, for a container
@@ -853,6 +859,26 @@ pub fn mount_user_binds(
     Ok(())
 }
 
+/// Bind-mounts the checkpoint socket at the same absolute path inside the
+/// container, best-effort: unlike `mount_user_binds`, a failure here must
+/// never abort the launch, only disable checkpoint telemetry for it. Returns
+/// whether the mount succeeded, so the caller can gate `SPUR_CHECKPOINT_SOCK`
+/// on it.
+fn mount_checkpoint_socket(rootfs: &Path, socket: &Path) -> bool {
+    let target = socket.display().to_string();
+    match bind_mount(rootfs, socket, &target, false) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                %error,
+                socket = %target,
+                "failed to bind mount the checkpoint socket; telemetry disabled for this container"
+            );
+            false
+        }
+    }
+}
+
 /// Bind-mount user home directory into the rootfs.
 pub fn mount_home(rootfs: &Path, home_dir: &str, withheld: Option<&Path>) -> anyhow::Result<()> {
     let source = Path::new(home_dir);
@@ -1407,6 +1433,11 @@ pub fn container_init(
         mount_home(rootfs, &config.home_dir, config.withheld_socket.as_deref())?;
     }
 
+    let checkpoint_socket = config
+        .checkpoint_socket
+        .as_deref()
+        .filter(|socket| mount_checkpoint_socket(rootfs, socket));
+
     let hook_env = run_hooks(rootfs)?;
 
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
@@ -1421,6 +1452,12 @@ pub fn container_init(
         spur_core::native_mint::IN_CONTAINER_ENV.to_string(),
         "1".to_string(),
     );
+    if let Some(socket) = checkpoint_socket {
+        hook_env.insert(
+            spur_core::checkpoint::CHECKPOINT_SOCK_ENV.to_string(),
+            socket.display().to_string(),
+        );
+    }
     Ok(hook_env)
 }
 
@@ -1554,6 +1591,7 @@ mod tests {
             username: "alice".into(),
             home_dir: "/home/alice".into(),
             withheld_socket: None,
+            checkpoint_socket: None,
             device_plan: None,
         }
     }
@@ -1816,6 +1854,33 @@ mod tests {
             .unwrap_err();
             assert!(format!("{err:#}").contains("credential socket"), "{err:#}");
         });
+    }
+
+    // --- Checkpoint socket mount ---
+
+    #[test]
+    fn checkpoint_socket_mount_failure_is_absorbed_and_reports_unavailable() {
+        // A real source file, so opening it with O_PATH succeeds as it would
+        // for the real checkpoint listener's socket.
+        let source_dir = tempfile::tempdir().unwrap();
+        let socket = source_dir.path().join("7.1.0.sock");
+        std::fs::write(&socket, b"").unwrap();
+
+        // Recreate the socket's absolute parent as a regular file inside the
+        // rootfs, so the container-side mount target cannot be created --
+        // standing in for an image whose rootfs has a regular file where the
+        // socket's parent directory would be.
+        let rootfs = tempfile::tempdir().unwrap();
+        let blocked_parent = rootfs
+            .path()
+            .join(socket.parent().unwrap().strip_prefix("/").unwrap());
+        std::fs::create_dir_all(blocked_parent.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        assert!(
+            !mount_checkpoint_socket(rootfs.path(), &socket),
+            "a blocked mount target must be absorbed, not propagated"
+        );
     }
 
     // --- Mount parsing ---
@@ -2372,6 +2437,7 @@ mod tests {
             username: username.into(),
             home_dir: home_dir.into(),
             withheld_socket: None,
+            checkpoint_socket: None,
             device_plan: None,
         }
     }
@@ -2475,6 +2541,7 @@ mod tests {
             username: "alice".into(),
             home_dir: "/home/alice".into(),
             withheld_socket: None,
+            checkpoint_socket: None,
             device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();
@@ -2517,6 +2584,7 @@ mod tests {
             username: "alice".into(),
             home_dir: "/home/alice".into(),
             withheld_socket: None,
+            checkpoint_socket: None,
             device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();

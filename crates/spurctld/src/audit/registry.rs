@@ -158,6 +158,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         | "Heartbeat"
         | "ReportStepdRecovery"
         | "ReportJobStatus"
+        | "ReportCheckpointTelemetry"
         | "RecordJobStart"
         | "RecordJobEnd" => RpcClass::Internal,
         // User-initiated, but srun/salloc drive these per step or per poll
@@ -451,6 +452,10 @@ mod tests {
         assert_eq!(classify("GetNodes"), Some(RpcClass::ReadOnly));
         assert_eq!(classify("ResetDiagStats"), Some(RpcClass::ReadOnly));
         assert_eq!(classify("Heartbeat"), Some(RpcClass::Internal));
+        assert_eq!(
+            classify("ReportCheckpointTelemetry"),
+            Some(RpcClass::Internal)
+        );
         assert_eq!(classify("JobKeepalive"), Some(RpcClass::Internal));
     }
 }

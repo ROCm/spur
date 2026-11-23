@@ -76,6 +76,10 @@ pub struct JobFinalized {
     pub exit_code: i32,
     #[serde(default)]
     pub actual_secs: u64,
+    /// The run this finalization ended, for the checkpoint store to match
+    /// against the records it has collected for that attempt.
+    #[serde(default)]
+    pub run_attempt: u32,
     /// Computed in apply, so a later entry cannot change it before the
     /// accounting write reads it.
     #[serde(skip)]
@@ -84,6 +88,17 @@ pub struct JobFinalized {
     pub reason_detail: Option<String>,
     #[serde(skip)]
     pub ended_by: Option<CancelProvenance>,
+    /// When this run ended inside a preempt grace, the grace's start,
+    /// captured by the caller before the requeue/cancel path clears
+    /// `job.preempt_pending`. Leader-local; not reconstructable from the WAL.
+    #[serde(skip)]
+    pub grace_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The run's node allocation at the moment it ended, for the checkpoint
+    /// store's `RunInfo`. Leader-local (apply-response only): a requeue/cancel
+    /// path that clears `job.allocated_nodes` before building this struct must
+    /// capture the list first, the same way `grace_started_at` is captured.
+    #[serde(skip)]
+    pub nodes: Vec<String>,
 }
 
 impl JobFinalized {
@@ -98,9 +113,12 @@ impl JobFinalized {
             state,
             exit_code,
             actual_secs,
+            run_attempt: job.run_attempt,
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
+            grace_started_at: None,
+            nodes: job.allocated_nodes.clone(),
         }
     }
 
@@ -118,9 +136,12 @@ impl JobFinalized {
             state,
             exit_code,
             actual_secs: elapsed_secs,
+            run_attempt: job.run_attempt,
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
+            grace_started_at: None,
+            nodes: job.allocated_nodes.clone(),
         }
     }
 }
@@ -2670,5 +2691,13 @@ mod tests {
             matches!(err, openraft::error::RPCError::Unreachable(_)),
             "expected Unreachable, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn job_finalized_deserializes_without_run_attempt() {
+        let json = r#"{"job_id":7,"state":"COMPLETED","exit_code":0,"actual_secs":12}"#;
+        let finalized: JobFinalized = serde_json::from_str(json).expect("pre-upgrade payload");
+        assert_eq!(finalized.run_attempt, 0);
+        assert_eq!(finalized.grace_started_at, None);
     }
 }

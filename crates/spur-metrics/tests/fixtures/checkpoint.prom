@@ -1,0 +1,50 @@
+# HELP spur_job_runs_ended Finalized job runs, labeled by terminal reason and checkpoint state.
+# TYPE spur_job_runs_ended counter
+spur_job_runs_ended_total{reason="completed",checkpoint="completed"} 1
+# HELP spur_job_runs_restored Finalized job runs that reported a restore, labeled by terminal reason.
+# TYPE spur_job_runs_restored counter
+spur_job_runs_restored_total{reason="completed"} 1
+# HELP spur_job_run_end_seconds_since_last_checkpoint Seconds between a finalized run's last completed checkpoint and run end.
+# TYPE spur_job_run_end_seconds_since_last_checkpoint histogram
+spur_job_run_end_seconds_since_last_checkpoint_sum{reason="completed"} 120.0
+spur_job_run_end_seconds_since_last_checkpoint_count{reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="60.0",reason="completed"} 0
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="120.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="240.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="480.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="960.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="1920.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="3840.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="7680.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="15360.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="30720.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="61440.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="122880.0",reason="completed"} 1
+spur_job_run_end_seconds_since_last_checkpoint_bucket{le="+Inf",reason="completed"} 1
+# HELP spur_job_run_checkpoints_completed Checkpoints completed over a finalized run's lifetime.
+# TYPE spur_job_run_checkpoints_completed histogram
+spur_job_run_checkpoints_completed_sum{reason="completed"} 5.0
+spur_job_run_checkpoints_completed_count{reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="1.0",reason="completed"} 0
+spur_job_run_checkpoints_completed_bucket{le="2.0",reason="completed"} 0
+spur_job_run_checkpoints_completed_bucket{le="4.0",reason="completed"} 0
+spur_job_run_checkpoints_completed_bucket{le="8.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="16.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="32.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="64.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="128.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="256.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="512.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="1024.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="2048.0",reason="completed"} 1
+spur_job_run_checkpoints_completed_bucket{le="+Inf",reason="completed"} 1
+# HELP spur_preempt_grace_checkpoint Preempt-grace checkpoint windows, labeled by outcome.
+# TYPE spur_preempt_grace_checkpoint counter
+spur_preempt_grace_checkpoint_total{outcome="completed"} 1
+# HELP spur_checkpoint_events_dropped Checkpoint telemetry events dropped, labeled by reason.
+# TYPE spur_checkpoint_events_dropped counter
+spur_checkpoint_events_dropped_total{reason="busy"} 3
+# HELP spur_job_run_checkpoints_failed Checkpoint events rejected as invalid, by cause.
+# TYPE spur_job_run_checkpoints_failed counter
+spur_job_run_checkpoints_failed_total{reason="malformed_json"} 2
+# EOF

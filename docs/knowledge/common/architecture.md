@@ -177,7 +177,8 @@ SuspendJob, ResumeJob, UpdateJob, RequeueJob, RunStep, ExecInJob,
 JobKeepalive, GetJobSteps, CreateJobStep, CompleteJobStep, ReportJobStatus.
 
 **Node management:** RegisterAgent, Heartbeat, ReportStepdRecovery,
-GetNodes, GetNode, UpdateNode, DrainNode, DeregisterNode, DeregisterAgent.
+ReportCheckpointTelemetry, GetNodes, GetNode, UpdateNode, DrainNode,
+DeregisterNode, DeregisterAgent.
 
 **Partition/Reservation:** GetPartitions, CreatePartition, UpdatePartition,
 DeletePartition, CreateReservation, UpdateReservation, DeleteReservation,

@@ -30,6 +30,7 @@ Content-Type for all responses: `application/openmetrics-text; version=1.0.0; ch
 | `user_acct` | `UserAcctMetricsSnapshot` -- per-user and per-account job breakdowns (high-cardinality, opt-in) |
 | `karma` | `KarmaMetricsSnapshot` -- per-user karma counters (jobs, GPUs, walltime); reset on leadership gain |
 | `k8s` | `K8sClusterMetricsSnapshot` (gauges) + `K8sMetrics` (lifecycle counters/histograms) |
+| `checkpoint` | `CheckpointMetrics` (long-lived run-end/restored-run/preempt-grace/dropped-event counters+histograms) + `CheckpointJobSnapshot` (per-job gauges) + `CheckpointJobFailed` (per-job, per-reason invalid-event counter) |
 | `export/` | OpenMetrics registration and encoding for each domain |
 
 ## Metric naming conventions
@@ -100,6 +101,50 @@ Counters: `spur_audit_rows_written`, `spur_audit_rows_dropped`.
 ### Per-user/account (`/metrics/jobs-users-accts`)
 
 Opt-in via `metrics.high_cardinality`. Per-user (label `username`): `spur_user_jobs`, `spur_user_jobs_{state}`, `spur_user_jobs_cpus_alloc`, `spur_user_jobs_memory_alloc_bytes`, `spur_user_jobs_gpus_alloc`. Per-account (label `account`): same pattern with `spur_account_` prefix.
+
+### Checkpoint telemetry (appended to `/metrics/jobs`, per-job gauges on `/metrics/jobs-users-accts`)
+
+Long-lived `CheckpointMetrics` accumulator (same pattern as `K8sMetrics`, but registered fresh
+per encode from cloned `Family` handles via `export::encode_registered` rather than a persistent
+`Registry`): `spur_job_runs_ended{reason,checkpoint}` counter, checkpoint ∈ `none|completed|in_progress`;
+`spur_job_runs_restored{reason}` counter, incremented once per finalized run that reported a
+restore (any record with `restore_step` set), regardless of whether it had any other event;
+`spur_job_run_end_seconds_since_last_checkpoint{reason}` and `spur_job_run_checkpoints_completed{reason}`
+histograms; `spur_preempt_grace_checkpoint{outcome}` counter, outcome ∈ `completed|failed|none`;
+`spur_checkpoint_events_dropped{reason}` counter for delivery/attribution drops
+(`not_job_process`, `uid_mismatch`, `read_timeout`, `rate_limited`, `busy`); `spur_job_run_checkpoints_failed{reason}`
+counter for events rejected as invalid (`unknown_kind`, `unsupported_version`, `invalid_status`,
+`unknown_field`, `invalid_field`, `malformed_json`, `oversize`, `job_mismatch`) --
+`spur_core::checkpoint::DropReason::is_invalid` is the classifier spurctld uses to route a wire
+reason name to one family or the other. No series is pre-seeded -- only observed
+`(reason, checkpoint)` pairs, outcomes, and reasons appear. `CheckpointMetrics::add_dropped` /
+`add_invalid` are no-ops for `n == 0` so a reason with zero events never creates a series. A run
+that never reported a single checkpoint event is not recorded in `spur_job_runs_ended` (or either
+histogram, or `spur_preempt_grace_checkpoint`) at all -- a failed-only run still counts, labeled
+`checkpoint="none"` like today.
+
+Every per-job checkpoint series uses the same identity label set --
+`job_id, user, account, job_name` -- nothing is a label unless it identifies the job or the
+application: `namespace` is redundant with `account` (it's derived from it), and `partition`/`qos`
+describe where a job ran, not what it is. `job_name` is sanitized before use as a label -- control
+characters become `_`, then the value is truncated to 64 chars on a char boundary
+(`export::checkpoint::sanitize_job_name`); the OpenMetrics encoder separately escapes any quote or
+backslash that survives sanitization.
+
+Per-job gauges (label `job_id, user, account, job_name`), built fresh per scrape from a
+`&[CheckpointJobSnapshot]` of jobs with a live (not yet finalized) run:
+`spur_job_checkpoints_completed`, `spur_job_checkpoint_in_progress` (0/1),
+`spur_job_checkpoint_events_dropped` (always present), plus `spur_job_checkpoint_last_step`
+and `spur_job_checkpoint_seconds_since_last` (sample omitted when the snapshot field is `None`).
+
+Per-job, per-reason invalid-event counter `spur_job_checkpoints_failed{job_id,user,account,
+job_name,reason}`, built fresh per scrape from a `&[CheckpointJobFailed]`
+(`export::checkpoint::register_checkpoint_job_failed_metrics`; replaces the old live-only
+`spur_job_checkpoint_events_failed` gauge). Only `(job, reason)` pairs with a nonzero count ever
+appear. Values are cumulative per `job_id` across every run attempt (monotonic through a requeue,
+never reset by a new attempt) -- `spurctld`'s `CheckpointStore::job_failed_snapshots` is what
+decides, per job, whether to report that cumulative total from a live run or from a retained
+finalized run's bookkeeping entry -- see that crate's `AGENTS.md`.
 
 ### Kubernetes (`/metrics/k8s`)
 
