@@ -82,6 +82,59 @@ def pytest_collection_modifyitems(config, items):
     items[:] = order_k0s_last(items)
 
 
+_QUARANTINES = pytest.StashKey[dict]()
+
+
+def apply_quarantine(item) -> str | None:
+    """Turn a ``quarantine(reason=...)`` marker into a non-strict, still-running xfail.
+
+    A quarantined test stays visible: it runs every time, never fails the job,
+    and surfaces as XPASS the moment the blocking bug is fixed. Returns the
+    reason, or None when the item is not quarantined.
+    """
+    marker = item.get_closest_marker("quarantine")
+    if marker is None:
+        return None
+    reason = marker.kwargs.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise pytest.UsageError(
+            f"{item.nodeid}: the quarantine marker requires a non-empty reason=... "
+            "naming the product bug that blocks the test"
+        )
+    reason = reason.strip()
+    item.add_marker(pytest.mark.xfail(strict=False, run=True, reason=f"quarantined: {reason}"))
+    return reason
+
+
+# itemcollected fires per item during collection, before any modifyitems hook, so
+# the conversion covers every shard's items and leaves the sharding and k0s-last
+# ordering hook above untouched.
+def pytest_itemcollected(item):
+    reason = apply_quarantine(item)
+    if reason is not None:
+        item.config.stash.setdefault(_QUARANTINES, {})[item.nodeid] = reason
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    quarantined = config.stash.get(_QUARANTINES, {})
+    rows = [
+        (outcome, report.nodeid, quarantined[report.nodeid])
+        for outcome, key in (("XFAIL", "xfailed"), ("XPASS", "xpassed"))
+        for report in terminalreporter.stats.get(key, [])
+        if report.nodeid in quarantined
+    ]
+    if not rows:
+        return
+    terminalreporter.section("Quarantined")
+    for outcome, nodeid, reason in sorted(rows, key=lambda row: (row[0] != "XPASS", row[1])):
+        terminalreporter.write_line(f"{outcome} {nodeid}")
+        terminalreporter.write_line(f"    {reason}")
+        if outcome == "XPASS":
+            terminalreporter.write_line(
+                "    XPASS: consider removing the quarantine", yellow=True
+            )
+
+
 def _running_full_suite(config) -> bool:
     for arg in config.args:
         path = Path(str(arg)).resolve()

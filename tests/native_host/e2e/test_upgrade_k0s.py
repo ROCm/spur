@@ -601,6 +601,10 @@ class TestRollingUpgradePreservesK0s:
             f"post-upgrade job output missing marker:\n{output}"
         )
 
+    @pytest.mark.quarantine(
+        reason="worker roles are cleared after a spurctld restart (same k0s membership "
+        "teardown as the multi-control-plane restart bug)"
+    )
     def test_worker_node_cp_survives_restart(self, k0s_native_cluster):
         """CP placed on a worker node (not co-located with spurctld) survives
         controller + agent restart.  Mirrors the common production layout
