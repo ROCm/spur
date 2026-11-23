@@ -762,6 +762,7 @@ async fn main() -> anyhow::Result<()> {
     agent_service
         .replay_adopted_allocations(&recovered_stepds, &startup.renamed)
         .await;
+    agent_service.recover_launch_holds().await;
     // Replay has refilled the ledger, so blocked reserved CPUs can be counted;
     // report them now rather than a period late.
     reporter.request_heartbeat();

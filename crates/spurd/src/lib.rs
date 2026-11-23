@@ -20,6 +20,7 @@ pub mod executor;
 pub mod job_entry;
 pub(crate) mod job_lifecycle;
 pub mod landlock;
+pub(crate) mod launch_record;
 pub mod mpi_plugin;
 pub mod privdrop;
 pub mod pty;
