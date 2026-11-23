@@ -143,6 +143,25 @@ def test_collect_wraps_the_script_in_a_remote_timeout_just_under_the_ssh_one():
     assert node.timeouts == [20]
 
 
+def test_collect_derives_the_remote_timeout_from_the_capped_ssh_timeout():
+    clock = FakeClock()
+    node = FakeDiagNode("node-a", clock=clock)
+
+    collect_node_diagnostics([node], [], None, budget=DiagnosticsBudget(8, clock))
+
+    assert node.timeouts == [8]
+    assert node.commands[0].startswith("timeout 6 sh -c ")
+
+
+def test_collect_never_lets_the_remote_timeout_reach_zero():
+    clock = FakeClock()
+    node = FakeDiagNode("node-a", clock=clock)
+
+    collect_node_diagnostics([node], [], None, budget=DiagnosticsBudget(1.5, clock))
+
+    assert node.commands[0].startswith("timeout 1 sh -c ")
+
+
 def test_collect_script_never_uses_a_sudo_that_can_prompt():
     node = FakeDiagNode("node-a")
 
@@ -252,6 +271,24 @@ def test_collect_notes_a_timeout_and_keeps_the_partial_output():
     text = result["alpha (node-a)"]
     assert "default via 10.0.0.1" in text
     assert "node-a: timed out after 20s" in text
+
+
+def test_collect_notes_a_remote_timeout_and_keeps_the_truncated_output():
+    node = FakeDiagNode("node-a", output="=== dmesg ===\nfirst lines\n", exit_code=124)
+
+    result = collect_node_diagnostics([node], ["alpha"], "/r/log")
+
+    text = result["alpha (node-a)"]
+    assert "first lines" in text
+    assert "node-a: timed out after 20s" in text
+
+
+def test_collect_does_not_report_an_ordinary_exit_as_a_timeout():
+    node = FakeDiagNode("node-a", exit_code=1)
+
+    result = collect_node_diagnostics([node], ["alpha"], "/r/log")
+
+    assert "timed out" not in result["alpha (node-a)"]
 
 
 def test_collect_records_an_unexpected_error_instead_of_raising():
@@ -489,7 +526,7 @@ def test_wait_k8s_phase_timeout_appends_the_controller_log_after_the_original_me
     assert "INFO heartbeat ok" not in message
 
 
-def test_k0s_log_context_does_not_swallow_programming_errors(monkeypatch):
+def test_k0s_log_context_does_not_swallow_programming_errors():
     cluster = make_cluster([FakeDiagNode("node-a", error=ValueError("bug"))])
 
     with pytest.raises(ValueError, match="bug"):

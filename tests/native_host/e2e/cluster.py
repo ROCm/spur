@@ -38,9 +38,11 @@ AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 CLI_NODE_INDEX = 0
 HEALTH_CHECK_TIMEOUT_S = 20
 DIAGNOSTICS_TIMEOUT_S = 20
-# Just under the SSH-side timeout so a hung journalctl/dmesg is killed on the node
-# instead of lingering after the channel is abandoned.
-DIAGNOSTICS_REMOTE_TIMEOUT_S = 18
+# The node-side timeout ends this much before the SSH one, so a hung journalctl/dmesg
+# is killed on the node instead of lingering after the channel is abandoned.
+DIAGNOSTICS_REMOTE_MARGIN_S = 2
+# `timeout` exits with this when it had to kill the command.
+TIMEOUT_EXIT_CODE = 124
 # Wall clock for everything one failing test collects, across all nodes and clusters.
 DIAGNOSTICS_BUDGET_S = 90
 # Hosts already warned about disabled leak detection, so it logs once per session.
@@ -692,7 +694,9 @@ def _diagnostics_script(log_dir: str | None, max_lines: int, k0s: bool) -> str:
 
 
 class DiagnosticsBudget:
-    """Wall-clock allowance shared by every collection one failing test triggers."""
+    """Wall-clock allowance shared by every collection one failing test triggers.
+    Soft on purpose: it is checked between nodes, so the worst overrun is one node's
+    channel-open wait plus its command time."""
 
     def __init__(self, seconds: float = DIAGNOSTICS_BUDGET_S, clock=time.monotonic):
         self._clock = clock
@@ -705,8 +709,9 @@ class DiagnosticsBudget:
         return self.remaining() <= 0
 
 
-def _remote_diagnostics_command(script: str) -> str:
-    return f"timeout {DIAGNOSTICS_REMOTE_TIMEOUT_S} sh -c {shlex.quote(script)}"
+def _remote_diagnostics_command(script: str, ssh_timeout: float) -> str:
+    remote_timeout = max(1, int(ssh_timeout) - DIAGNOSTICS_REMOTE_MARGIN_S)
+    return f"timeout {remote_timeout} sh -c {shlex.quote(script)}"
 
 
 def _node_diagnostics(node: "SshNode", script: str, budget: DiagnosticsBudget) -> str:
@@ -718,12 +723,12 @@ def _node_diagnostics(node: "SshNode", script: str, budget: DiagnosticsBudget) -
         return f"{node.host}: unreachable (session down)"
     timeout = min(DIAGNOSTICS_TIMEOUT_S, budget.remaining())
     try:
-        code, out = node.exec_with_exit(_remote_diagnostics_command(script), timeout=timeout)
+        code, out = node.exec_with_exit(_remote_diagnostics_command(script, timeout), timeout=timeout)
     except SshConnectionLost as err:
         return f"{node.host}: unreachable ({err})"
     except Exception as err:
         return f"{node.host}: diagnostics failed ({type(err).__name__}: {err})"
-    if code == -1:
+    if code in (-1, TIMEOUT_EXIT_CODE):
         return f"{out}\n{node.host}: timed out after {timeout:g}s"
     return out
 
