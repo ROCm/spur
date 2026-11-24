@@ -1426,6 +1426,7 @@ impl ClusterManager {
         let config = self.config();
         let partitions = self.partitions.read().clone();
 
+        apply_reservation_partition(&mut spec, &self.reservations.read());
         apply_default_partition(&mut spec, &partitions);
 
         // EnforcePartLimits mirrors Slurm: only a wall-time the user actually
@@ -13578,6 +13579,24 @@ pub(crate) fn evaluate_node_health(
         }
     }
     actions
+}
+
+// Slurm runs a job that names a reservation but no partition in the
+// reservation's partition.
+fn apply_reservation_partition(spec: &mut JobSpec, reservations: &[Reservation]) {
+    if spec.partition.as_deref().is_some_and(|p| !p.is_empty()) {
+        return;
+    }
+    let Some(name) = spec.reservation.as_deref() else {
+        return;
+    };
+    if let Some(partition) = reservations
+        .iter()
+        .find(|r| r.name == name)
+        .and_then(|r| r.partition.clone())
+    {
+        spec.partition = Some(partition);
+    }
 }
 
 fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
@@ -26416,6 +26435,68 @@ state = "UP"
         assert_eq!(
             cm.get_reservations()[0].partition.as_deref(),
             Some("default")
+        );
+    }
+
+    async fn cluster_with_gpu_partitioned_reservation(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.create_partition(Partition {
+            name: "gpu".into(),
+            nodes: "n1".into(),
+            state: spur_core::partition::PartitionState::Up,
+            ..Default::default()
+        })
+        .unwrap();
+        wait_for("gpu partition created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        let mut res = partitioned_reservation("gpu");
+        res.users = vec!["testuser".into()];
+        cm.create_reservation(res).unwrap();
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_naming_a_partitioned_reservation_runs_in_its_partition() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+
+        let mut implicit = basic_spec("implicit");
+        implicit.reservation = Some("r1".into());
+        implicit.partition = None;
+        let implicit_id = submit_and_wait(&cm, implicit);
+        assert_eq!(
+            cm.get_job(implicit_id).unwrap().spec.partition.as_deref(),
+            Some("gpu")
+        );
+
+        let mut explicit = basic_spec("explicit");
+        explicit.reservation = Some("r1".into());
+        explicit.partition = Some("default".into());
+        let explicit_id = submit_and_wait(&cm, explicit);
+        assert_eq!(
+            cm.get_job(explicit_id).unwrap().spec.partition.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_defaulting_to_a_deleted_reservation_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu partition deleted", || {
+            !cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        let mut spec = basic_spec("orphaned");
+        spec.reservation = Some("r1".into());
+        spec.partition = None;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            matches!(err, SubmitError::InvalidArgument(_)),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -41557,6 +41638,63 @@ state = "UP"
         }];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    fn reservation_bound_to(partition: Option<&str>) -> Reservation {
+        let now = chrono::Utc::now();
+        Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: String::new(),
+            partition: partition.map(Into::into),
+        }
+    }
+
+    fn spec_naming_reservation(reservation: &str, partition: Option<&str>) -> JobSpec {
+        let mut spec = basic_spec("j");
+        spec.reservation = Some(reservation.into());
+        spec.partition = partition.map(Into::into);
+        spec
+    }
+
+    #[test]
+    fn apply_reservation_partition_sets_unset_partition() {
+        let mut spec = spec_naming_reservation("r1", None);
+        super::apply_reservation_partition(&mut spec, &[reservation_bound_to(Some("gpu"))]);
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn apply_reservation_partition_treats_empty_string_as_unset() {
+        let mut spec = spec_naming_reservation("r1", Some(""));
+        super::apply_reservation_partition(&mut spec, &[reservation_bound_to(Some("gpu"))]);
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn apply_reservation_partition_keeps_explicit_partition() {
+        let mut spec = spec_naming_reservation("r1", Some("cpu"));
+        super::apply_reservation_partition(&mut spec, &[reservation_bound_to(Some("gpu"))]);
+        assert_eq!(spec.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn apply_reservation_partition_noop_without_reservation_partition() {
+        let mut spec = spec_naming_reservation("r1", None);
+        super::apply_reservation_partition(&mut spec, &[reservation_bound_to(None)]);
+        assert_eq!(spec.partition, None);
+    }
+
+    #[test]
+    fn apply_reservation_partition_noop_for_unknown_reservation() {
+        let mut spec = spec_naming_reservation("other", None);
+        super::apply_reservation_partition(&mut spec, &[reservation_bound_to(Some("gpu"))]);
+        assert_eq!(spec.partition, None);
     }
 
     // --- apply_default_qos tests ---
