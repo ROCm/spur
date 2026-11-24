@@ -297,6 +297,9 @@ pub enum ScontrolCommand {
         /// Comma-separated flags (maint, ignore_jobs, no_hold_jobs, overlap)
         #[arg(long, default_value = "")]
         flags: String,
+        /// Partition to bind the reservation to (optional)
+        #[arg(long, default_value = "")]
+        partition: String,
     },
     /// Update a reservation
     #[command(name = "update-reservation")]
@@ -546,20 +549,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             accounts,
             users,
             flags,
+            partition,
         } => {
             crate::privilege::require_privileged("manage reservations")?;
-            let duration = parse_reservation_duration(&duration)?;
-            create_reservation(
-                &args.controller,
-                &name,
-                &start_time,
-                duration,
-                &nodes,
-                &accounts,
-                &users,
-                &flags,
-            )
-            .await
+            let params = ReservationCreateParams {
+                name,
+                start_time,
+                duration_minutes: parse_reservation_duration(&duration)?,
+                nodes,
+                accounts,
+                users,
+                flags,
+                partition,
+            };
+            create_reservation(&args.controller, &params).await
         }
         ScontrolCommand::UpdateReservation {
             name,
@@ -1626,6 +1629,7 @@ struct ReservationCreateParams {
     accounts: String,
     users: String,
     flags: String,
+    partition: String,
 }
 
 /// Pure parse+validate of Slurm key=value pairs, split from the privileged
@@ -1638,6 +1642,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
     let mut accounts = String::new();
     let mut users = String::new();
     let mut flags = String::new();
+    let mut partition = String::new();
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1649,6 +1654,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
                 "accounts" => accounts = value.into(),
                 "users" => users = value.into(),
                 "flags" => flags = value.into(),
+                "partitionname" => partition = value.into(),
                 other => eprintln!("scontrol create reservation: unknown key '{}'", other),
             }
         }
@@ -1671,6 +1677,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
         accounts,
         users,
         flags,
+        partition,
     })
 }
 
@@ -1679,17 +1686,7 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
     crate::privilege::require_privileged("manage reservations")?;
 
     let p = parse_reservation_create_params(params)?;
-    create_reservation(
-        controller,
-        &p.name,
-        &p.start_time,
-        p.duration_minutes,
-        &p.nodes,
-        &p.accounts,
-        &p.users,
-        &p.flags,
-    )
-    .await
+    create_reservation(controller, &p).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2427,20 +2424,27 @@ fn parse_reservation_duration(s: &str) -> Result<u32> {
     })
 }
 
+fn reservation_create_request(
+    p: &ReservationCreateParams,
+    user: String,
+) -> spur_proto::proto::CreateReservationRequest {
+    spur_proto::proto::CreateReservationRequest {
+        name: p.name.clone(),
+        start_time: p.start_time.clone(),
+        duration_minutes: p.duration_minutes,
+        nodes: split_csv(&p.nodes),
+        accounts: split_csv(&p.accounts),
+        users: split_csv(&p.users),
+        flags: split_csv(&p.flags),
+        user,
+        partition: p.partition.trim().to_string(),
+    }
+}
+
 /// Create a reservation via the controller.
-#[allow(clippy::too_many_arguments)]
-async fn create_reservation(
-    controller: &str,
-    name: &str,
-    start_time: &str,
-    duration: u32,
-    nodes: &str,
-    accounts: &str,
-    users: &str,
-    flags: &str,
-) -> Result<()> {
+async fn create_reservation(controller: &str, p: &ReservationCreateParams) -> Result<()> {
     // Privilege is gated by callers; this is the last input guard.
-    if duration == 0 {
+    if p.duration_minutes == 0 {
         bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
     }
 
@@ -2449,43 +2453,25 @@ async fn create_reservation(
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    let node_list: Vec<String> = nodes
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let account_list: Vec<String> = accounts
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let user_list: Vec<String> = users
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let flag_list: Vec<String> = flags
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    if !p.partition.trim().is_empty() {
+        crate::resource_opts::require_controller_capability(
+            &mut client,
+            spur_core::node::CAP_RESERVATION_PARTITION,
+            "the controller does not support PartitionName= on reservations; \
+             upgrade spurctld or create the reservation without it",
+        )
+        .await?;
+    }
 
     client
-        .create_reservation(spur_proto::proto::CreateReservationRequest {
-            name: name.to_string(),
-            start_time: start_time.to_string(),
-            duration_minutes: duration,
-            nodes: node_list,
-            accounts: account_list,
-            users: user_list,
-            flags: flag_list,
-            user: crate::interactive::current_user()?,
-            partition: String::new(),
-        })
+        .create_reservation(reservation_create_request(
+            p,
+            crate::interactive::current_user()?,
+        ))
         .await
         .context("failed to create reservation")?;
 
-    println!("Reservation {} created", name);
+    println!("Reservation {} created", p.name);
     Ok(())
 }
 
@@ -4640,6 +4626,107 @@ mod tests {
         let parsed = parse_reservation_create_params(&params).unwrap();
         assert_eq!(parsed.name, "r1");
         assert_eq!(parsed.duration_minutes, 30 * 24 * 60);
+    }
+
+    #[test]
+    fn parse_reservation_create_params_reads_partition() {
+        let with = p(&[
+            "ReservationName=r1",
+            "Duration=60",
+            "Nodes=n1",
+            "partitionName=gpu",
+        ]);
+        assert_eq!(
+            parse_reservation_create_params(&with).unwrap().partition,
+            "gpu"
+        );
+
+        let without = p(&["ReservationName=r1", "Duration=60", "Nodes=n1"]);
+        assert_eq!(
+            parse_reservation_create_params(&without).unwrap().partition,
+            ""
+        );
+    }
+
+    fn reservation_params(partition: &str) -> ReservationCreateParams {
+        ReservationCreateParams {
+            name: "r1".into(),
+            start_time: "now".into(),
+            duration_minutes: 60,
+            nodes: "n1, n2,".into(),
+            accounts: "acct".into(),
+            users: "u1,u2".into(),
+            flags: "maint".into(),
+            partition: partition.into(),
+        }
+    }
+
+    #[test]
+    fn reservation_create_request_forwards_every_field() {
+        let req = reservation_create_request(&reservation_params(" gpu "), "alice".into());
+        assert_eq!(req.name, "r1");
+        assert_eq!(req.start_time, "now");
+        assert_eq!(req.duration_minutes, 60);
+        assert_eq!(req.nodes, vec!["n1", "n2"]);
+        assert_eq!(req.accounts, vec!["acct"]);
+        assert_eq!(req.users, vec!["u1", "u2"]);
+        assert_eq!(req.flags, vec!["maint"]);
+        assert_eq!(req.user, "alice");
+        assert_eq!(req.partition, "gpu");
+
+        let unbound = reservation_create_request(&reservation_params(""), "alice".into());
+        assert_eq!(unbound.partition, "");
+    }
+
+    #[test]
+    fn create_reservation_flag_accepts_partition() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "scontrol",
+                "create-reservation",
+                "--name=r1",
+                "--duration=60",
+                "--nodes=n1",
+            ];
+            args.extend_from_slice(extra);
+            match ScontrolArgs::try_parse_from(args).unwrap().command {
+                ScontrolCommand::CreateReservation { partition, .. } => partition,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        assert_eq!(parse(&["--partition=gpu"]), "gpu");
+        assert_eq!(parse(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn a_reservation_partition_is_refused_by_a_controller_without_the_capability() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let url = format!("http://{addr}");
+
+        let err = create_reservation(&url, &reservation_params("gpu"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not support PartitionName="),
+            "{err:#}"
+        );
+
+        let err = create_reservation(&url, &reservation_params("  "))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to create reservation"),
+            "a blank partition must skip the capability check: {err:#}"
+        );
+
+        capture.set_ping_capabilities(vec![spur_core::node::CAP_RESERVATION_PARTITION.to_string()]);
+        let err = create_reservation(&url, &reservation_params("gpu"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to create reservation"),
+            "{err:#}"
+        );
     }
 
     #[test]
