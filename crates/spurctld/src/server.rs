@@ -14,9 +14,8 @@ use tracing::{debug, info, warn};
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
-use spur_core::task_launch::{
-    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
-};
+use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
+use spur_core::task_launch::{build_step_task_plan, step_needs_pmix_prepare};
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
@@ -4284,7 +4283,7 @@ impl SlurmController for ControllerService {
                     peers.num_nodes,
                     job.spec.mpi.as_deref(),
                     job.allocated_nodes.len() as u32,
-                    job.spec.script.as_deref(),
+                    job.script_placement(),
                 )
             });
 
@@ -5552,6 +5551,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
+    let script_placement =
+        ScriptPlacement::from_wire(&spec.script_placement).map_err(Status::invalid_argument)?;
 
     let job_spec = spur_core::job::JobSpec {
         submitted_at: None,
@@ -5769,6 +5770,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         submit_line: sanitize_submit_line(&spec.submit_line),
         client_keepalive: spec.client_keepalive,
         cpus_per_gpu: spec.cpus_per_gpu,
+        script_placement,
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -5911,6 +5913,8 @@ fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) ->
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
+    // A reservation's nodes and placement stay provisional until the run starts.
+    let run_started = job.start_time.is_some();
     JobInfo {
         preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
             &job.preemption_usage,
@@ -6054,14 +6058,24 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             .requeue_count
             .saturating_add(job.preempt_requeue_count)
             .saturating_add(job.user_requeue_count),
-        // srun and salloc synthesize a script too, so its presence alone does not
-        // mean the batch submission Slurm's flag denotes.
-        batch_flag: job.spec.script.is_some() && !job.spec.srun_job && !job.spec.interactive,
+        batch_flag: job.spec.is_batch(),
         exclusive: job.spec.exclusive,
         // Filled by annotate_jobs_with_planned_reservations: the scheduler's
         // plan lives on the cluster, not the job record.
         planned_start_time: None,
         sched_nodelist: String::new(),
+        batch_host: job
+            .allocated_nodes
+            .first()
+            .filter(|_| run_started && job.spec.is_batch())
+            .cloned()
+            .unwrap_or_default(),
+        script_placement: ScriptPlacement::to_wire(job.spec.script_placement),
+        resolved_script_placement: if run_started {
+            job.script_placement().to_string()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -6802,15 +6816,10 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once one of a job's nodes has reported, for a batch script that
-/// launches ranks with `srun`. With `primary_only`, only the batch script's node
-/// (the first allocated) counts: the others run a hold script that never reports.
+/// Nodes to stop once a node of a batch-host run reports. With `primary_only`, only the batch
+/// host (the first allocated node) counts: the others run a hold script that never reports.
 fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
-    let launches_steps = job
-        .spec
-        .script
-        .as_deref()
-        .is_some_and(batch_script_uses_step_launch);
+    let launches_steps = job.script_placement() == ResolvedPlacement::BatchHost;
     let reporter_ended_the_job = primary_only
         .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node));
     if launches_steps && reporter_ended_the_job {
@@ -8302,6 +8311,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: false,
+            resolved_placement: None,
             at: None,
             effective_partition: None,
             memory_adjustment: None,
@@ -8369,6 +8379,7 @@ mod tests {
                 srun_step_dispatch: false,
                 run_attempt,
                 idle_fill: false,
+                resolved_placement: None,
                 at: None,
                 effective_partition: None,
                 memory_adjustment: None,
@@ -8917,6 +8928,7 @@ mod tests {
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         });
     }
@@ -17607,6 +17619,86 @@ mod tests {
             ..Default::default()
         }));
         assert!(!with(JobSpec::default()));
+    }
+
+    #[test]
+    fn proto_to_job_spec_carries_the_requested_script_placement() {
+        use spur_core::script_placement::ScriptPlacement;
+
+        let spec = |script_placement: &str| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            script_placement: script_placement.into(),
+            ..Default::default()
+        };
+        let stored = |value: &str| {
+            proto_to_job_spec(spec(value))
+                .expect("valid spec")
+                .script_placement
+        };
+
+        assert_eq!(stored(""), None, "unset leaves it to the cluster default");
+        assert_eq!(stored("auto"), Some(ScriptPlacement::Auto));
+        assert_eq!(stored("batch-host"), Some(ScriptPlacement::BatchHost));
+        assert_eq!(stored("all-nodes"), Some(ScriptPlacement::AllNodes));
+
+        let err = proto_to_job_spec(spec("bogus")).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("batch-host"), "{}", err.message());
+    }
+
+    #[test]
+    fn job_to_proto_reports_the_batch_host_and_both_placements() {
+        use spur_core::job::{Job, JobSpec};
+        use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
+
+        let mut job = Job::new(
+            7,
+            JobSpec {
+                script: Some("#!/bin/bash\n./train\n".into()),
+                script_placement: Some(ScriptPlacement::Auto),
+                ..Default::default()
+            },
+        );
+        let pending = job_to_proto(&job);
+        assert_eq!(pending.batch_host, "");
+        assert_eq!(pending.script_placement, "auto");
+        assert_eq!(pending.resolved_script_placement, "");
+
+        job.allocated_nodes = vec!["n2".into(), "n1".into()];
+        job.resolved_placement = Some(ResolvedPlacement::BatchHost);
+        let reserved = job_to_proto(&job);
+        assert_eq!(reserved.batch_host, "", "a reservation is not a start");
+        assert_eq!(reserved.resolved_script_placement, "");
+
+        job.start_time = Some(chrono::Utc::now());
+        let started = job_to_proto(&job);
+        assert_eq!(started.batch_host, "n2", "the first allocated node");
+        assert_eq!(started.resolved_script_placement, "batch-host");
+
+        job.resolved_placement = None;
+        assert_eq!(
+            job_to_proto(&job).resolved_script_placement,
+            "all-nodes",
+            "a run an older controller started follows its script"
+        );
+    }
+
+    #[test]
+    fn only_a_batch_job_reports_a_batch_host() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            7,
+            JobSpec {
+                script: Some("sleep infinity".into()),
+                interactive: true,
+                ..Default::default()
+            },
+        );
+        job.allocated_nodes = vec!["n1".into()];
+        job.start_time = Some(chrono::Utc::now());
+
+        assert_eq!(job_to_proto(&job).batch_host, "");
     }
 
     #[test]

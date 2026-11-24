@@ -25,6 +25,7 @@ mod rpc_middleware;
 mod rpc_stats;
 mod sched_stats;
 mod scheduler_loop;
+mod script_placement;
 mod server;
 mod step_claims;
 mod victim_order;

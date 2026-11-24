@@ -304,7 +304,9 @@ Test patterns:
   for testing wait loops, step dispatch, and node operations without network.
 - **Mock agent**: `mock_agent.rs` for PTY and streaming tests.
 - **Env isolation**: Tests that mutate `SPUR_*/SBATCH_*/SLURM_*` env vars use
-  `serial_test::serial(env_injection)` and `EnvGuard` to prevent races.
+  `serial_test::serial(env_injection)` and `EnvGuard`. A test that only reads
+  them through `env_defaults` cannot see another test's values: in test builds
+  each read takes `ENV_LOCK`, which an `EnvGuard` holds for its whole test.
 - **Format-spec coverage**: Every registered header letter/field name is
   asserted to have a matching render arm (prevents half-registered fields).
 - **Precedence tests**: sbatch has extensive tests for CLI-over-directive,

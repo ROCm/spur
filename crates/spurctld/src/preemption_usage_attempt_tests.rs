@@ -47,6 +47,7 @@ fn start_observation(cm: &ClusterManager, observation: u64, run_attempt: u32, no
             srun_step_dispatch: false,
             run_attempt,
             idle_fill: false,
+            resolved_placement: None,
             at: None,
         })
         .job_started
