@@ -1199,6 +1199,7 @@ impl ControllerService {
             users: req.users,
             flags,
             owner: req.user,
+            partition: None,
         };
         self.cluster
             .create_reservation(reservation)
@@ -17934,6 +17935,7 @@ mod tests {
             users: Vec::new(),
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         }
     }
 
@@ -18138,6 +18140,7 @@ mod tests {
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         };
         let maint = Reservation {
             name: "maint".into(),
@@ -18152,6 +18155,7 @@ mod tests {
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         };
         let reservations = vec![plain, maint];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);

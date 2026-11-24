@@ -25164,6 +25164,7 @@ state = "UP"
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         }];
         let state = spur_sched::traits::ClusterState {
             fabric: None,
@@ -25217,6 +25218,7 @@ state = "UP"
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         }];
         let state = spur_sched::traits::ClusterState {
             fabric: None,
@@ -26329,6 +26331,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -26354,6 +26357,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -26380,6 +26384,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
 
@@ -26513,6 +26518,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
 
@@ -26548,6 +26554,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
         let mut spec = basic_spec("resv-ended");
@@ -26682,6 +26689,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
         insert_preempting_qos_pair(&cm, "low", "high");
@@ -27383,6 +27391,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
         assert!(handoffs().is_empty());
@@ -28197,6 +28206,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
         let mut reserved = basic_spec("reserved");
@@ -29632,6 +29642,7 @@ state = "UP"
                 users: vec!["testuser".into()],
                 flags: Default::default(),
                 owner: String::new(),
+                partition: None,
             },
         });
 
@@ -29662,6 +29673,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -29709,6 +29721,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -29733,6 +29746,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         let cm1 = cm.clone();
         let cm2 = cm.clone();
@@ -29768,6 +29782,7 @@ state = "UP"
                 users: vec!["alice".into()],
                 flags: Default::default(),
                 owner: String::new(),
+                partition: None,
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -29798,6 +29813,7 @@ state = "UP"
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
 
@@ -29836,6 +29852,7 @@ state = "UP"
             users: Vec::new(),
             flags: Default::default(),
             owner: "alice".into(),
+            partition: None,
         })
         .unwrap();
 
@@ -29875,6 +29892,7 @@ state = "UP"
                 users: Vec::new(),
                 flags: Default::default(),
                 owner: "root".into(),
+                partition: None,
             })
             .unwrap_err();
         assert!(
@@ -29906,6 +29924,7 @@ state = "UP"
                     ..Default::default()
                 },
                 owner: String::new(),
+                partition: None,
             },
         });
 
@@ -29940,6 +29959,7 @@ state = "UP"
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
 
@@ -30052,6 +30072,7 @@ state = "UP"
                 users: vec!["testuser".into()],
                 flags: Default::default(),
                 owner: String::new(),
+                partition: None,
             })
             .unwrap();
 
@@ -30095,6 +30116,7 @@ state = "UP"
                     ..Default::default()
                 },
                 owner: String::new(),
+                partition: None,
             })
             .unwrap();
 
@@ -30130,6 +30152,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
 
@@ -38223,6 +38246,7 @@ state = "UP"
             users: vec!["testuser".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         })
         .unwrap();
         let mut spec = basic_spec("resv-victim");

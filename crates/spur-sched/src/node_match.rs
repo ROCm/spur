@@ -571,6 +571,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
         assert!(!p.matches(&node("node001"), std::slice::from_ref(&res), now));
         assert!(p.matches(&node("node002"), &[res], now));

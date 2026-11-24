@@ -551,6 +551,7 @@ mod tests {
             accounts: Vec::new(),
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         // A job with no reservation spec should NOT land on node001.
@@ -590,6 +591,7 @@ mod tests {
             accounts: Vec::new(),
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         let mut job = make_job_with_resources("reserved-job", 1, 1, 1, Some(60));

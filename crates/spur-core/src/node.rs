@@ -279,6 +279,11 @@ pub const CAP_STEP_RESOURCES: &str = "step-resources";
 /// the job with 1 CPU per task), so the CLI refuses those options instead.
 pub const CAP_PER_GPU_OPTIONS: &str = "per-gpu-options";
 
+/// Controller capability: `CreateReservationRequest.partition` is stored and
+/// applied. A controller without it would silently create an unbound
+/// reservation, so the CLI refuses a reservation partition instead.
+pub const CAP_RESERVATION_PARTITION: &str = "reservation-partition";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 

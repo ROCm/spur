@@ -1218,6 +1218,7 @@ mod reservation_wal_tests {
                     ..Default::default()
                 },
                 owner: String::new(),
+                partition: None,
             },
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1226,6 +1227,32 @@ mod reservation_wal_tests {
             WalOperation::ReservationCreate { reservation } => {
                 assert_eq!(reservation.name, "r1");
                 assert!(reservation.flags.maint);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reservation_create_round_trips_partition() {
+        let now = Utc::now();
+        let op = WalOperation::ReservationCreate {
+            reservation: Reservation {
+                name: "r1".into(),
+                start_time: now,
+                end_time: now + chrono::Duration::hours(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["alice".into()],
+                flags: ReservationFlags::default(),
+                owner: String::new(),
+                partition: Some("gpu".into()),
+            },
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::ReservationCreate { reservation } => {
+                assert_eq!(reservation.partition.as_deref(), Some("gpu"));
             }
             _ => panic!("wrong variant"),
         }
