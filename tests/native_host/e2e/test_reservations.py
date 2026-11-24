@@ -527,6 +527,8 @@ class TestReservations:
         finally:
             if job_id is not None:
                 cluster.cli(["scancel", str(job_id)])
+                # The partition cannot be deleted while the job is still Completing.
+                wait_job(cluster, job_id)
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
             cluster.scontrol("delete", f"PartitionName={part}")
 
