@@ -63,7 +63,7 @@ choice):
    cni_mtu = 1450                    # Calico MTU; headroom for WireGuard overhead on the mesh
    storage_provisioner = "local-path"  # default StorageClass for PVCs; or "none"
    # local_path_dir = "/mnt/scratch/local-path"  # point local-path at a big disk (default /var/lib)
-   k0s_version = "v1.36.2+k0s.0"     # pinned; or "latest"
+   k0s_version = "v1.36.5+k0s.0"     # pinned; or "latest"
 
 Installing k0s
 ~~~~~~~~~~~~~~~
@@ -76,7 +76,7 @@ network-restricted node), run on that node **as root**:
 
    sudo spur k8s install-k0s                     # the pinned version -> /usr/local/bin/k0s
    sudo spur k8s install-k0s --version latest    # newest k0s release
-   sudo spur k8s install-k0s --version v1.36.2+k0s.0 --path /opt/bin/k0s --force
+   sudo spur k8s install-k0s --version v1.36.5+k0s.0 --path /opt/bin/k0s --force
 
 The binary is downloaded from the official k0s GitHub release and SHA-256
 verified before it is installed.
