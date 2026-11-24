@@ -181,15 +181,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SacctArgs>(&args);
     let style = args.output_style();
     let fields = output_fields(&args)?;
-
-    let job_ids = args
-        .jobs
-        .as_deref()
-        .map(crate::job_id_arg::parse_job_ids)
-        .transpose()?
-        .unwrap_or_default();
-    let page = history_page(args.limit, job_ids.len());
-    let request = history_request(&args, job_ids, &page)?;
+    let (request, page) = job_history_request(&args)?;
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -249,6 +241,18 @@ fn page_with_probe(limit: u32) -> HistoryPage {
         // Stay inside the cap the controller will actually return.
         fetch: show.saturating_add(1).min(MAX_JOB_HISTORY_FETCH),
     }
+}
+
+fn job_history_request(args: &SacctArgs) -> Result<(GetJobHistoryRequest, HistoryPage)> {
+    let job_ids = args
+        .jobs
+        .as_deref()
+        .map(crate::job_id_arg::parse_job_ids)
+        .transpose()?
+        .unwrap_or_default();
+    let page = history_page(args.limit, job_ids.len());
+    let request = history_request(args, job_ids, &page)?;
+    Ok((request, page))
 }
 
 fn history_request(
@@ -899,7 +903,7 @@ mod tests {
     }
 
     fn request(args: &SacctArgs) -> GetJobHistoryRequest {
-        history_request(args, vec![], &history_page(args.limit, 0)).unwrap()
+        job_history_request(args).unwrap().0
     }
 
     const ISSUE_ARGV: [&[&str]; 3] = [
@@ -953,7 +957,6 @@ mod tests {
         for argv in ISSUE_ARGV {
             let req = request(&parse(argv));
             assert_eq!(req.user, "", "{argv:?}");
-            // 2026-11-22T00:00:00Z = 1_795_305_600, 2026-11-23T00:00:00Z = 1_795_392_000
             assert_eq!(
                 req.start_after,
                 Some(utc_midnight(2026, 11, 22)),
@@ -1016,24 +1019,15 @@ mod tests {
 
     #[test]
     fn allocations_does_not_change_the_request() {
-        let build = |argv: &[&str]| {
-            let args = parse(argv);
-            let ids = args
-                .jobs
-                .as_deref()
-                .map(crate::job_id_arg::parse_job_ids)
-                .transpose()
-                .unwrap()
-                .unwrap_or_default();
-            let page = history_page(args.limit, ids.len());
-            history_request(&args, ids, &page).unwrap()
-        };
         let bases: [&[&str]; 2] = [&["-S", "2026-11-22"], &["-j", "30.0", "-u", "alice"]];
         for base in bases {
             let with_x: Vec<&str> = base.iter().copied().chain(["-X"]).collect();
-            assert_eq!(build(&with_x), build(base), "{base:?}");
+            assert_eq!(request(&parse(&with_x)), request(&parse(base)), "{base:?}");
         }
-        assert_eq!(build(&["-j", "30.0", "-u", "alice", "-X"]).job_ids, [30]);
+        assert_eq!(
+            request(&parse(&["-j", "30.0", "-u", "alice", "-X"])).job_ids,
+            [30]
+        );
     }
 
     #[test]
@@ -1052,7 +1046,7 @@ mod tests {
         let help = <SacctArgs as clap::CommandFactory>::command()
             .render_help()
             .to_string();
-        for flag in ["--allusers", "--allocations", "-a", "-X"] {
+        for flag in ["-a, --allusers", "-X, --allocations"] {
             assert!(help.contains(flag), "{flag} missing from:\n{help}");
         }
     }
