@@ -306,6 +306,7 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
             reason_detail: reason_detail.unwrap_or_default(),
             ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
             ended_by_uid: ended_by.and_then(|c| c.uid),
+            nodelist: spur_core::hostlist::compress(&job.allocated_nodes),
             submission: Some(db::JobSubmission::for_job(job)),
         },
     )
@@ -579,6 +580,7 @@ mod tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            nodelist: String::new(),
             submission: None,
         }
     }

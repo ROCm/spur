@@ -291,7 +291,9 @@ Leader-gated loop that detects drift between in-memory job state and the account
 
 ### Notifier (`accounting/notifier.rs`)
 
-Async dispatch of job start/end records. `ClusterManager` calls `notifier.job_started()` / `notifier.job_ended()` and the notifier writes to PostgreSQL off the hot path. `drain_accounting()` waits up to 5 seconds at shutdown.
+Async dispatch of job start/end records. `ClusterManager` calls `notifier.notify_job_start()` / `notifier.notify_job_end()` and the notifier writes to PostgreSQL off the hot path. `drain_accounting()` waits up to 5 seconds at shutdown.
+
+Both `JobStartRecord` and `JobEndRecord` carry the run's `nodelist`, so a row the end write creates (start write lost or late) still names its nodes. The end's list comes from `JobFinalized::nodelist`, captured in apply before any requeue reset clears `allocated_nodes`, since the notifier runs after the reset. `record_job_end` replaces the stored list only with a non-empty one, so an end that knows no nodes (the external `RecordJobEnd`) keeps the start's.
 
 ## REST API
 

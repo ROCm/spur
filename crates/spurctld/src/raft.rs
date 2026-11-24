@@ -84,9 +84,14 @@ pub struct JobFinalized {
     pub reason_detail: Option<String>,
     #[serde(skip)]
     pub ended_by: Option<CancelProvenance>,
+    /// Compressed hostlist of the nodes the run held.
+    #[serde(skip)]
+    pub nodelist: String,
 }
 
 impl JobFinalized {
+    /// Requeue paths must call this before their reset clears the run's start
+    /// time and nodes.
     pub fn for_job(job: &Job, state: JobState, exit_code: i32) -> Self {
         let actual_secs = job
             .run_time()
@@ -101,26 +106,7 @@ impl JobFinalized {
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
-        }
-    }
-
-    /// Like `for_job` but with a pre-computed elapsed time. Used by requeue
-    /// paths that clear timestamps before constructing the finalized record.
-    pub fn for_job_with_elapsed(
-        job: &Job,
-        state: JobState,
-        exit_code: i32,
-        elapsed_secs: u64,
-    ) -> Self {
-        let (reason, reason_detail) = job.end_reason(state);
-        Self {
-            job_id: job.job_id,
-            state,
-            exit_code,
-            actual_secs: elapsed_secs,
-            reason,
-            reason_detail,
-            ended_by: job.ended_by(reason).cloned(),
+            nodelist: spur_core::hostlist::compress(&job.allocated_nodes),
         }
     }
 }
