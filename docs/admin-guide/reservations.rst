@@ -35,7 +35,7 @@ Supported inline keys (case-insensitive, in any order):
    * - ``StartTime``
      - ISO 8601 timestamp or ``now`` (the default).
    * - ``Duration``
-     - Required. Whole minutes, Slurm time (``H:MM``, ``H:MM:SS``,
+     - Required. Whole minutes, Slurm time (``MM:SS``, ``H:MM:SS``,
        ``D-HH:MM:SS``), or suffixed (``90m``, ``1h30m``). ``UNLIMITED`` is not
        supported.
    * - ``Nodes``
