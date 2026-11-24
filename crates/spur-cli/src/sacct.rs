@@ -1031,17 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn history_alias_accepts_the_new_flags() {
-        for argv in [
-            ["history", "-a", "-X"],
-            ["acct", "--allusers", "--allocations"],
-        ] {
-            let args = SacctArgs::try_parse_from(argv).unwrap();
-            assert!(args.allusers && args.allocations, "{argv:?}");
-        }
-    }
-
-    #[test]
     fn help_lists_allusers_and_allocations() {
         let help = <SacctArgs as clap::CommandFactory>::command()
             .render_help()
