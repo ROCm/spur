@@ -69,6 +69,11 @@ reservation (``--reservation=maint``) but requests no partition runs in the
 reservation's partition instead of the default one. An explicit ``-p`` always
 wins.
 
+This applies only when the reservation admits the submitter, either by user or
+by the job's account (``--account`` or the user's default account). A job from
+anyone else keeps the default partition and pends on the reservation like any
+job it does not admit.
+
 - The partition must exist when the reservation is created; an unknown name is
   rejected.
 - ``Nodes=`` is still required. Spur does not pick nodes from the partition and

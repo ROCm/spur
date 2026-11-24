@@ -1426,6 +1426,7 @@ impl ClusterManager {
         let config = self.config();
         let partitions = self.partitions.read().clone();
 
+        apply_default_account(&mut spec, &self.association_cache);
         apply_reservation_partition(&mut spec, &self.reservations.read());
         apply_default_partition(&mut spec, &partitions);
 
@@ -1440,7 +1441,6 @@ impl ClusterManager {
             }
         }
 
-        apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
@@ -13582,7 +13582,8 @@ pub(crate) fn evaluate_node_health(
 }
 
 // Slurm runs a job that names a reservation but no partition in the
-// reservation's partition.
+// reservation's partition, but only for submitters the reservation admits.
+// Admission can be by account, so the default account must be applied first.
 fn apply_reservation_partition(spec: &mut JobSpec, reservations: &[Reservation]) {
     if spec.partition.as_deref().is_some_and(|p| !p.is_empty()) {
         return;
@@ -13592,7 +13593,7 @@ fn apply_reservation_partition(spec: &mut JobSpec, reservations: &[Reservation])
     };
     if let Some(partition) = reservations
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.allows_user(&spec.user, spec.account.as_deref()))
         .and_then(|r| r.partition.clone())
     {
         spec.partition = Some(partition);
@@ -26439,6 +26440,15 @@ state = "UP"
     }
 
     async fn cluster_with_gpu_partitioned_reservation(dir: &TempDir) -> Arc<ClusterManager> {
+        let mut res = partitioned_reservation("gpu");
+        res.users = vec!["testuser".into()];
+        cluster_with_gpu_bound_reservation(dir, res).await
+    }
+
+    async fn cluster_with_gpu_bound_reservation(
+        dir: &TempDir,
+        res: Reservation,
+    ) -> Arc<ClusterManager> {
         let cm = test_cluster(dir).await;
         register_node(&cm, "n1", 8, 16000);
         cm.create_partition(Partition {
@@ -26451,10 +26461,46 @@ state = "UP"
         wait_for("gpu partition created", || {
             cm.get_partitions().iter().any(|p| p.name == "gpu")
         });
-        let mut res = partitioned_reservation("gpu");
-        res.users = vec!["testuser".into()];
         cm.create_reservation(res).unwrap();
+        wait_for("reservation created", || {
+            cm.reservations.read().iter().any(|r| r.name == "r1")
+        });
         cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_member_naming_a_partitioned_reservation_keeps_the_default_partition() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_bound_reservation(&dir, partitioned_reservation("gpu")).await;
+
+        let mut spec = basic_spec("outsider");
+        spec.reservation = Some("r1".into());
+        spec.partition = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.partition.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_by_default_account_runs_in_the_reservation_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut res = partitioned_reservation("gpu");
+        res.users = Vec::new();
+        res.accounts = vec!["research".into()];
+        let cm = cluster_with_gpu_bound_reservation(&dir, res).await;
+        cm.association_cache
+            .insert_default_account("testuser", "research");
+
+        let mut spec = basic_spec("member");
+        spec.reservation = Some("r1".into());
+        spec.partition = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.partition.as_deref(),
+            Some("gpu")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41695,6 +41741,27 @@ state = "UP"
         let mut spec = spec_naming_reservation("other", None);
         super::apply_reservation_partition(&mut spec, &[reservation_bound_to(Some("gpu"))]);
         assert_eq!(spec.partition, None);
+    }
+
+    #[test]
+    fn apply_reservation_partition_noop_for_non_member() {
+        let mut res = reservation_bound_to(Some("gpu"));
+        res.users = vec!["alice".into()];
+        res.accounts = vec!["research".into()];
+        let mut spec = spec_naming_reservation("r1", None);
+        spec.account = Some("other".into());
+        super::apply_reservation_partition(&mut spec, &[res]);
+        assert_eq!(spec.partition, None);
+    }
+
+    #[test]
+    fn apply_reservation_partition_admits_member_by_account() {
+        let mut res = reservation_bound_to(Some("gpu"));
+        res.accounts = vec!["research".into()];
+        let mut spec = spec_naming_reservation("r1", None);
+        spec.account = Some("research".into());
+        super::apply_reservation_partition(&mut spec, &[res]);
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
     }
 
     // --- apply_default_qos tests ---
