@@ -751,6 +751,30 @@ The user names are shown to the same audience as ``EndedBy`` in ``sacct``
    spur show node node01
    scontrol show partition gpu
 
+One record per line — ``-o`` / ``--oneliner``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``-o`` (``--oneliner``) prints each job, node, partition, or reservation on a
+single line of space-separated ``Key=Value`` pairs instead of the indented
+multi-line block, which makes the output easy to filter with ``grep`` or
+``awk``. The flag may appear before or after the entity. Every other entity
+(``step``, ``config``, ``federation``, ``assoc_mgr``, ``topology``,
+``hostnames``, ``hostlist``, ``hostlistsorted``) accepts ``-o`` and prints its
+usual output.
+
+.. code-block:: bash
+
+   scontrol show reservation maint -o
+   # ReservationName=maint StartTime=... EndTime=... Nodes=n[1-2] Users=alice,bob
+
+   scontrol -o show reservation maint | grep -oE 'EndTime=[^ ]+|Users=[^ ]+'
+
+Values that contain spaces, such as a node's ``Reason=`` or a job's
+``Comment=``, are printed as-is, so a field-splitting parser should anchor on
+the next ``Key=`` rather than on whitespace alone. Repeated lines become
+repeated keys on the one line (a node prints one ``GPUDevice=`` group per GPU),
+so a parser that builds a key-to-value map keeps only the last of them.
+
 Expanding node lists — ``scontrol show hostnames`` / ``hostlist``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

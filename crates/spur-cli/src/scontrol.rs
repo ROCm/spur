@@ -26,6 +26,10 @@ pub struct ScontrolArgs {
         global = true
     )]
     pub controller: String,
+
+    /// Print each show record on one line
+    #[arg(short = 'o', long = "oneliner", global = true)]
+    pub oneliner: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -358,7 +362,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 print!("{}", out?);
                 return Ok(());
             }
-            show(&args.controller, &entity, name.as_deref()).await
+            show(&args.controller, &entity, name.as_deref(), args.oneliner).await
         }
         ScontrolCommand::Ping => ping(&args.controller).await,
         ScontrolCommand::Version => {
@@ -692,7 +696,7 @@ fn show_hostlist(
     }
 }
 
-async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+async fn show(controller: &str, entity: &str, name: Option<&str>, oneliner: bool) -> Result<()> {
     let entity = entity.to_lowercase();
     if entity == "topology" {
         if name.is_some() {
@@ -737,7 +741,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
 
             for job in jobs {
-                print!("{}", format_job_detail(&job));
+                print!("{}", render_record(format_job_detail(&job), oneliner));
             }
         }
         "node" | "nodes" => {
@@ -750,70 +754,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get nodes")?;
 
             for node in resp.into_inner().nodes {
-                let total = node.total_resources.as_ref();
-                println!("NodeName={}", node.name);
-                // Append `[user@time]` to the reason when a set-time is recorded,
-                // matching Slurm's `scontrol show node` format.
-                let reason = match (node.reason_time.as_ref(), node.state_reason.is_empty()) {
-                    (Some(t), false) => {
-                        let user = crate::reason::reason_user(node.reason_uid, false);
-                        format!(
-                            "{} [{user}@{}]",
-                            node.state_reason,
-                            crate::timefmt::format_timestamp(Some(t))
-                        )
-                    }
-                    _ => node.state_reason.clone(),
-                };
-                println!("   State={} Reason={}", node_state_display(&node), reason);
-                if !node.partitions.is_empty() {
-                    println!("   Partitions={}", node.partitions.join(","));
-                }
-                println!("   {}", node_cpu_line(&node));
-                let gres = total.map(crate::gres_fmt::node_gres).unwrap_or_default();
-                if !gres.is_empty() {
-                    println!("   Gres={}", gres.join(","));
-                }
-                if let Some(resources) = total {
-                    println!(
-                        "   InventoryGeneration={} FabricBindingVersion={}",
-                        resources.generation, resources.fabric_binding_version
-                    );
-                    if let Some(revision) = &resources.block_file_revision {
-                        println!("   BlockFileRevision={revision}");
-                    }
-                    for gpu in crate::gres_fmt::node_devices(resources)
-                        .iter()
-                        .filter(|d| d.gres_name == "gpu")
-                    {
-                        let cpus = node.gpu_cpus.iter().find(|c| c.stable_id == gpu.stable_id);
-                        print!("{}", format_gpu_topology(gpu, cpus));
-                    }
-                }
-                if let Some(line) = node_spec_line(&node) {
-                    println!("   {line}");
-                }
-                println!("   Arch={} OS={}", node.arch, node.os);
-                if let Some(line) = capabilities_line(&node) {
-                    println!("   {line}");
-                }
-                if !node.labels.is_empty() {
-                    let mut label_str: Vec<String> = node
-                        .labels
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect();
-                    label_str.sort();
-                    println!("   Labels={}", label_str.join(","));
-                }
-                if !node.active_reservation.is_empty() {
-                    println!("   ActiveReservation={}", node.active_reservation);
-                }
-                if let Some(line) = planned_reservation_line(&node) {
-                    println!("   {line}");
-                }
-                println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
-                println!();
+                print!("{}", render_record(format_node_detail(&node), oneliner));
             }
         }
         "partition" | "partitions" => {
@@ -825,7 +766,8 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get partitions")?;
 
             for part in resp.into_inner().partitions {
-                print!("{}", format_partition_detail(&part));
+                let record = format_partition_detail(&part);
+                print!("{}", render_record(record, oneliner));
             }
         }
         "reservation" | "reservations" => {
@@ -845,8 +787,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 return Ok(());
             }
 
-            for res in reservations {
-                print!("{}", format_reservation_detail(&res));
+            for reservation in reservations {
+                let record = format_reservation_detail(&reservation);
+                print!("{}", render_record(record, oneliner));
             }
         }
         "step" | "steps" => {
@@ -924,6 +867,89 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// `NodeInfo.cpu_load` carries the load average multiplied by this factor.
+const CPU_LOAD_SCALE: f64 = 100.0;
+
+/// The node's reason, with `[user@time]` appended when a set-time is recorded,
+/// matching Slurm's `scontrol show node` format.
+fn node_reason(node: &spur_proto::proto::NodeInfo) -> String {
+    match &node.reason_time {
+        Some(set_at) if !node.state_reason.is_empty() => {
+            let user = crate::reason::reason_user(node.reason_uid, false);
+            let when = crate::timefmt::format_timestamp(Some(set_at));
+            format!("{} [{user}@{when}]", node.state_reason)
+        }
+        _ => node.state_reason.clone(),
+    }
+}
+
+/// Render one node for `scontrol show node`.
+fn format_node_detail(node: &spur_proto::proto::NodeInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "NodeName={}", node.name);
+    let _ = writeln!(
+        out,
+        "   State={} Reason={}",
+        node_state_display(node),
+        node_reason(node)
+    );
+    if !node.partitions.is_empty() {
+        let _ = writeln!(out, "   Partitions={}", node.partitions.join(","));
+    }
+    let _ = writeln!(out, "   {}", node_cpu_line(node));
+    if let Some(resources) = &node.total_resources {
+        let gres = crate::gres_fmt::node_gres(resources);
+        if !gres.is_empty() {
+            let _ = writeln!(out, "   Gres={}", gres.join(","));
+        }
+        let _ = writeln!(
+            out,
+            "   InventoryGeneration={} FabricBindingVersion={}",
+            resources.generation, resources.fabric_binding_version
+        );
+        if let Some(revision) = &resources.block_file_revision {
+            let _ = writeln!(out, "   BlockFileRevision={revision}");
+        }
+        for gpu in crate::gres_fmt::node_devices(resources)
+            .iter()
+            .filter(|device| device.gres_name == "gpu")
+        {
+            let cpus = node
+                .gpu_cpus
+                .iter()
+                .find(|entry| entry.stable_id == gpu.stable_id);
+            out.push_str(&format_gpu_topology(gpu, cpus));
+        }
+    }
+    if let Some(line) = node_spec_line(node) {
+        let _ = writeln!(out, "   {line}");
+    }
+    let _ = writeln!(out, "   Arch={} OS={}", node.arch, node.os);
+    if let Some(line) = capabilities_line(node) {
+        let _ = writeln!(out, "   {line}");
+    }
+    if !node.labels.is_empty() {
+        let mut labels: Vec<String> = node
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        labels.sort();
+        let _ = writeln!(out, "   Labels={}", labels.join(","));
+    }
+    if !node.active_reservation.is_empty() {
+        let _ = writeln!(out, "   ActiveReservation={}", node.active_reservation);
+    }
+    if let Some(line) = planned_reservation_line(node) {
+        let _ = writeln!(out, "   {line}");
+    }
+    let cpu_load = node.cpu_load as f64 / CPU_LOAD_SCALE;
+    let _ = writeln!(out, "   CpuLoad={cpu_load}");
+    let _ = writeln!(out);
+    out
 }
 
 async fn ping(controller: &str) -> Result<()> {
@@ -2623,6 +2649,27 @@ fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
     }
     let _ = writeln!(out);
     out
+}
+
+/// Collapse a multi-line `Key=Value` record onto one line (`scontrol -o`).
+fn collapse_record(record: &str) -> String {
+    let lines: Vec<&str> = record
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", lines.join(" "))
+}
+
+fn render_record(record: String, oneliner: bool) -> String {
+    if oneliner {
+        collapse_record(&record)
+    } else {
+        record
+    }
 }
 
 fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
@@ -4608,7 +4655,7 @@ mod tests {
     #[tokio::test]
     async fn show_job_rejects_a_malformed_id_before_contacting_the_controller() {
         // Nothing listens on port 1, so any network I/O would fail with a connect error first.
-        let err = show("http://127.0.0.1:1", "job", Some("abc"))
+        let err = show("http://127.0.0.1:1", "job", Some("abc"), false)
             .await
             .expect_err("a malformed job id must fail");
         assert!(
@@ -4622,13 +4669,157 @@ mod tests {
         // The mock returns no jobs, so a well-formed id that matches nothing must
         // fail (exit non-zero), not print nothing and succeed.
         let (addr, _capture) = crate::mock_controller::spawn().await;
-        let err = show(&format!("http://{addr}"), "job", Some("999999"))
+        let err = show(&format!("http://{addr}"), "job", Some("999999"), false)
             .await
             .expect_err("an unknown job id must fail");
         assert!(
             err.to_string().contains("Job 999999 not found"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn oneliner_flag_parses_before_and_after_the_entity() {
+        for argv in [
+            ["scontrol", "-o", "show", "reservation", "r1"],
+            ["scontrol", "show", "reservation", "r1", "-o"],
+            ["scontrol", "--oneliner", "show", "reservation", "r1"],
+            ["scontrol", "show", "reservation", "r1", "--oneliner"],
+        ] {
+            let args = ScontrolArgs::try_parse_from(argv).expect("parse");
+            assert!(args.oneliner, "{argv:?}");
+        }
+        let args =
+            ScontrolArgs::try_parse_from(["scontrol", "show", "reservation", "r1"]).expect("parse");
+        assert!(!args.oneliner);
+    }
+
+    #[tokio::test]
+    async fn show_ignores_oneliner_for_entities_it_does_not_collapse() {
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+        for entity in ["config", "federation"] {
+            show(&controller, entity, None, true)
+                .await
+                .unwrap_or_else(|e| panic!("{entity} -o must be ignored, got: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn show_oneliner_keeps_the_unknown_entity_error() {
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let err = show(&format!("http://{addr}"), "bogus", None, true)
+            .await
+            .expect_err("an unknown entity must fail");
+        assert!(
+            err.to_string().contains("unknown entity type 'bogus'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn collapse_record_joins_lines_and_drops_blank_ones() {
+        let record = "ReservationName=r1\n   StartTime=t0\n   Users=alice\n\n";
+        assert_eq!(
+            collapse_record(record),
+            "ReservationName=r1 StartTime=t0 Users=alice\n"
+        );
+        assert_eq!(collapse_record(""), "");
+        assert_eq!(collapse_record("\n\n"), "");
+    }
+
+    #[test]
+    fn render_record_leaves_the_record_untouched_without_oneliner() {
+        let record = "ReservationName=r1\n   Users=alice\n\n".to_string();
+        assert_eq!(render_record(record.clone(), false), record);
+    }
+
+    fn sample_reservation() -> spur_proto::proto::ReservationInfo {
+        spur_proto::proto::ReservationInfo {
+            name: "maint".into(),
+            start_time: "2026-11-24T09:00:00".into(),
+            end_time: "2026-11-24T17:00:00".into(),
+            nodes: "n[1-2]".into(),
+            users: "alice,bob".into(),
+            accounts: "ml".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reservation_detail_prints_multi_line_by_default() {
+        let out = render_record(format_reservation_detail(&sample_reservation()), false);
+        assert_eq!(
+            out,
+            "ReservationName=maint\n   StartTime=2026-11-24T09:00:00\n   \
+             EndTime=2026-11-24T17:00:00\n   Nodes=n[1-2]\n   Accounts=ml\n   \
+             Users=alice,bob\n\n"
+        );
+    }
+
+    #[test]
+    fn reservation_detail_prints_one_line_with_oneliner() {
+        let out = render_record(format_reservation_detail(&sample_reservation()), true);
+        assert_eq!(
+            out,
+            "ReservationName=maint StartTime=2026-11-24T09:00:00 \
+             EndTime=2026-11-24T17:00:00 Nodes=n[1-2] Accounts=ml Users=alice,bob\n"
+        );
+    }
+
+    #[test]
+    fn node_detail_prints_one_line_with_oneliner() {
+        let node = spur_proto::proto::NodeInfo {
+            name: "n1".into(),
+            arch: "x86_64".into(),
+            os: "Linux".into(),
+            ..idle_node()
+        };
+        let multi_line = format_node_detail(&node);
+        assert!(
+            multi_line.starts_with("NodeName=n1\n   State="),
+            "{multi_line}"
+        );
+        assert!(multi_line.ends_with("\n\n"), "{multi_line}");
+
+        let one_line = render_record(multi_line, true);
+        assert_eq!(one_line.lines().count(), 1, "{one_line}");
+        assert!(one_line.starts_with("NodeName=n1 State="), "{one_line}");
+        assert!(one_line.contains(" Arch=x86_64 OS=Linux "), "{one_line}");
+        assert!(one_line.ends_with(" CpuLoad=0\n"), "{one_line}");
+    }
+
+    #[test]
+    fn node_detail_scales_cpu_load_to_a_load_average() {
+        let node = spur_proto::proto::NodeInfo {
+            cpu_load: 152,
+            ..idle_node()
+        };
+        let detail = format_node_detail(&node);
+        assert!(detail.contains("   CpuLoad=1.52\n"), "{detail}");
+    }
+
+    #[test]
+    fn node_reason_is_plain_without_a_set_time() {
+        let node = spur_proto::proto::NodeInfo {
+            state_reason: "disk failure".into(),
+            reason_time: None,
+            ..idle_node()
+        };
+        assert_eq!(node_reason(&node), "disk failure");
+    }
+
+    #[test]
+    fn node_reason_stays_empty_when_only_a_set_time_is_recorded() {
+        let node = spur_proto::proto::NodeInfo {
+            state_reason: String::new(),
+            reason_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            ..idle_node()
+        };
+        assert_eq!(node_reason(&node), "");
     }
 
     #[test]
