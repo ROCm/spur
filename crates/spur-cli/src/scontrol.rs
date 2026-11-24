@@ -1440,29 +1440,29 @@ enum ScontrolEntity {
 
 /// Detect the target entity by scanning all params for `PartitionName=` /
 /// `ReservationName=`. Slurm key=value syntax is order-independent, so the
-/// marker may appear anywhere. Errors if both markers are present; returns
-/// `None` when neither is (the caller picks the default, e.g. job/node update).
-fn detect_entity(params: &[String]) -> Result<Option<ScontrolEntity>> {
+/// marker may appear anywhere. A reservation may carry a `PartitionName=`
+/// attribute, so `ReservationName=` wins when both are present. Returns `None`
+/// when neither is (the caller picks the default, e.g. job/node update).
+fn detect_entity(params: &[String]) -> Option<ScontrolEntity> {
     let present = |marker: &str| {
         params.iter().any(|p| {
             p.split_once('=')
                 .is_some_and(|(k, _)| k.eq_ignore_ascii_case(marker))
         })
     };
-    match (present("PartitionName"), present("ReservationName")) {
-        (true, true) => {
-            anyhow::bail!("scontrol: specify only one of PartitionName= or ReservationName=")
-        }
-        (true, false) => Ok(Some(ScontrolEntity::Partition)),
-        (false, true) => Ok(Some(ScontrolEntity::Reservation)),
-        (false, false) => Ok(None),
+    if present("ReservationName") {
+        Some(ScontrolEntity::Reservation)
+    } else if present("PartitionName") {
+        Some(ScontrolEntity::Partition)
+    } else {
+        None
     }
 }
 
 /// Parse key=value pairs from a Slurm-style `scontrol create` command and
 /// dispatch to the appropriate create handler (partition or reservation).
 async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
-    match detect_entity(params)? {
+    match detect_entity(params) {
         Some(ScontrolEntity::Partition) => parse_and_create_partition(controller, params).await,
         Some(ScontrolEntity::Reservation) => parse_and_create_reservation(controller, params).await,
         None => anyhow::bail!(
@@ -1739,8 +1739,15 @@ async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
 
 /// Parse "key=value" params from `scontrol update` command.
 async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
-    if let Some(ScontrolEntity::Partition) = detect_entity(params)? {
-        return parse_and_update_partition(controller, params).await;
+    match detect_entity(params) {
+        Some(ScontrolEntity::Partition) => {
+            return parse_and_update_partition(controller, params).await
+        }
+        Some(ScontrolEntity::Reservation) => anyhow::bail!(
+            "scontrol update: inline ReservationName= updates are not supported; \
+             use `scontrol update-reservation --name=<name> ...`"
+        ),
+        None => {}
     }
 
     match parse_update(params)? {
@@ -3977,15 +3984,15 @@ mod tests {
         // The entity marker may appear after other keys — Slurm syntax is
         // order-independent, so detection must scan all params, not just the first.
         assert_eq!(
-            detect_entity(&p(&["Nodes=n1", "PartitionName=gpu"])).unwrap(),
+            detect_entity(&p(&["Nodes=n1", "PartitionName=gpu"])),
             Some(ScontrolEntity::Partition)
         );
         assert_eq!(
-            detect_entity(&p(&["Flags=MAINT", "ReservationName=maint"])).unwrap(),
+            detect_entity(&p(&["Flags=MAINT", "ReservationName=maint"])),
             Some(ScontrolEntity::Reservation)
         );
         assert_eq!(
-            detect_entity(&p(&["State=DOWN", "PartitionName=gpu"])).unwrap(),
+            detect_entity(&p(&["State=DOWN", "PartitionName=gpu"])),
             Some(ScontrolEntity::Partition)
         );
     }
@@ -4009,10 +4016,7 @@ mod tests {
 
     #[test]
     fn detect_entity_none_when_no_marker() {
-        assert_eq!(
-            detect_entity(&p(&["JobId=5", "Priority=10"])).unwrap(),
-            None
-        );
+        assert_eq!(detect_entity(&p(&["JobId=5", "Priority=10"])), None);
     }
 
     #[test]
@@ -4021,8 +4025,15 @@ mod tests {
     }
 
     #[test]
-    fn detect_entity_rejects_both_markers() {
-        assert!(detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])).is_err());
+    fn detect_entity_prefers_reservation_when_both_markers_present() {
+        assert_eq!(
+            detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])),
+            Some(ScontrolEntity::Reservation)
+        );
+        assert_eq!(
+            detect_entity(&p(&["ReservationName=maint", "partitionname=gpu"])),
+            Some(ScontrolEntity::Reservation)
+        );
     }
 
     #[tokio::test]
@@ -4861,6 +4872,18 @@ mod tests {
             err.contains("'TimeLimit=10' cannot be combined with NodeName="),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_inline_reservation_update_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = parse_and_update(
+            &format!("http://{addr}"),
+            &p(&["ReservationName=r1", "PartitionName=gpu"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("update-reservation"), "{err}");
     }
 
     #[tokio::test]
