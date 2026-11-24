@@ -2473,6 +2473,7 @@ message CreateReservationRequest {
   repeated string users = 6;
   repeated string flags = 7;
   string user = 8;            // requesting user; must be an operator, and is recorded as the owner
+  string partition = 9;       // partition bound to the reservation; empty = none
 }
 
 message UpdateReservationRequest {
@@ -2510,6 +2511,7 @@ message ReservationInfo {
   string flags = 7;
   string state = 8;
   string owner = 9;
+  string partition = 10;  // empty = none
 }
 
 // ============================================================

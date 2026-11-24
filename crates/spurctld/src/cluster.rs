@@ -7404,6 +7404,13 @@ impl ClusterManager {
                 res.name
             )));
         }
+        if let Some(partition) = &res.partition {
+            if !self.partitions.read().iter().any(|p| &p.name == partition) {
+                return Err(ReservationError::invalid(format!(
+                    "unknown partition '{partition}'"
+                )));
+            }
+        }
         let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
         res.nodes = normalize_node_list(&res.nodes, &known).map_err(ReservationError::invalid)?;
         self.validate_reservation_job_overlap(&res, None)
@@ -26369,6 +26376,49 @@ state = "UP"
         assert!(cm.create_reservation(r2).is_ok());
     }
 
+    fn partitioned_reservation(partition: &str) -> Reservation {
+        let now = chrono::Utc::now();
+        Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+            partition: Some(partition.into()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_with_unknown_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let err = cm
+            .create_reservation(partitioned_reservation("nope"))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ReservationError::InvalidArgument(m) if m.contains("unknown partition 'nope'")),
+            "unexpected error: {err:?}"
+        );
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_with_known_partition_is_stored() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.create_reservation(partitioned_reservation("default"))
+            .unwrap();
+        assert_eq!(
+            cm.get_reservations()[0].partition.as_deref(),
+            Some("default")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_prioritize_active_reservation_targets() {
         let dir = TempDir::new().unwrap();
@@ -29782,7 +29832,7 @@ state = "UP"
                 users: vec!["alice".into()],
                 flags: Default::default(),
                 owner: String::new(),
-                partition: None,
+                partition: Some("default".into()),
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -29793,6 +29843,10 @@ state = "UP"
             cm2.get_reservations().iter().any(|r| r.name == "r1")
         });
         assert_eq!(cm2.get_reservations().len(), 1);
+        assert_eq!(
+            cm2.get_reservations()[0].partition.as_deref(),
+            Some("default")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

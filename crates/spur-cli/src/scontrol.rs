@@ -2473,6 +2473,7 @@ async fn create_reservation(
             users: user_list,
             flags: flag_list,
             user: crate::interactive::current_user()?,
+            partition: String::new(),
         })
         .await
         .context("failed to create reservation")?;
