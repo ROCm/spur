@@ -849,26 +849,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
 
             for res in reservations {
-                println!("ReservationName={}", res.name);
-                println!("   StartTime={}", res.start_time);
-                println!("   EndTime={}", res.end_time);
-                println!("   Nodes={}", res.nodes);
-                if !res.state.is_empty() {
-                    println!("   State={}", res.state);
-                }
-                if !res.flags.is_empty() {
-                    println!("   Flags={}", res.flags);
-                }
-                if !res.accounts.is_empty() {
-                    println!("   Accounts={}", res.accounts);
-                }
-                if !res.users.is_empty() {
-                    println!("   Users={}", res.users);
-                }
-                if !res.owner.is_empty() {
-                    println!("   Owner={}", res.owner);
-                }
-                println!();
+                print!("{}", format_reservation_detail(&res));
             }
         }
         "step" | "steps" => {
@@ -2530,6 +2511,31 @@ fn actor_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+/// Render one reservation for `scontrol show reservation`.
+fn format_reservation_detail(res: &spur_proto::proto::ReservationInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "ReservationName={}", res.name);
+    let _ = writeln!(out, "   StartTime={}", res.start_time);
+    let _ = writeln!(out, "   EndTime={}", res.end_time);
+    let _ = writeln!(out, "   Nodes={}", res.nodes);
+    let optional = [
+        ("PartitionName", &res.partition),
+        ("State", &res.state),
+        ("Flags", &res.flags),
+        ("Accounts", &res.accounts),
+        ("Users", &res.users),
+        ("Owner", &res.owner),
+    ];
+    for (key, value) in optional {
+        if !value.is_empty() {
+            let _ = writeln!(out, "   {key}={value}");
+        }
+    }
+    out.push('\n');
+    out
+}
+
 /// Render one partition for `scontrol show partition`.
 fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
     use std::fmt::Write;
@@ -3952,6 +3958,33 @@ mod tests {
         };
         assert!(format_partition_detail(&part("usercap")).contains("   QoS=usercap\n"));
         assert!(format_partition_detail(&part("")).contains("   QoS=N/A\n"));
+    }
+
+    fn reservation_info(partition: &str, state: &str) -> spur_proto::proto::ReservationInfo {
+        spur_proto::proto::ReservationInfo {
+            name: "r1".into(),
+            start_time: "S".into(),
+            end_time: "E".into(),
+            nodes: "n1".into(),
+            state: state.into(),
+            partition: partition.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn format_reservation_detail_prints_partition_when_set() {
+        assert_eq!(
+            format_reservation_detail(&reservation_info("gpu", "ACTIVE")),
+            "ReservationName=r1\n   StartTime=S\n   EndTime=E\n   Nodes=n1\n   PartitionName=gpu\n   State=ACTIVE\n\n"
+        );
+    }
+
+    #[test]
+    fn format_reservation_detail_omits_empty_fields() {
+        let out = format_reservation_detail(&reservation_info("", ""));
+        assert!(!out.contains("PartitionName="), "{out}");
+        assert!(!out.contains("State="), "{out}");
     }
 
     #[test]
