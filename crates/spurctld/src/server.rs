@@ -1178,6 +1178,20 @@ impl ControllerService {
     /// Split out so the audit layer records the outcome uniformly, including
     /// `invalid_argument` parse failures that occur before the cluster call.
     fn build_and_create_reservation(&self, req: CreateReservationRequest) -> Result<(), Status> {
+        let has_duration = req.duration_minutes > 0;
+        let has_end_time = !req.end_time.is_empty();
+
+        if has_duration && has_end_time {
+            return Err(Status::invalid_argument(
+                "duration and end_time are mutually exclusive; specify one, not both",
+            ));
+        }
+        if !has_duration && !has_end_time {
+            return Err(Status::invalid_argument(
+                "either duration_minutes or end_time is required",
+            ));
+        }
+
         let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
         {
             Utc::now()
@@ -1186,7 +1200,15 @@ impl ControllerService {
                 .parse::<DateTime<Utc>>()
                 .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
         };
-        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
+
+        let end_time = if has_end_time {
+            req.end_time
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| Status::invalid_argument(format!("invalid end_time: {}", e)))?
+        } else {
+            start_time + chrono::Duration::minutes(req.duration_minutes as i64)
+        };
+
         let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
             .map_err(Status::invalid_argument)?;
         let reservation = Reservation {
@@ -3779,6 +3801,7 @@ impl SlurmController for ControllerService {
                 txn::create_details(
                     &req.start_time,
                     req.duration_minutes,
+                    &req.end_time,
                     &req.nodes,
                     &req.accounts,
                     &req.users,
@@ -3813,6 +3836,7 @@ impl SlurmController for ControllerService {
                 &req.name,
                 txn::update_details(
                     req.duration_minutes,
+                    &req.end_time,
                     &req.add_nodes,
                     &req.remove_nodes,
                     &req.add_users,
@@ -3826,10 +3850,21 @@ impl SlurmController for ControllerService {
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
+        let end_time = if req.end_time.is_empty() {
+            None
+        } else {
+            Some(
+                req.end_time
+                    .parse::<DateTime<Utc>>()
+                    .map_err(|e| Status::invalid_argument(format!("invalid end_time: {}", e)))?,
+            )
+        };
+
         self.cluster
             .update_reservation(
                 &req.name,
                 req.duration_minutes,
+                end_time,
                 &req.add_nodes,
                 &req.remove_nodes,
                 &req.add_users,
@@ -18552,6 +18587,7 @@ mod tests {
                 users: Vec::new(),
                 flags: Vec::new(),
                 user: String::new(),
+                end_time: String::new(),
             }))
             .await
             .unwrap();
@@ -18660,6 +18696,7 @@ mod tests {
                 users,
                 flags: Vec::new(),
                 user: String::new(),
+                end_time: String::new(),
             }))
             .await
             .unwrap();

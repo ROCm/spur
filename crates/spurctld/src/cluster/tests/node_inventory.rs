@@ -572,6 +572,7 @@ fn committed_node_inventory_fences_late_registration_placement_and_reservation()
             remove_users: Vec::new(),
             add_accounts: Vec::new(),
             remove_accounts: Vec::new(),
+            end_time: None,
         })
         .node_inventory_error
         .is_some());
