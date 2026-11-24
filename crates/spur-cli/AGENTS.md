@@ -172,7 +172,10 @@ jobid asc. `--start` shows projected start times for pending jobs.
 
 **sacct** queries the accounting service (same gRPC port). Its state filter
 uses the same `parse_states_arg` as squeue before opening the connection. Format uses
-comma-separated field names (`--format=JobID,JobName,State`).
+comma-separated field names (`--format=JobID,JobName,State`). An empty
+`NodeList` on a row with no start time renders Slurm's `None assigned`
+(`NO_NODES_ASSIGNED`); on a started row it stays blank, since the run's nodes
+went unrecorded (an older row, or one written by the external `RecordJobStart`).
 
 ### Node management (sinfo, scontrol)
 
