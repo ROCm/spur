@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
-use spur_core::script_placement::ResolvedPlacement;
+use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
 use spur_core::task_launch::{build_step_task_plan, step_needs_pmix_prepare};
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
@@ -5551,10 +5551,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
-    let script_placement = (!spec.script_placement.is_empty())
-        .then(|| spec.script_placement.parse())
-        .transpose()
-        .map_err(Status::invalid_argument)?;
+    let script_placement =
+        ScriptPlacement::from_wire(&spec.script_placement).map_err(Status::invalid_argument)?;
 
     let job_spec = spur_core::job::JobSpec {
         submitted_at: None,
@@ -6072,11 +6070,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             .filter(|_| run_started && job.spec.is_batch())
             .cloned()
             .unwrap_or_default(),
-        script_placement: job
-            .spec
-            .script_placement
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        script_placement: ScriptPlacement::to_wire(job.spec.script_placement),
         resolved_script_placement: if run_started {
             job.script_placement().to_string()
         } else {

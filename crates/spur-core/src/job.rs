@@ -1524,6 +1524,16 @@ impl Job {
             .any(|node| !self.node_completions.contains_key(node))
     }
 
+    /// Drop what a reservation recorded on the job: nodes, resources, partition, and
+    /// resolved placement. Freeing the nodes' side is the caller's job.
+    pub fn clear_placement(&mut self) {
+        self.allocated_nodes.clear();
+        self.allocated_resources = None;
+        self.per_node_alloc.clear();
+        self.resolved_placement = None;
+        self.leave_partition();
+    }
+
     /// Whether this job currently occupies node/TRES capacity: either Running,
     /// or Pending with a reservation `reserve_placement` already charged.
     /// Quota/occupancy aggregates must use this, not a bare `== Running` check,

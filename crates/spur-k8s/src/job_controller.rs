@@ -1048,10 +1048,9 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         client_keepalive: false,
         cpus_per_gpu: None,
         memory_per_gpu_mb: 0,
-        script_placement: spec
-            .script_placement
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        script_placement: spur_core::script_placement::ScriptPlacement::to_wire(
+            spec.script_placement,
+        ),
     }
 }
 

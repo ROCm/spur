@@ -175,7 +175,8 @@ Held in controller memory. Key fields beyond the spec:
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
 - `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
-  and cleared on requeue. `Job::script_placement()` falls back to the `auto` text scan when
+  and cleared with the rest of the placement by `Job::clear_placement` (on requeue, or a hold
+  that frees the reservation). `Job::script_placement()` falls back to the `auto` text scan when
   it is unset (a run dispatched before placements were recorded), which is what agents
   without the `script-placement` capability apply.
 - `preferred_nodes`, `last_sched_eval`: transient per-scheduling-pass hints (`#[serde(skip)]`).

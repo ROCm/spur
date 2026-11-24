@@ -32,6 +32,17 @@ impl ScriptPlacement {
         }
     }
 
+    /// The proto string for a job's placement: empty when unset, which leaves the job to the
+    /// cluster default.
+    pub fn to_wire(placement: Option<Self>) -> String {
+        placement.map_or_else(String::new, |p| p.as_str().to_owned())
+    }
+
+    /// Inverse of [`Self::to_wire`]: empty is unset, anything else must name a placement.
+    pub fn from_wire(s: &str) -> Result<Option<Self>, String> {
+        (!s.is_empty()).then(|| s.parse()).transpose()
+    }
+
     /// Where a script with this placement runs.
     pub fn resolve(self, script: Option<&str>) -> ResolvedPlacement {
         match self {
@@ -255,6 +266,17 @@ mod tests {
         }
         let err = "batchhost".parse::<ScriptPlacement>().unwrap_err();
         assert!(err.contains("auto, batch-host, or all-nodes"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_wire_string_is_an_unset_placement() {
+        assert_eq!(ScriptPlacement::to_wire(None), "");
+        assert_eq!(ScriptPlacement::from_wire(""), Ok(None));
+        for placement in ScriptPlacement::ALL {
+            let wire = ScriptPlacement::to_wire(Some(placement));
+            assert_eq!(ScriptPlacement::from_wire(&wire), Ok(Some(placement)));
+        }
+        assert!(ScriptPlacement::from_wire("batchhost").is_err());
     }
 
     #[test]

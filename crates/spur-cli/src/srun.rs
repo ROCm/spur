@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::env_defaults::{
-    apply_csv, apply_flag, apply_num, apply_num_opt, apply_num_opt_nonzero, apply_str,
+    apply_csv, apply_flag, apply_num, apply_num_opt_nonzero, apply_parsed_opt, apply_str,
     apply_string, was_cli_set,
 };
 use crate::resource_opts::{
@@ -516,13 +516,13 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         ],
         &mut args.nodes,
     )?;
-    apply_num_opt(
+    apply_parsed_opt(
         matches,
         "ntasks",
         &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
         &mut args.ntasks,
     )?;
-    apply_num_opt(
+    apply_parsed_opt(
         matches,
         "cpus_per_task",
         CPUS_PER_TASK_ENV,

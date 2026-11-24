@@ -1322,6 +1322,19 @@ multi-node or ``--mpi=pmix`` job. Such a job waits until enough upgraded nodes a
 free, including any node it names with ``--nodelist``. Every other job still runs
 on any node.
 
+.. _upgrading-k8s-batch-jobs:
+
+Batch jobs and Kubernetes operator nodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Nodes managed by the Kubernetes operator launch only SpurJobs, so a batch job
+placed on one was refused at launch. The scheduler no longer offers them to batch
+jobs: in a partition that mixes them with native nodes, a batch job runs on the
+native nodes, or waits with a reason when there are too few. ``sbatch`` now
+rejects a ``--nodelist`` that leaves too few native nodes, so scripts that pin
+batch jobs to operator nodes fail at submit; submit that work as a SpurJob instead.
+SpurJobs are unaffected.
+
 See Also
 --------
 

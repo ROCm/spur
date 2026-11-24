@@ -131,14 +131,16 @@ impl<'a> NodePlacement<'a> {
         mut candidates: Vec<usize>,
         script_placement_default: ScriptPlacement,
     ) -> Option<Vec<usize>> {
-        if !self
-            .job
-            .spec
-            .needs_placement_aware_agents(script_placement_default)
+        let misplaces = |i: usize| nodes[i].reads_placement_off_script();
+        // Before the job check, which scans the script: with every agent upgraded, no pass scans.
+        if !candidates.iter().any(|&i| misplaces(i))
+            || !self
+                .job
+                .spec
+                .needs_placement_aware_agents(script_placement_default)
         {
             return Some(candidates);
         }
-        let misplaces = |i: usize| nodes[i].reads_placement_off_script();
         if self.nodelist_is_additive()
             && candidates
                 .iter()

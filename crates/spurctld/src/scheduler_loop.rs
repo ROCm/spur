@@ -10,7 +10,7 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
-use spur_core::script_placement::ResolvedPlacement;
+use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -2945,10 +2945,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         client_keepalive: s.client_keepalive,
         cpus_per_gpu: s.cpus_per_gpu,
         memory_per_gpu_mb: s.memory_per_gpu_mb.unwrap_or(0),
-        script_placement: s
-            .script_placement
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        script_placement: ScriptPlacement::to_wire(s.script_placement),
     }
 }
 
@@ -3239,10 +3236,7 @@ async fn dispatch_to_agent(
         client_keepalive: spec.client_keepalive,
         cpus_per_gpu: spec.cpus_per_gpu,
         memory_per_gpu_mb: spec.memory_per_gpu_mb.unwrap_or(0),
-        script_placement: spec
-            .script_placement
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        script_placement: ScriptPlacement::to_wire(spec.script_placement),
     };
 
     let response = client

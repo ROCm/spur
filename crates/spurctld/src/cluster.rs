@@ -8970,11 +8970,7 @@ impl ClusterManager {
     fn clear_run_state_for_requeue(job: &mut Job) {
         job.start_time = None;
         job.exit_code = None;
-        job.allocated_nodes.clear();
-        job.resolved_placement = None;
-        job.allocated_resources = None;
-        job.per_node_alloc.clear();
-        job.leave_partition();
+        job.clear_placement();
         job.node_completions.clear();
         job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
@@ -10160,10 +10156,7 @@ impl ClusterManager {
                             let freed_nodes = job.allocated_nodes.clone();
                             let allocated_resources = job.allocated_resources.clone();
                             let per_node_map = job.per_node_alloc.clone();
-                            job.allocated_nodes.clear();
-                            job.allocated_resources = None;
-                            job.per_node_alloc.clear();
-                            job.leave_partition();
+                            job.clear_placement();
                             Self::deallocate_job_slices(
                                 &mut nodes,
                                 &freed_nodes,
@@ -16398,14 +16391,9 @@ state = "UP"
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reservation_records_where_the_script_runs_until_the_run_ends() {
+    fn reserve_a_batch_host_run(cm: &ClusterManager, id: JobId) -> u32 {
         use spur_core::script_placement::ResolvedPlacement;
 
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 16000);
-        let id = submit_and_wait(&cm, basic_spec("placed"));
         let res = scalar_alloc(4, 8000);
         let attempt = cm
             .reserve_attributed_placement(
@@ -16424,6 +16412,16 @@ state = "UP"
             cm.get_job(id).unwrap().resolved_placement,
             Some(ResolvedPlacement::BatchHost)
         );
+        attempt
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_records_where_the_script_runs_until_the_run_ends() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("placed"));
+        let attempt = reserve_a_batch_host_run(&cm, id);
 
         cm.abort_placement(id, attempt, false).expect("abort");
         wait_for("placement released", || {
@@ -16433,6 +16431,82 @@ state = "UP"
             cm.get_job(id).unwrap().resolved_placement,
             None,
             "the next run resolves its own placement"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_that_frees_a_reservation_drops_where_the_script_runs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("held"));
+        let attempt = reserve_a_batch_host_run(&cm, id);
+
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: id,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(attempt),
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert!(!job.holds_a_placement(), "the hold freed the reservation");
+        assert_eq!(
+            job.resolved_placement, None,
+            "the next run resolves its own placement"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_keeps_where_its_script_runs_across_replay_and_snapshot_restore() {
+        use spur_core::script_placement::ResolvedPlacement;
+
+        let dir = TempDir::new().unwrap();
+        let (id, snapshot) = {
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 8, 16000);
+            let spec = JobSpec {
+                script: Some("#!/bin/bash\n./runner.sh\n".into()),
+                ..basic_spec("placed")
+            };
+            let id = submit_and_wait(&cm, spec);
+            let attempt = reserve_a_batch_host_run(&cm, id);
+            let res = scalar_alloc(4, 8000);
+            cm.activate_job(
+                id,
+                attempt,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+                false,
+                false,
+            )
+            .expect("activate");
+            settle(&cm, id, JobState::Running);
+            (id, cm.snapshot_state().unwrap())
+        };
+        let keeps_batch_host = |cm: &ClusterManager| {
+            cm.get_job(id).is_some_and(|job| {
+                job.resolved_placement == Some(ResolvedPlacement::BatchHost)
+                    && job.script_placement() == ResolvedPlacement::BatchHost
+            })
+        };
+
+        let replayed = test_cluster(&dir).await;
+        wait_for("the JobStart replays with its placement", || {
+            keeps_batch_host(&replayed)
+        });
+
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert!(
+            keeps_batch_host(&restored),
+            "the snapshot carries the run's placement, not the script's all-nodes scan"
         );
     }
 

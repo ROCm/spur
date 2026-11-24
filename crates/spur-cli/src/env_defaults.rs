@@ -188,9 +188,9 @@ where
     Ok(())
 }
 
-/// Apply a numeric env default to an `Option<T>` flag, i.e. one with no clap
+/// Apply a parsed env default to an `Option<T>` flag, i.e. one with no clap
 /// default where staying unset carries meaning.
-pub fn apply_num_opt<T>(
+pub fn apply_parsed_opt<T>(
     matches: &ArgMatches,
     id: &str,
     names: &[&str],
@@ -209,7 +209,7 @@ where
     Ok(())
 }
 
-/// Like `apply_num_opt`, but rejects a resolved value of zero, naming the
+/// Like `apply_parsed_opt`, but rejects a resolved value of zero, naming the
 /// variable that supplied it. `FromStr` has no notion of range, so this
 /// mirrors clap's CLI-side `value_parser!(u32).range(1..)` for the env path.
 pub fn apply_num_opt_nonzero(
