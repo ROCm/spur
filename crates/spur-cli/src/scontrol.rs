@@ -1717,15 +1717,8 @@ async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
 
 /// Parse "key=value" params from `scontrol update` command.
 async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
-    match detect_entity(params) {
-        Some(ScontrolEntity::Partition) => {
-            return parse_and_update_partition(controller, params).await
-        }
-        Some(ScontrolEntity::Reservation) => anyhow::bail!(
-            "scontrol update: inline ReservationName= updates are not supported; \
-             use `scontrol update-reservation --name=<name> ...`"
-        ),
-        None => {}
+    if let Some(ScontrolEntity::Partition) = detect_entity(params) {
+        return parse_and_update_partition(controller, params).await;
     }
 
     match parse_update(params)? {
@@ -5003,7 +4996,25 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("update-reservation"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("not supported: 'ReservationName=r1'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_update_naming_a_reservation_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = parse_and_update(
+            &format!("http://{addr}"),
+            &p(&["JobId=5", "ReservationName=r1"]),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not supported: 'ReservationName=r1'"), "{err}");
+        assert!(!err.contains("update-reservation"), "{err}");
     }
 
     #[tokio::test]
