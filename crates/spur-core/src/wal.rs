@@ -92,6 +92,9 @@ pub enum WalOperation {
         /// changed anything.
         #[serde(default)]
         memory_adjustment: Option<MemoryAdjustment>,
+        /// Where the run's batch script runs. `None` in pre-upgrade entries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_placement: Option<crate::script_placement::ResolvedPlacement>,
         /// Stamped on the leader so a replay dates the run from the dispatch
         /// rather than from its own clock. `None` in pre-upgrade entries.
         #[serde(default)]
@@ -685,6 +688,7 @@ impl WalOperation {
             idle_fill: false,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         }
     }
@@ -1337,6 +1341,7 @@ mod tests {
             idle_fill: true,
             effective_partition: None,
             memory_adjustment: None,
+            resolved_placement: None,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1375,6 +1380,7 @@ mod tests {
             effective_partition: Some("cpu".into()),
             memory_adjustment: Some(adjustment),
             preemption_observation: Some(7),
+            resolved_placement: None,
             at: None,
         };
         let back: WalOperation =
@@ -1410,6 +1416,52 @@ mod tests {
                 assert_eq!(name, "cpu");
                 assert_eq!(resource_limits, None);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen JobStart entry from before script placement was recorded. Never regenerate.
+    #[test]
+    fn job_start_pre_script_placement_payload_still_deserializes() {
+        const JOB_START_PRE_PLACEMENT: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1,"idle_fill":false,"effective_partition":null,"memory_adjustment":null,"at":null}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_PLACEMENT)
+            .expect("pre-placement JobStart must deserialize");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                resolved_placement,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert_eq!(resolved_placement, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_resolved_placement_round_trips() {
+        let mut op = WalOperation::job_start(
+            9,
+            vec!["n1".into()],
+            ResourceAllocations::default(),
+            HashMap::new(),
+        );
+        if let WalOperation::JobStart {
+            resolved_placement, ..
+        } = &mut op
+        {
+            *resolved_placement = Some(crate::script_placement::ResolvedPlacement::BatchHost);
+        }
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::JobStart {
+                resolved_placement, ..
+            } => assert_eq!(
+                resolved_placement,
+                Some(crate::script_placement::ResolvedPlacement::BatchHost)
+            ),
             _ => panic!("wrong variant"),
         }
     }

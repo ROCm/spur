@@ -43,6 +43,7 @@ fn reserve(cm: &ClusterManager, id: JobId, attempt: u32, nodes: &[(&str, Resourc
         srun_step_dispatch: false,
         run_attempt: attempt,
         idle_fill: false,
+        resolved_placement: None,
         at: None,
     });
 }

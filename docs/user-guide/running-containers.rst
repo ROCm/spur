@@ -100,11 +100,13 @@ A GPU training job with a read-only data mount:
           --container-mounts /data:/data:ro \
           --gres=gpu:8 train.sh
 
-An interactive shell in a container with your home directory mounted:
+An interactive shell in a container with your home directory mounted. ``--pty``
+connects the shell to your terminal; without it, ``bash`` gets no input and exits
+at once:
 
 .. code-block:: bash
 
-   srun --container-image ubuntu:22.04 --container-mount-home bash
+   srun --pty --container-image ubuntu:22.04 --container-mount-home bash
 
 How the Image Is Treated
 ~~~~~~~~~~~~~~~~~~~~~~~~

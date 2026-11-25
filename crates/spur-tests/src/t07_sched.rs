@@ -35,6 +35,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -63,6 +64,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -90,6 +92,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -113,6 +116,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -139,6 +143,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -168,6 +173,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -201,6 +207,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
 
@@ -348,6 +355,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -378,6 +386,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         // No idle nodes available, so exclusive job cannot be scheduled
@@ -406,6 +415,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -435,6 +445,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -468,6 +479,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");
@@ -502,6 +514,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         // Should schedule to the non-suspended node only.
@@ -526,6 +539,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "all nodes suspended");
@@ -565,6 +579,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[res],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -607,6 +622,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[res],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -632,6 +648,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -658,6 +675,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         // Must not panic — should schedule with 1 node (the minimum)
         let assignments = sched.schedule(&[job], &cluster);
@@ -683,6 +701,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -712,6 +731,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -742,6 +762,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -773,6 +794,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         // Should NOT be scheduled — insufficient available resources
@@ -806,6 +828,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -859,6 +882,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: Some(&topo),
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -926,6 +950,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: Some(&topo),
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -972,6 +997,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: Some(&topo),
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -1018,6 +1044,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: Some(&topo),
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -1073,6 +1100,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -1102,6 +1130,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            script_placement_default: Default::default(),
         };
 
         let assignments = sched.schedule(&pending, &cluster);

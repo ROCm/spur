@@ -18,7 +18,7 @@ upgrade replay.
 
 ```
 src/
-  lib.rs                 -- pub mod declarations (50 modules)
+  lib.rs                 -- pub mod declarations (53 modules)
   config.rs              -- SlurmConfig (TOML), all config sections (~5000 lines)
   job.rs                 -- JobSpec, Job, JobState, PendingReason, state machine
   node.rs                -- Node, NodeState, NodeEvent, NodeSource, NodeOverlay
@@ -61,6 +61,7 @@ src/
   quota_names.rs         -- K8s quota namespace/SA naming (account_namespace, sanitize_dns_label)
   audit_metrics.rs       -- Counters for the OpenMetrics audit surface
   task_launch.rs         -- Multi-task/multi-node step launch helpers (batch + srun dispatch)
+  script_placement.rs    -- ScriptPlacement (requested), ResolvedPlacement (per run), the `auto` text scan
   native_cred.rs         -- Native per-RPC credential structure (HMAC-signed)
   native_jwks.rs         -- JWKS key set loading and rotation
   native_mint.rs         -- Credential minting (sign a UserRpcCredential)
@@ -173,6 +174,11 @@ Held in controller memory. Key fields beyond the spec:
 - `time_limit_signaled_at`, `cancel_signaled_at`: replicated instants for deterministic verdicts.
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
+- `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
+  and cleared with the rest of the placement by `Job::clear_placement` (on requeue, or a hold
+  that frees the reservation). `Job::script_placement()` falls back to the `auto` text scan when
+  it is unset (a run dispatched before placements were recorded), which is what agents
+  without the `script-placement` capability apply.
 - `preferred_nodes`, `last_sched_eval`: transient per-scheduling-pass hints (`#[serde(skip)]`).
 
 `Job::run_time_at(now)` returns the current run's duration from `start_time`

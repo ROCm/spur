@@ -2733,6 +2733,18 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         let _ = write!(out, " SchedNodeList={}", job.sched_nodelist);
     }
     let _ = writeln!(out);
+    if job.batch_flag {
+        let placement = if job.resolved_script_placement.is_empty() {
+            or_null(&job.script_placement)
+        } else {
+            &job.resolved_script_placement
+        };
+        let _ = write!(out, "   ");
+        if !job.batch_host.is_empty() {
+            let _ = write!(out, "BatchHost={} ", job.batch_host);
+        }
+        let _ = writeln!(out, "ScriptPlacement={placement}");
+    }
     let _ = writeln!(
         out,
         "   NumNodes={} NumTasks={} CPUs/Task={}",
@@ -3051,6 +3063,41 @@ mod tests {
             dependency: vec!["afterok:5".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn job_detail_shows_where_a_batch_script_runs() {
+        use spur_proto::proto::JobInfo;
+
+        let requested = JobInfo {
+            batch_flag: true,
+            script_placement: "batch-host".into(),
+            ..Default::default()
+        };
+        let out = format_job_detail(&requested);
+        assert!(out.contains("\n   ScriptPlacement=batch-host\n"), "{out}");
+        assert!(!out.contains("BatchHost="), "not placed yet: {out}");
+
+        let unset = JobInfo {
+            batch_flag: true,
+            ..Default::default()
+        };
+        assert!(format_job_detail(&unset).contains("ScriptPlacement=(null)"));
+
+        let placed = JobInfo {
+            batch_flag: true,
+            batch_host: "node001".into(),
+            script_placement: "auto".into(),
+            resolved_script_placement: "all-nodes".into(),
+            ..Default::default()
+        };
+        let out = format_job_detail(&placed);
+        assert!(
+            out.contains("\n   BatchHost=node001 ScriptPlacement=all-nodes\n"),
+            "the resolved placement replaces the request once placed: {out}"
+        );
+
+        assert!(!format_job_detail(&JobInfo::default()).contains("ScriptPlacement"));
     }
 
     #[test]

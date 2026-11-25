@@ -10,6 +10,7 @@ use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
+use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -588,7 +589,7 @@ async fn process_assignment_inner(
     let resources = compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
 
     let job_id = assignment.job_id;
-    let attribution = crate::cluster::RunAttribution::for_assignment(&assignment, borrowed);
+    let mut attribution = crate::cluster::RunAttribution::for_assignment(&assignment, borrowed);
     // Dispatch and the prolog must see the request the placement was sized
     // for, not one recomputed from a memory policy changed since.
     let mut spec = job.spec.clone();
@@ -616,6 +617,22 @@ async fn process_assignment_inner(
             error!(job_id, error = %e, "failed to requeue srun job without script");
         }
         return false;
+    }
+
+    let placement_nodes: Vec<Node> = all_nodes
+        .iter()
+        .filter_map(|name| cluster.get_node(name))
+        .collect();
+    match crate::script_placement::resolve_run_placement(
+        &spec,
+        &placement_nodes,
+        cluster.config().controller.script_placement,
+    ) {
+        Ok(placement) => attribution.resolved_placement = Some(placement),
+        Err(refusal) => {
+            refuse_run_placement(&cluster, &job, refusal);
+            return false;
+        }
     }
 
     // Run PrologSlurmctld before any node is touched. In Slurm it gates node
@@ -987,18 +1004,19 @@ pub(crate) struct PassView {
     partition_node_usage: PartitionNodeUsage,
     pub(crate) fabric: spur_sched::traits::FabricSchedulingContext,
     topology: Option<spur_core::topology::TopologyTree>,
+    script_placement_default: spur_core::script_placement::ScriptPlacement,
 }
 
 impl PassView {
     /// Read for `in_quota`, the jobs classification admitted, before any borrower
     /// joins: only they own handoffs or lift a node's dispatch cooldown.
     pub(crate) fn read(cluster: &ClusterManager, in_quota: &[spur_core::job::Job]) -> Self {
+        let config = cluster.config();
         let nodes = cluster.nodes_off_dispatch_cooldown(in_quota);
         let reservations = cluster.get_reservations();
         let handoffs = cluster.preemption_handoffs(in_quota, &nodes, &reservations);
         let view = cluster.fabric_view(Utc::now());
-        let topology = cluster
-            .config()
+        let topology = config
             .topology
             .as_ref()
             .and_then(|config| config.build(&cluster.get_nodes(), &view));
@@ -1011,6 +1029,7 @@ impl PassView {
             partition_node_usage: running_partition_usage(cluster),
             fabric: spur_sched::traits::FabricSchedulingContext { view },
             topology,
+            script_placement_default: config.controller.script_placement,
         }
     }
 
@@ -1024,6 +1043,7 @@ impl PassView {
             busy_until: &self.busy_until,
             preemption_handoffs: &self.handoffs,
             partition_node_usage: &self.partition_node_usage,
+            script_placement_default: self.script_placement_default,
         }
     }
 }
@@ -1592,6 +1612,7 @@ pub(crate) async fn try_preempt_beside(
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
+        script_placement_default: Default::default(),
     };
     try_preempt_with_handoffs(
         cluster,
@@ -1624,6 +1645,7 @@ pub(crate) async fn reclaim_for(
         busy_until: &HashMap::new(),
         preemption_handoffs: &HashMap::new(),
         partition_node_usage: &usage,
+        script_placement_default: Default::default(),
     };
     let mut sched = cluster.config().scheduler.clone();
     sched.idle_fill_exempt_secs = 0;
@@ -2924,6 +2946,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         client_keepalive: s.client_keepalive,
         cpus_per_gpu: s.cpus_per_gpu,
         memory_per_gpu_mb: s.memory_per_gpu_mb.unwrap_or(0),
+        script_placement: ScriptPlacement::to_wire(s.script_placement),
     }
 }
 
@@ -2958,6 +2981,7 @@ struct AgentDispatchParams<'a> {
     /// its own gets a ceiling instead of running unbounded. 0 if the node is
     /// unknown at dispatch time.
     node_memory_ceiling_mb: u64,
+    script_placement: ResolvedPlacement,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -3213,6 +3237,7 @@ async fn dispatch_to_agent(
         client_keepalive: spec.client_keepalive,
         cpus_per_gpu: spec.cpus_per_gpu,
         memory_per_gpu_mb: spec.memory_per_gpu_mb.unwrap_or(0),
+        script_placement: ScriptPlacement::to_wire(spec.script_placement),
     };
 
     let response = client
@@ -3234,6 +3259,7 @@ async fn dispatch_to_agent(
             core_layout: params.core_layout.clone(),
             layout_revision: Some(params.layout_revision),
             node_memory_ceiling_mb: params.node_memory_ceiling_mb,
+            script_placement: params.script_placement.to_string(),
         })
         .await
         .map_err(dispatch_error_from_status)?;
@@ -3574,6 +3600,42 @@ enum DispatchConfirmOutcome {
     Aborted,
 }
 
+/// Leave a job whose run cannot be placed as resolved Pending: held when the
+/// user has to change it, backed off when an agent upgrade will fix it.
+fn refuse_run_placement(
+    cluster: &ClusterManager,
+    job: &spur_core::job::Job,
+    refusal: crate::script_placement::PlacementRefusal,
+) {
+    use crate::script_placement::PlacementRefusal;
+
+    let job_id = job.job_id;
+    // The attempt this dispatch would have reserved.
+    let run_attempt = job.run_attempt.saturating_add(1);
+    match refusal {
+        PlacementRefusal::Hold(detail) => {
+            warn!(job_id, "{detail}");
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail), run_attempt)
+            {
+                error!(job_id, error = %e, "failed to hold job for unsupported script placement");
+            }
+        }
+        PlacementRefusal::Backoff(detail) => {
+            warn!(job_id, "{detail}");
+            let _ = cluster.set_job_launch_failure_detail(job_id, detail);
+            // An agent too old for the placement is not the job's fault.
+            let spare_requeue_budget = cluster.take_spared_dispatch(job_id);
+            if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(
+                job_id,
+                run_attempt,
+                spare_requeue_budget,
+            ) {
+                error!(job_id, error = %e, "failed to back off for an agent without script placement");
+            }
+        }
+    }
+}
+
 fn abort_pending_pmix_dispatch(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
@@ -3659,11 +3721,13 @@ async fn confirm_dispatch_on_nodes(
     let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
     let dispatch_timeout = dispatch_deadline(&cluster);
 
-    let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
-        spec.mpi.as_deref(),
-        spec.num_nodes,
-        spec.script.as_deref(),
+    // As this run's reservation recorded it.
+    let script_placement = cluster.get_job(job_id).map_or_else(
+        || ResolvedPlacement::scanned(spec.script.as_deref()),
+        |job| job.script_placement(),
     );
+    let needs_pmix_prepare =
+        batch_dispatched_multi_node_pmix(spec.mpi.as_deref(), spec.num_nodes, script_placement);
 
     let mut peer_hosts: Vec<String> = Vec::new();
     let mut node_agents: Vec<(String, String)> = Vec::new();
@@ -3791,6 +3855,7 @@ async fn confirm_dispatch_on_nodes(
                 core_layout: delivery.layout.clone(),
                 layout_revision: delivery.revision,
                 node_memory_ceiling_mb,
+                script_placement,
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
                 Ok(Some(plan)) => plan,
@@ -3881,6 +3946,7 @@ async fn confirm_dispatch_on_nodes(
                 core_layout: delivery.layout.clone(),
                 layout_revision: delivery.revision,
                 node_memory_ceiling_mb,
+                script_placement,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
             // The join below drains every node, so one agent that accepts the call and never answers
@@ -6484,6 +6550,7 @@ pub(crate) mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: handoffs,
                 partition_node_usage: &Default::default(),
+                script_placement_default: Default::default(),
             };
             satisfiable_victim_set(
                 reclaimer,
@@ -6519,6 +6586,7 @@ pub(crate) mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: &HashMap::new(),
                 partition_node_usage: &Default::default(),
+                script_placement_default: Default::default(),
             };
             satisfiable_victim_set(
                 reclaimer,
@@ -6560,6 +6628,38 @@ pub(crate) mod tests {
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &own).is_some());
             let co_owned = held_by(vec![other, two_nodes.job_id]);
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &co_owned).is_some());
+        }
+
+        #[test]
+        fn reclaim_frees_no_node_whose_agent_would_misplace_the_script() {
+            use spur_core::node::CAP_SCRIPT_PLACEMENT;
+            use spur_core::script_placement::ScriptPlacement;
+
+            let mut nodes = vec![node("n1", 4), node("n2", 4)];
+            nodes[0].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                [("n2", vec![7])].into_iter().collect();
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let pool = TestVictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+                order: None,
+            };
+            let mut runner = reclaimer(2, 4);
+            runner.spec.script = Some("#!/bin/bash\n./runner.sh\n".into());
+            runner.spec.script_placement = Some(ScriptPlacement::BatchHost);
+
+            assert!(
+                victim_set_with_handoffs(&runner, &pool, &nodes, &HashMap::new()).is_none(),
+                "n2's agent would run the script itself, so evicting job 7 helps nobody"
+            );
+            nodes[1].capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+            assert_eq!(
+                victim_set_with_handoffs(&runner, &pool, &nodes, &HashMap::new()),
+                Some([7].into_iter().collect())
+            );
         }
 
         fn node(name: &str, cpus: u32) -> Node {
@@ -7477,6 +7577,8 @@ pub(crate) mod tests {
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
+            launch_requests:
+                Option<Arc<std::sync::Mutex<Vec<spur_proto::proto::LaunchJobRequest>>>>,
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
@@ -7556,6 +7658,9 @@ pub(crate) mod tests {
                 }
                 if let Some(sink) = &self.captured_node_memory_ceiling_mb {
                     sink.lock().unwrap().push(req.node_memory_ceiling_mb);
+                }
+                if let Some(sink) = &self.launch_requests {
+                    sink.lock().unwrap().push(req.clone());
                 }
                 let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
@@ -7880,6 +7985,7 @@ pub(crate) mod tests {
                 register_delay: Duration::ZERO,
                 reject_with_status: None,
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
@@ -7925,6 +8031,7 @@ pub(crate) mod tests {
                 register_delay,
                 reject_with_status: None,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay,
                 cancelled_attempts: Default::default(),
@@ -7945,6 +8052,42 @@ pub(crate) mod tests {
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
+        async fn spawn_mock_agent_capturing_launches() -> (
+            std::net::SocketAddr,
+            Arc<std::sync::Mutex<Vec<spur_proto::proto::LaunchJobRequest>>>,
+        ) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let launches = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                fanout_calls: None,
+                launch_requests: Some(launches.clone()),
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                cancel_requests: Default::default(),
+                signal_requests: Default::default(),
+                suspend_calls: Default::default(),
+                ping_hostname: String::new(),
+                captured_node_memory_ceiling_mb: None,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, launches)
+        }
+
         /// Mock agent whose launch_job always fails with `status`.
         async fn spawn_mock_agent_rejecting_with_status(
             status: tonic::Status,
@@ -7959,6 +8102,7 @@ pub(crate) mod tests {
                 reject_with_status: Some(status),
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
@@ -7993,6 +8137,7 @@ pub(crate) mod tests {
                 reject_with_status: None,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
@@ -8027,6 +8172,7 @@ pub(crate) mod tests {
                 reject_with_status: None,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
@@ -8065,6 +8211,7 @@ pub(crate) mod tests {
                 reject_with_status: None,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: cancelled_attempts.clone(),
@@ -8103,6 +8250,7 @@ pub(crate) mod tests {
                 reject_with_status: None,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                launch_requests: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
@@ -10527,6 +10675,137 @@ pub(crate) mod tests {
             );
         }
 
+        fn placement_capable() -> Vec<String> {
+            vec![spur_core::node::CAP_SCRIPT_PLACEMENT.to_string()]
+        }
+
+        fn runner_spec(name: &str, num_nodes: u32) -> JobSpec {
+            let mut spec = batch_spec(name, num_nodes);
+            spec.script = Some("#!/bin/bash\n./runner.sh\n".into());
+            spec
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_tells_every_agent_the_resolved_placement() {
+            use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (a1, launches1) = spawn_mock_agent_capturing_launches().await;
+            let (a2, launches2) = spawn_mock_agent_capturing_launches().await;
+            register_node_with_capabilities(&cm, "n1", a1, placement_capable());
+            register_node_with_capabilities(&cm, "n2", a2, placement_capable());
+
+            let mut spec = runner_spec("runner", 2);
+            spec.script_placement = Some(ScriptPlacement::BatchHost);
+            let job_id = submit_and_wait(&cm, spec);
+
+            assert!(process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await);
+            for launches in [launches1, launches2] {
+                let launches = launches.lock().unwrap();
+                assert_eq!(launches.len(), 1);
+                assert_eq!(launches[0].script_placement, "batch-host");
+                assert_eq!(
+                    launches[0].spec.as_ref().unwrap().script_placement,
+                    "batch-host"
+                );
+            }
+            assert_eq!(
+                cm.get_job(job_id).unwrap().resolved_placement,
+                Some(ResolvedPlacement::BatchHost)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_applies_the_cluster_default_to_an_unset_placement() {
+            use spur_core::script_placement::{ResolvedPlacement, ScriptPlacement};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.script_placement = ScriptPlacement::BatchHost;
+            let cm = test_cluster_with_config(&dir, config).await;
+            let (addr, launches) = spawn_mock_agent_capturing_launches().await;
+            register_node_with_capabilities(&cm, "n1", addr, placement_capable());
+
+            let job_id = submit_and_wait(&cm, runner_spec("defaulted", 1));
+
+            assert!(process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await);
+            assert_eq!(launches.lock().unwrap()[0].script_placement, "batch-host");
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.spec.script_placement, None, "kept as submitted");
+            assert_eq!(job.resolved_placement, Some(ResolvedPlacement::BatchHost));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_holds_a_batch_job_placed_on_k8s_agents() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (k1, launches1) = spawn_mock_agent_capturing_launches().await;
+            let (k2, launches2) = spawn_mock_agent_capturing_launches().await;
+            register_k8s_node_at(&cm, "k1", k1);
+            register_k8s_node_at(&cm, "k2", k2);
+
+            let job_id = submit_and_wait(&cm, runner_spec("k8s-runner", 2));
+
+            assert!(
+                !process_assignment(cm.clone(), assignment(job_id, &["k1", "k2"]), false).await
+            );
+            wait_for("hold applied", || {
+                cm.get_job(job_id).is_some_and(|j| j.priority == 0)
+            });
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::Held);
+            assert!(
+                job.state_reason().contains("K8s virtual agents"),
+                "{}",
+                job.state_reason()
+            );
+            assert!(!job.holds_a_placement());
+            assert!(launches1.lock().unwrap().is_empty());
+            assert!(launches2.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_backs_off_a_placement_an_old_agent_would_get_wrong() {
+            use spur_core::job::PendingReason;
+            use spur_core::script_placement::ScriptPlacement;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (a1, launches1) = spawn_mock_agent_capturing_launches().await;
+            let (a2, launches2) = spawn_mock_agent_capturing_launches().await;
+            register_node_with_capabilities(&cm, "n1", a1, placement_capable());
+            register_node_at(&cm, "n2", a2);
+
+            let mut spec = runner_spec("old-agent", 2);
+            spec.script_placement = Some(ScriptPlacement::BatchHost);
+            let job_id = submit_and_wait(&cm, spec);
+
+            let spared = crate::cluster::MAX_SPARED_DISPATCHES;
+            for refusal in 1..=spared + 1 {
+                assert!(
+                    !process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await
+                );
+                wait_for("backoff applied", || {
+                    cm.get_job(job_id).is_some_and(|j| j.run_attempt == refusal)
+                });
+                assert_eq!(
+                    cm.get_job(job_id).unwrap().requeue_count,
+                    u32::from(refusal > spared),
+                    "only a refusal past the spared ones charges the budget (refusal {refusal})"
+                );
+            }
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            let reason = job.state_reason();
+            assert!(reason.contains("n2") && !reason.contains("n1"), "{reason}");
+            assert!(launches1.lock().unwrap().is_empty());
+            assert!(launches2.lock().unwrap().is_empty());
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn launch_job_carries_the_nodes_schedulable_memory_as_the_ceiling() {
             let dir = TempDir::new().unwrap();
@@ -11886,6 +12165,7 @@ pub(crate) mod tests {
                     busy_until: &busy_until,
                     preemption_handoffs: &HashMap::new(),
                     partition_node_usage: &partition_node_usage,
+                    script_placement_default: Default::default(),
                 };
 
                 let mut sched = cm.config().scheduler.clone();

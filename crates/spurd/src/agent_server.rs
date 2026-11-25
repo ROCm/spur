@@ -32,11 +32,12 @@ use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::gpu_binding::BindingCheck;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
 use spur_core::native_exec::resolve_cgroup_budget;
+use spur_core::script_placement::ResolvedPlacement;
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
-    batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
-    build_mpi_mpirun_wrapper, build_multi_task_pmix_wrapper, build_multi_task_wrapper,
-    build_step_task_plan, slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
+    batch_companion_hold_script, batch_launch, build_mpi_mpirun_wrapper,
+    build_multi_task_pmix_wrapper, build_multi_task_wrapper, build_step_task_plan,
+    slurm_tasks_per_node_str, use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -519,6 +520,44 @@ fn launch_step_id(pty: bool) -> spur_core::step::StepId {
         spur_core::step::STEP_EXTERN
     } else {
         spur_core::step::STEP_BATCH
+    }
+}
+
+/// The placement a launch names. A controller that predates the field leaves it
+/// empty, and then the script decides, as it always has.
+fn launch_placement(requested: &str, script: &str) -> Result<ResolvedPlacement, Status> {
+    if requested.is_empty() {
+        return Ok(ResolvedPlacement::scanned(Some(script)));
+    }
+    requested.parse().map_err(Status::invalid_argument)
+}
+
+/// Whether this node only holds its slice while the batch host runs the script.
+fn holds_for_batch_host(placement: ResolvedPlacement, task_offset: u32, task_fanout: bool) -> bool {
+    placement == ResolvedPlacement::BatchHost && task_offset > 0 && !task_fanout
+}
+
+/// The files a batch launch's stdio opens.
+struct BatchStdio {
+    stdout: String,
+    stderr: String,
+    stdin: String,
+}
+
+/// A holder runs no user code, so it leaves the job's files alone: on shared
+/// storage, opening them would truncate what the batch host has written.
+fn batch_stdio(spec: &JobSpec, allocation_holder: bool) -> BatchStdio {
+    if allocation_holder {
+        return BatchStdio {
+            stdout: "/dev/null".into(),
+            stderr: "/dev/null".into(),
+            stdin: String::new(),
+        };
+    }
+    BatchStdio {
+        stdout: spec.stdout_path.clone(),
+        stderr: spec.stderr_path.clone(),
+        stdin: spec.stdin_path.clone(),
     }
 }
 
@@ -6681,6 +6720,7 @@ impl SlurmAgent for AgentService {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
         let mut persist_cred = (String::new(), String::new(), String::new());
+        let mut verified_cred = None;
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
                 spur_core::native_metrics::inc_exec_fail();
@@ -6716,28 +6756,7 @@ impl SlurmAgent for AgentService {
             cred.require_slice(hostname, cpus, memory_mb, &devices)
                 .map_err(map_exec_err)?;
             persist_cred = persist_execution_meta(&cred);
-            match self.launch_acceptance.accept(&cred) {
-                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
-                Ok(false) => {
-                    spur_core::native_metrics::inc_exec_ok();
-                    let paths = self
-                        .running
-                        .lock()
-                        .await
-                        .get(&req.job_id)
-                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
-                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
-                        .unwrap_or_default();
-                    return Ok(Response::new(LaunchJobResponse {
-                        success: true,
-                        error: String::new(),
-                        stdout_path: paths.0,
-                        stderr_path: paths.1,
-                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-                    }));
-                }
-                Err(e) => return Err(map_exec_err(e)),
-            }
+            verified_cred = Some(cred);
         }
         let job_id = req.job_id;
         // A launch names the node the controller scheduled it onto. If it does not name this host it
@@ -6769,6 +6788,40 @@ impl SlurmAgent for AgentService {
         ) {
             warn!(job_id, uid = spec.uid, "{msg}");
             return Err(Status::permission_denied(msg));
+        }
+
+        // Validated before the credential is recorded or the previous run fenced: a
+        // recorded credential's duplicate counts as launched, and a fence is final.
+        let placement = launch_placement(&req.script_placement, &spec.script)?;
+        let allocation_holder = holds_for_batch_host(placement, task_offset, req.task_fanout);
+        let script = if allocation_holder {
+            batch_companion_hold_script().to_string()
+        } else {
+            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
+        };
+        if let Some(cred) = &verified_cred {
+            match self.launch_acceptance.accept(cred) {
+                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
+                Ok(false) => {
+                    spur_core::native_metrics::inc_exec_ok();
+                    let paths = self
+                        .running
+                        .lock()
+                        .await
+                        .get(&job_id)
+                        .filter(|tracked| tracked.run_attempt == run_attempt)
+                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                        .unwrap_or_default();
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        stdout_path: paths.0,
+                        stderr_path: paths.1,
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    }));
+                }
+                Err(e) => return Err(map_exec_err(e)),
+            }
         }
 
         // Held until this run is tracked (or its half-built state is cleaned up), so a
@@ -6841,14 +6894,6 @@ impl SlurmAgent for AgentService {
         // collision-prone shared anchor for relative output paths.
         let work_dir = spec.work_dir.clone();
 
-        let allocation_holder =
-            batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout;
-        let script = if allocation_holder {
-            batch_companion_hold_script().to_string()
-        } else {
-            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
-        };
-
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
             spec.tasks_per_node
@@ -6910,7 +6955,7 @@ impl SlurmAgent for AgentService {
         }
 
         let pmix_multi_task = spec.mpi == MPI_PMIX
-            && use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+            && use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, placement);
 
         // Spur-only vars
         senv.set("SPUR_NODE_RANK", node_rank);
@@ -7059,7 +7104,7 @@ impl SlurmAgent for AgentService {
         let mut supervised_pmix = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
+        if spec.mpi == MPI_PMIX && placement == ResolvedPlacement::AllNodes {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
@@ -7094,7 +7139,7 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, placement);
         let launch_script = if shape == BatchLaunch::Mpirun {
             if spec.argv.is_empty() {
                 return Err(Status::invalid_argument(
@@ -7306,6 +7351,7 @@ impl SlurmAgent for AgentService {
             None
         };
 
+        let stdio = batch_stdio(&spec, allocation_holder);
         let launch_cfg = executor::JobLaunchConfig {
             step_id: launch_step,
             job_id,
@@ -7322,9 +7368,9 @@ impl SlurmAgent for AgentService {
             joins_parent_namespaces: false,
             allocation_holder,
             step_limits: Default::default(),
-            stdout_path: spec.stdout_path.clone(),
-            stderr_path: spec.stderr_path.clone(),
-            stdin_path: spec.stdin_path.clone(),
+            stdout_path: stdio.stdout,
+            stderr_path: stdio.stderr,
+            stdin_path: stdio.stdin,
             cpus,
             memory_mb,
             memory_ceiling_mb,
@@ -12709,6 +12755,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_launch_with_an_unknown_placement_fences_nothing() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_BATCH, &cgroup_root).await;
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 2,
+                script_placement: "per-socket".into(),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown placement must be refused");
+
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "refused before the fence is even tried: {refused}"
+        );
+        assert_run_one_kept(&svc, spur_core::step::STEP_BATCH).await;
+    }
+
+    #[tokio::test]
     async fn an_allocation_whose_fence_fails_leaves_the_old_run_reserved() {
         let svc = test_agent_service(test_reporter()).with_supervised_launch();
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
@@ -13373,6 +13452,85 @@ mod tests {
             .expect_err("old credential must not enter the replacement");
         assert!(error.message().contains("run_attempt mismatch"), "{error}");
         assert!(svc.active_steps.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_leaves_its_credential_unrecorded() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
+
+        let mut svc = test_agent_service(test_reporter());
+        svc.cluster_id = "launch-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let script = "#!/bin/bash\ntrue\n";
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: svc.cluster_id.clone(),
+            key_id: String::new(),
+            job_id: 79,
+            step_id: 0,
+            run_attempt: 1,
+            user: "fixture".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: svc.reporter.hostname.clone(),
+                cpus: 0,
+                memory_mb: 0,
+                devices: vec![],
+            }],
+            command_digest: spur_core::native_exec::command_digest(script, &[], ""),
+            container_digest: None,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 3600,
+            credential_id: [2; 16],
+        };
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 1,
+                script_placement: "per-socket".into(),
+                execution_credential: spur_core::native_exec::sign_execution(
+                    credential.clone(),
+                    &signing,
+                    now,
+                )
+                .expect("token"),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    gid: 1000,
+                    name: "j".into(),
+                    script: script.into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown placement must be refused");
+
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(true),
+            "a retry must launch rather than read as already launched"
+        );
     }
 
     #[tokio::test]
@@ -17707,6 +17865,72 @@ mod tests {
                 "a launch that does not unshare must record no namespaces"
             );
         }
+    }
+
+    #[test]
+    fn a_launch_follows_the_controllers_placement() {
+        assert_eq!(
+            launch_placement("batch-host", "#!/bin/bash\n./runner.sh\n").unwrap(),
+            ResolvedPlacement::BatchHost
+        );
+        assert_eq!(
+            launch_placement("all-nodes", "#!/bin/bash\nsrun ./train\n").unwrap(),
+            ResolvedPlacement::AllNodes
+        );
+    }
+
+    #[test]
+    fn a_launch_from_an_older_controller_reads_the_placement_off_its_script() {
+        assert_eq!(
+            launch_placement("", "#!/bin/bash\nsrun ./train\n").unwrap(),
+            ResolvedPlacement::BatchHost
+        );
+        assert_eq!(
+            launch_placement("", "#!/bin/bash\n./train\n").unwrap(),
+            ResolvedPlacement::AllNodes
+        );
+    }
+
+    #[test]
+    fn a_launch_naming_an_unknown_placement_is_refused() {
+        let err = launch_placement("auto", "#!/bin/bash\n./train\n").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn only_the_other_nodes_of_a_batch_host_script_hold() {
+        use ResolvedPlacement::{AllNodes, BatchHost};
+
+        assert!(
+            !holds_for_batch_host(BatchHost, 0, false),
+            "the batch host runs it"
+        );
+        assert!(holds_for_batch_host(BatchHost, 4, false));
+        assert!(
+            !holds_for_batch_host(BatchHost, 4, true),
+            "an srun fan-out runs on every node"
+        );
+        assert!(!holds_for_batch_host(AllNodes, 4, false));
+    }
+
+    #[test]
+    fn a_holder_leaves_the_jobs_stdio_files_alone() {
+        let spec = JobSpec {
+            stdout_path: "/shared/out.log".into(),
+            stderr_path: "/shared/err.log".into(),
+            stdin_path: "/shared/in.txt".into(),
+            ..Default::default()
+        };
+
+        let held = batch_stdio(&spec, true);
+        assert_eq!(held.stdout, "/dev/null");
+        assert_eq!(held.stderr, "/dev/null");
+        assert_eq!(held.stdin, "");
+
+        let ran = batch_stdio(&spec, false);
+        assert_eq!(ran.stdout, "/shared/out.log");
+        assert_eq!(ran.stderr, "/shared/err.log");
+        assert_eq!(ran.stdin, "/shared/in.txt");
     }
 
     #[test]

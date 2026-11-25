@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::env_defaults::{
-    apply_csv, apply_num_opt_nonzero, apply_str, apply_string, env_first, was_cli_set,
+    apply_csv, apply_num_opt_nonzero, apply_parsed_opt, apply_str, apply_string, env_first,
+    was_cli_set,
 };
 use crate::resource_opts::{
     option_source, requests_gpus, require_gpus, surviving, CPU_CONFLICT, MEM_CONFLICT,
@@ -10,6 +11,7 @@ use crate::resource_opts::{
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use spur_core::script_placement::ScriptPlacement;
 use spur_proto::proto::{GetJobRequest, JobSpec, JobState, SubmitJobRequest};
 
 /// Submit a batch job script.
@@ -189,6 +191,10 @@ pub struct SbatchArgs {
     /// MPI type (none, pmix)
     #[arg(long, default_value = "none", overrides_with = "mpi")]
     pub mpi: String,
+
+    /// Where the batch script runs: auto, batch-host, or all-nodes (default: the cluster's setting)
+    #[arg(long, overrides_with = "script_placement")]
+    pub script_placement: Option<ScriptPlacement>,
 
     /// Allow requeue
     #[arg(long, overrides_with_all = ["requeue", "no_requeue"])]
@@ -489,6 +495,13 @@ fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) -> clap::erro
         &["SPUR_EXPORT", "SBATCH_EXPORT"],
         &mut args.export,
     );
+    apply_parsed_opt(
+        matches,
+        "script_placement",
+        &["SPUR_SCRIPT_PLACEMENT", "SBATCH_SCRIPT_PLACEMENT"],
+        &mut args.script_placement,
+    )
+    .map_err(|e| clap_err(clap::error::ErrorKind::ValueValidation, e))?;
 
     // --nodelist and --nodefile are two spellings of one choice, so the env
     // nodelist has to displace a directive nodefile to actually take effect,
@@ -617,6 +630,7 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(topology, "topology");
     fallback!(open_mode, "open_mode");
     fallback!(mpi, "mpi");
+    fallback!(script_placement, "script_placement");
     // `--requeue` and `--no-requeue` are two spellings of one choice, same as
     // nodelist/nodefile: an explicit command-line answer of either spelling wins.
     if is_default(cli_matches, "requeue") && is_default(cli_matches, "no_requeue") {
@@ -1103,6 +1117,7 @@ pub(crate) fn build_sbatch_job_spec(
         client_keepalive: false,
         cpus_per_gpu: args.cpus_per_gpu,
         memory_per_gpu_mb: memory_per_gpu.unwrap_or(0),
+        script_placement: ScriptPlacement::to_wire(args.script_placement),
     })
 }
 
@@ -1305,6 +1320,50 @@ mod tests {
         let args = resolve_sbatch_args(&["--requeue".to_string()], &argv).expect("args");
         let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
         assert!(spec.requeue);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_carries_the_script_placement() {
+        let placed = [
+            "sbatch",
+            "--script-placement=batch-host",
+            "--wrap",
+            "./run.sh",
+        ];
+        let args = resolve_sbatch_args(&[], &placed.map(String::from)).expect("args");
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("spec");
+        assert_eq!(spec.script_placement, "batch-host");
+
+        let unset = ["sbatch", "--wrap", "./run.sh"];
+        let args = resolve_sbatch_args(&[], &unset.map(String::from)).expect("args");
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("spec");
+        assert_eq!(
+            spec.script_placement, "",
+            "unset leaves it to the cluster default"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn an_unknown_script_placement_fails_with_the_other_option_errors() {
+        let env = EnvGuard::new();
+        let wrap = ["sbatch", "--wrap", "./run.sh"].map(String::from);
+        let refused = |directives: &[String], cli: &[String]| {
+            let err = resolve_sbatch_args(directives, cli)
+                .expect_err("unknown placement")
+                .to_string();
+            assert!(err.contains("auto, batch-host, or all-nodes"), "{err}");
+            err
+        };
+
+        refused(
+            &[],
+            &["sbatch", "--script-placement=once", "--wrap", "./run.sh"].map(String::from),
+        );
+        refused(&["--script-placement=once".into()], &wrap);
+        env.set("SBATCH_SCRIPT_PLACEMENT", "once");
+        let err = refused(&[], &wrap);
+        assert!(err.contains("SBATCH_SCRIPT_PLACEMENT"), "{err}");
     }
 
     #[test]
@@ -2040,6 +2099,33 @@ echo "hello world"
             args.partition.as_deref(),
             Some("gpu"),
             "SPUR_PARTITION must apply to sbatch as it does to srun/salloc"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn script_placement_resolves_cli_then_env_then_directive() {
+        let env = EnvGuard::new();
+        let directive = ["--script-placement=batch-host"];
+        let placement = |cli: &[&str]| parse_merged(&directive, cli).script_placement;
+
+        assert_eq!(placement(&["sbatch"]), Some(ScriptPlacement::BatchHost));
+        env.set("SBATCH_SCRIPT_PLACEMENT", "all-nodes");
+        assert_eq!(
+            placement(&["sbatch"]),
+            Some(ScriptPlacement::AllNodes),
+            "env beats the directive"
+        );
+        env.set("SPUR_SCRIPT_PLACEMENT", "auto");
+        assert_eq!(
+            placement(&["sbatch"]),
+            Some(ScriptPlacement::Auto),
+            "the SPUR_ twin beats SBATCH_"
+        );
+        assert_eq!(
+            placement(&["sbatch", "--script-placement=batch-host"]),
+            Some(ScriptPlacement::BatchHost),
+            "the command line beats env"
         );
     }
 

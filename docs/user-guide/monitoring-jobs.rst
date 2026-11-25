@@ -705,9 +705,10 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
    The diagnostic fields below are printed on every job, with ``(null)`` for an
    unset string, so a parser must key on the field name rather than on a line
    being absent. Some fields still appear only when set (``Comment``,
-   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, the GPU line,
-   the preemption line, and the ``SuspendedBy``/``LastRequeue`` line), and
-   ``MinMemoryNode`` is spelled ``MinMemoryCPU`` for a ``--mem-per-cpu`` job.
+   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, ``BatchHost``,
+   the GPU line, the preemption line, and the ``SuspendedBy``/``LastRequeue``
+   line), ``ScriptPlacement`` appears on batch jobs only, and ``MinMemoryNode``
+   is spelled ``MinMemoryCPU`` for a ``--mem-per-cpu`` job.
 
 For a live job someone acted on, ``scontrol show job`` adds a line naming who.
 ``SuspendedBy`` is the user who suspended the job, only while it stays
@@ -787,6 +788,12 @@ the job starts on its own once matching nodes join.
      - Nodes actually **allocated**. Empty (``(null)``) while pending, except
        briefly while the controller reserves nodes and confirms the launch
        (bounded by ``dispatch_timeout_secs``). Not the same as ``ReqNodeList``.
+   * - ``BatchHost`` / ``ScriptPlacement``
+     - Batch jobs only. ``ScriptPlacement`` is the requested value while the job
+       is pending (``(null)`` when left to the cluster default) and the resolved
+       one (``batch-host`` or ``all-nodes``) once it starts. ``BatchHost`` is the
+       first allocated node, the one a ``batch-host`` script runs on, and appears
+       once the job starts. See :ref:`submit-script-placement`.
    * - ``Features``
      - Node feature constraint from ``-C/--constraint``.
    * - ``ReqTRES``

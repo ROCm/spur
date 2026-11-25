@@ -13,6 +13,7 @@ use tracing::warn;
 use spur_core::job::Job;
 use spur_core::node::Node;
 use spur_core::reservation::Reservation;
+use spur_core::script_placement::ScriptPlacement;
 
 /// Job placement constraints, parsed once and reused across all candidate nodes.
 pub struct NodePlacement<'a> {
@@ -122,6 +123,35 @@ impl<'a> NodePlacement<'a> {
             .is_some_and(|nodelist| nodelist.contains(name))
     }
 
+    /// Narrows `candidates`, indices into `nodes`, to agents that launch the job as
+    /// placed. `None` when an additive `--nodelist` needs one that would not.
+    pub fn without_misplacing_agents(
+        &self,
+        nodes: &[Node],
+        mut candidates: Vec<usize>,
+        script_placement_default: ScriptPlacement,
+    ) -> Option<Vec<usize>> {
+        let misplaces = |i: usize| nodes[i].reads_placement_off_script();
+        // Before the job check, which scans the script: with every agent upgraded, no pass scans.
+        if !candidates.iter().any(|&i| misplaces(i))
+            || !self
+                .job
+                .spec
+                .needs_placement_aware_agents(script_placement_default)
+        {
+            return Some(candidates);
+        }
+        if self.nodelist_is_additive()
+            && candidates
+                .iter()
+                .any(|&i| misplaces(i) && self.is_listed(&nodes[i].name))
+        {
+            return None;
+        }
+        candidates.retain(|&i| !misplaces(i));
+        Some(candidates)
+    }
+
     /// True if the node is in one of the job's requested partitions (or the job
     /// requested no partition).
     pub fn in_partition(&self, node: &Node) -> bool {
@@ -140,9 +170,21 @@ impl<'a> NodePlacement<'a> {
             .all(|f| node.features.iter().any(|nf| nf == f))
     }
 
-    /// Load-independent placement identity (nodelist/exclude, partition,
-    /// features, reservation), ignoring node state and free capacity.
+    /// Load-independent placement identity (nodelist/exclude, partition, features, reservation,
+    /// native nodes for a batch job), ignoring node state and free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
+        self.eligible_on_any_agent(node, reservations, now)
+            && !(node.is_kubernetes() && self.job.spec.needs_native_nodes())
+    }
+
+    /// [`eligible`](Self::eligible) without the native-node requirement, so the
+    /// pending-reason classifier can ask "would K8s virtual nodes have fit?".
+    pub fn eligible_on_any_agent(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
         self.allows_name(&node.name)
             && self.in_partition(node)
             && self.has_features(node)
@@ -267,7 +309,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use spur_core::job::JobSpec;
-    use spur_core::node::NodeState;
+    use spur_core::node::{NodeSource, NodeState, CAP_SCRIPT_PLACEMENT};
     use spur_core::resource::ResourceSet;
 
     fn node(name: &str) -> Node {
@@ -575,5 +617,97 @@ mod tests {
         };
         assert!(!p.matches(&node("node001"), std::slice::from_ref(&res), now));
         assert!(p.matches(&node("node002"), &[res], now));
+    }
+
+    fn placement_aware(mut node: Node) -> Node {
+        node.capabilities = vec![CAP_SCRIPT_PLACEMENT.into()];
+        node
+    }
+
+    fn batch_host_runner(num_nodes: u32, nodelist: Option<&str>) -> Job {
+        job_with(JobSpec {
+            script: Some("#!/bin/bash\n./runner.sh\n".into()),
+            script_placement: Some(ScriptPlacement::BatchHost),
+            num_nodes,
+            nodelist: nodelist.map(Into::into),
+            ..base_spec()
+        })
+    }
+
+    #[test]
+    fn agents_that_would_misplace_a_script_drop_out_of_its_candidates() {
+        let nodes = [
+            node("n1"),
+            placement_aware(node("n2")),
+            placement_aware(node("n3")),
+        ];
+        let runner = batch_host_runner(2, None);
+        assert_eq!(
+            NodePlacement::new(&runner).without_misplacing_agents(
+                &nodes,
+                vec![0, 1, 2],
+                ScriptPlacement::Auto
+            ),
+            Some(vec![1, 2])
+        );
+
+        let auto = job_with(JobSpec {
+            script_placement: None,
+            ..runner.spec.clone()
+        });
+        assert_eq!(
+            NodePlacement::new(&auto).without_misplacing_agents(
+                &nodes,
+                vec![0, 1, 2],
+                ScriptPlacement::Auto
+            ),
+            Some(vec![0, 1, 2]),
+            "an older agent launches an auto job as it would anyway"
+        );
+    }
+
+    #[test]
+    fn a_job_pinned_to_an_agent_that_would_misplace_its_script_waits() {
+        let nodes = [
+            node("n1"),
+            placement_aware(node("n2")),
+            placement_aware(node("n3")),
+        ];
+        let pinned = batch_host_runner(2, Some("n1"));
+        assert_eq!(
+            NodePlacement::new(&pinned).without_misplacing_agents(
+                &nodes,
+                vec![0, 1, 2],
+                ScriptPlacement::Auto
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_batch_job_is_not_eligible_for_k8s_nodes() {
+        let mut k8s = node("k1");
+        k8s.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        let now = Utc::now();
+
+        let batch = job_with(JobSpec {
+            script: Some("#!/bin/bash\n./train\n".into()),
+            ..base_spec()
+        });
+        let p = NodePlacement::new(&batch);
+        assert!(!p.eligible(&k8s, &[], now));
+        assert!(p.eligible_on_any_agent(&k8s, &[], now));
+        assert!(p.eligible(&node("n1"), &[], now));
+
+        let spurjob = job_with(JobSpec {
+            argv: vec!["./train".into()],
+            ..base_spec()
+        });
+        assert!(
+            NodePlacement::new(&spurjob).eligible(&k8s, &[], now),
+            "a SpurJob carries no script, so the operator can launch it"
+        );
     }
 }
