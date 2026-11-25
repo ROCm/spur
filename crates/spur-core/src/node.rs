@@ -282,6 +282,11 @@ pub const CAP_PER_GPU_OPTIONS: &str = "per-gpu-options";
 /// Agent capability: the agent places a batch script by `LaunchJobRequest.script_placement`.
 pub const CAP_SCRIPT_PLACEMENT: &str = "script-placement";
 
+/// Controller capability: `CreateReservationRequest.partition` is stored and
+/// applied. A controller without it would silently create an unbound
+/// reservation, so the CLI refuses a reservation partition instead.
+pub const CAP_RESERVATION_PARTITION: &str = "reservation-partition";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 

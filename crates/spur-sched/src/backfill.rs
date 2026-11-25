@@ -3698,6 +3698,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         let big = Job::new(
@@ -4366,6 +4367,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         }];
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
@@ -5709,6 +5711,7 @@ mod tests {
             users,
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         }
     }
 
@@ -5845,6 +5848,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         // Non-reservation job should be able to use node001 since reservation is inactive
@@ -5887,6 +5891,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         let mut job = make_job(1, 1, 1);
@@ -5936,6 +5941,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         let mut big = make_job(1, 2, 1);
@@ -5996,6 +6002,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         };
 
         let mut big = total_gpu_job(1, 2, 8);

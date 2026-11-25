@@ -139,6 +139,7 @@ pub fn create_details(
     accounts: &[String],
     users: &[String],
     flags: &[String],
+    partition: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "start_time": start_time,
@@ -147,6 +148,7 @@ pub fn create_details(
         "accounts": accounts,
         "users": users,
         "flags": flags,
+        "partition": partition,
     })
 }
 
@@ -285,12 +287,14 @@ mod tests {
             &["acct".into()],
             &["alice".into()],
             &["MAINT".into()],
+            "gpu",
         );
         assert_eq!(v["start_time"], "now");
         assert_eq!(v["duration_minutes"], 60);
         assert_eq!(v["nodes"], serde_json::json!(["n1", "n2"]));
         assert_eq!(v["users"], serde_json::json!(["alice"]));
         assert_eq!(v["flags"], serde_json::json!(["MAINT"]));
+        assert_eq!(v["partition"], "gpu");
     }
 
     #[test]

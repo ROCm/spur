@@ -169,6 +169,13 @@ pub struct ClientResponse {
     /// True when a `NodeRegister`/`NodeUpdate` named a node the saved list excludes.
     #[serde(default)]
     pub node_registration_rejected: bool,
+    /// Set when a `PartitionDelete` was refused because this reservation is bound
+    /// to the partition.
+    #[serde(default)]
+    pub partition_delete_blocked_by: Option<String>,
+    /// Why a `ReservationCreate` was refused, e.g. its partition no longer exists.
+    #[serde(default)]
+    pub reservation_rejected: Option<String>,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

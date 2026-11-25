@@ -486,6 +486,52 @@ class TestReservations:
         finally:
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", omit_name])
 
+    def test_create_with_partition_binds_jobs_to_it(self, cluster):
+        """Slurm-inline create accepts PartitionName= next to ReservationName=,
+        and a job naming the reservation without -p runs in that partition."""
+        stamp = int(time.time())
+        part = f"res-part-{stamp}"
+        res_name = f"res-part-resv-{stamp}"
+        node = cluster.node_names[0]
+        submit_user = cluster.nodes[0].user
+        job_id = None
+        cluster.scontrol("create", f"PartitionName={part}", f"Nodes={node}", "State=UP")
+        try:
+            create_out = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create",
+                    f"ReservationName={res_name}",
+                    "StartTime=now",
+                    "Duration=30",
+                    f"Nodes={node}",
+                    f"Users={submit_user}",
+                    f"PartitionName={part}",
+                    "Flags=IGNORE_JOBS",
+                ],
+            )
+            assert "specify only one of" not in create_out, create_out
+            assert "created" in create_out.lower(), create_out
+
+            show_out = cluster.scontrol("show", "reservation", res_name)
+            assert f"PartitionName={part}" in show_out, show_out
+
+            script = cluster.write_file("res-part.sh", "#!/bin/bash\nsleep 60\n")
+            job_id = parse_job_id(
+                cluster.sbatch(["-N", "1", f"--reservation={res_name}", "-t", "1", script])
+            )
+            assert job_id is not None
+            job_out = cluster.scontrol("show", "job", str(job_id))
+            assert f"Partition={part}" in job_out, job_out
+        finally:
+            if job_id is not None:
+                cluster.cli(["scancel", str(job_id)])
+                # The partition cannot be deleted while the job is still Completing.
+                wait_job(cluster, job_id)
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+            cluster.scontrol("delete", f"PartitionName={part}")
+
     def test_reservation_management_is_privilege_not_ownership(self, cluster):
         """Managing a reservation takes operator privilege, not ownership: an
         operator may update or delete a reservation somebody else created, while

@@ -297,6 +297,9 @@ pub enum ScontrolCommand {
         /// Comma-separated flags (maint, ignore_jobs, no_hold_jobs, overlap)
         #[arg(long, default_value = "")]
         flags: String,
+        /// Partition to bind the reservation to (optional)
+        #[arg(long, default_value = "")]
+        partition: String,
     },
     /// Update a reservation
     #[command(name = "update-reservation")]
@@ -546,20 +549,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             accounts,
             users,
             flags,
+            partition,
         } => {
             crate::privilege::require_privileged("manage reservations")?;
-            let duration = parse_reservation_duration(&duration)?;
-            create_reservation(
-                &args.controller,
-                &name,
-                &start_time,
-                duration,
-                &nodes,
-                &accounts,
-                &users,
-                &flags,
-            )
-            .await
+            let params = ReservationCreateParams {
+                name,
+                start_time,
+                duration_minutes: parse_reservation_duration(&duration)?,
+                nodes,
+                accounts,
+                users,
+                flags,
+                partition,
+            };
+            create_reservation(&args.controller, &params).await
         }
         ScontrolCommand::UpdateReservation {
             name,
@@ -846,26 +849,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
 
             for res in reservations {
-                println!("ReservationName={}", res.name);
-                println!("   StartTime={}", res.start_time);
-                println!("   EndTime={}", res.end_time);
-                println!("   Nodes={}", res.nodes);
-                if !res.state.is_empty() {
-                    println!("   State={}", res.state);
-                }
-                if !res.flags.is_empty() {
-                    println!("   Flags={}", res.flags);
-                }
-                if !res.accounts.is_empty() {
-                    println!("   Accounts={}", res.accounts);
-                }
-                if !res.users.is_empty() {
-                    println!("   Users={}", res.users);
-                }
-                if !res.owner.is_empty() {
-                    println!("   Owner={}", res.owner);
-                }
-                println!();
+                print!("{}", format_reservation_detail(&res));
             }
         }
         "step" | "steps" => {
@@ -1440,29 +1424,29 @@ enum ScontrolEntity {
 
 /// Detect the target entity by scanning all params for `PartitionName=` /
 /// `ReservationName=`. Slurm key=value syntax is order-independent, so the
-/// marker may appear anywhere. Errors if both markers are present; returns
-/// `None` when neither is (the caller picks the default, e.g. job/node update).
-fn detect_entity(params: &[String]) -> Result<Option<ScontrolEntity>> {
+/// marker may appear anywhere. A reservation may carry a `PartitionName=`
+/// attribute, so `ReservationName=` wins when both are present. Returns `None`
+/// when neither is (the caller picks the default, e.g. job/node update).
+fn detect_entity(params: &[String]) -> Option<ScontrolEntity> {
     let present = |marker: &str| {
         params.iter().any(|p| {
             p.split_once('=')
                 .is_some_and(|(k, _)| k.eq_ignore_ascii_case(marker))
         })
     };
-    match (present("PartitionName"), present("ReservationName")) {
-        (true, true) => {
-            anyhow::bail!("scontrol: specify only one of PartitionName= or ReservationName=")
-        }
-        (true, false) => Ok(Some(ScontrolEntity::Partition)),
-        (false, true) => Ok(Some(ScontrolEntity::Reservation)),
-        (false, false) => Ok(None),
+    if present("ReservationName") {
+        Some(ScontrolEntity::Reservation)
+    } else if present("PartitionName") {
+        Some(ScontrolEntity::Partition)
+    } else {
+        None
     }
 }
 
 /// Parse key=value pairs from a Slurm-style `scontrol create` command and
 /// dispatch to the appropriate create handler (partition or reservation).
 async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
-    match detect_entity(params)? {
+    match detect_entity(params) {
         Some(ScontrolEntity::Partition) => parse_and_create_partition(controller, params).await,
         Some(ScontrolEntity::Reservation) => parse_and_create_reservation(controller, params).await,
         None => anyhow::bail!(
@@ -1626,6 +1610,7 @@ struct ReservationCreateParams {
     accounts: String,
     users: String,
     flags: String,
+    partition: String,
 }
 
 /// Pure parse+validate of Slurm key=value pairs, split from the privileged
@@ -1638,6 +1623,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
     let mut accounts = String::new();
     let mut users = String::new();
     let mut flags = String::new();
+    let mut partition = String::new();
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1649,6 +1635,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
                 "accounts" => accounts = value.into(),
                 "users" => users = value.into(),
                 "flags" => flags = value.into(),
+                "partitionname" => partition = value.into(),
                 other => eprintln!("scontrol create reservation: unknown key '{}'", other),
             }
         }
@@ -1671,6 +1658,7 @@ fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreat
         accounts,
         users,
         flags,
+        partition,
     })
 }
 
@@ -1679,17 +1667,7 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
     crate::privilege::require_privileged("manage reservations")?;
 
     let p = parse_reservation_create_params(params)?;
-    create_reservation(
-        controller,
-        &p.name,
-        &p.start_time,
-        p.duration_minutes,
-        &p.nodes,
-        &p.accounts,
-        &p.users,
-        &p.flags,
-    )
-    .await
+    create_reservation(controller, &p).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1739,7 +1717,7 @@ async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
 
 /// Parse "key=value" params from `scontrol update` command.
 async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
-    if let Some(ScontrolEntity::Partition) = detect_entity(params)? {
+    if let Some(ScontrolEntity::Partition) = detect_entity(params) {
         return parse_and_update_partition(controller, params).await;
     }
 
@@ -2420,20 +2398,27 @@ fn parse_reservation_duration(s: &str) -> Result<u32> {
     })
 }
 
+fn reservation_create_request(
+    p: &ReservationCreateParams,
+    user: String,
+) -> spur_proto::proto::CreateReservationRequest {
+    spur_proto::proto::CreateReservationRequest {
+        name: p.name.clone(),
+        start_time: p.start_time.clone(),
+        duration_minutes: p.duration_minutes,
+        nodes: split_csv(&p.nodes),
+        accounts: split_csv(&p.accounts),
+        users: split_csv(&p.users),
+        flags: split_csv(&p.flags),
+        user,
+        partition: p.partition.trim().to_string(),
+    }
+}
+
 /// Create a reservation via the controller.
-#[allow(clippy::too_many_arguments)]
-async fn create_reservation(
-    controller: &str,
-    name: &str,
-    start_time: &str,
-    duration: u32,
-    nodes: &str,
-    accounts: &str,
-    users: &str,
-    flags: &str,
-) -> Result<()> {
+async fn create_reservation(controller: &str, p: &ReservationCreateParams) -> Result<()> {
     // Privilege is gated by callers; this is the last input guard.
-    if duration == 0 {
+    if p.duration_minutes == 0 {
         bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
     }
 
@@ -2442,42 +2427,25 @@ async fn create_reservation(
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    let node_list: Vec<String> = nodes
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let account_list: Vec<String> = accounts
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let user_list: Vec<String> = users
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let flag_list: Vec<String> = flags
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    if !p.partition.trim().is_empty() {
+        crate::resource_opts::require_controller_capability(
+            &mut client,
+            spur_core::node::CAP_RESERVATION_PARTITION,
+            "the controller does not support PartitionName= on reservations; \
+             upgrade spurctld or create the reservation without it",
+        )
+        .await?;
+    }
 
     client
-        .create_reservation(spur_proto::proto::CreateReservationRequest {
-            name: name.to_string(),
-            start_time: start_time.to_string(),
-            duration_minutes: duration,
-            nodes: node_list,
-            accounts: account_list,
-            users: user_list,
-            flags: flag_list,
-            user: crate::interactive::current_user()?,
-        })
+        .create_reservation(reservation_create_request(
+            p,
+            crate::interactive::current_user()?,
+        ))
         .await
         .context("failed to create reservation")?;
 
-    println!("Reservation {} created", name);
+    println!("Reservation {} created", p.name);
     Ok(())
 }
 
@@ -2534,6 +2502,31 @@ fn actor_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
         parts.push(format!("LastRequeue={}{by}", job.last_requeue));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Render one reservation for `scontrol show reservation`.
+fn format_reservation_detail(res: &spur_proto::proto::ReservationInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "ReservationName={}", res.name);
+    let _ = writeln!(out, "   StartTime={}", res.start_time);
+    let _ = writeln!(out, "   EndTime={}", res.end_time);
+    let _ = writeln!(out, "   Nodes={}", res.nodes);
+    let optional = [
+        ("PartitionName", &res.partition),
+        ("State", &res.state),
+        ("Flags", &res.flags),
+        ("Accounts", &res.accounts),
+        ("Users", &res.users),
+        ("Owner", &res.owner),
+    ];
+    for (key, value) in optional {
+        if !value.is_empty() {
+            let _ = writeln!(out, "   {key}={value}");
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Render one partition for `scontrol show partition`.
@@ -4007,6 +4000,33 @@ mod tests {
         assert!(format_partition_detail(&part("")).contains("   QoS=N/A\n"));
     }
 
+    fn reservation_info(partition: &str, state: &str) -> spur_proto::proto::ReservationInfo {
+        spur_proto::proto::ReservationInfo {
+            name: "r1".into(),
+            start_time: "S".into(),
+            end_time: "E".into(),
+            nodes: "n1".into(),
+            state: state.into(),
+            partition: partition.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn format_reservation_detail_prints_partition_when_set() {
+        assert_eq!(
+            format_reservation_detail(&reservation_info("gpu", "ACTIVE")),
+            "ReservationName=r1\n   StartTime=S\n   EndTime=E\n   Nodes=n1\n   PartitionName=gpu\n   State=ACTIVE\n\n"
+        );
+    }
+
+    #[test]
+    fn format_reservation_detail_omits_empty_fields() {
+        let out = format_reservation_detail(&reservation_info("", ""));
+        assert!(!out.contains("PartitionName="), "{out}");
+        assert!(!out.contains("State="), "{out}");
+    }
+
     #[test]
     fn normalize_show_name_trims_and_blanks_to_none() {
         assert_eq!(normalize_show_name(None), None);
@@ -4023,15 +4043,15 @@ mod tests {
         // The entity marker may appear after other keys — Slurm syntax is
         // order-independent, so detection must scan all params, not just the first.
         assert_eq!(
-            detect_entity(&p(&["Nodes=n1", "PartitionName=gpu"])).unwrap(),
+            detect_entity(&p(&["Nodes=n1", "PartitionName=gpu"])),
             Some(ScontrolEntity::Partition)
         );
         assert_eq!(
-            detect_entity(&p(&["Flags=MAINT", "ReservationName=maint"])).unwrap(),
+            detect_entity(&p(&["Flags=MAINT", "ReservationName=maint"])),
             Some(ScontrolEntity::Reservation)
         );
         assert_eq!(
-            detect_entity(&p(&["State=DOWN", "PartitionName=gpu"])).unwrap(),
+            detect_entity(&p(&["State=DOWN", "PartitionName=gpu"])),
             Some(ScontrolEntity::Partition)
         );
     }
@@ -4055,10 +4075,7 @@ mod tests {
 
     #[test]
     fn detect_entity_none_when_no_marker() {
-        assert_eq!(
-            detect_entity(&p(&["JobId=5", "Priority=10"])).unwrap(),
-            None
-        );
+        assert_eq!(detect_entity(&p(&["JobId=5", "Priority=10"])), None);
     }
 
     #[test]
@@ -4067,8 +4084,15 @@ mod tests {
     }
 
     #[test]
-    fn detect_entity_rejects_both_markers() {
-        assert!(detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])).is_err());
+    fn detect_entity_prefers_reservation_when_both_markers_present() {
+        assert_eq!(
+            detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])),
+            Some(ScontrolEntity::Reservation)
+        );
+        assert_eq!(
+            detect_entity(&p(&["ReservationName=maint", "partitionname=gpu"])),
+            Some(ScontrolEntity::Reservation)
+        );
     }
 
     #[tokio::test]
@@ -4678,6 +4702,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_reservation_create_params_reads_partition() {
+        let with = p(&[
+            "ReservationName=r1",
+            "Duration=60",
+            "Nodes=n1",
+            "partitionName=gpu",
+        ]);
+        assert_eq!(
+            parse_reservation_create_params(&with).unwrap().partition,
+            "gpu"
+        );
+
+        let without = p(&["ReservationName=r1", "Duration=60", "Nodes=n1"]);
+        assert_eq!(
+            parse_reservation_create_params(&without).unwrap().partition,
+            ""
+        );
+    }
+
+    fn reservation_params(partition: &str) -> ReservationCreateParams {
+        ReservationCreateParams {
+            name: "r1".into(),
+            start_time: "now".into(),
+            duration_minutes: 60,
+            nodes: "n1, n2,".into(),
+            accounts: "acct".into(),
+            users: "u1,u2".into(),
+            flags: "maint".into(),
+            partition: partition.into(),
+        }
+    }
+
+    #[test]
+    fn reservation_create_request_forwards_every_field() {
+        let req = reservation_create_request(&reservation_params(" gpu "), "alice".into());
+        assert_eq!(req.name, "r1");
+        assert_eq!(req.start_time, "now");
+        assert_eq!(req.duration_minutes, 60);
+        assert_eq!(req.nodes, vec!["n1", "n2"]);
+        assert_eq!(req.accounts, vec!["acct"]);
+        assert_eq!(req.users, vec!["u1", "u2"]);
+        assert_eq!(req.flags, vec!["maint"]);
+        assert_eq!(req.user, "alice");
+        assert_eq!(req.partition, "gpu");
+
+        let unbound = reservation_create_request(&reservation_params(""), "alice".into());
+        assert_eq!(unbound.partition, "");
+    }
+
+    #[test]
+    fn create_reservation_flag_accepts_partition() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "scontrol",
+                "create-reservation",
+                "--name=r1",
+                "--duration=60",
+                "--nodes=n1",
+            ];
+            args.extend_from_slice(extra);
+            match ScontrolArgs::try_parse_from(args).unwrap().command {
+                ScontrolCommand::CreateReservation { partition, .. } => partition,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        assert_eq!(parse(&["--partition=gpu"]), "gpu");
+        assert_eq!(parse(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn a_reservation_partition_is_refused_by_a_controller_without_the_capability() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let url = format!("http://{addr}");
+
+        let err = create_reservation(&url, &reservation_params("gpu"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not support PartitionName="),
+            "{err:#}"
+        );
+
+        let err = create_reservation(&url, &reservation_params("  "))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to create reservation"),
+            "a blank partition must skip the capability check: {err:#}"
+        );
+
+        capture.set_ping_capabilities(vec![spur_core::node::CAP_RESERVATION_PARTITION.to_string()]);
+        let err = create_reservation(&url, &reservation_params("gpu"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to create reservation"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn show_hostnames_expands_in_order_one_per_line() {
         let out = show_hostlist("hostnames", Some("n[1-3],gpu01"), None)
             .expect("hostnames is a hostlist entity")
@@ -4907,6 +5032,36 @@ mod tests {
             err.contains("'TimeLimit=10' cannot be combined with NodeName="),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_inline_reservation_update_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = parse_and_update(
+            &format!("http://{addr}"),
+            &p(&["ReservationName=r1", "PartitionName=gpu"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not supported: 'ReservationName=r1'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_update_naming_a_reservation_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = parse_and_update(
+            &format!("http://{addr}"),
+            &p(&["JobId=5", "ReservationName=r1"]),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not supported: 'ReservationName=r1'"), "{err}");
+        assert!(!err.contains("update-reservation"), "{err}");
     }
 
     #[tokio::test]

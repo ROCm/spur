@@ -300,6 +300,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             sweep_orphaned_placements(&cluster).await;
         }
         cluster.purge_expired_reservations();
+        cluster.purge_invalid_reservations();
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
         // Age preempt-freed-node earmarks by one pass before they are read for

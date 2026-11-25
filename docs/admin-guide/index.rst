@@ -12,6 +12,8 @@ Configuring and operating a Spur cluster.
 - :doc:`partition-resource-limits` — per-partition caps on the CPUs, memory,
   and GPUs a partition may use on a shared node, and per-job memory limits and
   defaults.
+- :doc:`reservations` — setting nodes aside for users and accounts over a time
+  window, optionally bound to a partition.
 - :doc:`idle-fill-scheduling` — letting over-quota jobs use capacity nobody with a
   quota claim wants, and reclaiming it when somebody does. Off by default;
   enabling it narrows a preemption guarantee.

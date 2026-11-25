@@ -1350,6 +1350,23 @@ rejects a ``--nodelist`` that leaves too few native nodes, so scripts that pin
 batch jobs to operator nodes fail at submit; submit that work as a SpurJob instead.
 SpurJobs are unaffected.
 
+.. _upgrading-reservation-partition:
+
+Reservation partitions (``PartitionName=``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``scontrol create ReservationName=... PartitionName=...`` now binds the
+reservation to the partition instead of failing with
+``specify only one of PartitionName= or ReservationName=``
+(see :doc:`/admin-guide/reservations`).
+Existing reservations replay unchanged with no partition.
+
+The CLI refuses a reservation partition unless the controller advertises the
+``reservation-partition`` capability, so an older controller never silently
+creates an unbound reservation. Upgrade every controller replica before
+creating partition-bound reservations: an older replica that applies the create
+drops the partition from its copy.
+
 See Also
 --------
 

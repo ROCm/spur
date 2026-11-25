@@ -72,6 +72,9 @@ pub struct Reservation {
     /// an operator may manage any reservation. Empty for reservations predating the field.
     #[serde(default)]
     pub owner: String,
+    /// Partition jobs naming this reservation run in when they request none.
+    #[serde(default)]
+    pub partition: Option<String>,
 }
 
 impl Reservation {
@@ -312,7 +315,17 @@ mod tests {
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         }
+    }
+
+    #[test]
+    fn reservation_without_partition_deserializes_to_none() {
+        let old = r#"{"name":"r1","start_time":"2026-01-01T00:00:00Z","end_time":"2026-01-01T01:00:00Z",
+            "nodes":["n1"],"accounts":[],"users":[],"flags":{"maint":false,"ignore_jobs":false,
+            "no_hold_jobs":false,"overlap":false},"owner":""}"#;
+        let res: Reservation = serde_json::from_str(old).unwrap();
+        assert_eq!(res.partition, None);
     }
 
     #[test]
@@ -371,6 +384,7 @@ mod tests {
             users: Vec::new(),
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         assert!(res.allows_user("anyone", None));
     }
@@ -404,6 +418,7 @@ mod tests {
             users: Vec::new(),
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         let b = Reservation {
             name: "b".into(),
@@ -414,6 +429,7 @@ mod tests {
             users: Vec::new(),
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         assert!(reservations_overlap(&a, &b));
     }
@@ -433,6 +449,7 @@ mod tests {
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         };
         let b = Reservation {
             name: "b".into(),
@@ -443,6 +460,7 @@ mod tests {
             users: Vec::new(),
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         assert!(overlap_allowed(&a, &b));
         a.flags.overlap = false;
@@ -461,6 +479,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         let job = Job::new(1, JobSpec::default());
         assert!(prospective_overlap(
@@ -496,6 +515,7 @@ mod tests {
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
             owner: String::new(),
+            partition: None,
         };
         let job = Job::new(1, JobSpec::default());
         assert!(prospective_overlap(

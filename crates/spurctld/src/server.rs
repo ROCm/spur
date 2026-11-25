@@ -657,12 +657,14 @@ impl ControllerService {
         }
     }
 
-    // srun refuses step flags, and sbatch/salloc/srun refuse per-GPU job
-    // options, against a controller that lacks these.
+    // srun refuses step flags, sbatch/salloc/srun refuse per-GPU job options,
+    // and scontrol refuses reservation partitions, against a controller that
+    // lacks these.
     fn own_capabilities() -> Vec<String> {
         vec![
             spur_core::node::CAP_STEP_RESOURCES.to_string(),
             spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+            spur_core::node::CAP_RESERVATION_PARTITION.to_string(),
         ]
     }
 
@@ -1189,6 +1191,7 @@ impl ControllerService {
         let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
         let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
             .map_err(Status::invalid_argument)?;
+        let partition = Some(req.partition.trim().to_string()).filter(|p| !p.is_empty());
         let reservation = Reservation {
             name: req.name,
             start_time,
@@ -1198,6 +1201,7 @@ impl ControllerService {
             users: req.users,
             flags,
             owner: req.user,
+            partition,
         };
         self.cluster
             .create_reservation(reservation)
@@ -3783,6 +3787,7 @@ impl SlurmController for ControllerService {
                     &req.accounts,
                     &req.users,
                     &req.flags,
+                    &req.partition,
                 ),
             )
             .asserted_actor(&req.user),
@@ -3899,6 +3904,7 @@ impl SlurmController for ControllerService {
                 flags: r.flags.display_csv(),
                 state: r.state_label(now).into(),
                 owner: r.owner.clone(),
+                partition: r.partition.clone().unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(ListReservationsResponse {
@@ -9284,6 +9290,7 @@ mod tests {
             vec![
                 spur_core::node::CAP_STEP_RESOURCES.to_string(),
                 spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+                spur_core::node::CAP_RESERVATION_PARTITION.to_string(),
             ]
         );
     }
@@ -10229,6 +10236,7 @@ mod tests {
             vec![
                 spur_core::node::CAP_STEP_RESOURCES.to_string(),
                 spur_core::node::CAP_PER_GPU_OPTIONS.to_string(),
+                spur_core::node::CAP_RESERVATION_PARTITION.to_string(),
             ]
         );
     }
@@ -18026,6 +18034,7 @@ mod tests {
             users: Vec::new(),
             flags: Default::default(),
             owner: String::new(),
+            partition: None,
         }
     }
 
@@ -18230,6 +18239,7 @@ mod tests {
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         };
         let maint = Reservation {
             name: "maint".into(),
@@ -18244,6 +18254,7 @@ mod tests {
                 ..Default::default()
             },
             owner: String::new(),
+            partition: None,
         };
         let reservations = vec![plain, maint];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
@@ -18510,37 +18521,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_reservations_filters_by_name() {
-        use spur_core::resource::ResourceSet;
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
-
-        for n in ["n1", "n2"] {
-            svc.cluster
-                .register_node(
-                    n.into(),
-                    n.into(),
-                    ResourceSet {
-                        cpus: 4,
-                        memory_mb: 8000,
-                        ..Default::default()
-                    },
-                    "127.0.0.1".into(),
-                    6818,
-                    String::new(),
-                    String::new(),
-                    spur_core::node::NodeSource::NativeHost,
-                    std::collections::HashMap::new(),
-                    Vec::new(),
-                    true,
-                )
-                .unwrap();
-        }
-        for _ in 0..200 {
-            if svc.cluster.get_node("n1").is_some() && svc.cluster.get_node("n2").is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        register_reservation_nodes(&svc, &["n1", "n2"]).await;
 
         for (name, node) in [("rocm_patch", "n1"), ("other_resv", "n2")] {
             svc.create_reservation(admin_request(CreateReservationRequest {
@@ -18552,6 +18535,7 @@ mod tests {
                 users: Vec::new(),
                 flags: Vec::new(),
                 user: String::new(),
+                partition: String::new(),
             }))
             .await
             .unwrap();
@@ -18601,6 +18585,102 @@ mod tests {
             reservation_read_scope(&svc.cluster, Some(&viewer("alice", false))),
             spur_core::rbac::ReadScope::All
         ));
+    }
+
+    async fn register_reservation_nodes(svc: &ControllerService, nodes: &[&str]) {
+        use spur_core::resource::ResourceSet;
+        for &n in nodes {
+            svc.cluster
+                .register_node(
+                    n.into(),
+                    n.into(),
+                    ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    true,
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if nodes.iter().all(|n| svc.cluster.get_node(n).is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn partitioned_reservation_request(
+        name: &str,
+        node: &str,
+        partition: &str,
+    ) -> CreateReservationRequest {
+        CreateReservationRequest {
+            name: name.into(),
+            start_time: "now".into(),
+            duration_minutes: 60,
+            nodes: vec![node.into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Vec::new(),
+            user: String::new(),
+            partition: partition.into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_reservation_rejects_unknown_partition() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_reservation_nodes(&svc, &["n1"]).await;
+
+        let status = svc
+            .create_reservation(admin_request(partitioned_reservation_request(
+                "r1", "n1", "nope",
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_reservations_reports_partition() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_reservation_nodes(&svc, &["n1", "n2"]).await;
+
+        for (name, node, partition) in [("r1", "n1", " default "), ("r2", "n2", "   ")] {
+            svc.create_reservation(admin_request(partitioned_reservation_request(
+                name, node, partition,
+            )))
+            .await
+            .unwrap();
+        }
+
+        let all = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        let partition_of = |name: &str| {
+            all.iter()
+                .find(|r| r.name == name)
+                .map(|r| r.partition.clone())
+                .unwrap()
+        };
+        assert_eq!(partition_of("r1"), "default");
+        assert_eq!(partition_of("r2"), "");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18660,6 +18740,7 @@ mod tests {
                 users,
                 flags: Vec::new(),
                 user: String::new(),
+                partition: String::new(),
             }))
             .await
             .unwrap();

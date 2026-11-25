@@ -108,7 +108,9 @@ the long-form subcommands, which take ``--selector`` as comma-separated
 
 All three require the **Administrator** role (see
 :ref:`privileged-operations`). ``delete`` refuses a partition that still has
-running, completing, or suspended jobs.
+running, completing, or suspended jobs, or that a reservation is bound to with
+``PartitionName=`` (see :doc:`/admin-guide/reservations`). Delete the
+reservation first.
 
 A GPU partition can give GPU jobs a default number of CPUs per GPU with
 ``def_cpu_per_gpu`` (Slurm's ``DefCpuPerGPU``; see
@@ -135,8 +137,11 @@ authoritative again: it overwrites runtime edits to partitions the file defines
 (except a runtime ``PreemptExemptTime`` or ``GraceTime`` the file leaves
 unset), recreates file
 partitions deleted at runtime, and deletes runtime-created partitions the file
-does not define unless they still have active jobs. Copy any runtime change you
-want to keep into ``spur.conf`` before running ``scontrol reconfigure``.
+does not define unless they still have active jobs. Reservations bound to a
+partition it deletes are deleted with it, unless one is used by a running job,
+in which case the partition and its reservations are kept. Copy any runtime
+change you want to keep into ``spur.conf`` before running
+``scontrol reconfigure``.
 
 Applying Config Changes
 -----------------------
