@@ -24,6 +24,7 @@ use crate::partition_cap::{
     partition_cap_ok, planned_memory_adjustment, resolution_rank, TresCharge,
 };
 use crate::timeline::{CapCheck, NodeTimeline, PartitionCharge, UNLIMITED_JOB_DURATION};
+use crate::topology::order_by_locality;
 use crate::traits::{AdmitAll, Assignment, ClusterState, JobStart, Scheduler, StartAdmission};
 
 /// Backfill scheduler.
@@ -1811,35 +1812,13 @@ impl BackfillScheduler {
             return Err((UnplacedKind::TooFewCandidates, node_starts.len()));
         }
 
-        // Topology-aware reordering for multi-node jobs
-        if needed_nodes > 1 {
-            if let Some(topo) = &cluster.topology {
-                let wants_topo = job.spec.topology.as_deref();
-                if matches!(wants_topo, Some("tree") | Some("block")) {
-                    // Locality must not delay a placement that can start sooner.
-                    let earliest_window = node_starts[needed_nodes - 1].1;
-                    let candidate_names: Vec<&str> = node_starts
-                        .iter()
-                        .take_while(|(_, start)| *start <= earliest_window)
-                        .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
-                        .collect();
-                    let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
-
-                    // Rebuild node_starts ordered by topology locality
-                    let mut reordered = Vec::with_capacity(needed_nodes);
-                    for name in &local_order {
-                        if let Some(pos) = node_starts
-                            .iter()
-                            .position(|(ni, _)| cluster.nodes[*ni].name == *name)
-                        {
-                            reordered.push(node_starts.remove(pos));
-                        }
-                    }
-                    reordered.extend(node_starts);
-                    node_starts = reordered;
-                }
-            }
-        }
+        node_starts = order_by_locality(
+            node_starts,
+            needed_nodes,
+            job.spec.topology.as_deref(),
+            cluster.topology,
+            |ni| cluster.nodes[*ni].name.as_str(),
+        );
 
         if placement.nodelist_is_additive() {
             node_starts.sort_by_key(|(ni, _)| !placement.is_listed(&cluster.nodes[*ni].name));
