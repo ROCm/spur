@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use spur_core::account_limits::{
     check_account_limits_with_grp_node_charge, check_account_standalone_limits,
@@ -7087,7 +7087,8 @@ impl ClusterManager {
 
     /// Delete a partition by name (persisted via Raft).
     ///
-    /// Refuses if any running jobs are using the partition.
+    /// Refuses if any running jobs are using the partition or any reservation is
+    /// bound to it.
     pub fn delete_partition(&self, name: &str) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -7109,10 +7110,18 @@ impl ClusterManager {
                 )));
             }
         }
-        self.propose(WalOperation::PartitionDelete {
-            name: name.to_string(),
-        })
-        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        let bound = reservation_bound_to(&self.reservations.read(), name);
+        if let Some(reservation) = bound {
+            return Err(partition_in_use_by_reservation(name, &reservation));
+        }
+        let resp = self
+            .propose(WalOperation::PartitionDelete {
+                name: name.to_string(),
+            })
+            .map_err(|e| PartitionError::raft(e.to_string()))?;
+        if let Some(reservation) = resp.partition_delete_blocked_by {
+            return Err(partition_in_use_by_reservation(name, &reservation));
+        }
         Ok(())
     }
 
@@ -7246,8 +7255,25 @@ impl ClusterManager {
                 );
                 continue;
             }
-            self.propose(WalOperation::PartitionDelete { name: name.clone() })
+            // Config wins over a reservation's binding, as in Slurm, which purges
+            // reservations whose partition disappears on reconfigure.
+            if !self.purge_reservations_bound_to(name) {
+                warn!(
+                    partition = %name,
+                    "reconfigure: partition removed from conf but a bound reservation could not be purged; skipping deletion"
+                );
+                continue;
+            }
+            let response = self
+                .propose(WalOperation::PartitionDelete { name: name.clone() })
                 .map_err(|e| anyhow::anyhow!("reconfigure: delete {name}: {e}"))?;
+            if let Some(reservation) = response.partition_delete_blocked_by {
+                warn!(
+                    partition = %name,
+                    reservation = %reservation,
+                    "reconfigure: partition removed from conf but a reservation was bound to it meanwhile; skipping deletion"
+                );
+            }
         }
 
         // Create partitions present in conf but absent from current WAL state.
@@ -7425,6 +7451,9 @@ impl ClusterManager {
         if let Some(error) = resp.node_inventory_error {
             return Err(ReservationError::invalid(error));
         }
+        if let Some(error) = resp.reservation_rejected {
+            return Err(ReservationError::invalid(error));
+        }
         if !resp.reservation_created {
             return Err(ReservationError::already_exists(format!(
                 "reservation '{}' already exists",
@@ -7571,47 +7600,86 @@ impl ClusterManager {
             .map(|r| r.name.clone())
             .collect();
         for name in expired {
-            let in_use = self.jobs.read().values().any(|job| {
-                matches!(
-                    job.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && job.spec.reservation.as_deref() == Some(name.as_str())
-            });
-            if in_use {
-                continue;
-            }
-            let error = match self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
-                Ok(_) => None,
-                Err(e) => {
-                    warn!(name = %name, error = %e, "failed to purge expired reservation");
-                    Some(e.to_string())
-                }
-            };
-            // Audit both outcomes (like the RPC handlers) so a repeatedly-failing
-            // system purge leaves a trail, not just an ephemeral warn.
-            let outcome = if error.is_none() {
-                TxnOutcome::Success
-            } else {
-                TxnOutcome::Error
-            };
-            self.record_txn(TxnRecord {
-                ts: Utc::now(),
-                actor: "system".to_string(),
-                actor_uid: None,
-                verified: false,
-                // No request, so no peer; `source` already says it was internal.
-                peer_addr: String::new(),
-                source: TxnSource::System,
-                action: TxnAction::Delete,
-                entity_type: TxnEntity::Reservation,
-                entity_name: name.clone(),
-                outcome,
-                details: txn::finalize_details(
-                    txn::delete_details(Some("expired")),
-                    error.as_deref(),
-                ),
-            });
+            self.purge_reservation(&name, "expired");
         }
+    }
+
+    /// Remove reservations whose bound partition no longer exists, e.g. after a
+    /// restart where the partition was dropped from spur.conf. Slurm purges such
+    /// reservations on reconfigure/restart rather than keep a dead binding.
+    pub fn purge_invalid_reservations(&self) {
+        let invalid =
+            reservations_with_missing_partition(&self.reservations.read(), &self.partitions.read());
+        for name in invalid {
+            if self.purge_reservation(&name, "partition removed") {
+                error!(name = %name, "purged reservation bound to a partition that no longer exists");
+            }
+        }
+    }
+
+    /// Purge every reservation bound to `partition`. Returns false if any is left,
+    /// e.g. because a running job still uses it.
+    fn purge_reservations_bound_to(&self, partition: &str) -> bool {
+        let bound: Vec<String> = self
+            .reservations
+            .read()
+            .iter()
+            .filter(|r| r.partition.as_deref() == Some(partition))
+            .map(|r| r.name.clone())
+            .collect();
+        let mut all_purged = true;
+        for name in bound {
+            all_purged &= self.purge_reservation(&name, "partition removed");
+        }
+        all_purged
+    }
+
+    fn reservation_in_use_by_running_job(&self, name: &str) -> bool {
+        self.jobs.read().values().any(|job| {
+            matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) && job.spec.reservation.as_deref() == Some(name)
+        })
+    }
+
+    /// System-initiated, audited reservation delete. Returns true when the
+    /// reservation was deleted; one still used by a running job is left alone.
+    fn purge_reservation(&self, name: &str, reason: &str) -> bool {
+        if self.reservation_in_use_by_running_job(name) {
+            return false;
+        }
+        let error = match self.propose(WalOperation::ReservationDelete {
+            name: name.to_string(),
+        }) {
+            Ok(_) => None,
+            Err(e) => {
+                warn!(name = %name, reason, error = %e, "failed to purge reservation");
+                Some(e.to_string())
+            }
+        };
+        // Audit both outcomes (like the RPC handlers) so a repeatedly-failing
+        // system purge leaves a trail, not just an ephemeral warn.
+        let outcome = if error.is_none() {
+            TxnOutcome::Success
+        } else {
+            TxnOutcome::Error
+        };
+        self.record_txn(TxnRecord {
+            ts: Utc::now(),
+            actor: "system".to_string(),
+            actor_uid: None,
+            verified: false,
+            // No request, so no peer; `source` already says it was internal.
+            peer_addr: String::new(),
+            source: TxnSource::System,
+            action: TxnAction::Delete,
+            entity_type: TxnEntity::Reservation,
+            entity_name: name.to_string(),
+            outcome,
+            details: txn::finalize_details(txn::delete_details(Some(reason)), error.as_deref()),
+        });
+        error.is_none()
     }
 
     pub(crate) fn pending_preemption_checkpoints(
@@ -10659,6 +10727,18 @@ impl ClusterManager {
                 self.reconcile_partitions(&mut nodes);
             }
             WalOperation::PartitionDelete { name } => {
+                // Re-checked here because a ReservationCreate can commit between
+                // the leader's pre-check and this entry.
+                let bound = reservation_bound_to(&self.reservations.read(), name);
+                if let Some(reservation) = bound {
+                    warn!(
+                        name,
+                        reservation = %reservation,
+                        "partition delete refused: a reservation is bound to it"
+                    );
+                    response.partition_delete_blocked_by = Some(reservation);
+                    return response;
+                }
                 {
                     let mut partitions = self.partitions.write();
                     let len_before = partitions.len();
@@ -10678,6 +10758,21 @@ impl ClusterManager {
                 if let Some(error) = self.reservation_inventory_error(&nodes, &reservation.nodes) {
                     response.node_inventory_error = Some(error);
                     return response;
+                }
+                // Re-checked here because a PartitionDelete can commit between the
+                // leader's pre-check and this entry.
+                if let Some(partition) = &reservation.partition {
+                    let exists = self.partitions.read().iter().any(|p| &p.name == partition);
+                    if !exists {
+                        warn!(
+                            name = %reservation.name,
+                            partition = %partition,
+                            "reservation create names a deleted partition, ignoring"
+                        );
+                        response.reservation_rejected =
+                            Some(format!("unknown partition '{partition}'"));
+                        return response;
+                    }
                 }
                 let mut reservations = self.reservations.write();
                 if reservations.iter().any(|r| r.name == reservation.name) {
@@ -13598,6 +13693,36 @@ fn apply_reservation_partition(spec: &mut JobSpec, reservations: &[Reservation])
     {
         spec.partition = Some(partition);
     }
+}
+
+fn partition_in_use_by_reservation(partition: &str, reservation: &str) -> PartitionError {
+    PartitionError::invalid(format!(
+        "partition '{partition}' in use by reservation '{reservation}'"
+    ))
+}
+
+/// First reservation bound to `partition`, if any.
+fn reservation_bound_to(reservations: &[Reservation], partition: &str) -> Option<String> {
+    reservations
+        .iter()
+        .find(|r| r.partition.as_deref() == Some(partition))
+        .map(|r| r.name.clone())
+}
+
+/// Names of reservations bound to a partition that is not in `partitions`.
+fn reservations_with_missing_partition(
+    reservations: &[Reservation],
+    partitions: &[Partition],
+) -> Vec<String> {
+    reservations
+        .iter()
+        .filter(|r| {
+            r.partition
+                .as_deref()
+                .is_some_and(|bound| !partitions.iter().any(|p| p.name == bound))
+        })
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
@@ -26531,10 +26656,9 @@ state = "UP"
     async fn job_defaulting_to_a_deleted_reservation_partition_is_rejected() {
         let dir = TempDir::new().unwrap();
         let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
-        cm.delete_partition("gpu").unwrap();
-        wait_for("gpu partition deleted", || {
-            !cm.get_partitions().iter().any(|p| p.name == "gpu")
-        });
+        // delete_partition refuses a bound partition; this is the restart case
+        // where spur.conf dropped it, before the invalid-reservation sweep runs.
+        cm.partitions.write().retain(|p| p.name != "gpu");
 
         let mut spec = basic_spec("orphaned");
         spec.reservation = Some("r1".into());
@@ -26544,6 +26668,160 @@ state = "UP"
             matches!(err, SubmitError::InvalidArgument(_)),
             "unexpected error: {err:?}"
         );
+    }
+
+    fn start_job_in_reservation(cm: &ClusterManager, partition: &str) -> JobId {
+        let mut spec = basic_spec("resv-running");
+        spec.reservation = Some("r1".into());
+        spec.partition = Some(partition.into());
+        let job_id = submit_and_wait(cm, spec);
+        let alloc = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+        job_id
+    }
+
+    fn reservation_names(cm: &ClusterManager) -> Vec<String> {
+        let mut names: Vec<String> = cm.get_reservations().into_iter().map(|r| r.name).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_refuses_while_a_reservation_is_bound() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+
+        let err = cm.delete_partition("gpu").unwrap_err();
+        assert!(
+            matches!(&err, PartitionError::InvalidArgument(m) if m.contains("in use by reservation 'r1'")),
+            "unexpected error: {err:?}"
+        );
+        assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm.delete_reservation("r1").unwrap();
+        cm.delete_partition("gpu").unwrap();
+        assert!(!cm.get_partitions().iter().any(|p| p.name == "gpu"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_ignores_unbound_reservations() {
+        let dir = TempDir::new().unwrap();
+        let mut res = partitioned_reservation("gpu");
+        res.partition = None;
+        let cm = cluster_with_gpu_bound_reservation(&dir, res).await;
+
+        cm.delete_partition("gpu").unwrap();
+        assert!(!cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        assert_eq!(reservation_names(&cm), vec!["r1"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_delete_apply_is_refused_while_a_reservation_is_bound() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+
+        let resp = cm.apply_operation(&WalOperation::PartitionDelete { name: "gpu".into() });
+        assert_eq!(resp.partition_delete_blocked_by.as_deref(), Some("r1"));
+        assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        assert!(!cm.deleted_partition_names.read().contains("gpu"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_create_apply_is_refused_when_its_partition_is_gone() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let resp = cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: partitioned_reservation("ghost"),
+        });
+        assert_eq!(
+            resp.reservation_rejected.as_deref(),
+            Some("unknown partition 'ghost'")
+        );
+        assert!(!resp.reservation_created);
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_invalid_reservations_removes_only_those_with_a_missing_partition() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+        let mut unbound = partitioned_reservation("gpu");
+        unbound.name = "r2".into();
+        unbound.partition = None;
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: unbound,
+        });
+        let mut valid = partitioned_reservation("default");
+        valid.name = "r3".into();
+        cm.apply_operation(&WalOperation::ReservationCreate { reservation: valid });
+
+        cm.purge_invalid_reservations();
+        assert_eq!(reservation_names(&cm), vec!["r1", "r2", "r3"]);
+
+        cm.partitions.write().retain(|p| p.name != "gpu");
+        cm.purge_invalid_reservations();
+        assert_eq!(reservation_names(&cm), vec!["r2", "r3"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_invalid_reservations_keeps_one_with_a_running_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_gpu_partitioned_reservation(&dir).await;
+        start_job_in_reservation(&cm, "gpu");
+
+        cm.partitions.write().retain(|p| p.name != "gpu");
+        cm.purge_invalid_reservations();
+        assert_eq!(reservation_names(&cm), vec!["r1"]);
+    }
+
+    const TWO_PARTITION_CONF: &str = "cluster_name = \"test\"\n\n\
+        [[partitions]]\nname = \"cpu\"\nnodes = \"ALL\"\ndefault = true\n\n\
+        [[partitions]]\nname = \"gpu\"\nnodes = \"ALL\"\n";
+    const CPU_ONLY_CONF: &str = "cluster_name = \"test\"\n\n\
+        [[partitions]]\nname = \"cpu\"\nnodes = \"ALL\"\ndefault = true\n";
+
+    async fn conf_cluster_with_gpu_bound_reservation(
+        dir: &TempDir,
+    ) -> (Arc<ClusterManager>, PathBuf) {
+        let (cm, conf_path) = test_cluster_with_conf_file(dir, TWO_PARTITION_CONF).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut res = partitioned_reservation("gpu");
+        res.users = vec!["testuser".into()];
+        cm.create_reservation(res).unwrap();
+        (cm, conf_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_purges_reservations_bound_to_a_partition_dropped_from_conf() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = conf_cluster_with_gpu_bound_reservation(&dir).await;
+
+        std::fs::write(&conf_path, CPU_ONLY_CONF).unwrap();
+        cm.reconfigure().unwrap();
+        assert!(!cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_keeps_a_dropped_partition_whose_reservation_has_a_running_job() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = conf_cluster_with_gpu_bound_reservation(&dir).await;
+        // The job runs in cpu, so only the reservation, not a job, pins gpu.
+        start_job_in_reservation(&cm, "cpu");
+
+        std::fs::write(&conf_path, CPU_ONLY_CONF).unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        assert_eq!(reservation_names(&cm), vec!["r1"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
