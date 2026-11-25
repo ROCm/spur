@@ -16,8 +16,12 @@ use crate::timefmt::format_duration_dhms as format_duration;
 #[command(name = "sacct", about = "Display accounting data for jobs")]
 pub struct SacctArgs {
     /// Show jobs for this user
-    #[arg(short = 'u', long)]
+    #[arg(short = 'u', long, overrides_with = "allusers")]
     pub user: Option<String>,
+
+    /// Show jobs for all users you may read (the default); the last of -a and -u wins
+    #[arg(short = 'a', long, overrides_with_all = ["allusers", "user"])]
+    pub allusers: bool,
 
     /// Show jobs for this account
     #[arg(short = 'A', long)]
@@ -58,6 +62,10 @@ pub struct SacctArgs {
     /// Accepted for Slurm compatibility; has no effect
     #[arg(long)]
     pub noconvert: bool,
+
+    /// Accepted for Slurm compatibility; history already has one row per job
+    #[arg(short = 'X', long, overrides_with = "allocations")]
+    pub allocations: bool,
 
     /// Output '|' delimited with a trailing '|'
     #[arg(short = 'p', long, overrides_with = "parsable2")]
@@ -173,15 +181,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SacctArgs>(&args);
     let style = args.output_style();
     let fields = output_fields(&args)?;
-
-    let job_ids = args
-        .jobs
-        .as_deref()
-        .map(crate::job_id_arg::parse_job_ids)
-        .transpose()?
-        .unwrap_or_default();
-    let page = history_page(args.limit, job_ids.len());
-    let request = history_request(&args, job_ids, &page)?;
+    let (request, page) = job_history_request(&args)?;
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -241,6 +241,18 @@ fn page_with_probe(limit: u32) -> HistoryPage {
         // Stay inside the cap the controller will actually return.
         fetch: show.saturating_add(1).min(MAX_JOB_HISTORY_FETCH),
     }
+}
+
+fn job_history_request(args: &SacctArgs) -> Result<(GetJobHistoryRequest, HistoryPage)> {
+    let job_ids = args
+        .jobs
+        .as_deref()
+        .map(crate::job_id_arg::parse_job_ids)
+        .transpose()?
+        .unwrap_or_default();
+    let page = history_page(args.limit, job_ids.len());
+    let request = history_request(args, job_ids, &page)?;
+    Ok((request, page))
 }
 
 fn history_request(
@@ -884,5 +896,147 @@ mod tests {
         let (rows, truncated) = take_visible(vec!["a", "b"], 2);
         assert_eq!(rows, ["a", "b"]);
         assert!(!truncated);
+    }
+
+    fn parse(argv: &[&str]) -> SacctArgs {
+        SacctArgs::try_parse_from(std::iter::once("sacct").chain(argv.iter().copied())).unwrap()
+    }
+
+    fn request(args: &SacctArgs) -> GetJobHistoryRequest {
+        job_history_request(args).unwrap().0
+    }
+
+    const ISSUE_ARGV: [&[&str]; 3] = [
+        &[
+            "-a",
+            "--allusers",
+            "--parsable2",
+            "-n",
+            "-X",
+            "--format=JobID",
+            "-S",
+            "2026-11-22",
+            "-E",
+            "2026-11-23",
+        ],
+        &[
+            "--allusers",
+            "--parsable2",
+            "-n",
+            "-X",
+            "--format=JobID",
+            "-S",
+            "2026-11-22",
+            "-E",
+            "2026-11-23",
+        ],
+        &[
+            "--parsable2",
+            "-n",
+            "-X",
+            "--format=JobID",
+            "-S",
+            "2026-11-22",
+            "-E",
+            "2026-11-23",
+        ],
+    ];
+
+    fn utc_midnight(year: i32, month: u32, day: u32) -> prost_types::Timestamp {
+        let seconds = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        prost_types::Timestamp { seconds, nanos: 0 }
+    }
+
+    #[test]
+    fn the_issue_command_lines_request_every_permitted_user_in_the_window() {
+        for argv in ISSUE_ARGV {
+            let req = request(&parse(argv));
+            assert_eq!(req.user, "", "{argv:?}");
+            assert_eq!(
+                req.start_after,
+                Some(utc_midnight(2026, 11, 22)),
+                "{argv:?}"
+            );
+            assert_eq!(
+                req.start_before,
+                Some(utc_midnight(2026, 11, 23)),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_issue_command_lines_print_bare_job_ids() {
+        for argv in ISSUE_ARGV {
+            let args = parse(argv);
+            let lines = render(
+                args.output_style(),
+                &output_fields(&args).unwrap(),
+                &history(),
+            );
+            assert_eq!(lines, ["34", "35"], "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn the_last_of_allusers_and_user_wins_as_in_slurm() {
+        let cases: [(&[&str], &str); 6] = [
+            (&["-u", "alice", "-a"], ""),
+            (&["-a", "-u", "alice"], "alice"),
+            (&["--user", "alice", "--allusers"], ""),
+            (&["--allusers", "--user", "alice"], "alice"),
+            (&["-u", "bob", "-a", "-u", "carol"], "carol"),
+            (&["-a", "-u", "bob", "-a"], ""),
+        ];
+        for (argv, user) in cases {
+            assert_eq!(request(&parse(argv)).user, user, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn allusers_and_allocations_tolerate_repeats() {
+        for argv in [["-a", "--allusers"], ["-a", "-a"]] {
+            assert!(parse(&argv).allusers, "{argv:?}");
+        }
+        for argv in [["-X", "--allocations"], ["-X", "-X"]] {
+            assert!(parse(&argv).allocations, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn clustered_short_flags_parse() {
+        let args = parse(&["-aX"]);
+        assert!(args.allusers && args.allocations);
+
+        let args = parse(&["-anPX"]);
+        assert!(args.allusers && args.noheader && args.parsable2 && args.allocations);
+    }
+
+    #[test]
+    fn allocations_does_not_change_the_request() {
+        let bases: [&[&str]; 2] = [&["-S", "2026-11-22"], &["-j", "30.0", "-u", "alice"]];
+        for base in bases {
+            let with_x: Vec<&str> = base.iter().copied().chain(["-X"]).collect();
+            assert_eq!(request(&parse(&with_x)), request(&parse(base)), "{base:?}");
+        }
+        assert_eq!(
+            request(&parse(&["-j", "30.0", "-u", "alice", "-X"])).job_ids,
+            [30]
+        );
+    }
+
+    #[test]
+    fn help_lists_allusers_and_allocations() {
+        let help = <SacctArgs as clap::CommandFactory>::command()
+            .render_help()
+            .to_string();
+        for flag in ["-a, --allusers", "-X, --allocations"] {
+            assert!(help.contains(flag), "{flag} missing from:\n{help}");
+        }
     }
 }

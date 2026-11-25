@@ -100,6 +100,10 @@ client-side; cancel by plain job ID.
 **sacct --jobs** filters are applied server-side: `GetJobHistoryRequest.job_ids`
 is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
 
+**sacct -a/--allusers** is accepted. Spur's default already shows every job the
+caller may read, so `-a` only matters against `-u`; the last of `-a`/`-u` wins,
+as in Slurm.
+
 **scontrol show assoc_mgr** uses a simplified layout. Filters to one user
 (`users=<name>`); Slurm's `accounts=`, `qos=`, and `flags=` selectors are not
 accepted.
@@ -107,6 +111,7 @@ accepted.
 ### Flags Accepted for Compatibility (No-Op)
 
 - `--noconvert` on squeue, sinfo, sacct, sstat, sshare, sreport
+- `-X`/`--allocations` on sacct (history has one row per job, no step rows)
 - `--container-readonly` (rejected at submission, not silently ignored)
 
 ## REST API Parity

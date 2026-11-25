@@ -459,6 +459,10 @@ Flags:
    * - ``--user``
      - ``-u``
      - Filter by user.
+   * - ``--allusers``
+     - ``-a``
+     - Show every user's jobs you may read. This is already the default, so
+       ``-a`` matters only against ``-u``: the last of the two wins, as in Slurm.
    * - ``--account``
      - ``-A``
      - Filter by account.
@@ -493,6 +497,10 @@ Flags:
    * - ``--noheader``
      - ``-n``
      - Omit the header line.
+   * - ``--allocations``
+     - ``-X``
+     - Accepted for compatibility. History has one row per job and no step rows,
+       so there is nothing to drop.
    * - ``--parsable2``
      - ``-P``
      - Print fields ``|`` delimited, **without** a trailing ``|``: one header
