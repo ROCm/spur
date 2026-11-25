@@ -131,7 +131,9 @@ on caps for oversubscription/OOM protection.
 .. warning::
 
    A partition removed from ``spur.conf`` is skipped rather than deleted when it
-   still has active jobs. ``scontrol reconfigure`` reports success either way, and
+   still has active jobs, or when a reservation bound to it is used by a running
+   job. Otherwise its bound reservations are deleted with it (see
+   :doc:`reservations`). ``scontrol reconfigure`` reports success either way, and
    the skip is recorded only in the controller log. Drain a partition before
    removing it from the file.
 

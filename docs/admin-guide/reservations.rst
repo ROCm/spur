@@ -78,9 +78,18 @@ job it does not admit.
   rejected.
 - ``Nodes=`` is still required. Spur does not pick nodes from the partition and
   does not check that the listed nodes belong to it.
-- If the partition is deleted later, jobs that name the reservation without
-  ``-p`` are rejected at submit with the usual unknown-partition error. They do
-  not fall back to the default partition.
+- ``scontrol delete PartitionName=`` refuses a partition while a reservation is
+  bound to it, as Slurm does. Delete the reservation first.
+- When ``spur.conf`` drops the partition, the controller deletes the
+  reservations bound to it, as Slurm purges reservations with an invalid
+  partition. Reservations used by a running job are never deleted:
+
+  - ``scontrol reconfigure`` then keeps the partition too, and retries on the
+    next reconfigure.
+  - After a restart that no longer loads the partition, such a reservation is
+    deleted once its jobs end. Until then, jobs that name it without ``-p`` are
+    rejected at submit with the usual unknown-partition error rather than
+    falling back to the default partition.
 
 Upgrade note
 ------------
