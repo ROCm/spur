@@ -134,7 +134,18 @@ same way. `ended_run_stragglers` stops every node the run still holds
 retry of it, never on a stopped copy's own report. The run waits, Completing or
 still Running in its grace, until each kept node's last step records its
 `JobStepComplete`, which frees the node (`release_after_step_end`) and then ends
-the run (`finish_settled_run`). A grace hands each freed node to the preemptor
+the run (`finish_settled_run`). Only an end the nodes confirm counts: in such a
+run (`keeps_nodes_for_steps`), a client's own end of a step (an `srun` abandoning
+it, or closing its PTY) is recorded by `record_step_end_once_gone` only once every
+node of the step answers `AwaitStep`, which spurd does after the step's cleanup;
+`CancelStep` only signals, so a cancel escalates to SIGKILL after the kill wait.
+A step whose client died records no end at all (only `run_step` records a numbered
+step's), so the completing-timeout loop also runs `confirm_steps_on_kept_nodes`
+every pass for a Completing run's live steps on kept nodes; a leader-local set
+(`begin_step_end_confirmation`) keeps one wait per step. Not-found from an agent is
+final once `not_found_is_final` holds (it registered before the step started, or
+has been up as long as a re-attach waits), else after that long. A node that never
+confirms leaves the step live. A grace hands each freed node to the preemptor
 at that point. The completing timeout's force-finish quarantines and kills kept
 nodes like unreported ones without changing the verdict. A kept node that goes
 Down or is removed takes its steps with it: `evict_jobs_on_node` frees its slice

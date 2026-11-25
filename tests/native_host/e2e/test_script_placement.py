@@ -211,24 +211,39 @@ class TestStepOnAFinishedCopysNode:
     def test_a_failure_stops_a_step_left_on_a_finished_copys_node(
         self, multi_node_cluster
     ):
+        self._fail_node_1_over_a_step_left_on_node_0(multi_node_cluster, "kept-step", "")
+
+    def test_a_step_whose_srun_died_ends_with_the_run(self, multi_node_cluster):
         cluster = multi_node_cluster
+        # SIGKILL leaves srun no chance to abandon the step or record its end.
+        self._fail_node_1_over_a_step_left_on_node_0(cluster, "orphan-step", "  kill -9 $!\n")
+
+        drained = [
+            name
+            for name in cluster.node_names
+            if "job cleanup was not confirmed" in cluster.scontrol_show_node(name)
+        ]
+        assert not drained, f"the run waited for the completing timeout: {drained}"
+
+    def _fail_node_1_over_a_step_left_on_node_0(self, cluster, name: str, before_exit: str):
         cluster.require_nodes(NODES)
         # Unique per run, so the process check cannot see another run's step.
         step_sleep = random.randrange(10_000_000, 20_000_000)
-        step_marker = f"{cluster.remote_dir}/kept-step.step"
-        copy_done = f"{cluster.remote_dir}/kept-step.done"
-        go = f"{cluster.remote_dir}/kept-step.go"
+        step_marker = f"{cluster.remote_dir}/{name}.step"
+        copy_done = f"{cluster.remote_dir}/{name}.done"
+        go = f"{cluster.remote_dir}/{name}.go"
         # Node 0 leaves a step on itself, as a one-node step lands on the first node
         # still running, and exits cleanly. When told to, node 1 waits until the
         # controller refuses node 0 new steps, so it holds node 0 only for the step,
         # checks the step still runs, and fails.
         script, _ = _runner(
             cluster,
-            "kept-step",
+            name,
             'if [ "$SLURM_NODEID" = 0 ]; then\n'
             "  srun -N 1 -n 1 bash -c "
             f"'hostname >> {step_marker}; exec sleep {step_sleep}' &\n"
             f"  until [ -s {step_marker} ]; do sleep 1; done\n"
+            f"{before_exit}"
             f"  touch {copy_done}\n"
             "  exit 0\n"
             "fi\n"

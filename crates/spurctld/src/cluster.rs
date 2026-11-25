@@ -648,6 +648,9 @@ pub struct ClusterManager {
     deleted_nodes: RwLock<HashMap<String, DeletedAgent>>,
     /// Removed nodes whose refused heartbeat this process already logged. Leader-local.
     deleted_heartbeats_logged: parking_lot::Mutex<HashSet<String>>,
+    /// Steps, by job, run attempt, and step id, whose nodes this leader is waiting
+    /// on to confirm them gone before recording their end. Leader-local.
+    step_end_confirmations: parking_lot::Mutex<HashSet<(JobId, u32, u32)>>,
     /// Partition names seeded from config before WAL replay. A replayed
     /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
     /// once overridden the name is removed, so later duplicates stay
@@ -891,6 +894,12 @@ fn ends_copy_by_copy(job: &Job) -> bool {
         && job.state == JobState::Running
         && job.preempt_grace().is_none()
         && runs_per_node(job)
+}
+
+/// A run that can keep a node past its copy's exit, freeing it when the job's
+/// steps there end, so only the node can vouch that one has ended.
+pub(crate) fn keeps_nodes_for_steps(job: &Job) -> bool {
+    job.allocated_nodes.len() > 1 && runs_per_node(job)
 }
 
 /// A run past its end or inside a preemption grace, so a node its copy left
@@ -1216,6 +1225,7 @@ impl ClusterManager {
             deleted_partition_names: RwLock::new(HashSet::new()),
             deleted_nodes: RwLock::new(HashMap::new()),
             deleted_heartbeats_logged: parking_lot::Mutex::new(HashSet::new()),
+            step_end_confirmations: parking_lot::Mutex::new(HashSet::new()),
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
@@ -4423,6 +4433,31 @@ impl ClusterManager {
 
     pub(crate) fn is_deleted_agent(&self, name: &str, agent_instance: &str) -> bool {
         self.deleted_agent(name, agent_instance).is_some()
+    }
+
+    /// Start waiting on a step's nodes to confirm it gone; false if a wait already runs.
+    pub(crate) fn begin_step_end_confirmation(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: u32,
+    ) -> bool {
+        self.step_end_confirmations
+            .lock()
+            .insert((job_id, run_attempt, step_id))
+    }
+
+    pub(crate) fn end_step_end_confirmation(&self, job_id: JobId, run_attempt: u32, step_id: u32) {
+        self.step_end_confirmations
+            .lock()
+            .remove(&(job_id, run_attempt, step_id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_agent_start_time(&self, node: &str, at: DateTime<Utc>) {
+        if let Some(node) = self.nodes.write().get_mut(node) {
+            node.agent_start_time = Some(at);
+        }
     }
 
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.

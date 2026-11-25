@@ -327,6 +327,12 @@ impl LeaderProxy {
 
 const STEP_REAWAIT_ATTEMPTS: u32 = 30;
 const STEP_REAWAIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long past the kill wait a client-ended step's nodes get to confirm it gone,
+/// before the run's end or the completing timeout is left to settle it.
+const STEP_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+/// Between `AwaitStep` calls to a node that is not sure yet: one mid-cleanup
+/// answers unavailable, and the step's own caller may still hold its waiter.
+const STEP_GONE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 const STEP_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// tonic surfaces a dropped connection as Unknown/"transport error" rather than
@@ -489,6 +495,238 @@ async fn reawait_step(
     Err(Status::unavailable(
         "lost contact with the step's agent and could not re-attach",
     ))
+}
+
+/// This leader's claim on waiting for a step's nodes to confirm it gone, so the
+/// periodic pass and a client's end never wait on one step twice. Released on drop.
+struct StepEndConfirmation {
+    cluster: Arc<ClusterManager>,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+}
+
+impl StepEndConfirmation {
+    fn claim(
+        cluster: &Arc<ClusterManager>,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+    ) -> Option<Self> {
+        cluster
+            .begin_step_end_confirmation(job_id, run_attempt, step_id)
+            .then(|| Self {
+                cluster: cluster.clone(),
+                job_id,
+                run_attempt,
+                step_id,
+            })
+    }
+}
+
+impl Drop for StepEndConfirmation {
+    fn drop(&mut self) {
+        self.cluster
+            .end_step_end_confirmation(self.job_id, self.run_attempt, self.step_id);
+    }
+}
+
+/// Start waiting on its nodes for each step an ending run still records live on a
+/// node it keeps. Its client may be gone, so nothing else would record its end and
+/// the run would sit out the completing timeout. Returns how many waits it started.
+pub(crate) fn confirm_steps_on_kept_nodes(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+) -> usize {
+    if job.retained_nodes.is_empty() {
+        return 0;
+    }
+    let kill_wait =
+        crate::scheduler_loop::graceful_kill_wait_secs(&cluster.config().scheduler, job);
+    let mut started = 0;
+    for step in cluster.get_steps(job.job_id) {
+        let live = spur_core::step::is_user_step(step.step_id) && !step.state.is_terminal();
+        if !live
+            || !step
+                .nodes
+                .iter()
+                .any(|node| job.retained_nodes.contains(node))
+        {
+            continue;
+        }
+        let Some(claim) =
+            StepEndConfirmation::claim(cluster, job.job_id, job.run_attempt, step.step_id)
+        else {
+            continue;
+        };
+        tokio::spawn(record_step_end_once_gone(
+            claim,
+            step,
+            job.spec.user.clone(),
+            std::time::Duration::from_secs(u64::from(kill_wait)),
+            0,
+            true,
+        ));
+        started += 1;
+    }
+    started
+}
+
+/// Record an end of `step` once every node it was placed on confirms it gone.
+/// spurd answers `AwaitStep` only after a step's cleanup, while `CancelStep` just signals
+/// it; a cancel escalates to SIGKILL after the kill wait, as a job cancel does.
+async fn record_step_end_once_gone(
+    claim: StepEndConfirmation,
+    step: spur_core::step::JobStep,
+    user: String,
+    kill_wait: std::time::Duration,
+    exit_code: i32,
+    cancelled: bool,
+) {
+    let cluster = claim.cluster.clone();
+    let run_attempt = claim.run_attempt;
+    let (job_id, step_id) = (step.job_id, step.step_id);
+    let deadline = tokio::time::Instant::now() + kill_wait + STEP_GONE_GRACE;
+    let mut checks = tokio::task::JoinSet::new();
+    for node in step.nodes.clone() {
+        let (cluster, user, step) = (cluster.clone(), user.clone(), step.clone());
+        checks.spawn(async move {
+            step_gone_on(&cluster, &node, &step, run_attempt, &user, deadline).await
+        });
+    }
+    let kill = tokio::time::sleep(kill_wait);
+    tokio::pin!(kill);
+    let mut killed = !cancelled;
+    let mut all_gone = true;
+    loop {
+        tokio::select! {
+            checked = checks.join_next() => match checked {
+                Some(Ok(true)) => {}
+                Some(_) => all_gone = false,
+                None => break,
+            },
+            () = &mut kill, if !killed => {
+                killed = true;
+                crate::scheduler_loop::cancel_step_on_nodes(
+                    &cluster,
+                    job_id,
+                    run_attempt,
+                    step_id,
+                    &step.nodes,
+                    crate::scheduler_loop::SIGKILL,
+                )
+                .await;
+            }
+        }
+    }
+    if !all_gone {
+        warn!(
+            job_id,
+            step_id, "a step's nodes did not confirm it gone; leaving its end to the run's"
+        );
+        return;
+    }
+    if cluster
+        .get_step(job_id, step_id)
+        .is_none_or(|recorded| recorded.state.is_terminal())
+    {
+        return;
+    }
+    if let Err(error) = cluster.record_step_complete(job_id, step_id, exit_code, false, cancelled) {
+        warn!(job_id, step_id, %error, "failed to record step completion");
+    }
+}
+
+/// Whether an agent's not-found for a step is final rather than an agent just back that
+/// has not adopted its sessions yet: one registered before the step started has not
+/// restarted since, and one up as long as a re-attach waits has adopted all it will.
+fn not_found_is_final(
+    agent_registered: Option<DateTime<Utc>>,
+    step_started: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    adoption: std::time::Duration,
+) -> bool {
+    agent_registered.is_some_and(|registered| {
+        step_started.is_some_and(|started| registered < started)
+            || (now - registered).to_std().is_ok_and(|up| up >= adoption)
+    })
+}
+
+/// Whether `node`'s agent confirms the step gone by `deadline`: it answers `AwaitStep`
+/// once the step's cleanup is done, and not-found when it has nothing of the step,
+/// which counts once final (see `not_found_is_final`) or once it lasts a re-attach.
+async fn step_gone_on(
+    cluster: &ClusterManager,
+    node: &str,
+    step: &spur_core::step::JobStep,
+    run_attempt: u32,
+    user: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let (job_id, step_id) = (step.job_id, step.step_id);
+    let adoption = STEP_REAWAIT_BACKOFF * STEP_REAWAIT_ATTEMPTS;
+    let mut not_found_since = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        // A node gone from the table has no slice left to free.
+        let Some(record) = cluster.get_node(node) else {
+            return true;
+        };
+        let answer = match crate::scheduler_loop::node_comm_http_url(&record) {
+            Some(addr) => {
+                await_step_at(addr, job_id, run_attempt, step_id, user, deadline - now).await
+            }
+            None => Err(Code::Unavailable),
+        };
+        match answer {
+            Ok(()) => return true,
+            Err(Code::NotFound) => {
+                let settled_agent = not_found_is_final(
+                    record.agent_start_time,
+                    step.start_time,
+                    Utc::now(),
+                    adoption,
+                );
+                if settled_agent || now - *not_found_since.get_or_insert(now) >= adoption {
+                    return true;
+                }
+            }
+            Err(_) => not_found_since = None,
+        }
+        tokio::time::sleep(STEP_GONE_POLL.min(deadline.saturating_duration_since(now))).await;
+    }
+}
+
+/// One `AwaitStep` call, which waits for the step to end, bounded by `limit`.
+async fn await_step_at(
+    addr: String,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+    user: &str,
+    limit: std::time::Duration,
+) -> Result<(), Code> {
+    let call = async {
+        let mut agent = crate::agent_client::connect(addr)
+            .await
+            .map_err(|_| Code::Unavailable)?;
+        agent
+            .await_step(spur_proto::AwaitStepRequest {
+                job_id,
+                step_id,
+                user: user.to_string(),
+                run_attempt,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| status.code())
+    };
+    tokio::time::timeout(limit, call)
+        .await
+        .unwrap_or(Err(Code::DeadlineExceeded))
 }
 
 /// The credential the controller presents to agents. Unlike the admission key
@@ -3472,9 +3710,14 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        self.cluster
-            .record_step_complete(job_id, req.step_id, req.exit_code, false, req.cancelled)
-            .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+        // Ending the step there may free a node the run kept for it, so its nodes, not
+        // the client, have to confirm it gone before the end is recorded.
+        let confirm_first = crate::cluster::keeps_nodes_for_steps(&job);
+        if !confirm_first {
+            self.cluster
+                .record_step_complete(job_id, req.step_id, req.exit_code, false, req.cancelled)
+                .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+        }
 
         // srun abandoning a step may have left an admitted retry running (or
         // about to claim) on its nodes: stop it there too, not just in the
@@ -3489,6 +3732,26 @@ impl SlurmController for ControllerService {
                 15,
             )
             .await;
+        }
+
+        let claim = confirm_first
+            .then(|| {
+                StepEndConfirmation::claim(&self.cluster, job_id, job.run_attempt, req.step_id)
+            })
+            .flatten();
+        if let Some(claim) = claim {
+            let kill_wait = crate::scheduler_loop::graceful_kill_wait_secs(
+                &self.cluster.config().scheduler,
+                &job,
+            );
+            tokio::spawn(record_step_end_once_gone(
+                claim,
+                step,
+                job.spec.user.clone(),
+                std::time::Duration::from_secs(u64::from(kill_wait)),
+                req.exit_code,
+                req.cancelled,
+            ));
         }
 
         Ok(Response::new(()))
@@ -12474,6 +12737,229 @@ mod tests {
             n2_cancelled.lock().unwrap().is_empty(),
             "no step of the job runs there"
         );
+    }
+
+    /// An agent that records the step cancels it is sent and answers `AwaitStep` with
+    /// `awaited`, or, given `asked`, notifies it and never answers.
+    async fn spawn_step_agent(
+        awaited: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+        asked: Option<Arc<tokio::sync::Notify>>,
+    ) -> (std::net::SocketAddr, StepCancelLog) {
+        let step_cancels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: awaited,
+            step_started: asked,
+            cancelled: None,
+            execs: None,
+            commands: None,
+            command_response: None,
+            step_cancels: Some(step_cancels.clone()),
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
+        })
+        .await;
+        (addr, step_cancels)
+    }
+
+    /// A per-node job whose copy on n1 exited cleanly under a running step 0, and whose
+    /// copy on n2 then failed, so the ended run keeps n1 for the step.
+    async fn ended_run_keeping_n1_for_a_step(svc: &ControllerService, n1: u16, n2: u16) -> u32 {
+        let job_id = running_two_node_job(svc, "./train\n", n1, n2).await;
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("step");
+        let attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        svc.cluster
+            .node_complete(job_id, "n1", 0, 0, attempt)
+            .expect("n1's copy");
+        svc.cluster
+            .node_complete(job_id, "n2", 3, 0, attempt)
+            .expect("n2's copy");
+        job_id
+    }
+
+    async fn abandon_step(svc: &ControllerService, job_id: u32, step_id: u32) {
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            cancelled: true,
+            user: "alice".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may abandon its step");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoning_a_step_keeps_its_node_charged_until_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let (n1, n1_step_cancels) = spawn_step_agent(None, Some(asked.clone())).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+
+        abandon_step(&svc, job_id, 0).await;
+        let ended = async {
+            while !svc
+                .cluster
+                .get_job(job_id)
+                .expect("job")
+                .state
+                .is_terminal()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        // n1's agent holds the controller's AwaitStep without answering, as one mid-cleanup.
+        tokio::select! {
+            () = asked.notified() => {}
+            () = ended => panic!("the run ended before n1's agent confirmed the step gone"),
+        }
+
+        assert_eq!(
+            n1_step_cancels.lock().unwrap()[0].signal,
+            15,
+            "the step is told to stop at once"
+        );
+        assert!(!svc
+            .cluster
+            .get_step(job_id, 0)
+            .expect("step")
+            .state
+            .is_terminal());
+        assert!(svc.cluster.get_node("n1").expect("n1").alloc_resources.cpus > 0);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Completing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_step_frees_its_node_once_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_step_agent(Some(Ok(Default::default())), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+
+        abandon_step(&svc, job_id, 0).await;
+
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
+    }
+
+    /// Waits for the job set up by `ended_run_keeping_n1_for_a_step` to end, then checks
+    /// it took n2's failure, gave n1 back, and closed the step cancelled.
+    async fn assert_the_run_ended_and_freed_n1(svc: &ControllerService, job_id: u32) {
+        for _ in 0..400 {
+            if svc
+                .cluster
+                .get_job(job_id)
+                .expect("job")
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert_eq!((job.state, job.exit_code), (JobState::Failed, Some(3)));
+        assert_eq!(
+            svc.cluster.get_node("n1").expect("n1").alloc_resources.cpus,
+            0
+        );
+        assert_eq!(
+            svc.cluster.get_step(job_id, 0).expect("step").state,
+            spur_core::step::StepState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_left_live_on_a_kept_node_ends_once_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_step_agent(Some(Ok(Default::default())), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+
+        let started = confirm_steps_on_kept_nodes(&svc.cluster, &job);
+
+        assert_eq!(started, 1);
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_pass_does_not_wait_twice_on_one_step() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let (n1, _) = spawn_step_agent(None, Some(asked.clone())).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert_eq!(confirm_steps_on_kept_nodes(&svc.cluster, &job), 1);
+        asked.notified().await;
+
+        assert_eq!(confirm_steps_on_kept_nodes(&svc.cluster, &job), 0);
+    }
+
+    #[test]
+    fn only_an_agent_that_cannot_have_lost_the_step_has_the_final_word_on_it() {
+        let now = Utc::now();
+        let adoption = std::time::Duration::from_secs(60);
+        let ago = |secs| Some(now - chrono::Duration::seconds(secs));
+
+        assert!(
+            not_found_is_final(ago(30), ago(10), now, adoption),
+            "registered before the step started, so it never restarted under it"
+        );
+        assert!(
+            !not_found_is_final(ago(10), ago(30), now, adoption),
+            "back since the step started, and maybe still adopting its sessions"
+        );
+        assert!(
+            not_found_is_final(ago(90), ago(120), now, adoption),
+            "back long enough to have adopted everything"
+        );
+        assert!(!not_found_is_final(None, ago(30), now, adoption));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoning_a_step_a_settled_agent_never_ran_is_recorded_at_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let never_ran = Status::not_found("this node is not running that step");
+        let (n1, _) = spawn_step_agent(Some(Err(never_ran)), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        svc.cluster
+            .set_agent_start_time("n1", Utc::now() - chrono::Duration::minutes(5));
+
+        abandon_step(&svc, job_id, 0).await;
+
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

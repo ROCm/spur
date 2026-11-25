@@ -4307,6 +4307,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
         for job in completing {
             if !completing_job_is_overdue(&job, now, wait) {
+                crate::server::confirm_steps_on_kept_nodes(&cluster, &job);
                 continue;
             }
             if job.end_time.is_none() {
