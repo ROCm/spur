@@ -1720,6 +1720,7 @@ fn history_job_info(r: &db::JobRecord, show_actors: bool) -> JobInfo {
         )),
         fabric_bindings: Default::default(),
         gpu_bindings: Default::default(),
+        share_with: Vec::new(),
         job_id: r.job_id,
         name: r.name.clone(),
         user: r.user_name.clone(),

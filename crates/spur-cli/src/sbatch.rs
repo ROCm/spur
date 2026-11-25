@@ -216,6 +216,11 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "comment")]
     pub comment: Option<String>,
 
+    /// Let other users start sessions in this job with `srun --jobid`:
+    /// comma-separated usernames, and/or `@account` for every member of the job's account
+    #[arg(long, value_name = "USERS", overrides_with = "share_with")]
+    pub share_with: Option<String>,
+
     /// Mail notification type (comma-separated: BEGIN,END,FAIL,ALL)
     #[arg(long, overrides_with = "mail_type")]
     pub mail_type: Option<String>,
@@ -1118,7 +1123,18 @@ pub(crate) fn build_sbatch_job_spec(
         cpus_per_gpu: args.cpus_per_gpu,
         memory_per_gpu_mb: memory_per_gpu.unwrap_or(0),
         script_placement: ScriptPlacement::to_wire(args.script_placement),
+        share_with: share_with_entries(args.share_with.as_deref())?,
     })
+}
+
+/// Validate `--share-with` before submitting, in the canonical form the controller stores.
+pub(crate) fn share_with_entries(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    spur_core::share::JobShare::parse(&[value])
+        .map(|share| share.entries())
+        .map_err(|e| anyhow::anyhow!("--share-with: {e}"))
 }
 
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
@@ -1303,6 +1319,28 @@ mod tests {
         let spec =
             build_sbatch_job_spec(args, None, "sbatch --no-requeue --wrap hostname").expect("spec");
         assert!(!spec.requeue);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_canonicalizes_share_with() {
+        let argv = [
+            "sbatch",
+            "--share-with=bob, @Account,bob",
+            "--wrap",
+            "hostname",
+        ]
+        .map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let spec = build_sbatch_job_spec(args, None, "sbatch").expect("spec");
+        assert_eq!(spec.share_with, vec!["bob", "@account"]);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_rejects_an_unknown_share_keyword() {
+        let argv = ["sbatch", "--share-with=@everyone", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let err = build_sbatch_job_spec(args, None, "sbatch").expect_err("must be rejected");
+        assert!(err.to_string().starts_with("--share-with:"), "{err}");
     }
 
     #[test]

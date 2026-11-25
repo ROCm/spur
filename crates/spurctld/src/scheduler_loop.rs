@@ -2947,6 +2947,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         cpus_per_gpu: s.cpus_per_gpu,
         memory_per_gpu_mb: s.memory_per_gpu_mb.unwrap_or(0),
         script_placement: ScriptPlacement::to_wire(s.script_placement),
+        share_with: s.share.entries(),
     }
 }
 
@@ -3238,6 +3239,7 @@ async fn dispatch_to_agent(
         cpus_per_gpu: spec.cpus_per_gpu,
         memory_per_gpu_mb: spec.memory_per_gpu_mb.unwrap_or(0),
         script_placement: ScriptPlacement::to_wire(spec.script_placement),
+        share_with: spec.share.entries(),
     };
 
     let response = client

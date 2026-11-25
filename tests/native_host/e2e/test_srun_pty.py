@@ -37,43 +37,13 @@ def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> se
     return sessions
 
 
-def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
-    node = cluster.nodes[node_index]
-    listing = node.exec_allow_fail(
-        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
-    )
-    prefix = f"{job_id}."
-    sessions = set()
-    for name in listing.split():
-        if not name.startswith(prefix):
-            continue
-        try:
-            step_id = int(name.rsplit(".", 1)[-1])
-        except ValueError:
-            continue
-        if step_id >= _RESERVED_STEP_FLOOR:
-            sessions.add(name)
-    return sessions
-
-
-# The reserved-range floor above also matches the allocation's own
-# batch/extern placeholder, which exists well before a nested `srun --pty`.
-_STEP_INTERACTIVE = 0xFFFFFFFA
-
-
-def _interactive_step_session_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
-    return {
-        name
-        for name in _reserved_step_sessions_for_job(cluster, job_id, node_index)
-        if name.rsplit(".", 1)[-1] == str(_STEP_INTERACTIVE)
-    }
-
-
-def _wait_for_interactive_step_session(cluster, job_id: int, timeout: int = 30) -> set[str]:
+def _wait_for_pty_step_session(cluster, job_id: int, timeout: int = 30) -> set[str]:
+    # Each `srun --pty` is its own numbered step, so its supervisor is the
+    # job's only user-step session in these tests.
     deadline = time.time() + timeout
     sessions: set[str] = set()
     while time.time() < deadline:
-        sessions = _interactive_step_session_for_job(cluster, job_id)
+        sessions = _user_step_sessions_for_job(cluster, job_id)
         if sessions:
             break
         time.sleep(1)
@@ -240,18 +210,15 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before = _wait_for_interactive_step_session(cluster, job_id)
-            assert before, (
-                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
-                "before the restart"
-            )
+            before = _wait_for_pty_step_session(cluster, job_id)
+            assert before, "expected a session for the pty step before the restart"
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
             # Identity, not count: a supervisor killed with the agent and
             # respawned afterwards would satisfy any "still one running" check.
-            after = _interactive_step_session_for_job(cluster, job_id)
+            after = _user_step_sessions_for_job(cluster, job_id)
             assert before <= after, (
                 "the pty step's supervisor must outlive the agent that spawned it: "
                 f"{sorted(before)} before the restart, {sorted(after)} after"
@@ -374,16 +341,13 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the standalone job to appear before the restart"
 
-            before = _wait_for_interactive_step_session(cluster, job_id)
-            assert before, (
-                f"expected the job's own supervisor (step id {_STEP_INTERACTIVE:#x}) "
-                "before the restart"
-            )
+            before = _wait_for_pty_step_session(cluster, job_id)
+            assert before, "expected a supervisor for the job's pty step before the restart"
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
-            after = _interactive_step_session_for_job(cluster, job_id)
+            after = _user_step_sessions_for_job(cluster, job_id)
             assert before <= after, (
                 "a standalone --pty job's own supervisor must outlive the agent "
                 f"that spawned it: {sorted(before)} before, {sorted(after)} after"
@@ -436,7 +400,7 @@ class TestSrunPtyStepSupervision:
         assert job_id, "the standalone pty job never reached RUNNING"
         # RUNNING comes before srun opens the session; killing it in that gap
         # would leave no shell to exit at all.
-        assert _wait_for_interactive_step_session(cluster, job_id), (
+        assert _wait_for_pty_step_session(cluster, job_id), (
             "the shell's interactive session never started"
         )
 
@@ -485,11 +449,8 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before = _wait_for_interactive_step_session(cluster, job_id)
-            assert before, (
-                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
-                "before the restart"
-            )
+            before = _wait_for_pty_step_session(cluster, job_id)
+            assert before, "expected a session for the pty step before the restart"
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)

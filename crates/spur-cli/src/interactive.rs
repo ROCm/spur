@@ -302,6 +302,14 @@ pub struct InteractiveSessionHandle {
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
+/// What the controller hands back for a node to check before launching a step:
+/// the native step credential, or a join grant for a user who does not own the job.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepProof {
+    pub execution_credential: String,
+    pub join_grant: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn open_interactive_session(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
@@ -312,7 +320,7 @@ pub async fn open_interactive_session(
     overlap: bool,
     user: &str,
     container: Option<spur_proto::proto::ContainerSpec>,
-    execution_credential: String,
+    proof: StepProof,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     // Non-TTY stdin (script, pipe, redirect) closes the input stream on EOF, not
     // on hangup. Flag it so the agent drains output instead of SIGHUP-ing the
@@ -330,7 +338,8 @@ pub async fn open_interactive_session(
             user: user.to_string(),
             container,
             non_interactive,
-            execution_credential,
+            execution_credential: proof.execution_credential,
+            join_grant: proof.join_grant,
         })),
     };
 
@@ -460,7 +469,7 @@ pub async fn run_interactive_session(
         overlap,
         user,
         None,
-        String::new(),
+        StepProof::default(),
     )
     .await
     .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
