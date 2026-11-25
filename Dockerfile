@@ -10,7 +10,7 @@
 # Extract portable binaries to disk (nightly, release):
 #   DOCKER_BUILDKIT=1 docker build --target dist --output type=local,dest=./dist .
 
-FROM almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b AS chef
+FROM almalinux:8@sha256:768bedc30fe0a536adb0a65d2eddb7caad364e514fbddd0ae9e026975f590342 AS chef
 
 ARG PROTOC_VERSION=25.1
 RUN dnf install -y unzip curl gcc make binutils && dnf clean all && \
@@ -87,7 +87,7 @@ RUN echo "=== Required GLIBC versions ===" && \
         echo "  ${bin}: requires ${MAX:-none}"; \
     done
 
-FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS runtime
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289 AS runtime
 
 # The base tag lags noble-security by weeks, so take every published fix here.
 # CI rebuilds this stage uncached (no-cache-filters) so the upgrade never goes stale.
