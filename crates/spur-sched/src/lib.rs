@@ -8,6 +8,7 @@ pub mod node_match;
 pub mod partition_cap;
 pub mod priority;
 pub mod timeline;
+pub mod topology;
 pub mod traits;
 
 pub use timeline::UNLIMITED_JOB_DURATION;
