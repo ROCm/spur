@@ -347,6 +347,7 @@ fn clean_report_from_n2() -> WalOperation {
         signal: 0,
         run_attempt: 1,
         at: None,
+        launch_detail: None,
     }
 }
 

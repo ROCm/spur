@@ -19948,6 +19948,7 @@ state = "UP"
             signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::OutOfMemory);
         assert_eq!(
@@ -22790,6 +22791,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let job = cm.get_job(job_id).unwrap();
@@ -22991,6 +22993,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         };
 
         cm.apply_operation(&node_report(3));
