@@ -1465,7 +1465,6 @@ dependencies = [
  "hyper-util",
  "log",
  "rustls",
- "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -1841,9 +1840,9 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73b082f549411623a4f8949bd24dcaedacb1511379c461c76d579fde301d021"
+checksum = "f95e1a9107878bef32cfbe2e5e084584db832c9616df9981adc4673f9fb1c853"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -1854,9 +1853,9 @@ dependencies = [
 
 [[package]]
 name = "kube-client"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae56b223bca490db1f1b115bfc606d411177511d7748d8cc019a7e3b2935430b"
+checksum = "703ee17477c86501627e83492895c06ab6fc2c55a319bb2fbc582ccae739ba67"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1892,9 +1891,9 @@ dependencies = [
 
 [[package]]
 name = "kube-core"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6de84b47fc1aa35ba0ef9059ef54b47c8b47f0979afd15487e525282f2d73fb9"
+checksum = "b5e9a9aa533b2f4106ac1ac45e168bb452325eb9e918d57335444f60bef34ffc"
 dependencies = [
  "derive_more 2.1.1",
  "form_urlencoded",
@@ -1911,9 +1910,9 @@ dependencies = [
 
 [[package]]
 name = "kube-derive"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de1fb46ac34371491ac0277c13e0e1bb9288000e64c86ca3d91343754818e64e"
+checksum = "cedc991dbe7757a646098dead35e070e13ce66e2996b02162ac7f97eb97f4d6e"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -1925,9 +1924,9 @@ dependencies = [
 
 [[package]]
 name = "kube-runtime"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dea60005024b6ec1819c426209aa29b9eaca64f6b3988ab73c55f43fa484392"
+checksum = "ca78d9eeb4674eb75e381e6a956e8a5005942928dec87de4db9ef9701af8a637"
 dependencies = [
  "ahash 0.8.12",
  "async-broadcast",
@@ -1940,7 +1939,7 @@ dependencies = [
  "json-patch",
  "k8s-openapi",
  "kube-client",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "pin-project",
  "serde",
  "serde_json",
