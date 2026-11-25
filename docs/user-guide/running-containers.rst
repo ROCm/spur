@@ -193,7 +193,7 @@ held after repeated failures. Spur never drops a mount and runs the job without
 it.
 
 On Kubernetes partitions, a bind source that does not exist on the node is
-created as an empty directory, so a mistyped source gives the job an empty
+created as an empty directory, so a wrong source path gives the job an empty
 directory instead of an error.
 
 .. note::
