@@ -10760,10 +10760,13 @@ impl ClusterManager {
                     return response;
                 }
                 // Re-checked here because a PartitionDelete can commit between the
-                // leader's pre-check and this entry.
+                // leader's pre-check and this entry. Keyed on the log's tombstone, not
+                // mere absence, so replay never depends on what spur.conf still
+                // defines; an unloaded partition is left to purge_invalid_reservations.
                 if let Some(partition) = &reservation.partition {
-                    let exists = self.partitions.read().iter().any(|p| &p.name == partition);
-                    if !exists {
+                    let deleted = self.deleted_partition_names.read().contains(partition)
+                        && !self.partitions.read().iter().any(|p| &p.name == partition);
+                    if deleted {
                         warn!(
                             name = %reservation.name,
                             partition = %partition,
@@ -26734,7 +26737,26 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reservation_create_apply_is_refused_when_its_partition_is_gone() {
+    async fn reservation_create_apply_is_refused_after_its_partition_was_deleted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.create_partition(gpu_partition()).unwrap();
+        cm.delete_partition("gpu").unwrap();
+
+        let resp = cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: partitioned_reservation("gpu"),
+        });
+        assert_eq!(
+            resp.reservation_rejected.as_deref(),
+            Some("unknown partition 'gpu'")
+        );
+        assert!(!resp.reservation_created);
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_create_apply_keeps_one_whose_partition_is_only_unloaded() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -26742,11 +26764,24 @@ state = "UP"
         let resp = cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: partitioned_reservation("ghost"),
         });
-        assert_eq!(
-            resp.reservation_rejected.as_deref(),
-            Some("unknown partition 'ghost'")
-        );
-        assert!(!resp.reservation_created);
+        assert!(resp.reservation_created);
+        assert_eq!(reservation_names(&cm), vec!["r1"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_reservation_survives_replay_when_the_conf_drops_its_partition() {
+        let dir = TempDir::new().unwrap();
+        {
+            let (cm, _) = conf_cluster_with_gpu_bound_reservation(&dir).await;
+            assert_eq!(reservation_names(&cm), vec!["r1"]);
+        }
+        let (cm, _) = test_cluster_with_conf_file(&dir, CPU_ONLY_CONF).await;
+        wait_for("reservation replayed", || {
+            cm.get_reservations().iter().any(|r| r.name == "r1")
+        });
+        assert!(!cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm.purge_invalid_reservations();
         assert!(cm.get_reservations().is_empty());
     }
 
