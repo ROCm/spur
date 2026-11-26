@@ -1145,18 +1145,21 @@ class TestSacctmgrUserAssociationLimits:
 
 class TestSacctmgrQosAuthorization:
     """A user submitting an explicit --qos outside their association's
-    pinned default QOS must be rejected, not silently accepted."""
+    allow-list must be rejected, not silently accepted. A default QOS alone
+    is not an allow-list: it only fills in a job that names no QOS."""
 
-    def test_submission_rejects_qos_outside_association_default(self, accounting_cluster):
+    def test_submission_rejects_qos_outside_association_allow_list(self, accounting_cluster):
         c = accounting_cluster
         user = c.nodes[0].user
 
         c.sacctmgr(["add", "qos", "name=authqos"])
         c.sacctmgr(["add", "qos", "name=otherqos"])
         c.sacctmgr(["add", "account", "name=qosauthz"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=qosauthz", "defaultqos=authqos"])
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=qosauthz", "qos=authqos", "defaultqos=authqos"]
+        )
         # Wait past the association cache refresh floor (10s) before
-        # submitting, else the pinned default hasn't loaded yet.
+        # submitting, else the allow-list hasn't loaded yet.
         time.sleep(15)
 
         script = c.write_file("qos-authz.sh", "#!/bin/bash\ntrue\n")
@@ -1173,7 +1176,7 @@ class TestSacctmgrQosAuthorization:
         wait_job(c, good_id, timeout=30)
 
     def test_submission_rejects_borrowing_qos_from_a_different_account(self, accounting_cluster):
-        # A user in two accounts, each pinned to its own QOS, must not be
+        # A user in two accounts, each limited to its own QOS, must not be
         # able to submit under one account while borrowing the other's QOS.
         c = accounting_cluster
         user = c.nodes[0].user
@@ -1182,8 +1185,14 @@ class TestSacctmgrQosAuthorization:
         c.sacctmgr(["add", "qos", "name=primusqos"])
         c.sacctmgr(["add", "account", "name=hyperloom"])
         c.sacctmgr(["add", "account", "name=primus"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=hyperloom", "defaultqos=hyperloomqos"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=primus", "defaultqos=primusqos"])
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=hyperloom",
+             "qos=hyperloomqos", "defaultqos=hyperloomqos"]
+        )
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=primus",
+             "qos=primusqos", "defaultqos=primusqos"]
+        )
         time.sleep(15)
 
         script = c.write_file("qos-cross-acct.sh", "#!/bin/bash\ntrue\n")
@@ -1329,21 +1338,19 @@ class TestSacctmgrQosAuthorization:
         out = c.sacctmgr(["show", "user"])
         row = next(line for line in out.splitlines() if "clearqos" in line and user in line)
         assert "clearqosa,clearqosb" not in row, f"allow-list must be cleared, got {row!r}"
-        assert "clearqosa" in row, f"pinned default must survive the explicit clear, got {row!r}"
+        assert "clearqosa" in row, f"default must survive the explicit clear, got {row!r}"
 
         time.sleep(15)
         script = c.write_file("qos-cleared.sh", "#!/bin/bash\ntrue\n")
 
-        out = c.cli_allow_fail(
-            ["sbatch", "-J", "qos-cleared-bad", "-N", "1", "-A", "clearqos", "--qos=clearqosb", script]
-        )
-        assert "not permitted" in out, f"cleared allow-list member must now be rejected, got {out!r}"
-
-        still_default_id = parse_job_id(
-            c.sbatch(["-J", "qos-cleared-ok", "-N", "1", "-A", "clearqos", "--qos=clearqosa", script])
-        )
-        assert still_default_id is not None, "the pinned default must still be usable"
-        wait_job(c, still_default_id, timeout=30)
+        # With no list anywhere above the user, any QOS may be named. The
+        # default is only what a job gets when it names none.
+        for name, qos in (("qos-cleared-b", "clearqosb"), ("qos-cleared-a", "clearqosa")):
+            job_id = parse_job_id(
+                c.sbatch(["-J", name, "-N", "1", "-A", "clearqos", f"--qos={qos}", script])
+            )
+            assert job_id is not None, f"{qos} must be usable once the list is cleared"
+            wait_job(c, job_id, timeout=30)
 
     def test_stale_association_default_does_not_block_unrelated_explicit_qos(self, accounting_cluster):
         # An association's pinned default can go stale (its QOS deleted
@@ -1357,6 +1364,11 @@ class TestSacctmgrQosAuthorization:
         c.sacctmgr(["add", "account", "name=staleacct"])
         c.sacctmgr(["add", "user", f"name={user}", "account=staleacct", "defaultqos=stalegoal"])
         c.sacctmgr(["delete", "qos", "name=stalegoal"])
+
+        # Like Slurm, deleting a QOS also clears the defaults that named it.
+        shown = c.sacctmgr(["show", "user", f"user={user}"])
+        row = next(ln for ln in shown.splitlines() if "staleacct" in ln)
+        assert "stalegoal" not in row, f"deleted QOS must leave the default:\n{shown}"
         time.sleep(15)
 
         script = c.write_file("qos-stale-default.sh", "#!/bin/bash\ntrue\n")
@@ -1366,18 +1378,24 @@ class TestSacctmgrQosAuthorization:
         assert job_id is not None, "explicit --qos must succeed despite a stale pinned default"
         wait_job(c, job_id, timeout=30)
 
-    def test_cluster_fallback_qos_withheld_when_outside_association_allow_list(self, accounting_cluster):
-        # A restricted association omitting --qos must not silently receive
-        # the cluster-wide fallback QOS when that fallback isn't in its
-        # allow-list — closes the gap where the fallback chain bypassed
-        # per-association authorization entirely.
+    def test_no_qos_job_under_a_list_gets_its_only_qos_or_is_rejected(self, accounting_cluster):
+        # A restricted association omitting --qos must never receive a
+        # cluster fallback that isn't on its list. As in Slurm, a list of one
+        # resolves to that QOS, and a longer list with no usable default
+        # rejects the job instead of running it with no QOS.
         c = accounting_cluster
         user = c.nodes[0].user
 
         c.sacctmgr(["add", "qos", "name=fallbackqos"])
         c.sacctmgr(["add", "qos", "name=restrictedqos"])
+        c.sacctmgr(["add", "qos", "name=restrictedqos2"])
         c.sacctmgr(["add", "account", "name=fallbackacct"])
+        c.sacctmgr(["add", "account", "name=fallbackwide"])
         c.sacctmgr(["add", "user", f"name={user}", "account=fallbackacct", "qos=restrictedqos"])
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=fallbackwide",
+             "qos=restrictedqos,restrictedqos2"]
+        )
 
         deep_merge(c.config_overrides, {"accounting": {"default_qos": "fallbackqos"}})
         c._write_config()
@@ -1388,13 +1406,95 @@ class TestSacctmgrQosAuthorization:
         job_id = parse_job_id(
             c.sbatch(["-J", "qos-fallback", "-N", "1", "-A", "fallbackacct", script])
         )
-        assert job_id is not None, "job with no --qos must still be accepted"
+        assert job_id is not None, "a list of one must resolve to that QOS"
+        wait_job(c, job_id, timeout=30)
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=restrictedqos" in show, f"expected the only allowed QOS: {show!r}"
+
+        out = c.cli_allow_fail(["sbatch", "-J", "qos-none", "-N", "1", "-A", "fallbackwide", script])
+        assert "no permitted QOS" in out, f"expected a rejection, got {out!r}"
+
+    def test_default_qos_must_be_on_the_associations_list(self, accounting_cluster):
+        # Slurm refuses an association write that leaves it unable to use its
+        # own default, whether the write changes the list or the default.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=deflista"])
+        c.sacctmgr(["add", "qos", "name=deflistb"])
+        c.sacctmgr(["add", "account", "name=deflist", "qos=deflista,deflistb", "defaultqos=deflista"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=deflist"])
+
+        out = c.cli_allow_fail(
+            ["sacctmgr", "modify", "user", f"name={user}", "account=deflist", "set", "qos=deflistb"]
+        )
+        assert "default QOS" in out, f"a list without the inherited default must be refused: {out!r}"
+
+        out = c.cli_allow_fail(
+            ["sacctmgr", "modify", "account", "name=deflist", "set", "qos-=deflista"]
+        )
+        assert "default QOS" in out, f"removing the account default must be refused: {out!r}"
+
+        c.sacctmgr(
+            ["modify", "user", f"name={user}", "account=deflist", "set",
+             "qos=deflistb", "defaultqos=deflistb"]
+        )
+        shown = c.sacctmgr(["show", "user", f"user={user}"])
+        row = next(ln for ln in shown.splitlines() if "deflist" in ln)
+        assert "deflistb" in row and "deflista" not in row, f"expected the new list:\n{shown}"
+
+    def test_account_tree_qos_flows_down_to_submit(self, accounting_cluster):
+        # A leaf user with nothing of their own gets the list and default set
+        # two accounts up, and a later qos-= on that account reaches them.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        for qos in ("treenormal", "treeburst", "treeextra"):
+            c.sacctmgr(["add", "qos", f"name={qos}"])
+        c.sacctmgr(
+            ["add", "account", "name=treetop", "qos=treenormal,treeburst,treeextra",
+             "defaultqos=treenormal"]
+        )
+        c.sacctmgr(["add", "account", "name=treemid", "parent=treetop"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=treemid"])
+        time.sleep(15)
+
+        script = c.write_file("qos-tree.sh", "#!/bin/bash\ntrue\n")
+        job_id = parse_job_id(c.sbatch(["-J", "qos-tree-default", "-N", "1", "-A", "treemid", script]))
+        assert job_id is not None, "the inherited default must resolve"
+        wait_job(c, job_id, timeout=30)
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=treenormal" in show, f"expected the default set two levels up: {show!r}"
+
+        c.sacctmgr(["modify", "account", "name=treetop", "set", "qos-=treeextra"])
+        time.sleep(15)
+        out = c.cli_allow_fail(
+            ["sbatch", "-J", "qos-tree-removed", "-N", "1", "-A", "treemid", "--qos=treeextra", script]
+        )
+        assert "not permitted" in out, f"a name removed above must not reach the leaf: {out!r}"
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-tree-kept", "-N", "1", "-A", "treemid", "--qos=treeburst", script])
+        )
+        assert job_id is not None, "a name still inherited must be usable"
         wait_job(c, job_id, timeout=30)
 
-        show = c.scontrol("show", "job", str(job_id))
-        assert "QOS=fallbackqos" not in show, (
-            f"unauthorized cluster fallback must not be silently granted: {show!r}"
-        )
+    def test_qos_writes_never_open_or_orphan_the_tree(self, accounting_cluster):
+        c = accounting_cluster
+
+        c.sacctmgr(["add", "qos", "name=openonly"])
+        c.sacctmgr(["add", "account", "name=opentop", "qos=openonly"])
+        c.sacctmgr(["add", "account", "name=openchild", "parent=opentop"])
+
+        out = c.cli_allow_fail(["sacctmgr", "modify", "account", "name=opentop", "set", "qos-=openonly"])
+        assert "every QOS" in out, f"emptying the top list must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "delete", "qos", "name=openonly"])
+        assert "every QOS" in out, f"deleting the top list's only QOS must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "-i", "delete", "account", "name=opentop"])
+        assert "sub-accounts" in out, f"deleting a parent must be refused: {out!r}"
+        out = c.cli_allow_fail(["sacctmgr", "add", "account", "name=openstray", "parent=opentpo"])
+        assert "does not exist" in out, f"an unknown parent must be refused: {out!r}"
+
+        c.sacctmgr(["add", "account", "name=openroot", "parent=root"])
 
     def test_update_job_qos_rejects_unauthorized_and_account_spoofing(self, accounting_cluster):
         # scontrol update job qos= must enforce the same per-association
@@ -1408,7 +1508,10 @@ class TestSacctmgrQosAuthorization:
         c.sacctmgr(["add", "qos", "name=updateforbidden"])
         c.sacctmgr(["add", "account", "name=updateacct"])
         c.sacctmgr(["add", "account", "name=updatestranger"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=updateacct", "defaultqos=updateallowed"])
+        c.sacctmgr(
+            ["add", "user", f"name={user}", "account=updateacct",
+             "qos=updateallowed", "defaultqos=updateallowed"]
+        )
         time.sleep(15)
 
         script = c.write_file("qos-update.sh", "#!/bin/bash\nsleep 30\n")

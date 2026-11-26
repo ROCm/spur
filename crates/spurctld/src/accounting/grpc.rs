@@ -9,7 +9,7 @@ use spur_core::accounting::{limit_to_wire, TresRecord};
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
-use super::{db, txn};
+use super::{db, qos_level, txn};
 use crate::audit::Annotation;
 
 fn internal(e: impl std::fmt::Display) -> Status {
@@ -143,21 +143,206 @@ fn normalize_admin_level(raw: &str) -> Result<&str, Status> {
     })
 }
 
-/// Normalize a comma-separated QOS allow-list: trim, drop empty tokens (a
-/// trailing comma is harmless), and reject any name that is not a QOS.
-async fn normalize_qos_list(pool: &PgPool, list: &str) -> Result<String, Status> {
-    let names: Vec<&str> = list
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let missing = db::missing_qos(pool, &names)
+/// The account or user-account association a QOS write targets.
+#[derive(Clone, Copy)]
+enum Grantee<'a> {
+    Account(&'a str),
+    User { user: &'a str, account: &'a str },
+}
+
+impl<'a> Grantee<'a> {
+    fn account(self) -> &'a str {
+        match self {
+            Self::Account(account) | Self::User { account, .. } => account,
+        }
+    }
+
+    fn user(self) -> Option<&'a str> {
+        match self {
+            Self::Account(_) => None,
+            Self::User { user, .. } => Some(user),
+        }
+    }
+}
+
+fn association_label(account: &str, user: Option<&str>) -> String {
+    match user {
+        Some(user) => format!("A={account} U={user}"),
+        None => format!("A={account}"),
+    }
+}
+
+/// A QOS edit applied to what its level stores now.
+#[derive(Default)]
+struct StagedQos {
+    /// The `allowed_qos` column patch: `None` leaves it alone.
+    stored: Option<Option<String>>,
+    /// A `qos-=` removed the last name of this level's `qos=` list.
+    emptied: bool,
+}
+
+/// Take the QOS grants lock, check every name the write mentions (including
+/// one being removed: an unknown name is a typo), and apply the edit. Names
+/// are checked against the live DB, not `QosCache`, so a QOS created just now
+/// is accepted, and under the lock, so a concurrent `delete qos` cannot slip
+/// in before the write commits.
+async fn stage_qos_write(
+    conn: &mut sqlx::PgConnection,
+    grantee: Grantee<'_>,
+    write: Option<&qos_level::QosWrite>,
+    default_qos: Option<&str>,
+) -> Result<StagedQos, Status> {
+    db::lock_qos_grants(conn).await.map_err(internal)?;
+    let mut names = write.map(qos_level::QosWrite::names).unwrap_or_default();
+    names.extend(default_qos.filter(|name| !name.is_empty()));
+    let missing = db::missing_qos(&mut *conn, &names)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(internal)?;
     if let Some(name) = missing.first() {
         return Err(Status::not_found(format!("QOS '{name}' does not exist")));
     }
-    Ok(names.join(","))
+    let Some(write) = write else {
+        return Ok(StagedQos::default());
+    };
+    let current = if write.needs_current() {
+        match grantee {
+            Grantee::Account(account) => db::account_allowed_qos(conn, account).await,
+            Grantee::User { user, account } => db::user_allowed_qos(conn, user, account).await,
+        }
+        .map_err(internal)?
+    } else {
+        None
+    };
+    let stored =
+        qos_level::apply_write(current.as_deref(), write).map_err(Status::invalid_argument)?;
+    let emptied = write.needs_current()
+        && qos_level::emptied_exact_list(current.as_deref(), stored.as_deref());
+    Ok(StagedQos {
+        stored: Some(stored),
+        emptied,
+    })
+}
+
+/// The account tree as the current transaction sees it, evaluated.
+struct QosTree {
+    accounts: Vec<db::AccountRecord>,
+    universe: Vec<String>,
+    effects: std::collections::HashMap<String, qos_level::AccountEffect>,
+}
+
+impl QosTree {
+    async fn load(conn: &mut sqlx::PgConnection) -> Result<Self, Status> {
+        let accounts = db::list_accounts(&mut *conn).await.map_err(internal)?;
+        let universe = db::list_qos_names(&mut *conn).await.map_err(internal)?;
+        let effects = db::account_effects(&accounts, &universe);
+        Ok(Self {
+            accounts,
+            universe,
+            effects,
+        })
+    }
+
+    fn refuse_broken_parent(&self, account: &str) -> Result<(), Status> {
+        match qos_level::parent_problem(&db::account_nodes(&self.accounts), account) {
+            None => Ok(()),
+            Some(qos_level::ParentProblem::Missing(parent)) => Err(Status::not_found(format!(
+                "parent account '{parent}' does not exist"
+            ))),
+            Some(qos_level::ParentProblem::Cycle) => Err(Status::invalid_argument(format!(
+                "account '{account}' cannot be placed under one of its own sub-accounts"
+            ))),
+        }
+    }
+
+    /// Labels of the given associations that no list limits any more.
+    fn unlimited<'a>(
+        &self,
+        levels: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ) -> Vec<String> {
+        levels
+            .into_iter()
+            .filter(|(account, _)| {
+                !self
+                    .effects
+                    .get(*account)
+                    .is_some_and(|effect| effect.qos.limited)
+            })
+            .map(|(account, user)| association_label(account, user))
+            .collect()
+    }
+
+    /// Refuse a write that leaves `account` and its users, or just `user`
+    /// under it, unable to use their own default QOS, as Slurm does. Like
+    /// Slurm, sub-accounts are not checked.
+    async fn refuse_denied_defaults(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        grantee: Grantee<'_>,
+    ) -> Result<(), Status> {
+        let account = grantee.account();
+        let Some(effect) = self.effects.get(account) else {
+            return Ok(());
+        };
+        let cells = db::association_qos_cells(conn, account, grantee.user())
+            .await
+            .map_err(internal)?;
+        let users: Vec<qos_level::UserQos<'_>> = cells
+            .iter()
+            .map(|(user, qos, default_qos)| qos_level::UserQos {
+                user,
+                qos: qos.as_deref(),
+                default_qos: default_qos.as_deref(),
+            })
+            .collect();
+        let include_account = grantee.user().is_none();
+        let denied =
+            qos_level::defaults_without_access(effect, &users, &self.universe, include_account);
+        if denied.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<String> = denied
+            .iter()
+            .map(|d| {
+                format!(
+                    "DefQOS={} {}",
+                    d.default_qos,
+                    association_label(account, d.user)
+                )
+            })
+            .collect();
+        Err(Status::invalid_argument(format!(
+            "these associations would not have access to their default QOS: {}. \
+             Add it to their qos list or change the default",
+            rows.join("; ")
+        )))
+    }
+}
+
+/// Re-check the tree after a write, inside its transaction, so an error
+/// rolls the write back.
+async fn check_qos_grants(
+    conn: &mut sqlx::PgConnection,
+    grantee: Grantee<'_>,
+    staged: &StagedQos,
+    parent_changed: bool,
+) -> Result<(), Status> {
+    let tree = QosTree::load(conn).await?;
+    if parent_changed {
+        tree.refuse_broken_parent(grantee.account())?;
+    }
+    if staged.emptied {
+        if let Some(label) = tree
+            .unlimited([(grantee.account(), grantee.user())])
+            .first()
+        {
+            return Err(Status::invalid_argument(format!(
+                "qos-= would remove the last QOS from the qos= list of {label}, and nothing \
+                 above it sets a list, so it could use every QOS. Set qos= to the QOS it \
+                 may use instead"
+            )));
+        }
+    }
+    tree.refuse_denied_defaults(conn, grantee).await
 }
 
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
@@ -822,9 +1007,16 @@ impl SlurmAccounting for AccountingService {
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
         }
-        let allowed_qos_normalized = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
+        let write =
+            qos_level::parse_write(req.allowed_qos.as_deref()).map_err(Status::invalid_argument)?;
+        let grantee = Grantee::Account(&req.name);
+        let touches_grants =
+            write.is_some() || req.default_qos.is_some() || req.parent_account.is_some();
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let staged = if touches_grants {
+            stage_qos_write(&mut tx, grantee, write.as_ref(), req.default_qos.as_deref()).await?
+        } else {
+            StagedQos::default()
         };
         let update = db::AccountUpdate {
             description: req.description.as_deref(),
@@ -833,12 +1025,15 @@ impl SlurmAccounting for AccountingService {
             fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
-            allowed_qos: nullable_str(&allowed_qos_normalized),
+            allowed_qos: staged.stored.as_ref().map(Option::as_deref),
+            default_qos: nullable_str(&req.default_qos),
         };
-        let mut tx = pool.begin().await.map_err(internal)?;
         let result = db::upsert_account(&mut tx, &req.name, update)
             .await
             .map_err(internal)?;
+        if touches_grants {
+            check_qos_grants(&mut tx, grantee, &staged, req.parent_account.is_some()).await?;
+        }
         let details = txn::requested(&[
             ("description", req.description.map(Into::into)),
             ("organization", req.organization.map(Into::into)),
@@ -846,7 +1041,8 @@ impl SlurmAccounting for AccountingService {
             ("fairshare_weight", req.fairshare_weight.map(Into::into)),
             ("max_running_jobs", req.max_running_jobs.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
-            ("allowed_qos", allowed_qos_normalized.map(Into::into)),
+            ("allowed_qos", req.allowed_qos.map(Into::into)),
+            ("default_qos", req.default_qos.map(Into::into)),
         ]);
         write_txn_in_band(
             &mut tx,
@@ -872,6 +1068,19 @@ impl SlurmAccounting for AccountingService {
         let pool = &pool;
         let req = request.into_inner();
         let mut tx = pool.begin().await.map_err(internal)?;
+        db::lock_qos_grants(&mut tx).await.map_err(internal)?;
+        let children = db::child_accounts(&mut tx, &req.name)
+            .await
+            .map_err(internal)?;
+        if !children.is_empty() {
+            // Orphaned children would lose every QOS list they inherit.
+            return Err(Status::failed_precondition(format!(
+                "account '{}' still has sub-accounts: {}. Delete them or move them under \
+                 another parent first",
+                req.name,
+                children.join(", ")
+            )));
+        }
         db::delete_account(&mut tx, &req.name)
             .await
             .map_err(internal)?;
@@ -937,6 +1146,8 @@ impl SlurmAccounting for AccountingService {
         let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let universe = db::list_qos_names(pool).await.map_err(internal)?;
+        let effects = db::account_effects(&records, &universe);
         let partial = allowed
             .as_ref()
             .is_some_and(|names| records.iter().any(|r| !names.iter().any(|n| n == &r.name)));
@@ -944,15 +1155,23 @@ impl SlurmAccounting for AccountingService {
         let accounts = records
             .into_iter()
             .filter(|r| account_allowed(allowed.as_deref(), &r.name))
-            .map(|r| AccountInfo {
-                name: r.name,
-                description: r.description,
-                organization: r.organization,
-                parent_account: r.parent.unwrap_or_default(),
-                fairshare_weight: r.fairshare_weight as f64,
-                max_running_jobs: limit_to_wire(r.max_running_jobs),
-                grp_tres: r.grp_tres.unwrap_or_default(),
-                allowed_qos: r.allowed_qos.unwrap_or_default(),
+            .map(|r| {
+                let effect = effects.get(&r.name);
+                AccountInfo {
+                    name: r.name,
+                    description: r.description,
+                    organization: r.organization,
+                    parent_account: r.parent.unwrap_or_default(),
+                    fairshare_weight: r.fairshare_weight as f64,
+                    max_running_jobs: limit_to_wire(r.max_running_jobs),
+                    grp_tres: r.grp_tres.unwrap_or_default(),
+                    allowed_qos: effect
+                        .map(|effect| effect.qos.display())
+                        .unwrap_or_default(),
+                    default_qos: effect
+                        .and_then(|effect| effect.default_qos.clone())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
 
@@ -970,50 +1189,30 @@ impl SlurmAccounting for AccountingService {
             .as_deref()
             .map(normalize_admin_level)
             .transpose()?;
-        // QOS references are validated against the live DB, not QosCache: a QOS
-        // created just now may not have reached the cache's next refresh yet,
-        // the same lag job submission already accepts for QosCache reads. Each
-        // check runs only for a field the request actually restated.
-        if let Some(dq) = req.default_qos.as_deref() {
-            if !dq.is_empty() {
-                let exists = db::qos_exists(pool, dq)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                if !exists {
-                    return Err(Status::not_found(format!("QOS '{dq}' does not exist")));
-                }
-            }
-        }
-        // Normalize + validate an explicitly restated allow-list. `None` leaves
-        // the stored allow-list untouched; an explicit empty clears it.
-        let allowed_qos_normalized: Option<String> = match req.allowed_qos.as_deref() {
-            None => None,
-            Some(list) => Some(normalize_qos_list(pool, list).await?),
-        };
-        // Cross-check the default is in the allow-list only when both are
-        // restated here; a preserved (unset) side can't be validated without a
-        // read and is left to the stored value.
-        if let (Some(dq), Some(list)) = (
-            req.default_qos.as_deref(),
-            allowed_qos_normalized.as_deref(),
-        ) {
-            if !dq.is_empty() && !list.is_empty() && !list.split(',').any(|q| q == dq) {
-                return Err(Status::invalid_argument(format!(
-                    "default QOS '{dq}' must be included in qos={list}"
-                )));
-            }
-        }
+        let write =
+            qos_level::parse_write(req.allowed_qos.as_deref()).map_err(Status::invalid_argument)?;
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
         }
         if let Some(t) = &req.grp_tres {
             validate_tres("grptres", t)?;
         }
+        let grantee = Grantee::User {
+            user: &req.user,
+            account: &req.account,
+        };
+        let touches_grants = write.is_some() || req.default_qos.is_some();
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let staged = if touches_grants {
+            stage_qos_write(&mut tx, grantee, write.as_ref(), req.default_qos.as_deref()).await?
+        } else {
+            StagedQos::default()
+        };
         let update = db::UserUpdate {
             admin_level,
             is_default: req.is_default,
             default_qos: nullable_str(&req.default_qos),
-            allowed_qos: nullable_str(&allowed_qos_normalized),
+            allowed_qos: staged.stored.as_ref().map(Option::as_deref),
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             max_submit_jobs: nullable_limit(req.max_submit_jobs, "max_submit_jobs")?,
             grp_submit_jobs: nullable_limit(req.grp_submit_jobs, "grp_submit_jobs")?,
@@ -1021,10 +1220,12 @@ impl SlurmAccounting for AccountingService {
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        let mut tx = pool.begin().await.map_err(internal)?;
         let outcome = db::add_user(&mut tx, &req.user, &req.account, update)
             .await
             .map_err(internal)?;
+        if touches_grants {
+            check_qos_grants(&mut tx, grantee, &staged, false).await?;
+        }
         write_txn_in_band(
             &mut tx,
             &audit,
@@ -1035,7 +1236,7 @@ impl SlurmAccounting for AccountingService {
                     ("admin_level", admin_level.map(Into::into)),
                     ("is_default", req.is_default.map(Into::into)),
                     ("default_qos", req.default_qos.map(Into::into)),
-                    ("allowed_qos", allowed_qos_normalized.map(Into::into)),
+                    ("allowed_qos", req.allowed_qos.map(Into::into)),
                     ("max_running_jobs", req.max_running_jobs.map(Into::into)),
                     ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
                 ]),
@@ -1389,6 +1590,12 @@ impl SlurmAccounting for AccountingService {
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
+        if qos_level::is_edit_marker(&req.name) {
+            return Err(Status::invalid_argument(format!(
+                "QOS name '{}' must not start with '+' or '-'",
+                req.name
+            )));
+        }
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
         }
@@ -1506,7 +1713,28 @@ impl SlurmAccounting for AccountingService {
         let pool = &pool;
         let req = request.into_inner();
         let mut tx = pool.begin().await.map_err(internal)?;
+        db::lock_qos_grants(&mut tx).await.map_err(internal)?;
         db::delete_qos(&mut tx, &req.name).await.map_err(internal)?;
+        let emptied = db::strip_qos_references(&mut tx, &req.name)
+            .await
+            .map_err(internal)?;
+        if !emptied.is_empty() {
+            let tree = QosTree::load(&mut tx).await?;
+            let open = tree.unlimited(
+                emptied
+                    .iter()
+                    .map(|level| (level.account.as_str(), level.user.as_deref())),
+            );
+            if !open.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "QOS '{}' is the only QOS on the qos= list of {}, and nothing above them \
+                     sets a list, so deleting it would let them use every QOS. Give them \
+                     another qos= list first",
+                    req.name,
+                    open.join("; ")
+                )));
+            }
+        }
         write_txn_in_band(
             &mut tx,
             &audit,
@@ -2955,5 +3183,122 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn qos_writes_refuse_to_open_or_orphan_the_tree() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .expect("DB connect");
+        db::migrate(&pool).await.expect("migrate");
+        let service = AccountingService::unavailable("test");
+        service.install_pool(pool.clone());
+
+        let pid = std::process::id();
+        let qos_a = format!("spur_grants_qa_{pid}");
+        let qos_b = format!("spur_grants_qb_{pid}");
+        let top = format!("spur_grants_top_{pid}");
+        let mid = format!("spur_grants_mid_{pid}");
+        let leaf = format!("spur_grants_leaf_{pid}");
+        let cleanup = || async {
+            for account in [&leaf, &mid, &top] {
+                sqlx::query("DELETE FROM accounts WHERE name = $1")
+                    .bind(account)
+                    .execute(&pool)
+                    .await
+                    .expect("delete account");
+            }
+            sqlx::query("DELETE FROM qos WHERE name = ANY($1)")
+                .bind([&qos_a, &qos_b])
+                .execute(&pool)
+                .await
+                .expect("delete qos");
+        };
+        cleanup().await;
+
+        for name in [&qos_a, &qos_b] {
+            service
+                .create_qos(Request::new(CreateQosRequest {
+                    name: name.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("create qos");
+        }
+        let account = |name: &str, parent: Option<&str>, qos: Option<&str>| {
+            Request::new(CreateAccountRequest {
+                name: name.to_owned(),
+                parent_account: parent.map(str::to_owned),
+                allowed_qos: qos.map(str::to_owned),
+                ..Default::default()
+            })
+        };
+        service
+            .create_account(account(&top, None, Some(&format!("{qos_a},{qos_b}"))))
+            .await
+            .expect("create top");
+        service
+            .create_account(account(&mid, Some(&top), Some(&qos_a)))
+            .await
+            .expect("create mid");
+
+        let missing = service
+            .create_account(account(&leaf, Some("spur_grants_no_such_parent"), None))
+            .await
+            .expect_err("an unknown parent must be refused");
+        assert_eq!(missing.code(), tonic::Code::NotFound, "{missing:?}");
+
+        let cycle = service
+            .create_account(account(&top, Some(&mid), None))
+            .await
+            .expect_err("a parent under the account itself must be refused");
+        assert_eq!(cycle.code(), tonic::Code::InvalidArgument, "{cycle:?}");
+
+        let orphaning = service
+            .delete_account(Request::new(DeleteAccountRequest { name: top.clone() }))
+            .await
+            .expect_err("deleting an account with sub-accounts must be refused");
+        assert_eq!(orphaning.code(), tonic::Code::FailedPrecondition);
+
+        service
+            .create_account(account(&mid, None, Some(&format!("-{qos_a}"))))
+            .await
+            .expect("under a limited parent an emptied list inherits it");
+
+        service
+            .create_account(account(&top, None, Some(&qos_a)))
+            .await
+            .expect("narrow top");
+        let opening = service
+            .create_account(account(&top, None, Some(&format!("-{qos_a}"))))
+            .await
+            .expect_err("emptying the top list would open every QOS");
+        assert_eq!(opening.code(), tonic::Code::InvalidArgument, "{opening:?}");
+
+        let deleting = service
+            .delete_qos(Request::new(DeleteQosRequest {
+                name: qos_a.clone(),
+            }))
+            .await
+            .expect_err("deleting the last QOS of the top list would open it");
+        assert_eq!(deleting.code(), tonic::Code::FailedPrecondition);
+        let still_there: Vec<String> = db::list_accounts(&pool)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|record| record.name == top)
+            .filter_map(|record| record.allowed_qos)
+            .collect();
+        assert_eq!(
+            still_there,
+            vec![qos_a.clone()],
+            "a refused write rolls back"
+        );
+
+        cleanup().await;
     }
 }

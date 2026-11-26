@@ -47,15 +47,77 @@ snapshot size. See :ref:`preemption-outcome-export`.
 Account QOS allow-list compatibility
 ------------------------------------
 
-Account QOS allow-lists (``sacctmgr add/modify account ... qos=``) add an
-``allowed_qos`` column to the ``accounts`` table, created automatically at
-startup. Upgrade every controller before setting one. An older controller
-ignores the field: ``sacctmgr`` reports the account as added or modified, but no
-list is stored.
+Account QOS allow-lists (``sacctmgr add/modify account ... qos=``) add
+``allowed_qos`` and ``default_qos`` columns to the ``accounts`` table, created
+automatically at startup. A stored list may be a replacement (``normal,burst``)
+or an add/remove edit (``+expedite,-standby``). Upgrade every controller before
+setting one. An older controller ignores an account's ``qos`` and
+``defaultqos``: ``sacctmgr`` reports the account as added or modified, but
+neither is stored. On a user, it rejects a ``qos+=`` or ``qos-=`` value as an
+unknown QOS name.
 
-**Rollback.** An older controller leaves the column in place but does not read
-it. Users who have no ``qos=`` of their own stop inheriting the account's list
-and may again use any QOS. Lists set directly on users are unaffected.
+``sacctmgr show user`` (``UserInfo.allowed_qos`` and ``UserInfo.default_qos``)
+now returns the evaluated list and the inherited default, not only what was
+set on the user. A script that reads these and writes them back pins the
+inherited values on the user.
+
+A QOS name starting with ``+`` or ``-`` can no longer be created or modified,
+since those mark an add or remove. Rename any such QOS before upgrading. A
+stored list that mixes one with plain names reads as exactly the names listed,
+and ``qos+=``/``qos-=`` on it is refused until it is replaced with ``qos=``.
+
+**Rollback.** An older controller leaves the columns in place but does not read
+them. Users who have no ``qos=`` of their own stop inheriting the account's
+list, including anything that account inherited from its parent, and may again
+use any QOS. Exact lists set directly on users are unaffected. A stored
+add/remove edit (``+name``) is read as a literal QOS name, so a user it applies
+to can use only their default QOS, if they have one, until the edit is
+replaced with ``qos=``.
+
+Default QOS admission changes
+-----------------------------
+
+.. warning::
+
+   This release changes which jobs a default QOS admits. Review your
+   associations before upgrading, using ``sacctmgr show user`` on the old
+   controller.
+
+- **A default QOS alone no longer limits the user.** Before, an association
+  with ``defaultqos=`` and no ``qos=`` list anywhere above it could only use
+  that one QOS. Now it may name any QOS, and the default only applies to a job
+  that names none. Rows that show a ``Def QOS`` and an empty ``QOS`` column
+  are affected. To keep the old limit, set ``qos=`` to the default on each one
+  before upgrading, for example
+  ``sacctmgr modify user name=alice account=physics set qos=normal``.
+- **A default QOS that is not on the allow-list is now skipped.** Before, a
+  job that named no QOS ran under the association's default even when the
+  default was missing from the ``qos=`` list. Now, as in Slurm, the default is
+  ignored. The job gets the only QOS on the list, or the cluster
+  ``default_qos`` when the list includes it. Otherwise it is refused with
+  ``no permitted QOS resolves``. Rows whose ``Def QOS`` is not in their ``QOS``
+  column are affected. Add the default to the list, or change the default.
+  As in Slurm, a write that leaves the account it changes, or a user directly
+  in it, with such a default is refused; sub-accounts are not re-checked.
+- **A job under a QOS list never runs with no QOS.** Before, a job that named
+  no QOS under an association with a ``qos=`` list but no usable default ran
+  with no QOS. Now it is refused unless the list has exactly one QOS. Give
+  those associations a ``defaultqos`` from their list.
+- **Deleting a QOS removes it from lists and defaults.** A list set with
+  ``qos=`` whose only name was the deleted QOS then inherits again. When
+  nothing above it sets a list, that would allow every QOS, so the delete is
+  refused until the list is replaced. The same holds for ``qos-=`` of a
+  list's last name.
+- **Account parents are checked.** ``parent=`` must name an existing account
+  (or ``root``, the top of the tree) and cannot be one of the account's own
+  sub-accounts. An account with sub-accounts can no longer be deleted; delete
+  or move them first. Before, a misspelled or deleted parent silently made its
+  children top-level accounts, which with inherited lists would drop their
+  QOS limits.
+
+**Rollback.** An older controller restores the old submit rules. Associations
+you gave an explicit ``qos=`` list keep it. Lists and defaults trimmed by a
+QOS deletion stay trimmed.
 
 Single-Host: ``spur self-update``
 ---------------------------------

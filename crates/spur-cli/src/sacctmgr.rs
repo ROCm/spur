@@ -74,13 +74,16 @@ const SACCTMGR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// entity's fields in that one page.
 const ADD_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos, defaultqos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
             gracetime, idlefillpreemptable, usagefactor, maxjobsperuser, maxwall,
             maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit,
-            maxtresperuser, grptres, grpwall, flags";
+            maxtresperuser, grptres, grpwall, flags
+
+qos=a,b sets the allow-list. qos+=a adds a name and qos-=a removes one,
+keeping whatever was inherited.";
 
 /// `key=value` fields `modify` accepts. Same as `add` plus the clearing
 /// operations that only make sense against an existing record:
@@ -89,7 +92,7 @@ Fields (key=value), by entity:
 /// immediately-preemptable).
 const MODIFY_FIELDS_HELP: &str = "\
 Fields (key=value), by entity:
-  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres, qos, defaultqos
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
@@ -102,7 +105,9 @@ Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
 This differs from preemptexempttime=0, which sets an explicit zero exemption.
 cleargracetime=1 likewise resets a QOS GraceTime to unset (inherit the
 partition's), unlike gracetime=0, which means no grace. It takes a boolean
-value (1/yes/true or 0/no/false) and cannot be combined with gracetime=.";
+value (1/yes/true or 0/no/false) and cannot be combined with gracetime=.
+qos=a,b replaces the allow-list. qos+=a adds a name and qos-=a removes one,
+keeping whatever was inherited. qos= with nothing after it inherits again.";
 
 /// `key=value` selectors `delete` accepts, per entity. Distinct from the write
 /// fields: delete only *selects* what to remove, and advertising a write field
@@ -251,6 +256,8 @@ const USER_KEYS: &[&str] = &[
     "adminlevel",
     "defaultqos",
     "qos",
+    "qos+",
+    "qos-",
     "maxrunningjobs",
     "maxjobs",
     "maxsubmitjobs",
@@ -278,6 +285,9 @@ const ACCOUNT_KEYS: &[&str] = &[
     "grptres",
     "rawusage",
     "qos",
+    "qos+",
+    "qos-",
+    "defaultqos",
 ];
 
 /// Selectors `delete account` / `delete qos` accept: the entity name only.
@@ -449,16 +459,7 @@ fn build_add_user_request(
         .cloned()
         .unwrap_or_else(|| "none".into());
     let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
-    let allowed_qos = p.get("qos").cloned().unwrap_or_default();
-    if !default_qos.is_empty()
-        && !allowed_qos.is_empty()
-        && !allowed_qos
-            .split(',')
-            .map(str::trim)
-            .any(|q| q == default_qos)
-    {
-        bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
-    }
+    let allowed_qos = qos_assignment(p)?.unwrap_or_default();
     // An unset numeric limit sends INFINITE (clear/no-limit) on `add`; a literal
     // 0 would mean "block all" under the sentinel semantics.
     let no_limit = spur_core::accounting::INFINITE;
@@ -515,50 +516,29 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" => {
-            reject_unknown_keys(&p, ACCOUNT_KEYS)?;
-            let name = p
-                .get("name")
-                .or_else(|| p.get("account"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-            let desc = p.get("description").cloned().unwrap_or_default();
-            let org = p.get("organization").cloned().unwrap_or_default();
-            let parent = p.get("parent").cloned().unwrap_or_default();
-            let fairshare: f64 = p
-                .get("fairshare")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0);
-            let max_jobs: u32 = find_alias(&p, &["maxrunningjobs", "maxjobs"])
-                .map(|(k, v)| parse_limit(k, v))
-                .transpose()?
-                .unwrap_or(spur_core::accounting::INFINITE);
-            let grp_tres = p.get("grptres").cloned().unwrap_or_default();
-            let qos = p.get("qos").cloned();
-
+            let req = build_add_account_request(&p)?;
             let mut client = connect(addr).await?;
             client
-                .create_account(CreateAccountRequest {
-                    name: name.clone(),
-                    description: Some(desc.clone()),
-                    organization: Some(org.clone()),
-                    parent_account: Some(parent.clone()),
-                    fairshare_weight: Some(fairshare),
-                    max_running_jobs: Some(max_jobs),
-                    grp_tres: Some(grp_tres),
-                    allowed_qos: qos.clone(),
-                })
+                .create_account(req.clone())
                 .await
                 .context("CreateAccount RPC failed")?;
 
             println!(
                 " Adding Account(s)\n  Name       = {}\n  Descr      = {}\n  Org        = {}\n  Parent     = {}\n  Fairshare  = {}",
-                name,
-                desc,
-                org,
-                if parent.is_empty() { "root" } else { &parent },
-                fairshare
+                req.name,
+                req.description.unwrap_or_default(),
+                req.organization.unwrap_or_default(),
+                req.parent_account
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("root"),
+                req.fairshare_weight.unwrap_or_default()
             );
-            if let Some(q) = qos.as_deref().filter(|q| !q.is_empty()) {
+            if let Some(q) = req.allowed_qos.as_deref().filter(|q| !q.is_empty()) {
                 println!("  QOS        = {q}");
+            }
+            if let Some(q) = req.default_qos.as_deref().filter(|q| !q.is_empty()) {
+                println!("  DefQOS     = {q}");
             }
             println!(" Account added.");
             Ok(())
@@ -804,6 +784,80 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
+/// `qos=a,b` replaces the list. `qos+=a` and `qos-=b` become `+a,-b`, which
+/// the controller applies on top of whatever is already inherited. An empty
+/// `qos=` clears the local edit so the parent list is used again.
+fn qos_assignment(p: &std::collections::HashMap<String, String>) -> Result<Option<String>> {
+    let assign = p.get("qos");
+    let add = p.get("qos+");
+    let remove = p.get("qos-");
+    if assign.is_some() && (add.is_some() || remove.is_some()) {
+        bail!("qos= replaces the list; qos+= and qos-= change it. Use one or the other");
+    }
+    if let Some(list) = assign {
+        return Ok(Some(list.clone()));
+    }
+    if add.is_none() && remove.is_none() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    if let Some(list) = add {
+        push_qos_ops(&mut parts, list, '+')?;
+    }
+    if let Some(list) = remove {
+        push_qos_ops(&mut parts, list, '-')?;
+    }
+    Ok(Some(parts.join(",")))
+}
+
+fn push_qos_ops(parts: &mut Vec<String>, list: &str, op: char) -> Result<()> {
+    let names: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        bail!("qos{op}= needs a QOS name");
+    }
+    for name in names {
+        parts.push(format!("{op}{name}"));
+    }
+    Ok(())
+}
+
+/// Build the `CreateAccountRequest` for `add account`. Every field gets its
+/// default, except `parent`, which stays unset when not given: re-adding an
+/// existing account must not move it to the top and drop its inherited QOS.
+fn build_add_account_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<CreateAccountRequest> {
+    reject_unknown_keys(p, ACCOUNT_KEYS)?;
+    let name = p
+        .get("name")
+        .or_else(|| p.get("account"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    let fairshare: f64 = p
+        .get("fairshare")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let max_jobs: u32 = find_alias(p, &["maxrunningjobs", "maxjobs"])
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?
+        .unwrap_or(spur_core::accounting::INFINITE);
+    Ok(CreateAccountRequest {
+        name,
+        description: Some(p.get("description").cloned().unwrap_or_default()),
+        organization: Some(p.get("organization").cloned().unwrap_or_default()),
+        parent_account: p.get("parent").cloned(),
+        fairshare_weight: Some(fairshare),
+        max_running_jobs: Some(max_jobs),
+        grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
+        allowed_qos: qos_assignment(p)?,
+        default_qos: p.get("defaultqos").cloned(),
+    })
+}
+
 /// Build a partial-patch `CreateAccountRequest` for `modify account`: a field
 /// is `Some` only when the command restated it (so the server leaves every
 /// other column untouched), and an explicitly empty value clears it.
@@ -829,7 +883,8 @@ fn build_modify_account_request(
             .map(|(k, v)| parse_limit(k, v))
             .transpose()?,
         grp_tres: p.get("grptres").cloned(),
-        allowed_qos: p.get("qos").cloned(),
+        allowed_qos: qos_assignment(p)?,
+        default_qos: p.get("defaultqos").cloned(),
     })
 }
 
@@ -1019,12 +1074,7 @@ fn build_modify_user_request(
         .clone();
     let account = resolve_user_account(p)?;
     let default_qos = p.get("defaultqos").cloned();
-    let allowed_qos = p.get("qos").cloned();
-    if let (Some(dq), Some(list)) = (default_qos.as_deref(), allowed_qos.as_deref()) {
-        if !dq.is_empty() && !list.is_empty() && !list.split(',').map(str::trim).any(|q| q == dq) {
-            bail!("defaultqos={dq} must be included in qos={list}");
-        }
-    }
+    let allowed_qos = qos_assignment(p)?;
     Ok(AddUserRequest {
         user,
         is_default: p.get("defaultaccount").map(|da| da == &account),
@@ -1823,7 +1873,7 @@ fn association_lines(accounts: &[AccountInfo], users: &[UserInfo]) -> Vec<Associ
             // Same truncation `show account` uses for the Share column.
             share: Some(account.fairshare_weight as u32),
             qos: account.allowed_qos.clone(),
-            default_qos: String::new(),
+            default_qos: account.default_qos.clone(),
         });
         for user in users.iter().filter(|u| u.account == account.name) {
             placed.insert((user.name.clone(), user.account.clone()));
@@ -2063,21 +2113,21 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_rejects_default_qos_outside_allow_list() {
+    fn build_add_user_request_leaves_default_qos_access_to_the_controller() {
+        // Only the controller sees the inherited list, so it alone decides
+        // whether the default is usable.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
             "qos=highprio,lowprio".into(),
             "defaultqos=other-teams-qos".into(),
         ]);
-        let err = build_add_user_request(&p).unwrap_err();
-        assert!(err.to_string().contains("must be included in qos="));
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.default_qos, "other-teams-qos");
     }
 
     #[test]
     fn build_add_user_request_allows_defaultqos_alone_without_a_list() {
-        // Pinning only a default (no qos= list) is still valid — it's
-        // single-QOS scoping, not a validation error.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
@@ -2653,6 +2703,9 @@ mod tests {
             "maxjobs",
             "grptres",
             "qos",
+            "qos+",
+            "qos-",
+            "defaultqos",
         ];
         for field in parsed_fields {
             let p = parse_params(&["name=acct".into(), format!("{field}=1")]);
@@ -2866,6 +2919,42 @@ mod tests {
     }
 
     #[test]
+    fn build_add_account_request_leaves_an_unstated_parent_alone() {
+        let p = parse_params(&["name=physics".into()]);
+        let req = build_add_account_request(&p).unwrap();
+        assert_eq!(req.parent_account, None);
+        assert_eq!(req.fairshare_weight, Some(1.0));
+        assert_eq!(req.allowed_qos, None);
+
+        let p = parse_params(&["name=physics".into(), "parent=science".into()]);
+        let req = build_add_account_request(&p).unwrap();
+        assert_eq!(req.parent_account.as_deref(), Some("science"));
+    }
+
+    #[test]
+    fn build_modify_account_request_adds_and_removes_qos_names() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "set".into(),
+            "qos+=expedite".into(),
+            "qos-=standby".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.allowed_qos.as_deref(), Some("+expedite,-standby"));
+    }
+
+    #[test]
+    fn build_modify_account_request_rejects_mixing_qos_forms() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "qos=burst".into(),
+            "qos+=expedite".into(),
+        ]);
+        let err = build_modify_account_request(&p).unwrap_err();
+        assert!(err.to_string().contains("one or the other"), "{err}");
+    }
+
+    #[test]
     fn build_modify_account_request_explicit_empty_clears() {
         // An explicit `grptres=` is a request to clear, distinct from omitting
         // it (which preserves).
@@ -2979,17 +3068,6 @@ mod tests {
         let p = parse_params(&["name=alice".into(), "account=physics".into(), "qos=".into()]);
         let req = build_modify_user_request(&p).unwrap();
         assert_eq!(req.allowed_qos, Some(String::new()));
-    }
-
-    #[test]
-    fn build_modify_user_request_rejects_default_outside_restated_list() {
-        let p = parse_params(&[
-            "name=alice".into(),
-            "account=physics".into(),
-            "qos=a,b".into(),
-            "defaultqos=c".into(),
-        ]);
-        assert!(build_modify_user_request(&p).is_err());
     }
 
     #[test]
@@ -3490,6 +3568,7 @@ mod tests {
             max_running_jobs: 10,
             grp_tres: "node=4,cpu=256".into(),
             allowed_qos: String::new(),
+            default_qos: String::new(),
         }
     }
 

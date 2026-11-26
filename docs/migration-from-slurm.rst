@@ -123,6 +123,13 @@ Accounting entities map directly from Slurm:
 - The ``[accounting] require_association`` setting is the equivalent of Slurm's
   ``AccountingStorageEnforce=associations``.
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
+- Account and user ``qos`` lists, ``qos+=``/``qos-=``, and account
+  ``defaultqos`` inherit down the account tree as in Slurm. Slurm's ``root``
+  association always carries a list; in Spur the top of the tree allows every
+  QOS until some account sets one. A removal that would open an association to
+  every QOS (``qos-=`` of its last name, or deleting that QOS) is refused
+  instead of inheriting, and an account with sub-accounts cannot be deleted.
+  See :doc:`/admin-guide/accounting`.
 - The ``[auth] private_data`` setting is the equivalent of the ``slurm.conf``
   side of Slurm's ``PrivateData`` (see :ref:`private-data`). Like Slurm, it is
   unset by default, so every user sees every job. ``"jobs"``, ``"usage"``,

@@ -27,7 +27,9 @@ and who terminated the job. `idle_fill` marks jobs that ran on spare capacity.
 **`accounts`** -- hierarchical account tree. `parent_account` references another
 account by name (nullable for root accounts). Each account carries a
 `fairshare_weight` (default 1) and optional resource limits: `max_running_jobs`,
-`grp_tres` (group TRES cap as a `cpu=N,node=N,...` string).
+`grp_tres` (group TRES cap as a `cpu=N,node=N,...` string). `allowed_qos` holds
+the account's QOS edit and `default_qos` its default (see
+[QOS lists and defaults](#qos-lists-and-defaults)).
 
 **`users`** -- composite PK `(name, account)`. References `accounts(name)`.
 Carries `admin_level` (None/Operator/Administrator), `default_account` (at most
@@ -36,7 +38,8 @@ one per user, enforced by a partial unique index), and a `created_at` timestamp.
 **`associations`** -- per-user-per-account-per-partition limits. Unique on
 `(user_name, account, partition_name)`. Columns: `fairshare_weight`,
 `max_running_jobs`, `max_submit_jobs`, `grp_submit_jobs`, `max_tres_per_job`,
-`grp_tres`, `max_wall_min`, `default_qos`, `allowed_qos`.
+`grp_tres`, `max_wall_min`, `default_qos`, `allowed_qos` (the user's QOS edit,
+same encoding as on `accounts`).
 
 **`qos`** -- Quality of Service definitions. Primary key is `name`. Columns:
 `priority`, `preempt_mode` (off/cancel/requeue/suspend), `preempt` (list of QOS
@@ -105,6 +108,47 @@ resolve to `Administrator`: `Admin`, `Administrator`, `SuperUser`.
 **Association limits** (`AccountLimits`): `max_running_jobs`,
 `max_submit_jobs`, `grp_submit_jobs`, `max_wall_minutes` (all `Option<u32>`),
 `max_tres_per_job`, `grp_tres` (both `Option<TresRecord>`). None = no limit.
+
+### QOS lists and defaults
+
+Implemented in `spurctld/src/accounting/qos_level.rs`. An `allowed_qos` cell
+stores an edit, not the evaluated list: NULL inherits, `a,b` replaces
+(`QosLevel::Exact`), and `+a,-b` adds and removes on top of the parent
+(`QosLevel::Adjust`). `evaluate_accounts` folds the edits from the root down
+the `parent_account` chain, and `effective_user` applies the user's edit last.
+The top of the tree is "every QOS" (`EffectiveQos::unrestricted`), so a removal
+with no list above starts from every existing QOS name (`list_qos_names`) and
+an add there leaves access open. An exact list left empty by `-` or by QOS
+deletion inherits again. `default_qos` is the user's own (an empty string
+counts as unset), else the nearest account's. A stored cell that does not
+parse reads as the exact names stored (`parse_level`); `strip_name` leaves it
+untouched and `apply_write` refuses a `qos+=`/`qos-=` on it. A parent missing from `accounts` ends the walk, treating the
+account as top of the tree.
+
+Every write that changes QOS grants takes one transaction-scoped advisory lock,
+`lock_qos_grants` (`SCHEMA_LOCK_CLASS`, `QOS_GRANTS_LOCK_OBJ` = 2): account and
+user writes that restate `qos`, `defaultqos` or `parent`, `delete qos`, and
+`delete account`. Under it, `stage_qos_write` (`grpc.rs`) checks every named
+QOS exists and applies a `qos+=`/`qos-=` to the stored edit. After the write,
+`check_qos_grants` re-evaluates the tree in the same transaction and refuses:
+
+- a parent that does not exist or is a sub-account of the account
+  (`parent_problem`). `root` with no such account means top of the tree
+  (`IMPLICIT_ROOT`);
+- a `qos-=` that emptied an exact list when nothing above sets one
+  (`emptied_exact_list`), since inheriting would allow every QOS;
+- a default off the evaluated list for the account or a user directly in it
+  (`defaults_without_access`). Like Slurm, sub-accounts are not re-checked.
+
+`delete qos` runs `strip_qos_references`, which drops the name from every edit,
+clears defaults naming it, and returns each exact list it emptied
+(`EmptiedList`); the delete is refused if any of them is then unlimited.
+`delete account` is refused while `child_accounts` is non-empty.
+
+At submit, `apply_default_qos` (`cluster.rs`) resolves a job with no `--qos` to
+the first of: the default when permitted, the only existing QOS on the list,
+then `accounting.default_qos` when permitted. With a list and none of these, the
+job is rejected; with no list, only `require_qos` rejects it.
 
 ## QOS Enforcement
 
@@ -238,6 +282,7 @@ connected rather than running with empty caches.
 | `spurctld/src/accounting/fairshare.rs` | Fair-share factor computation |
 | `spurctld/src/accounting/reconcile.rs` | Periodic resync of stale DB records |
 | `spurctld/src/accounting/grpc.rs` | gRPC service (sacctmgr RPCs) |
+| `spurctld/src/accounting/qos_level.rs` | QOS edit encoding, inheritance, default access check |
 | `spurctld/src/accounting/notifier.rs` | Job start/end notification writer |
 | `spurctld/src/accounting/txn.rs` | Audit transaction types |
 | `spur-core/src/accounting.rs` | Data models: Account, Qos, TresRecord, limits |

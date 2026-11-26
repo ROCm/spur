@@ -523,7 +523,7 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Live
      - Cluster-wide fallback QOS, applied at submit when a job resolves to no QOS
        (the analog of Slurm's ``normal``). Must name an existing QOS; empty means
-       no fallback.
+       no fallback. Skipped for an association whose QOS list leaves it out.
    * - ``require_qos``
      - bool
      - ``false``
