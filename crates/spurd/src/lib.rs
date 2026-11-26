@@ -27,6 +27,8 @@ pub mod reporter;
 pub(crate) mod scratch;
 pub mod seccomp;
 pub mod spec;
+pub(crate) mod spool_fs;
+pub(crate) mod startup_spool;
 pub mod step_completion;
 pub mod step_resources;
 pub mod stepd;

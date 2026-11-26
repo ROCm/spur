@@ -163,6 +163,112 @@ The two daemons are configured with command-line flags. The most common are belo
    in use. ``[devices]`` inventory is also re-discovered periodically after
    startup; see :doc:`../admin-guide/configuration`.
 
+Orphan job spool and container rootfs cleanup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each job keeps its script and step output in ``/var/spool/spur/job<id>``. A
+``spurd`` not running as root falls back to ``/tmp/spur/job<id>``
+(``$TMPDIR/spur`` if set) when the first cannot be created. The directory is
+removed when the job finishes. Directories left behind by a crash or a lost job
+are removed once, each time ``spurd`` starts, before it accepts work:
+
+* A directory is removed only after the leader controller confirms the job has
+  finished, or confirms it no longer exists and its id is below the next id the
+  controller will issue. Any doubt keeps it.
+* Running work keeps its directory: jobs and steps tracked by the agent, a
+  surviving ``spurstepd`` for the job, a populated job cgroup, any process with
+  ``SPUR_JOB_ID``, ``SPUR_JOBID``, ``SLURM_JOB_ID`` or ``SLURM_JOBID`` set to
+  the job's id, or any process with its working directory or an open file
+  inside it.
+* A spool root is scanned only if it is owned by the ``spurd`` user and not
+  writable by group or others; otherwise ``skipped unsafe or unreadable spool
+  root`` is logged and it is left alone.
+* The pass is skipped when ``[cgroup] enabled = false``; on a cgroup v1 host it
+  runs but removes nothing except leftover container trash. It stops after 60
+  seconds, keeping whatever it has not decided, and the next start continues.
+  Heartbeats run during the pass, so a launch sent to the node in that window is
+  refused and retried later, possibly on the same node, and new steps of jobs
+  already running there fail until the pass ends.
+* ``spurd`` reads every process's environment, working directory and open
+  files once, before it locks any job. Without ``CAP_SYS_PTRACE`` (for example
+  in a container) these reads fail and nothing is removed; the agent logs
+  ``retained directories: activity inventory uncertain`` with the number of
+  directories kept. A read stuck on a hung process keeps everything until the
+  next start, without blocking later launches.
+* Symlinks in the spool path (for example ``/var/spool`` on another disk) are
+  followed. A ``job<id>`` entry that is itself a symlink, a spool containing a
+  mount point, or a tree deeper than 256 levels is logged with ``kept job
+  spool: <reason>`` for manual removal; a deep tree may be partly removed.
+* With ``[auth] plugin = "spur"`` and ``private_data`` including ``jobs``,
+  ``spurd`` calls the controller as ``root``, which sees only root's own jobs
+  unless it is an Operator or Administrator. Other users' directories are then
+  kept. Give root the Operator role (for example through ``operator_groups``)
+  to let cleanup proceed; ``allow_uid_zero_administrator = true`` also works but
+  makes root on every node a cluster Administrator.
+* Run one ``spurd`` per host. The spool, container and cgroup roots are fixed,
+  so a second agent from another cluster on the same host could remove the
+  first agent's leftover directories.
+
+The same pass handles leftover container root filesystems in the container
+directory: ``$SPUR_CONTAINER_DIR`` if set for ``spurd``, else
+``/var/spool/spur/containers`` (created if missing) if writable, else
+``$HOME/.spur/containers``. The spool-root rule applies to it too: it must be
+owned by the ``spurd`` user and not writable by group or others.
+
+* Only unnamed rootfs directories are considered: ``job_<id>`` for a job and
+  ``step_<id>_<step>`` for a step. A named container (``--container-name``)
+  whose name is exactly one of those forms is treated as that job's rootfs;
+  other names outside ``spur:trash`` (below) are never touched.
+* The controller confirmation and the job checks above apply. As with spools, a
+  process whose working directory or open file is under the rootfs path, or
+  whose root directory is the rootfs, keeps it; a process in another mount
+  namespace (such as the container itself) is checked against its own mount
+  table, and a bind mount of the rootfs directory or anything under it on the
+  same filesystem, in the agent's or a running process's mount namespace, keeps
+  it. A bind of something inside an overlay or tmpfs layer is not detected. A
+  mount table that cannot be read keeps every directory.
+* Every mount at or beneath the rootfs (overlay ``lower``, ``upper`` and
+  ``merged``, or a mount on the directory itself) is unmounted first, without a
+  lazy detach. If one stays mounted the directory is kept, possibly with other
+  layers already unmounted, and ``kept container rootfs: a mount beneath it
+  could not be unmounted`` is logged; the next start tries again.
+* The pass then moves the directory, still under its job's lock, into
+  ``spur:trash`` inside the container directory, so its job's path is free
+  before the agent accepts work. The trash must be owned by the ``spurd`` user
+  and accessible only to it; ``spurd`` creates it that way. If the move fails
+  the directory, now unmounted, is kept for the next start. In the rare case
+  that the moved directory no longer matches and cannot be moved back, it stays
+  in the trash and is deleted with it (logged at error level).
+* The trash is emptied in the background after ``spurd`` starts serving, one
+  directory at a time, with no time limit, so a large image does not delay
+  startup; until then it holds the disk space. Stopping ``spurd`` halts the
+  deletion. The next start deletes whatever is left in the trash without asking
+  the controller, as long as the pass runs: cgroups enabled, and the container
+  directory passes the ownership check above and can be listed in time. An entry
+  moved after the 60-second budget ran out also waits for the next start.
+
+Container rootfs decisions are logged as ``retained container rootfs:
+<reason>``, ``retained locally owned container rootfs``, ``kept container
+rootfs: <reason>``, ``queued orphan container rootfs for background deletion``,
+``deleting orphan container rootfs``, ``deleted orphan container rootfs`` or
+``failed to delete orphan container rootfs; will reconsider on next startup``. A
+trash that is unsafe logs ``kept container rootfs: the trash is unusable`` for
+each rootfs (left as it was) and ``skipped unsafe or unreadable container
+trash`` for its contents; an entry in it that cannot be opened logs ``skipped
+unexpected container trash entry``. A finished background run logs ``background
+container rootfs cleanup finished deleted=<n> kept=<n> failed=<n>``.
+
+Directories kept because the activity inventory was uncertain, or the
+controller did not confirm them (per batch of 128 job ids), are logged with a
+count (``retained directories: <reason>``); directories left when the time runs out
+log ``retained remaining directories`` with the reason. Each path is logged at
+debug level. Directories still in use log ``retained locally owned job spool``
+or ``retained job spool: runtime session, cgroup or process still holds it``;
+removals log ``deleted orphan job spool``. The pass ends with ``startup job
+spool cleanup finished deleted=<n> retained=<n> errors=<n> queued_rootfs=<n>``,
+where ``queued_rootfs`` counts trash entries left for the background run,
+including those from an earlier start.
+
 Quick Start: Two-Node Cluster
 -----------------------------
 

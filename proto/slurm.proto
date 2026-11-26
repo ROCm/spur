@@ -882,10 +882,18 @@ message GetJobsRequest {
   string qos = 8;
   // Filter: only jobs in one of these reservations (comma-separated).
   string reservation = 9;
+  // Require quorum-confirmed leader state; fail if freshness cannot be established.
+  bool require_authoritative = 10;
 }
 
 message GetJobsResponse {
   repeated JobInfo jobs = 1;
+  // Caller visibility only; request filters still apply.
+  bool unrestricted_visibility = 2;
+  // True only after a quorum-backed leader read with committed state applied.
+  bool authoritative = 3;
+  // Set with authoritative; ids at or above it were never issued by this cluster.
+  uint32 next_job_id = 4;
 }
 
 message GetJobRequest {
