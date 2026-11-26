@@ -4307,6 +4307,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
         for job in completing {
             if !completing_job_is_overdue(&job, now, wait) {
+                crate::server::confirm_steps_on_kept_nodes(&cluster, &job);
                 continue;
             }
             if job.end_time.is_none() {
@@ -4334,7 +4335,7 @@ fn completing_job_is_overdue(
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
-/// unreported nodes in the background so a slow cancel can't race this verdict.
+/// unconfirmed nodes in the background so a slow cancel can't race this verdict.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
@@ -4342,24 +4343,29 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         .filter(|n| !job.node_completions.contains_key(*n))
         .cloned()
         .collect();
+    // A node kept for a step that never ended is as unconfirmed as one that never reported.
+    let unconfirmed: Vec<String> = missing.iter().chain(&job.retained_nodes).cloned().collect();
 
-    for node in &missing {
+    for node in &unconfirmed {
         if let Err(error) = cluster.quarantine_node(
             node,
             "job cleanup was not confirmed before completion timeout",
         ) {
-            warn!(job_id = job.job_id, node, %error, "cannot quarantine unreported node; retaining job resources");
+            warn!(job_id = job.job_id, node, %error, "cannot quarantine unconfirmed node; retaining job resources");
             return;
         }
     }
 
-    // Empty when no nodes allocated; derived_completion falls back to worst completion.
-    let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-    let (mut state, mut exit_code, _signal) =
-        spur_core::job::Job::derived_completion(&job.node_completions, &primary);
+    let spur_core::job::ReportedOutcome {
+        mut state,
+        mut exit_code,
+        mut signal,
+        ..
+    } = job.reported_outcome();
     if job.node_completions.is_empty() {
         state = spur_core::job::JobState::Failed;
         exit_code = -1;
+        signal = 0;
     } else if !missing.is_empty() {
         warn!(
             job_id = job.job_id,
@@ -4368,19 +4374,23 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
             expected = job.allocated_nodes.len(),
             "completing timeout — not all nodes reported"
         );
-        state = spur_core::job::JobState::Failed;
-        if exit_code == 0 {
+        // A node that never confirmed its cleanup cannot let the run end as a
+        // success, though what the reports did say is kept.
+        if state == spur_core::job::JobState::Completed {
+            state = spur_core::job::JobState::Failed;
+        }
+        if exit_code == 0 && signal == 0 {
             exit_code = 1;
         }
     }
 
-    let unreported_nodes = missing.clone();
-    if !missing.is_empty() {
+    let unreported_nodes = missing;
+    if !unconfirmed.is_empty() {
         let cluster = cluster.clone();
         let job_id = job.job_id;
         let run_attempt = job.run_attempt;
         tokio::spawn(async move {
-            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &unconfirmed, 9).await;
         });
     }
 
@@ -4388,6 +4398,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         job_id = job.job_id,
         state = ?state,
         exit_code,
+        signal,
         "completing timeout expired — force-finishing job"
     );
 
@@ -4397,6 +4408,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         state,
         JobEndFacts {
             unreported_nodes,
+            signal: Some(signal),
             ..Default::default()
         },
     ) {
@@ -6441,6 +6453,38 @@ pub(crate) mod tests {
         let released = [("n1".to_string(), 1), ("n2".to_string(), 1)];
         let left = without_released(&handoffs, &released);
         assert_eq!(left, HashMap::from([("n1".to_string(), vec![2])]));
+    }
+
+    #[test]
+    fn a_victim_does_not_occupy_a_node_it_already_released() {
+        use spur_core::job::{Job, JobSpec, JobState, NodeCompletion};
+
+        let mut candidate = Job::new(1, JobSpec::default());
+        candidate.state = JobState::Running;
+        candidate.allocated_nodes = vec!["n1".into(), "n2".into()];
+        candidate
+            .node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        let mut pending = Job::new(
+            2,
+            JobSpec {
+                nodelist: Some("n1".into()),
+                ..Default::default()
+            },
+        );
+
+        let nodes: Vec<_> = ["n1", "n2"]
+            .into_iter()
+            .map(|name| {
+                spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default())
+            })
+            .collect();
+
+        assert!(!preempt_overlaps_pending_nodes(
+            &pending, &candidate, &nodes
+        ));
+        pending.spec.nodelist = Some("n2".into());
+        assert!(preempt_overlaps_pending_nodes(&pending, &candidate, &nodes));
     }
 
     mod idle_fill_reclaim_tests {
@@ -9179,6 +9223,7 @@ pub(crate) mod tests {
 
             let spec = JobSpec {
                 name: "completing-timeout".into(),
+                script: Some("#!/bin/bash\nsrun ./train\n".into()),
                 user: "testuser".into(),
                 num_nodes: 2,
                 num_tasks: 2,
@@ -9224,6 +9269,128 @@ pub(crate) mod tests {
                 0,
                 "the node that already reported must not be cancelled"
             );
+        }
+
+        /// A Running job on mock-agent nodes; `script` decides where it runs.
+        async fn running_on_mock_agents(
+            cm: &Arc<ClusterManager>,
+            nodes: &[&str],
+            script: &str,
+        ) -> (spur_core::job::JobId, u32) {
+            for node in nodes {
+                let (addr, _) = spawn_mock_agent().await;
+                register_node_at(cm, node, addr);
+            }
+            let count = nodes.len() as u32;
+            let spec = JobSpec {
+                name: "completing-verdict".into(),
+                script: Some(script.into()),
+                user: "testuser".into(),
+                num_nodes: count,
+                num_tasks: count,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(cm, spec);
+            let names: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+            let per_node_allocs = names
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    names,
+                    ResourceAllocations::with_scalar(count, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            settle(cm, job_id, spur_core::job::JobState::Running);
+            (job_id, run_attempt)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_keeps_the_first_failed_copys_exit() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (job_id, attempt) =
+                running_on_mock_agents(&cm, &["n1", "n2", "n3"], "#!/bin/bash\n./train\n").await;
+            cm.node_complete(job_id, "n2", 3, 0, attempt).unwrap();
+            cm.node_complete(job_id, "n1", 0, 15, attempt).unwrap();
+
+            let job = cm.get_job(job_id).unwrap();
+            force_finish_completing_job(&cm, &job).await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!((job.exit_code, job.exit_signal), (Some(3), 0));
+            assert_eq!(job.unreported_nodes, ["n3".to_string()]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_keeps_the_deciding_nodes_signal() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (job_id, attempt) =
+                running_on_mock_agents(&cm, &["n1", "n2"], "#!/bin/bash\nsrun ./train\n").await;
+            cm.node_complete(job_id, "n1", 0, 9, attempt).unwrap();
+
+            let job = cm.get_job(job_id).unwrap();
+            force_finish_completing_job(&cm, &job).await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(
+                (job.exit_code, job.exit_signal),
+                (Some(0), 9),
+                "an exit 1 would hide that the batch host was killed"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_quarantines_a_finished_copys_node_still_running_a_step() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (job_id, attempt) =
+                running_on_mock_agents(&cm, &["n1", "n2"], "#!/bin/bash\n./train\n").await;
+            cm.create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: None,
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .unwrap();
+            cm.node_complete(job_id, "n1", 0, 0, attempt).unwrap();
+            cm.node_complete(job_id, "n2", 0, 0, attempt).unwrap();
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completing);
+            force_finish_completing_job(&cm, &job).await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completed, "every copy exited cleanly");
+            assert!(job.unreported_nodes.is_empty());
+            let kept = cm.get_node("n1").unwrap();
+            assert_eq!(kept.state, NodeState::Drain);
+            assert!(kept.admin_locked);
+            assert!(cm.get_node("n2").unwrap().is_schedulable());
         }
 
         // When no node reported (e.g. a suspended job's tasks died out-of-band),
@@ -9295,6 +9462,7 @@ pub(crate) mod tests {
                 &cm,
                 JobSpec {
                     name: "completing-missing-node".into(),
+                    script: Some("#!/bin/bash\nsrun ./train\n".into()),
                     user: "testuser".into(),
                     num_nodes: 3,
                     num_tasks: 3,
@@ -9351,6 +9519,7 @@ pub(crate) mod tests {
 
             let spec = JobSpec {
                 name: "completing-race".into(),
+                script: Some("#!/bin/bash\nsrun ./train\n".into()),
                 user: "testuser".into(),
                 num_nodes: 2,
                 num_tasks: 2,

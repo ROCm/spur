@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 use crate::burst_buffer::BbStageState;
@@ -1078,6 +1078,16 @@ pub struct NodeCompletion {
     pub signal: i32,
 }
 
+/// What a run's node reports say it ended with (see `Job::reported_outcome`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedOutcome {
+    pub state: JobState,
+    pub exit_code: i32,
+    /// The deciding node's signal; an OOM kill shows in `state` instead.
+    pub signal: i32,
+    pub reason: PendingReason,
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -1150,6 +1160,17 @@ pub struct Job {
     /// Per-node exit codes reported while the job is in Completing.
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
+
+    /// The first node whose copy of a per-node script failed. It ended the run,
+    /// so its exit is the run's. Cleared on requeue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_node: Option<String>,
+
+    /// Nodes whose copy of a per-node script exited cleanly while the run went
+    /// on. They reported, but keep their slice until the run ends, as `spurd`
+    /// keeps the allocation while any of the job's steps still run there.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retained_nodes: BTreeSet<String>,
 
     /// Standalone srun: native step dispatch after allocation registration.
     #[serde(default)]
@@ -1315,6 +1336,8 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            first_failed_node: None,
+            retained_nodes: BTreeSet::new(),
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
             preempt_pending: None,
@@ -1355,6 +1378,36 @@ impl Job {
             }
         }
         self.pending_reason.display().to_string()
+    }
+
+    /// The run's outcome from its node reports, decided by the first failed copy
+    /// of a per-node script, else the batch node (the first allocated). The one
+    /// selection both the last report and the completing timeout's force-finish use.
+    pub fn reported_outcome(&self) -> ReportedOutcome {
+        let deciding_node = self
+            .first_failed_node
+            .as_deref()
+            .or_else(|| self.allocated_nodes.first().map(String::as_str))
+            .unwrap_or_default();
+        let (derived_state, exit_code, raw_signal) =
+            Self::derived_completion(&self.node_completions, deciding_node);
+        // spurd flags an OOM kill with a sentinel bit in the signal; strip it so
+        // the stored signal is the real SIGKILL and the state says OUT_OF_MEMORY.
+        let signal = raw_signal & !OOM_SIGNAL_FLAG;
+        // A recorded first failure decides alone, OOM included. Without one any
+        // node's OOM counts, as on older controllers, whose logs must replay alike.
+        let oom = if self.first_failed_node.is_some() {
+            raw_signal & OOM_SIGNAL_FLAG != 0
+        } else {
+            self.reported_oom()
+        };
+        let (state, reason) = self.completion_verdict(derived_state, exit_code, signal, oom);
+        ReportedOutcome {
+            state,
+            exit_code,
+            signal,
+            reason,
+        }
     }
 
     /// Derive a job's `ExitCode` and state from per-node completions, matching
@@ -1458,6 +1511,26 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
+        self.allocated_nodes.iter().any(|n| n == node) && self.still_charges(node)
+    }
+
+    /// The allocated nodes still charged for this job, in allocation order. What
+    /// asks which nodes the job occupies now reads this, not `allocated_nodes`.
+    pub fn held_node_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.allocated_nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|node| self.still_charges(node))
+    }
+
+    /// An allocated node's slice goes back at its report, unless it is retained.
+    fn still_charges(&self, node: &str) -> bool {
+        !self.node_completions.contains_key(node) || self.retained_nodes.contains(node)
+    }
+
+    /// Whether this node has yet to report its part of the run. A node that
+    /// reported may still be charged (see `retained_nodes`).
+    pub fn still_runs_on(&self, node: &str) -> bool {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
@@ -1486,11 +1559,7 @@ impl Job {
 
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
-        self.allocated_nodes
-            .iter()
-            .filter(|node| !self.node_completions.contains_key(*node))
-            .cloned()
-            .collect()
+        self.held_node_names().map(str::to_string).collect()
     }
 
     pub fn held_allocations(&self) -> impl Iterator<Item = (&String, &ResourceAllocations)> {
@@ -1501,8 +1570,45 @@ impl Job {
                 Some(nodes) => nodes.contains(node),
                 None => self.allocated_nodes.contains(node),
             };
-            allocated && !self.node_completions.contains_key(*node)
+            allocated && self.still_charges(node)
         })
+    }
+
+    /// The allocated nodes that already reported, in allocation order.
+    pub fn finished_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.node_completions.contains_key(*node))
+            .cloned()
+            .collect()
+    }
+
+    /// The allocated nodes still running their part of the run, in allocation order.
+    pub fn running_nodes(&self) -> Vec<String> {
+        self.running_node_names().map(str::to_string).collect()
+    }
+
+    /// `running_nodes` without the copies.
+    pub fn running_node_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.allocated_nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|node| !self.node_completions.contains_key(*node))
+    }
+
+    /// The allocated nodes whose slice already went back, in allocation order.
+    pub fn released_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| !self.still_charges(node))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget the run's node reports. Callers free every slice still charged first.
+    pub fn clear_node_reports(&mut self) {
+        self.node_completions.clear();
+        self.retained_nodes.clear();
     }
 
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
@@ -1521,7 +1627,7 @@ impl Job {
     pub fn holds_a_placement(&self) -> bool {
         self.allocated_nodes
             .iter()
-            .any(|node| !self.node_completions.contains_key(node))
+            .any(|node| self.still_charges(node))
     }
 
     /// Drop what a reservation recorded on the job: nodes, resources, partition, and
@@ -2087,6 +2193,187 @@ mod tests {
                 .collect();
             assert_eq!(held, ["n1"]);
         }
+    }
+
+    #[test]
+    fn a_retained_node_reported_but_is_still_charged() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        for node in ["n1", "n2"] {
+            job.node_completions
+                .insert(node.into(), NodeCompletion { code: 0, signal: 0 });
+        }
+        job.retained_nodes.insert("n2".into());
+
+        assert_eq!(job.held_nodes(), ["n2".to_string(), "n3".to_string()]);
+        assert_eq!(job.held_node_names().collect::<Vec<_>>(), ["n2", "n3"]);
+        assert_eq!(job.running_nodes(), ["n3".to_string()]);
+        assert_eq!(job.released_nodes(), ["n1".to_string()]);
+        assert!(job.is_held_on("n2") && !job.still_runs_on("n2"));
+
+        for node in ["n1", "n2", "n3"] {
+            job.per_node_alloc
+                .insert(node.into(), ResourceAllocations::with_scalar(1, 0));
+        }
+        let mut held: Vec<_> = job
+            .held_allocations()
+            .map(|(node, _)| node.as_str())
+            .collect();
+        held.sort_unstable();
+        assert_eq!(held, ["n2", "n3"]);
+
+        job.node_completions
+            .insert("n3".into(), NodeCompletion { code: 0, signal: 0 });
+        assert!(job.holds_a_placement());
+
+        job.clear_node_reports();
+        assert!(job.node_completions.is_empty() && job.retained_nodes.is_empty());
+    }
+
+    #[test]
+    fn finished_nodes_are_the_allocated_ones_that_reported() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions
+            .insert("n3".into(), NodeCompletion { code: 0, signal: 0 });
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 1, signal: 0 });
+
+        assert_eq!(job.finished_nodes(), ["n2".to_string(), "n3".to_string()]);
+    }
+
+    // A snapshot from before the field existed must still restore.
+    #[test]
+    fn a_job_without_a_first_failed_node_still_deserializes() {
+        let mut job = make_job();
+        job.first_failed_node = Some("n2".into());
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("first_failed_node");
+
+        let back: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(back.first_failed_node, None);
+    }
+
+    #[test]
+    fn a_job_without_retained_nodes_still_deserializes() {
+        let mut job = make_job();
+        job.retained_nodes.insert("n1".into());
+        let mut value = serde_json::to_value(&job).unwrap();
+        assert!(value.get("retained_nodes").is_some());
+        value.as_object_mut().unwrap().remove("retained_nodes");
+
+        let back: Job = serde_json::from_value(value).unwrap();
+        assert!(back.retained_nodes.is_empty());
+    }
+
+    #[test]
+    fn the_first_failed_copy_decides_the_reported_outcome() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 3, signal: 0 });
+        assert_eq!(
+            job.reported_outcome().signal,
+            15,
+            "without a failed copy the batch node decides"
+        );
+
+        job.first_failed_node = Some("n2".into());
+
+        let outcome = job.reported_outcome();
+        assert_eq!(
+            (outcome.state, outcome.exit_code, outcome.signal),
+            (JobState::Failed, 3, 0)
+        );
+        assert_eq!(outcome.reason, PendingReason::NonZeroExitCode);
+    }
+
+    #[test]
+    fn a_reported_oom_kill_shows_in_the_state_not_the_signal() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into()];
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 9 | OOM_SIGNAL_FLAG,
+            },
+        );
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!(outcome.state, JobState::OutOfMemory);
+        assert_eq!(outcome.signal, 9);
+    }
+
+    fn oom_kill() -> NodeCompletion {
+        NodeCompletion {
+            code: 0,
+            signal: 9 | OOM_SIGNAL_FLAG,
+        }
+    }
+
+    #[test]
+    fn a_later_oom_kill_cannot_override_the_first_failure() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.first_failed_node = Some("n2".into());
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 3, signal: 0 });
+        job.node_completions.insert("n3".into(), oom_kill());
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!(
+            (outcome.state, outcome.exit_code, outcome.signal),
+            (JobState::Failed, 3, 0)
+        );
+    }
+
+    #[test]
+    fn a_first_failure_that_was_an_oom_kill_ends_the_run_as_one() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.first_failed_node = Some("n2".into());
+        job.node_completions.insert(
+            "n1".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 15,
+            },
+        );
+        job.node_completions.insert("n2".into(), oom_kill());
+
+        let outcome = job.reported_outcome();
+
+        assert_eq!((outcome.state, outcome.signal), (JobState::OutOfMemory, 9));
+    }
+
+    /// Older controllers apply this rule to every log they write, so a run
+    /// without a recorded first failure must keep it.
+    #[test]
+    fn without_a_recorded_first_failure_any_nodes_oom_kill_counts() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        job.node_completions.insert("n2".into(), oom_kill());
+
+        assert_eq!(job.reported_outcome().state, JobState::OutOfMemory);
     }
 
     #[test]

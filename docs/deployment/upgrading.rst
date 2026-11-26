@@ -1332,8 +1332,11 @@ Batch script placement (``script_placement``)
 This release adds ``sbatch --script-placement`` and the ``[controller]
 script_placement`` default (see :ref:`submit-script-placement`). Until a job asks for
 a placement or a default is set, every job runs its script where it did before,
-whatever release each controller, agent, and client runs. No new Raft entry type is
-added, so replication never stalls: existing entries only gain optional fields.
+whatever release each controller, agent, and client runs. Placement itself adds no
+new Raft entry type: the entries it touches only gain optional fields. The same
+release does add one for batch scripts that run on every node, which ordinary
+multi-node jobs write with no placement configured, so its upgrade order applies to
+every cluster (see :ref:`upgrading-per-node-runs`).
 
 **Upgrade every controller before using a placement**: before setting the
 ``[controller]`` default, and before users get an ``sbatch`` that accepts
@@ -1393,6 +1396,35 @@ The CLI refuses a reservation partition unless the controller advertises the
 creates an unbound reservation. Upgrade every controller replica before
 creating partition-bound reservations: an older replica that applies the create
 drops the partition from its copy.
+
+.. _upgrading-per-node-runs:
+
+Batch scripts that run on every node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes how a job ends when its script runs on every node, which
+includes an ``auto`` job whose script does not call ``srun``, ``mpirun``, or
+``mpiexec`` (see :ref:`submit-script-placement`). A copy that exits cleanly now
+leaves the job running, its node still allocated to the job until the job ends,
+and the first copy that fails ends the job with its exit code. When the job ends,
+a step still running on a finished copy's node is stopped, and the job stays
+``COMPLETING`` until it exits. No configuration change is needed.
+
+**Upgrade the leader last.** When a job's script runs on more than one node, each
+copy that exits while the job is still running writes a new Raft log entry,
+``JobCopyExited``. A controller that predates it
+cannot parse the entry and stops replicating until it is upgraded, so the order
+in :ref:`upgrading-leader-last` applies, and a rollback after the entry has been
+written is not supported: roll forward. A Raft snapshot taken while such a job
+has a finished copy's node still allocated, or has had a copy fail, is refused by
+an older controller in the same way, so a follower that needs a snapshot to catch
+up also stays stalled until it is upgraded.
+
+Until the leader runs this release, such a job still ends when its first copy
+exits: it moves to ``COMPLETING``, then after ``scheduler.complete_wait_secs``
+fails and drains the nodes still running a copy. Its outcome is taken from the
+first node alone. Every controller applies these older entries the same way, so
+controllers on different releases never disagree about a job.
 
 See Also
 --------

@@ -103,7 +103,59 @@ decides once per run at dispatch (`script_placement::resolve_run_placement` in
 On `BatchHost`, every node but the one at `task_offset` 0 runs
 `batch_companion_hold_script` with stdio on `/dev/null`, holding its slice for
 the steps the script launches. The controller stops those nodes when the batch
-host reports (`step_launch_stragglers`), and the batch host's exit is the job's.
+host reports (`ended_run_stragglers`), and the batch host's exit is the job's.
+
+On `AllNodes`, each copy's exit stands on its own (`runs_per_node` in
+`cluster.rs`; salloc and native srun allocations run no script and are left
+out). While such a job spans more than one node and is Running outside a
+preemption grace (`ends_copy_by_copy`), `node_complete` proposes the exit as
+`WalOperation::JobCopyExited`. `JobNodeComplete` keeps its
+older meaning (the first report ends the run), so every controller replays a
+log an older leader wrote the same way. `ClusterManager::apply_node_exit` applies
+both, so its unit tests (`cluster::tests::node_exit`) pin the decision table
+without the WAL. A clean exit leaves the job Running
+(`NodeCompleteResult::StillRunning`) but keeps the node's slice charged
+(`Job.retained_nodes`): `spurd` keeps a job's allocation until its last
+supervisor on the node exits, steps included, so a node given back at its copy's
+exit could be dispatched to while the agent still holds it. The first failed
+copy is recorded in `Job.first_failed_node`, moves the job to Completing, and
+supplies the job's state, exit, and signal, which a copy OOM-killed while being
+stopped cannot change (`Job::reported_outcome`, which the completing timeout's
+force-finish reads too). The apply drops a repeat `JobCopyExited`, one proposed
+before the first applied, so it cannot overwrite that failure; a repeat
+`JobNodeComplete` still overwrites, as on older controllers. Steps can no longer
+target a node that finished.
+
+When the run ends (its first failure, its last copy, or any report in a
+preemption grace), a kept node goes back only once no live user step of the job
+runs there (`nodes_running_steps`); the copy whose exit ends the run is kept the
+same way. `ended_run_stragglers` stops every node the run still holds
+(`Job::held_nodes()`), kept ones included, on the report that ends the run or a
+retry of it, never on a stopped copy's own report. The run waits, Completing or
+still Running in its grace, until each kept node's last step records its
+`JobStepComplete`, which frees the node (`release_after_step_end`) and then ends
+the run (`finish_settled_run`). Only an end the nodes confirm counts: in such a
+run (`keeps_nodes_for_steps`), a client's own end of a step (an `srun` abandoning
+it, or closing its PTY) is recorded by `record_step_end_once_gone` only once every
+node of the step answers `AwaitStep`, which spurd does after the step's cleanup;
+`CancelStep` only signals, so a cancel escalates to SIGKILL after the kill wait.
+A step whose client died records no end at all (only `run_step` records a numbered
+step's), so the completing-timeout loop also runs `confirm_steps_on_kept_nodes`
+every pass for a Completing run's live steps on kept nodes; a leader-local set
+(`begin_step_end_confirmation`) keeps one wait per step. Not-found from an agent is
+final once `not_found_is_final` holds (it registered before the step started, or
+has been up as long as a re-attach waits), else after that long. A node that never
+confirms leaves the step live. A grace hands each freed node to the preemptor
+at that point. The completing timeout's force-finish quarantines and kills kept
+nodes like unreported ones without changing the verdict. A kept node that goes
+Down or is removed takes its steps with it: `evict_jobs_on_node` frees its slice
+and drops it from `retained_nodes`, at any point in the run, ending a run that
+only waited on it. The steps' records stay open, since a step spanning another
+kept node may still run there. Every
+other ending (`JobComplete`, requeue, preemption, eviction) frees all but
+`Job::released_nodes()` at once, as it does for unreported nodes. While a run
+holds this state, snapshots are fenced from older controllers (see
+[Raft](../consensus/raft.md)). Suspend keeps its own handling.
 A `BatchHost` script is a driver, not an MPI rank, so batch-level PMIx fan-out
 and prepare are skipped.
 

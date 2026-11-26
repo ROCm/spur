@@ -170,10 +170,28 @@ separate path for admin requeue so nothing else can resurrect a terminal job.
 
 Held in controller memory. Key fields beyond the spec:
 - `run_attempt`: monotonic epoch, bumped per dispatch. Guards stale completion reports.
-- `node_completions`: per-node exit status, drives `derived_completion()`.
+- `allocated_nodes`: the run's whole allocation, kept until the run is reset. A node that
+  reported may already be handed back (in a preemption grace, or once the run is
+  Completing), so code asking whether the job occupies a node now reads
+  `is_held_on`/`held_node_names`, never `allocated_nodes`.
+- `node_completions`: per-node exit status. `reported_outcome()` turns them into the run's
+  state, exit code, and signal, decided by `first_failed_node` else the first allocated
+  node; both the last report and the completing timeout's force-finish use it. An OOM
+  kill counts from `first_failed_node` alone once one is recorded, else from any node,
+  as older controllers apply it to the logs they write.
 - `time_limit_signaled_at`, `cancel_signaled_at`: replicated instants for deterministic verdicts.
 - `suspended_secs` + `suspended_at`: wall-clock accounting for suspend/resume.
 - `idle_fill`: this run uses spare capacity outside QOS quota.
+- `first_failed_node`: on a per-node run, the first node whose copy failed. It ended the
+  run, so its exit is the run's. Cleared on requeue.
+- `retained_nodes`: on a per-node run, nodes whose copy exited cleanly while the run went
+  on, plus, once it ends, any reported node a live step of the job still runs on. They
+  reported, but stay charged until the run ends and their steps do, or the node is
+  lost or removed, so "reported" and
+  "charged" differ: `is_held_on`/`held_node_names` (charged) include them,
+  `still_runs_on`/`running_nodes` (not yet reported) and `released_nodes` (slice returned)
+  do not. `clear_node_reports` clears them with `node_completions`, after the caller has
+  freed their slices.
 - `resolved_placement`: where this run's batch script runs, set from `WalOperation::JobStart`
   and cleared with the rest of the placement by `Job::clear_placement` (on requeue, or a hold
   that frees the reservation). `Job::script_placement()` falls back to the `auto` text scan when
@@ -188,10 +206,10 @@ the current clock; callers comparing several jobs can pass one instant to
 `run_time_at` for a consistent view. Requeue resets the run clock.
 
 `Job::held_allocations()` indexes allocated node names temporarily for jobs wider
-than two nodes and visits each allocation once, excluding completion reports and
-unassigned map entries. One-/two-node jobs need no temporary membership index.
+than two nodes and visits each allocation once, excluding released completion
+reports (a retained node still counts) and unassigned map entries. One-/two-node jobs need no temporary membership index.
 `held_nodes()` retains allocation order, and `holds_a_placement()` checks
-completion membership without rescanning the allocation list. These helpers
+charge status without rescanning the allocation list. These helpers
 do not change the persisted job representation.
 
 ### PendingReason

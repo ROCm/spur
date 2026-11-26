@@ -141,6 +141,7 @@ fn cancel(cm: &ClusterManager, origin: &str) {
             uid: Some(1000),
         }),
         controller_initiated: false,
+        signal: None,
         at: None,
     });
 }
@@ -301,6 +302,109 @@ fn grace_opens_only_on_release_and_partial_reports_still_count_one_victim() {
         (1, 0, 0)
     );
     assert!(cm.preemption_usage.read().victims.is_empty());
+}
+
+/// Job 1, running on n1 to n3, where the copy on n1 has exited cleanly.
+fn per_node_victim_with_a_finished_copy(cm: &ClusterManager) {
+    start(
+        cm,
+        1,
+        1,
+        &[("n1", scalar()), ("n2", scalar()), ("n3", scalar())],
+    );
+    cm.apply_operation(&WalOperation::JobCopyExited {
+        job_id: 1,
+        node_name: "n1".into(),
+        exit_code: 0,
+        signal: 0,
+        run_attempt: 1,
+        at: None,
+    });
+    assert!(cm.get_job(1).expect("victim").retained_nodes.contains("n1"));
+}
+
+fn warn_of_preemption_by_10(cm: &ClusterManager) {
+    let pending = PreemptPending {
+        preemption_claim: Some(cm.preemption_claim(&cm.get_job(1).expect("victim"), 1)),
+        signaled_at: chrono::DateTime::UNIX_EPOCH,
+        deadline: chrono::DateTime::UNIX_EPOCH,
+        preempted_by: 10,
+        preempt_qos: None,
+        mode: PreemptMode::Requeue,
+        run_attempt: 1,
+        requeue_hold_secs: 30,
+    };
+    cm.apply_operation(&WalOperation::JobPreemptSignaled { job_id: 1, pending });
+}
+
+fn clean_report_from_n2() -> WalOperation {
+    WalOperation::JobNodeComplete {
+        job_id: 1,
+        node_name: "n2".into(),
+        exit_code: 0,
+        signal: 0,
+        run_attempt: 1,
+        at: None,
+    }
+}
+
+#[test]
+fn a_grace_report_frees_the_nodes_finished_copies_kept() {
+    let (_dir, cm) = cluster();
+    per_node_victim_with_a_finished_copy(&cm);
+    warn_of_preemption_by_10(&cm);
+
+    cm.apply_operation(&clean_report_from_n2());
+    start(&cm, 10, 1, &[("n1", scalar())]);
+    confirm(&cm, 1, true);
+
+    assert_eq!(
+        cm.preemption_usage().used,
+        1,
+        "the preemptor started on the node the finished copy kept"
+    );
+}
+
+#[test]
+fn a_step_ending_in_grace_frees_the_node_it_kept() {
+    let (_dir, cm) = cluster();
+    cm.apply_operation(&WalOperation::JobStepCreate {
+        step: Box::new(spur_core::step::JobStep {
+            job_id: 1,
+            step_id: 0,
+            name: "eval".into(),
+            state: spur_core::step::StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["n1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+            pty: false,
+            job_shell: false,
+        }),
+    });
+    per_node_victim_with_a_finished_copy(&cm);
+    warn_of_preemption_by_10(&cm);
+    cm.apply_operation(&clean_report_from_n2());
+
+    cm.apply_operation(&WalOperation::JobStepComplete {
+        job_id: 1,
+        step_id: 0,
+        exit_code: 0,
+        oom_killed: false,
+        cancelled: false,
+    });
+    start(&cm, 10, 1, &[("n1", scalar())]);
+    confirm(&cm, 1, true);
+
+    assert_eq!(
+        cm.preemption_usage().used,
+        1,
+        "the preemptor started on the node the step held"
+    );
 }
 
 #[test]

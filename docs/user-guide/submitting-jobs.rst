@@ -189,6 +189,22 @@ step, as in Slurm:
 
    srun --ntasks-per-node=1 ./prepare-node.sh
 
+When the script runs on every node, each copy ends on its own. A copy that exits
+cleanly leaves the job running, and the job ends once every copy has exited.
+Until then, a node whose copy has finished stays allocated to the job, as in
+Slurm, so a step still running there keeps its resources. When the job ends,
+Spur stops such steps too, and the job stays ``COMPLETING`` until they exit: a
+node is released once no step of the job runs there. A step that has not exited
+within ``scheduler.complete_wait_secs`` gets its node drained, as a node that
+never reports does. A step you cancel in such a job, for example by
+interrupting its ``srun``, ends once its processes have exited on every node it
+ran on, and is killed if it still runs after ``scheduler.kill_wait_secs``. The first copy that
+fails, with a non-zero exit, a signal, or by running out of memory, ends the
+job: Spur stops the other copies, and the job takes the failed copy's state and
+exit code, even if a copy being stopped then runs out of memory. A node whose
+copy has finished cannot take new ``srun`` steps, and a step
+aimed at it fails with "already finished its part of this job".
+
 ``scontrol show job`` reports the outcome. ``ScriptPlacement=`` shows the
 requested value while the job is pending and the one it runs with once it
 starts, and from then ``BatchHost=`` names the first allocated node, the one a

@@ -593,7 +593,11 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
    * - ``CompletingTimeout``
      - FAILED
      - The controller stopped waiting for the job's nodes to report; the
-       detail lists the nodes that never did.
+       detail lists the nodes that never did. ``ExitCode`` still comes from the
+       node whose report decides the job, such as the first copy that failed,
+       and reads ``1:0`` only when that node exited cleanly. A node the kernel
+       OOM-killed ends the job ``OUT_OF_MEMORY`` instead, unless it was a copy
+       stopped after another copy failed.
    * - ``TimeLimit``
      - TIMEOUT
      - The job reached its time limit, however the process then died.

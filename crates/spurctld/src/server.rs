@@ -327,6 +327,12 @@ impl LeaderProxy {
 
 const STEP_REAWAIT_ATTEMPTS: u32 = 30;
 const STEP_REAWAIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long past the kill wait a client-ended step's nodes get to confirm it gone,
+/// before the run's end or the completing timeout is left to settle it.
+const STEP_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+/// Between `AwaitStep` calls to a node that is not sure yet: one mid-cleanup
+/// answers unavailable, and the step's own caller may still hold its waiter.
+const STEP_GONE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 const STEP_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// tonic surfaces a dropped connection as Unknown/"transport error" rather than
@@ -489,6 +495,238 @@ async fn reawait_step(
     Err(Status::unavailable(
         "lost contact with the step's agent and could not re-attach",
     ))
+}
+
+/// This leader's claim on waiting for a step's nodes to confirm it gone, so the
+/// periodic pass and a client's end never wait on one step twice. Released on drop.
+struct StepEndConfirmation {
+    cluster: Arc<ClusterManager>,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+}
+
+impl StepEndConfirmation {
+    fn claim(
+        cluster: &Arc<ClusterManager>,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+    ) -> Option<Self> {
+        cluster
+            .begin_step_end_confirmation(job_id, run_attempt, step_id)
+            .then(|| Self {
+                cluster: cluster.clone(),
+                job_id,
+                run_attempt,
+                step_id,
+            })
+    }
+}
+
+impl Drop for StepEndConfirmation {
+    fn drop(&mut self) {
+        self.cluster
+            .end_step_end_confirmation(self.job_id, self.run_attempt, self.step_id);
+    }
+}
+
+/// Start waiting on its nodes for each step an ending run still records live on a
+/// node it keeps. Its client may be gone, so nothing else would record its end and
+/// the run would sit out the completing timeout. Returns how many waits it started.
+pub(crate) fn confirm_steps_on_kept_nodes(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+) -> usize {
+    if job.retained_nodes.is_empty() {
+        return 0;
+    }
+    let kill_wait =
+        crate::scheduler_loop::graceful_kill_wait_secs(&cluster.config().scheduler, job);
+    let mut started = 0;
+    for step in cluster.get_steps(job.job_id) {
+        let live = spur_core::step::is_user_step(step.step_id) && !step.state.is_terminal();
+        if !live
+            || !step
+                .nodes
+                .iter()
+                .any(|node| job.retained_nodes.contains(node))
+        {
+            continue;
+        }
+        let Some(claim) =
+            StepEndConfirmation::claim(cluster, job.job_id, job.run_attempt, step.step_id)
+        else {
+            continue;
+        };
+        tokio::spawn(record_step_end_once_gone(
+            claim,
+            step,
+            job.spec.user.clone(),
+            std::time::Duration::from_secs(u64::from(kill_wait)),
+            0,
+            true,
+        ));
+        started += 1;
+    }
+    started
+}
+
+/// Record an end of `step` once every node it was placed on confirms it gone.
+/// spurd answers `AwaitStep` only after a step's cleanup, while `CancelStep` just signals
+/// it; a cancel escalates to SIGKILL after the kill wait, as a job cancel does.
+async fn record_step_end_once_gone(
+    claim: StepEndConfirmation,
+    step: spur_core::step::JobStep,
+    user: String,
+    kill_wait: std::time::Duration,
+    exit_code: i32,
+    cancelled: bool,
+) {
+    let cluster = claim.cluster.clone();
+    let run_attempt = claim.run_attempt;
+    let (job_id, step_id) = (step.job_id, step.step_id);
+    let deadline = tokio::time::Instant::now() + kill_wait + STEP_GONE_GRACE;
+    let mut checks = tokio::task::JoinSet::new();
+    for node in step.nodes.clone() {
+        let (cluster, user, step) = (cluster.clone(), user.clone(), step.clone());
+        checks.spawn(async move {
+            step_gone_on(&cluster, &node, &step, run_attempt, &user, deadline).await
+        });
+    }
+    let kill = tokio::time::sleep(kill_wait);
+    tokio::pin!(kill);
+    let mut killed = !cancelled;
+    let mut all_gone = true;
+    loop {
+        tokio::select! {
+            checked = checks.join_next() => match checked {
+                Some(Ok(true)) => {}
+                Some(_) => all_gone = false,
+                None => break,
+            },
+            () = &mut kill, if !killed => {
+                killed = true;
+                crate::scheduler_loop::cancel_step_on_nodes(
+                    &cluster,
+                    job_id,
+                    run_attempt,
+                    step_id,
+                    &step.nodes,
+                    crate::scheduler_loop::SIGKILL,
+                )
+                .await;
+            }
+        }
+    }
+    if !all_gone {
+        warn!(
+            job_id,
+            step_id, "a step's nodes did not confirm it gone; leaving its end to the run's"
+        );
+        return;
+    }
+    if cluster
+        .get_step(job_id, step_id)
+        .is_none_or(|recorded| recorded.state.is_terminal())
+    {
+        return;
+    }
+    if let Err(error) = cluster.record_step_complete(job_id, step_id, exit_code, false, cancelled) {
+        warn!(job_id, step_id, %error, "failed to record step completion");
+    }
+}
+
+/// Whether an agent's not-found for a step is final rather than an agent just back that
+/// has not adopted its sessions yet: one registered before the step started has not
+/// restarted since, and one up as long as a re-attach waits has adopted all it will.
+fn not_found_is_final(
+    agent_registered: Option<DateTime<Utc>>,
+    step_started: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    adoption: std::time::Duration,
+) -> bool {
+    agent_registered.is_some_and(|registered| {
+        step_started.is_some_and(|started| registered < started)
+            || (now - registered).to_std().is_ok_and(|up| up >= adoption)
+    })
+}
+
+/// Whether `node`'s agent confirms the step gone by `deadline`: it answers `AwaitStep`
+/// once the step's cleanup is done, and not-found when it has nothing of the step,
+/// which counts once final (see `not_found_is_final`) or once it lasts a re-attach.
+async fn step_gone_on(
+    cluster: &ClusterManager,
+    node: &str,
+    step: &spur_core::step::JobStep,
+    run_attempt: u32,
+    user: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let (job_id, step_id) = (step.job_id, step.step_id);
+    let adoption = STEP_REAWAIT_BACKOFF * STEP_REAWAIT_ATTEMPTS;
+    let mut not_found_since = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        // A node gone from the table has no slice left to free.
+        let Some(record) = cluster.get_node(node) else {
+            return true;
+        };
+        let answer = match crate::scheduler_loop::node_comm_http_url(&record) {
+            Some(addr) => {
+                await_step_at(addr, job_id, run_attempt, step_id, user, deadline - now).await
+            }
+            None => Err(Code::Unavailable),
+        };
+        match answer {
+            Ok(()) => return true,
+            Err(Code::NotFound) => {
+                let settled_agent = not_found_is_final(
+                    record.agent_start_time,
+                    step.start_time,
+                    Utc::now(),
+                    adoption,
+                );
+                if settled_agent || now - *not_found_since.get_or_insert(now) >= adoption {
+                    return true;
+                }
+            }
+            Err(_) => not_found_since = None,
+        }
+        tokio::time::sleep(STEP_GONE_POLL.min(deadline.saturating_duration_since(now))).await;
+    }
+}
+
+/// One `AwaitStep` call, which waits for the step to end, bounded by `limit`.
+async fn await_step_at(
+    addr: String,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+    user: &str,
+    limit: std::time::Duration,
+) -> Result<(), Code> {
+    let call = async {
+        let mut agent = crate::agent_client::connect(addr)
+            .await
+            .map_err(|_| Code::Unavailable)?;
+        agent
+            .await_step(spur_proto::AwaitStepRequest {
+                job_id,
+                step_id,
+                user: user.to_string(),
+                run_attempt,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| status.code())
+    };
+    tokio::time::timeout(limit, call)
+        .await
+        .unwrap_or(Err(Code::DeadlineExceeded))
 }
 
 /// The credential the controller presents to agents. Unlike the admission key
@@ -763,7 +1001,7 @@ impl ControllerService {
 
         // A node that already reported its part of a victim's grace has no
         // supervisor left to answer, which is not a lost cohort.
-        let expected_nodes = job.held_nodes();
+        let expected_nodes = job.running_nodes();
         let mut missing = Vec::new();
         let mut set = tokio::task::JoinSet::new();
         let mut handle_to_node = HashMap::new();
@@ -1633,7 +1871,8 @@ pub(crate) fn cancel_reclaim_grace(kill_wait_secs: u32) -> chrono::Duration {
 }
 
 /// Whether `node` may release its reported run (never one newer than this controller applied): the
-/// run is over, the job is active elsewhere or queued with no launch here, or unknown but ours.
+/// run is over, the job is active but no longer holds `node`, queued with no launch here, or
+/// unknown but ours.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatus) -> bool {
     let Some(job) = cluster.get_job(report.job_id) else {
         return report.job_id < cluster.peek_next_job_id();
@@ -1661,9 +1900,7 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     }
     // State and allocation commit as two WAL entries, so an empty nodelist
     // on an active job is not yet authoritative.
-    job.state.is_active()
-        && !job.allocated_nodes.is_empty()
-        && !job.allocated_nodes.iter().any(|n| n == node)
+    job.state.is_active() && !job.allocated_nodes.is_empty() && !job.is_held_on(node)
 }
 
 /// Jobs a heartbeat reported with a non-empty translated GPU set, for the
@@ -2901,6 +3138,7 @@ impl SlurmController for ControllerService {
                 self.stop_remaining_nodes(req.job_id, &result, &req.reporting_node);
                 Ok(Response::new(()))
             }
+            Some(Ok(NodeCompleteResult::StillRunning)) => Ok(Response::new(())),
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
@@ -3342,11 +3580,16 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
-        let step_nodes =
-            resolve_step_nodes(&job.held_nodes(), req.num_nodes, &req.nodelist, &req.node)
-                .map_err(Status::invalid_argument)?;
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
+        let step_nodes = resolve_step_nodes(
+            &job.running_nodes(),
+            &job.finished_nodes(),
+            req.num_nodes,
+            &req.nodelist,
+            &req.node,
+        )
+        .map_err(Status::invalid_argument)?;
         self.cluster
             .validate_step_bindings(&job, &step_nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -3467,9 +3710,14 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        self.cluster
-            .record_step_complete(job_id, req.step_id, req.exit_code, false, req.cancelled)
-            .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+        // Ending the step there may free a node the run kept for it, so its nodes, not
+        // the client, have to confirm it gone before the end is recorded.
+        let confirm_first = crate::cluster::keeps_nodes_for_steps(&job);
+        if !confirm_first {
+            self.cluster
+                .record_step_complete(job_id, req.step_id, req.exit_code, false, req.cancelled)
+                .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+        }
 
         // srun abandoning a step may have left an admitted retry running (or
         // about to claim) on its nodes: stop it there too, not just in the
@@ -3484,6 +3732,26 @@ impl SlurmController for ControllerService {
                 15,
             )
             .await;
+        }
+
+        let claim = confirm_first
+            .then(|| {
+                StepEndConfirmation::claim(&self.cluster, job_id, job.run_attempt, req.step_id)
+            })
+            .flatten();
+        if let Some(claim) = claim {
+            let kill_wait = crate::scheduler_loop::graceful_kill_wait_secs(
+                &self.cluster.config().scheduler,
+                &job,
+            );
+            tokio::spawn(record_step_end_once_gone(
+                claim,
+                step,
+                job.spec.user.clone(),
+                std::time::Duration::from_secs(u64::from(kill_wait)),
+                req.exit_code,
+                req.cancelled,
+            ));
         }
 
         Ok(Response::new(()))
@@ -3957,10 +4225,10 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
         let node_name =
-            job.held_nodes().into_iter().next().ok_or_else(|| {
+            job.running_nodes().into_iter().next().ok_or_else(|| {
                 Status::internal(format!("job {} has no allocated nodes", job_id))
             })?;
 
@@ -4032,10 +4300,10 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        // Not allocated_nodes: a node that already reported (a victim in its grace)
-        // was freed and may belong to another job now.
-        let held_nodes = job.held_nodes();
-        if held_nodes.is_empty() {
+        // Not allocated_nodes: a node that already reported has finished its part
+        // of the job, and may already belong to another one.
+        let running_nodes = job.running_nodes();
+        if running_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "job {} has no allocated nodes — is the allocation still active?",
                 job_id
@@ -4057,8 +4325,15 @@ impl SlurmController for ControllerService {
                 .map(Response::new);
         }
 
-        validate_step_nodes_for_run(job_id, req.step_id, step.state, &step.nodes, &held_nodes)
-            .map_err(Status::failed_precondition)?;
+        validate_step_nodes_for_run(
+            job_id,
+            req.step_id,
+            step.state,
+            &step.nodes,
+            &running_nodes,
+            &job.finished_nodes(),
+        )
+        .map_err(Status::failed_precondition)?;
         self.cluster
             .validate_step_bindings(&job, &step.nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -5370,8 +5645,18 @@ fn resolve_step_container(
     }
 }
 
+/// Why a step cannot use `node`: it already ended its part of the job, or never had one.
+fn unavailable_step_node(node: &str, finished: &[String]) -> String {
+    if finished.iter().any(|n| n == node) {
+        format!("node {node} already finished its part of this job")
+    } else {
+        format!("node {node} is not allocated to this job")
+    }
+}
+
 fn resolve_step_nodes(
     allocated: &[String],
+    finished: &[String],
     requested_count: u32,
     requested_list: &str,
     legacy_node: &str,
@@ -5394,7 +5679,7 @@ fn resolve_step_nodes(
                 ));
             }
             if !allocated.contains(node) {
-                return Err(format!("node {node} is not allocated to this job"));
+                return Err(unavailable_step_node(node, finished));
             }
         }
         if requested_count > 0 && requested_count as usize != requested.len() {
@@ -5407,7 +5692,7 @@ fn resolve_step_nodes(
     }
 
     if !legacy_node.is_empty() {
-        let node = select_step_node(allocated, legacy_node)?;
+        let node = select_step_node(allocated, finished, legacy_node)?;
         return Ok(vec![node.to_string()]);
     }
 
@@ -5430,6 +5715,7 @@ fn validate_step_nodes_for_run(
     state: spur_core::step::StepState,
     step_nodes: &[String],
     held: &[String],
+    finished: &[String],
 ) -> Result<(), String> {
     if state != spur_core::step::StepState::Running {
         return Err(format!(
@@ -5441,6 +5727,9 @@ fn validate_step_nodes_for_run(
         return Err(format!("step {job_id}.{step_id} has no nodes"));
     }
     for node in step_nodes {
+        if finished.contains(node) {
+            return Err(unavailable_step_node(node, finished));
+        }
         if !held.contains(node) {
             return Err(format!(
                 "step node {node} is not in the job's current allocation"
@@ -5477,7 +5766,11 @@ fn map_step_plan_to_nodes(
     }
 }
 
-fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
+fn select_step_node<'a>(
+    allocated: &'a [String],
+    finished: &[String],
+    requested: &str,
+) -> Result<&'a str, String> {
     if requested.is_empty() {
         return allocated
             .first()
@@ -5488,7 +5781,7 @@ fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a 
         .iter()
         .find(|n| n.as_str() == requested)
         .map(String::as_str)
-        .ok_or_else(|| format!("node {requested} is not allocated to this job"))
+        .ok_or_else(|| unavailable_step_node(requested, finished))
 }
 
 // ---- Proto conversion helpers ----
@@ -6796,8 +7089,8 @@ fn stragglers_after_report(
     use crate::cluster::NodeCompleteResult;
 
     match result {
-        NodeCompleteResult::Completing => step_launch_stragglers(job, None),
-        NodeCompleteResult::InGrace => step_launch_stragglers(job, Some(reporting_node)),
+        NodeCompleteResult::Completing => ended_run_stragglers(job, reporting_node, false),
+        NodeCompleteResult::InGrace => ended_run_stragglers(job, reporting_node, true),
         _ => Vec::new(),
     }
 }
@@ -6822,13 +7115,23 @@ fn remaining_nodes_stop(
     })
 }
 
-/// Nodes to stop once a node of a batch-host run reports. With `primary_only`, only the batch
-/// host (the first allocated node) counts: the others run a hold script that never reports.
-fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
-    let launches_steps = job.script_placement() == ResolvedPlacement::BatchHost;
-    let reporter_ended_the_job = primary_only
-        .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node));
-    if launches_steps && reporter_ended_the_job {
+/// Nodes to stop when `reporting_node`'s report ended the run, or retries the one that did, even a
+/// finished copy's node held for a step. A per-node run ends at its first failed or last copy; a
+/// batch-host one at any report, but in a grace only at the batch host's: the rest just hold.
+fn ended_run_stragglers(
+    job: &spur_core::job::Job,
+    reporting_node: &str,
+    in_grace: bool,
+) -> Vec<String> {
+    let ended = match job.script_placement() {
+        ResolvedPlacement::BatchHost => {
+            !in_grace || job.allocated_nodes.first().map(String::as_str) == Some(reporting_node)
+        }
+        ResolvedPlacement::AllNodes => {
+            job.all_nodes_completed() || job.first_failed_node.as_deref() == Some(reporting_node)
+        }
+    };
+    if ended {
         job.held_nodes()
     } else {
         Vec::new()
@@ -8272,6 +8575,43 @@ mod tests {
         assert!(
             !is_reclaimable(&cluster, "n1", &report_run(50, 0)),
             "an old agent names no run, so it could be a launch after a release"
+        );
+    }
+
+    /// What an agent still holds of an active run on a node the run gave back is
+    /// reclaimable; on a node the run still charges, a finished copy's included, it is not.
+    #[tokio::test]
+    async fn is_reclaimable_follows_whether_the_active_run_still_holds_the_node() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 60, &["n1", "n2", "n3"], 1);
+        cluster.apply_operation(&WalOperation::job_state_change(
+            60,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let copy_exit = |node: &str, exit_code| WalOperation::JobCopyExited {
+            job_id: 60,
+            node_name: node.into(),
+            exit_code,
+            signal: 0,
+            run_attempt: 1,
+            at: None,
+        };
+
+        cluster.apply_operation(&copy_exit("n1", 0));
+        assert!(!is_reclaimable(&cluster, "n1", &report_run(60, 1)));
+
+        cluster.apply_operation(&copy_exit("n2", 3));
+        assert!(is_reclaimable(&cluster, "n1", &report_run(60, 1)));
+        assert!(is_reclaimable(&cluster, "n2", &report_run(60, 1)));
+        assert!(
+            !is_reclaimable(&cluster, "n3", &report_run(60, 1)),
+            "its copy is still being stopped"
         );
     }
 
@@ -12324,16 +12664,356 @@ mod tests {
     }
 
     async fn report_node_finished(svc: &ControllerService, job_id: u32, node: &str) {
+        report_node_exit(svc, job_id, node, 0).await;
+    }
+
+    async fn report_node_exit(svc: &ControllerService, job_id: u32, node: &str, exit_code: i32) {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
         svc.report_job_status(Request::new(ReportJobStatusRequest {
             job_id,
-            state: JobState::Completed.to_proto_i32(),
+            state: state.to_proto_i32(),
+            exit_code,
             reporting_node: node.into(),
             run_attempt,
             ..Default::default()
         }))
         .await
         .expect("completion report accepted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_copy_of_a_per_node_script_stops_the_other_nodes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+
+        report_node_exit(&svc, job_id, "n2", 1).await;
+
+        wait_for_cancel(&n1_cancelled, job_id).await;
+        assert!(
+            n2_cancelled.lock().unwrap().is_empty(),
+            "the failed copy has already ended"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_copy_stops_a_finished_copys_node_still_running_a_step() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("step");
+        report_node_exit(&svc, job_id, "n1", 0).await;
+
+        report_node_exit(&svc, job_id, "n2", 0).await;
+
+        wait_for_cancel(&n1_cancelled, job_id).await;
+        assert!(
+            n2_cancelled.lock().unwrap().is_empty(),
+            "no step of the job runs there"
+        );
+    }
+
+    /// An agent that records the step cancels it is sent and answers `AwaitStep` with
+    /// `awaited`, or, given `asked`, notifies it and never answers.
+    async fn spawn_step_agent(
+        awaited: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+        asked: Option<Arc<tokio::sync::Notify>>,
+    ) -> (std::net::SocketAddr, StepCancelLog) {
+        let step_cancels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: awaited,
+            step_started: asked,
+            cancelled: None,
+            execs: None,
+            commands: None,
+            command_response: None,
+            step_cancels: Some(step_cancels.clone()),
+            claims: None,
+            claim_response: None,
+            on_claim: None,
+            block_on_cancel: None,
+            block_on_claim: None,
+            release_seen: None,
+        })
+        .await;
+        (addr, step_cancels)
+    }
+
+    /// A per-node job whose copy on n1 exited cleanly under a running step 0, and whose
+    /// copy on n2 then failed, so the ended run keeps n1 for the step.
+    async fn ended_run_keeping_n1_for_a_step(svc: &ControllerService, n1: u16, n2: u16) -> u32 {
+        let job_id = running_two_node_job(svc, "./train\n", n1, n2).await;
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "eval".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: false,
+                job_shell: false,
+            })
+            .expect("step");
+        let attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        svc.cluster
+            .node_complete(job_id, "n1", 0, 0, attempt)
+            .expect("n1's copy");
+        svc.cluster
+            .node_complete(job_id, "n2", 3, 0, attempt)
+            .expect("n2's copy");
+        job_id
+    }
+
+    async fn abandon_step(svc: &ControllerService, job_id: u32, step_id: u32) {
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            cancelled: true,
+            user: "alice".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may abandon its step");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoning_a_step_keeps_its_node_charged_until_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let (n1, n1_step_cancels) = spawn_step_agent(None, Some(asked.clone())).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+
+        abandon_step(&svc, job_id, 0).await;
+        let ended = async {
+            while !svc
+                .cluster
+                .get_job(job_id)
+                .expect("job")
+                .state
+                .is_terminal()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        // n1's agent holds the controller's AwaitStep without answering, as one mid-cleanup.
+        tokio::select! {
+            () = asked.notified() => {}
+            () = ended => panic!("the run ended before n1's agent confirmed the step gone"),
+        }
+
+        assert_eq!(
+            n1_step_cancels.lock().unwrap()[0].signal,
+            15,
+            "the step is told to stop at once"
+        );
+        assert!(!svc
+            .cluster
+            .get_step(job_id, 0)
+            .expect("step")
+            .state
+            .is_terminal());
+        assert!(svc.cluster.get_node("n1").expect("n1").alloc_resources.cpus > 0);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Completing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_step_frees_its_node_once_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_step_agent(Some(Ok(Default::default())), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+
+        abandon_step(&svc, job_id, 0).await;
+
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
+    }
+
+    /// Waits for the job set up by `ended_run_keeping_n1_for_a_step` to end, then checks
+    /// it took n2's failure, gave n1 back, and closed the step cancelled.
+    async fn assert_the_run_ended_and_freed_n1(svc: &ControllerService, job_id: u32) {
+        for _ in 0..400 {
+            if svc
+                .cluster
+                .get_job(job_id)
+                .expect("job")
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert_eq!((job.state, job.exit_code), (JobState::Failed, Some(3)));
+        assert_eq!(
+            svc.cluster.get_node("n1").expect("n1").alloc_resources.cpus,
+            0
+        );
+        assert_eq!(
+            svc.cluster.get_step(job_id, 0).expect("step").state,
+            spur_core::step::StepState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_left_live_on_a_kept_node_ends_once_the_node_confirms_it_gone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_step_agent(Some(Ok(Default::default())), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+
+        let started = confirm_steps_on_kept_nodes(&svc.cluster, &job);
+
+        assert_eq!(started, 1);
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_pass_does_not_wait_twice_on_one_step() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let (n1, _) = spawn_step_agent(None, Some(asked.clone())).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert_eq!(confirm_steps_on_kept_nodes(&svc.cluster, &job), 1);
+        asked.notified().await;
+
+        assert_eq!(confirm_steps_on_kept_nodes(&svc.cluster, &job), 0);
+    }
+
+    #[test]
+    fn only_an_agent_that_cannot_have_lost_the_step_has_the_final_word_on_it() {
+        let now = Utc::now();
+        let adoption = std::time::Duration::from_secs(60);
+        let ago = |secs| Some(now - chrono::Duration::seconds(secs));
+
+        assert!(
+            not_found_is_final(ago(30), ago(10), now, adoption),
+            "registered before the step started, so it never restarted under it"
+        );
+        assert!(
+            !not_found_is_final(ago(10), ago(30), now, adoption),
+            "back since the step started, and maybe still adopting its sessions"
+        );
+        assert!(
+            not_found_is_final(ago(90), ago(120), now, adoption),
+            "back long enough to have adopted everything"
+        );
+        assert!(!not_found_is_final(None, ago(30), now, adoption));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoning_a_step_a_settled_agent_never_ran_is_recorded_at_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let never_ran = Status::not_found("this node is not running that step");
+        let (n1, _) = spawn_step_agent(Some(Err(never_ran)), None).await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = ended_run_keeping_n1_for_a_step(&svc, n1.port(), n2.port()).await;
+        svc.cluster
+            .set_agent_start_time("n1", Utc::now() - chrono::Duration::minutes(5));
+
+        abandon_step(&svc, job_id, 0).await;
+
+        assert_the_run_ended_and_freed_n1(&svc, job_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_copy_of_a_per_node_script_stops_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let per_node = running_two_node_job(&svc, "./train\n", n1.port(), n2.port()).await;
+        let batch_host = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let clean_exit = |job_id, node| {
+            let attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+            svc.cluster
+                .node_complete(job_id, node, 0, 0, attempt)
+                .expect("report")
+        };
+
+        let copy = clean_exit(per_node, "n2");
+        let host = clean_exit(batch_host, "n1");
+
+        assert!(remaining_nodes_stop(&svc.cluster, per_node, &copy, "n2").is_none());
+        assert!(
+            remaining_nodes_stop(&svc.cluster, batch_host, &host, "n1").is_some(),
+            "the batch host's exit stops the rest"
+        );
+        assert_eq!(
+            svc.cluster.get_job(per_node).expect("job").state,
+            JobState::Running
+        );
+    }
+
+    /// A lone copy ends its run under either entry, so it keeps the one that a
+    /// controller predating `JobCopyExited` can still replicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_node_script_exit_writes_the_older_entry() {
+        use spur_core::script_placement::ResolvedPlacement;
+        use spur_core::wal::WalOperation;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").script_placement(),
+            ResolvedPlacement::AllNodes
+        );
+
+        report_node_finished(&svc, job_id, "n1").await;
+
+        let logged = logged_operations(dir.path());
+        assert!(logged.iter().any(|(_, op)| matches!(op,
+            WalOperation::JobNodeComplete { job_id: id, .. } if *id == job_id
+        )));
+        assert!(!logged
+            .iter()
+            .any(|(_, op)| matches!(op, WalOperation::JobCopyExited { .. })));
     }
 
     /// A non-primary node finishing early leaves the others to run out the grace;
@@ -12401,7 +13081,7 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
             err.message()
-                .contains("n2 is not in the job's current allocation"),
+                .contains("node n2 already finished its part of this job"),
             "unexpected error: {}",
             err.message()
         );
@@ -12600,6 +13280,7 @@ mod tests {
             "in a grace a companion's report is a step event"
         );
         for result in [
+            NodeCompleteResult::StillRunning,
             NodeCompleteResult::AlreadyTerminal,
             NodeCompleteResult::StaleReport,
             NodeCompleteResult::AllDone {
@@ -12612,22 +13293,37 @@ mod tests {
     }
 
     #[test]
-    fn only_a_step_launching_script_has_stragglers_to_stop() {
+    fn only_a_report_that_ends_the_run_has_stragglers_to_stop() {
+        let exit = |code, signal| spur_core::job::NodeCompletion { code, signal };
         let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
         job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
-        job.node_completions.insert(
-            "n1".into(),
-            spur_core::job::NodeCompletion { code: 0, signal: 0 },
-        );
+        job.node_completions.insert("n1".into(), exit(0, 0));
 
         job.spec.script = Some("./train\n".into());
-        assert!(step_launch_stragglers(&job, None).is_empty());
-
-        job.spec.script = Some("srun ./train\n".into());
-        assert_eq!(
-            step_launch_stragglers(&job, None),
-            ["n2".to_string(), "n3".to_string()]
+        assert!(
+            ended_run_stragglers(&job, "n1", false).is_empty(),
+            "one copy of a per-node script ending cleanly ends nothing"
         );
+        job.first_failed_node = Some("n1".into());
+        assert_eq!(
+            ended_run_stragglers(&job, "n1", false),
+            ["n2", "n3"],
+            "the first failed copy ends a per-node run"
+        );
+        job.node_completions.insert("n2".into(), exit(0, 15));
+        assert!(
+            ended_run_stragglers(&job, "n2", false).is_empty(),
+            "a stopped copy's exit stops nothing more"
+        );
+        assert_eq!(
+            ended_run_stragglers(&job, "n1", false),
+            ["n3"],
+            "a retry of the failure stops what is still held"
+        );
+
+        job.first_failed_node = None;
+        job.spec.script = Some("srun ./train\n".into());
+        assert_eq!(ended_run_stragglers(&job, "n2", false), ["n3"]);
     }
 
     #[test]
@@ -12644,11 +13340,11 @@ mod tests {
         };
 
         assert!(
-            step_launch_stragglers(&reported("n2"), Some("n2")).is_empty(),
+            ended_run_stragglers(&reported("n2"), "n2", true).is_empty(),
             "a companion's report signals nobody"
         );
         assert_eq!(
-            step_launch_stragglers(&reported("n1"), Some("n1")),
+            ended_run_stragglers(&reported("n1"), "n1", true),
             ["n2".to_string()],
             "the primary's report stops the rest"
         );
@@ -12689,6 +13385,29 @@ mod tests {
         assert!(
             matches!(probe, StepdRecoveryProbe::Retained),
             "only n2 still holds the job, and it is alive"
+        );
+    }
+
+    /// A finished copy's node stays charged, but has no supervisor left either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_probe_ignores_a_node_whose_copy_finished() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let finished = spawn_probe_agent(false).await;
+        let alive = spawn_probe_agent(true).await;
+        let job_id = running_two_node_job(&svc, "./train\n", finished.port(), alive.port()).await;
+        report_node_finished(&svc, job_id, "n1").await;
+        let job = svc.cluster.get_job(job_id).expect("job");
+        assert!(job.is_held_on("n1"));
+
+        let probe = svc
+            .probe_stepd_recovery("n2", job_id, job.run_attempt, spur_core::step::STEP_BATCH)
+            .await
+            .expect("probe");
+
+        assert!(
+            matches!(probe, StepdRecoveryProbe::Retained),
+            "only n2 still runs the job, and it is alive"
         );
     }
 
@@ -17126,19 +17845,19 @@ mod tests {
     #[test]
     fn select_step_node_empty_request_uses_first_allocated() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, ""), Ok("node001"));
+        assert_eq!(select_step_node(&allocated, &[], ""), Ok("node001"));
     }
 
     #[test]
     fn select_step_node_named_request_targets_that_node() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, "node002"), Ok("node002"));
+        assert_eq!(select_step_node(&allocated, &[], "node002"), Ok("node002"));
     }
 
     #[test]
     fn select_step_node_rejects_node_outside_allocation() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        let err = select_step_node(&allocated, "node999").unwrap_err();
+        let err = select_step_node(&allocated, &[], "node999").unwrap_err();
         assert!(err.contains("node999"));
         assert!(err.contains("not allocated"));
     }
@@ -17146,13 +17865,13 @@ mod tests {
     #[test]
     fn select_step_node_empty_request_no_nodes_errors() {
         let allocated: Vec<String> = Vec::new();
-        assert!(select_step_node(&allocated, "").is_err());
+        assert!(select_step_node(&allocated, &[], "").is_err());
     }
 
     #[test]
     fn select_step_node_rejects_comma_joined_request() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(select_step_node(&allocated, "node001,node002").is_err());
+        assert!(select_step_node(&allocated, &[], "node001,node002").is_err());
     }
 
     #[test]
@@ -17163,7 +17882,7 @@ mod tests {
             "node003".to_string(),
         ];
         assert_eq!(
-            resolve_step_nodes(&allocated, 2, "", "").unwrap(),
+            resolve_step_nodes(&allocated, &[], 2, "", "").unwrap(),
             vec!["node001".to_string(), "node002".to_string()]
         );
     }
@@ -17176,7 +17895,7 @@ mod tests {
             "node003".to_string(),
         ];
         assert_eq!(
-            resolve_step_nodes(&allocated, 0, "node[003,001]", "").unwrap(),
+            resolve_step_nodes(&allocated, &[], 0, "node[003,001]", "").unwrap(),
             vec!["node003".to_string(), "node001".to_string()]
         );
     }
@@ -17184,10 +17903,10 @@ mod tests {
     #[test]
     fn resolve_step_nodes_rejects_unallocated_and_oversized_requests() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(resolve_step_nodes(&allocated, 3, "", "")
+        assert!(resolve_step_nodes(&allocated, &[], 3, "", "")
             .unwrap_err()
             .contains("only 2 allocated"));
-        assert!(resolve_step_nodes(&allocated, 0, "node003", "")
+        assert!(resolve_step_nodes(&allocated, &[], 0, "node003", "")
             .unwrap_err()
             .contains("not allocated"));
     }
@@ -17201,13 +17920,22 @@ mod tests {
             spur_core::job::NodeCompletion { code: 0, signal: 0 },
         );
         let held = job.held_nodes();
+        let finished = job.finished_nodes();
 
         assert_eq!(
-            resolve_step_nodes(&held, 0, "", "").unwrap(),
+            resolve_step_nodes(&held, &finished, 0, "", "").unwrap(),
             vec!["node002".to_string(), "node003".to_string()],
             "the default step skips the node that reported"
         );
-        assert!(resolve_step_nodes(&held, 0, "node001", "")
+        assert_eq!(
+            resolve_step_nodes(&held, &finished, 0, "node001", "").unwrap_err(),
+            "node node001 already finished its part of this job"
+        );
+        assert_eq!(
+            resolve_step_nodes(&held, &finished, 0, "", "node001").unwrap_err(),
+            "node node001 already finished its part of this job"
+        );
+        assert!(resolve_step_nodes(&held, &finished, 0, "node009", "")
             .unwrap_err()
             .contains("not allocated"));
     }
@@ -17215,7 +17943,7 @@ mod tests {
     #[test]
     fn resolve_step_nodes_rejects_conflicting_count_and_nodelist() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(resolve_step_nodes(&allocated, 1, "node[001-002]", "")
+        assert!(resolve_step_nodes(&allocated, &[], 1, "node[001-002]", "")
             .unwrap_err()
             .contains("nodelist names 2"));
     }
@@ -17224,33 +17952,52 @@ mod tests {
     fn validate_step_nodes_for_run_requires_running_on_allocated_nodes() {
         use spur_core::step::StepState;
         let allocated = vec!["n1".to_string(), "n2".to_string()];
-        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated)
+        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated, &[])
             .expect("running step on an allocated node is valid");
         assert!(validate_step_nodes_for_run(
             1,
             0,
             StepState::Completed,
             &["n1".into()],
-            &allocated
+            &allocated,
+            &[]
         )
         .unwrap_err()
         .contains("COMPLETED"));
-        assert!(
-            validate_step_nodes_for_run(1, 0, StepState::Pending, &["n1".into()], &allocated)
-                .unwrap_err()
-                .contains("PENDING")
-        );
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Pending,
+            &["n1".into()],
+            &allocated,
+            &[]
+        )
+        .unwrap_err()
+        .contains("PENDING"));
         assert!(validate_step_nodes_for_run(
             1,
             0,
             StepState::Running,
             &["gone".into()],
-            &allocated
+            &allocated,
+            &[]
         )
         .unwrap_err()
         .contains("not in the job's current allocation"));
+        assert_eq!(
+            validate_step_nodes_for_run(
+                1,
+                0,
+                StepState::Running,
+                &["n3".into()],
+                &allocated,
+                &["n3".into()]
+            )
+            .unwrap_err(),
+            "node n3 already finished its part of this job"
+        );
         assert!(
-            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated)
+            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated, &[])
                 .unwrap_err()
                 .contains("has no nodes")
         );

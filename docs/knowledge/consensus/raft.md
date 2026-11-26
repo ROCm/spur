@@ -43,8 +43,9 @@ serde enum.  Every cluster state change is one variant.
 | `JobSubmit` | Insert a new job with its full `JobSpec` |
 | `JobStateChange` | Transition a job between states (Pending, Running, etc.); carries optional `pending_reason`, `begin_time` (backoff hold), `expected_run_attempt` (stale-activation guard) |
 | `JobStart` | Record node allocation at dispatch; carries `per_node_alloc`, `run_attempt`, `idle_fill` stamp, `srun_step_dispatch` flag |
-| `JobComplete` | Finalize a job with exit code and terminal `JobState` |
+| `JobComplete` | Finalize a job with exit code and terminal `JobState`; a completing-timeout force-finish also carries the deciding node's `signal` (absent leaves `exit_signal` as it was) |
 | `JobNodeComplete` | Per-node completion report with exit code, signal, and `run_attempt` guard |
+| `JobCopyExited` | Same fields; one node's exit from a Running multi-node run whose script runs on every node, which ends node by node (see [job execution](../execution/job-execution.md)) |
 | `JobTimeLimitSignaled` | Legacy (`#[cfg(test)]` only); records wall-clock signal for replay compat |
 | `JobTimeLimitExpired` | Live wall-clock watchdog: records timeout with `run_attempt` guard and moves run to Completing |
 | `JobPreemptSignaled` | Preemption warning with deadline; carries `PreemptPending` |
@@ -302,6 +303,20 @@ break replay.
 
 5. **`ClusterSnapshot` fields also need `#[serde(default)]`**.  The snapshot
    is JSON and restored on startup; a missing field must not crash restore.
+
+6. **Never change what an existing variant does when applied**.  Controllers on
+   different releases apply the same entries during a rolling upgrade, so they
+   would diverge.  New behavior gets a new variant (`JobCopyExited` beside
+   `JobNodeComplete`), which an older controller cannot parse: it stops
+   replicating instead, and the upgrade runs leader last.
+
+7. **A snapshot must not hand an older controller state it would misapply.**
+   It ignores fields it does not know, so state only a new variant produces
+   would reach it silently through a snapshot. While any active job holds such
+   state (`holds_per_node_run_state`: `Job.first_failed_node` or
+   `Job.retained_nodes`), `ClusterSnapshot` writes the jobs under `fenced_jobs`
+   and omits `jobs`, which older controllers require, so they refuse the snapshot
+   and stay stalled as they do on the entry. Restore reads either key.
 
 ---
 

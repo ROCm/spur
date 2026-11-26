@@ -125,6 +125,7 @@ outside the WAL for performance.
 | `JobStart` | Attach allocation (nodes, resources, per-node slices) |
 | `JobComplete` | Terminal state reached |
 | `JobNodeComplete` | Per-node completion report |
+| `JobCopyExited` | Per-node exit of a multi-node script that runs on every node |
 | `JobTimeLimitSignaled` | Wall-clock exhaustion signal |
 | `JobCancelSignaled` | Cancellation signal recorded |
 | `JobPreemptRequeue` | Atomic preempt + requeue to Pending |
@@ -347,9 +348,14 @@ accounting label set when a job is requeued. See `Job::transition` in
 
 Terminal states are persisted via `WalOperation::JobComplete`. The
 `JobNodeComplete` WAL entry tracks per-node completion; when all allocated
-nodes report, the job transitions to its final state. An `exit_code` of 0
-yields COMPLETED; non-zero yields FAILED. Timeout, cancel, and node-fail
-override the exit-code-based decision.
+nodes report, the job transitions to its final state. A multi-node job whose
+script runs on every node reports through `JobCopyExited` instead (see
+[job execution](../execution/job-execution.md)). A node's first report is its
+exit: `ClusterManager::node_complete` proposes nothing for a repeat, but answers
+it with where the run stands, so a reporter retrying the follow-up (stopping the
+other nodes) still gets it. An `exit_code` of 0 yields COMPLETED; non-zero
+yields FAILED. Timeout, cancel, and node-fail override the exit-code-based
+decision.
 
 ## 8. Node lifecycle
 
