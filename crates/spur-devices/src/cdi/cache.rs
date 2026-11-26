@@ -1,12 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
 use crate::cdi::spec::{CdiDevice, CdiSpec};
+use crate::registry::entry::kind_to_gres_name;
 
 pub const DEFAULT_SPEC_DIRS: &[&str] = &["/etc/cdi", "/var/run/cdi"];
 
@@ -49,6 +50,7 @@ impl std::fmt::Display for CacheErrors {
 pub struct CdiCache {
     devices: HashMap<String, CachedDevice>,
     errors: CacheErrors,
+    skipped_discovery: BTreeSet<String>,
 }
 
 impl CdiCache {
@@ -56,6 +58,7 @@ impl CdiCache {
         Self {
             devices: HashMap::new(),
             errors: CacheErrors::default(),
+            skipped_discovery: BTreeSet::new(),
         }
     }
 
@@ -66,6 +69,12 @@ impl CdiCache {
         }
         let live = auto_detect.then(crate::discovery::discover_all_cdi);
         Self::load_with(&cdi_dirs, live.as_deref())
+    }
+
+    /// Gres names live discovery found devices for but did not add, because an
+    /// on-disk spec already supplies devices of that name.
+    pub fn skipped_discovery(&self) -> &BTreeSet<String> {
+        &self.skipped_discovery
     }
 
     /// Load specs from exactly `cdi_dirs`, then merge `live` discovery when given.
@@ -89,14 +98,25 @@ impl CdiCache {
         cache
     }
 
-    /// An on-disk spec stays authoritative for its kind; live discovery only
-    /// refreshes its topology. Kinds with no on-disk spec come from discovery.
+    /// On-disk specs stay authoritative per gres name, the unit jobs are given
+    /// devices by: two kinds of one name would describe the same devices twice.
+    /// Live discovery only refreshes their topology; names no on-disk spec
+    /// supplies come from discovery.
     fn merge_live(&mut self, live: &[CdiSpec]) {
-        let on_disk: HashSet<String> = self.devices.values().map(|d| d.kind.clone()).collect();
+        let on_disk: HashSet<String> = self
+            .devices
+            .values()
+            .map(|d| kind_to_gres_name(&d.kind))
+            .collect();
         let (present, absent): (Vec<CdiSpec>, Vec<CdiSpec>) = live
             .iter()
             .cloned()
-            .partition(|spec| on_disk.contains(&spec.kind));
+            .partition(|spec| on_disk.contains(&kind_to_gres_name(&spec.kind)));
+        self.skipped_discovery = present
+            .iter()
+            .filter(|spec| !spec.devices.is_empty())
+            .map(|spec| kind_to_gres_name(&spec.kind))
+            .collect();
         // Before adding discovered kinds: it rewrites every cached GPU's topology.
         self.refresh_topology(&present);
         self.add_specs(&absent);
@@ -625,6 +645,38 @@ mod tests {
         let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
+    }
+
+    #[test]
+    fn an_on_disk_spec_of_another_kind_for_the_same_gres_turns_its_discovery_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut site = make_amd_spec(&["0", "1"]);
+        site.kind = "hpc.example.org/gpu".into();
+        site.write_json(&dir.path().join("site-gpu.json")).unwrap();
+        let live = [make_amd_spec(&["0", "1"])];
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
+
+        assert_eq!(cache.len(), 2, "only the site's GPUs, not a second copy");
+        assert!(cache.get_device("amd.com/gpu=0").is_none());
+        assert_eq!(
+            cache.skipped_discovery(),
+            &BTreeSet::from(["gpu".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_on_disk_spec_of_another_gres_leaves_gpu_discovery_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vnic = make_amd_spec(&["0"]);
+        vnic.kind = "amd.com/vnic".into();
+        vnic.write_json(&dir.path().join("vnic.json")).unwrap();
+        let live = [make_amd_spec(&["0", "1"])];
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&live));
+
+        assert!(cache.get_device("amd.com/gpu=1").is_some());
+        assert!(cache.skipped_discovery().is_empty());
     }
 
     #[test]

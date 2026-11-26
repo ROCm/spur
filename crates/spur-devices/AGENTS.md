@@ -53,8 +53,11 @@ Accepts `.json`, `.yaml`, `.yml` files. Later directories have higher
 priority (same qualified name -> later dir wins).
 
 `CdiCache::load()` optionally runs auto-detection when `auto_detect` is true:
-live specs fill every kind with no on-disk spec, and only refresh topology for
-kinds that have one. `CdiCache::load_with()` takes the spec
+authority is per gres name (`kind_to_gres_name`), so `amd.com/gpu` and
+`hpc.example.org/gpu` are one kind. Live specs fill every gres name no on-disk
+spec supplies; for the others they only refresh topology, and the skipped names
+are reported by `skipped_discovery()` (carried by `DeviceRegistry`, warned by
+`spurd` on change). `CdiCache::load_with()` takes the spec
 directories and live specs explicitly, so tests never read the host.
 
 ## GPU auto-detection (discovery/amd_gpu.rs)

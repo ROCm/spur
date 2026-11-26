@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
@@ -17,17 +17,20 @@ use crate::types::DeviceSelection;
 
 pub struct DeviceRegistry {
     devices: Vec<DeviceEntry>,
+    skipped_discovery: BTreeSet<String>,
 }
 
 impl DeviceRegistry {
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
+            skipped_discovery: BTreeSet::new(),
         }
     }
 
     pub fn populate(&mut self, cdi_cache: &CdiCache, gres_cache: &GresCache) {
         self.devices.clear();
+        self.skipped_discovery = cdi_cache.skipped_discovery().clone();
         let mut candidates = Vec::new();
 
         let mut cdi_entries: Vec<(String, DeviceEntry)> = cdi_cache
@@ -127,6 +130,11 @@ impl DeviceRegistry {
             .collect();
         self.devices.extend(kept);
         self
+    }
+
+    /// Gres names an on-disk CDI spec supplies, so live discovery skipped them.
+    pub fn skipped_discovery(&self) -> &BTreeSet<String> {
+        &self.skipped_discovery
     }
 
     pub fn list(&self) -> &[DeviceEntry] {
@@ -615,12 +623,14 @@ mod tests {
                 gpu(0x110000, "/dev/dri/renderD128"),
                 gpu(0x110001, "/dev/dri/renderD129"),
             ],
+            ..DeviceRegistry::new()
         };
         let candidate = DeviceRegistry {
             devices: vec![
                 gpu(0x110000, "/dev/dri/renderD200"),
                 gpu(0x110001, "/dev/dri/renderD201"),
             ],
+            ..DeviceRegistry::new()
         };
         let pinned: HashSet<u64> = [0x110000].into();
 
@@ -649,6 +659,7 @@ mod tests {
                 gpu(0x120300, "/dev/dri/renderD131"),
                 gpu(0x110005, "/dev/dri/renderD133"),
             ],
+            ..DeviceRegistry::new()
         };
         let candidate = DeviceRegistry {
             devices: vec![
@@ -657,6 +668,7 @@ mod tests {
                 gpu(0x120000, "/dev/dri/renderD202"),
                 nic,
             ],
+            ..DeviceRegistry::new()
         };
         let reported: HashSet<u64> = [0x110000, 0x110001, 0x120300].into();
         let pinned: HashSet<u64> = [0x120300].into();

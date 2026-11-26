@@ -964,31 +964,30 @@ link was found, which could name another device's card.
 * With ``[devices] auto_detect = false``, the spec is never rewritten.
 * Rolling ``spurd`` back to an older build brings the guessed card node back.
 
-GPU auto-detection per CDI kind
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GPU auto-detection per device kind
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 With ``[devices] auto_detect`` on (the default), ``spurd`` now discovers each
-device kind live unless an on-disk CDI spec of that same kind exists. Before, any
-on-disk spec turned live GPU discovery off. Discovered GPUs win over GPUs you
-configured another way:
+device kind live unless an on-disk CDI spec supplies devices of that kind, under
+any CDI kind name. Before, any on-disk spec turned live GPU discovery off, so an
+on-disk spec of another device kind no longer hides the node's GPUs. Discovered
+GPUs win over GPUs you configured another way:
 
 * **GRES GPUs on nodes with discovered GPUs.** A ``[[devices.gres]]`` GPU whose
   ``file`` names a discovered GPU is merged into it instead of being reported
   as a second GPU. Its ``type`` and ``cores``, where set, replace the
   discovered ones, so jobs that request the configured type keep matching. The
   GPU uses the discovered device nodes.
-* **GPU ids on nodes with GRES GPUs and a CDI spec of another kind.** Such a node
+* **GPU ids on nodes with GRES GPUs and a CDI spec of a non-GPU kind.** Such a node
   used to keep positional GPU ids; it now discovers its GPUs live and reports
   PCI-encoded ids. **Drain these nodes before upgrading ``spurd``**, so no
   running job holds a positional id.
-* **GPU specs under another CDI kind.** A spec under a kind other than
-  ``amd.com/gpu`` (for example ``example.com/gpu``) no longer suppresses
-  ``amd.com/gpu`` discovery. Only a device that grants exactly the same device
-  nodes as a discovered GPU is merged with it, and then only one of the two
-  specs' mounts, hooks and environment is applied. A device that grants some
-  but not all of a discovered GPU's nodes is reported as a separate device next
-  to it. Describing discovered GPUs under another CDI kind is not supported.
-  Move such specs to an ``amd.com/gpu`` spec, or set ``auto_detect = false``.
+* **GPU specs under another CDI kind.** A site spec supplying GPUs under a
+  kind other than ``amd.com/gpu`` (for example ``hpc.example.org/gpu``) keeps
+  GPU discovery off, as before: the node reports only the spec's GPUs. ``spurd``
+  now logs a warning that ``auto_detect`` is on but on-disk specs supply that
+  kind. If you describe all of a node's devices yourself, set
+  ``auto_detect = false``.
 
 Bounded controller shutdown (``shutdown_grace_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

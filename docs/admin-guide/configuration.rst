@@ -2566,9 +2566,12 @@ converges to hardware changes without an agent restart — see
      - bool
      - ``true``
      - Discover devices from sysfs (AMD GPUs via KFD) for every device kind
-       that has no on-disk CDI spec; an on-disk spec of one kind does not stop
-       discovery of another. For a kind with an on-disk spec, only refresh
-       topology for its matching AMD devices; see :doc:`fabric-observation`.
+       (``gpu``) that no on-disk CDI spec supplies. An on-disk spec supplying a
+       kind, under any CDI kind name (``amd.com/gpu`` or ``hpc.example.org/gpu``
+       both supply ``gpu``), turns off discovery of that kind only, and
+       ``spurd`` logs a warning saying so. For an on-disk ``amd.com/gpu`` spec,
+       only refresh topology for its matching AMD devices; see
+       :doc:`fabric-observation`.
    * - ``cdi_spec_dirs``
      - [string]
      - ``[]``

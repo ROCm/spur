@@ -596,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
             &reported,
             &startup.fences.pinned_ids(),
         );
+        warn_skipped_discovery(&DeviceRegistry::new(), &reg);
     }
     info!(
         cpus = resources.cpus,
@@ -1361,6 +1362,27 @@ async fn publish_registry(
     let mut reg = registry.lock().await;
     let previous = std::mem::take(&mut *reg);
     *reg = candidate.with_pinned(&previous, "gpu", &ids, pinned);
+    warn_skipped_discovery(&previous, &reg);
+}
+
+/// The registry is rebuilt every refresh, so only a change is worth a warning.
+fn skipped_discovery_to_warn<'a>(
+    previous: &std::collections::BTreeSet<String>,
+    next: &'a std::collections::BTreeSet<String>,
+) -> Option<&'a std::collections::BTreeSet<String>> {
+    (!next.is_empty() && next != previous).then_some(next)
+}
+
+fn warn_skipped_discovery(previous: &DeviceRegistry, next: &DeviceRegistry) {
+    if let Some(kinds) =
+        skipped_discovery_to_warn(previous.skipped_discovery(), next.skipped_discovery())
+    {
+        warn!(
+            ?kinds,
+            "[devices] auto_detect is on, but on-disk CDI specs supply these device kinds; \
+             using the specs and not discovering them live"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1618,6 +1640,17 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&CdiCache::new(), &gres_cache);
         reg
+    }
+
+    #[test]
+    fn skipped_discovery_warns_only_when_the_set_changes() {
+        use std::collections::BTreeSet;
+        let none = BTreeSet::new();
+        let gpu = BTreeSet::from(["gpu".to_string()]);
+        assert!(skipped_discovery_to_warn(&none, &none).is_none());
+        assert_eq!(skipped_discovery_to_warn(&none, &gpu), Some(&gpu));
+        assert!(skipped_discovery_to_warn(&gpu, &gpu).is_none());
+        assert!(skipped_discovery_to_warn(&gpu, &none).is_none());
     }
 
     #[tokio::test]
