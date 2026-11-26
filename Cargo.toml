@@ -83,7 +83,7 @@ libloading = "0.9.0"
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 
 # Auth
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 
 # Logging
 tracing = "0.1"
