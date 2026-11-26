@@ -111,7 +111,7 @@ Default QOS admission changes
 - **Account parents are checked.** ``parent=`` must name an existing account
   (or ``root``, the top of the tree) and cannot be one of the account's own
   sub-accounts. An account with sub-accounts can no longer be deleted; delete
-  or move them first. Before, a mistyped or deleted parent silently made its
+  or move them first. Before, a misspelled or deleted parent silently made its
   children top-level accounts, which with inherited lists would drop their
   QOS limits.
 
