@@ -388,7 +388,8 @@ Follow this order for any cluster upgrade:
 1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
-   controller at a time to preserve quorum.
+   controller at a time to preserve quorum. An agent keeps leftover job spool
+   directories until every controller is upgraded (see :doc:`native-host`).
 3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
    running job blocks the swap unless you force it. The exception is
    ``spur_in_place_upgrade=true``, which deliberately never drains and relies on

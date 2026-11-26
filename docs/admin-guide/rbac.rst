@@ -84,7 +84,9 @@ either, so ``private_data`` is enforceable only under ``plugin = "spur"`` with
 commands. ``sreport preemptions`` applies both ``jobs`` and ``usage`` privacy:
 either setting limits a User to their own rows and the accounts they coordinate.
 These lifetime reports retain the requesting association from the first export,
-even if the job's account is subsequently changed.
+even if the job's account is subsequently changed. ``"jobs"`` also limits what a
+compute node sees, so ``spurd`` keeps other users' leftover job spools at startup
+unless its root identity is an Operator or Administrator.
 
 ``CancelJob`` with no verified identity and an empty ``user`` is treated as the
 in-cluster daemon (the Kubernetes operator) and can cancel any job. A named

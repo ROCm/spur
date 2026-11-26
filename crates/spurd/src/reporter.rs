@@ -673,6 +673,20 @@ impl NodeReporter {
         Ok(())
     }
 
+    pub(crate) async fn query_spool_jobs(
+        &self,
+        job_ids: Vec<u32>,
+    ) -> anyhow::Result<spur_proto::proto::GetJobsResponse> {
+        let req = spur_proto::proto::GetJobsRequest {
+            job_ids,
+            require_authoritative: true,
+            ..Default::default()
+        };
+        self.with_controller(move |mut client| async move { client.get_jobs(req).await })
+            .await
+            .context("startup job spool query failed")
+    }
+
     pub async fn report_stepd_recovery(
         &self,
         job_id: u32,
