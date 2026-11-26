@@ -7,5 +7,5 @@ pub mod entry;
 pub use device_registry::DeviceRegistry;
 pub use entry::{
     entry_matches_gres_name, kind_matches_gres_name, kind_to_gres_name, resolve_link_type,
-    DeviceCapability, DeviceEntry,
+    DeviceCapability, DeviceClass, DeviceEntry,
 };

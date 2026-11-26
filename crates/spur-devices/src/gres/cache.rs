@@ -10,13 +10,11 @@ use crate::gres::entry::{
     infer_vendor_from_paths, inject_actions_for_gres, GresEntry, GresFlags,
 };
 use crate::inject::InjectActions;
-use crate::registry::entry::collect_device_paths;
 
 #[derive(Clone, Debug, Default)]
 pub struct GresCache {
     pub injectable: Vec<ExpandedGresDevice>,
     pub countable: Vec<CountableGresPool>,
-    pub source_entries: Vec<GresEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,11 +23,10 @@ pub struct ExpandedGresDevice {
     pub resource_type: Option<String>,
     pub vendor: Option<String>,
     pub inject_actions: InjectActions,
-    pub cores: Option<Vec<u32>>,
     pub links: Option<Vec<i32>>,
+    pub cores: Option<Vec<u32>>,
     pub device_edits: ContainerEdits,
     pub shared_edits: ContainerEdits,
-    pub device_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +39,6 @@ pub struct CountableGresPool {
 impl GresCache {
     pub fn from_entries(entries: &[GresEntry]) -> Self {
         let mut cache = Self {
-            source_entries: entries.to_vec(),
             ..Default::default()
         };
 
@@ -104,24 +100,19 @@ fn build_expanded_device(gres: &GresEntry, paths: &[String]) -> Option<ExpandedG
     let gres_flags = GresFlags::from_strings(&gres.flags);
     let device_edits = build_device_edits(paths);
     let shared_edits = build_shared_edits(paths);
-    let device_paths = collect_device_paths(&device_edits, &shared_edits);
 
     Some(ExpandedGresDevice {
         gres_name: gres.name.clone(),
         resource_type: gres.r#type.clone(),
         vendor: infer_vendor_from_paths(paths),
         inject_actions: inject_actions_for_gres(&gres_flags, paths),
-        cores: gres
-            .cores
-            .as_ref()
-            .and_then(|s| annotations::parse_cores(s)),
         links: gres
             .links
             .as_ref()
             .and_then(|s| annotations::parse_links(s)),
+        cores: gres.cores.as_deref().and_then(annotations::parse_cores),
         device_edits,
         shared_edits,
-        device_paths,
     })
 }
 
@@ -177,10 +168,13 @@ mod tests {
 
         assert_eq!(cache.injectable.len(), 1);
         assert_eq!(cache.injectable[0].device_edits.device_nodes.len(), 2);
-        assert_eq!(cache.injectable[0].device_paths.len(), 3);
-        assert!(cache.injectable[0]
-            .device_paths
-            .contains(&"/dev/kfd".to_string()));
+        let shared: Vec<&str> = cache.injectable[0]
+            .shared_edits
+            .device_nodes
+            .iter()
+            .map(|n| n.path.as_str())
+            .collect();
+        assert_eq!(shared, vec!["/dev/kfd"]);
     }
 
     #[test]

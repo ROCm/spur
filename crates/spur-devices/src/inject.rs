@@ -101,17 +101,23 @@ pub struct HostInjectionPlan {
 /// Merge container edits and inject actions from resolved registry entries.
 pub fn merge_edits_from_devices(devices: &[&DeviceEntry]) -> MergedEdits {
     let mut result = MergedEdits::default();
-    let mut shared_applied: HashSet<String> = HashSet::new();
+    // Keyed by content, not kind: two specs of one kind (or GRES entries, which
+    // share one internal kind) can each carry their own shared edits.
+    let mut shared_applied: Vec<&ContainerEdits> = Vec::new();
 
     for dev in devices {
         result.device_edits.append(&dev.device_edits);
 
-        if !shared_applied.contains(&dev.kind) && !dev.shared_edits.is_empty() {
+        if !dev.shared_edits.is_empty() && !shared_applied.contains(&&dev.shared_edits) {
             result.shared_edits.append(&dev.shared_edits);
-            shared_applied.insert(dev.kind.clone());
+            shared_applied.push(&dev.shared_edits);
         }
 
-        result.inject_actions.merge(&dev.inject_actions);
+        // Visibility vars list GPU ids; from another kind they would come out
+        // empty and hide the job's GPUs.
+        if dev.class() == crate::registry::entry::DeviceClass::Gpu {
+            result.inject_actions.merge(&dev.inject_actions);
+        }
     }
 
     result
@@ -446,28 +452,42 @@ mod tests {
     fn gpu_device_entry(device_id: u32) -> DeviceEntry {
         use crate::registry::entry::{DeviceCapability, DeviceEntry};
         DeviceEntry {
-            index: device_id,
+            numa_node: None,
+            cores: None,
             gres_name: "gpu".into(),
             resource_type: None,
             kind: "amd.com/gpu".into(),
             device_id,
             capability: DeviceCapability::Injectable,
             memory_mb: 0,
-            numa_node: None,
-            cores: None,
             links: None,
             link_type: None,
             pci_bdf: None,
             vendor: Some("amd".into()),
             inject_actions: InjectActions::default(),
             capacity: 1,
-            allocated: 0,
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
-            device_paths: Vec::new(),
             topology: None,
             stable_id: 0,
         }
+    }
+
+    #[test]
+    fn a_non_gpu_kind_with_gpu_actions_sets_no_gpu_visibility() {
+        let mut accel = gpu_device_entry(0);
+        accel.gres_name = "accel".into();
+        accel.kind = "spur.internal/gres".into();
+        accel.inject_actions = amd_inject_actions();
+
+        let (host, container) = build_injection_plans(&[&accel], 1000, 1000);
+
+        assert!(
+            !host.env.contains_key("ROCR_VISIBLE_DEVICES"),
+            "an empty ROCR list would hide the job's GPUs"
+        );
+        assert!(!container.env.contains_key("ROCR_VISIBLE_DEVICES"));
+        assert!(!host.env.contains_key("SPUR_JOB_GPUS"));
     }
 
     #[test]

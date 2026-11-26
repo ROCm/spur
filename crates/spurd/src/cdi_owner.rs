@@ -12,8 +12,8 @@ use anyhow::Context;
 use tracing::{info, warn};
 
 use spur_devices::cdi::annotations::{AUTO_DETECTED, STABLE_ID};
-use spur_devices::cdi::discovery::discover_to_cdi;
 use spur_devices::cdi::spec::{CdiDevice, CdiSpec, DeviceNode};
+use spur_devices::discovery::discover_gpu_cdi;
 
 pub const SPEC_PATH: &str = "/etc/cdi/amd.json";
 
@@ -183,7 +183,7 @@ fn warn_foreign_stale(on_disk: &CdiSpec) {
 }
 
 /// Inner seam so tests can supply `live` without touching host GPUs. `resync` calls this with
-/// `discover_to_cdi()`.
+/// `discover_gpu_cdi()`.
 pub fn resync_with(dir: &Path, auto_detect: bool, live: &[CdiSpec], drm_readable: bool) -> bool {
     if !auto_detect {
         return false;
@@ -227,7 +227,7 @@ pub fn resync_with(dir: &Path, auto_detect: bool, live: &[CdiSpec], drm_readable
 
 pub fn resync(dir: &Path, auto_detect: bool) -> bool {
     let drm_readable = std::fs::read_dir("/sys/class/drm").is_ok();
-    resync_with(dir, auto_detect, &discover_to_cdi(), drm_readable)
+    resync_with(dir, auto_detect, &discover_gpu_cdi(), drm_readable)
 }
 
 #[cfg(test)]

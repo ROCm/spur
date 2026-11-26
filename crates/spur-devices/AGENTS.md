@@ -12,10 +12,14 @@ src/
   lib.rs              -- public re-exports
   types.rs            -- LinkType enum (Pcie, Xgmi, Nvlink)
   inject.rs           -- injection plan builders (host + container)
+  pci.rs              -- PCI identity, stable-id encoding (BDF + partition rank), PCI host bridge lookup
+  sysfs.rs            -- sysfs and /dev readers shared by every discovery (root-relative for fixtures)
+  discovery/
+    mod.rs            -- discover_all_cdi(): every kind found on this host
+    amd_gpu.rs        -- KFD-based AMD GPU auto-detection -> CdiSpec (discover_gpu_cdi)
   cdi/
     spec.rs           -- CDI spec data model (CdiSpec, CdiDevice, ContainerEdits, DeviceNode, Mount, Hook)
     cache.rs          -- CdiCache: load specs from /etc/cdi, /var/run/cdi, or in-memory
-    discovery.rs      -- KFD-based AMD GPU auto-detection -> CdiSpec
     annotations.rs    -- spur.amd.com/* annotation keys + DeviceMetadata struct
   gres/
     entry.rs          -- GresEntry (Slurm-style resource config), hostlist expansion, flag-driven env injection
@@ -48,10 +52,15 @@ Default search paths: `/etc/cdi`, `/var/run/cdi`, plus any extras.
 Accepts `.json`, `.yaml`, `.yml` files. Later directories have higher
 priority (same qualified name -> later dir wins).
 
-`CdiCache::load()` optionally runs auto-detection when no on-disk specs
-exist and `auto_detect` is true.
+`CdiCache::load()` optionally runs auto-detection when `auto_detect` is true:
+authority is per gres name (`kind_to_gres_name`), so `amd.com/gpu` and
+`hpc.example.org/gpu` are one kind. Live specs fill every gres name no on-disk
+spec supplies; for the others they only refresh topology, and the skipped names
+are reported by `skipped_discovery()` (carried by `DeviceRegistry`, warned by
+`spurd` on change). `CdiCache::load_with()` takes the spec
+directories and live specs explicitly, so tests never read the host.
 
-## GPU auto-detection (discovery.rs)
+## GPU auto-detection (discovery/amd_gpu.rs)
 
 Reads `/sys/class/kfd/kfd/topology/nodes` to enumerate AMD GPUs. Filters
 by vendor_id 0x1002, simd_count > 0, cpu_cores == 0. Extracts:
@@ -61,11 +70,12 @@ by vendor_id 0x1002, simd_count > 0, cpu_cores == 0. Extracts:
 - IO link topology (XGMI detection from link_type=2)
 - Compute/memory partition, unique ID, numa node
 
-Produces `CdiSpec` with `amd.com/gpu` kind. Each GPU gets two device
-nodes (renderD* and card*) with stat-derived major/minor/mode/uid/gid.
+Produces `CdiSpec` with `amd.com/gpu` kind. Each GPU gets its renderD*
+node, plus the card* node sysfs links to it (never a guessed index), with
+stat-derived major/minor/mode/uid/gid.
 Shared edits include `/dev/kfd`, ROCm lib mounts, video/render GIDs.
 
-**stable_id**: BDF-derived reload-invariant device identifier. Encodes
+**stable_id** (pci.rs): BDF-derived reload-invariant device identifier. Encodes
 domain:bus:dev.func plus intra-BDF partition rank. Low 8 bits =
 partition index (STABLE_ID_PARTITION_MASK = 0xFF). Survives driver
 reloads that shift render minor numbers. Bit layout (`encode_stable_id`):
@@ -102,23 +112,25 @@ and countable pools (count-only, no device paths).
 `DeviceRegistry` (device_registry.rs) is the unified device inventory.
 `populate()` merges CDI cache + GRES cache:
 
-1. CDI entries first (sorted by PCI BDF, then by primary device path)
+1. CDI entries first: entries with a PCI address, ordered by address, then stable id, then primary device path; then entries without one, by primary device path; the qualified device name breaks any remaining tie
 2. GRES injectable entries: each is first tried against the discovered CDI
-   entries (`merge_into_discovered()`) by its `renderD*` node; a match
-   merges the configured `type`/`cores`/`links` onto the discovered GPU
-   (device nodes stay discovery's) instead of becoming a second device, so
-   `[[devices.gres]] cores=` can set a GPU's reserved-core affinity without
-   disabling auto-detection. Unmatched entries remain separate candidates.
+   entries of its gres name (`merge_into_discovered()`, targets from
+   `merge_targets()`). Only its own nodes count (`own_node_paths()`, so not
+   `/dev/kfd`). A node only one discovered entry has names that entry; when
+   none does, a shared node (a partitioned GPU's `cardN`) names every entry
+   behind it. Its `type`/`cores`/`links` merge onto the named entries (device
+   nodes stay discovery's) and its other own nodes are dropped with a warning.
+   An entry naming no discovered entry stays a candidate.
 3. GRES countable pools
-4. Dedup by exact device-node path match, for whatever GRES entries did not
-   merge (CDI wins)
+4. Skip CDI aggregates (a device whose nodes are the union of two or more siblings of its kind, like `all`), then dedup whatever did not merge: CDI against CDI by identical node set, a GRES entry against anything that owns one of its own nodes (CDI wins)
 5. Assign sequential device_ids per gres_name
 6. Backfill stable_id from device_id when annotation absent
 
 `DeviceEntry` (entry.rs) carries all scheduling-relevant fields:
 gres_name, kind, device_id, stable_id, capability (Injectable vs
 CountablePool), memory_mb, numa_node, cores, links, link_type, pci_bdf,
-vendor, inject_actions, device/shared edits.
+topology, vendor, inject_actions, device/shared edits. `node_paths()` yields the
+device's own node paths (not its kind's shared ones).
 
 `resolve_by_ids()` looks up devices by stable_id (not positional
 device_id). Returns error if any ID is missing.
@@ -128,8 +140,11 @@ device_id). Returns error if any ID is missing.
 Two injectors: `HostInjector` and `ContainerInjector`. Both consume
 `MergedEdits` (device-specific + shared edits, deduplicated).
 
-`merge_edits_from_devices()`: aggregates per-device edits; applies
-shared edits once per kind.
+`DeviceRegistry::build_job_injection_plans()` takes a `DeviceSelection`
+(gres name -> stable ids) and builds one plan across every allocated kind.
+
+`merge_edits_from_devices()`: aggregates per-device edits; applies each
+distinct set of shared edits once (two specs of one kind both contribute).
 
 **ContainerInjectionPlan**: device nodes (with uid/gid fallback to job
 owner), bind mounts (sorted by depth), env vars, hooks, additional GIDs.
@@ -142,7 +157,8 @@ existing), all device paths.
 **GPU visibility**: sets vendor-appropriate env var
 (ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK) to
 the comma-separated device_id list. Empty device list -> empty string
-(hides all GPUs).
+(hides all GPUs). Only `DeviceClass::Gpu` entries (gres `gpu`) carry
+visibility vars, so a NIC of vendor `amd` never sets ROCR_VISIBLE_DEVICES.
 
 `SPUR_JOB_GPUS` env var is always set when GPU gres devices are present.
 
@@ -166,5 +182,6 @@ unknown -> PCIe). Default is PCIe when no link data present.
 cargo test -p spur-devices
 ```
 
-Uses tempfile for filesystem-based CDI spec tests. KFD topology tests
-use synthetic sysfs fixtures. No network or hardware required.
+Uses tempfile for filesystem-based CDI spec tests. Discovery runs against a
+filesystem root (`discover_gpu_cdi_from_root`), so KFD topology tests use
+synthetic sysfs fixtures. No network, hardware, or host files required.

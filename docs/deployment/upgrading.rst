@@ -556,10 +556,12 @@ Reserved cores per GPU, per-step shares and CPU billing
   ``memory.high``. Upgrade every ``spurd`` before changing spec cores,
   ``reserved_memory_mb``, ``restricted_cores_per_gpu`` or a node's GPUs while
   jobs run.
-- ``[[devices.gres]]`` ``type``/``links`` **now override what discovery
-  reports** for the matching GPU, so an existing entry can change a GPU's type
-  on upgrade. An entry that matches only some of a render node's GPUs is
-  dropped with a warning in the ``spurd`` log.
+- ``[[devices.gres]]`` ``type``, ``cores`` and ``links`` **now override what
+  discovery reports** for the devices an entry names, so an existing entry can
+  change a GPU's type on upgrade. Device nodes of an entry that belong to none
+  of the devices it names are dropped with a warning in the ``spurd`` log, and
+  an entry that shares a device node with a discovered or CDI device is
+  dropped.
 
 .. _cgroup-upgrade-notes:
 
@@ -961,6 +963,31 @@ link was found, which could name another device's card.
 * Jobs running at upgrade keep the device access they started with.
 * With ``[devices] auto_detect = false``, the spec is never rewritten.
 * Rolling ``spurd`` back to an older build brings the guessed card node back.
+
+GPU auto-detection per device kind
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With ``[devices] auto_detect`` on (the default), ``spurd`` now discovers each
+device kind live unless an on-disk CDI spec supplies devices of that kind, under
+any CDI kind name. Before, any on-disk spec turned live GPU discovery off, so an
+on-disk spec of another device kind no longer hides the node's GPUs. Discovered
+GPUs win over GPUs you configured another way:
+
+* **GRES GPUs on nodes with discovered GPUs.** A ``[[devices.gres]]`` GPU whose
+  ``file`` names a discovered GPU is merged into it instead of being reported
+  as a second GPU. Its ``type`` and ``cores``, where set, replace the
+  discovered ones, so jobs that request the configured type keep matching. The
+  GPU uses the discovered device nodes.
+* **GPU ids on nodes with GRES GPUs and a CDI spec of a non-GPU kind.** Such a node
+  used to keep positional GPU ids; it now discovers its GPUs live and reports
+  PCI-encoded ids. **Drain these nodes before upgrading ``spurd``**, so no
+  running job holds a positional id.
+* **GPU specs under another CDI kind.** A site spec supplying GPUs under a
+  kind other than ``amd.com/gpu`` (for example ``hpc.example.org/gpu``) keeps
+  GPU discovery off, as before: the node reports only the spec's GPUs. ``spurd``
+  now logs a warning that ``auto_detect`` is on but on-disk specs supply that
+  kind. If you describe all of a node's devices yourself, set
+  ``auto_detect = false``.
 
 Bounded controller shutdown (``shutdown_grace_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
