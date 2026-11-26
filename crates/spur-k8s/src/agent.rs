@@ -666,7 +666,8 @@ impl SlurmAgent for VirtualAgent {
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
 
-        // Delete all pods for this job by label selector
+        // Not reported released: a deleted Pod runs on through its grace period, and
+        // the job controller's Pod watcher reports it once it is Failed or Succeeded.
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
         let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
 
