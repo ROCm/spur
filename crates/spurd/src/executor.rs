@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -439,6 +440,48 @@ pub enum RunningJob {
     AllocationOnly,
 }
 
+/// What the process a launch tracks is, relative to the user's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackedProcess {
+    /// The workload itself (or the shell that runs it).
+    #[default]
+    Workload,
+    /// A namespace launcher (`unshare`, `nsenter`, a container's waiting parent)
+    /// that forks the workload and relays its exit status. It dies on signals it
+    /// has no handler for, which ends the step while the workload still runs.
+    Launcher,
+}
+
+impl TrackedProcess {
+    /// KILL and CONT reach the launcher: `nsenter` mirrors its child's stop and
+    /// resumes it only once continued itself. STOP must not, or an `nsenter`
+    /// mid-mirror stops a second time and never wakes. All else would kill it.
+    fn spares_launcher(self, sig: Signal) -> bool {
+        self == Self::Launcher && !matches!(sig, Signal::SIGKILL | Signal::SIGCONT)
+    }
+
+    /// Whether `sig` must be delivered through the launcher's descendants rather
+    /// than the tracked process's group, which would take the launcher with it.
+    pub(crate) fn behind_launcher(self, sig: Signal) -> bool {
+        self == Self::Launcher && sig != Signal::SIGKILL
+    }
+
+    /// Decided from the launch alone so a supervisor reading a persisted launch
+    /// spec reaches the same answer as the launch that produced the process.
+    pub fn of_launch(cfg: &JobLaunchConfig, is_root: bool) -> Self {
+        // A container fork-waits in its parent whether or not spurd is root. A
+        // joined step's script `exec`s `nsenter`, and every job a step can join
+        // has a pid namespace, so `nsenter` forks and waits.
+        let launcher = cfg.container.is_some()
+            || cfg.joins_parent_namespaces
+            || would_use_namespaces(cfg, is_root);
+        match launcher {
+            true => Self::Launcher,
+            false => Self::Workload,
+        }
+    }
+}
+
 /// Split a finished process's wait status into (exit_code, signal).
 /// Slurm parity: WIFEXITED -> (code, 0); WIFSIGNALED -> (0, sig).
 pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
@@ -566,6 +609,28 @@ impl RunningJob {
             }
             RunningJob::AllocationOnly => Ok(()),
         }
+    }
+
+    /// The tracked pid while it can still be signalled.
+    fn live_pid(&self) -> Option<i32> {
+        match self {
+            RunningJob::Managed { child } => child.id().map(|pid| pid as i32),
+            RunningJob::Forked { pid, reaped, .. } => (!*reaped).then_some(*pid),
+            RunningJob::AllocationOnly => None,
+        }
+    }
+
+    /// Signal the user's workload. Behind a launcher this reaches every
+    /// descendant of it, and the launcher itself only for the signals it must
+    /// get; otherwise it is [`Self::kill_signal`].
+    pub fn signal_workload(&self, sig: Signal, tracked: TrackedProcess) -> anyhow::Result<()> {
+        if !tracked.behind_launcher(sig) {
+            return self.kill_signal(sig);
+        }
+        if let Some(pid) = self.live_pid() {
+            signal_launcher_tree(pid, tracked, sig);
+        }
+        Ok(())
     }
 }
 
@@ -1673,16 +1738,225 @@ pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
 /// Signals every pid in the cgroup with any signal (unlike `cgroup_kill`,
 /// SIGKILL-only). Returns the count signaled; `Ok(0)` means no tracked pids.
 pub fn cgroup_signal(cgroup_path: &Path, sig: Signal) -> std::io::Result<usize> {
-    let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
-    let mut signaled = 0;
-    for pid_str in pids.lines() {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            if signal::kill(Pid::from_raw(pid), sig).is_ok() {
-                signaled += 1;
+    cgroup_signal_except(cgroup_path, sig, None)
+}
+
+/// [`cgroup_signal`] that leaves `except` alone.
+pub fn cgroup_signal_except(
+    cgroup_path: &Path,
+    sig: Signal,
+    except: Option<i32>,
+) -> std::io::Result<usize> {
+    Ok(signal_pids_except(
+        &cgroup_member_pids(cgroup_path)?,
+        sig,
+        except,
+    ))
+}
+
+fn cgroup_member_pids(cgroup_path: &Path) -> std::io::Result<Vec<i32>> {
+    let procs = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
+    Ok(procs
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect())
+}
+
+fn signal_pids_except(pids: &[i32], sig: Signal, except: Option<i32>) -> usize {
+    pids.iter()
+        .filter(|pid| Some(**pid) != except)
+        .filter(|pid| signal::kill(Pid::from_raw(**pid), sig).is_ok())
+        .count()
+}
+
+/// Delivers `sig` to a job's workload: the cgroup's processes first, since they
+/// include descendants a process-group signal misses, and the tracked process's
+/// own tree when the cgroup is absent, unreadable, or has nobody in it yet.
+/// A launcher gets only what [`TrackedProcess::spares_launcher`] allows: KILL
+/// first, so it cannot relay the worker's death as its own exit; CONT last, so
+/// an `nsenter` that has not read the child's stop report never reads it.
+pub fn deliver_signal(
+    cgroup_path: Option<&Path>,
+    job: &RunningJob,
+    tracked: TrackedProcess,
+    sig: Signal,
+) -> anyhow::Result<()> {
+    let launcher = job
+        .live_pid()
+        .filter(|_| tracked == TrackedProcess::Launcher);
+    let except = launcher.filter(|_| tracked.behind_launcher(sig));
+    // Read before anything is signalled: killing the launcher first reparents
+    // its children, and the fallback tree walk below could no longer find them.
+    let members = cgroup_path.map(cgroup_member_pids);
+    match members {
+        Some(Ok(pids)) if pids.iter().any(|pid| Some(*pid) != except) => {
+            if sig == Signal::SIGKILL {
+                signal_launcher(launcher, tracked, sig);
             }
+            signal_pids_except(&pids, sig, except);
+            if sig != Signal::SIGKILL {
+                signal_launcher(launcher, tracked, sig);
+            }
+            Ok(())
+        }
+        Some(Err(error)) => {
+            warn!(%error, "cgroup.procs signal failed, falling back to the tracked process");
+            job.signal_workload(sig, tracked)
+        }
+        _ => job.signal_workload(sig, tracked),
+    }
+}
+
+/// Signals everything the launcher `pid` started, then the launcher itself if
+/// `sig` is one it must get. That is what a signal to the launcher's process
+/// group used to reach, minus the launcher, plus descendants that left the group.
+pub(crate) fn signal_launcher_tree(pid: i32, tracked: TrackedProcess, sig: Signal) {
+    if sig == Signal::SIGSTOP {
+        stop_to_fixpoint(
+            pid,
+            || launcher_workload_pids(pid),
+            is_stopped_or_gone,
+            STOP_SETTLE_BUDGET,
+        );
+        return;
+    }
+    signal_pids_except(&launcher_workload_pids(pid), sig, None);
+    signal_launcher(Some(pid), tracked, sig);
+}
+
+/// How long a stop waits for what it signalled to be stopped. A process that
+/// cannot stop (uninterruptible sleep) must not hold up a caller on the async
+/// runtime; a stop normally settles within a millisecond.
+const STOP_SETTLE_BUDGET: Duration = Duration::from_secs(1);
+const STOP_SETTLE_POLL: Duration = Duration::from_millis(1);
+
+/// Stops the launcher's workload and returns once it is really stopped. A
+/// per-pid stop only queues, and a process inside `fork()` publishes its child
+/// after any scan, so it rescans until nothing new turns up. The launcher is
+/// stopped only when nothing is behind it: `nsenter` mirrors its child's stop.
+fn stop_to_fixpoint(
+    launcher: i32,
+    collect: impl Fn() -> Vec<i32>,
+    is_settled: impl Fn(i32) -> bool,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    let mut attempted = Vec::new();
+    // Only a pid the signal reached can be waited for: one it was refused
+    // (another user's) never stops, and would use up the whole budget.
+    let mut reached = Vec::new();
+    let mut round = collect();
+    if round.is_empty() {
+        round.push(launcher);
+    }
+    loop {
+        for pid in round {
+            if signal::kill(Pid::from_raw(pid), Signal::SIGSTOP).is_ok() {
+                reached.push(pid);
+            }
+            attempted.push(pid);
+        }
+        if wait_until_settled(&reached, &is_settled, deadline) {
+            round = collect()
+                .into_iter()
+                .filter(|pid| *pid != launcher && !attempted.contains(pid))
+                .collect();
+            if round.is_empty() {
+                return;
+            }
+            if Instant::now() < deadline {
+                continue;
+            }
+            warn!(launcher, found = ?round, "stop ran out of time with more processes to stop");
+        } else {
+            let unsettled: Vec<_> = reached.iter().filter(|pid| !is_settled(**pid)).collect();
+            warn!(launcher, ?unsettled, "processes did not stop in time");
+        }
+        signal_pids_except(&collect(), Signal::SIGSTOP, Some(launcher));
+        return;
+    }
+}
+
+fn wait_until_settled(pids: &[i32], is_settled: &impl Fn(i32) -> bool, deadline: Instant) -> bool {
+    loop {
+        if pids.iter().all(|pid| is_settled(*pid)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(STOP_SETTLE_POLL);
+    }
+}
+
+/// Whether every thread of `pid` is stopped (by a signal or a tracer), a
+/// zombie, or gone. A group stop reaches the threads one by one, and a thread
+/// still running may be in a `fork()`.
+fn is_stopped_or_gone(pid: i32) -> bool {
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return true;
+    };
+    threads.flatten().all(|thread| {
+        let state = std::fs::read_to_string(thread.path().join("stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next());
+        matches!(state, None | Some('T' | 't' | 'Z' | 'X'))
+    })
+}
+
+/// The launcher's descendants, deepest first, then the rest of its process group
+/// for whatever was reparented out of the tree.
+fn launcher_workload_pids(launcher: i32) -> Vec<i32> {
+    let mut pids = descendant_pids(launcher);
+    for member in process_group_members(launcher) {
+        if member != launcher && !pids.contains(&member) {
+            pids.push(member);
         }
     }
-    Ok(signaled)
+    pids
+}
+
+fn descendant_pids(pid: i32) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for child in get_child_pids(pid) {
+        pids.extend(descendant_pids(child));
+        pids.push(child);
+    }
+    pids
+}
+
+/// Every process in the group `leader` leads. A process that merely belongs to
+/// a group does not own it, and its group may hold the supervisor and others.
+fn process_group_members(leader: i32) -> Vec<i32> {
+    if process_group_of(leader) != Some(leader) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| process_group_of(*pid) == Some(leader))
+        .collect()
+}
+
+/// The stat field after the state and parent pid, read past the closing paren
+/// of the command name, which may itself contain spaces.
+fn process_group_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+fn signal_launcher(launcher: Option<i32>, tracked: TrackedProcess, sig: Signal) {
+    if let Some(pid) = launcher.filter(|_| !tracked.spares_launcher(sig)) {
+        let _ = signal::kill(Pid::from_raw(pid), sig);
+    }
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1829,20 +2103,32 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
 
 /// Recursively signal a process and all its descendants (children first).
 pub(crate) fn kill_process_tree(pid: i32, sig: Signal) {
-    let children = get_child_pids(pid);
-    for child in &children {
-        kill_process_tree(*child, sig);
-    }
+    kill_descendants(pid, sig);
     let _ = signal::kill(Pid::from_raw(pid), sig);
 }
 
-/// Read immediate child PIDs from /proc/<pid>/task/<pid>/children.
+/// [`kill_process_tree`] without `pid` itself.
+fn kill_descendants(pid: i32, sig: Signal) {
+    for child in get_child_pids(pid) {
+        kill_process_tree(child, sig);
+    }
+}
+
+/// Immediate children of `pid`. Linux lists a child under the thread that forked
+/// it, so every thread's file is read, not just the main thread's.
 fn get_child_pids(pid: i32) -> Vec<i32> {
-    let path = format!("/proc/{}/task/{}/children", pid, pid);
-    std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    threads
+        .flatten()
+        .flat_map(|thread| {
+            std::fs::read_to_string(thread.path().join("children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|child| child.parse().ok())
+                .collect::<Vec<i32>>()
+        })
         .collect()
 }
 
@@ -3474,6 +3760,56 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_signal_except_leaves_the_named_pid_alone() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut spared = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn spared sleep");
+        let mut signaled = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signaled sleep");
+        std::fs::write(
+            cgroup.path().join("cgroup.procs"),
+            format!("{}\n{}\n", spared.id(), signaled.id()),
+        )
+        .expect("seed cgroup.procs");
+
+        let count = cgroup_signal_except(cgroup.path(), Signal::SIGKILL, Some(spared.id() as i32))
+            .expect("signal all but one");
+
+        assert_eq!(count, 1);
+        let status = signaled.wait().expect("wait for signaled child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            spared.try_wait().expect("poll spared child").is_none(),
+            "the spared pid must not have been signaled"
+        );
+        spared.kill().expect("clean up spared child");
+        spared.wait().expect("reap spared child");
+    }
+
+    #[test]
+    fn cgroup_signal_except_none_signals_everyone() {
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(cgroup.path().join("cgroup.procs"), child.id().to_string())
+            .expect("seed cgroup.procs");
+
+        let count =
+            cgroup_signal_except(cgroup.path(), Signal::SIGKILL, None).expect("signal everyone");
+
+        assert_eq!(count, 1);
+        child.wait().expect("wait for signaled child");
+    }
+
+    #[test]
     fn cgroup_signal_reports_the_read_failure_when_theres_no_cgroup() {
         let missing = std::path::Path::new("/nonexistent/spur-cgroup-signal-test");
         assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
@@ -4227,6 +4563,107 @@ mod tests {
         };
 
         assert!(!would_use_namespaces(&step, true));
+    }
+
+    fn container_launch() -> ContainerLaunchConfig {
+        ContainerLaunchConfig {
+            config: ContainerConfig {
+                image: "docker://job-image".into(),
+                mounts: Vec::new(),
+                workdir: None,
+                name: None,
+                readonly: false,
+                mount_home: false,
+                remap_root: false,
+                gpu_devices: Vec::new(),
+                environment: HashMap::new(),
+                container_env: HashMap::new(),
+                entrypoint: None,
+                uid: 1000,
+                gid: 1000,
+                username: "spur".into(),
+                home_dir: "/home/spur".into(),
+                device_plan: None,
+                withheld_socket: None,
+            },
+            rootfs: PathBuf::from("/tmp/rootfs"),
+        }
+    }
+
+    #[test]
+    fn a_batch_job_under_unshare_tracks_a_launcher() {
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(false), true),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_step_entering_its_jobs_namespaces_tracks_a_launcher() {
+        let step = JobLaunchConfig {
+            joins_parent_namespaces: true,
+            step_id: 3,
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&step, true),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_container_job_tracks_a_launcher_with_or_without_root() {
+        let container = JobLaunchConfig {
+            container: Some(container_launch()),
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&container, true),
+            TrackedProcess::Launcher
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&container, false),
+            TrackedProcess::Launcher
+        );
+    }
+
+    #[test]
+    fn a_launch_without_a_launcher_tracks_the_workload() {
+        let pmix = JobLaunchConfig {
+            pmix_multi_task: true,
+            ..holder_cfg(false)
+        };
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(false), false),
+            TrackedProcess::Workload,
+            "rootless batch job"
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&holder_cfg(true), true),
+            TrackedProcess::Workload,
+            "allocation holder"
+        );
+        assert_eq!(
+            TrackedProcess::of_launch(&pmix, true),
+            TrackedProcess::Workload,
+            "multi-rank pmix wrapper"
+        );
+    }
+
+    #[test]
+    fn a_launcher_is_spared_every_signal_but_kill_and_cont() {
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGUSR1,
+            Signal::SIGHUP,
+            Signal::SIGSTOP,
+        ] {
+            assert!(TrackedProcess::Launcher.spares_launcher(sig), "{sig:?}");
+            assert!(!TrackedProcess::Workload.spares_launcher(sig), "{sig:?}");
+        }
+        for sig in [Signal::SIGKILL, Signal::SIGCONT] {
+            assert!(!TrackedProcess::Launcher.spares_launcher(sig), "{sig:?}");
+        }
     }
 
     #[test]
@@ -5010,8 +5447,9 @@ mod tests {
                 stderr: err_fd,
             };
             let result = unsafe { raw.wire() };
-            // Exit with code 0 on success, 1 on failure.
-            std::process::exit(if result.is_ok() { 0 } else { 1 });
+            // `_exit`: the runtime's own exit would flush stdout, which another
+            // test thread may have locked when this process was forked.
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) };
         }
 
         // Parent: wait for child.
@@ -5036,7 +5474,7 @@ mod tests {
 
         if pid == 0 {
             let result = unsafe { raw.wire() };
-            std::process::exit(if result.is_err() { 0 } else { 1 });
+            unsafe { libc::_exit(if result.is_err() { 0 } else { 1 }) };
         }
 
         let mut status = 0i32;
@@ -5101,6 +5539,703 @@ mod tests {
         assert!(
             msg.contains("failed to join cgroup"),
             "unexpected message: {msg}"
+        );
+    }
+
+    /// Set only by the tests below when they re-run this test binary as a
+    /// multithreaded workload.
+    const WORKLOAD_HELPER_ENV: &str = "SPURD_TEST_MULTITHREADED_WORKLOAD";
+
+    /// A workload whose worker thread, not its main thread, forks the helper
+    /// subprocess, which leaves the workload's process group. A no-op unless a
+    /// test below re-executes the binary to run it.
+    #[test]
+    fn multithreaded_workload_helper() {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os(WORKLOAD_HELPER_ENV).is_none() {
+            return;
+        }
+        std::thread::spawn(|| {
+            let mut helper = std::process::Command::new("sleep")
+                .arg("3600")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the helper");
+            println!("ready {}", helper.id());
+            // The forking thread has to outlive the helper, or the kernel hands
+            // the helper to another thread and the listing no longer depends on it.
+            let _ = helper.wait();
+        });
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A stand-in process and the helper it announced, both killed when it goes
+    /// out of scope.
+    struct StandIn {
+        leader: i32,
+        helper: i32,
+        own_group: bool,
+        child: std::process::Child,
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            // The helper can sit in a group of its own, so it is killed by pid,
+            // unless it is already gone and its number may belong to someone else.
+            if state_of(self.helper).is_some() {
+                let _ = signal::kill(Pid::from_raw(self.helper), Signal::SIGKILL);
+            }
+            if self.own_group {
+                let _ = signal::killpg(Pid::from_raw(self.leader), Signal::SIGKILL);
+            } else {
+                let _ = signal::kill(Pid::from_raw(self.leader), Signal::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Starts `command` and waits for the `ready <pid>` line that names its
+    /// helper. With `own_group` it leads a process group of its own.
+    fn spawn_stand_in(mut command: std::process::Command, own_group: bool) -> StandIn {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        if own_group {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("spawn the stand-in");
+        let leader = child.id() as i32;
+        let stdout = child.stdout.take().expect("stand-in stdout");
+        let helper = std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            // The test harness leaves its own `test <name> ... ` text on the same line.
+            .find_map(|line| line.rsplit_once("ready ")?.1.parse().ok())
+            .expect("the stand-in announces its helper");
+        StandIn {
+            leader,
+            helper,
+            own_group,
+            child,
+        }
+    }
+
+    fn multithreaded_workload() -> StandIn {
+        let helper_test = module_path!()
+            .split_once("::")
+            .map(|(_, module)| format!("{module}::multithreaded_workload_helper"))
+            .expect("the tests live in a module of the crate");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args(["--exact", &helper_test, "--nocapture", "--test-threads=1"])
+            .env(WORKLOAD_HELPER_ENV, "1");
+        spawn_stand_in(command, true)
+    }
+
+    /// The process state letter, or `None` once the process is gone.
+    fn state_of(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    /// Polls for `want` for up to ~2s: a signal's effect lands after `kill` returns.
+    fn await_state(pid: i32, want: &[Option<char>]) -> Option<char> {
+        for _ in 0..200 {
+            if want.contains(&state_of(pid)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        state_of(pid)
+    }
+
+    #[test]
+    fn a_child_forked_by_a_secondary_thread_is_listed_under_its_process() {
+        let (forked_tx, forked_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let forker = std::thread::spawn(move || {
+            let mut child = std::process::Command::new("sleep")
+                .arg("3600")
+                .spawn()
+                .expect("spawn the child");
+            forked_tx.send(child.id() as i32).expect("report the child");
+            // Parked so the child stays listed under this thread.
+            let _ = done_rx.recv();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let child = forked_rx.recv().expect("the forked child");
+
+        let listed = get_child_pids(std::process::id() as i32);
+
+        done_tx.send(()).expect("release the forking thread");
+        forker.join().expect("forking thread");
+        assert!(listed.contains(&child), "{listed:?} lacks {child}");
+    }
+
+    #[test]
+    fn a_launcher_stop_reaches_a_helper_forked_by_a_worker_thread() {
+        let launcher = multithreaded_workload();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(launcher.helper, &[Some('T')]), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_term_reaches_a_helper_forked_by_a_worker_thread() {
+        let launcher = multithreaded_workload();
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGTERM);
+
+        // Gone, or a zombie for the moment before the workload reaps it.
+        let state = await_state(launcher.helper, &[Some('Z'), None]);
+        assert!(matches!(state, Some('Z') | None), "{state:?}");
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('Z'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_stop_reaches_a_process_that_only_shares_its_group() {
+        let mut command = std::process::Command::new("/bin/sh");
+        // The subshell exits at once, so the sleep it started is no longer a
+        // descendant of the launcher but is still in its group.
+        command
+            .arg("-c")
+            .arg("(sleep 3600 & echo ready $!); sleep 3600");
+        let launcher = spawn_stand_in(command, true);
+
+        signal_launcher_tree(launcher.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(launcher.helper, &[Some('T')]), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
+    }
+
+    /// A launcher that has not forked its workload yet: it reports in, then forks
+    /// once it reads a line from its stdin.
+    struct UnforkedLauncher {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl UnforkedLauncher {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                // Not `wait`: it returns when the worker stops, which a launcher does not.
+                .arg("echo ready; read go; sleep 3600 & echo forked $!; while :; do sleep 0.05; done")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the launcher");
+            let stdin = child.stdin.take().expect("launcher stdin");
+            let output = std::io::BufReader::new(child.stdout.take().expect("launcher stdout"));
+            let mut launcher = Self {
+                child,
+                stdin,
+                output,
+            };
+            assert_eq!(launcher.line(), "ready");
+            launcher
+        }
+
+        fn pid(&self) -> i32 {
+            self.child.id() as i32
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .expect("read launcher output");
+            line.trim().to_string()
+        }
+
+        fn fork_now(&mut self) {
+            use std::io::Write;
+            writeln!(self.stdin, "go").expect("tell the launcher to fork");
+        }
+    }
+
+    impl Drop for UnforkedLauncher {
+        fn drop(&mut self) {
+            let _ = signal::killpg(Pid::from_raw(self.pid()), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn a_stop_before_the_launcher_forks_stops_the_launcher_until_it_is_resumed() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGSTOP);
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+
+        // It cannot read this while stopped, so it forks nothing until resumed.
+        launcher.fork_now();
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGCONT);
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the resumed launcher forks its workload");
+        assert_ne!(state_of(forked), Some('T'), "the workload runs");
+        assert_ne!(state_of(pid), Some('T'), "the launcher runs");
+    }
+
+    #[test]
+    fn a_cgroup_holding_only_the_launcher_does_not_lose_a_stop_or_the_resume() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.procs"), format!("{pid}\n"))
+            .expect("seed cgroup.procs");
+        let job = RunningJob::Forked {
+            pid,
+            _pidfd: None,
+            reaped: false,
+        };
+        let deliver = |sig| {
+            deliver_signal(Some(cgroup.path()), &job, TrackedProcess::Launcher, sig)
+                .expect("deliver the signal")
+        };
+
+        deliver(Signal::SIGSTOP);
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+
+        launcher.fork_now();
+        deliver(Signal::SIGCONT);
+        assert!(launcher.line().starts_with("forked "));
+    }
+
+    /// A child process killed and reaped when it goes out of scope.
+    struct Spawned(std::process::Child);
+
+    impl Spawned {
+        fn new(program: &str, args: &[&str]) -> Self {
+            Self(
+                std::process::Command::new(program)
+                    .args(args)
+                    .spawn()
+                    .expect("spawn the process"),
+            )
+        }
+
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Long enough that only a settled stop, never the budget, ends a test.
+    const UNBOUNDED: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn a_stop_also_reaches_a_workload_that_appeared_while_the_launcher_was_being_stopped() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+        // The workload was not there when the launcher was first looked at.
+        let looks = std::cell::Cell::new(0);
+        let collect = || {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                Vec::new()
+            } else {
+                vec![forked]
+            }
+        };
+
+        stop_to_fixpoint(pid, collect, is_stopped_or_gone, UNBOUNDED);
+
+        assert_eq!(state_of(pid), Some('T'));
+        assert_eq!(state_of(forked), Some('T'));
+        assert_eq!(
+            looks.get(),
+            3,
+            "looks again once the new workload is stopped"
+        );
+    }
+
+    #[test]
+    fn a_stop_keeps_looking_until_a_look_finds_nothing_new() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let child: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+        let grandchild = Spawned::new("sleep", &["3600"]);
+        let looks = std::cell::Cell::new(0);
+        let collect = || {
+            looks.set(looks.get() + 1);
+            match looks.get() {
+                1 => vec![child],
+                _ => vec![child, grandchild.pid()],
+            }
+        };
+
+        stop_to_fixpoint(pid, collect, is_stopped_or_gone, UNBOUNDED);
+
+        assert_eq!(state_of(child), Some('T'));
+        assert_eq!(state_of(grandchild.pid()), Some('T'));
+        assert_ne!(
+            state_of(pid),
+            Some('T'),
+            "a launcher with a workload is spared"
+        );
+        assert_eq!(looks.get(), 3);
+    }
+
+    #[test]
+    fn a_stop_that_is_never_confirmed_still_stops_what_the_last_look_finds_and_returns() {
+        let launcher = Spawned::new("sleep", &["3600"]);
+        let late = Spawned::new("sleep", &["3600"]);
+        let looks = std::cell::Cell::new(0);
+        // Nothing behind the launcher at first, a process there on the last look.
+        let collect = || {
+            looks.set(looks.get() + 1);
+            match looks.get() {
+                1 => Vec::new(),
+                _ => vec![late.pid()],
+            }
+        };
+        let never_settled = |_| false;
+
+        stop_to_fixpoint(launcher.pid(), collect, never_settled, Duration::ZERO);
+
+        assert_eq!(await_state(late.pid(), &[Some('T')]), Some('T'));
+        assert_eq!(await_state(launcher.pid(), &[Some('T')]), Some('T'));
+        assert_eq!(looks.get(), 2);
+    }
+
+    #[test]
+    fn a_pid_the_stop_cannot_reach_is_not_waited_for() {
+        let launcher = Spawned::new("sleep", &["3600"]);
+        // No such process, so the signal fails as it does for another user's.
+        let unreachable = i32::MAX;
+        let polled = std::cell::Cell::new(false);
+        let never_settled = |_| {
+            polled.set(true);
+            false
+        };
+
+        // The budget only bounds a regression, which would wait on the pid.
+        stop_to_fixpoint(
+            launcher.pid(),
+            || vec![unreachable],
+            never_settled,
+            Duration::from_millis(50),
+        );
+
+        assert!(!polled.get(), "the stop waited for a pid it never reached");
+    }
+
+    #[test]
+    fn a_launcher_that_has_already_exited_does_not_hold_up_a_stop() {
+        let exited = Spawned::new("true", &[]);
+        let pid = exited.pid();
+        // Left unreaped, so it stays a zombie the stop has to treat as stopped.
+        assert_eq!(await_state(pid, &[Some('Z')]), Some('Z'));
+
+        stop_to_fixpoint(pid, Vec::new, is_stopped_or_gone, UNBOUNDED);
+    }
+
+    #[test]
+    fn a_process_is_settled_when_stopped_a_zombie_or_gone_but_not_while_running() {
+        let mut sleeper = Spawned::new("sleep", &["3600"]);
+        let pid = sleeper.pid();
+        assert!(!is_stopped_or_gone(pid));
+
+        signal::kill(Pid::from_raw(pid), Signal::SIGSTOP).expect("stop");
+        assert_eq!(await_state(pid, &[Some('T')]), Some('T'));
+        assert!(is_stopped_or_gone(pid));
+
+        signal::kill(Pid::from_raw(pid), Signal::SIGKILL).expect("kill");
+        assert_eq!(await_state(pid, &[Some('Z')]), Some('Z'));
+        assert!(is_stopped_or_gone(pid));
+
+        sleeper.0.wait().expect("reap");
+        assert!(is_stopped_or_gone(pid));
+    }
+
+    #[test]
+    fn a_stop_with_a_workload_behind_the_launcher_spares_the_launcher() {
+        let mut launcher = UnforkedLauncher::spawn();
+        let pid = launcher.pid();
+        launcher.fork_now();
+        let forked: i32 = launcher
+            .line()
+            .strip_prefix("forked ")
+            .and_then(|pid| pid.parse().ok())
+            .expect("the launcher forks its workload");
+
+        signal_launcher_tree(pid, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+        assert_eq!(await_state(forked, &[Some('T')]), Some('T'));
+        assert_ne!(state_of(pid), Some('T'), "a launcher that mirrors stops");
+    }
+
+    /// Names the file whose appearance tells [`widened_fork_helper`] to fork.
+    const WIDE_FORK_GO_ENV: &str = "SPURD_TEST_WIDE_FORK_GO";
+
+    /// Maps and touches this many page pairs, so a fork copies tens of thousands
+    /// of areas and stays inside the kernel for long enough to be signalled there.
+    const WIDE_FORK_MAPPINGS: usize = 30_000;
+
+    /// Forks a child that never exits, once told to, from a process whose fork is
+    /// slow. A no-op unless a test below re-executes the binary to run it.
+    #[test]
+    fn widened_fork_helper() {
+        let Some(go) = std::env::var_os(WIDE_FORK_GO_ENV) else {
+            return;
+        };
+        'mapping: for _ in 0..WIDE_FORK_MAPPINGS {
+            // A guard page between the writable ones keeps the kernel from
+            // merging them back into one area.
+            for prot in [libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE] {
+                // SAFETY: an anonymous private mapping of one page, never unmapped.
+                let page = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        prot,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                // Past the kernel's limit the fork is merely faster, which only
+                // weakens the test.
+                if page == libc::MAP_FAILED {
+                    break 'mapping;
+                }
+                if prot != libc::PROT_NONE {
+                    // SAFETY: the page was just mapped writable.
+                    unsafe { page.cast::<u8>().write(1) };
+                }
+            }
+        }
+        println!("ready {}", std::process::id());
+        while !Path::new(&go).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        println!("forking");
+        let started = std::time::Instant::now();
+        // SAFETY: the child only calls pause, which is async-signal-safe.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            loop {
+                // SAFETY: pause has no preconditions.
+                unsafe { libc::pause() };
+            }
+        }
+        println!("forked {child} after {:?}", started.elapsed());
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A process whose `fork()` is in flight, optionally behind a shell that
+    /// plays the launcher. Everything it started is killed when it goes out of
+    /// scope.
+    struct WideFork {
+        leader: i32,
+        helper: i32,
+        go: PathBuf,
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl WideFork {
+        /// With `behind_launcher` the forking process is a child of the leader
+        /// shell, otherwise it is the leader.
+        fn spawn(behind_launcher: bool) -> Self {
+            use std::os::unix::process::CommandExt;
+            let helper_test = module_path!()
+                .split_once("::")
+                .map(|(_, module)| format!("{module}::widened_fork_helper"))
+                .expect("the tests live in a module of the crate");
+            let helper_args = ["--exact", &helper_test, "--nocapture", "--test-threads=1"];
+            let exe = std::env::current_exe().expect("this test binary");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let go = dir.path().join("go");
+            let mut command = if behind_launcher {
+                let mut shell = std::process::Command::new("/bin/sh");
+                shell
+                    .arg("-c")
+                    .arg("\"$0\" \"$@\" & while :; do sleep 0.05; done")
+                    .arg(&exe)
+                    .args(helper_args);
+                shell
+            } else {
+                let mut helper = std::process::Command::new(&exe);
+                helper.args(helper_args);
+                helper
+            };
+            let mut child = command
+                .env(WIDE_FORK_GO_ENV, &go)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the forking process");
+            let output = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+            let mut spawned = Self {
+                leader: child.id() as i32,
+                helper: 0,
+                go,
+                child,
+                output,
+                _dir: dir,
+            };
+            // The harness leaves its own `test <name> ... ` text on the same line.
+            let ready = spawned.line_containing("ready ");
+            spawned.helper = ready
+                .rsplit_once("ready ")
+                .and_then(|(_, pid)| pid.trim().parse().ok())
+                .expect("the helper announces its pid");
+            spawned
+        }
+
+        fn line_containing(&mut self, marker: &str) -> String {
+            use std::io::BufRead;
+            loop {
+                let mut line = String::new();
+                let read = self.output.read_line(&mut line).expect("read the helper");
+                assert_ne!(read, 0, "the helper exited before printing {marker:?}");
+                if line.contains(marker) {
+                    return line;
+                }
+            }
+        }
+
+        /// Returns once the helper has been told to fork and has had a moment to
+        /// enter the call, which takes it far longer than that to leave.
+        fn wait_until_forking(&mut self) {
+            std::fs::write(&self.go, b"").expect("tell the helper to fork");
+            self.line_containing("forking");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        /// Whether a child shows up at all within a fork's time, which tells a
+        /// stop that was too late for the fork to publish its child from one that
+        /// beat the fork, which then never starts.
+        fn child_published_late(&self) -> bool {
+            (0..30).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                !get_child_pids(self.helper).is_empty()
+            })
+        }
+    }
+
+    impl Drop for WideFork {
+        fn drop(&mut self) {
+            let _ = signal::killpg(Pid::from_raw(self.leader), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    const WIDE_FORK_ATTEMPTS: usize = 10;
+
+    /// Stops a launcher tree while a process in it is inside `fork()`, and checks
+    /// the child that fork publishes is stopped by the time the stop returns. A
+    /// stop that lands before the fork begins publishes no child and proves
+    /// nothing, so it is retried; only a child seen stopped passes.
+    fn stop_through_a_fork_in_flight(behind_launcher: bool) -> WideFork {
+        for _ in 0..WIDE_FORK_ATTEMPTS {
+            let mut fork = WideFork::spawn(behind_launcher);
+            fork.wait_until_forking();
+
+            signal_launcher_tree(fork.leader, TrackedProcess::Launcher, Signal::SIGSTOP);
+
+            // Read at once: a child that stops later is not one the stop reached.
+            let children = get_child_pids(fork.helper);
+            let states: Vec<_> = children.iter().map(|child| state_of(*child)).collect();
+            if children.is_empty() {
+                assert!(
+                    !fork.child_published_late(),
+                    "the fork published its child after the stop returned"
+                );
+                continue;
+            }
+            assert!(
+                states.iter().all(|state| *state == Some('T')),
+                "children {children:?} are {states:?} when the stop returned"
+            );
+            return fork;
+        }
+        panic!("the stop never landed inside the fork in {WIDE_FORK_ATTEMPTS} attempts");
+    }
+
+    #[test]
+    fn a_stop_during_the_launchers_own_fork_stops_the_child_that_fork_publishes() {
+        let launcher = stop_through_a_fork_in_flight(false);
+
+        assert_eq!(state_of(launcher.leader), Some('T'));
+    }
+
+    #[test]
+    fn a_stop_during_the_workloads_fork_stops_the_child_that_fork_publishes() {
+        let launcher = stop_through_a_fork_in_flight(true);
+
+        assert_eq!(state_of(launcher.helper), Some('T'));
+        assert_ne!(
+            state_of(launcher.leader),
+            Some('T'),
+            "the launcher is spared"
+        );
+    }
+
+    #[test]
+    fn a_launcher_that_does_not_lead_its_group_has_no_group_to_signal() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 3600 & echo ready $!; wait");
+        let launcher = spawn_stand_in(command, false);
+
+        assert!(process_group_members(launcher.leader).is_empty());
+        assert!(process_group_members(launcher.helper).is_empty());
+        // The launcher shares the group of this test binary, which is not its own.
+        assert_ne!(
+            // SAFETY: getpgid only reads the process table.
+            unsafe { libc::getpgid(launcher.leader) },
+            launcher.leader
         );
     }
 }
