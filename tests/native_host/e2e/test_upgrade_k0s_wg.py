@@ -20,11 +20,11 @@ full WireGuard mesh across all nodes. k0s is NOT yet ``up`` when the fixture
 yields — the test controls timing.
 
 Binary-swap upgrade (``TestWgVersionUpgradePreservesK0s``):
-  Set ``SPUR_TEST_BASELINE_BINARIES_DIR`` to a directory containing v0.14.0
-  (or any prior release) binaries. The cluster starts on those binaries, then
-  the test swaps in the PR binaries (``SPUR_TEST_BINARIES_DIR``) and does a
-  rolling restart — proving a real version-to-version upgrade preserves k0s.
-  Skipped when the env var is unset (CI sets it; local runs can too).
+  Off by default. Set ``SPUR_TEST_BASELINE_BINARIES_DIR`` to a directory with
+  a prior release's binaries to run it: the cluster starts on those binaries,
+  then the test swaps in the PR binaries (``SPUR_TEST_BINARIES_DIR``) and does
+  a rolling restart, proving a real version-to-version upgrade preserves k0s.
+  CI does not set it.
 """
 
 from __future__ import annotations
@@ -828,21 +828,20 @@ class TestWgRollingUpgradePreservesK0s:
 @pytest.mark.k0s
 class TestWgVersionUpgradePreservesK0s:
     """Real version-to-version upgrade: start the cluster on baseline binaries
-    (e.g. v0.14.0), bring k0s up, swap to the PR binaries, do a rolling
+    from a prior release, bring k0s up, swap to the PR binaries, do a rolling
     restart, and prove k0s + WG mesh survived.
 
-    Requires ``SPUR_TEST_BASELINE_BINARIES_DIR`` pointing to the old-version
-    binaries. CI downloads these from the GitHub release; local runs can point
-    to a pre-built directory. Skipped when unset.
+    Off by default: runs only when ``SPUR_TEST_BASELINE_BINARIES_DIR`` points
+    to a prior release's binaries. CI does not set it.
     """
 
     def test_version_upgrade_preserves_k0s_over_wg(self, wg_k0s_cluster):
         baseline_dir = _get_baseline_binaries_dir()
         if not baseline_dir:
             pytest.skip(
-                "SPUR_TEST_BASELINE_BINARIES_DIR not set — "
-                "set it to a directory with v0.14.0 binaries to run "
-                "the version upgrade test"
+                "off by default: CI does not provide baseline binaries; set "
+                "SPUR_TEST_BASELINE_BINARIES_DIR to a prior release's "
+                "binaries to run the version upgrade test"
             )
         upgrade_dir = _get_upgrade_binaries_dir()
 

@@ -657,19 +657,20 @@ class TestRollingUpgradePreservesK0s:
 @pytest.mark.k0s
 class TestVersionUpgradePreservesK0s:
     """Real version-to-version upgrade (no WireGuard): start the cluster on
-    baseline binaries (e.g. v0.14.0), bring k0s up, swap to the PR binaries,
-    do a rolling restart, and prove k0s survived.
+    baseline binaries from a prior release, bring k0s up, swap to the PR
+    binaries, do a rolling restart, and prove k0s survived.
 
-    Requires ``SPUR_TEST_BASELINE_BINARIES_DIR``. Skipped when unset.
+    Off by default: runs only when ``SPUR_TEST_BASELINE_BINARIES_DIR`` points
+    to a prior release's binaries. CI does not set it.
     """
 
     def test_version_upgrade_preserves_k0s(self, k0s_native_cluster):
         baseline_dir = _get_baseline_binaries_dir()
         if not baseline_dir:
             pytest.skip(
-                "SPUR_TEST_BASELINE_BINARIES_DIR not set — "
-                "set it to a directory with v0.14.0 binaries to run "
-                "the version upgrade test"
+                "off by default: CI does not provide baseline binaries; set "
+                "SPUR_TEST_BASELINE_BINARIES_DIR to a prior release's "
+                "binaries to run the version upgrade test"
             )
         upgrade_dir = _get_upgrade_binaries_dir()
 
