@@ -517,13 +517,18 @@ Flags:
        still exits 0.
 
 Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
-``%`` letters. The available fields are ``JobID``, ``JobName``, ``User``,
-``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
-``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
-``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
-``Borrowed``, ``ReqGPUS``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. Set a
-per-field width with ``Field%N``, e.g. ``JobName%20``. Names are matched in full,
-ignoring case.
+``%`` letters. The available fields are ``JobID``, ``JobIDRaw``, ``JobName``,
+``User``, ``Account``, ``Partition``, ``State``, ``Elapsed``, ``ElapsedRaw``,
+``NNodes``, ``ExitCode``, ``DerivedExitCode``, ``Start``, ``End``, ``Submit``,
+``TimeLimit``, ``NodeList``, ``NCPUS``, ``AllocCPUS``, ``ReqMem``, ``QOS``,
+``Reservation``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``, ``Borrowed``,
+``ReqGPUS``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. ``AllocCPUS`` is the
+same value as ``NCPUS``, as in Slurm, and ``Reservation`` is blank for a job that
+ran outside a reservation. ``JobIDRaw`` is the bare numeric job ID, and
+``ElapsedRaw`` is ``Elapsed`` in whole seconds (``0`` for a job that never
+started).
+Set a per-field width with ``Field%N``, e.g. ``JobName%20``. Names are matched in
+full, ignoring case.
 
 A Slurm field Spur does not provide, such as ``AllocTRES``, ``MaxRSS``, or
 ``WorkDir``, prints as an ``N/A`` column under its Slurm name, so a Slurm script

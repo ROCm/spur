@@ -153,20 +153,20 @@ pub fn parse_named_format_strict(
     fmt: &str,
     field: &dyn Fn(&str) -> Option<(char, &'static str)>,
 ) -> anyhow::Result<Vec<FormatToken>> {
-    let (tokens, unknown) = parse_named_items(fmt, field);
-    if let Some(name) = unknown.first() {
+    let (tokens, first_unknown) = parse_named_items(fmt, field);
+    if let Some(name) = first_unknown {
         anyhow::bail!("Invalid field requested: {name}");
     }
     Ok(tokens)
 }
 
-/// The tokens for the known names, and the unknown names in input order.
+/// The tokens for the known names, and the first unknown name.
 fn parse_named_items<'a>(
     fmt: &'a str,
     field: &dyn Fn(&str) -> Option<(char, &'static str)>,
-) -> (Vec<FormatToken>, Vec<&'a str>) {
+) -> (Vec<FormatToken>, Option<&'a str>) {
     let mut tokens = Vec::new();
-    let mut unknown = Vec::new();
+    let mut first_unknown = None;
     let items: Vec<&str> = fmt.split(',').collect();
     for (i, item) in items.iter().enumerate() {
         let item = item.trim();
@@ -179,7 +179,8 @@ fn parse_named_items<'a>(
         };
         let Some((spec, header)) = field(name) else {
             // A bare `%width` has no name; report the token the user typed.
-            unknown.push(if name.is_empty() { item } else { name });
+            let typed = if name.is_empty() { item } else { name };
+            first_unknown = first_unknown.or(Some(typed));
             continue;
         };
         let abs_width = width.unsigned_abs() as usize;
@@ -194,7 +195,7 @@ fn parse_named_items<'a>(
             tokens.push(FormatToken::Literal(" ".to_string()));
         }
     }
-    (tokens, unknown)
+    (tokens, first_unknown)
 }
 
 /// Parse Slurm's `-O`/`--Format` grammar: a comma-separated list of fields, each
