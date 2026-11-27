@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod hostlist;
 pub mod job;
 pub mod k0s;
+pub mod launch_kind;
 pub mod mpi;
 pub mod native_cred;
 pub mod native_exec;

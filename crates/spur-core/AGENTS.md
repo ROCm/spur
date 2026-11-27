@@ -28,6 +28,10 @@ Shared types for every other crate. General WAL schema rules are in root
 - `reported_outcome()` is the single source of a run's state, exit code, and signal: `first_failed_node` if set, else the first allocated node. Both the last report and the completing timeout's force-finish use it. Once `first_failed_node` is recorded only its OOM counts; without one any node's OOM counts, as older controllers apply it, so replayed logs agree.
 - `Job::script_placement()` falls back to the `auto` text scan when `resolved_placement` is unset (a run dispatched before placements were recorded), matching what agents without the `script-placement` capability do. `Job::clear_placement` clears it with the rest of the placement.
 
+## Launch kind
+
+- `LaunchFlags` reads a `LaunchKind` from both the core and the proto `JobSpec`, because the controller holds the stored spec while an agent sees only the spec it was dispatched. Both `From` impls must read every flag that changes how a job launches, so equivalent specs get the same kind; `a_proto_spec_classifies_like_the_spec_it_is_stored_as` checks this for every combination of the flags they read. A dispatched spec is not always equivalent to the stored one: srun's fallback dispatch clears `srun_job`, so the spec it sends classifies as `Batch`.
+
 ## Node state pitfalls
 
 - `Draining -> Drain` is driven by `update_state_from_alloc()` when the last allocation is released, not by `NodeState::transition()`. `update_state_from_alloc()` leaves admin hold states untouched except `Draining -> Drain`.
