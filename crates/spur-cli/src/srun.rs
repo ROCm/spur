@@ -174,7 +174,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_image: Option<String>,
 
-    /// Container bind mounts ("/src:/dst:ro")
+    /// Container mounts, repeatable or comma-separated ("/src:/dst:ro", "tmpfs:/dst:size=1G")
     #[arg(long)]
     pub container_mounts: Vec<String>,
 
@@ -2804,6 +2804,12 @@ mod tests {
         // Container modifiers ride the interactive path too, so they no longer warn.
         let (args, matches) = parse_srun(&["srun", "--pty", "--container-mounts", "/a:/b", "bash"]);
         assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
+    }
+
+    #[test]
+    fn a_comma_mount_list_stays_one_value() {
+        let (args, _) = parse_srun(&["srun", "--container-mounts=/a:/a,/b:/b", "true"]);
+        assert_eq!(args.container_mounts, vec!["/a:/a,/b:/b"]);
     }
 
     #[test]

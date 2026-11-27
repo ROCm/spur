@@ -134,7 +134,7 @@ pub async fn run(
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
                         topology: None,
-                        capabilities: vec![],
+                        capabilities: vec![spur_core::node::CAP_CONTAINER_TMPFS.into()],
                         agent_instance: String::new(),
                     };
 

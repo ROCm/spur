@@ -51,9 +51,9 @@ runs inside the container.
      - Description
    * - ``--container-image <ref|/path.sqsh>``
      - Image to run in. A registry reference, a stored name, or a ``.sqsh`` path.
-   * - ``--container-mounts <src>:<dst>[:ro]``
-     - Bind-mount a host path into the container. Repeatable; append ``:ro`` for
-       read-only.
+   * - ``--container-mounts <mount>[,<mount>...]``
+     - Mount host paths or a tmpfs into the container. Repeatable, or give several
+       mounts separated by commas. See `Container Mounts`_.
    * - ``--container-workdir <dir>``
      - Working directory inside the container.
    * - ``--container-name <name>``
@@ -119,8 +119,8 @@ never lets anything in your image lead that work onto the node itself:
   inside the image. With ``/lib -> usr/lib`` in the image, a mount on
   ``/lib/modules`` lands on the image's ``/usr/lib/modules``; an absolute link
   such as ``/data -> /scratch`` leads to the image's own ``/scratch``, never the
-  node's. ``/tmp`` and ``/etc``, where Spur writes the job's entry script and its
-  account and DNS files, are resolved the same way, so ``/tmp -> var/tmp`` works.
+  node's. ``/etc``, where Spur writes the container's account and DNS files, and
+  ``/.spur``, where it writes the job's entry script, are resolved the same way.
 - The container refuses to start when the image's ``/dev``, ``/proc``, ``/sys``
   or ``/run`` is a link, or when ``/etc/passwd`` or ``/etc/group`` is a link or
   anything but a regular file, such as a FIFO or a device node.
@@ -129,6 +129,104 @@ never lets anything in your image lead that work onto the node itself:
   ``/etc/passwd``.
 - The image's ``/etc/resolv.conf`` is replaced with the node's DNS settings,
   even when the image ships it as a link.
+
+Container Mounts
+----------------
+
+Each mount takes one of these forms:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Form
+     - Mounts
+   * - ``<src>:<dst>``
+     - The host path ``<src>`` at ``<dst>``. ``<src>`` must be an absolute path.
+       On a native node it must exist; Kubernetes partitions differ, see below.
+   * - ``tmpfs:<dst>``
+     - An empty in-memory filesystem at ``<dst>``, writable by every user in the
+       container unless it is ``:ro``. Add ``:size=<n>`` to cap it, in bytes or
+       with a ``K``, ``M`` or ``G`` suffix in powers of 1024, either case
+       (``tmpfs:/cache:size=8G``). Without a size, a native node uses the
+       kernel's default of half the node's memory; on Kubernetes the volume
+       counts against the pod's memory limit. Its contents are gone when the
+       container exits. ``tmpfs:/tmp`` gives the job a private ``/tmp``.
+   * - ``pvc:<claim>:<dst>``
+     - A PersistentVolumeClaim, on Kubernetes partitions only.
+
+Append ``:ro`` to any form for read-only, or ``:rw`` to say read-write
+explicitly. ``<dst>`` must be an absolute path other than ``/`` and
+``/.spur``, which holds the job's entry script, and it cannot contain ``..``.
+A destination whose last part is a ``size=`` option, such as ``tmpfs:/size=1G``,
+is an error rather than a mount at a folder named ``size=1G``. Two mounts cannot
+share a destination, however it is spelled, and one request holds at most 64
+mounts. These two commands are the same:
+
+.. code-block:: bash
+
+   sbatch --container-image=/images/pytorch.sqsh \
+          --container-mounts=/data:/data:ro,/scratch:/scratch,tmpfs:/cache:size=8G \
+          train.sh
+
+   sbatch --container-image=/images/pytorch.sqsh \
+          --container-mounts=/data:/data:ro \
+          --container-mounts=/scratch:/scratch \
+          --container-mounts=tmpfs:/cache:size=8G \
+          train.sh
+
+A comma always separates two mounts, so a path that contains a comma cannot be
+mounted. An empty value, such as ``--container-mounts=$MOUNTS`` with ``MOUNTS``
+unset, means no mounts.
+
+A mount Spur cannot read is rejected when the job is submitted or the ``srun``
+step is created, and the error names it. That covers an unknown flag, a relative
+source or destination, an empty entry in a list, ``ro`` with ``rw``, a
+destination with ``..`` in it, more than 64 mounts, and a reserved or repeated
+destination. Mounts are only checked when the job or step
+has a container image, since they are not used otherwise. The SpurJob
+``volumes`` field takes the same forms and is checked the same way.
+
+During a rolling upgrade, a ``tmpfs:`` mount is only applied by a spurd that
+supports it. A job that asks for one stays pending until every node it was
+placed on has been upgraded, and an ``srun`` step that asks for one is refused on
+a node that has not.
+
+A destination the image turns into ``/.spur`` or a folder above it, for example
+through a link, is refused when the container starts, so a mount can never hide
+the job's entry script.
+
+On a native node, a bind source that does not exist fails the job or step. The
+reason, naming the mount, is in the node agent's log, so ask your cluster
+administrator if the job's output does not explain the failure. A ``pvc:`` mount
+on a native node is refused at launch: the job stays pending, is retried, and is
+held after repeated failures. Spur never drops a mount and runs the job without
+it.
+
+On Kubernetes partitions, a bind source that does not exist on the node is
+created as an empty directory, so a wrong source path gives the job an empty
+directory instead of an error.
+
+.. note::
+
+   Breaking change: these mounts used to be accepted, and were applied
+   differently or silently dropped. They are now rejected:
+
+   - an unknown flag such as ``:z``, or a third field other than ``ro`` or
+     ``rw`` (any third field containing ``ro``, such as ``:error``, used to make
+     a native mount read-only);
+   - a relative source path, or a destination that is relative, ``/``, under
+     ``/.spur``, contains ``..``, ends in a ``size=`` option, or is used by
+     another mount;
+   - more than 64 mounts in one request;
+   - an empty entry inside a list, such as ``a,,b`` or a trailing comma;
+   - a path containing a comma, which is now split into two mounts.
+
+   The SpurJob ``volumes`` field is checked the same way, so a volume with one
+   of these forms now fails the whole SpurJob at submit.
+
+   The job's entry script moved from ``/tmp`` to ``/.spur``, so a mount on
+   ``/tmp`` no longer hides it.
 
 Environment Inside the Container
 --------------------------------

@@ -136,6 +136,25 @@ pub fn is_root_trusted_dir(owner_uid: u32, mode: u32) -> bool {
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
+    /// Where the launching agent put the entry script inside the container. An agent from
+    /// before the script moved never sets it, and its supervisor reads `/tmp`.
+    #[serde(default)]
+    pub entry_script_dir: Option<String>,
+}
+
+impl ContainerLaunchConfig {
+    pub fn new(config: ContainerConfig, rootfs: PathBuf) -> Self {
+        Self {
+            config,
+            rootfs,
+            entry_script_dir: Some(spur_core::container_mount::ENTRY_SCRIPT_DIR.to_string()),
+        }
+    }
+
+    pub fn entry_script(&self, job_id: u32) -> String {
+        let dir = self.entry_script_dir.as_deref().unwrap_or("/tmp");
+        format!("{dir}/spur_job_{job_id}.sh")
+    }
 }
 
 /// Everything an agent needs to launch a job process on this node.
@@ -2549,7 +2568,7 @@ pub(crate) fn write_spool_scratch(
 pub(crate) fn job_spool_mount(dir: &ScratchDir) -> crate::container::BindMount {
     let path = dir.path().display().to_string();
     crate::container::BindMount {
-        source: path.clone(),
+        source: crate::container::MountFrom::Host(path.clone()),
         target: path,
         readonly: true,
     }
@@ -2753,18 +2772,16 @@ async fn launch_container_job(
                 "/bin/sh"
             };
             let c_shell = CString::new(shell).unwrap();
+            let script = ctn.entry_script(job_id);
             let exec_args: Vec<CString> = if let Some(ref ep) = entrypoint {
-                let cmd = format!("{} && {} /tmp/spur_job_{}.sh", ep, shell, job_id);
+                let cmd = format!("{} && {} {}", ep, shell, script);
                 vec![
                     c_shell.clone(),
                     CString::new("-c").unwrap(),
                     CString::new(cmd).unwrap(),
                 ]
             } else {
-                vec![
-                    c_shell.clone(),
-                    CString::new(format!("/tmp/spur_job_{}.sh", job_id)).unwrap(),
-                ]
+                vec![c_shell.clone(), CString::new(script).unwrap()]
             };
             let exec_arg_refs: Vec<&std::ffi::CStr> =
                 exec_args.iter().map(|s| s.as_c_str()).collect();
@@ -3346,6 +3363,33 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container_launch_json(extra: &str) -> String {
+        format!(
+            r#"{{"config":{{"image":"docker://img","uid":1000,"gid":1000,
+                "username":"u","home_dir":"/home/u"}},"rootfs":"/r"{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn a_launch_from_an_agent_before_the_script_moved_reads_it_from_tmp() {
+        let old_agent: ContainerLaunchConfig =
+            serde_json::from_str(&container_launch_json("")).expect("legacy launch config");
+        assert_eq!(old_agent.entry_script(83), "/tmp/spur_job_83.sh");
+
+        let new_agent: ContainerLaunchConfig =
+            serde_json::from_str(&container_launch_json(r#","entry_script_dir":"/.spur""#))
+                .expect("current launch config");
+        assert_eq!(new_agent.entry_script(83), "/.spur/spur_job_83.sh");
+    }
+
+    #[test]
+    fn a_new_launch_config_names_the_reserved_script_directory() {
+        let launch: ContainerLaunchConfig =
+            serde_json::from_str(&container_launch_json("")).expect("launch config");
+        let launch = ContainerLaunchConfig::new(launch.config, launch.rootfs);
+        assert_eq!(launch.entry_script(7), "/.spur/spur_job_7.sh");
+    }
 
     #[test]
     fn step_output_enospc_under_the_owned_root_is_a_node_fault() {
@@ -4364,7 +4408,10 @@ mod tests {
         let mount = job_spool_mount(&dir);
 
         let folder = root.path().display().to_string();
-        assert_eq!(mount.source, folder);
+        assert_eq!(
+            mount.source,
+            crate::container::MountFrom::Host(folder.clone())
+        );
         assert_eq!(
             mount.target, folder,
             "generated wrappers name their scripts by host path"

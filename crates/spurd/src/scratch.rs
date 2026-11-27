@@ -213,6 +213,36 @@ fn resolve_in_root(
     kind: MountPoint,
     mode: u32,
 ) -> io::Result<OwnedFd> {
+    walk_in_root(root, path, kind, mode).map(|(fd, _)| fd)
+}
+
+/// A directory's device and inode: the same for every name that reaches it.
+pub(crate) type DirId = (u64, u64);
+
+pub(crate) fn identity(fd: &impl AsFd) -> io::Result<DirId> {
+    let stat = fstat(fd)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+/// Every directory from `root` down to the one `path` names, resolved as
+/// [`open_mount_point`] resolves it. A mount on any of them hides what is beneath.
+pub(crate) fn dir_chain(root: &ScratchDir, path: &Path) -> io::Result<Vec<DirId>> {
+    let (fd, ancestors) = walk_in_root(root, path, MountPoint::Dir, 0o755)?;
+    let mut chain = vec![identity(root)?];
+    for dir in &ancestors {
+        chain.push(identity(dir)?);
+    }
+    chain.push(identity(&fd)?);
+    Ok(chain)
+}
+
+/// The resolved directory, and the directories walked through to reach it.
+fn walk_in_root(
+    root: &ScratchDir,
+    path: &Path,
+    kind: MountPoint,
+    mode: u32,
+) -> io::Result<(OwnedFd, Vec<ScratchDir>)> {
     let mut walked: Vec<ScratchDir> = Vec::new();
     let mut pending = steps(path);
     let mut links = 0;
@@ -238,12 +268,13 @@ fn resolve_in_root(
                 pending = expanded;
             }
             Ok(_) | Err(Errno::ENOENT) if last && kind == MountPoint::File => {
-                return open_file_mount_point(dir, &name);
+                let point = open_file_mount_point(dir, &name)?;
+                return Ok((point, walked));
             }
             Ok(_) | Err(Errno::ENOENT) => {
                 let subdir = dir.subdir(&name, if last { mode } else { 0o755 })?;
                 if last {
-                    return Ok(subdir.fd);
+                    return Ok((subdir.fd, walked));
                 }
                 walked.push(subdir);
             }
@@ -252,8 +283,8 @@ fn resolve_in_root(
     }
     match (kind, walked.pop()) {
         (MountPoint::File, _) => Err(Errno::EISDIR.into()),
-        (MountPoint::Dir, Some(dir)) => Ok(dir.fd),
-        (MountPoint::Dir, None) => root.fd.try_clone(),
+        (MountPoint::Dir, Some(dir)) => Ok((dir.fd, walked)),
+        (MountPoint::Dir, None) => Ok((root.fd.try_clone()?, walked)),
     }
 }
 

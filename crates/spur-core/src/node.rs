@@ -287,6 +287,10 @@ pub const CAP_SCRIPT_PLACEMENT: &str = "script-placement";
 /// reservation, so the CLI refuses a reservation partition instead.
 pub const CAP_RESERVATION_PARTITION: &str = "reservation-partition";
 
+/// Agent capability: the agent applies `tmpfs:` container mounts. An older agent drops
+/// the entry, so a job that asks for one is kept off it.
+pub const CAP_CONTAINER_TMPFS: &str = "container-tmpfs";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 

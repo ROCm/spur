@@ -80,7 +80,8 @@ pub struct SpurJobSpec {
     #[serde(default)]
     pub account: Option<String>,
 
-    /// Volume mounts: "/src:/dst:ro" for hostPath or "pvc:claim-name:/dst" for PVCs.
+    /// Volume mounts in the --container-mounts forms: "/src:/dst[:ro]" for hostPath,
+    /// "tmpfs:/dst[:size=64M]" for memory, "pvc:claim-name:/dst" for PVCs; an entry may hold a comma list.
     #[serde(default)]
     pub volumes: Vec<String>,
 

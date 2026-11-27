@@ -233,7 +233,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_image")]
     pub container_image: Option<String>,
 
-    /// Container bind mounts ("/src:/dst:ro")
+    /// Container mounts, repeatable or comma-separated ("/src:/dst:ro", "tmpfs:/dst:size=1G")
     #[arg(long)]
     pub container_mounts: Vec<String>,
 
@@ -1688,6 +1688,16 @@ echo "hello world"
             &["sbatch", "--container-mounts=/b:/b"],
         );
         assert_eq!(args.container_mounts, vec!["/a:/a", "/b:/b"]);
+    }
+
+    // The controller splits the list; the CLI must hand it over whole.
+    #[test]
+    fn a_comma_mount_list_stays_one_value_from_both_sources() {
+        let args = parse_merged(
+            &["--container-mounts=/a:/a,/b:/b"],
+            &["sbatch", "--container-mounts", "/c:/c,tmpfs:/d"],
+        );
+        assert_eq!(args.container_mounts, vec!["/a:/a,/b:/b", "/c:/c,tmpfs:/d"]);
     }
 
     #[test]
