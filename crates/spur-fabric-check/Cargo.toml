@@ -1,0 +1,23 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "spur-fabric-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Per-node RDMA fabric health check for use as a Spur [[health.checks]] program"
+
+[[bin]]
+name = "spur-fabric-check"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
