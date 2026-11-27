@@ -74,6 +74,15 @@ impl RaftInternal for RaftInternalService {
         Ok(Response::new(RaftResponse { payload }))
     }
 
+    async fn capabilities(
+        &self,
+        _request: Request<RaftRequest>,
+    ) -> Result<Response<RaftResponse>, Status> {
+        let payload = serde_json::to_vec(crate::raft::RAFT_CAPABILITIES)
+            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+        Ok(Response::new(RaftResponse { payload }))
+    }
+
     async fn install_snapshot(
         &self,
         request: Request<RaftRequest>,
@@ -146,6 +155,13 @@ mod tests {
             Ok(Response::new(RaftResponse {
                 payload: Vec::new(),
             }))
+        }
+
+        async fn capabilities(
+            &self,
+            _request: Request<RaftRequest>,
+        ) -> Result<Response<RaftResponse>, Status> {
+            Err(Status::unimplemented("capabilities"))
         }
 
         async fn install_snapshot(
