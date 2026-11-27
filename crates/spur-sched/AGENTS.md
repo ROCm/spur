@@ -42,9 +42,8 @@ per-node ledger on each agent (spurd). Changes to it are agent-side behavior cha
   `cpu_is_heterogeneous`. A wrong selection silently over- or under-allocates.
 - The k0s gate is in `matches()`, not `eligible()`, and `matches_ignoring_k0s()` exists so the
   pending-reason classifier can say "would match if not k0s-reserved". Likewise
-  `eligible()` excludes K8s virtual nodes for batch jobs (`needs_native_nodes()`), and
-  `eligible_on_any_agent()` omits that check so the classifier can tell when K8s nodes alone
-  would have fit.
+  `eligible_on_any_agent()` omits the batch-job K8s exclusion so the classifier can tell when
+  K8s nodes alone would have fit.
 - Node filtering also drops agents that would misplace a job's batch script
   (`without_misplacing_agents()`, `None` when an additive `--nodelist` names one). Semantics:
   `docs/knowledge/execution/job-execution.md` (script placement).

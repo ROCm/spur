@@ -28,7 +28,8 @@ agent auth in `docs/knowledge/security/auth-model.md`. This file covers spurd-lo
   `LaunchAcceptance` or fencing anything, so a refused request leaves the previous run and the
   credential untouched.
 - `JobLifecycle` serializes setup/teardown per job ID. Without it a re-dispatch races the
-  previous run's cgroup/spool cleanup, since those paths are reused.- Jobs run as process-group leaders; signals go to the whole group (`killpg`), not just the
+  previous run's cgroup/spool cleanup, since those paths are reused.
+- Jobs run as process-group leaders; signals go to the whole group (`killpg`), not just the
   tracked PID.
 - `AllocationOnly` (a companion node's slice with no user code) must NOT be PID-namespaced:
   as PID 1 its unhandled signals are dropped by the kernel.
