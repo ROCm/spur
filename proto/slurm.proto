@@ -1287,6 +1287,15 @@ message RunningJobStatus {
   repeated uint64 gpu_stable_ids = 4;
   // The run this node holds, so a reclaim can target it alone. 0 from an old agent.
   uint32 run_attempt = 5;
+  // Present only when this agent read the job cgroup. Absent, rather than zero,
+  // on an older agent or a job with no cgroup, so a scrape does not publish a
+  // series for a sample that was never taken.
+  optional uint64 cpu_usage_usec = 6;
+  optional uint64 rss_bytes = 7;
+  optional uint64 virtual_bytes = 8;
+  optional uint64 swap_bytes = 9;
+  optional uint64 disk_read_bytes = 10;
+  optional uint64 disk_write_bytes = 11;
 }
 
 message HeartbeatResponse {
