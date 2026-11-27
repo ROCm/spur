@@ -14,7 +14,11 @@ spurctld/spurd control plane.
 .. note::
 
    This feature is gated on ``[cluster].enabled``. With it off (the default),
-   spurd never touches systemd or k0s, and nothing here applies.
+   spurd never touches systemd or k0s, and nothing here applies. ``spurctld``
+   reads it once, at startup: a controller started with it off refuses
+   ``spur k8s up`` and ``add-nodes``, and ``down`` while any node holds a k0s
+   role. Changing it takes a ``spurctld``
+   restart on every controller; ``scontrol reconfigure`` does not apply it.
 
 Overview
 --------
