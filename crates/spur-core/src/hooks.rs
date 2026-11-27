@@ -16,6 +16,7 @@ use crate::spur_env::SpurEnv;
 pub type JobId = u32;
 
 /// Context passed to prolog/epilog hook scripts via environment variables.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HookContext {
     pub job_id: JobId,
     pub work_dir: String,
@@ -84,13 +85,13 @@ pub fn bounded_hook_ceiling(timeout: Duration) -> Duration {
 }
 
 struct HookBound {
-    timeout: Duration,
+    timeout: Option<Duration>,
     kill_grace: Duration,
     group_token: String,
 }
 
 impl HookBound {
-    fn new(timeout: Duration, kill_grace: Duration) -> Self {
+    fn new(timeout: Option<Duration>, kill_grace: Duration) -> Self {
         use rand::RngExt;
         let token: u128 = rand::rng().random();
         Self {
@@ -119,7 +120,18 @@ pub async fn run_hook_bounded(
     timeout: Duration,
     on_spawn: impl FnOnce(u32, &str),
 ) -> anyhow::Result<()> {
-    let bound = HookBound::new(timeout, HOOK_KILL_GRACE);
+    let bound = HookBound::new(Some(timeout), HOOK_KILL_GRACE);
+    run_hook_with(script_path, ctx, Some(bound), on_spawn).await
+}
+
+/// [`run_hook`] in its own process group, which `on_spawn` receives as for
+/// [`run_hook_bounded`], with no time limit.
+pub async fn run_hook_grouped(
+    script_path: &str,
+    ctx: &HookContext,
+    on_spawn: impl FnOnce(u32, &str),
+) -> anyhow::Result<()> {
+    let bound = HookBound::new(None, HOOK_KILL_GRACE);
     run_hook_with(script_path, ctx, Some(bound), on_spawn).await
 }
 
@@ -165,11 +177,17 @@ async fn run_hook_with(
 
     let incomplete = || format!("{} script failed to complete", ctx.script_context);
     let status = match bound {
-        None => Some(child.wait().await.with_context(incomplete)?),
-        Some(bound) => match tokio::time::timeout(bound.timeout, child.wait()).await {
+        None | Some(HookBound { timeout: None, .. }) => {
+            Some(child.wait().await.with_context(incomplete)?)
+        }
+        Some(HookBound {
+            timeout: Some(timeout),
+            kill_grace,
+            ..
+        }) => match tokio::time::timeout(timeout, child.wait()).await {
             Ok(status) => Some(status.with_context(incomplete)?),
             Err(_) => {
-                terminate_hook_group(pid, bound.kill_grace, &mut child).await;
+                terminate_hook_group(pid, kill_grace, &mut child).await;
                 None
             }
         },
@@ -952,6 +970,28 @@ mod tests {
 
     #[tokio::test]
     #[serial(run_hooks)]
+    async fn a_grouped_hook_leads_its_own_group_and_carries_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("token");
+        let script = make_script(&format!(
+            "printf %s \"${}\" > {}",
+            HOOK_GROUP_TOKEN_ENV,
+            seen.display()
+        ));
+        let reported = std::cell::RefCell::new(None);
+        run_hook_grouped(script.to_str().unwrap(), &test_ctx(), |pid, token| {
+            let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)));
+            *reported.borrow_mut() = Some((pid, pgid, token.to_string()));
+        })
+        .await
+        .unwrap();
+        let (pid, pgid, token) = reported.take().expect("on_spawn must receive the pid");
+        assert_eq!(pgid.unwrap().as_raw(), pid as i32);
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), token);
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
     async fn bounded_hook_failure_is_not_reported_as_a_timeout() {
         let script = make_script("exit 3");
         let err = run_hook_bounded(
@@ -998,7 +1038,7 @@ mod tests {
             "trap '' TERM\nsleep 300 &\necho $! > {}\nwait",
             pidfile.display()
         ));
-        let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
+        let bound = HookBound::new(Some(Duration::from_secs(1)), Duration::from_millis(100));
         let err = run_hook_with(
             script.to_str().unwrap(),
             &test_ctx(),
@@ -1022,7 +1062,7 @@ mod tests {
             "setsid sleep 60 &\necho $! > {}\nwait",
             pidfile.display()
         ));
-        let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
+        let bound = HookBound::new(Some(Duration::from_secs(1)), Duration::from_millis(100));
         let err = run_hook_with(
             script.to_str().unwrap(),
             &test_ctx(),

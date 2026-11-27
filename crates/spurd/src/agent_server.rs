@@ -42,6 +42,7 @@ use spur_core::task_launch::{
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
+use crate::launch_record::{LaunchPhase, LaunchRecord, LaunchRecords};
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
@@ -3133,7 +3134,14 @@ async fn quarantine_expired_cleanup(
             continue;
         }
         if !record.quarantine_acknowledged {
-            if !report_node_quarantine(controller_addr, reporting_node, node_token).await {
+            if !report_node_quarantine(
+                controller_addr,
+                reporting_node,
+                node_token,
+                crate::cgroup_cleanup::DRAIN_REASON,
+            )
+            .await
+            {
                 break;
             }
             cleanup.acknowledge_quarantine(&record)?;
@@ -3213,6 +3221,7 @@ async fn report_node_quarantine(
     controller_addr: &str,
     reporting_node: &str,
     node_token: &str,
+    drain_reason: &str,
 ) -> bool {
     let result = retry_controller_rpc(|_| async {
         let channel = spur_client::connect_channel(controller_addr)
@@ -3227,7 +3236,7 @@ async fn report_node_quarantine(
                 state: spur_core::job::JobState::Completed.to_proto_i32(),
                 reporting_node: reporting_node.to_owned(),
                 drain_node: true,
-                drain_reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+                drain_reason: drain_reason.to_owned(),
                 node_token: node_token.to_owned(),
                 ..Default::default()
             })
@@ -3236,7 +3245,7 @@ async fn report_node_quarantine(
     })
     .await;
     if let Err(error) = &result {
-        warn!(%error, "could not confirm node quarantine for pending cleanup");
+        warn!(%error, drain_reason, "could not confirm node quarantine");
     }
     result.is_ok()
 }
@@ -4583,6 +4592,8 @@ pub struct AgentService {
     interactive_launch_steps: Arc<Mutex<HashMap<(u32, u32), u32>>>,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
+    launch_holds: LaunchHolds,
+    pending_quarantines: PendingQuarantines,
     /// Serializes launches that would land on one supervisor session.
     step_launches: crate::job_lifecycle::StepLaunchLifecycle,
     /// GPUs launching steps have taken before their supervisor's descriptor holds them.
@@ -4731,6 +4742,8 @@ impl AgentService {
             live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
             interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
+            launch_holds: LaunchHolds::default(),
+            pending_quarantines: PendingQuarantines::default(),
             step_launches: crate::job_lifecycle::StepLaunchLifecycle::default(),
             pending_step_shares: crate::step_resources::PendingStepShares::default(),
             step_claims: crate::step_resources::StepClaims::default(),
@@ -5649,6 +5662,7 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let launch_holds = self.launch_holds.clone();
         let reporter = self.reporter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -5716,7 +5730,11 @@ impl AgentService {
                 // can't race a committing launch.
                 {
                     let jobs = running.lock().await;
-                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                    reconcile_orphaned_allocations(
+                        &jobs,
+                        &launch_holds,
+                        &mut *allocation.lock().await,
+                    );
                 }
 
                 run_completion_hooks_and_report(
@@ -5747,9 +5765,11 @@ const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
 fn reconcile_orphaned_allocations(
     running: &HashMap<u32, TrackedJob>,
+    launch_holds: &LaunchHolds,
     allocation: &mut NodeAllocation,
 ) {
-    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+    let mut live = launch_holds.job_ids();
+    live.extend(running.keys().copied());
     let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
     if !reclaimed.is_empty() {
         warn!(
@@ -5803,6 +5823,356 @@ impl Drop for LaunchReservationGuard {
         }
     }
 }
+
+/// Launch attempts whose reservation only the launch may release: from prolog
+/// entry until a supervisor owns the job or the epilog undoing the prolog exits.
+/// Another job given those GPUs earlier would have its state removed by that
+/// epilog. Each entry records whether a cancel arrived meanwhile.
+#[derive(Clone, Default)]
+struct LaunchHolds(Arc<std::sync::Mutex<HashMap<(u32, u32), bool>>>);
+
+impl LaunchHolds {
+    fn begin(&self, job_id: u32, run_attempt: u32) -> LaunchHold {
+        self.entries().insert((job_id, run_attempt), false);
+        LaunchHold {
+            holds: self.clone(),
+            key: (job_id, run_attempt),
+        }
+    }
+
+    /// Leaves a held attempt's release to its launch; false when nothing holds it.
+    fn defer_cancel(&self, job_id: u32, run_attempt: u32) -> bool {
+        match self.entries().get_mut(&(job_id, run_attempt)) {
+            Some(cancelled) => {
+                *cancelled = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn job_ids(&self) -> std::collections::HashSet<u32> {
+        self.entries().keys().map(|(job_id, _)| *job_id).collect()
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<(u32, u32), bool>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct LaunchHold {
+    holds: LaunchHolds,
+    key: (u32, u32),
+}
+
+impl LaunchHold {
+    fn cancelled(&self) -> bool {
+        self.holds
+            .entries()
+            .get(&self.key)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Ends the hold and reports whether a cancel was deferred to it, in one
+    /// step so a cancel cannot land between the check and the release.
+    fn finish(self) -> bool {
+        self.holds.entries().remove(&self.key).unwrap_or(false)
+    }
+}
+
+impl Drop for LaunchHold {
+    fn drop(&mut self) {
+        self.holds.entries().remove(&self.key);
+    }
+}
+
+/// What a launch owes the node once its prolog ran and until a supervisor owns
+/// the job: the epilog, before the reservation and job id are given up. Dropped
+/// unhanded, as a dropped handler drops it, it still runs that epilog detached.
+struct LaunchCleanup(Option<LaunchCleanupParts>);
+
+type PrologTask = tokio::task::JoinHandle<(anyhow::Result<()>, spur_core::hooks::HookContext)>;
+
+struct LaunchCleanupParts {
+    reservation: LaunchReservationGuard,
+    lifecycle: crate::job_lifecycle::KeyedLifecycleGuard<u32>,
+    hold: Option<LaunchHold>,
+    prolog: Option<PrologTask>,
+    epilog: Option<String>,
+    epilog_ctx: Option<spur_core::hooks::HookContext>,
+    epilog_timeout: std::time::Duration,
+    reporter: Arc<NodeReporter>,
+    records: LaunchRecords,
+    /// On disk while an epilog is owed, so a restarted agent still runs it.
+    record: Option<LaunchRecord>,
+    pending_quarantines: PendingQuarantines,
+}
+
+/// Failed-launch epilogs whose node quarantine the controller has not yet
+/// acknowledged; the node takes no new work meanwhile.
+#[derive(Clone, Default)]
+struct PendingQuarantines(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PendingQuarantines {
+    fn begin(&self) -> PendingQuarantine {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PendingQuarantine(self.0.clone())
+    }
+
+    fn any(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+
+struct PendingQuarantine(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PendingQuarantine {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn save_launch_record(records: &LaunchRecords, record: &LaunchRecord) {
+    if let Err(error) = records.write(record) {
+        warn!(
+            job_id = record.job_id,
+            run_attempt = record.run_attempt,
+            %error,
+            "cannot record a launch's hold; a restart would forget the epilog it owes"
+        );
+    }
+}
+
+fn forget_launch_record(records: &LaunchRecords, job_id: u32, run_attempt: u32) {
+    if let Err(error) = records.remove(job_id, run_attempt) {
+        warn!(job_id, run_attempt, %error, "cannot remove a launch's hold record");
+    }
+}
+
+/// A job's newer attempt superseded its older ones, whose records only a
+/// failed removal left behind.
+fn newest_attempt_per_job(
+    recovered: Vec<LaunchRecord>,
+    records: &LaunchRecords,
+) -> Vec<LaunchRecord> {
+    let mut newest: HashMap<u32, LaunchRecord> = HashMap::new();
+    for record in recovered {
+        let superseded = match newest.get(&record.job_id) {
+            Some(kept) if kept.run_attempt >= record.run_attempt => record,
+            _ => match newest.insert(record.job_id, record) {
+                Some(older) => older,
+                None => continue,
+            },
+        };
+        forget_launch_record(records, superseded.job_id, superseded.run_attempt);
+    }
+    newest.into_values().collect()
+}
+
+fn epilog_context(prolog_ctx: spur_core::hooks::HookContext) -> spur_core::hooks::HookContext {
+    spur_core::hooks::HookContext {
+        script_context: "epilog_slurmd".into(),
+        ..prolog_ctx
+    }
+}
+
+/// An epilog is owed only once the prolog exited zero; a failed prolog is the
+/// controller's to handle with a drain.
+async fn await_prolog(task: PrologTask) -> anyhow::Result<spur_core::hooks::HookContext> {
+    let (result, ctx) = task.await?;
+    result.map(|()| ctx)
+}
+
+impl LaunchCleanup {
+    /// Runs the prolog in a task this cleanup owns: a handler dropped meanwhile
+    /// leaves it to finish, then the epilog to undo it, before anything is released.
+    async fn run_prolog(
+        &mut self,
+        prolog: String,
+        ctx: spur_core::hooks::HookContext,
+        allocated: &AllocationResult,
+    ) -> anyhow::Result<()> {
+        let Some(parts) = self.0.as_mut() else {
+            anyhow::bail!("launch cleanup already finished");
+        };
+        if parts.epilog.is_some() {
+            let record = parts.record.insert(LaunchRecord {
+                job_id: parts.reservation.job_id,
+                run_attempt: parts.reservation.run_attempt,
+                cpu_ids: allocated.cpu_ids.clone(),
+                memory_mb: allocated.memory_mb,
+                gpu_ids: allocated.gpu_ids.clone(),
+                prolog_ctx: ctx.clone(),
+                phase: LaunchPhase::Prolog { hook: None },
+            });
+            save_launch_record(&parts.records, record);
+        }
+        let on_spawn = parts.on_hook_spawn(|hook| LaunchPhase::Prolog { hook: Some(hook) });
+        let task = parts.prolog.insert(tokio::spawn(async move {
+            let result = spur_core::hooks::run_hook_grouped(&prolog, &ctx, on_spawn).await;
+            (result, ctx)
+        }));
+        let outcome = task.await;
+        parts.prolog = None;
+        let (result, ctx) = outcome?;
+        result?;
+        parts.epilog_ctx = Some(epilog_context(ctx));
+        Ok(())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0
+            .as_ref()
+            .and_then(|parts| parts.hold.as_ref())
+            .is_some_and(LaunchHold::cancelled)
+    }
+
+    /// Runs the epilog, if one is owed, and releases what the launch held.
+    async fn fail(mut self) {
+        if let Some(task) = self.start_teardown() {
+            if let Err(error) = task.await {
+                error!(%error, "failed-launch teardown task did not finish");
+            }
+        }
+    }
+
+    /// The supervisor now owns the job's teardown. Returns the reservation and
+    /// job id for the launch to commit, and whether a cancel arrived meanwhile.
+    fn hand_off(
+        mut self,
+    ) -> (
+        LaunchReservationGuard,
+        crate::job_lifecycle::KeyedLifecycleGuard<u32>,
+        bool,
+    ) {
+        let parts = self
+            .0
+            .take()
+            .expect("a launch cleanup is handed off at most once");
+        if let Some(record) = &parts.record {
+            forget_launch_record(&parts.records, record.job_id, record.run_attempt);
+        }
+        let cancelled = parts.hold.is_some_and(LaunchHold::finish);
+        (parts.reservation, parts.lifecycle, cancelled)
+    }
+
+    fn start_teardown(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let mut parts = self.0.take()?;
+        let prolog = parts.prolog.take();
+        let owed = parts.epilog.is_some() && parts.epilog_ctx.is_some();
+        if prolog.is_none() && !owed {
+            parts.release();
+            return None;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            parts.release();
+            return None;
+        };
+        Some(runtime.spawn(async move {
+            if let Some(task) = prolog {
+                parts.epilog_ctx = await_prolog(task).await.ok().map(epilog_context);
+            }
+            parts.run_epilog().await;
+            parts.release();
+        }))
+    }
+}
+
+impl LaunchCleanupParts {
+    /// Runs the epilog if the prolog left one owed. A failure quarantines the
+    /// node, returning only once the controller has acknowledged it.
+    async fn run_epilog(&mut self) {
+        let (Some(epilog), Some(ctx)) = (self.epilog.take(), self.epilog_ctx.take()) else {
+            return;
+        };
+        self.enter_phase(LaunchPhase::Epilog { hook: None });
+        let on_spawn = self.on_hook_spawn(|hook| LaunchPhase::Epilog { hook: Some(hook) });
+        let result =
+            spur_core::hooks::run_hook_bounded(&epilog, &ctx, self.epilog_timeout, on_spawn).await;
+        let Err(e) = result else {
+            return;
+        };
+        error!(job_id = ctx.job_id, error = %e, "epilog hook failed after a failed launch — quarantining node");
+        let pending = self.pending_quarantines.begin();
+        self.quarantine(pending).await;
+    }
+
+    async fn finish_recovered(mut self, pending: Option<PendingQuarantine>) {
+        match pending {
+            Some(pending) => self.quarantine(pending).await,
+            None => self.run_epilog().await,
+        }
+        self.release();
+    }
+
+    /// Returns once the controller has acknowledged the quarantine; `_pending`
+    /// keeps new work off the node until then.
+    async fn quarantine(&mut self, _pending: PendingQuarantine) {
+        self.enter_phase(LaunchPhase::QuarantinePending);
+        while !report_node_quarantine(
+            &self.reporter.controller_addr,
+            &self.reporter.hostname,
+            &self.reporter.node_token(),
+            EPILOG_FAILED_DRAIN_REASON,
+        )
+        .await
+        {
+            tokio::time::sleep(FAILED_LAUNCH_QUARANTINE_RETRY).await;
+        }
+    }
+
+    fn enter_phase(&mut self, phase: LaunchPhase) {
+        if let Some(record) = self.record.as_mut() {
+            record.phase = phase;
+            save_launch_record(&self.records, record);
+        }
+    }
+
+    /// Records a spawned hook's group, so a restarted agent can stop it.
+    fn on_hook_spawn(
+        &self,
+        phase: fn(crate::teardown_lease::HookProcess) -> LaunchPhase,
+    ) -> impl FnOnce(u32, &str) + Send + 'static {
+        let records = self.records.clone();
+        let record = self.record.clone();
+        move |pid, group_token| {
+            let Some(mut record) = record else {
+                return;
+            };
+            record.phase = phase(crate::teardown_lease::HookProcess {
+                pid,
+                group_token: group_token.to_string(),
+            });
+            save_launch_record(&records, &record);
+        }
+    }
+
+    /// The record goes first: a restart after it must not run the epilog
+    /// against resources a new job may already hold. The reservation goes
+    /// before the hold, so a cancel that finds the hold gone finds nothing
+    /// left to release, and the job id goes last.
+    fn release(self) {
+        if let Some(record) = &self.record {
+            forget_launch_record(&self.records, record.job_id, record.run_attempt);
+        }
+        drop(self.reservation);
+        drop(self.hold);
+        drop(self.lifecycle);
+    }
+}
+
+impl Drop for LaunchCleanup {
+    fn drop(&mut self) {
+        self.start_teardown();
+    }
+}
+
+/// Between rounds of asking the controller to quarantine a node whose
+/// failed-launch epilog failed; each round already retries the RPC.
+const FAILED_LAUNCH_QUARANTINE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 use spur_proto::controller_rpc_retryable;
 
@@ -7232,7 +7602,7 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
-        let mut reservation_guard =
+        let reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
 
         let injection = {
@@ -7256,6 +7626,7 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
+        let mut cleanup = self.launch_cleanup(reservation_guard, lifecycle);
         if let Some(ref prolog) = self.hooks.prolog {
             let ctx = spur_core::hooks::HookContext {
                 job_id,
@@ -7269,7 +7640,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
             };
-            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+            if let Err(e) = cleanup.run_prolog(prolog.clone(), ctx, &alloc_result).await {
                 // No completion report and no self-drain: the controller owns
                 // both decisions here, because only it can pair the drain with
                 // the hold that stops the job walking the cluster.
@@ -7287,8 +7658,15 @@ impl SlurmAgent for AgentService {
 
         if let Some(plan) = pmix_plan.as_ref() {
             if pmix_per_local_rank_env.is_none() {
-                mpi_plugin::apply_pmix_setup_fork_env(&self.mpi_host, plan, task_offset, &mut env)
-                    .map_err(Status::failed_precondition)?;
+                if let Err(e) = mpi_plugin::apply_pmix_setup_fork_env(
+                    &self.mpi_host,
+                    plan,
+                    task_offset,
+                    &mut env,
+                ) {
+                    cleanup.fail().await;
+                    return Err(Status::failed_precondition(e));
+                }
             }
         }
 
@@ -7329,6 +7707,7 @@ impl SlurmAgent for AgentService {
                     None
                 }
                 AllocationCgroup::Refuse(reason) => {
+                    cleanup.fail().await;
                     return Err(Status::resource_exhausted(format!(
                         "cgroup setup failed for pty job: {reason}"
                     )));
@@ -7346,6 +7725,7 @@ impl SlurmAgent for AgentService {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
+                    cleanup.fail().await;
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -7419,6 +7799,16 @@ impl SlurmAgent for AgentService {
         let admission = self
             .admit_step_launch(job_id, run_attempt, launch_step)
             .await;
+        if cleanup.cancelled() {
+            cleanup.fail().await;
+            return Ok(Response::new(LaunchJobResponse {
+                success: false,
+                error: "job cancelled before its launch".into(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+            }));
+        }
 
         let launch_result = if stepd_enabled {
             launch_stepd(
@@ -7470,6 +7860,7 @@ impl SlurmAgent for AgentService {
 
         match launch_result {
             Ok((mut result, runtime_descriptor)) => {
+                let (mut reservation_guard, lifecycle) = self.hand_off_launch(cleanup).await;
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
 
                 // Claim the stepd slot before committing anything
@@ -7639,7 +8030,8 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                // reservation_guard releases the allocation and PMI on this return.
+                // reservation_guard releases the allocation and PMI once the failed
+                // launch's teardown below ends.
                 let failure_kind = match e {
                     executor::LaunchError::PrologFailed(_) => {
                         LaunchFailureKind::LaunchFailureProlog
@@ -7649,6 +8041,7 @@ impl SlurmAgent for AgentService {
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
                 self.drain_on_node_fault(&e, job_id);
+                cleanup.fail().await;
 
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
@@ -7872,7 +8265,9 @@ impl SlurmAgent for AgentService {
         if !jobs.contains_key(&job_id) {
             // `pre_cancel_attempt` already checked the ledger; `None` means
             // anything found now landed during the signal call and is not ours.
-            if let Some(attempt) = pre_cancel_attempt {
+            let releasable = pre_cancel_attempt
+                .filter(|&attempt| !self.launch_holds.defer_cancel(job_id, attempt));
+            if let Some(attempt) = releasable {
                 self.allocation.lock().await.release_job_if(job_id, attempt);
             }
         }
@@ -8183,7 +8578,7 @@ impl SlurmAgent for AgentService {
         self.require_spec_enforced().await?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
-        let _lifecycle = self.lifecycle.acquire(req.job_id).await;
+        let lifecycle = self.lifecycle.acquire(req.job_id).await;
         #[cfg(test)]
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
@@ -8300,7 +8695,7 @@ impl SlurmAgent for AgentService {
         };
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
-        let mut reservation_guard =
+        let reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), req.job_id, req.run_attempt);
 
         // This allocation launches nothing, so its cgroup has to be created
@@ -8349,6 +8744,7 @@ impl SlurmAgent for AgentService {
         // — once per allocation on the node, before the extern stepd (and thus
         // any step workload) starts. Pairs with the node Epilog the extern
         // stepd runs on teardown (owns_job_lifetime(STEP_EXTERN)).
+        let mut cleanup = self.launch_cleanup(reservation_guard, lifecycle);
         if let Some(ref prolog) = self.hooks.prolog {
             let ctx = spur_core::hooks::HookContext {
                 job_id: req.job_id,
@@ -8362,7 +8758,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
             };
-            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+            if let Err(e) = cleanup.run_prolog(prolog.clone(), ctx, &alloc_result).await {
                 error!(job_id = req.job_id, error = %e, "prolog hook failed before srun allocation");
                 // Release what the allocation set up so a failed prolog does not
                 // strand the cgroup; the reservation guard releases on return.
@@ -8381,7 +8777,7 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let runtime_descriptor = if supervise_allocation {
+        let (runtime_descriptor, mut reservation_guard, _lifecycle) = if supervise_allocation {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
                 run_attempt: req.run_attempt,
@@ -8424,7 +8820,14 @@ impl SlurmAgent for AgentService {
             let admission = self
                 .admit_step_launch(req.job_id, req.run_attempt, spur_core::step::STEP_EXTERN)
                 .await;
-            let (_, mut descriptor) = launch_stepd(
+            if cleanup.cancelled() {
+                cleanup.fail().await;
+                return Err(Status::aborted(format!(
+                    "job {} was cancelled before its allocation started",
+                    req.job_id
+                )));
+            }
+            let launched = launch_stepd(
                 &config,
                 req.run_attempt,
                 &self.reporter.controller_addr,
@@ -8446,11 +8849,18 @@ impl SlurmAgent for AgentService {
                 },
                 &admission,
             )
-            .await
-            .map_err(|error| {
-                self.drain_on_node_fault(&error, req.job_id);
-                Status::unavailable(format!("failed to start allocation stepd: {error}"))
-            })?;
+            .await;
+            let mut descriptor = match launched {
+                Ok((_, descriptor)) => descriptor,
+                Err(error) => {
+                    self.drain_on_node_fault(&error, req.job_id);
+                    cleanup.fail().await;
+                    return Err(Status::unavailable(format!(
+                        "failed to start allocation stepd: {error}"
+                    )));
+                }
+            };
+            let (reservation_guard, lifecycle) = self.hand_off_launch(cleanup).await;
 
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
@@ -8481,9 +8891,10 @@ impl SlurmAgent for AgentService {
                     req.job_id
                 )));
             }
-            true
+            (true, reservation_guard, lifecycle)
         } else {
-            false
+            let (reservation_guard, lifecycle) = self.hand_off_launch(cleanup).await;
+            (false, reservation_guard, lifecycle)
         };
 
         let mut jobs = self.running.lock().await;
@@ -10822,6 +11233,12 @@ impl AgentService {
     }
 
     fn ensure_node_cleanup_ready(&self) -> Result<(), Status> {
+        if self.pending_quarantines.any() {
+            warn!("refusing new work until the controller quarantines this node after a failed epilog");
+            return Err(Status::resource_exhausted(
+                "node is waiting to be drained after a failed epilog",
+            ));
+        }
         crate::stepd::StepdStore::new(&self.stepd_state_dir)
             .ensure_cleanup_ready()
             .map_err(|error| {
@@ -10840,6 +11257,134 @@ impl AgentService {
                 request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
             });
         }
+    }
+
+    /// Takes over a launch's reservation and job id at prolog entry; with a
+    /// prolog configured, the reservation is held against cancel and reclaim
+    /// from here until the launch hands it to a supervisor or tears it down.
+    fn launch_cleanup(
+        &self,
+        reservation: LaunchReservationGuard,
+        lifecycle: crate::job_lifecycle::KeyedLifecycleGuard<u32>,
+    ) -> LaunchCleanup {
+        let hold = self.hooks.prolog.is_some().then(|| {
+            self.launch_holds
+                .begin(reservation.job_id, reservation.run_attempt)
+        });
+        LaunchCleanup(Some(LaunchCleanupParts {
+            reservation,
+            lifecycle,
+            hold,
+            prolog: None,
+            epilog: self.hooks.epilog.clone(),
+            epilog_ctx: None,
+            epilog_timeout: self.hooks.epilog_timeout(),
+            reporter: self.reporter.clone(),
+            records: LaunchRecords::new(&self.stepd_state_dir),
+            record: None,
+            pending_quarantines: self.pending_quarantines.clone(),
+        }))
+    }
+
+    /// Takes back what a previous agent's launches still held between prolog
+    /// entry and a supervisor: their resources and job ids are held again, a
+    /// hook it left running is killed, and the epilog runs again, or the
+    /// pending quarantine is retried, before anything is released. Runs before
+    /// the agent serves, after the adopted supervisors are replayed.
+    pub async fn recover_launch_holds(&self) {
+        let records = LaunchRecords::new(&self.stepd_state_dir);
+        let recovered = match records.load() {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                error!(%error, "cannot read launch hold records; their epilogs are not rerun");
+                return;
+            }
+        };
+        for record in newest_attempt_per_job(recovered, &records) {
+            let (job_id, run_attempt) = (record.job_id, record.run_attempt);
+            if self.supervisor_adopted(job_id, run_attempt).await {
+                forget_launch_record(&records, job_id, run_attempt);
+                continue;
+            }
+            if let Some(hook) = record.phase.hook() {
+                if crate::teardown_lease::kill_orphaned_hook(hook) {
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        pid = hook.pid,
+                        "killed a hook the previous agent left running"
+                    );
+                }
+            }
+            let restored = self.allocation.lock().await.restore_for_job(
+                job_id,
+                run_attempt,
+                &record.cpu_ids,
+                record.memory_mb,
+                &record.gpu_ids,
+            );
+            // An epilog run without the resources held could undo another job's state.
+            if let Err(error) = &restored {
+                error!(
+                    job_id,
+                    run_attempt,
+                    ?error,
+                    "cannot hold a recovered launch's resources again; quarantining instead of rerunning its epilog"
+                );
+            }
+            let pending = (record.phase == LaunchPhase::QuarantinePending || restored.is_err())
+                .then(|| self.pending_quarantines.begin());
+            let parts = LaunchCleanupParts {
+                reservation: LaunchReservationGuard::new(
+                    self.allocation.clone(),
+                    job_id,
+                    run_attempt,
+                ),
+                lifecycle: self.lifecycle.acquire(job_id).await,
+                hold: Some(self.launch_holds.begin(job_id, run_attempt)),
+                prolog: None,
+                epilog: self.hooks.epilog.clone(),
+                epilog_ctx: Some(epilog_context(record.prolog_ctx.clone())),
+                epilog_timeout: self.hooks.epilog_timeout(),
+                reporter: self.reporter.clone(),
+                records: records.clone(),
+                record: Some(record),
+                pending_quarantines: self.pending_quarantines.clone(),
+            };
+            info!(
+                job_id,
+                run_attempt, "finishing a launch's teardown the previous agent left owed"
+            );
+            tokio::spawn(parts.finish_recovered(pending));
+        }
+    }
+
+    async fn supervisor_adopted(&self, job_id: u32, run_attempt: u32) -> bool {
+        self.stepds
+            .lock()
+            .await
+            .values()
+            .any(|session| session.job_id == job_id && session.run_attempt >= run_attempt)
+    }
+
+    /// Gives a started launch back its reservation and job id. A cancel the
+    /// hold deferred is applied now, so the commit finds the reservation gone,
+    /// the same as a cancel landing mid-launch without a prolog.
+    async fn hand_off_launch(
+        &self,
+        cleanup: LaunchCleanup,
+    ) -> (
+        LaunchReservationGuard,
+        crate::job_lifecycle::KeyedLifecycleGuard<u32>,
+    ) {
+        let (reservation, lifecycle, cancelled) = cleanup.hand_off();
+        if cancelled {
+            self.allocation
+                .lock()
+                .await
+                .release_job_if(reservation.job_id, reservation.run_attempt);
+        }
+        (reservation, lifecycle)
     }
 
     fn write_step_script(
@@ -11085,7 +11630,8 @@ impl AgentService {
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
-        let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+        let mut live: std::collections::HashSet<u32> = running.keys().copied().collect();
+        live.extend(self.launch_holds.job_ids());
 
         let mut alloc = self.allocation.lock().await;
 
@@ -17448,6 +17994,722 @@ mod tests {
         );
     }
 
+    /// Written by a child process onto a fresh inode: a write handle held here
+    /// could be inherited by a process another test is forking, and executing
+    /// the script would then fail with ETXTBSY.
+    fn hook_script(body: &str) -> tempfile::TempPath {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        std::fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\\n' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                "sh",
+            ])
+            .arg(format!("#!/bin/bash\n{body}"))
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "writing the hook script failed: {status}");
+        path
+    }
+
+    fn shell_path(path: &std::path::Path) -> String {
+        shlex::try_quote(path.to_str().unwrap())
+            .unwrap()
+            .into_owned()
+    }
+
+    fn recording_hook_script(target: &std::path::Path) -> tempfile::TempPath {
+        hook_script(&format!(
+            "echo \"$SPUR_SCRIPT_CONTEXT $SPUR_JOB_ID\" >> {}",
+            shell_path(target)
+        ))
+    }
+
+    /// A hook that creates `<name>.started`, then waits until the test creates
+    /// `<name>.release`; it also stops once `dir` is gone, so a failed test
+    /// leaves no hook behind.
+    fn blocking_hook(
+        dir: &std::path::Path,
+        name: &str,
+    ) -> (tempfile::TempPath, [std::path::PathBuf; 2]) {
+        let markers = [
+            dir.join(format!("{name}.started")),
+            dir.join(format!("{name}.release")),
+        ];
+        let script = hook_script(&format!(
+            "touch {started}\nwhile [ ! -e {release} ] && [ -d {dir} ]; do sleep 0.01; done",
+            started = shell_path(&markers[0]),
+            release = shell_path(&markers[1]),
+            dir = shell_path(dir),
+        ));
+        (script, markers)
+    }
+
+    async fn file_appears(path: &std::path::Path) {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits for `ready`, failing rather than hanging if the launch returns first.
+    async fn before_launch_returns<T: std::fmt::Debug>(
+        launch: &mut tokio::task::JoinHandle<T>,
+        ready: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::select! {
+            () = ready => {}
+            outcome = launch => panic!("the launch returned first: {outcome:?}"),
+        }
+    }
+
+    /// An agent whose supervised launch of `job_id`'s `step_id` fails right after
+    /// its prolog: a file where the step's session directory goes stops any start.
+    fn agent_failing_after_prolog(
+        reporter: Arc<NodeReporter>,
+        [prolog, epilog]: &[tempfile::TempPath; 2],
+        state_dir: &std::path::Path,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+    ) -> AgentService {
+        let session = crate::stepd::StepdStore::new(state_dir)
+            .claim_session_dir(job_id, 0, step_id)
+            .unwrap();
+        std::fs::remove_dir(&session).unwrap();
+        std::fs::write(&session, b"").unwrap();
+        AgentService::new(
+            reporter,
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                epilog: Some(epilog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_supervised_launch()
+        .with_runtime_state_dir(state_dir)
+    }
+
+    fn register_one_cpu(job_id: u32) -> Request<RegisterJobAllocationRequest> {
+        Request::new(RegisterJobAllocationRequest {
+            job_id,
+            cpus: 1,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_fails_after_the_prolog_runs_the_epilog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let hooks = [
+            recording_hook_script(&record),
+            recording_hook_script(&record),
+        ];
+        let svc = agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            77,
+            spur_core::step::STEP_BATCH,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 77,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "unlaunched".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a failed launch is a launch outcome")
+            .into_inner();
+
+        assert!(!resp.success, "the launch must fail: {resp:?}");
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "prolog_slurmd 77\nepilog_slurmd 77\n",
+            "what the prolog set up must be undone when no job came to own it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_srun_allocation_that_fails_after_the_prolog_runs_the_epilog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let hooks = [
+            recording_hook_script(&record),
+            recording_hook_script(&record),
+        ];
+        let svc = agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            78,
+            spur_core::step::STEP_EXTERN,
+        );
+
+        svc.register_job_allocation(register_one_cpu(78))
+            .await
+            .expect_err("the allocation's supervisor cannot start");
+
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "prolog_slurmd 78\nepilog_slurmd 78\n",
+            "what the prolog set up must be undone when no allocation came to own it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_leaves_a_failed_launch_reserved_until_its_epilog_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epilog, [started, release]) = blocking_hook(dir.path(), "epilog");
+        let hooks = [hook_script("exit 0"), epilog];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            79,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(79)).await }
+        });
+        before_launch_returns(&mut launch, file_appears(&started)).await;
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 79,
+            signal: 9,
+            run_attempt: 0,
+            kill_wait_secs: 0,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(79),
+            Some(0),
+            "another job must not get these resources while the epilog still runs"
+        );
+
+        std::fs::write(&release, b"").unwrap();
+        launch
+            .await
+            .unwrap()
+            .expect_err("the allocation's supervisor cannot start");
+        assert_eq!(svc.allocation.lock().await.owner_attempt(79), None);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_launch_handler_still_finishes_its_epilog_before_releasing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epilog, [started, release]) = blocking_hook(dir.path(), "epilog");
+        let hooks = [hook_script("exit 0"), epilog];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            80,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(80)).await }
+        });
+        before_launch_returns(&mut launch, file_appears(&started)).await;
+
+        launch.abort();
+        assert!(launch.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(80),
+            Some(0),
+            "dropping the handler must neither stop the epilog nor free its resources"
+        );
+
+        std::fs::write(&release, b"").unwrap();
+        // The teardown releases the reservation before it gives up the job id.
+        let _lifecycle = svc.lifecycle.acquire(80).await;
+        assert_eq!(svc.allocation.lock().await.owner_attempt(80), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_epilog_failure_quarantines_the_node_before_releasing() {
+        let (controller, reports, drains, gate) = spawn_gated_mock_controller();
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = [hook_script("exit 0"), hook_script("exit 1")];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter_with_controller(&controller),
+            &hooks,
+            dir.path(),
+            81,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(81)).await }
+        });
+
+        before_launch_returns(&mut launch, gate.started.notified()).await;
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(81),
+            Some(0),
+            "the node must stay fenced locally until the controller confirms its quarantine"
+        );
+        let report = reports.lock().unwrap()[0].clone();
+        assert_eq!(
+            (
+                report.job_id,
+                report.drain_node,
+                report.reporting_node.as_str()
+            ),
+            (0, true, "test-node")
+        );
+        assert_eq!(report.drain_reason, EPILOG_FAILED_DRAIN_REASON);
+        assert!(
+            svc.ensure_node_cleanup_ready().is_err(),
+            "no new work may land before the controller has drained the node"
+        );
+
+        gate.release.notify_one();
+        launch
+            .await
+            .unwrap()
+            .expect_err("the allocation's supervisor cannot start");
+        assert_eq!(svc.allocation.lock().await.owner_attempt(81), None);
+        assert!(svc.ensure_node_cleanup_ready().is_ok());
+        assert!(
+            drains.requests.lock().unwrap().is_empty(),
+            "the admin-only drain RPC is not how an agent quarantines itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_prolog_keeps_the_reservation_until_the_epilog_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prolog, [prolog_started, prolog_release]) = blocking_hook(dir.path(), "prolog");
+        let (epilog, [epilog_started, epilog_release]) = blocking_hook(dir.path(), "epilog");
+        let hooks = [prolog, epilog];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            82,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(82)).await }
+        });
+        before_launch_returns(&mut launch, file_appears(&prolog_started)).await;
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 82,
+            signal: 9,
+            run_attempt: 0,
+            kill_wait_secs: 0,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(82),
+            Some(0),
+            "another job must not get these resources while the prolog still runs"
+        );
+
+        std::fs::write(&prolog_release, b"").unwrap();
+        before_launch_returns(&mut launch, file_appears(&epilog_started)).await;
+        assert_eq!(svc.allocation.lock().await.owner_attempt(82), Some(0));
+
+        std::fs::write(&epilog_release, b"").unwrap();
+        let error = launch
+            .await
+            .unwrap()
+            .expect_err("a cancelled allocation does not start");
+        assert!(
+            error.message().contains("cancelled"),
+            "the cancel, not the launch, must stop the allocation: {error:?}"
+        );
+        assert_eq!(svc.allocation.lock().await.owner_attempt(82), None);
+    }
+
+    #[tokio::test]
+    async fn a_handler_dropped_before_its_supervisor_starts_still_runs_the_epilog() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let hooks = [
+            recording_hook_script(&record),
+            recording_hook_script(&record),
+        ];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            83,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let session = (83, 0, spur_core::step::STEP_EXTERN);
+        let slot = svc.step_launches.acquire(session).await;
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(83)).await }
+        });
+        before_launch_returns(&mut launch, async {
+            while !svc.step_launches.has_waiter(&session) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        launch.abort();
+        assert!(launch.await.unwrap_err().is_cancelled());
+        drop(slot);
+        // The teardown releases the reservation before it gives up the job id.
+        let _lifecycle = svc.lifecycle.acquire(83).await;
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "prolog_slurmd 83\nepilog_slurmd 83\n",
+            "a handler dropped after the prolog still owes the node its epilog"
+        );
+        assert_eq!(svc.allocation.lock().await.owner_attempt(83), None);
+    }
+
+    #[tokio::test]
+    async fn a_handler_dropped_during_the_prolog_keeps_the_reservation_until_the_epilog_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("hooks");
+        let (prolog, [started, release]) = blocking_hook(dir.path(), "prolog");
+        let hooks = [prolog, recording_hook_script(&record)];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            84,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(84)).await }
+        });
+        before_launch_returns(&mut launch, file_appears(&started)).await;
+
+        launch.abort();
+        assert!(launch.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(84),
+            Some(0),
+            "another job must not get these resources while the prolog still runs"
+        );
+
+        std::fs::write(&release, b"").unwrap();
+        // The teardown releases the reservation before it gives up the job id.
+        let _lifecycle = svc.lifecycle.acquire(84).await;
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "epilog_slurmd 84\n",
+            "the prolog a dropped handler left running must still be undone"
+        );
+        assert_eq!(svc.allocation.lock().await.owner_attempt(84), None);
+    }
+
+    fn launch_record(job_id: u32, phase: LaunchPhase) -> LaunchRecord {
+        LaunchRecord {
+            job_id,
+            run_attempt: 1,
+            cpu_ids: vec![0],
+            memory_mb: 0,
+            gpu_ids: Vec::new(),
+            prolog_ctx: spur_core::hooks::HookContext {
+                job_id,
+                work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                uid: nix::unistd::getuid().as_raw(),
+                gid: nix::unistd::getgid().as_raw(),
+                partition: String::new(),
+                nodelist: String::new(),
+                script_context: "prolog_slurmd".into(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+            },
+            phase,
+        }
+    }
+
+    /// A process group like a hook's, left behind by an agent that died.
+    fn leftover_hook() -> (std::process::Child, crate::teardown_lease::HookProcess) {
+        use std::os::unix::process::CommandExt;
+        let token = "a-leftover-hooks-token";
+        let leader = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 300"])
+            .env(spur_core::hooks::HOOK_GROUP_TOKEN_ENV, token)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let hook = crate::teardown_lease::HookProcess {
+            pid: leader.id(),
+            group_token: token.into(),
+        };
+        (leader, hook)
+    }
+
+    fn agent_after_restart(
+        reporter: Arc<NodeReporter>,
+        epilog: &std::path::Path,
+        state_dir: &std::path::Path,
+    ) -> AgentService {
+        AgentService::new(
+            reporter,
+            HooksConfig {
+                epilog: Some(epilog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir)
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_keeps_its_epilog_on_record_until_it_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epilog, [started, release]) = blocking_hook(dir.path(), "epilog");
+        let hooks = [hook_script("exit 0"), epilog];
+        let svc = Arc::new(agent_failing_after_prolog(
+            test_reporter(),
+            &hooks,
+            dir.path(),
+            85,
+            spur_core::step::STEP_EXTERN,
+        ));
+        let mut launch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.register_job_allocation(register_one_cpu(85)).await }
+        });
+        before_launch_returns(&mut launch, file_appears(&started)).await;
+
+        let records = LaunchRecords::new(dir.path());
+        let recorded = records.load().unwrap();
+        let [record] = recorded.as_slice() else {
+            panic!("one launch must be on record: {recorded:?}");
+        };
+        assert_eq!((record.job_id, record.run_attempt), (85, 0));
+        let Some(hook) = record.phase.hook() else {
+            panic!("the running epilog's group must be recorded: {record:?}");
+        };
+        assert!(
+            matches!(record.phase, LaunchPhase::Epilog { .. })
+                && crate::teardown_lease::is_the_hooks_group(hook).unwrap(),
+            "a restarted agent must be able to find the running epilog: {record:?}"
+        );
+
+        std::fs::write(&release, b"").unwrap();
+        launch
+            .await
+            .unwrap()
+            .expect_err("the allocation's supervisor cannot start");
+        assert_eq!(records.load().unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_restarted_agent_kills_the_leftover_epilog_and_reruns_it_before_releasing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epilog, [started, release]) = blocking_hook(dir.path(), "epilog");
+        let (mut leftover, hook) = leftover_hook();
+        let records = LaunchRecords::new(dir.path());
+        records
+            .write(&launch_record(86, LaunchPhase::Epilog { hook: Some(hook) }))
+            .unwrap();
+        let svc = agent_after_restart(test_reporter(), &epilog, dir.path());
+
+        svc.recover_launch_holds().await;
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&leftover.wait().unwrap()),
+            Some(libc::SIGKILL),
+            "the old agent's epilog must not outlive the restart"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(86),
+            Some(1),
+            "no new job may get these resources before the epilog runs again"
+        );
+        assert!(
+            svc.ensure_node_cleanup_ready().is_ok(),
+            "only a pending quarantine refuses new work"
+        );
+
+        file_appears(&started).await;
+        assert_eq!(svc.allocation.lock().await.owner_attempt(86), Some(1));
+        std::fs::write(&release, b"").unwrap();
+        // The teardown releases the reservation before it gives up the job id.
+        let _lifecycle = svc.lifecycle.acquire(86).await;
+        assert_eq!(svc.allocation.lock().await.owner_attempt(86), None);
+        assert_eq!(records.load().unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_restarted_agent_takes_no_work_until_its_pending_quarantine_is_acknowledged() {
+        let (controller, reports, _drains, gate) = spawn_gated_mock_controller();
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("hooks");
+        let epilog = recording_hook_script(&ran);
+        LaunchRecords::new(dir.path())
+            .write(&launch_record(87, LaunchPhase::QuarantinePending))
+            .unwrap();
+        let svc = agent_after_restart(
+            test_reporter_with_controller(&controller),
+            &epilog,
+            dir.path(),
+        );
+
+        svc.recover_launch_holds().await;
+        let refused = svc
+            .ensure_node_cleanup_ready()
+            .expect_err("new work must wait for the controller's drain");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+
+        gate.started.notified().await;
+        let report = reports.lock().unwrap()[0].clone();
+        assert_eq!(
+            (report.job_id, report.drain_node),
+            (0, true),
+            "the quarantine the old agent owed must be reported again"
+        );
+        assert!(svc.ensure_node_cleanup_ready().is_err());
+        assert_eq!(svc.allocation.lock().await.owner_attempt(87), Some(1));
+
+        gate.release.notify_one();
+        let _lifecycle = svc.lifecycle.acquire(87).await;
+        assert!(svc.ensure_node_cleanup_ready().is_ok());
+        assert_eq!(svc.allocation.lock().await.owner_attempt(87), None);
+        assert!(
+            !ran.exists(),
+            "a failed epilog is not rerun once its quarantine was owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_agent_quarantines_rather_than_rerun_an_epilog_it_cannot_hold_resources_for(
+    ) {
+        let (controller, reports, _drains, gate) = spawn_gated_mock_controller();
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("hooks");
+        let epilog = recording_hook_script(&ran);
+        let mut unknown_gpu = launch_record(90, LaunchPhase::Epilog { hook: None });
+        unknown_gpu.gpu_ids = vec![5];
+        LaunchRecords::new(dir.path()).write(&unknown_gpu).unwrap();
+        let svc = agent_after_restart(
+            test_reporter_with_controller(&controller),
+            &epilog,
+            dir.path(),
+        );
+
+        svc.recover_launch_holds().await;
+        assert!(svc.ensure_node_cleanup_ready().is_err());
+        gate.started.notified().await;
+        assert!(reports.lock().unwrap()[0].drain_node);
+
+        gate.release.notify_one();
+        let _lifecycle = svc.lifecycle.acquire(90).await;
+        assert!(
+            !ran.exists(),
+            "an epilog must not run against resources the agent could not hold"
+        );
+        assert!(svc.ensure_node_cleanup_ready().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_restarted_agent_recovers_only_a_jobs_newest_attempt() {
+        let (controller, _reports, _drains, gate) = spawn_gated_mock_controller();
+        let dir = tempfile::tempdir().unwrap();
+        let epilog = hook_script("exit 0");
+        let records = LaunchRecords::new(dir.path());
+        let older = launch_record(91, LaunchPhase::QuarantinePending);
+        let newer = LaunchRecord {
+            run_attempt: 2,
+            ..older.clone()
+        };
+        records.write(&older).unwrap();
+        records.write(&newer).unwrap();
+        let svc = agent_after_restart(
+            test_reporter_with_controller(&controller),
+            &epilog,
+            dir.path(),
+        );
+
+        svc.recover_launch_holds().await;
+        assert_eq!(records.load().unwrap(), vec![newer]);
+        assert_eq!(svc.allocation.lock().await.owner_attempt(91), Some(2));
+
+        gate.started.notified().await;
+        gate.release.notify_one();
+        let _lifecycle = svc.lifecycle.acquire(91).await;
+        assert_eq!(records.load().unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_restarted_agent_leaves_a_launch_its_supervisor_took_over_to_that_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("hooks");
+        let epilog = recording_hook_script(&ran);
+        let records = LaunchRecords::new(dir.path());
+        records
+            .write(&launch_record(88, LaunchPhase::Prolog { hook: None }))
+            .unwrap();
+        let svc = agent_after_restart(test_reporter(), &epilog, dir.path());
+        svc.adopt_stepds(&[crate::stepd::StepdDescriptor::new(
+            88,
+            1,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        )])
+        .await;
+
+        svc.recover_launch_holds().await;
+        let _lifecycle = svc.lifecycle.acquire(88).await;
+        assert!(!ran.exists(), "the supervisor owns this job's epilog");
+        assert_eq!(records.load().unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_cannot_reclaim_the_gpus_of_a_recovered_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epilog, [started, release]) = blocking_hook(dir.path(), "epilog");
+        let mut recovered = launch_record(89, LaunchPhase::Epilog { hook: None });
+        recovered.gpu_ids = vec![0];
+        LaunchRecords::new(dir.path()).write(&recovered).unwrap();
+        let svc = agent_after_restart(test_reporter_with_gpus(&[0]), &epilog, dir.path());
+        svc.recover_launch_holds().await;
+        file_appears(&started).await;
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        };
+        let err = svc
+            .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0])))
+            .await
+            .expect_err("a recovered launch still in its epilog is not a stale owner");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(svc.allocation.lock().await.owner_attempt(89), Some(1));
+
+        std::fs::write(&release, b"").unwrap();
+        let _lifecycle = svc.lifecycle.acquire(89).await;
+        assert_eq!(svc.allocation.lock().await.owner_attempt(89), None);
+    }
+
     #[tokio::test]
     async fn exec_in_job_returns_without_deadlock() {
         let svc = AgentService::new(
@@ -21812,7 +23074,11 @@ mod tests {
 
         {
             let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+            reconcile_orphaned_allocations(
+                &jobs,
+                &svc.launch_holds,
+                &mut *svc.allocation.lock().await,
+            );
         }
 
         // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
@@ -21821,6 +23087,37 @@ mod tests {
             1,
             "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_spares_a_held_launch() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(3, 1, 2, 0, &[0]).unwrap();
+            alloc.commit_job(3, 1);
+        }
+        let reconcile = || async {
+            let jobs = svc.running.lock().await;
+            reconcile_orphaned_allocations(
+                &jobs,
+                &svc.launch_holds,
+                &mut *svc.allocation.lock().await,
+            );
+        };
+
+        let hold = svc.launch_holds.begin(3, 1);
+        reconcile().await;
+        assert_eq!(svc.free_gpu_count().await, 0);
+
+        drop(hold);
+        reconcile().await;
+        assert_eq!(svc.free_gpu_count().await, 1);
     }
 
     #[derive(Clone, Default)]
@@ -22244,7 +23541,11 @@ mod tests {
                 jobs.get(&55).expect("registered job").user,
                 "allocation-owner"
             );
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+            reconcile_orphaned_allocations(
+                &jobs,
+                &svc.launch_holds,
+                &mut *svc.allocation.lock().await,
+            );
         }
         assert_eq!(
             svc.free_gpu_count().await,

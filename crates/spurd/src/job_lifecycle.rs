@@ -55,6 +55,15 @@ impl<K: Eq + Hash + Clone> KeyedLifecycle<K> {
             held: Some(held),
         }
     }
+
+    /// Whether an acquire of `key` is queued behind its holder: the map, the
+    /// holder and each waiter all keep the entry alive.
+    #[cfg(test)]
+    pub(crate) fn has_waiter(&self, key: &K) -> bool {
+        lock_registry(&self.entries)
+            .get(key)
+            .is_some_and(|entry| Arc::strong_count(entry) > 2)
+    }
 }
 
 /// Poisoning means some holder panicked, not that the map is torn: it is only ever

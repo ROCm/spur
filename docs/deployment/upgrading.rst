@@ -1475,6 +1475,35 @@ Node inventory now lists every allocatable device, of every kind, in
   ``spur.amd.com/link-type`` CDI annotations are still written, so an older
   agent reads them, but are not read.
 
+Node epilog after a failed launch
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The node ``epilog`` now also runs when a launch fails after the node
+``prolog`` ran but before the job's supervisor started, before the agent
+reports the failure. Before, nothing undid the prolog for such a job, so
+whatever it wrote, such as the exporter label files in
+:doc:`/admin-guide/dme-integration`, stayed on the node. An epilog that
+assumes the job ran, for example one that reads the job's output, now also
+sees jobs that never started. It gets the same environment as the prolog.
+The job's resources on the node stay held until it exits, even if the job is
+cancelled meanwhile; if it fails, they stay held until the controller has
+drained the node, and the node refuses new work until then.
+
+When an ``epilog`` is configured, the agent keeps this obligation in
+``launch-holds/`` under its state directory, from the moment the ``prolog``
+starts. If ``spurd`` restarts before the job's supervisor started or the
+``epilog`` finished, the new agent holds the job's resources again before it
+serves, kills a ``prolog`` or ``epilog`` the old agent left running, and runs
+the ``epilog``, again if it had already started. An interrupted ``epilog``
+therefore can run twice for one job, so it must be safe to repeat. If the
+``epilog`` had already failed, or the job's resources cannot be held again, the
+new agent asks the controller to drain the node instead, and refuses new work
+until it does. The node ``prolog`` now runs in its
+own process group, and sees ``SPUR_HOOK_GROUP_TOKEN`` as the ``epilog`` does.
+
+A launch that fails after the supervisor started, and a supervisor the agent
+loses, still do not run the node ``epilog``.
+
 See Also
 --------
 
