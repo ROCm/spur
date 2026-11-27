@@ -1238,7 +1238,8 @@ class TestContainerMounts:
             (":error", "unknown flag 'error'"),
             (",/:/m/data", "another entry already mounts this destination"),
             (",tmpfs:size=1G", "destination must be an absolute path"),
-            ("=ro", "destination cannot contain '='"),
+            ("/../x", "destination cannot contain '..'"),
+            ("/size=1G", "destination looks like a size= option"),
             (",tmpfs:/.spur", "/.spur is reserved"),
         ],
         ids=[
@@ -1248,7 +1249,8 @@ class TestContainerMounts:
             "third-field-not-ro-or-rw",
             "repeated-destination",
             "option-in-place-of-destination",
-            "equals-in-destination",
+            "parent-directory-in-destination",
+            "size-option-as-destination",
             "entry-script-folder",
         ],
     )

@@ -157,10 +157,11 @@ Each mount takes one of these forms:
 
 Append ``:ro`` to any form for read-only, or ``:rw`` to say read-write
 explicitly. ``<dst>`` must be an absolute path other than ``/`` and
-``/.spur``, which holds the job's entry script. It cannot contain ``=``, so a
-misplaced option such as ``tmpfs:size=1G`` is an error rather than a mount at a
-folder named ``size=1G``. Two mounts cannot share a destination. These two
-commands are the same:
+``/.spur``, which holds the job's entry script, and it cannot contain ``..``.
+A destination whose last part is a ``size=`` option, such as ``tmpfs:/size=1G``,
+is an error rather than a mount at a folder named ``size=1G``. Two mounts cannot
+share a destination, however it is spelled, and one request holds at most 64
+mounts. These two commands are the same:
 
 .. code-block:: bash
 
@@ -180,10 +181,20 @@ unset, means no mounts.
 
 A mount Spur cannot read is rejected when the job is submitted or the ``srun``
 step is created, and the error names it. That covers an unknown flag, a relative
-source or destination, an empty entry in a list, ``ro`` with ``rw``, and a
-reserved or repeated destination. Mounts are only checked when the job or step
+source or destination, an empty entry in a list, ``ro`` with ``rw``, a
+destination with ``..`` in it, more than 64 mounts, and a reserved or repeated
+destination. Mounts are only checked when the job or step
 has a container image, since they are not used otherwise. The SpurJob
 ``volumes`` field takes the same forms and is checked the same way.
+
+During a rolling upgrade, a ``tmpfs:`` mount is only applied by a spurd that
+supports it. A job that asks for one stays pending until every node it was
+placed on has been upgraded, and an ``srun`` step that asks for one is refused on
+a node that has not.
+
+A destination the image turns into ``/.spur`` or a folder above it, for example
+through a link, is refused when the container starts, so a mount can never hide
+the job's entry script.
 
 On a native node, a bind source that does not exist fails the job or step. The
 reason, naming the mount, is in the node agent's log, so ask your cluster
@@ -205,7 +216,9 @@ directory instead of an error.
      ``rw`` (any third field containing ``ro``, such as ``:error``, used to make
      a native mount read-only);
    - a relative source path, or a destination that is relative, ``/``, under
-     ``/.spur``, contains ``=``, or is used by another mount;
+     ``/.spur``, contains ``..``, ends in a ``size=`` option, or is used by
+     another mount;
+   - more than 64 mounts in one request;
    - an empty entry inside a list, such as ``a,,b`` or a trailing comma;
    - a path containing a comma, which is now split into two mounts.
 

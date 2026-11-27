@@ -3,12 +3,16 @@
 
 //! The `--container-mounts` grammar, shared by the controller and both agents.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
 /// Where the native agent puts a container's entry script; a user mount here would hide it.
 pub const ENTRY_SCRIPT_DIR: &str = "/.spur";
+
+/// More mounts than any job needs; the cap keeps a hostile list from costing the controller time.
+pub const MAX_MOUNTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSource {
@@ -41,6 +45,12 @@ pub fn split(values: &[String]) -> Result<Vec<String>, MountSpecError> {
             if entry.is_empty() {
                 return Err(invalid(value, "empty entry in the mount list"));
             }
+            if specs.len() == MAX_MOUNTS {
+                return Err(invalid(
+                    entry,
+                    &format!("more than {MAX_MOUNTS} mounts in one request"),
+                ));
+            }
             specs.push(entry.to_string());
         }
     }
@@ -50,13 +60,10 @@ pub fn split(values: &[String]) -> Result<Vec<String>, MountSpecError> {
 /// Each entry with the spec it was parsed from, so an agent refusing one can quote it.
 pub fn parse_list(values: &[String]) -> Result<Vec<(String, MountSpec)>, MountSpecError> {
     let mut mounts: Vec<(String, MountSpec)> = Vec::new();
+    let mut targets: HashSet<PathBuf> = HashSet::new();
     for spec in split(values)? {
         let mount = parse(&spec)?;
-        let target = mount.target.trim_end_matches('/');
-        if mounts
-            .iter()
-            .any(|(_, m)| m.target.trim_end_matches('/') == target)
-        {
+        if !targets.insert(normalized(&mount.target)) {
             return Err(invalid(
                 &spec,
                 "another entry already mounts this destination",
@@ -65,6 +72,14 @@ pub fn parse_list(values: &[String]) -> Result<Vec<(String, MountSpec)>, MountSp
         mounts.push((spec, mount));
     }
     Ok(mounts)
+}
+
+/// Whether any entry asks for a tmpfs, which an agent older than the grammar cannot apply.
+pub fn wants_tmpfs(mounts: &[String]) -> bool {
+    mounts
+        .iter()
+        .flat_map(|value| value.split(','))
+        .any(|entry| entry.trim_start().starts_with("tmpfs:"))
 }
 
 /// The split list, each entry checked, in the form the agents receive.
@@ -104,20 +119,33 @@ fn check_target(spec: &str, target: &str) -> Result<(), MountSpecError> {
     if !target.starts_with('/') {
         return Err(invalid(spec, "destination must be an absolute path"));
     }
-    if target.contains('=') {
-        return Err(invalid(spec, "destination cannot contain '='"));
+    let path = Path::new(target);
+    if path.components().any(|c| c == Component::ParentDir) {
+        return Err(invalid(spec, "destination cannot contain '..'"));
     }
-    let target = target.trim_end_matches('/');
-    if target.is_empty() {
+    // An option typed where the destination goes, as in `tmpfs:/size=1G`.
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("size="))
+    {
+        return Err(invalid(spec, "destination looks like a size= option"));
+    }
+    let path = normalized(target);
+    if path == Path::new("/") {
         return Err(invalid(spec, "cannot mount over the container root"));
     }
-    if Path::new(target).starts_with(ENTRY_SCRIPT_DIR) {
+    if path.starts_with(ENTRY_SCRIPT_DIR) {
         return Err(invalid(
             spec,
             &format!("{ENTRY_SCRIPT_DIR} is reserved for the job's entry script"),
         ));
     }
     Ok(())
+}
+
+/// The destination with repeated and trailing slashes folded away.
+fn normalized(target: &str) -> PathBuf {
+    Path::new(target).components().collect()
 }
 
 fn apply_flags(spec: &str, mount: &mut MountSpec, flags: &[&str]) -> Result<(), MountSpecError> {
@@ -265,10 +293,78 @@ mod tests {
             "/src:/",
             "tmpfs://",
             "tmpfs:/size=1G",
-            "/src:/dst=ro",
+            "/src:/data/size=1G",
         ] {
             assert!(parse(spec).is_err(), "{spec} should be rejected");
         }
+    }
+
+    #[test]
+    fn an_equals_sign_in_a_destination_is_fine_unless_it_is_a_size_option() {
+        for spec in ["/src:/data/year=2024", "/src:/dst=ro", "tmpfs:/a=b"] {
+            assert!(parse(spec).is_ok(), "{spec} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_destination_cannot_climb_out_of_the_path_it_names() {
+        for spec in [
+            "tmpfs:/x/../.spur",
+            "tmpfs:/a/..",
+            "/src:/a/../data",
+            "/src:/..",
+            "tmpfs:/.spur/../x",
+        ] {
+            let err = parse(spec).unwrap_err().to_string();
+            assert!(err.contains("'..'"), "{spec} gave: {err}");
+        }
+    }
+
+    #[test]
+    fn spellings_of_one_destination_collide() {
+        for pair in [
+            ["/a:/data", "/b:/data/"],
+            ["/a:/data", "/b://data"],
+            ["/a:/data", "tmpfs:/data//"],
+        ] {
+            let err = mounts(&pair).unwrap_err().to_string();
+            assert!(err.contains("already mounts"), "{pair:?} gave: {err}");
+        }
+    }
+
+    #[test]
+    fn the_entry_script_directory_is_refused_however_it_is_spelled() {
+        for spec in [
+            "tmpfs:/.spur",
+            "tmpfs:/.spur/",
+            "tmpfs://.spur",
+            "tmpfs:/./.spur",
+            "/src:/.spur/job",
+        ] {
+            let err = parse(spec).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{spec} gave: {err}");
+        }
+    }
+
+    #[test]
+    fn a_request_holds_at_most_the_maximum_number_of_mounts() {
+        let full: Vec<String> = (0..MAX_MOUNTS).map(|i| format!("/s{i}:/d{i}")).collect();
+        assert_eq!(normalize(&[full.join(",")]).unwrap().len(), MAX_MOUNTS);
+
+        let over: Vec<String> = (0..=MAX_MOUNTS).map(|i| format!("/s{i}:/d{i}")).collect();
+        let err = normalize(&[over.join(",")]).unwrap_err();
+        assert_eq!(err.spec, format!("/s{MAX_MOUNTS}:/d{MAX_MOUNTS}"));
+        assert!(err.reason.contains("more than"), "{err}");
+        assert!(normalize(&over).is_err(), "a repeated flag counts the same");
+    }
+
+    #[test]
+    fn only_a_tmpfs_entry_asks_for_tmpfs() {
+        assert!(wants_tmpfs(&["/a:/b,tmpfs:/c".into()]));
+        assert!(wants_tmpfs(&["/a:/a".into(), " tmpfs:/c:size=1M".into()]));
+        assert!(!wants_tmpfs(&["/a:/b,pvc:claim:/c".into()]));
+        assert!(!wants_tmpfs(&["/tmpfs:/b".into()]));
+        assert!(!wants_tmpfs(&[]));
     }
 
     #[test]
