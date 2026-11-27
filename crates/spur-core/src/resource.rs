@@ -523,7 +523,7 @@ impl ResourceSet {
         }
         // Picks are simulated so typed and untyped keys of one gres cannot both
         // count the same free device.
-        let mut picked = allocated.clone();
+        let mut picked: HashMap<&str, HashSet<u64>> = HashMap::new();
         for (key, count) in request.devices_typed_first() {
             if !self.allocates_by_id(&key.gres_name) {
                 if self.free_pool_count(allocated, key) < u64::from(count) {
@@ -531,23 +531,19 @@ impl ResourceSet {
                 }
                 continue;
             }
-            let free =
-                self.available_device_ids(&picked, &key.gres_name, key.device_type.as_deref());
+            let free = self.free_device_ids(
+                allocated,
+                &key.gres_name,
+                key.device_type.as_deref(),
+                picked.get(key.gres_name.as_str()),
+            );
             if free.len() < count as usize {
                 return false;
             }
             picked
-                .devices
-                .entry(key.gres_name.clone())
+                .entry(key.gres_name.as_str())
                 .or_default()
-                .extend(
-                    free.into_iter()
-                        .take(count as usize)
-                        .map(|device_id| AllocatedDevice {
-                            device_id,
-                            count: 1,
-                        }),
-                );
+                .extend(free.into_iter().take(count as usize));
         }
         true
     }
@@ -575,9 +571,17 @@ impl ResourceSet {
     /// reported under another id, so none of this kind can be trusted free.
     fn holds(&self, allocated: &ResourceAllocations, gres_name: &str) -> Option<Holds> {
         let mut holds = Holds::default();
-        let known = |id: u64| self.devices_of(gres_name).any(|d| d.stable_id == id);
-        for held in allocated.devices.get(gres_name).into_iter().flatten() {
-            if known(held.device_id) {
+        let held_of_name = allocated
+            .devices
+            .get(gres_name)
+            .map_or(&[][..], Vec::as_slice);
+        let known: HashSet<u64> = if held_of_name.is_empty() {
+            HashSet::new()
+        } else {
+            self.devices_of(gres_name).map(|d| d.stable_id).collect()
+        };
+        for held in held_of_name {
+            if known.contains(&held.device_id) {
                 holds.by_id.insert(held.device_id);
                 holds.untyped += held.count.saturating_sub(1);
             } else if held.device_id == 0 && gres_name != crate::device::GPU_GRES {
@@ -603,9 +607,21 @@ impl ResourceSet {
         gres_name: &str,
         device_type: Option<&str>,
     ) -> Vec<u64> {
-        let Some(holds) = self.holds(allocated, gres_name) else {
+        self.free_device_ids(allocated, gres_name, device_type, None)
+    }
+
+    /// `available_device_ids` with `picked` also held, as a fit check's earlier picks are.
+    fn free_device_ids(
+        &self,
+        allocated: &ResourceAllocations,
+        gres_name: &str,
+        device_type: Option<&str>,
+        picked: Option<&HashSet<u64>>,
+    ) -> Vec<u64> {
+        let Some(mut holds) = self.holds(allocated, gres_name) else {
             return Vec::new();
         };
+        holds.by_id.extend(picked.into_iter().flatten().copied());
         let mut free_by_type: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
         for device in self.devices_of(gres_name) {
             if !holds.by_id.contains(&device.stable_id) {
@@ -632,13 +648,10 @@ impl ResourceSet {
             None | Some("any") => true,
             Some(t) => device.device_type == t,
         };
+        let free: HashSet<u64> = free_by_type.into_values().flatten().collect();
         self.devices_of(gres_name)
             .filter(wanted)
-            .filter(|d| {
-                free_by_type
-                    .get(d.device_type.as_str())
-                    .is_some_and(|free| free.contains(&d.stable_id))
-            })
+            .filter(|d| free.contains(&d.stable_id))
             .map(|d| d.stable_id)
             .take(total)
             .collect()
@@ -1781,6 +1794,42 @@ mod device_inventory_tests {
         );
         assert!(node.can_satisfy_with_allocated(&legacy("nic", 2), &nic_request(1, 0)));
         assert!(!node.can_satisfy_with_allocated(&legacy("nic", 2), &nic_request(2, 0)));
+    }
+
+    #[test]
+    fn a_cpx_node_counts_held_and_simulated_picks_once() {
+        let node = ResourceSet {
+            cpus: 256,
+            devices: (1..=64u64)
+                .map(|id| Device::gpu(id, if id <= 32 { "a" } else { "b" }, (id - 1) as u32))
+                .collect(),
+            ..Default::default()
+        };
+        let mut held = ResourceAllocations::default();
+        held.devices.insert(
+            GPU_GRES.to_string(),
+            (1..=8).map(AllocatedDevice::injectable).collect(),
+        );
+        let free = node.available_device_ids(&held, GPU_GRES, None);
+        assert_eq!(free.len(), 56);
+        assert!(free.iter().all(|id| *id > 8));
+        assert_eq!(
+            node.available_device_ids(&held, GPU_GRES, Some("a")).len(),
+            24
+        );
+
+        let fits = |typed: u32, untyped: u32| {
+            let mut request = ResourceRequest::with_scalar(1, 0);
+            request.add_devices(GPU_GRES, Some("a"), typed);
+            request.add_devices(GPU_GRES, None, untyped);
+            node.can_satisfy_with_allocated(&held, &request)
+        };
+        assert!(fits(24, 32));
+        assert!(
+            !fits(24, 33),
+            "typed picks are not counted again by the untyped key"
+        );
+        assert!(!fits(25, 0));
     }
 
     #[test]
