@@ -175,10 +175,11 @@ impl ClusterSupervisor {
 
     /// Render the unit file. Mirrors k0s's own installer directives (see module docs for why
     /// `Type=simple` / `KillMode=process` and not `notify` / `mixed`). A finite
-    /// `StartLimitIntervalSec`/`StartLimitBurst` bounds a hard crash-loop (a genuinely broken node
-    /// stops hammering every `RestartSec`); the reconcile supervisor is the higher-level recovery
-    /// authority and re-enables the unit on its next tick, so the limit adds backoff without a
-    /// permanent lockout.
+    /// `StartLimitIntervalSec`/`StartLimitBurst` in `[Unit]` (systemd ignores the interval in
+    /// `[Service]`) bounds a hard crash-loop (a genuinely broken node stops hammering every
+    /// `RestartSec`); the reconcile supervisor is the higher-level recovery authority and starts
+    /// the unit again once the interval ends, so the limit adds backoff without a permanent
+    /// lockout.
     fn render_unit(&self) -> String {
         let mut exec = format!(
             "{} {}",
@@ -202,13 +203,13 @@ impl ClusterSupervisor {
              ConditionFileIsExecutable={bin}\n\
              After=network-online.target\n\
              Wants=network-online.target\n\
+             StartLimitIntervalSec=300\n\
+             StartLimitBurst=5\n\
              \n\
              [Service]\n\
              ExecStart={exec}\n\
              Restart=always\n\
              RestartSec=10\n\
-             StartLimitIntervalSec=300\n\
-             StartLimitBurst=5\n\
              Delegate=yes\n\
              KillMode=process\n\
              LimitCORE=infinity\n\
@@ -1275,6 +1276,23 @@ mod tests {
         // k0s does not sd_notify: the unit must NOT be Type=notify (default simple is correct).
         assert!(!unit.contains("Type=notify"));
         assert_eq!(sup.unit_file_name(), "k0scontroller.service");
+    }
+
+    /// systemd ignores `StartLimitIntervalSec` in `[Service]` and keeps its 10 s default, which
+    /// `RestartSec=10` never reaches, so a crash loop would never stop.
+    #[test]
+    fn start_limit_is_in_the_unit_section() {
+        let unit = ClusterSupervisor::new(ClusterConfig {
+            role: ClusterRole::Worker,
+            k0s_binary: PathBuf::from("/usr/local/bin/k0s"),
+            k0s_config: None,
+            join_token_file: None,
+            node_ip: None,
+        })
+        .render_unit();
+        let (unit_section, _) = unit.split_once("[Service]").unwrap();
+        assert!(unit_section.contains("\nStartLimitIntervalSec=300\n"));
+        assert!(unit_section.contains("\nStartLimitBurst=5\n"));
     }
 
     #[test]
