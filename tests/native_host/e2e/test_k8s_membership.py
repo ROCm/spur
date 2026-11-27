@@ -16,6 +16,8 @@ from contextlib import contextmanager
 
 import pytest
 
+from cluster import assert_nodes_network, has_sudo
+
 logger = logging.getLogger(__name__)
 
 STRAY_UNIT = "/run/systemd/system/k0sworker.service"
@@ -32,6 +34,7 @@ def k8s_enabled_cluster(unstarted_cluster):
         unstarted_cluster.k8s_down(reset=True)
     except Exception:
         logger.warning("k8s_down during teardown failed", exc_info=True)
+    assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names)
 
 
 @pytest.fixture
@@ -45,8 +48,13 @@ def k8s_drift_cluster(unstarted_cluster):
     )
     yield unstarted_cluster
     # A teardown that does not converge must fail loudly: it leaves k0s behind for the next run.
-    unstarted_cluster.k8s_down(reset=True)
-    _wait_torn_down(unstarted_cluster)
+    errors = []
+    try:
+        unstarted_cluster.k8s_down(reset=True)
+        _wait_torn_down(unstarted_cluster)
+    except Exception as err:  # reported below, together with the network check
+        errors.append(err)
+    assert_nodes_network(unstarted_cluster.nodes, unstarted_cluster.node_names, errors)
 
 
 def _wait_torn_down(cluster, timeout: int = 180) -> None:
@@ -73,9 +81,7 @@ def stray_k0s_worker(cluster, node_index: int, spurd_owned: bool = False):
     `spurd_owned` gives the unit the description spurd writes, which makes it stoppable."""
     node, sudo = cluster.nodes[node_index], cluster._sudo_prefix()
     unit_head = "[Unit]\\nDescription=k0s k0sworker (managed by spurd)\\n" if spurd_owned else ""
-    try:
-        node.exec(f"{sudo}true")
-    except RuntimeError:
+    if not has_sudo(node, sudo):
         pytest.skip(f"a stray k0s unit needs sudo on {cluster.node_names[node_index]}")
     if "active" in node.exec_allow_fail("systemctl is-active k0sworker k0scontroller").split():
         pytest.skip(f"{cluster.node_names[node_index]} already runs a k0s unit")

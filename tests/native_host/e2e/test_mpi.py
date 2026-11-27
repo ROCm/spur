@@ -6,13 +6,14 @@
 import dataclasses
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
 
 from cluster import (
     SpurCluster,
+    SshConnectionLost,
     ensure_bins,
     job_state,
     make_remote_dir,
@@ -552,17 +553,32 @@ class TestMpiSoak:
             (["--mpi=pmix", "-N", "2", "-n", "4", hello_mpi], {0, 1, 2, 3}, 4),
         ]
 
-        def run_one(entry: tuple[list[str], set[int], int]) -> tuple[list[str], set[int], int, int, str]:
+        def run_one(
+            entry: tuple[list[str], set[int], int],
+        ) -> tuple[list[str], set[int], int, int | None, str]:
             args, expected_ranks, expected_size = entry
-            code, out = cluster.srun_with_exit(args)
+            try:
+                code, out = cluster.srun_with_exit(args, timeout=300)
+            except SshConnectionLost as err:
+                return args, expected_ranks, expected_size, None, f"SSH session lost: {err}"
             return args, expected_ranks, expected_size, code, out
 
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-            futures = [pool.submit(run_one, entry) for entry in wave]
-            for fut in as_completed(futures):
-                args, expected_ranks, expected_size, code, out = fut.result()
-                assert code == 0, f"srun {args} failed:\n{out}"
+            results = [fut.result() for fut in [pool.submit(run_one, e) for e in wave]]
+
+        # Every member's output is reported so one failure cannot hide another's.
+        failures = []
+        for args, expected_ranks, expected_size, code, out in results:
+            if code != 0:
+                failures.append(f"srun {args} exited {code}:\n{out}")
+                continue
+            try:
                 assert_mpi_ranks(out, expected_ranks, expected_size)
+            except AssertionError as exc:
+                failures.append(f"srun {args} rank check failed: {exc}")
+        assert not failures, (
+            f"{len(failures)}/{len(wave)} wave members failed:\n\n" + "\n\n".join(failures)
+        )
 
 
 @pytest.mark.mpi
@@ -879,6 +895,8 @@ class TestMpirunTestMatrix:
                 ["-j", str(job_id), "--format=JobID,State,ExitCode", "-n"]
             )
             assert str(job_id) in sacct_out, f"job {job_id} not in sacct:\n{sacct_out}"
+        except SshConnectionLost:
+            raise
         except RuntimeError:
             scontrol_out = cluster.cli(
                 ["scontrol", "show", "job", str(job_id)]
@@ -901,6 +919,8 @@ class TestMpirunGpuCollective:
             pytest.skip(f"RCCL needs distinct GPU per rank, found {gpus}")
         try:
             rccl_bin = cluster.compile_rccl_fixture("rccl_all_reduce.c")
+        except SshConnectionLost:
+            raise
         except Exception as e:
             pytest.skip(f"RCCL fixture build failed (no GPU toolchain?): {e}")
         code, out = cluster.srun_with_exit(
@@ -919,6 +939,8 @@ class TestMpirunGpuCollective:
             pytest.skip(f"RCCL needs distinct GPU per rank, found {gpus}")
         try:
             rccl_bin = cluster.compile_rccl_fixture("rccl_all_reduce.c")
+        except SshConnectionLost:
+            raise
         except Exception as e:
             pytest.skip(f"RCCL fixture build failed (no GPU toolchain?): {e}")
         out_path = f"{cluster.remote_dir}/rccl-g2.out"

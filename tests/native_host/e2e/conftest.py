@@ -7,6 +7,7 @@ Pytest configuration and fixtures for Spur native-host E2E tests.
 See docs/developer/building.rst for full environment variable reference.
 """
 
+import fnmatch
 import logging
 import os
 from pathlib import Path
@@ -16,11 +17,17 @@ import pytest
 from cluster import (
     HA_HEALTH_TICK_SECS,
     HA_HEARTBEAT_TIMEOUT_SECS,
+    SshConnectionLost,
     SshNode,
     SpurCluster,
     deep_merge,
     ensure_bins,
+    failure_diagnostic_sections,
+    live_clusters,
     make_remote_dir,
+    node_health_guard,
+    reset_k0s_all_nodes,
+    reset_k0s_and_assert_network,
 )
 from wg_cluster import MESH_CIDR, WG_IFACE, WgMesh, wg_available
 
@@ -33,28 +40,52 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # test; conftest auto-marks it `gpu` so CI can route it without a manual tag.
 _GPU_FIXTURES = frozenset({"gpu_cluster", "gpu_container_cluster"})
 
+# Fixtures whose teardown resets k0s, which can take a node's network down. The
+# k8s_*cluster family is matched by pattern; these three have other names.
+_K0S_FIXTURES = frozenset({"k0s_native_cluster", "wg_k0s_cluster", "wg_login_cluster"})
+_K0S_FIXTURE_PATTERN = "k8s_*cluster"
+
+
+def _uses_k0s_fixture(fixturenames) -> bool:
+    return any(
+        name in _K0S_FIXTURES or fnmatch.fnmatchcase(name, _K0S_FIXTURE_PATTERN)
+        for name in fixturenames
+    )
+
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "mpi: MPI end-to-end tests requiring spur_mpi_pmix.so, libpmix, and mpicc",
     )
-    config.addinivalue_line(
-        "markers",
-        "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
-    )
-    config.addinivalue_line(
-        "markers",
-        "gpu: requires GPU hardware on the nodes (auto-applied to tests using GPU fixtures)",
-    )
 
 
-# tryfirst so the marker lands before pytest's built-in `-m` deselection runs.
+# tryfirst so the markers land before pytest's built-in `-m` deselection runs and
+# before the root conftest's trylast sharding and k0s-last ordering.
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     for item in items:
-        if _GPU_FIXTURES.intersection(getattr(item, "fixturenames", ())):
+        fixturenames = getattr(item, "fixturenames", ())
+        if _GPU_FIXTURES.intersection(fixturenames):
             item.add_marker("gpu")
+        if _uses_k0s_fixture(fixturenames):
+            item.add_marker("k0s")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not report.failed:
+        return
+    # A failing test must keep its own failure, so a broken collector is shown as
+    # a section instead of raised.
+    try:
+        report.sections.extend(failure_diagnostic_sections(
+            report.when, report.failed, live_clusters(), item.funcargs.get("ssh_nodes"),
+            k0s=item.get_closest_marker("k0s") is not None))
+    except Exception as err:
+        report.sections.append(("diagnostics", f"collection failed: {type(err).__name__}: {err}"))
 
 
 def _get_nodes_config() -> list[str]:
@@ -134,6 +165,18 @@ def ssh_nodes():
 
     for node in nodes:
         node.close()
+
+
+@pytest.fixture(autouse=True)
+def _node_health(request):
+    """Per-test node guard (see node_health_guard). The session-autouse _ensure_bins
+    pulls ssh_nodes into every e2e test, so in practice each test pays one
+    `iptables -S` round trip per node before and after it."""
+    if "ssh_nodes" not in request.fixturenames:
+        yield
+        return
+    with node_health_guard(request.getfixturevalue("ssh_nodes")):
+        yield
 
 
 @pytest.fixture(scope="session")
@@ -290,6 +333,7 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     c.provision()
     c.root_agent_preflight()
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={"cluster": {"enabled": True, "cni": "kuberouter"}},
             agent_as_root=True,
@@ -304,6 +348,7 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
+    _reset_k0s_all_nodes_and_check_network(c)
 
 
 @pytest.fixture
@@ -318,8 +363,8 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    _reset_k0s_all_nodes(c)
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={"cluster": {"enabled": True, "cni": "calico"}},
             agent_as_root=True,
@@ -334,7 +379,7 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
-    _reset_k0s_all_nodes(c)
+    _reset_k0s_all_nodes_and_check_network(c)
 
 
 @pytest.fixture
@@ -380,6 +425,8 @@ def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         c.enable_accounting()
+    except SshConnectionLost:
+        raise
     except RuntimeError as e:
         pytest.skip(str(e))
     try:
@@ -628,34 +675,15 @@ def _reset_k0s_all_nodes(c):
 
     `spur k8s down --reset` only flags phase=Down; the controller's reconcile
     loop stops the k0s components *asynchronously*. Because the fixture kills
-    spurctld/spurd right after (c.teardown()), that async reset is cut off — so
-    without this, k0s services and the etcd datadir survive and the NEXT wg_k0s
-    test inherits dirty state (membership won't shrink, the API server refuses
-    connections). Reset each node directly so every test starts from a clean slate.
+    spurctld/spurd right after (c.teardown()), that async reset is cut off, so
+    without this the k0s services and etcd datadir survive and the NEXT k0s test
+    inherits dirty state. Reset each node directly so every test starts clean.
     """
-    sudo = c._sudo_prefix()
-    for node in c.nodes:
-        node.exec_allow_fail(
-            f"{sudo}systemctl stop k0scontroller k0sworker 2>/dev/null || true"
-        )
-        node.exec_allow_fail(f"{sudo}k0s stop 2>/dev/null || true")
-        node.exec_allow_fail(f"{sudo}k0s reset 2>/dev/null || true")
-        node.exec_allow_fail(
-            f"{sudo}rm -rf /etc/k0s /var/lib/k0s /run/k0s 2>/dev/null || true"
-        )
-        # Best-effort steps above (|| true) can't wedge teardown — but a reset
-        # that silently failed would resurface as a baffling failure in the NEXT
-        # test that inherits the leftover k0s state. Verify the datadir is gone
-        # and warn (naming the node) if not, so blame lands on the offender.
-        leftover = node.exec_allow_fail(
-            "test -e /var/lib/k0s && echo DIRTY || echo CLEAN"
-        )
-        if "DIRTY" in leftover:
-            logger.warning(
-                "k0s reset left /var/lib/k0s behind on %s — the next wg_k0s test "
-                "may inherit dirty state (stale etcd membership / API refusals)",
-                node.host,
-            )
+    reset_k0s_all_nodes(c.nodes, c._sudo_prefix())
+
+
+def _reset_k0s_all_nodes_and_check_network(c, after_reset=None):
+    reset_k0s_and_assert_network(c.nodes, c.node_names, c._sudo_prefix(), after_reset)
 
 
 def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
@@ -677,7 +705,11 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
 
     # Start from a clean k0s slate: a prior test (or a crashed run) can leave k0s
     # services + an etcd datadir behind, which corrupts this cluster's membership.
-    _reset_k0s_all_nodes(c)
+    try:
+        _reset_k0s_all_nodes(c)
+    except Exception:
+        c.teardown()
+        raise
 
     # Establish the mesh first (spur0 up on every node) so spurd reads its
     # wg_pubkey + mesh IP at startup and the reconcile has a real mesh to
@@ -724,10 +756,10 @@ def _teardown_wg_k0s(c):
     # `rm -rf`, that reconcile races the manual cleanup. Tearing the daemons down
     # first leaves nothing contending with it.
     c.teardown()
-    _reset_k0s_all_nodes(c)
     mesh = getattr(c, "wg_mesh", None)
-    if mesh is not None:
-        mesh.teardown(getattr(c, "wg_mesh_indices", []))
+    after_reset = None if mesh is None else (
+        lambda: mesh.teardown(getattr(c, "wg_mesh_indices", [])))
+    _reset_k0s_all_nodes_and_check_network(c, after_reset)
 
 
 @pytest.fixture

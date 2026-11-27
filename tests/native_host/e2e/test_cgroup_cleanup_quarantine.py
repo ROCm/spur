@@ -1,29 +1,42 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test for quarantining a node whose job cgroup cannot be emptied.
+"""E2E test for quarantining a node whose job cgroup cannot be removed.
 
-``cgroup.kill`` defeats ``setsid`` and ``trap '' TERM``, so a plain escaping
-descendant is reaped in time. A root helper that keeps moving fresh processes
-into the job's cgroup stands in for a workload the kernel cannot clear.
+``cgroup.kill`` reaps every process, so no workload can hold the cgroup without
+racing the reaper. Bind-mounting the step cgroup onto itself instead makes its
+``rmdir`` fail with EBUSY on every attempt until it is unmounted.
 """
 
+import logging
 import re
+import shlex
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state, wait_until
+from cluster import parse_cleanup_records, parse_job_id, wait_job, wait_job_state, wait_until
+
+logger = logging.getLogger(__name__)
 
 CLEANUP_TIMEOUT = 5
-# Unique duration so the cleanup pkill matches only this test's processes.
-MARKER = 7331
-CLEANUP_HOLD = "unfinished job cgroup cleanup"
 DRAIN_REASON = "job cgroup cleanup incomplete"
+LAUNCH_REFUSED = "refusing new work until pending job cleanup completes"
 
 
 def _node_reason(cluster, name: str) -> str:
     match = re.search(r"Reason=(.*)", cluster.scontrol_show_node(name))
     return match.group(1) if match else ""
+
+
+def _pending_cleanup(cluster, node, job_id: int) -> list[dict]:
+    """The agent's persisted cleanup obligations for *job_id*, one per step."""
+    directory = f"{cluster.state_dir}/runtime/cleanup"
+    # An unmatched glob stays literal, and a record can vanish mid-loop once reaped.
+    script = (
+        f'for f in {shlex.quote(directory)}/{job_id}.*.json; do '
+        '[ -e "$f" ] || continue; cat "$f"; echo; done'
+    )
+    return parse_cleanup_records(node.exec(f"{cluster._sudo_prefix()}sh -c {shlex.quote(script)}"))
 
 
 class TestCgroupCleanupQuarantine:
@@ -62,27 +75,25 @@ class TestCgroupCleanupQuarantine:
         )
         assert re.fullmatch(rf"/spur/job_{job_id}_\d+/step_\w+", cgroup), cgroup
 
-        stop = f"{cluster.remote_dir}/pinner.stop"
-        pinner = cluster.write_file(
-            "pinner.sh",
-            "#!/bin/bash\n"
-            f"procs=/sys/fs/cgroup{cgroup}/cgroup.procs\n"
-            f"while [ ! -e {stop} ]; do\n"
-            f"  sleep {MARKER} & pid=$!\n"
-            '  echo "$pid" > "$procs" 2>/dev/null || kill "$pid"\n'
-            "done\n",
-        )
+        pinned = shlex.quote(f"/sys/fs/cgroup{cgroup}")
+        mounted = True
         try:
-            node.exec(f"{sudo}setsid nohup bash {pinner} > /dev/null 2>&1 &")
+            node.exec(f"{sudo}mount --bind {pinned} {pinned}")
             cluster.cli(["scancel", str(job_id)])
 
             wait_until(
                 lambda: DRAIN_REASON in _node_reason(cluster, name),
                 timeout_s=CLEANUP_TIMEOUT + 45, desc="cleanup quarantine drain",
             )
+            # The agent persists the acknowledgment only after the controller accepted the drain.
+            wait_until(
+                lambda: any(r["quarantine_acknowledged"] for r in _pending_cleanup(cluster, node, job_id)),
+                timeout_s=30, desc="acknowledged pending-cleanup record",
+            )
             assert wait_job(cluster, job_id, timeout=60) in ("CA", "GONE")
 
             cluster.scontrol("update", f"NodeName={name}", "State=RESUME")
+            log_offset = len(cluster.spurd_log(0))
             probe = cluster.write_file("after-cleanup.sh", "#!/bin/bash\necho CLEANUP_CLEARED\n")
             out_path = f"{cluster.remote_dir}/after-cleanup.out"
             next_id = parse_job_id(
@@ -90,16 +101,22 @@ class TestCgroupCleanupQuarantine:
             )
             assert next_id is not None
             wait_until(
-                lambda: CLEANUP_HOLD in cluster.scontrol("show", "job", str(next_id)),
+                lambda: LAUNCH_REFUSED in cluster.spurd_log(0)[log_offset:],
                 timeout_s=60, desc="launch refused while cleanup is pending",
             )
+            assert _pending_cleanup(cluster, node, job_id), "cleanup record cleared while still pinned"
             assert DRAIN_REASON not in _node_reason(cluster, name), (
                 "an acknowledged quarantine must not re-drain the resumed node"
             )
 
-            node.exec(f"touch {stop}")
+            node.exec(f"{sudo}umount {pinned}")
+            mounted = False
             assert wait_job(cluster, next_id, timeout=120) == "CD", cluster.debug_job(next_id)
             assert "CLEANUP_CLEARED" in cluster.read_output_on_any_node(out_path)
+            assert not _pending_cleanup(cluster, node, job_id)
         finally:
-            node.exec_allow_fail(f"touch {stop}")
-            node.exec_allow_fail(f"{sudo}pkill -f '[s]leep {MARKER}' || true")
+            if mounted:
+                code, out = node.exec_with_exit(f"{sudo}umount {pinned}")
+                if code != 0:
+                    logger.warning("umount of the pinned cgroup %s on %s failed (exit %d): %s",
+                                   pinned, node.host, code, out.strip())

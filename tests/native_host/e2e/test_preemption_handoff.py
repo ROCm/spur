@@ -10,7 +10,15 @@ import time
 
 import pytest
 
-from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state, wait_until
+from cluster import (
+    SpurCluster,
+    SshConnectionLost,
+    make_remote_dir,
+    parse_job_id,
+    wait_job,
+    wait_job_state,
+    wait_until,
+)
 
 
 @pytest.fixture
@@ -39,6 +47,8 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count, retention=86400, controll
     c = SpurCluster(ssh_nodes[:count], make_remote_dir(), remote_bin_dir)
     try:
         c.enable_accounting()
+    except SshConnectionLost:
+        raise
     except RuntimeError as exc:
         pytest.skip(str(exc))
     try:

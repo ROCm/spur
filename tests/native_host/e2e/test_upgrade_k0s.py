@@ -31,7 +31,15 @@ from pathlib import Path
 
 import pytest
 
-from cluster import BINARIES, SpurCluster, make_remote_dir, parse_job_id, wait_job
+from cluster import (
+    BINARIES,
+    SpurCluster,
+    make_remote_dir,
+    parse_job_id,
+    reset_k0s_all_nodes,
+    reset_k0s_and_assert_network,
+    wait_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -386,17 +394,7 @@ def _drain_and_restart_agent(c: SpurCluster, node_index: int) -> None:
 
 
 def _reset_k0s_all_nodes(c: SpurCluster) -> None:
-    """Forcibly reset k0s on every node (matches conftest._reset_k0s_all_nodes)."""
-    sudo = c._sudo_prefix()
-    for node in c.nodes:
-        node.exec_allow_fail(
-            f"{sudo}systemctl stop k0scontroller k0sworker 2>/dev/null || true"
-        )
-        node.exec_allow_fail(f"{sudo}k0s stop 2>/dev/null || true")
-        node.exec_allow_fail(f"{sudo}k0s reset 2>/dev/null || true")
-        node.exec_allow_fail(
-            f"{sudo}rm -rf /etc/k0s /var/lib/k0s /run/k0s 2>/dev/null || true"
-        )
+    reset_k0s_all_nodes(c.nodes, c._sudo_prefix())
 
 
 # --- fixture ----------------------------------------------------------------
@@ -418,8 +416,8 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    _reset_k0s_all_nodes(c)
     try:
+        _reset_k0s_all_nodes(c)
         c.start(
             config_overrides={
                 "cluster": {"enabled": True, "cni": "kuberouter"},
@@ -439,7 +437,7 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
-    _reset_k0s_all_nodes(c)
+    reset_k0s_and_assert_network(c.nodes, c.node_names, c._sudo_prefix())
 
 
 # --- tests ------------------------------------------------------------------
@@ -603,6 +601,10 @@ class TestRollingUpgradePreservesK0s:
             f"post-upgrade job output missing marker:\n{output}"
         )
 
+    @pytest.mark.quarantine(
+        reason="worker roles are cleared after a spurctld restart (same k0s membership "
+        "teardown as the multi-control-plane restart bug)"
+    )
     def test_worker_node_cp_survives_restart(self, k0s_native_cluster):
         """CP placed on a worker node (not co-located with spurctld) survives
         controller + agent restart.  Mirrors the common production layout

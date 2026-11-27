@@ -11,7 +11,7 @@ dispatch. Each test cancels its job in a finally block.
 
 import time
 
-from cluster import parse_job_id, job_state
+from cluster import parse_job_id, job_state, wait_until
 
 
 def _wait_state(cluster, job_id, want, timeout=30):
@@ -204,7 +204,8 @@ class TestSuspendAccounting:
         job_id = None
         try:
             job_id = _submit_sleep(cluster, "sr-acct")
-            time.sleep(6)
+            wait_until(lambda: _squeue_time(cluster, job_id) >= 6, timeout_s=30,
+                       interval_s=1, desc=f"job {job_id} to accrue 6s of run time")
             cluster.scontrol("suspend", str(job_id))
             assert _wait_state(cluster, job_id, "S")
             t_susp = _squeue_time(cluster, job_id)

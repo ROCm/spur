@@ -20,6 +20,8 @@ from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from kubernetes.utils import create_from_dict
 
+from k8s_diagnostics import register_namespaces
+
 logger = logging.getLogger(__name__)
 
 # Deploy the same manifests users apply, so e2e exercises them as shipped.
@@ -32,12 +34,19 @@ SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
 SPUR_JOB_PLURAL = "spurjobs"
 CRD_NAME = f"{SPUR_JOB_PLURAL}.{SPUR_JOB_GROUP}"
-DEFAULT_TIMEOUT = 60
+# Covers the first job on a worker, which can still be waiting on a cold image pull.
+DEFAULT_TIMEOUT = 120
 WAIT_INTERVAL = 2
 HA_TIMEOUT = 90
-# The operator registers the nodes only after it reaches a ready controller;
-# measured at about three minutes after the controller Pods are ready.
-NODE_REGISTER_TIMEOUT = 300
+# Each readiness gate gets this full budget on its own. A cold cluster provisions
+# the controller PVCs first, and the operator registers the workers only after a
+# controller is ready (measured at about three minutes).
+READY_GATE_TIMEOUT = 300
+PREPULL_TIMEOUT = 300
+MANAGED_NODE_LABEL = "spur.amd.com/managed=true"
+JOB_IMAGE = "mirror.gcr.io/library/busybox:latest"
+PREPULL_APP = "spur-e2e-prepull"
+PREPULL_SELECTOR = f"app={PREPULL_APP}"
 CLUSTER_SCOPED_KINDS = frozenset({"ClusterRole", "ClusterRoleBinding"})
 
 
@@ -73,6 +82,11 @@ def _load_kube_config() -> None:
         config.load_kube_config()
     except config.ConfigException:
         config.load_incluster_config()
+
+
+def core_v1_api() -> client.CoreV1Api:
+    _load_kube_config()
+    return client.CoreV1Api()
 
 
 def verify_kube_access() -> None:
@@ -446,27 +460,38 @@ class ClusterFixture:
         self._apply_yaml_docs(_MANIFESTS_DIR / "operator.yaml", None)
         logger.info("operator Deployment applied (image=%s)", self.config.image)
 
-    def wait_ready(self, timeout: int = 120) -> None:
-        wait_until(
-            lambda: self._operator_available(),
-            timeout,
-            "operator deployment not ready",
-            interval=3,
-        )
+    def wait_ready(self, timeout: int = READY_GATE_TIMEOUT) -> None:
+        """Wait for the controller, operator and every managed worker, in that order.
 
+        Controllers come first so a PVC that never binds is reported as a missing
+        controller instead of as the operator that depends on it.
+        """
         expected = self.config.replicas
         wait_until(
             lambda: self._ready_controller_count() >= expected,
             timeout,
-            f"expected {expected} ready controller pod(s)",
+            f"gate 'controllers ready': expected {expected} ready controller pod(s)",
             interval=3,
         )
         logger.info("controller pod(s) ready: %s", self._ready_controller_count())
 
         wait_until(
-            lambda: self._registered_node_count() >= 1,
-            NODE_REGISTER_TIMEOUT,
-            "no node registered with the controller",
+            self._operator_available,
+            timeout,
+            "gate 'operator ready': operator deployment not ready",
+            interval=3,
+        )
+
+        workers = managed_node_names(self.core_v1)
+        if not workers:
+            raise RuntimeError(
+                f"gate 'workers registered': no node carries the {MANAGED_NODE_LABEL} label"
+            )
+        wait_until(
+            lambda: self._registered_node_count() >= len(workers),
+            timeout,
+            f"gate 'workers registered': controller does not list all {len(workers)} "
+            f"managed worker(s) {workers}",
             interval=5,
         )
         logger.info("node(s) registered: %s", self._registered_node_count())
@@ -602,10 +627,98 @@ class ClusterFixture:
                 raise
 
 
+def managed_node_names(core_v1: client.CoreV1Api) -> list[str]:
+    nodes = core_v1.list_node(label_selector=MANAGED_NODE_LABEL)
+    return sorted(node.metadata.name for node in nodes.items)
+
+
+def prepull_pod(name: str, node: str, image: str) -> client.V1Pod:
+    return client.V1Pod(
+        metadata=client.V1ObjectMeta(name=name, labels={"app": PREPULL_APP}),
+        spec=client.V1PodSpec(
+            node_name=node,
+            restart_policy="Never",
+            # Bypasses the scheduler, so tolerate whatever taints the workers carry.
+            tolerations=[client.V1Toleration(operator="Exists")],
+            containers=[
+                client.V1Container(
+                    name="pull",
+                    image=image,
+                    image_pull_policy="IfNotPresent",
+                    command=["true"],
+                )
+            ],
+        ),
+    )
+
+
+def _waiting_reason(pod: client.V1Pod) -> str:
+    for status in pod.status.container_statuses or []:
+        waiting = status.state.waiting if status.state else None
+        if waiting is not None:
+            return f"{waiting.reason}: {waiting.message}" if waiting.message else waiting.reason
+    return pod.status.phase or "Unknown"
+
+
+def prepull_summary(pods: list[client.V1Pod]) -> str:
+    return "; ".join(
+        f"{pod.metadata.name} on {pod.spec.node_name}: {_waiting_reason(pod)}"
+        for pod in pods
+        if pod.status.phase != "Succeeded"
+    )
+
+
+def prepull_image(
+    core_v1: client.CoreV1Api,
+    namespace: str,
+    image: str,
+    timeout: int = PREPULL_TIMEOUT,
+) -> None:
+    """Pull *image* onto every managed worker so the first job does not pay for it.
+
+    Raises when any worker cannot pull it; the pods are removed either way.
+    """
+    workers = managed_node_names(core_v1)
+    if not workers:
+        raise RuntimeError(f"cannot pre-pull {image}: no node carries the {MANAGED_NODE_LABEL} label")
+
+    def delete_pods() -> None:
+        core_v1.delete_collection_namespaced_pod(
+            namespace,
+            label_selector=PREPULL_SELECTOR,
+            grace_period_seconds=0,
+            propagation_policy="Background",
+        )
+
+    def pods() -> list[client.V1Pod]:
+        return core_v1.list_namespaced_pod(namespace, label_selector=PREPULL_SELECTOR).items
+
+    def done() -> bool:
+        current = pods()
+        failed = [pod for pod in current if pod.status.phase == "Failed"]
+        if failed:
+            raise RuntimeError(f"pre-pull of {image} failed: {prepull_summary(failed)}")
+        return len(current) == len(workers) and all(
+            pod.status.phase == "Succeeded" for pod in current
+        )
+
+    delete_pods()
+    try:
+        for i, node in enumerate(workers):
+            core_v1.create_namespaced_pod(namespace, prepull_pod(f"prepull-{i}", node, image))
+        try:
+            wait_until(done, timeout, f"pre-pull of {image} did not finish", interval=3)
+        except TimeoutError as exc:
+            raise TimeoutError(f"{exc} ({prepull_summary(pods())})") from exc
+    finally:
+        delete_pods()
+    logger.info("pre-pulled %s on %s", image, workers)
+
+
 def base_spec(name: str, command: list[str], num_nodes: int = 1) -> dict:
     return {
         "name": name,
-        "image": "mirror.gcr.io/library/busybox:latest",
+        "image": JOB_IMAGE,
         "gpus": {},
         "numNodes": num_nodes,
         "tasksPerNode": 1,
@@ -732,6 +845,7 @@ def ensure_namespace(name: str) -> None:
     except ApiException as exc:
         if not _is_already_exists(exc):
             raise
+    register_namespaces(name)
 
 
 def delete_namespace(name: str, *, wait: bool = False, timeout: int = 120) -> None:

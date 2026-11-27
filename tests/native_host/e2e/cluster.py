@@ -9,13 +9,19 @@ and CLI wrappers for interacting with the running cluster.
 """
 
 import contextlib
+import ipaddress
+import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess  # nosec B404
+import threading
 import time
 import logging
+from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import paramiko
@@ -30,6 +36,21 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+# SpurCluster.cli() runs on this node, so a partition that cuts its own traffic
+# to the controller port would sever the CLI the test needs to observe the outage.
+CLI_NODE_INDEX = 0
+HEALTH_CHECK_TIMEOUT_S = 20
+NETWORK_CHECK_TIMEOUT_S = 20
+DIAGNOSTICS_TIMEOUT_S = 20
+# The node-side timeout ends this much before the SSH one, so a hung journalctl/dmesg
+# is killed on the node instead of lingering after the channel is abandoned.
+DIAGNOSTICS_REMOTE_MARGIN_S = 2
+# `timeout` exits with this when it had to kill the command.
+TIMEOUT_EXIT_CODE = 124
+# Wall clock for everything one failing test collects, across all nodes and clusters.
+DIAGNOSTICS_BUDGET_S = 90
+# Hosts already warned about disabled leak detection, so it logs once per session.
+_leak_check_warned: set[str] = set()
 # HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
 # and heartbeat_timeout must clear spurd's fixed 30s send interval so ordinary
 # cadence jitter can never be mistaken for the grace-window bug.
@@ -65,6 +86,10 @@ POSTGRES_IMAGES = tuple(
 )
 IMAGE_PULL_ATTEMPTS = 2
 IMAGE_PULL_BACKOFF_SECS = 5
+# Above SshNode.DEFAULT_TIMEOUT_S: these pull from registries or compile on
+# shared CI VMs, where a slow mirror or a loaded host stretches them.
+IMAGE_IMPORT_TIMEOUT_S = 1200
+FIXTURE_BUILD_TIMEOUT_S = 900
 
 
 def log_tail_is_leader(log: str) -> bool:
@@ -89,18 +114,28 @@ def ensure_docker_image(node: "SshNode", image: str):
     quoted = shlex.quote(image)
     if node.exec_with_exit(f"docker image inspect {quoted} >/dev/null 2>&1")[0] == 0:
         return
+    exec_with_retry(node, f"docker pull -q {quoted}", what=f"docker pull {image}",
+                    attempts=IMAGE_PULL_ATTEMPTS, timeout=300)
+
+
+def exec_with_retry(node: "SshNode", command: str, *, what: str, attempts: int,
+                    timeout: int, tail_lines: int = 60) -> str:
+    """Run *command* on *node* until it exits 0 and return its output.
+
+    For commands that fetch from registries or package mirrors, where 429s and
+    mirror outages clear on their own. The final error names *what* and keeps
+    the tail of the last attempt's output, which is where the cause is printed."""
     output = ""
-    for attempt in range(1, IMAGE_PULL_ATTEMPTS + 1):
-        code, output = node.exec_with_exit(f"docker pull -q {quoted}", timeout=300)
+    for attempt in range(1, attempts + 1):
+        code, output = node.exec_with_exit(command, timeout=timeout)
         if code == 0:
-            return
-        logger.warning("docker pull %s failed (attempt %d/%d): %s",
-                       image, attempt, IMAGE_PULL_ATTEMPTS, output.strip())
-        if attempt < IMAGE_PULL_ATTEMPTS:
+            return output
+        logger.warning("%s failed (attempt %d/%d): %s",
+                       what, attempt, attempts, output.strip()[-2000:])
+        if attempt < attempts:
             time.sleep(IMAGE_PULL_BACKOFF_SECS * attempt)
-    raise RuntimeError(
-        f"docker pull {image} failed on {node.host} after {IMAGE_PULL_ATTEMPTS} attempts:\n{output}"
-    )
+    tail = "\n".join(output.strip().splitlines()[-tail_lines:])
+    raise RuntimeError(f"{what} failed on {node.host} after {attempts} attempts:\n{tail}")
 
 
 def ensure_any_docker_image(node: "SshNode", images: tuple[str, ...]) -> str:
@@ -109,6 +144,8 @@ def ensure_any_docker_image(node: "SshNode", images: tuple[str, ...]) -> str:
         try:
             ensure_docker_image(node, image)
             return image
+        except SshConnectionLost:
+            raise
         except RuntimeError as err:
             logger.warning("%s", err)
     raise RuntimeError(f"none of {images} could be pulled on {node.host}")
@@ -132,6 +169,268 @@ def deep_merge(base: dict, overrides: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+def _refuse_cli_node(helper: str, node_index: int):
+    if node_index == CLI_NODE_INDEX:
+        raise ValueError(
+            f"{helper} cannot target node {CLI_NODE_INDEX}: the test CLI runs there "
+            f"and the partition would cut it off from the controller"
+        )
+
+
+def _drop_rule_pattern() -> re.Pattern:
+    return re.compile(rf"^-A .*--dport ({CONTROLLER_PORT}|{AGENT_PORT})\b.* -j DROP$")
+
+
+class NodeUnresponsive(Exception):
+    """A node whose session looks alive did not answer a short command.
+
+    Not a RuntimeError, so a handler for failed commands cannot mistake it for one."""
+
+
+def has_sudo(node: "SshNode", sudo: str) -> bool:
+    """Whether *sudo* (a ``_sudo_prefix()``) works on *node*. A lost session or a
+    hung probe raises instead, so neither can turn into a "needs sudo" skip."""
+    code, out = node.exec_with_exit(f"{sudo}true", timeout=HEALTH_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeUnresponsive(
+            f"node {node.host} unresponsive: sudo probe timed out after {HEALTH_CHECK_TIMEOUT_S}s: {out.strip()}")
+    return code == 0
+
+
+def leftover_drop_rules(node: "SshNode") -> list[str]:
+    """Rules in ``iptables -S`` that drop the controller or agent port, i.e. a
+    partition a test left behind."""
+    code, out = node.exec_with_exit("sudo iptables -S", timeout=HEALTH_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeUnresponsive(
+            f"node {node.host} unresponsive: `sudo iptables -S` timed out after {HEALTH_CHECK_TIMEOUT_S}s")
+    if code != 0:
+        raise RuntimeError(f"`sudo iptables -S` failed on {node.host} (exit {code}): {out.strip()}")
+    pattern = _drop_rule_pattern()
+    return [line for line in out.splitlines() if pattern.match(line)]
+
+
+def snapshot_drop_rules(nodes: list["SshNode"]) -> list[Counter | None]:
+    """Per node (same order), the partition rules present now. None where
+    ``iptables -S`` cannot be listed: leak detection is then skipped for that node.
+    Raises NodeUnresponsive when a node's session fails or the listing times out."""
+    baseline = []
+    for node in nodes:
+        try:
+            baseline.append(Counter(leftover_drop_rules(node)))
+        except _NODE_SSH_ERRORS as err:
+            raise NodeUnresponsive(f"node {node.host} unresponsive: {_describe(err)}") from err
+        except RuntimeError as err:
+            # Tests without partitions must still pass on a bed with no usable
+            # sudo iptables, so warn once instead of erroring every teardown.
+            if node.host not in _leak_check_warned:
+                _leak_check_warned.add(node.host)
+                logger.warning(
+                    "Partition leak detection is disabled on %s: `sudo iptables -S` failed: %s",
+                    node.host, err)
+            baseline.append(None)
+    return baseline
+
+
+def reap_leaked_drop_rules(nodes: list["SshNode"], baseline: list[Counter | None]) -> list[str]:
+    """Remove the partition rules a test added since *baseline* so they cannot
+    poison later tests. Rules already in the baseline are left alone. A failure
+    on one node is reported and does not stop the others. Returns one report
+    line per leaked rule or failure; empty when nothing leaked."""
+    report = []
+    for node, before in zip(nodes, baseline):
+        if before is None:
+            continue
+        try:
+            leaked = list((Counter(leftover_drop_rules(node)) - before).elements())
+        except (RuntimeError, NodeUnresponsive, *_NODE_SSH_ERRORS) as err:
+            report.append(f"{node.host}: could not check for leaked rules: {err}")
+            continue
+        for rule in leaked:
+            delete = rule.replace("-A ", "-D ", 1)
+            try:
+                code, out = node.exec_with_exit(f"sudo iptables {delete}",
+                                                timeout=HEALTH_CHECK_TIMEOUT_S)
+            except _NODE_SSH_ERRORS as err:
+                code, out = -1, str(err)
+            outcome = "removed" if code == 0 else f"removal failed (exit {code}): {out.strip()}"
+            report.append(f"{node.host}: {rule.removeprefix('-A ')} -> {outcome}")
+    return report
+
+
+def check_nodes_reachable(nodes: list["SshNode"]) -> dict[str, "SshConnectionLost"]:
+    """Reconnect any node whose session died. Returns the nodes that could not be
+    reached, as host -> error; empty when every node is up."""
+    unreachable = {}
+    for node in nodes:
+        try:
+            node.ensure_connected()
+        except SshConnectionLost as err:
+            unreachable[node.host] = err
+    return unreachable
+
+
+def unreachable_message(unreachable: dict[str, "SshConnectionLost"]) -> str:
+    hosts = "; ".join(f"node {host} unreachable after reconnect ({err})"
+                      for host, err in unreachable.items())
+    return f"{hosts}; aborting shard"
+
+
+@contextlib.contextmanager
+def node_health_guard(nodes: list["SshNode"]):
+    """Around one test: reconnect dead sessions first, ending the shard if a node
+    stays unreachable or does not answer, and afterwards fail on any partition the
+    test leaked (removing it so later tests are unaffected)."""
+    unreachable = check_nodes_reachable(nodes)
+    if unreachable:
+        pytest.exit(unreachable_message(unreachable), returncode=3)
+    try:
+        baseline = snapshot_drop_rules(nodes)
+    except NodeUnresponsive as err:
+        pytest.exit(f"{err}; aborting shard", returncode=3)
+
+    yield
+
+    report = reap_leaked_drop_rules(nodes, baseline)
+    if report:
+        pytest.fail("node health check failed after the test:\n" + "\n".join(report),
+                    pytrace=False)
+
+
+class NodeNetworkError(RuntimeError):
+    """A node is reachable over SSH but fails its network sanity check."""
+
+
+class K0sResetError(RuntimeError):
+    """k0s could not be reset on one or more nodes because their SSH session failed."""
+
+
+_loopback_warned: set[str] = set()
+
+
+def _describe(err: BaseException) -> str:
+    return f"{type(err).__name__}: {err}"
+
+
+def _reset_k0s_node(node: "SshNode", sudo: str) -> None:
+    node.exec_allow_fail(f"{sudo}systemctl stop k0scontroller k0sworker 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}k0s stop 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}k0s reset 2>/dev/null || true")
+    node.exec_allow_fail(f"{sudo}rm -rf /etc/k0s /var/lib/k0s /run/k0s 2>/dev/null || true")
+    # The reset commands above end in `|| true`, so a silent failure would only
+    # surface as a baffling failure in the next test that inherits the leftovers.
+    leftover = node.exec_allow_fail("test -e /var/lib/k0s && echo DIRTY || echo CLEAN")
+    if "DIRTY" in leftover:
+        logger.warning(
+            "k0s reset left /var/lib/k0s behind on %s; the next k0s test may inherit "
+            "dirty state (stale etcd membership / API refusals)", node.host)
+
+
+def reset_k0s_all_nodes(nodes: list["SshNode"], sudo: str) -> None:
+    """Forcibly reset k0s on every node, independent of the controller.
+
+    A node whose session fails is skipped and the rest are still reset, so one
+    dropped connection cannot leave dirty k0s state on the later nodes. Raises
+    K0sResetError at the end naming every node that failed.
+    """
+    failures = {}
+    for node in nodes:
+        try:
+            _reset_k0s_node(node, sudo)
+        except _NODE_SSH_ERRORS as err:
+            logger.warning("k0s reset on %s failed: %s", node.host, err)
+            failures[node.host] = err
+    if failures:
+        detail = "; ".join(f"{host}: {_describe(err)}" for host, err in failures.items())
+        raise K0sResetError(f"k0s reset failed on {len(failures)} node(s): {detail}")
+
+
+def _node_driver_ip(node: "SshNode") -> str:
+    # Read on the node, so it is the address the node itself sees for this driver,
+    # also when SSH goes through a tunnel or NAT.
+    code, out = node.exec_with_exit("echo $SSH_CLIENT", timeout=NETWORK_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeNetworkError(
+            f"{node.host}: timed out after {NETWORK_CHECK_TIMEOUT_S}s reading SSH_CLIENT")
+    fields = out.split()
+    if code != 0 or not fields:
+        raise NodeNetworkError(f"{node.host}: cannot determine the driver address from SSH_CLIENT: {out.strip()!r}")
+    try:
+        loopback = ipaddress.ip_address(fields[0]).is_loopback
+    except ValueError:
+        raise NodeNetworkError(f"{node.host}: SSH_CLIENT does not start with an address: {out.strip()!r}") from None
+    if loopback and node.host not in _loopback_warned:
+        _loopback_warned.add(node.host)
+        logger.warning(
+            "%s sees the driver as %s (loopback): the route check proves little on this bed",
+            node.host, fields[0])
+    return fields[0]
+
+
+def _assert_node_network(node: "SshNode", driver_ip: str) -> None:
+    """Raise unless *node* routes to *driver_ip* and answers on a fresh SSH channel.
+    Raises SshConnectionLost when the session cannot be restored."""
+    node.ensure_connected()
+    code, out = node.exec_with_exit(f"ip route get {shlex.quote(driver_ip)} && echo ok",
+                                    timeout=NETWORK_CHECK_TIMEOUT_S)
+    if code == -1:
+        raise NodeNetworkError(f"{node.host}: network check timed out after {NETWORK_CHECK_TIMEOUT_S}s")
+    if code != 0 or out.split()[-1:] != ["ok"]:
+        raise NodeNetworkError(f"{node.host}: no route to the driver {driver_ip} (exit {code}): {out.strip()}")
+
+
+def network_failure_report(nodes: list["SshNode"], names: list[str]) -> str | None:
+    """None when every node passes the network check; otherwise one line per broken
+    node plus bounded diagnostics for all nodes (a node with a dead session answers
+    instantly with 'unreachable')."""
+    failures = {}
+    for node in nodes:
+        try:
+            _assert_node_network(node, _node_driver_ip(node))
+        except _NODE_SSH_ERRORS + (NodeNetworkError,) as err:
+            failures[node.host] = err
+    if not failures:
+        return None
+    diagnostics = collect_node_diagnostics(nodes, names, None, k0s=True, budget=DiagnosticsBudget())
+    lines = [f"node network broken after k0s teardown: {_describe(err)}" for err in failures.values()]
+    lines += [f"--- {key} ---\n{text}" for key, text in diagnostics.items()]
+    return "\n".join(lines)
+
+
+def assert_nodes_network(nodes: list["SshNode"], names: list[str],
+                         errors: Sequence[BaseException] = ()) -> None:
+    """Fail the calling fixture teardown when any node lost its network, naming the
+    node. For fixtures whose cleanup (k0s reset) can take a node's network down.
+    *errors* from earlier cleanup steps are raised or reported along with it, so
+    neither failure hides the other."""
+    report = network_failure_report(nodes, names)
+    if report is None:
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise RuntimeError("\n".join(_describe(err) for err in errors))
+        return
+    pytest.fail("\n".join([*(_describe(err) for err in errors), report]), pytrace=False)
+
+
+def reset_k0s_and_assert_network(nodes: list["SshNode"], names: list[str], sudo: str,
+                                 after_reset=None) -> None:
+    """The k0s fixture teardown tail: reset every node, run *after_reset* (e.g. mesh
+    teardown) whatever the reset did, then verify each node's network. Every failure
+    is reported together, so a reset error is never hidden behind a network failure."""
+    errors: list[BaseException] = []
+    try:
+        reset_k0s_all_nodes(nodes, sudo)
+    except K0sResetError as err:
+        errors.append(err)
+    if after_reset is not None:
+        try:
+            after_reset()
+        except Exception as err:  # reported below, after the network check has run
+            errors.append(err)
+    assert_nodes_network(nodes, names, errors)
 
 
 @contextlib.contextmanager
@@ -158,6 +457,7 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
 def cut_off_node(cluster: "SpurCluster", node_index: int):
     """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
     Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
+    _refuse_cli_node("cut_off_node", node_index)
     controller = cluster.nodes[0]
     target = cluster.nodes[node_index].address
     rules = [
@@ -179,6 +479,7 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
 def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
     """Drop one node's outbound traffic to every controller's client port, so its
     agent cannot heartbeat but controllers can still reach it. Always undone on exit."""
+    _refuse_cli_node("block_heartbeats_from", node_index)
     node = cluster.nodes[node_index]
     rule_args = f"-p tcp --dport {port} -j DROP"
     node.exec(f"sudo iptables -I OUTPUT {rule_args}")
@@ -224,19 +525,43 @@ def isolate_controller(cluster: "SpurCluster", node_index: int):
             controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
+class SshConnectionLost(RuntimeError):
+    """The SSH session to a node died and could not be safely re-established."""
+
+
 class SshNode:
-    """SSH connection to a single test node."""
+    """SSH connection to a single test node.
+
+    A session found dead before a command is sent is reconnected transparently.
+    One that dies after the command was sent raises SshConnectionLost instead:
+    re-running a non-idempotent command is worse than failing the test."""
+
+    DEFAULT_TIMEOUT_S = 600
+    CONNECT_TIMEOUT_S = 15
+    HANDSHAKE_TIMEOUT_S = 30
+    KEEPALIVE_S = 15
+    CHANNEL_OPEN_TIMEOUT_S = 30
+    RECONNECT_BACKOFF_S = (1, 2, 4)
+    # Caps each blocking read so stderr is drained and the deadline checked
+    # while a command is quiet on stdout.
+    _POLL_S = 1.0
+    _CHUNK_BYTES = 32768
+    _CONNECTION_ERRORS = (paramiko.SSHException, EOFError, OSError)
+    # Retrying cannot fix credentials or a changed host key; backoff only delays the failure.
+    _PERMANENT_CONNECT_ERRORS = (paramiko.AuthenticationException, paramiko.BadHostKeyException)
+
+    _sleep = staticmethod(time.sleep)
+    _clock = staticmethod(time.monotonic)
 
     def __init__(self, host: str, user: str, password: str | None = None,
-                 key_path: str | None = None, port: int = 22, address: str | None = None):
+                 key_path: str | None = None, port: int = 22, address: str | None = None,
+                 client_factory=paramiko.SSHClient):
         self.host = host
         # Where other nodes/daemons reach this node, e.g. the underlay IP
         # behind an SSH tunnel's `localhost`. Defaults to `host`.
         self.address = address or host
         self.user = user
-        self.client = paramiko.SSHClient()
-        # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
+        self._client_factory = client_factory
 
         connect_kwargs = {"hostname": host, "port": port, "username": user}
         if key_path:
@@ -245,51 +570,165 @@ class SshNode:
             connect_kwargs["password"] = password
         else:
             connect_kwargs["allow_agent"] = True
+        self._connect_kwargs = connect_kwargs
 
-        self.client.connect(**connect_kwargs)
+        self._lock = threading.Lock()
         self._sftp = None
+        self.client = self._connect()
+
+    def _connect(self) -> paramiko.SSHClient:
+        client = self._client_factory()
+        # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
+        try:
+            client.connect(
+                **self._connect_kwargs,
+                timeout=self.CONNECT_TIMEOUT_S,
+                banner_timeout=self.HANDSHAKE_TIMEOUT_S,
+                auth_timeout=self.HANDSHAKE_TIMEOUT_S,
+            )
+        except BaseException:
+            client.close()
+            raise
+        # Without keepalives an idle session through NAT or a flapping link
+        # dies silently and is only noticed by the next command.
+        client.get_transport().set_keepalive(self.KEEPALIVE_S)
+        return client
+
+    def is_alive(self) -> bool:
+        """Whether the SSH transport is up. Cheap; does not probe the node."""
+        transport = self.client.get_transport()
+        return transport is not None and transport.is_active()
+
+    def ensure_connected(self) -> None:
+        """Reconnect if the session is dead. Raises SshConnectionLost when every
+        attempt fails. Concurrent callers share a single reconnect."""
+        with self._lock:
+            if self.is_alive():
+                return
+            self._reconnect()
+
+    def _reconnect(self):
+        logger.warning("SSH session to %s is not active; reconnecting", self.host)
+        attempts = len(self.RECONNECT_BACKOFF_S)
+        last_error = None
+        for attempt, delay in enumerate(self.RECONNECT_BACKOFF_S, start=1):
+            self._sleep(delay)
+            try:
+                client = self._connect()
+            except self._PERMANENT_CONNECT_ERRORS as err:
+                raise SshConnectionLost(
+                    f"SSH session to {self.host} lost and reconnect was refused: {err}"
+                ) from err
+            except self._CONNECTION_ERRORS as err:
+                last_error = err
+                logger.warning("Reconnect to %s failed (attempt %d/%d): %s",
+                               self.host, attempt, attempts, err)
+                continue
+            stale, self.client = self.client, client
+            self._sftp = None
+            stale.close()
+            return
+        raise SshConnectionLost(
+            f"SSH session to {self.host} lost and {attempts} reconnect attempts failed: {last_error}"
+        ) from last_error
+
+    def _lost(self, cmd: str) -> SshConnectionLost:
+        return SshConnectionLost(f"SSH session to {self.host} dropped while running: {cmd}")
 
     @property
     def sftp(self) -> paramiko.SFTPClient:
+        self.ensure_connected()
         if self._sftp is None:
             self._sftp = self.client.open_sftp()
         return self._sftp
 
-    def _run(self, cmd: str, timeout: int | None = None) -> tuple[int, str, str]:
+    def _open_channel(self) -> paramiko.Channel:
+        """Open a session channel, reconnecting if the transport is dead. Nothing
+        has been sent yet, so reconnecting here cannot repeat a command."""
+        self.ensure_connected()
+        try:
+            return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
+        except self._CONNECTION_ERRORS as err:
+            if self.is_alive():
+                raise
+            logger.warning("Opening a channel to %s failed on a dead transport: %s", self.host, err)
+        self.ensure_connected()
+        return self.client.get_transport().open_session(timeout=self.CHANNEL_OPEN_TIMEOUT_S)
+
+    def _run(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> tuple[int, str, str]:
         """Run a command via SSH. Returns (exit_code, stdout, stderr). The one
         place that drives the channel; higher-level helpers shape the result.
 
-        With *timeout* (seconds), the channel is closed at the deadline and the
-        exit code is -1, with whatever output arrived until then."""
-        # Running shell commands on the disposable test VMs is the harness's job;
-        # inputs come from harness constants and test fixtures.
-        _, stdout, stderr = self.client.exec_command(cmd)  # nosec B601
-        if timeout is not None:
-            deadline = time.time() + timeout
-            while not stdout.channel.exit_status_ready():
-                if time.time() > deadline:
-                    stdout.channel.close()
-                    return -1, stdout.read().decode(), stderr.read().decode()
-                time.sleep(1)
-        exit_code = stdout.channel.recv_exit_status()
-        return exit_code, stdout.read().decode(), stderr.read().decode()
+        At the *timeout* deadline (seconds) the channel is closed and the exit
+        code is -1, with whatever output arrived until then. ``None`` waits
+        forever, so pass it only for commands that cannot hang.
 
-    def exec(self, cmd: str, check: bool = True) -> str:
+        Raises SshConnectionLost if the session dies after the command was sent."""
+        channel = self._open_channel()
+        try:
+            # Running shell commands on the disposable test VMs is the harness's job;
+            # inputs come from harness constants and test fixtures.
+            channel.exec_command(cmd)  # nosec B601
+            return self._collect(channel, cmd, timeout)
+        except self._CONNECTION_ERRORS as err:
+            if self.is_alive():
+                raise
+            raise self._lost(cmd) from err
+        finally:
+            channel.close()
+
+    def _collect(self, channel: paramiko.Channel, cmd: str,
+                 timeout: int | None) -> tuple[int, str, str]:
+        deadline = None if timeout is None else self._clock() + timeout
+        out, err = bytearray(), bytearray()
+        while True:
+            self._drain(channel.recv_stderr_ready, channel.recv_stderr, err)
+            wait = self._POLL_S
+            if deadline is not None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    self._drain(channel.recv_ready, channel.recv, out)
+                    return -1, out.decode(), err.decode()
+                wait = min(wait, remaining)
+            channel.settimeout(wait)
+            try:
+                chunk = channel.recv(self._CHUNK_BYTES)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            out += chunk
+        self._drain(channel.recv_stderr_ready, channel.recv_stderr, err)
+        exit_code = channel.recv_exit_status()
+        if exit_code == -1 and not self.is_alive():
+            raise self._lost(cmd)
+        return exit_code, out.decode(), err.decode()
+
+    def _drain(self, ready, recv, buf: bytearray):
+        while ready():
+            buf += recv(self._CHUNK_BYTES)
+
+    def exec(self, cmd: str, check: bool = True, timeout: int | None = DEFAULT_TIMEOUT_S) -> str:
         """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
-        exit_code, out, err = self._run(cmd)
+        started = self._clock()
+        exit_code, out, err = self._run(cmd, timeout=timeout)
         if check and exit_code != 0:
+            # -1 also means "no exit status", so only a run that used up its timeout is called one.
+            timed_out = exit_code == -1 and timeout is not None and self._clock() - started >= timeout
+            status = f"exit {exit_code}, timed out after {timeout}s" if timed_out else f"exit {exit_code}"
             raise RuntimeError(
-                f"Command failed on {self.host} (exit {exit_code}): {cmd}\n"
+                f"Command failed on {self.host} ({status}): {cmd}\n"
                 f"stdout: {out}\nstderr: {err}"
             )
         return out
 
-    def exec_allow_fail(self, cmd: str) -> str:
+    def exec_allow_fail(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> str:
         """Run a command, returning stdout+stderr regardless of exit code."""
-        _, out, err = self._run(cmd)
+        _, out, err = self._run(cmd, timeout=timeout)
         return out + err
 
-    def exec_with_exit(self, cmd: str, timeout: int | None = None) -> tuple[int, str]:
+    def exec_with_exit(self, cmd: str, timeout: int | None = DEFAULT_TIMEOUT_S) -> tuple[int, str]:
         """Run a command, returning (exit_code, combined stdout+stderr)."""
         exit_code, out, err = self._run(cmd, timeout=timeout)
         return exit_code, out + err
@@ -313,6 +752,10 @@ class SshNode:
         if self._sftp:
             self._sftp.close()
         self.client.close()
+
+
+# Per node, a failed SSH session must not end the loop over the other nodes.
+_NODE_SSH_ERRORS = (SshConnectionLost, paramiko.SSHException, EOFError, OSError)
 
 
 def _upload_binary(nodes: list[SshNode], local_path: Path, bin_dir: str, name: str):
@@ -381,6 +824,156 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
             node.upload(str(plugin_path), remote_plugin)
 
     logger.info("Binaries ready at %s on all nodes", bin_dir)
+
+
+# Clusters between provision() and teardown(), so the failure hook can find them
+# without every fixture having to hand its cluster over.
+_live_clusters: list["SpurCluster"] = []
+
+
+def register_cluster(cluster: "SpurCluster"):
+    if not any(live is cluster for live in _live_clusters):
+        _live_clusters.append(cluster)
+
+
+def unregister_cluster(cluster: "SpurCluster"):
+    _live_clusters[:] = [live for live in _live_clusters if live is not cluster]
+
+
+def live_clusters() -> list["SpurCluster"]:
+    return list(_live_clusters)
+
+
+def _diagnostics_commands(log_dir: str | None, max_lines: int, k0s: bool) -> list[tuple[str, str]]:
+    commands = []
+    if log_dir:
+        for log in ("spurctld.log", "spurd.log"):
+            path = shlex.quote(f"{log_dir}/{log}")
+            commands.append((f"{log} (last {max_lines} lines)", f"tail -n {max_lines} {path}"))
+    commands += [
+        ("ip -br addr", "ip -br addr"),
+        ("ip route", "ip route"),
+        ("iptables -S", "sudo -n iptables -S"),
+        ("dmesg (last 50 lines)", "sudo -n dmesg | tail -50"),
+        ("journalctl -u ssh (last 50 lines)", "sudo -n journalctl -u ssh -n 50 --no-pager"),
+        ("uptime", "uptime"),
+    ]
+    if k0s:
+        commands += [
+            ("k0s status", "sudo -n k0s status"),
+            ("k0s etcd member-list", "sudo -n k0s etcd member-list"),
+            ("systemctl status k0scontroller", "systemctl status k0scontroller --no-pager"),
+        ]
+    return commands
+
+
+def _diagnostics_script(log_dir: str | None, max_lines: int, k0s: bool) -> str:
+    """One shell line for a whole node, so the cost is a single round trip. Each
+    command is guarded so a missing tool or passwordless sudo only blanks its section."""
+    return "; ".join(
+        f"echo '=== {title} ==='; ({command}) 2>&1 || true"
+        for title, command in _diagnostics_commands(log_dir, max_lines, k0s)
+    )
+
+
+class DiagnosticsBudget:
+    """Wall-clock allowance shared by every collection one failing test triggers.
+    Soft on purpose: it is checked between nodes, so the worst overrun is one node's
+    channel-open wait plus its command time."""
+
+    def __init__(self, seconds: float = DIAGNOSTICS_BUDGET_S, clock=time.monotonic):
+        self._clock = clock
+        self._deadline = clock() + seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self._deadline - self._clock())
+
+    def exhausted(self) -> bool:
+        return self.remaining() <= 0
+
+
+def _remote_diagnostics_command(script: str, ssh_timeout: float) -> str:
+    remote_timeout = max(1, int(ssh_timeout) - DIAGNOSTICS_REMOTE_MARGIN_S)
+    return f"timeout {remote_timeout} sh -c {shlex.quote(script)}"
+
+
+def _node_diagnostics(node: "SshNode", script: str, budget: DiagnosticsBudget) -> str:
+    # Runs while a test is already failing, so it must report any trouble as text.
+    if budget.exhausted():
+        return f"{node.host}: skipped (diagnostics budget exhausted)"
+    # Reconnecting is node_health_guard's job; doing it here would stall every failure.
+    if not node.is_alive():
+        return f"{node.host}: unreachable (session down)"
+    timeout = min(DIAGNOSTICS_TIMEOUT_S, budget.remaining())
+    try:
+        code, out = node.exec_with_exit(_remote_diagnostics_command(script, timeout), timeout=timeout)
+    except SshConnectionLost as err:
+        return f"{node.host}: unreachable ({err})"
+    except Exception as err:
+        return f"{node.host}: diagnostics failed ({type(err).__name__}: {err})"
+    if code in (-1, TIMEOUT_EXIT_CODE):
+        return f"{out}\n{node.host}: timed out after {timeout:g}s"
+    return out
+
+
+def collect_node_diagnostics(nodes: list["SshNode"], names: list[str], log_dir: str | None,
+                             max_lines: int = 200, k0s: bool = False,
+                             budget: DiagnosticsBudget | None = None) -> dict[str, str]:
+    """Per node, keyed ``"<name> (<host>)"``: log tails (when *log_dir* is given),
+    network, kernel and ssh state, plus k0s state when *k0s*. A node that cannot
+    be reached, is slow, or comes after *budget* ran out is reported in its
+    entry; this never raises."""
+    budget = budget or DiagnosticsBudget()
+    script = _diagnostics_script(log_dir, max_lines, k0s)
+    result = {}
+    for i, node in enumerate(nodes):
+        name = names[i] if i < len(names) else node.host
+        result[f"{name} ({node.host})"] = _node_diagnostics(node, script, budget)
+    return result
+
+
+def _reported_node_indices(clusters: list["SpurCluster"]) -> list[list[int]]:
+    """Per cluster, the indices of the nodes it reports. Clusters share the session's
+    nodes, so each node is reported once, by the latest-registered cluster holding it:
+    an older registration may be a stale one that never reached teardown."""
+    owner = {id(node): cluster for cluster in clusters for node in cluster.nodes}
+    return [[i for i, node in enumerate(cluster.nodes) if owner[id(node)] is cluster]
+            for cluster in clusters]
+
+
+def failure_diagnostic_sections(when: str, failed: bool, clusters: list["SpurCluster"],
+                                ssh_nodes: list["SshNode"] | None, *, k0s: bool = False,
+                                max_lines: int = 200,
+                                budget: DiagnosticsBudget | None = None) -> list[tuple[str, str]]:
+    """Report sections for a test phase. Only a failed setup or call gets any;
+    skips, xfails and teardown failures stay quiet. Without a live cluster, falls
+    back to node-level state from *ssh_nodes* when the test used them. *k0s* adds
+    the k0s state sections."""
+    if not failed or when not in ("setup", "call"):
+        return []
+    budget = budget or DiagnosticsBudget()
+    if clusters:
+        collected = [c.collect_diagnostics(max_lines, k0s=k0s, budget=budget, indices=indices)
+                     for c, indices in zip(clusters, _reported_node_indices(clusters)) if indices]
+    elif ssh_nodes:
+        collected = [collect_node_diagnostics(ssh_nodes, [], None, max_lines, k0s, budget)]
+    else:
+        collected = []
+    return [(f"diagnostics: {key}", text) for diagnostics in collected
+            for key, text in diagnostics.items()]
+
+
+K0S_LOG_PATTERN = re.compile(r"k0s|join[ -]token|raft|leader|stop", re.IGNORECASE)
+K0S_LOG_LINES = 60
+# Enough history that the matching lines span the whole failed wait.
+K0S_LOG_SCAN_LINES = 5000
+
+
+def filter_k0s_log(text: str, limit: int = K0S_LOG_LINES) -> str:
+    """The last *limit* controller-log lines that concern k0s, join tokens, Raft,
+    leadership or stopping."""
+    matching = [line for line in text.splitlines() if K0S_LOG_PATTERN.search(line)]
+    return "\n".join(matching[-limit:])
 
 
 class SpurCluster:
@@ -460,6 +1053,7 @@ class SpurCluster:
         hostnames known) but no daemons are running.  Call :meth:`start`
         to bring up the cluster with a specific configuration.
         """
+        register_cluster(self)
         self._create_dirs()
         self._resolve_hostnames()
         logger.info("Cluster provisioned: %s", self.node_names)
@@ -568,13 +1162,16 @@ class SpurCluster:
 
     def teardown(self):
         """Kill all daemons and remove the working directory."""
-        self.stop()
-        # Detached supervisors survive stop(), so reap them or they leak across
-        # tests — at teardown, not stop_agents(), so a test can still watch one survive.
-        rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
-        for node in self.nodes:
-            self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
-            node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
+        try:
+            self.stop()
+            # Detached supervisors survive stop(), so reap them or they leak across
+            # tests — at teardown, not stop_agents(), so a test can still watch one survive.
+            rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
+            for node in self.nodes:
+                self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
+                node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
+        finally:
+            unregister_cluster(self)
         logger.info("Cluster torn down")
 
     # --- CLI wrappers ---
@@ -615,7 +1212,7 @@ class SpurCluster:
         *controller_addr* overrides the endpoint(s) passed via
         ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
         """
-        return self.nodes[0].exec(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec(self._cli_command(args, controller_addr))
 
     def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
@@ -623,7 +1220,9 @@ class SpurCluster:
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
         """
-        return self.nodes[0].exec_allow_fail(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec_allow_fail(
+            self._cli_command(args, controller_addr)
+        )
 
     def cli_as_user(
         self,
@@ -649,8 +1248,8 @@ class SpurCluster:
             args, controller_addr, run_as=run_as, extra_env=extra_env
         )
         if not check:
-            return self.nodes[0].exec_allow_fail(cmd)
-        code, out = self.nodes[0].exec_with_exit(cmd)
+            return self.nodes[CLI_NODE_INDEX].exec_allow_fail(cmd)
+        code, out = self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
         if code != 0:
             raise RuntimeError(
                 f"Command failed as {run_as} (exit {code}): {cmd}\n{out}"
@@ -661,7 +1260,9 @@ class SpurCluster:
         self, args: list[str], controller_addr: str | None = None
     ) -> tuple[int, str]:
         """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
-        return self.nodes[0].exec_with_exit(self._cli_command(args, controller_addr))
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(
+            self._cli_command(args, controller_addr)
+        )
 
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
@@ -679,10 +1280,10 @@ class SpurCluster:
             shlex.quote(f"{self.bin_dir}/sbatch"),
         ]
         cmd_parts.extend(shlex.quote(a) for a in args)
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(" ".join(cmd_parts))
 
     def srun_with_exit(
-        self, args: list[str], *, timeout: int | None = None
+        self, args: list[str], *, timeout: int | None = SshNode.DEFAULT_TIMEOUT_S
     ) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr).
 
@@ -693,7 +1294,7 @@ class SpurCluster:
         cmd_parts = self._cli_env_assignments()
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
-        return self.nodes[0].exec_with_exit(" ".join(cmd_parts), timeout=timeout)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(" ".join(cmd_parts), timeout=timeout)
 
     def srun_in_allocation(
         self,
@@ -719,7 +1320,7 @@ class SpurCluster:
         if unset_env:
             unset = " ".join(f"-u {shlex.quote(name)}" for name in unset_env)
             cmd = f"env {unset} {cmd}"
-        return self.nodes[0].exec_with_exit(cmd)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
 
     def salloc_run(
         self,
@@ -742,7 +1343,7 @@ class SpurCluster:
                                   extra_env=extra_env, all_nodes=all_nodes)
         if tty:
             cmd = f"script -qec {shlex.quote(cmd)} /dev/null"
-        return self.nodes[0].exec_with_exit(cmd)
+        return self.nodes[CLI_NODE_INDEX].exec_with_exit(cmd)
 
     def salloc_command(
         self,
@@ -943,7 +1544,24 @@ class SpurCluster:
         requirement = f"phase {phase}"
         if active_controllers is not None:
             requirement += f" with active controllers {active_controllers}"
-        raise TimeoutError(f"k0s did not reach {requirement} within {timeout}s:\n{last}")
+        raise TimeoutError(
+            f"k0s did not reach {requirement} within {timeout}s:\n{last}\n{self.k0s_log_context()}"
+        )
+
+    def k0s_log_context(self) -> str:
+        """Controller-log lines about k0s, join tokens, Raft and leadership, for a
+        wait that timed out. Reports a failed read instead of raising so the
+        caller's own error is never replaced."""
+        path = f"{self.log_dir}/spurctld.log"
+        if not self.nodes[0].is_alive():
+            return "spurctld.log unavailable (session down)"
+        try:
+            log = self.nodes[0].exec_allow_fail(f"tail -n {K0S_LOG_SCAN_LINES} '{path}'",
+                                                timeout=DIAGNOSTICS_TIMEOUT_S)
+        except (SshConnectionLost, *SshNode._CONNECTION_ERRORS) as err:
+            return f"spurctld.log unavailable ({type(err).__name__}: {err})"
+        lines = filter_k0s_log(log)
+        return f"spurctld.log (last {K0S_LOG_LINES} k0s/join-token/raft/leader/stop lines):\n{lines}"
 
     def etcd_member_count(self) -> int:
         """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
@@ -970,6 +1588,9 @@ class SpurCluster:
             if last >= count:
                 return last
             time.sleep(3)
+        # Callers assert on the count, so report the context here rather than raise.
+        logger.warning("etcd did not reach %d members within %ds (last seen %d)\n%s",
+                       count, timeout, last, self.k0s_log_context())
         return last
 
     def sacct(self, args: list[str]) -> str:
@@ -1083,6 +1704,17 @@ class SpurCluster:
             pid = node.exec(cmd).strip()
             logger.info("spurauthd started on %s (pid %s)", name, pid)
 
+    def collect_diagnostics(self, max_lines: int = 200, *, k0s: bool = False,
+                            budget: DiagnosticsBudget | None = None,
+                            indices: list[int] | None = None) -> dict[str, str]:
+        """Log tails and node state from every node (or only those at *indices*),
+        keyed ``"<name> (<host>)"``. Never raises, so it is safe from a failure hook
+        or a fixture teardown."""
+        picked = range(len(self.nodes)) if indices is None else indices
+        nodes = [self.nodes[i] for i in picked]
+        names = [self.node_names[i] if i < len(self.node_names) else self.nodes[i].host for i in picked]
+        return collect_node_diagnostics(nodes, names, self.log_dir, max_lines, k0s, budget)
+
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
         lines = [f"=== DEBUG job {job_id} ==="]
@@ -1148,9 +1780,7 @@ class SpurCluster:
     def root_agent_preflight(self):
         """Verify passwordless (or password-backed) sudo for rootful spurd. Skips if not."""
         for i, node in enumerate(self.nodes):
-            try:
-                node.exec(f"{self._sudo_prefix()}true")
-            except RuntimeError:
+            if not has_sudo(node, self._sudo_prefix()):
                 pytest.skip(
                     f"rootful spurd requires sudo on {self.node_names[i]} "
                     f"(set SPUR_TEST_SSH_PASSWORD or configure NOPASSWD sudo)"
@@ -1313,7 +1943,8 @@ class SpurCluster:
         mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
         for node in self.nodes:
             node.exec(
-                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}",
+                timeout=FIXTURE_BUILD_TIMEOUT_S,
             )
             if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
@@ -1365,7 +1996,7 @@ class SpurCluster:
             f"-I{shlex.quote(rocm_include)} -D__HIP_PLATFORM_AMD__ -lrccl"
         )
         for node in self.nodes:
-            node.exec(build)
+            node.exec(build, timeout=FIXTURE_BUILD_TIMEOUT_S)
         return remote_bin
 
     def restart_agent(self, node_index: int = 0):
@@ -1591,7 +2222,8 @@ tar -C "$R" -czf '{local_tar}' .
         image_dir = f"{self.remote_dir}/images/{slug}"
         node.exec(f"mkdir -p '{image_dir}'")
         node.exec(
-            f"SPUR_IMAGE_DIR='{image_dir}' '{self.bin_dir}/spur' image import {shlex.quote(uri)}"
+            f"SPUR_IMAGE_DIR='{image_dir}' '{self.bin_dir}/spur' image import {shlex.quote(uri)}",
+            timeout=IMAGE_IMPORT_TIMEOUT_S,
         )
         images = node.exec(f"ls '{image_dir}'/*.sqsh").split()
         if len(images) != 1:
@@ -2060,6 +2692,11 @@ def node_reserved_cpus(show_node: str) -> tuple[int, set[int]]:
 # --- Job helpers ---
 
 
+def parse_cleanup_records(output: str) -> list[dict]:
+    """Parse spurd pending-cleanup records printed one JSON object per line."""
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
 def parse_job_id(sbatch_output: str) -> int | None:
     """Extract job ID from sbatch output like 'Submitted batch job 42'."""
     parts = sbatch_output.split()
@@ -2171,19 +2808,35 @@ def retry_until_qos_ready(submit, timeout: int = 15) -> str:
         return out
 
 
+_QUEUE_TAIL_LINES = 40
+
+
+def _timeout_with_queue(headline: str, queue_output: str | None) -> TimeoutError:
+    """A TimeoutError whose first line is *headline*, followed by the last
+    queue listing polled, so a failure shows what the scheduler was doing."""
+    if queue_output is None:
+        return TimeoutError(headline)
+    tail = "\n".join(queue_output.rstrip("\n").splitlines()[-_QUEUE_TAIL_LINES:])
+    return TimeoutError(f"{headline}\n{tail}")
+
+
 def wait_job_state(
     cluster: SpurCluster, job_id: int, state: str, timeout: int = 120
 ) -> None:
     """Wait until the job reaches the given squeue state (e.g. PD, R)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        sq = cluster.squeue_all()
-        if job_state(sq, job_id) == state:
-            return
-        time.sleep(2)
-    raise TimeoutError(
-        f"Job {job_id} did not reach state {state} within {timeout}s"
-    )
+    last_queue = None
+
+    def reached():
+        nonlocal last_queue
+        last_queue = cluster.squeue_all()
+        return job_state(last_queue, job_id) == state
+
+    try:
+        wait_until(reached, timeout_s=timeout, interval_s=2)
+    except TimeoutError:
+        raise _timeout_with_queue(
+            f"Job {job_id} did not reach state {state} within {timeout}s", last_queue
+        ) from None
 
 
 def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
@@ -2192,26 +2845,47 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     Returns "GONE" if the job disappears from the queue after being seen.
     Raises TimeoutError if the job doesn't finish within the timeout.
     """
-    deadline = time.time() + timeout
     last = ""
     seen = False
-    while time.time() < deadline:
-        sq = cluster.squeue_all()
-        state = job_state(sq, job_id)
+    last_queue = None
+
+    def finished():
+        nonlocal last, seen, last_queue
+        last_queue = cluster.squeue_all()
+        state = job_state(last_queue, job_id)
         if state in _TERMINAL_STATE_CODES:
             return state
         if state is None:
-            if seen:
-                return last if last else "GONE"
-            # Job not visible yet — give scheduler a moment
-            time.sleep(1)
-            continue
+            # A job not yet visible is still being registered by the scheduler.
+            return (last if last else "GONE") if seen else None
         seen = True
         last = state
-        time.sleep(2)
-    raise TimeoutError(
-        f"Job {job_id} did not finish within {timeout}s (last state: {last})"
-    )
+        return None
+
+    try:
+        return wait_until(finished, timeout_s=timeout, interval_s=2)
+    except TimeoutError:
+        raise _timeout_with_queue(
+            f"Job {job_id} did not finish within {timeout}s (last state: {last})",
+            last_queue,
+        ) from None
+
+
+def wait_job_id_by_name(cluster: SpurCluster, name: str, timeout: int = 30) -> int:
+    """Wait until a job named *name* is in the queue (any state) and return its id.
+
+    Submission can return before the job is visible or scheduled, so callers
+    that look a job up by name must poll rather than sleep."""
+    def first_id():
+        out = cluster.squeue(["-n", name, "-t", "all", "-h", "-o", "%i"])
+        for line in out.splitlines():
+            fields = line.split()
+            if fields and fields[0].isdigit():
+                return int(fields[0])
+        return None
+
+    return wait_until(first_id, timeout_s=timeout, interval_s=1,
+                      desc=f"a job named {name} to appear in the queue")
 
 
 def wait_sacct_row(cluster: SpurCluster, job_id: int, fmt: str,

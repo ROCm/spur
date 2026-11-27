@@ -176,6 +176,7 @@ jobs:
     runs-on: [self-hosted, spur-e2e, "${{ matrix.pool }}"]
     needs: mark-skipped
     if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
+    timeout-minutes: 90
     permissions:
       contents: read
       actions: read
@@ -199,7 +200,7 @@ jobs:
           - { pool: non-gpu, selector: "not gpu", shard_id: 11, shard_count: 12 }
     env:
       # LogLevel=ERROR silences the known-hosts warning from UserKnownHostsFile=/dev/null.
-      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
       RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-${{ matrix.pool }}-${{ matrix.shard_id }}
       SHARD_ID: ${{ matrix.shard_id }}
       SHARD_COUNT: ${{ matrix.shard_count }}
@@ -272,6 +273,22 @@ jobs:
               echo "ERROR: $ip not reachable after 180s" >&2
               exit 1
             fi
+            # sshd answers before cloud-init finishes; its final stage can still touch the VM.
+            # Exit 2 is "done, recoverable errors" (degraded) and is tolerated; 1 is a hard error.
+            echo "Waiting for cloud-init on $ip..."
+            rc=0
+            ssh $SSH_OPTS -o ConnectTimeout=10 -o BatchMode=yes \
+              -i "$KEY" ci@"$ip" "timeout 300 cloud-init status --wait" || rc=$?
+            case "$rc" in
+              0) echo "  $ip cloud-init done" ;;
+              2) echo "::warning::cloud-init on $ip finished degraded (recoverable errors)" ;;
+              *)
+                echo "ERROR: cloud-init on $ip did not finish cleanly (exit $rc; 124 = still running after 300s, 255 = ssh failed)" >&2
+                ssh $SSH_OPTS -o ConnectTimeout=10 -o BatchMode=yes \
+                  -i "$KEY" ci@"$ip" "cloud-init status --long" >&2 || true
+                exit 1
+                ;;
+            esac
           done
 
       - name: Push artifacts into driver VM
@@ -368,6 +385,47 @@ jobs:
           exit \$rc
           REMOTE
 
+      # Only ssh into the VMs and run fixed commands there; output stays plain text on the runner.
+      - name: Dump node diagnostics
+        if: failure() || cancelled()
+        env:
+          KEY: ${{ steps.ssh.outputs.privkey }}
+          DRIVER_IP: ${{ steps.cluster.outputs.driver_ip }}
+          NODE_IPS: ${{ steps.cluster.outputs.node_ips }}
+        run: |
+          OUT="${RUN_DIR}/e2e-results/node-diagnostics"
+          mkdir -p "$OUT"
+          SCRIPT=$(mktemp /tmp/node-diag-XXXXXX.sh)
+          cat > "$SCRIPT" <<'REMOTE'
+          set -u
+          section() { printf '\n===== %s =====\n' "$1"; }
+          for f in /tmp/spur-e2e-[0-9]*-[0-9]*/log/*.log; do
+            [ -f "$f" ] || continue
+            section "$f (last 200 lines)"
+            tail -n 200 "$f"
+          done
+          section uptime
+          uptime
+          section "cloud-init status"
+          timeout 20 cloud-init status --long 2>&1
+          section "ip -br addr"
+          ip -br addr 2>&1
+          section "ip route"
+          ip route 2>&1
+          section "iptables -S"
+          timeout 20 sudo -n iptables -S 2>&1
+          section "dmesg (last 100 lines)"
+          timeout 20 sudo -n dmesg 2>&1 | tail -n 100
+          section "journalctl -u ssh (last 100 lines)"
+          timeout 20 sudo -n journalctl -u ssh --no-pager -n 100 2>&1
+          REMOTE
+          IFS=',' read -ra NODES <<< "$NODE_IPS"
+          for ip in "$DRIVER_IP" "${NODES[@]}"; do
+            timeout 180 ssh $SSH_OPTS -o ConnectTimeout=10 -o BatchMode=yes \
+              -i "$KEY" ci@"$ip" bash -s < "$SCRIPT" > "$OUT/diag-${ip}.txt" 2>&1 || true
+          done
+          rm -f "$SCRIPT"
+
       - name: Collect results from driver VM
         if: always()
         env:
@@ -380,11 +438,12 @@ jobs:
 
       - name: Upload test results
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-results-native-${{ matrix.pool }}-${{ matrix.shard_id }}
           path: ${{ env.RUN_DIR }}/e2e-results/
-          retention-days: 3
+          retention-days: 14
           if-no-files-found: ignore
 
       - name: Tear down ephemeral VM cluster
@@ -409,11 +468,12 @@ jobs:
     runs-on: [self-hosted, spur-e2e, non-gpu]
     needs: mark-skipped
     if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
+    timeout-minutes: 90
     permissions:
       contents: read
       actions: read
     env:
-      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
       RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-k8s
     steps:
       - name: Download release binaries
@@ -490,6 +550,22 @@ jobs:
               echo "ERROR: $ip not reachable after 180s" >&2
               exit 1
             fi
+            # sshd answers before cloud-init finishes; its final stage can still touch the VM.
+            # Exit 2 is "done, recoverable errors" (degraded) and is tolerated; 1 is a hard error.
+            echo "Waiting for cloud-init on $ip..."
+            rc=0
+            ssh $SSH_OPTS -o ConnectTimeout=10 -o BatchMode=yes \
+              -i "$KEY" ci@"$ip" "timeout 300 cloud-init status --wait" || rc=$?
+            case "$rc" in
+              0) echo "  $ip cloud-init done" ;;
+              2) echo "::warning::cloud-init on $ip finished degraded (recoverable errors)" ;;
+              *)
+                echo "ERROR: cloud-init on $ip did not finish cleanly (exit $rc; 124 = still running after 300s, 255 = ssh failed)" >&2
+                ssh $SSH_OPTS -o ConnectTimeout=10 -o BatchMode=yes \
+                  -i "$KEY" ci@"$ip" "cloud-init status --long" >&2 || true
+                exit 1
+                ;;
+            esac
           done
 
       - name: Bootstrap k8s cluster
@@ -586,11 +662,12 @@ jobs:
 
       - name: Upload test results
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-results-k8s
           path: ${{ env.RUN_DIR }}/e2e-results/
-          retention-days: 3
+          retention-days: 14
           if-no-files-found: ignore
 
       - name: Tear down ephemeral VM cluster
