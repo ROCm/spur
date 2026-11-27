@@ -77,7 +77,10 @@ replaces the first. Matches Slurm.
 `scontrol create/update/delete partition`. Runtime changes are persisted
 through Raft and survive restarts.
 
-**scontrol show** output is always multi-line `Key=Value`; no `--oneliner`.
+**scontrol show** `-o`/`--oneliner` collapses each
+job/node/partition/reservation record onto one line (`collapse_record`); every
+other entity accepts and ignores it, unlike Slurm, which also applies it to
+`topology` and `assoc_mgr`.
 `NodeList=(null)` on pending jobs (not omitted). `ReqTRES` omits Slurm's
 `billing=` component. `StartTime` shows projected start for pending jobs (check
 `JobState` instead of `StartTime != N/A`).
