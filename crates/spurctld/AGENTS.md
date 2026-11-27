@@ -2,7 +2,7 @@
 
 Raft, snapshot, forwarding (`PassthroughCodec`), and WAL recovery details live in
 `docs/knowledge/consensus/raft.md`. Auth tiers are in `docs/knowledge/security/auth-model.md`.
-Accounting schema, migrations, and bring-up are in `docs/knowledge/accounting/accounting.md`.
+Accounting migrations, bring-up, and outage semantics are in `docs/knowledge/accounting/accounting.md`.
 
 ## Invariants
 

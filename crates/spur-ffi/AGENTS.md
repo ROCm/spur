@@ -1,8 +1,8 @@
 # AGENTS.md -- spur-ffi
 
 C FFI shim (`libspur_compat.so`) exporting Slurm-named `extern "C"` functions
-that forward to `spurctld` over gRPC. Surface, type mappings, and the
-controller address are in `docs/knowledge/common/slurm-compatibility.md`.
+that forward to `spurctld` over gRPC. The FFI contract and the controller
+address are in `docs/knowledge/common/slurm-compatibility.md`.
 
 ## Pitfalls
 

@@ -36,7 +36,7 @@ Each crate has an `AGENTS.md` with crate-local rules. Read it before editing tha
 
 The knowledge base is `docs/knowledge/<area>/*.md` (cross-crate) plus each crate's `AGENTS.md` (crate-local). It is for agents and maintainers; user-facing docs live in `docs/`.
 
-- **What belongs in a crate `AGENTS.md`**: invariants, pitfalls, cross-file/cross-crate coupling ("change X, also change Y"), design rationale not visible in code, and non-default test requirements. Not restatements of code: no module trees, API/type tables, enum variant lists, constant values, counts, or dependency lists.
+- **What belongs**: invariants, pitfalls, cross-file/cross-crate coupling ("change X, also change Y"), cross-component flows where ordering matters, design rationale not visible in code, and non-default test requirements. Not restatements of code: no module trees, API/type/RPC tables, enum variant lists, constant values, counts, or dependency lists. Not copies of user docs: point to the `docs/` page instead.
 - **When**: update in the same PR when you change an invariant, protocol, persisted format, state machine, or architectural boundary the KB describes.
 - **Where**: crate-local facts in that crate's `AGENTS.md`, cross-crate facts in the matching `docs/knowledge/<area>/` file. State each fact once and link to it elsewhere.
 - **How**: edit in place, present tense. Name symbols (e.g. `RAFT_MAX_MESSAGE_SIZE`) so drift is greppable. Delete stale claims; no "update:"/"previously" notes, history, or issue/PR numbers.

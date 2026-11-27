@@ -36,7 +36,7 @@ Shared types for every other crate. General WAL schema rules are in root
 ## Resources and core layout
 
 - Device allocation keys on `stable_id`, never the positional `Device.index` (see [gpu-discovery.md](../../docs/knowledge/devices/gpu-discovery.md)). Comparing positions across allocation boundaries double-books devices after a mid-set removal.
-- A gres a node reports devices for is allocated by id (`allocates_by_id`); any other gres draws on the countable `generic` pool. In `ResourceSet::holds`, a count-only `{device_id: 0}` hold from builds before NICs were reported by id counts as anonymous, but for GPUs (always by id) an unknown id, 0 included, means the node offers none of that kind until the job ends.
+- A gres a node reports devices for is allocated by id (`allocates_by_id`); any other gres draws on the countable `generic` pool. In `ResourceSet::holds`, a count-only `{device_id: 0}` hold from builds before NICs were reported by id counts as anonymous; the GPU unknown-id rule is in [gpu-discovery.md](../../docs/knowledge/devices/gpu-discovery.md#5-repartition-and-renumbering-safety).
 - At most one GPU request form (total, per-node, per-task) may be set; a `gpu:` entry in `gres` counts as implicit per-node (`resolve_gpu_demand()`).
 - `CoreLayout::compute()` keeps a GPU's previous `reserved_picks` while still valid; if that sticky fill cannot fit every GPU, all GPUs are re-picked fresh.
 - `CoreLayout::fingerprint()` is a wire value the agent compares against its held layout, so its encoding must stay stable across builds. `0` means "no layout held" and must never be produced by a layout.
