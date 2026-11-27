@@ -634,6 +634,10 @@ async fn process_assignment_inner(
             return false;
         }
     }
+    if let Err(refusal) = crate::container_mounts::require_tmpfs_support(&spec, &placement_nodes) {
+        refuse_run_placement(&cluster, &job, refusal);
+        return false;
+    }
 
     // Run PrologSlurmctld before any node is touched. In Slurm it gates node
     // access: a failure must abort admission before allocations are registered,
@@ -3630,7 +3634,7 @@ fn refuse_run_placement(
                 run_attempt,
                 spare_requeue_budget,
             ) {
-                error!(job_id, error = %e, "failed to back off for an agent without script placement");
+                error!(job_id, error = %e, "failed to back off for an agent too old for this run");
             }
         }
     }

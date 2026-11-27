@@ -8,6 +8,7 @@ mod audit;
 mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
+mod container_mounts;
 mod dispatch_tracker;
 mod fairshare_cache;
 mod hooks;

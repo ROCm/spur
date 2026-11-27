@@ -3587,9 +3587,7 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        if let Some(c) = req.container.as_mut() {
-            c.mounts = container_mounts_for(&c.image, std::mem::take(&mut c.mounts))?;
-        }
+        normalize_step_mounts(req.container.as_mut())?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -3623,6 +3621,11 @@ impl SlurmController for ControllerService {
             Status::unavailable(format!("node {target_node} is not currently registered"))
         })?;
         let node_addr = node_comm_socket(&node, &target_node)?;
+        refuse_tmpfs_on_old_agent(
+            resolve_step_container(req.container.clone(), &job.spec).as_ref(),
+            &node,
+            &target_node,
+        )?;
 
         let step_id = self.cluster.allocate_step_id(job_id);
 
@@ -4318,6 +4321,8 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
+        normalize_step_mounts(req.container.as_mut())?;
+
         // Not allocated_nodes: a node that already reported has finished its part
         // of the job, and may already belong to another one.
         let running_nodes = job.running_nodes();
@@ -4404,6 +4409,7 @@ impl SlurmController for ControllerService {
                             continue;
                         }
                     };
+                    refuse_tmpfs_on_old_agent(step_container.as_ref(), &node, &node_name)?;
                     if step_takes_own_share(req.resources.as_ref())
                         && !node.supports(spur_core::node::CAP_STEP_RESOURCES)
                     {
@@ -5880,6 +5886,32 @@ fn container_mounts_for(image: &str, mounts: Vec<String>) -> Result<Vec<String>,
     }
     spur_core::container_mount::normalize(&mounts)
         .map_err(|e| Status::invalid_argument(format!("--container-mounts: {e}")))
+}
+
+/// Refuses a step's mounts at the controller, so the step is never recorded and the
+/// agent is never the first to find the list invalid.
+fn normalize_step_mounts(container: Option<&mut ContainerSpec>) -> Result<(), Status> {
+    let Some(container) = container else {
+        return Ok(());
+    };
+    container.mounts =
+        container_mounts_for(&container.image, std::mem::take(&mut container.mounts))?;
+    Ok(())
+}
+
+/// An agent that predates tmpfs mounts drops the entry and runs the step without it.
+fn refuse_tmpfs_on_old_agent(
+    container: Option<&ContainerSpec>,
+    node: &spur_core::node::Node,
+    node_name: &str,
+) -> Result<(), Status> {
+    let wants = container.is_some_and(|c| spur_core::container_mount::wants_tmpfs(&c.mounts));
+    if !wants || node.supports(spur_core::node::CAP_CONTAINER_TMPFS) {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "a tmpfs mount needs a newer spurd than the one on {node_name}: upgrade spurd on {node_name}"
+    )))
 }
 
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
@@ -19485,6 +19517,57 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("'/b:/b:z'"), "{}", err.message());
         assert_eq!(svc.cluster.get_steps(job_id).len(), steps_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_refuses_a_bad_mount_before_the_step_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let steps_before = svc.cluster.get_steps(job_id).len();
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                user: "ubuntu".into(),
+                container: Some(ContainerSpec {
+                    image: "img.sqsh".into(),
+                    mounts: vec!["/a:/a,/b:/b:z".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a step mount that does not parse must be refused");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("'/b:/b:z'"), "{}", err.message());
+        assert_eq!(svc.cluster.get_steps(job_id).len(), steps_before);
+    }
+
+    #[test]
+    fn a_step_with_a_tmpfs_mount_is_refused_on_an_agent_without_tmpfs() {
+        let container = |mounts: &[&str]| ContainerSpec {
+            image: "img.sqsh".into(),
+            mounts: mounts.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
+        };
+        let old = spur_core::node::Node::new("n1".into(), Default::default());
+        let mut current = spur_core::node::Node::new("n2".into(), Default::default());
+        current.capabilities = vec![spur_core::node::CAP_CONTAINER_TMPFS.into()];
+        let tmpfs = container(&["/a:/a,tmpfs:/cache"]);
+
+        let err = refuse_tmpfs_on_old_agent(Some(&tmpfs), &old, "n1").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("upgrade spurd on n1"),
+            "{}",
+            err.message()
+        );
+        assert!(refuse_tmpfs_on_old_agent(Some(&tmpfs), &current, "n2").is_ok());
+        assert!(refuse_tmpfs_on_old_agent(Some(&container(&["/a:/a"])), &old, "n1").is_ok());
+        assert!(refuse_tmpfs_on_old_agent(None, &old, "n1").is_ok());
     }
 
     #[test]

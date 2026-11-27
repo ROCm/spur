@@ -617,6 +617,7 @@ impl NodeReporter {
                 spur_core::node::CAP_SIGNAL_JOB.into(),
                 spur_core::node::CAP_STEP_RESOURCES.into(),
                 spur_core::node::CAP_SCRIPT_PLACEMENT.into(),
+                spur_core::node::CAP_CONTAINER_TMPFS.into(),
             ],
             agent_instance: self.agent_instance.clone(),
         }
@@ -3170,6 +3171,7 @@ mod tests {
                 "signal-job".to_string(),
                 "step-resources".to_string(),
                 "script-placement".to_string(),
+                "container-tmpfs".to_string(),
             ]
         );
     }
