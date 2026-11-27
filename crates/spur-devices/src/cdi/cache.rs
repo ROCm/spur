@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::cdi::spec::{CdiDevice, CdiSpec};
+use crate::discovery::NicLog;
 use crate::registry::entry::kind_to_gres_name;
 
 pub const DEFAULT_SPEC_DIRS: &[&str] = &["/etc/cdi", "/var/run/cdi"];
@@ -50,6 +51,7 @@ impl std::fmt::Display for CacheErrors {
 pub struct CdiCache {
     devices: HashMap<String, CachedDevice>,
     errors: CacheErrors,
+    discovered_kinds: HashSet<String>,
     skipped_discovery: BTreeSet<String>,
 }
 
@@ -58,17 +60,30 @@ impl CdiCache {
         Self {
             devices: HashMap::new(),
             errors: CacheErrors::default(),
+            discovered_kinds: HashSet::new(),
             skipped_discovery: BTreeSet::new(),
         }
     }
 
-    pub fn load(cdi_spec_dirs: &[String], auto_detect: bool) -> Self {
+    /// NIC outcomes go to `nic_log` only for kinds discovery supplied, since an
+    /// on-disk spec of a kind replaces what discovery found for it.
+    pub fn load(cdi_spec_dirs: &[String], auto_detect: bool, nic_log: &mut NicLog) -> Self {
         let mut cdi_dirs: Vec<PathBuf> = DEFAULT_SPEC_DIRS.iter().map(PathBuf::from).collect();
         for extra in cdi_spec_dirs {
             cdi_dirs.push(PathBuf::from(extra));
         }
-        let live = auto_detect.then(crate::discovery::discover_all_cdi);
-        Self::load_with(&cdi_dirs, live.as_deref())
+        let Some(mut live) = auto_detect.then(crate::discovery::discover_all_cdi) else {
+            return Self::load_with(&cdi_dirs, None);
+        };
+        let cache = Self::load_with(&cdi_dirs, Some(&live.specs));
+        live.nics.retain_kinds(cache.discovered_kinds());
+        nic_log.report(&live.nics);
+        cache
+    }
+
+    /// Kinds that came from live discovery rather than an on-disk spec.
+    pub fn discovered_kinds(&self) -> &HashSet<String> {
+        &self.discovered_kinds
     }
 
     /// Gres names live discovery found devices for but did not add, because an
@@ -117,6 +132,7 @@ impl CdiCache {
             .filter(|spec| !spec.devices.is_empty())
             .map(|spec| kind_to_gres_name(&spec.kind))
             .collect();
+        self.discovered_kinds = absent.iter().map(|spec| spec.kind.clone()).collect();
         // Before adding discovered kinds: it rewrites every cached GPU's topology.
         self.refresh_topology(&present);
         self.add_specs(&absent);
@@ -697,6 +713,26 @@ mod tests {
         );
         assert!(cache.get_device("amd.com/nic=0").is_some());
         assert!(cache.get_device("amd.com/nic=1").is_some());
+    }
+
+    #[test]
+    fn only_kinds_missing_on_disk_count_as_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut on_disk_nic = make_amd_spec(&["0"]);
+        on_disk_nic.kind = "amd.com/nic".into();
+        on_disk_nic
+            .write_json(&dir.path().join("nic.json"))
+            .unwrap();
+        let mut live_nic = make_amd_spec(&["0", "1"]);
+        live_nic.kind = "amd.com/nic".into();
+        let mut live_vnic = make_amd_spec(&["0"]);
+        live_vnic.kind = "amd.com/vnic".into();
+
+        let cache = CdiCache::load_with(&[dir.path().to_path_buf()], Some(&[live_nic, live_vnic]));
+        assert_eq!(
+            cache.discovered_kinds(),
+            &HashSet::from(["amd.com/vnic".to_string()])
+        );
     }
 
     #[test]

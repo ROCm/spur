@@ -1882,8 +1882,8 @@ pub struct ClusterPeer {
 
 /// Device discovery and CDI configuration.
 ///
-/// `auto_detect` is AMD KFD sysfs only; other vendors need on-disk CDI specs or GRES
-/// `file` entries.
+/// `auto_detect` finds AMD GPUs (KFD) and AMD Pollara AI NICs (PCI sysfs); other
+/// devices need on-disk CDI specs or GRES `file` entries.
 ///
 /// ```toml
 /// [devices]
@@ -1903,7 +1903,7 @@ pub struct ClusterPeer {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicesConfig {
-    /// Discover GPUs from KFD when the CDI cache is empty. AMD only for now.
+    /// Discover AMD GPUs and AI NICs for every kind with no on-disk CDI spec.
     #[serde(default = "default_true_fn")]
     pub auto_detect: bool,
 
@@ -2219,6 +2219,10 @@ pub struct CgroupConfig {
     /// cgroup-v2 BPF device filter. Default-deny: no allocation, pseudo-devices only.
     #[serde(default = "default_true_fn")]
     pub constrain_devices: bool,
+    /// On a node that allocates RDMA devices per job (AI NICs), withhold the
+    /// ones a job was not allocated; otherwise `/dev/infiniband` stays open.
+    #[serde(default = "default_true_fn")]
+    pub constrain_rdma_devices: bool,
     /// Extra device paths every job may open, on top of its allocation and the
     /// host-infrastructure list: the escape hatch for a site device the defaults miss.
     #[serde(default)]
@@ -2252,6 +2256,7 @@ impl Default for CgroupConfig {
             min_ram_mb: default_min_ram_mb(),
             oom_kill_job: true,
             constrain_devices: true,
+            constrain_rdma_devices: true,
             extra_device_paths: Vec::new(),
         }
     }
@@ -4162,6 +4167,18 @@ node_names = ["n[01-02]", "n01", "service-a"]
         )
         .expect("parses");
         assert!(!opted_out.cgroup.constrain_devices);
+    }
+
+    #[test]
+    fn rdma_devices_are_constrained_unless_a_config_opts_out() {
+        assert!(CgroupConfig::default().constrain_rdma_devices);
+        let upgraded = SlurmConfig::load_from_str("cluster_name = \"t\"\n[cgroup]\n").unwrap();
+        assert!(upgraded.cgroup.constrain_rdma_devices);
+        let opted_out = SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[cgroup]\nconstrain_rdma_devices = false\n",
+        )
+        .unwrap();
+        assert!(!opted_out.cgroup.constrain_rdma_devices);
     }
 
     #[test]

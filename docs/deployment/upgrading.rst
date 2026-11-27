@@ -1426,6 +1426,34 @@ fails and drains the nodes still running a copy. Its outcome is taken from the
 first node alone. Every controller applies these older entries the same way, so
 controllers on different releases never disagree about a job.
 
+RDMA device access on AI NIC nodes (``constrain_rdma_devices``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur now discovers AMD Pollara AI NICs and schedules them per job
+(:doc:`/admin-guide/ai-nics`). On a node that hands out RDMA devices per job, a
+job can open those devices only if they are allocated to it. This covers a node
+with Pollara NICs and ``auto_detect`` on, and a node with a ``[[devices.gres]]``
+entry whose files are under ``/dev/infiniband/``. RDMA nodes Spur does not
+allocate, such as ``rdma_cm`` or another vendor's HCA, stay open.
+
+**Effect:** a job on such a node that uses those NICs without requesting them,
+for example MPI over verbs, now fails to open their ``/dev/infiniband/uverbsN``
+with ``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
+as before:
+
+.. code-block:: toml
+
+   [cgroup]
+   constrain_rdma_devices = false
+
+A job that uses NCCL or RCCL may not fail at all: when it cannot open the
+verbs device, NCCL and RCCL can silently fall back to TCP sockets, which is
+much slower. Check job logs on NIC nodes after the upgrade.
+
+Other nodes are not affected. Jobs already running when ``spurd`` is upgraded
+keep the access they started with, so until they end they can still reach
+NICs the scheduler now allocates to new jobs.
+
 Generic device inventory
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1495,12 +1523,16 @@ Node inventory now lists every allocatable device, of every kind, in
   devices before the controllers, or drain those nodes first. An older
   controller does not see those devices, so it cannot allocate them, and the
   upgraded agent keeps ignoring count-only ``[[devices.gres]]`` entries of the
-  same name, so jobs that request them pend. An older agent ignores allocations
+  same name, so jobs that request them pend. On a node with Pollara NICs the
+  upgraded agent also keeps withholding their RDMA devices from jobs that were
+  not allocated them: such jobs fail to open them with ``EPERM``, or NCCL and
+  RCCL silently fall back to TCP. An older agent ignores allocations
   of device kinds other than GPUs, so a job allocated NICs before the rollback
   keeps running without them claimed on the node. If the older agent
-  rewrites a running job's state, which it does when GPU ids change, its
-  non-GPU devices are dropped from it and stay unclaimed after rolling forward.
-  Upgrade in the opposite order: controllers first.
+  rewrites a running job's state, which it does when GPU ids change, the job's
+  NICs and its RDMA restriction are dropped from it: after rolling forward,
+  other jobs can still be allocated those NICs and the job's later steps can
+  open every RDMA device. Upgrade in the opposite order: controllers first.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``. The

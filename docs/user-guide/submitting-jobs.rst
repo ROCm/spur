@@ -477,6 +477,10 @@ entry on the job:
 repeated ``--gres`` flag replaces the previous value (last wins). See
 :doc:`interactive` for what a GPU job sees at run time.
 
+On nodes with AMD AI NICs, request them alongside GPUs with
+``--gres=gpu:8,nic:8``. The job gets its NICs' RDMA devices and
+``NCCL_IB_HCA``; see :doc:`/admin-guide/ai-nics`.
+
 .. _submit-arrays:
 
 Job Arrays

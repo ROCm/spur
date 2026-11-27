@@ -7,6 +7,8 @@ Configuring and operating a Spur cluster.
   node setting, with its type, default, and meaning.
 - :doc:`rbac` — User, Coordinator, Operator, and Administrator bindings.
 - :doc:`fabric-observation` — read-only GPU fabric membership discovery and inspection.
+- :doc:`ai-nics` — scheduling AMD Pollara AI NICs per job: discovery, requests,
+  and the job's RDMA environment.
 - :doc:`accounting` — managing accounts, users, QOS, associations, and resource
   limits. Requires a PostgreSQL-backed accounting database.
 - :doc:`partition-resource-limits` — per-partition caps on the CPUs, memory,

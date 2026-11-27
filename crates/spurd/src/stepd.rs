@@ -165,6 +165,9 @@ pub struct StepdJobResources {
     pub memory_ceiling_mb: u64,
     /// Every device the job holds, by kind, as stable ids.
     pub devices: spur_devices::DeviceSelection,
+    /// RDMA nodes withheld unless allocated, fixed when the job started so its
+    /// later steps get the same device access.
+    pub gated_rdma: Vec<String>,
     /// The exact cores, so a restart replays the binding the job is pinned to
     /// instead of re-deriving one that overlaps it.
     pub cpu_ids: Vec<u32>,
@@ -195,6 +198,8 @@ struct StepdJobResourcesRepr {
     #[serde(default)]
     devices: spur_devices::DeviceSelection,
     #[serde(default)]
+    gated_rdma: Vec<String>,
+    #[serde(default)]
     cpu_ids: Vec<u32>,
     #[serde(default)]
     partition: String,
@@ -219,6 +224,7 @@ impl From<StepdJobResourcesRepr> for StepdJobResources {
             memory_mb: raw.memory_mb,
             memory_ceiling_mb: raw.memory_ceiling_mb,
             devices,
+            gated_rdma: raw.gated_rdma,
             cpu_ids: raw.cpu_ids,
             partition: raw.partition,
             nodelist: raw.nodelist,
@@ -238,6 +244,7 @@ impl From<StepdJobResources> for StepdJobResourcesRepr {
             memory_ceiling_mb: r.memory_ceiling_mb,
             gpu_devices: r.devices.gpus().to_vec(),
             devices: r.devices,
+            gated_rdma: r.gated_rdma,
             cpu_ids: r.cpu_ids,
             partition: r.partition,
             nodelist: r.nodelist,
@@ -302,6 +309,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 memory_mb: config.memory_mb,
                 memory_ceiling_mb: config.memory_ceiling_mb,
                 devices: config.devices.clone(),
+                gated_rdma: config.gated_rdma.clone(),
                 cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
@@ -351,6 +359,7 @@ impl StepdLaunchSpec {
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
+            gated_rdma: self.resources.gated_rdma.clone(),
             memlock: self.memlock.into(),
             io_mode: self.io_mode,
             pmix_multi_task: self.pmix_multi_task,
@@ -4228,6 +4237,7 @@ mod device_state_compat {
             devices: spur_devices::DeviceSelection::new()
                 .with("gpu", vec![0x110000])
                 .with("nic", vec![0x050000]),
+            gated_rdma: vec!["/dev/infiniband/uverbs0".into()],
             ..Default::default()
         }
     }
@@ -4263,6 +4273,10 @@ mod device_state_compat {
             serde_json::from_str(FROZEN_GPU_DESCRIPTOR_JSON).expect("older descriptor.json");
 
         assert_eq!(d.resources.devices.gpus(), &[0x110000, 0x120000]);
+        assert!(
+            d.resources.gated_rdma.is_empty(),
+            "a job started before RDMA gating keeps RDMA open"
+        );
         let binding = d
             .resources
             .gpu_binding
@@ -4752,6 +4766,19 @@ mod tests {
         assert_eq!(
             spec.into_launch_config().io_mode,
             crate::executor::LaunchIo::Pty
+        );
+    }
+
+    #[test]
+    fn a_relaunched_supervisor_keeps_withholding_rdma() {
+        let mut config = launch_spec().into_launch_config();
+        config.gated_rdma = vec!["/dev/infiniband/uverbs0".to_string()];
+        let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
+        let persisted: StepdLaunchSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(
+            persisted.into_launch_config().gated_rdma,
+            ["/dev/infiniband/uverbs0"]
         );
     }
 
