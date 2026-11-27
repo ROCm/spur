@@ -849,6 +849,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    While its victims run out their grace or drain, and for the post-release
    passes, the preemptor also keeps its share of its QOS and account
    ``grptres`` caps, so another job under the same cap can't take that room.
+   The claim ends if its node list, exclusions or partitions
+   rule out all of the nodes being freed or held for it.
 
    A handoff whose victims are still running out a grace, or draining after
    cancel preemption, survives a controller restart. Once a requeue takes effect, its

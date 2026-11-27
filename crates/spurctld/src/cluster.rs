@@ -6430,6 +6430,8 @@ impl ClusterManager {
                 HashSet::new()
             } else {
                 let node_list: Vec<Node> = self.nodes.read().values().cloned().collect();
+                let nodes_by_name: HashMap<_, _> =
+                    node_list.iter().map(|n| (n.name.as_str(), n)).collect();
                 candidates
                     .iter()
                     .filter(|candidate| {
@@ -6443,10 +6445,16 @@ impl ClusterManager {
                                 )
                             })
                         });
-                        let earmarked = freed_by_owner.get(&id).is_some_and(|nodes| {
-                            nodes
+                        let earmarked = freed_by_owner.get(&id).is_some_and(|freed| {
+                            let placement =
+                                spur_sched::node_match::NodePlacement::new(&candidate.job);
+                            freed
                                 .iter()
-                                .any(|node| job_requests_node(&candidate.job, node, &node_list))
+                                .filter_map(|name| nodes_by_name.get(name.as_str()))
+                                .any(|node| {
+                                    placement.allows_name(&node.name)
+                                        && placement.in_partition(node)
+                                })
                         });
                         drains || earmarked
                     })
@@ -11799,23 +11807,6 @@ enum GateOutcome {
     /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
     /// to bypass tagging in any other gate.
     DropUntagged,
-}
-
-/// Whether `node` is a node this pending job could be placed on: named directly
-/// in its `--nodelist`, or part of a partition it requested. Mirrors the
-/// node-overlap scoping of `preempt_overlaps_pending_nodes` for a single node.
-fn job_requests_node(job: &Job, node: &str, nodes: &[Node]) -> bool {
-    if let Some(ref nodelist) = job.spec.nodelist {
-        return nodelist.split(',').map(str::trim).any(|n| n == node);
-    }
-    let partitions: Vec<&str> = requested_partition_names(job.spec.partition.as_deref()).collect();
-    nodes.iter().any(|n| {
-        n.name == node
-            && (partitions.is_empty()
-                || partitions
-                    .iter()
-                    .any(|p| n.partitions.iter().any(|np| np == p)))
-    })
 }
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
@@ -33518,6 +33509,25 @@ state = "UP"
             "the cap refuses {sibling}"
         );
         assert!(pass.started().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excluding_the_earmarked_node_releases_the_preemptors_grp_node_claim() {
+        let dir = TempDir::new().unwrap();
+        let (cm, preemptor, sibling) = preemptor_with_earmarked_node(&dir).await;
+        cm.update_job(
+            preemptor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("n2".into()),
+        )
+        .unwrap();
+
+        assert_eq!(one_pass(&cm).started(), vec![sibling]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
