@@ -66,7 +66,7 @@ toml = "1.1"
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono"] }
 # Consensus
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.10", features = ["serde"] }
 
 # K8s
 kube = { version = "5.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "ws"] }
