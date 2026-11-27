@@ -699,7 +699,7 @@ pub struct ClusterManager {
     boot_epoch: AtomicU64,
     /// When each node was last asked to re-register, and for which layout.
     layout_reregister_asked: parking_lot::Mutex<HashMap<String, (std::time::Instant, u64)>>,
-    propose_timeout: std::time::Duration,
+    propose_timeout_ms: AtomicU64,
     accounting: RwLock<Option<AccountingNotifier>>,
     billing_weights:
         RwLock<Option<std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>>>,
@@ -1245,7 +1245,7 @@ impl ClusterManager {
             raft: RwLock::new(None),
             boot_epoch: AtomicU64::new(0),
             layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
-            propose_timeout: PROPOSE_TIMEOUT,
+            propose_timeout_ms: AtomicU64::new(PROPOSE_TIMEOUT.as_millis() as u64),
             accounting: RwLock::new(None),
             billing_weights: RwLock::new(None),
             fairshare_cache,
@@ -7515,7 +7515,7 @@ impl ClusterManager {
             .ok_or_else(|| anyhow::anyhow!("Raft is not initialized"))?;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                tokio::time::timeout(self.propose_timeout, async {
+                tokio::time::timeout(self.propose_timeout(), async {
                     // Relies on OpenRaft 0.9 sending metrics on every core-loop pass (guarded by
                     // tests); a read index would miss an appended but uncommitted earlier write.
                     let mut metrics = raft.metrics();
@@ -8903,6 +8903,16 @@ impl ClusterManager {
         // job leaving the running set frees its licenses automatically.
     }
 
+    fn propose_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.propose_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    fn set_propose_timeout(&self, timeout: std::time::Duration) {
+        self.propose_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
+    }
+
     #[allow(clippy::result_large_err)]
     fn propose(&self, mut op: WalOperation) -> anyhow::Result<ClientResponse> {
         // Stamped at the one chokepoint into the log rather than at each call
@@ -8913,7 +8923,7 @@ impl ClusterManager {
             .read()
             .clone()
             .expect("raft must be set before propose is called");
-        let limit = self.propose_timeout;
+        let limit = self.propose_timeout();
         let mut write: PendingWrite = Box::pin(async move {
             raft.client_write(op)
                 .await
@@ -14434,8 +14444,8 @@ pub(crate) mod gated {
     use spur_core::wal::WalOperation;
     use tempfile::TempDir;
 
-    use super::{ClusterManager, OutcomeUnknown};
-    use crate::raft::test_support::ApplyGate;
+    use super::{ClusterManager, OutcomeUnknown, PROPOSE_TIMEOUT};
+    use crate::raft::test_support::{ApplyGate, ClosedGate};
     use crate::raft::{ClientResponse, StateMachineApply};
 
     struct GatedApplier {
@@ -14456,11 +14466,37 @@ pub(crate) mod gated {
         }
     }
 
-    /// A single-node cluster whose applies can be held, with a short propose timeout.
-    pub(crate) async fn cluster(
-        dir: &TempDir,
-        config: SlurmConfig,
-    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+    /// Holds the cluster's applies while closed. Writes time out fast only while it is
+    /// closed, so a slow runner can't time out the writes around it.
+    pub(crate) struct Gate {
+        apply: Arc<ApplyGate>,
+        cm: Arc<ClusterManager>,
+    }
+
+    pub(crate) struct ClosedWrites {
+        _gate: ClosedGate,
+        cm: Arc<ClusterManager>,
+    }
+
+    impl Gate {
+        pub(crate) fn close(&self) -> ClosedWrites {
+            self.cm
+                .set_propose_timeout(std::time::Duration::from_millis(200));
+            ClosedWrites {
+                _gate: self.apply.close(),
+                cm: self.cm.clone(),
+            }
+        }
+    }
+
+    impl Drop for ClosedWrites {
+        fn drop(&mut self) {
+            self.cm.set_propose_timeout(PROPOSE_TIMEOUT);
+        }
+    }
+
+    /// A single-node cluster whose applies can be held.
+    pub(crate) async fn cluster(dir: &TempDir, config: SlurmConfig) -> (Arc<ClusterManager>, Gate) {
         cluster_with_config_path(dir, config, None).await
     }
 
@@ -14468,10 +14504,8 @@ pub(crate) mod gated {
         dir: &TempDir,
         config: SlurmConfig,
         path: Option<std::path::PathBuf>,
-    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
-        let mut cm = ClusterManager::new_with_config_path(config, dir.path(), path).unwrap();
-        cm.propose_timeout = std::time::Duration::from_millis(200);
-        let cm = Arc::new(cm);
+    ) -> (Arc<ClusterManager>, Gate) {
+        let cm = Arc::new(ClusterManager::new_with_config_path(config, dir.path(), path).unwrap());
         let gate = Arc::new(ApplyGate::default());
         let applier = Arc::new(GatedApplier {
             inner: cm.clone(),
@@ -14487,11 +14521,27 @@ pub(crate) mod gated {
             .await
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
+        let gate = Gate {
+            apply: gate,
+            cm: cm.clone(),
+        };
         (cm, gate)
     }
 
     pub(crate) fn late(err: &anyhow::Error) -> Option<&OutcomeUnknown> {
         err.downcast_ref::<OutcomeUnknown>()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_time_out_fast_only_while_the_gate_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap();
+        let (cm, gate) = cluster(&dir, config).await;
+        assert_eq!(cm.propose_timeout(), PROPOSE_TIMEOUT);
+        let closed = gate.close();
+        assert_eq!(cm.propose_timeout(), std::time::Duration::from_millis(200));
+        drop(closed);
+        assert_eq!(cm.propose_timeout(), PROPOSE_TIMEOUT);
     }
 }
 
