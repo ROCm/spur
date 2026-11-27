@@ -1440,13 +1440,17 @@ Node inventory now lists every allocatable device, of every kind, in
   whatever the GPUs' real links: an ``XGMI`` node reports PCIe, so treat both as
   unknown. ``memory_mb`` is derived from the device's VRAM
   (``topology.vram_bytes``).
+* **Deprecated: ``RegisterJobAllocationRequest.gpu_devices``.** Still filled
+  for this release; read ``allocated``.
 * **Raft log and snapshots.** A controller reads node inventories written by
   earlier releases, and keeps writing the old ``gpus`` list next to
   ``devices``, so you can roll back to the previous release.
 * **Agent state files.** An upgraded ``spurd`` reads the
   ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
   wrote, and writes both in a shape an older ``spurd`` reads, so a rollback
-  keeps withholding repartitioned GPUs.
+  keeps withholding repartitioned GPUs. Supervisors of running jobs keep
+  working across the upgrade and a rollback: their state still records the
+  job's GPUs in the old form.
 * **Node GRES output is aggregated.** ``Gres=`` in ``scontrol show node`` and
   ``%G`` in ``sinfo`` print one ``name[:type]:count`` entry per name and type:
   GPUs first in inventory order, then other device kinds by name, then
@@ -1456,10 +1460,29 @@ Node inventory now lists every allocatable device, of every kind, in
 * **Exclusive jobs take every device.** An ``--exclusive`` job is allocated
   every device of every kind on its node, not only the GPUs. A node holding a
   device id its inventory no longer reports offers no exclusive placement until
-  the job holding it ends.
+  the job holding it ends. On a node with NICs, an exclusive job holds every
+  NIC, so jobs that need NICs wait for it.
 * **Kubernetes GPU lines.** On a Kubernetes node with
   ``spur.amd.com/gpu-memory-mb`` set, ``scontrol show node`` prints one
   ``GPUDevice=`` line per GPU, with only its type and VRAM known.
+* **File-backed GRES of any kind are schedulable.** A ``[[devices.gres]]``
+  entry with ``file`` and a name other than ``gpu`` was never reported, so jobs
+  requesting it could not run. It is now reported, allocated per device, and
+  injected like a GPU.
+* **Every injectable CDI kind is schedulable.** A node reports the devices of
+  every CDI kind it can inject, including kinds from your own specs under
+  ``/etc/cdi`` or ``/var/run/cdi``, and jobs can request them as GRES. An
+  ``--exclusive`` job is allocated and injected with all of them.
+* **Count-only pools named like discovered devices are ignored.** On a node
+  where Spur reports a kind by device (for example NICs it discovers), a
+  count-only ``[[devices.gres]]`` entry with the same name is ignored, with a
+  warning whenever the set of ignored entries changes. Remove such ``nic`` and
+  ``vnic`` entries from ``spur.conf``. A count-only ``gpu`` entry is always
+  ignored: GPUs are only scheduled by device. Once ``spurd`` has handed a kind
+  out by device, it keeps doing so until it restarts: if every device of that
+  kind disappears, the node reports none and jobs that request it pend instead
+  of falling back to the count-only entry. A restart of ``spurd`` re-evaluates
+  this.
 * **Per-GPU CPU placement is carried by every device.** A device's NUMA node
   and its ``cores=`` CPUs are reported on the generic ``Device`` (gRPC fields
   ``numa_node`` and ``affinity_cpus``) and still written to the legacy
@@ -1468,6 +1491,16 @@ Node inventory now lists every allocatable device, of every kind, in
   general pool. Set ``restricted_cores_per_gpu`` or ``def_cpu_per_gpu`` only
   after every controller and agent is upgraded; see
   :ref:`gpu-cores-upgrade-notes`.
+* **Rollback order.** Roll back the agents on nodes with NICs or other non-GPU
+  devices before the controllers, or drain those nodes first. An older
+  controller does not see those devices, so it cannot allocate them, and the
+  upgraded agent keeps ignoring count-only ``[[devices.gres]]`` entries of the
+  same name, so jobs that request them pend. An older agent ignores allocations
+  of device kinds other than GPUs, so a job allocated NICs before the rollback
+  keeps running without them claimed on the node. If the older agent
+  rewrites a running job's state, which it does when GPU ids change, its
+  non-GPU devices are dropped from it and stay unclaimed after rolling forward.
+  Upgrade in the opposite order: controllers first.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``. The

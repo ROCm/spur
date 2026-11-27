@@ -1791,7 +1791,9 @@ message RegisterJobAllocationRequest {
   uint32 gid = 5;
   uint32 cpus = 6;
   uint64 memory_mb = 7;
-  repeated string gpu_devices = 8;
+  // Deprecated: the GPU ids of `allocated`, still filled for older agents.
+  // Removed in a future release; read `allocated`.
+  repeated string gpu_devices = 8 [deprecated = true];
   ResourceAllocations allocated = 9;
   string mpi = 10;
   string work_dir = 11;

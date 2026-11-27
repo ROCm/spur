@@ -580,14 +580,18 @@ impl ResourceSet {
         } else {
             self.devices_of(gres_name).map(|d| d.stable_id).collect()
         };
-        for held in held_of_name {
-            if known.contains(&held.device_id) {
-                holds.by_id.insert(held.device_id);
-                holds.untyped += held.count.saturating_sub(1);
-            } else if held.device_id == 0 && gres_name != crate::device::GPU_GRES {
-                holds.untyped += held.count;
-            } else {
-                return None;
+        let classified = crate::device::classify_held(
+            gres_name,
+            held_of_name.iter().map(|held| (held.device_id, held.count)),
+            |id| known.contains(&id),
+        );
+        for held in classified {
+            match held {
+                crate::device::Held::Device(id) => {
+                    holds.by_id.insert(id);
+                }
+                crate::device::Held::Anonymous(count) => holds.untyped += count,
+                crate::device::Held::Unknown(_) => return None,
             }
         }
         let typed_prefix = format!("{gres_name}:");
