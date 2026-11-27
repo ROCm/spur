@@ -634,6 +634,25 @@ fn fd_path(point: &impl AsFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", point.as_fd().as_raw_fd()))
 }
 
+/// A user mount that resolves onto the entry script's directory, or one above it, would
+/// hide the script. Names are compared by what they reach, since links in the image can
+/// lead any spelling of a destination there.
+fn refuse_if_hides_entry_script(
+    rootfs: &Path,
+    point: &impl AsFd,
+    target: &str,
+) -> anyhow::Result<()> {
+    let dir = spur_core::container_mount::ENTRY_SCRIPT_DIR;
+    let root = crate::scratch::ScratchDir::open(rootfs)
+        .with_context(|| format!("open container rootfs {}", rootfs.display()))?;
+    let chain = crate::scratch::dir_chain(&root, Path::new(dir))
+        .with_context(|| format!("resolve {dir} in {}", rootfs.display()))?;
+    if chain.contains(&crate::scratch::identity(point)?) {
+        bail!("mount destination {target} resolves to {dir}, or a directory above it, which would hide the job's entry script");
+    }
+    Ok(())
+}
+
 fn bind_mount(rootfs: &Path, source: &Path, target: &str, readonly: bool) -> anyhow::Result<()> {
     bind_mount_withholding(rootfs, source, target, readonly, None)
 }
@@ -661,6 +680,7 @@ fn bind_mount_withholding(
         refuse_if_exposes(&real, &source.display().to_string(), socket)?;
     }
     let point = create_mount_target(rootfs, target, &pinned)?;
+    refuse_if_hides_entry_script(rootfs, &point, target)?;
     nix::mount::mount(
         Some(&pinned),
         &fd_path(&point),
@@ -926,6 +946,7 @@ fn tmpfs_mount(
     readonly: bool,
 ) -> anyhow::Result<()> {
     let point = mount_point_in(rootfs, target, crate::scratch::MountPoint::Dir)?;
+    refuse_if_hides_entry_script(rootfs, &point, target)?;
     let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
     if readonly {
         flags |= MsFlags::MS_RDONLY;
@@ -2016,6 +2037,55 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    fn entry_guard(rootfs: &Path, target: &str) -> anyhow::Result<()> {
+        let point = mount_point_in(rootfs, target, crate::scratch::MountPoint::Dir)?;
+        refuse_if_hides_entry_script(rootfs, &point, target)
+    }
+
+    fn assert_hides_entry_script(rootfs: &Path, target: &str) {
+        let err = format!("{:#}", entry_guard(rootfs, target).unwrap_err());
+        assert!(err.contains("entry script"), "{target} gave: {err}");
+    }
+
+    #[test]
+    fn a_link_to_the_entry_script_directory_cannot_take_a_mount() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/.spur", rootfs.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("alias", rootfs.path().join("alias2")).unwrap();
+
+        assert_hides_entry_script(rootfs.path(), "/.spur");
+        assert_hides_entry_script(rootfs.path(), "/alias");
+        assert_hides_entry_script(rootfs.path(), "/alias2");
+    }
+
+    #[test]
+    fn a_mount_over_where_the_entry_script_directory_leads_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("tmp")).unwrap();
+        std::os::unix::fs::symlink("/tmp", rootfs.path().join(".spur")).unwrap();
+
+        assert_hides_entry_script(rootfs.path(), "/tmp");
+    }
+
+    #[test]
+    fn a_mount_over_the_root_or_a_link_to_it_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/", rootfs.path().join("up")).unwrap();
+
+        assert_hides_entry_script(rootfs.path(), "/up");
+    }
+
+    #[test]
+    fn a_mount_elsewhere_is_left_alone() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("data")).unwrap();
+        std::os::unix::fs::symlink("/data", rootfs.path().join("alias")).unwrap();
+
+        for target in ["/cache", "/data", "/alias", "/data/nested"] {
+            entry_guard(rootfs.path(), target).unwrap_or_else(|e| panic!("{target}: {e:#}"));
+        }
     }
 
     #[test]

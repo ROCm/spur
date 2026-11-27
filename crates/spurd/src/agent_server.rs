@@ -3951,10 +3951,7 @@ fn build_container_launch(
             .map_err(|e| Status::internal(format!("container setup failed: {e}")))?;
 
     Ok((
-        executor::ContainerLaunchConfig {
-            config: cfg,
-            rootfs,
-        },
+        executor::ContainerLaunchConfig::new(cfg, rootfs),
         rootfs_mode,
     ))
 }
@@ -7169,12 +7166,18 @@ impl SlurmAgent for AgentService {
 
         // Validated before the credential is recorded or the previous run fenced: a
         // recorded credential's duplicate counts as launched, and a fence is final.
+        // The mount list is checked here for the same reason.
         let placement = launch_placement(&req.script_placement, &spec.script)?;
         let allocation_holder = holds_for_batch_host(placement, task_offset, req.task_fanout);
         let script = if allocation_holder {
             batch_companion_hold_script().to_string()
         } else {
             build_job_script(&spec.script, &spec.argv, &spec.script_args)?
+        };
+        let user_mounts = if spec.container_image.is_empty() {
+            Vec::new()
+        } else {
+            container_mounts(&spec.container_mounts)?
         };
         if let Some(cred) = &verified_cred {
             match self.launch_acceptance.accept(cred) {
@@ -7388,7 +7391,7 @@ impl SlurmAgent for AgentService {
         let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
-            let mounts = container_mounts(&spec.container_mounts)?;
+            let mounts = user_mounts;
 
             let username = spec.user.clone();
             let uid = spec.uid;
@@ -7720,7 +7723,7 @@ impl SlurmAgent for AgentService {
         let container_launch = if !spec.container_image.is_empty() {
             match (container_config.take(), rootfs_path.take()) {
                 (Some(config), Some(rootfs)) => {
-                    Some(executor::ContainerLaunchConfig { config, rootfs })
+                    Some(executor::ContainerLaunchConfig::new(config, rootfs))
                 }
                 _ => {
                     cleanup.fail().await;
@@ -13993,8 +13996,16 @@ mod tests {
         assert!(svc.active_steps.lock().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_refused_launch_leaves_its_credential_unrecorded() {
+    /// A service that verifies credentials, and a signed job credential for it.
+    fn credentialed_launch_fixture(
+        job_id: u32,
+        script: &str,
+        image: &str,
+    ) -> (
+        AgentService,
+        spur_core::native_cred::ExecutionCredential,
+        String,
+    ) {
         use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
 
         let mut svc = test_agent_service(test_reporter());
@@ -14009,12 +14020,11 @@ mod tests {
             spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
                 .expect("verification"),
         ));
-        let script = "#!/bin/bash\ntrue\n";
         let credential = ExecutionCredential {
             kind: CredentialKind::Job,
             cluster_id: svc.cluster_id.clone(),
             key_id: String::new(),
-            job_id: 79,
+            job_id,
             step_id: 0,
             run_attempt: 1,
             user: "fixture".into(),
@@ -14030,25 +14040,29 @@ mod tests {
                 memory_mb: 0,
                 devices: vec![],
             }],
-            command_digest: spur_core::native_exec::command_digest(script, &[], ""),
-            container_digest: None,
+            command_digest: spur_core::native_exec::command_digest(script, &[], image),
+            container_digest: spur_core::native_exec::container_digest(image),
             issued_at: now,
             not_before: now,
             expires_at: now + 3600,
             credential_id: [2; 16],
         };
+        let token = spur_core::native_exec::sign_execution(credential.clone(), &signing, now)
+            .expect("token");
+        (svc, credential, token)
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_leaves_its_credential_unrecorded() {
+        let script = "#!/bin/bash\ntrue\n";
+        let (svc, credential, token) = credentialed_launch_fixture(79, script, "");
 
         let refused = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 79,
                 run_attempt: 1,
                 script_placement: "per-socket".into(),
-                execution_credential: spur_core::native_exec::sign_execution(
-                    credential.clone(),
-                    &signing,
-                    now,
-                )
-                .expect("token"),
+                execution_credential: token,
                 spec: Some(JobSpec {
                     uid: 1000,
                     gid: 1000,
@@ -14069,6 +14083,46 @@ mod tests {
             svc.launch_acceptance.accept(&credential),
             Ok(true),
             "a retry must launch rather than read as already launched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_with_an_unusable_mount_is_refused_again_when_retransmitted() {
+        let script = "#!/bin/bash\ntrue\n";
+        let image = "/nonexistent/bogus-job-image.sqsh";
+        let (svc, credential, token) = credentialed_launch_fixture(80, script, image);
+        let request = || {
+            Request::new(LaunchJobRequest {
+                job_id: 80,
+                run_attempt: 1,
+                execution_credential: token.clone(),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    gid: 1000,
+                    name: "j".into(),
+                    script: script.into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    container_image: image.into(),
+                    container_mounts: vec!["pvc:claim:/data:ro".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+
+        for _ in ["first", "retransmitted"] {
+            let err = svc
+                .launch_job(request())
+                .await
+                .expect_err("a pvc mount on a native node must be refused");
+            assert_refused_naming_mount(err, "pvc:claim:/data:ro");
+        }
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(true),
+            "neither refusal may record the credential as launched"
         );
     }
 
@@ -19217,10 +19271,10 @@ mod tests {
             device_plan: None,
         };
         let cfg = executor::JobLaunchConfig {
-            container: Some(executor::ContainerLaunchConfig {
-                config: container,
-                rootfs: std::path::PathBuf::from("/tmp/rootfs"),
-            }),
+            container: Some(executor::ContainerLaunchConfig::new(
+                container,
+                std::path::PathBuf::from("/tmp/rootfs"),
+            )),
             ..namespace_test_config()
         };
         let ns = launch_namespaces(&cfg, false);

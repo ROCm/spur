@@ -4551,8 +4551,8 @@ mod tests {
     fn a_session_records_the_container_its_job_runs_in() {
         let mut spec = launch_spec();
         spec.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
-        spec.container = Some(crate::executor::ContainerLaunchConfig {
-            config: crate::container::ContainerConfig {
+        spec.container = Some(crate::executor::ContainerLaunchConfig::new(
+            crate::container::ContainerConfig {
                 image: "docker://job-image".into(),
                 mounts: Vec::new(),
                 workdir: None,
@@ -4571,8 +4571,8 @@ mod tests {
                 withheld_socket: None,
                 device_plan: None,
             },
-            rootfs: PathBuf::from("/tmp/rootfs"),
-        });
+            PathBuf::from("/tmp/rootfs"),
+        ));
         let mut descriptor = StepdDescriptor::new(
             42,
             1,
