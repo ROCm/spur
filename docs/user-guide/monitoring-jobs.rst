@@ -495,8 +495,8 @@ Flags:
      - Comma-separated field names (see below).
    * - ``--long``
      - ``-l``
-     - Long form; adds DerivedExitCode, Start, End, TimeLimit, the three
-       preemption fields, and Reason.
+     - Long form; adds DerivedExitCode, Submit, Start, End, TimeLimit, the
+       three preemption fields, and Reason.
    * - ``--brief``
      - ``-b``
      - Brief form: JobID, State, ExitCode.
@@ -532,9 +532,20 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 
 ``NodeList`` is the compressed hostlist of the nodes the job was allocated, in
 the same form ``squeue`` and ``scontrol show job`` print (``node[01-04]``). It
-is recorded when the job starts, so it stays available after the job leaves
-the controller; a requeued job shows the nodes of its latest run. Jobs that
-started before this release recorded no node list and show it empty.
+is recorded when the job starts and again when it ends, so it stays available
+after the job leaves the controller; a requeued job shows the nodes of its
+latest run. A job that was never given nodes, such as one cancelled while
+waiting in the queue, shows ``None assigned``, as Slurm prints it. A job
+cancelled while its launch was still being confirmed shows the nodes it was
+given, with ``Start`` reading ``Unknown``. Jobs that started before this
+release recorded no node list and show it empty.
+
+``QOS`` is the QOS the job ran under, including a default QOS applied at
+submission. Spur has no stock ``normal`` QOS: a job that resolved to no QOS,
+with no ``accounting.default_qos`` configured, shows it empty. ``Submit`` is
+when the job was submitted and stays fixed across requeues, so for a job that
+was never requeued ``Start`` minus ``Submit`` is how long it waited in the
+queue.
 
 ``NCPUS`` is the job's total allocated CPUs, recorded when the job starts: for
 a ``--cpus-per-gpu`` job this already counts the CPUs its GPUs brought in, so

@@ -105,8 +105,11 @@ impl SacctArgs {
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %18r";
 const SACCT_LONG_FORMAT: &str =
-    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
+    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19V %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
+
+/// Slurm's `NodeList` for a job that never got nodes.
+const NO_NODES_ASSIGNED: &str = "None assigned";
 
 pub fn sacct_header(spec: char) -> &'static str {
     match spec {
@@ -339,7 +342,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'S' => format_timestamp(job.start_time.as_ref()),
         'E' => format_timestamp(job.end_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
-        'n' => job.nodelist.clone(),
+        'n' => format_nodelist(job),
         'C' => ncpus(job).to_string(),
         'Q' => job.qos.clone(),
         'y' => {
@@ -406,6 +409,18 @@ pub(crate) fn ncpus(job: &spur_proto::proto::JobInfo) -> u32 {
         .find(|(key, _)| *key == "cpu")
         .and_then(|(_, value)| value.trim().parse().ok())
         .unwrap_or_else(|| job.num_tasks.saturating_mul(job.cpus_per_task.max(1)))
+}
+
+/// An empty list on a job that started means its nodes went unrecorded, so it
+/// stays blank rather than claiming no nodes were assigned.
+fn format_nodelist(job: &spur_proto::proto::JobInfo) -> String {
+    if !job.nodelist.is_empty() {
+        return job.nodelist.clone();
+    }
+    if job.start_time.is_none() {
+        return NO_NODES_ASSIGNED.into();
+    }
+    String::new()
 }
 
 fn state_name(state: i32) -> String {
@@ -477,6 +492,40 @@ mod tests {
     #[test]
     fn long_format_ends_with_reason() {
         assert!(SACCT_LONG_FORMAT.ends_with("%18r"));
+    }
+
+    #[test]
+    fn long_format_shows_submit_ahead_of_start_and_end() {
+        let args = SacctArgs::try_parse_from(["sacct", "-l"]).unwrap();
+        let fields = output_fields(&args).unwrap();
+        let header = render(args.output_style(), &fields, &[]).remove(0);
+        let columns: Vec<&str> = header.split_whitespace().collect();
+        let position = |name: &str| columns.iter().position(|c| *c == name);
+        let submit = position("Submit").expect("long format has a Submit column");
+        assert_eq!(position("Start"), Some(submit + 1), "{header}");
+        assert_eq!(position("End"), Some(submit + 2), "{header}");
+    }
+
+    #[test]
+    fn nodelist_reads_none_assigned_only_for_a_job_that_never_started() {
+        let never_started = JobInfo::default();
+        assert_eq!(resolve_sacct_field(&never_started, 'n'), "None assigned");
+
+        let ran = JobInfo {
+            nodelist: "node[01-02]".into(),
+            start_time: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_sacct_field(&ran, 'n'), "node[01-02]");
+
+        let unrecorded = JobInfo {
+            nodelist: String::new(),
+            ..ran
+        };
+        assert_eq!(resolve_sacct_field(&unrecorded, 'n'), "");
     }
 
     #[test]
@@ -740,7 +789,7 @@ mod tests {
         let expected = [
             "JobID|State|ExitCode|NodeList",
             "34|TIMEOUT|143:0|node1",
-            "35|CANCELLED|0:0|",
+            "35|CANCELLED|0:0|None assigned",
         ];
         assert_eq!(render_with(&["-P"]), expected);
         assert_eq!(render_with(&["--parsable2"]), expected);
@@ -751,7 +800,7 @@ mod tests {
         let expected = [
             "JobID|State|ExitCode|NodeList|",
             "34|TIMEOUT|143:0|node1|",
-            "35|CANCELLED|0:0||",
+            "35|CANCELLED|0:0|None assigned|",
         ];
         assert_eq!(render_with(&["-p"]), expected);
         assert_eq!(render_with(&["--parsable"]), expected);
@@ -761,7 +810,7 @@ mod tests {
     fn noheader_drops_the_parsable_header_line() {
         assert_eq!(
             render_with(&["-n", "-P"]),
-            ["34|TIMEOUT|143:0|node1", "35|CANCELLED|0:0|"]
+            ["34|TIMEOUT|143:0|node1", "35|CANCELLED|0:0|None assigned"]
         );
     }
 

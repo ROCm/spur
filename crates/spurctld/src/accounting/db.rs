@@ -466,6 +466,9 @@ pub struct JobEndRecord {
     /// Who cancelled the run; empty unless `reason` is a cancel code.
     pub ended_by: String,
     pub ended_by_uid: Option<u32>,
+    /// Compressed hostlist of the nodes the run held, empty when unknown. An
+    /// empty list keeps the stored one, so this end never erases the start's.
+    pub nodelist: String,
     /// Written only when this end creates the row, as for a job that never started.
     /// `None` only for the external `RecordJobEnd` RPC.
     pub submission: Option<JobSubmission>,
@@ -526,11 +529,12 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
                           ended_by, ended_by_uid, name, user_name, account, partition_name, qos,
                           num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
-                          submit_time, reservation, time_limit_secs, preemption_usage)
+                          submit_time, reservation, time_limit_secs, preemption_usage, nodelist)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 COALESCE($14, ''), COALESCE($15, ''), COALESCE($16, ''), COALESCE($17, ''),
                 COALESCE($18, ''), COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1),
-                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26, COALESCE($27, '{}'::jsonb))
+                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26, COALESCE($27, '{}'::jsonb),
+                $28)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -547,7 +551,8 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             preemption_usage = CASE
                 WHEN COALESCE((jobs.preemption_usage->>'revision')::numeric, 0)
                     <= COALESCE(($27->>'revision')::numeric, 0)
-                THEN COALESCE($27, jobs.preemption_usage) ELSE jobs.preemption_usage END
+                THEN COALESCE($27, jobs.preemption_usage) ELSE jobs.preemption_usage END,
+            nodelist = COALESCE(NULLIF($28, ''), jobs.nodelist)
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task, alloc_cpus, total_gpus, qos, state, idle_fill
         "#,
     )
@@ -578,6 +583,7 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(sub.map(|s| &s.reservation))
     .bind(sub.and_then(|s| s.time_limit_secs))
     .bind(preemption_usage)
+    .bind(&rec.nodelist)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -766,6 +772,7 @@ pub struct JobRecord {
     pub user_name: String,
     pub account: String,
     pub partition: String,
+    pub qos: String,
     pub state: String,
     pub exit_code: i32,
     pub exit_signal: i32,
@@ -842,7 +849,7 @@ fn push_coordinated(
 /// and the row limit. Split out so a test can check that order without a database.
 fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
+        "SELECT job_id, name, user_name, account, partition_name, qos, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, cpus_per_task, alloc_cpus, \
          nodelist, \
          submit_time, start_time, end_time, reservation, \
@@ -902,6 +909,7 @@ pub async fn get_job_history(
             user_name: row.get("user_name"),
             account: row.get("account"),
             partition: row.get("partition_name"),
+            qos: row.get("qos"),
             state: row.get("state"),
             exit_code: row.get("exit_code"),
             exit_signal: row.get("exit_signal"),
@@ -1397,6 +1405,14 @@ mod history_query_tests {
         );
         assert!(pred < limit, "{sql}");
         assert!(sql.contains("account = ANY"), "{sql}");
+    }
+
+    #[test]
+    fn the_history_statement_reads_the_qos_column() {
+        let sql = job_history_query(&JobHistoryQuery::default()).sql();
+        let sql = sql.as_str();
+        let (select_list, _) = sql.split_once(" FROM jobs").expect("a SELECT FROM jobs");
+        assert!(select_list.split(',').any(|c| c.trim() == "qos"), "{sql}");
     }
 
     #[test]
@@ -2541,6 +2557,7 @@ mod job_history_tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            nodelist: String::new(),
             submission: None,
         }
     }
@@ -2705,6 +2722,89 @@ mod job_history_tests {
         assert!(row.get::<Option<DateTime<Utc>>, _>("start_time").is_some());
         assert_eq!(row.get::<String, _>("state"), "CANCELLED");
         tx.rollback().await?;
+        Ok(())
+    }
+
+    async fn stored_nodelist(conn: &mut PgConnection, job_id: JobId) -> anyhow::Result<String> {
+        Ok(
+            sqlx::query_scalar("SELECT nodelist FROM jobs WHERE job_id = $1")
+                .bind(i64::from(job_id))
+                .fetch_one(conn)
+                .await?,
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn an_end_that_creates_the_row_records_the_runs_nodes() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = submitted_job(9_800_503);
+        let record = JobEndRecord {
+            nodelist: "node[01-02]".into(),
+            ..cancel_record(&job)
+        };
+        record_job_end(&mut tx, &record).await?;
+
+        assert_eq!(stored_nodelist(&mut tx, job.job_id).await?, "node[01-02]");
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn an_end_fills_a_missing_nodelist_and_never_erases_one() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job_id = 9_800_504;
+        let started = Utc::now() - Duration::minutes(5);
+        seed_job(&mut tx, job_id, "", started, None).await?;
+        let ended = |nodelist: &str| JobEndRecord {
+            nodelist: nodelist.into(),
+            ..end_record(job_id, "COMPLETED", Utc::now())
+        };
+
+        record_job_end(&mut tx, &ended("node07")).await?;
+        assert_eq!(stored_nodelist(&mut tx, job_id).await?, "node07");
+
+        record_job_end(&mut tx, &ended("")).await?;
+        assert_eq!(stored_nodelist(&mut tx, job_id).await?, "node07");
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn history_reports_the_qos_the_job_ran_under() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let id = test_job_id(92);
+        let user = format!("spur_hist_qos_{}", std::process::id());
+        delete_jobs(&pool, &[id]).await.ok();
+        let t0 = Utc::now() - Duration::hours(1);
+        start_with_qos(
+            &pool, id, "qos", &user, "", "", "high", 1, 1, 1, 0, t0, t0, "",
+        )
+        .await?;
+        end(&pool, id, "COMPLETED", 0, t0 + Duration::minutes(1), 0, 0).await?;
+
+        let history = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                job_ids: &[id],
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await;
+        delete_jobs(&pool, &[id]).await.ok();
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+
+        let history = history?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].qos, "high");
         Ok(())
     }
 

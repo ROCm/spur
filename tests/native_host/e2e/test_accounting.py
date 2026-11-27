@@ -172,6 +172,8 @@ class TestSacctUnstartedMetadata:
             "2", "128", "t", "UserCancel", "f", "90", submit_time,
         ], row
         assert _sacct_field(c.cli, job_id, "Start", 30) == "Unknown"
+        assert _sacct_field(c.cli, job_id, "Submit", 30) == submit_time
+        assert _sacct_field(c.cli, job_id, "NodeList", 30) == "None assigned"
         output = c.sacct(["-j", str(job_id)])
         assert output.splitlines()[0].split()[-1] == "Reason", output
         assert output.splitlines()[-1].split()[-1] == "UserCancel", output
@@ -413,6 +415,38 @@ class TestSacctNodeList:
             assert _wait_sacct_nodelist(c, job_id, second) == second
         finally:
             c.cli_allow_fail(["scancel", str(job_id)])
+
+
+class TestSacctFinishedJobRecord:
+    """A finished job keeps the nodes it ran on, the QOS it ran under and when
+    it was submitted, so its placement and queue wait stay recoverable."""
+
+    def test_finished_job_reports_nodelist_qos_and_submit(self, accounting_cluster):
+        c = accounting_cluster
+        qos = "finished_qos"
+        c.sacctmgr(["add", "qos", f"name={qos}"])
+        # Long enough that the 2s squeue poll reliably sees it running.
+        script = c.write_file("acct-finished.sh", "#!/bin/bash\nsleep 20\n")
+        job_id = parse_job_id(
+            c.sbatch_when_qos_ready(["-J", "acct-finished", "-N", "1", "-q", qos, script])
+        )
+        assert job_id is not None, "acct-finished: submit failed"
+        wait_job_state(c, job_id, "R", timeout=60)
+        node = _allocated_nodes(c, job_id)
+        show = c.scontrol("show", "job", str(job_id))
+        submit_time = re.search(r"SubmitTime=(\S+)", show).group(1)
+        wait_job(c, job_id, timeout=90)
+
+        # The start record lands first; poll until the end write marks it done.
+        deadline = time.time() + 60
+        fields = []
+        while time.time() < deadline:
+            row = wait_sacct_row(c, job_id, "JobID,State,NodeList%60,QOS%30,Submit")
+            fields = row.split()
+            if fields[1] == "COMPLETED":
+                break
+            time.sleep(2)
+        assert fields[1:] == ["COMPLETED", node, qos, submit_time], fields
 
 
 def _reason(cluster, job_id: int) -> str:

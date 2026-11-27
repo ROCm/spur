@@ -948,6 +948,38 @@ struct NodeExitEffect {
     finalized: Option<JobFinalized>,
 }
 
+/// The accounting end record for a finalized run. Fields fixed at apply come
+/// from `finalized`, since the apply that finalized the run, or a later one,
+/// may already have reset the live job.
+fn job_end_record(
+    finalized: &JobFinalized,
+    job: Option<&Job>,
+    end_time: DateTime<Utc>,
+) -> JobEndRecord {
+    JobEndRecord {
+        job_id: finalized.job_id,
+        state: finalized.state.display().to_owned(),
+        exit_code: finalized.exit_code,
+        end_time,
+        exit_signal: job.map_or(0, |j| j.exit_signal),
+        derived_exit_code: job.map_or(0, |j| j.derived_exit_code),
+        preempted_by: job.and_then(|j| j.preempted_by),
+        preempt_mode: job.and_then(|j| j.preempt_mode.clone()).unwrap_or_default(),
+        preempt_qos: job.and_then(|j| j.preempt_qos.clone()).unwrap_or_default(),
+        preemption_usage: job.map(|j| j.preemption_usage.clone()),
+        reason: Some(finalized.reason),
+        reason_detail: finalized.reason_detail.clone().unwrap_or_default(),
+        ended_by: finalized
+            .ended_by
+            .as_ref()
+            .map(|c| c.user.clone())
+            .unwrap_or_default(),
+        ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
+        nodelist: finalized.nodelist.clone(),
+        submission: job.map(JobSubmission::for_job),
+    }
+}
+
 /// What a run is charged to and how it runs, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
@@ -4129,53 +4161,8 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            let (
-                exit_signal,
-                derived_exit_code,
-                preempted_by,
-                preempt_mode,
-                preempt_qos,
-                submission,
-            ) = self
-                .jobs
-                .read()
-                .get(&job_id)
-                .map(|j| {
-                    (
-                        j.exit_signal,
-                        j.derived_exit_code,
-                        j.preempted_by,
-                        j.preempt_mode.clone(),
-                        j.preempt_qos.clone(),
-                        Some(JobSubmission::for_job(j)),
-                    )
-                })
-                .unwrap_or((0, 0, None, None, None, None));
-            notifier.notify_job_end(JobEndRecord {
-                preemption_usage: self
-                    .jobs
-                    .read()
-                    .get(&job_id)
-                    .map(|j| j.preemption_usage.clone()),
-                job_id,
-                state: state.display().to_owned(),
-                exit_code: finalized.exit_code,
-                end_time: Utc::now(),
-                exit_signal,
-                derived_exit_code,
-                preempted_by,
-                preempt_mode: preempt_mode.unwrap_or_default(),
-                preempt_qos: preempt_qos.unwrap_or_default(),
-                reason: Some(finalized.reason),
-                reason_detail: finalized.reason_detail.clone().unwrap_or_default(),
-                ended_by: finalized
-                    .ended_by
-                    .as_ref()
-                    .map(|c| c.user.clone())
-                    .unwrap_or_default(),
-                ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
-                submission,
-            });
+            let record = job_end_record(finalized, self.jobs.read().get(&job_id), Utc::now());
+            notifier.notify_job_end(record);
         }
 
         // Preempted excluded: preempt_job owns its requeue (with hold).
@@ -9284,13 +9271,11 @@ impl ClusterManager {
         job.end_time = Some(at);
         job.end_suspension(at);
         job.clear_node_reports();
-
-        // Capture run_time before reset clears start_time.
-        // run_time() excludes suspended intervals.
-        let elapsed = job
-            .run_time()
-            .map(|d| d.num_seconds().max(0) as u64)
-            .unwrap_or(0);
+        job.preempted_by = preempted_by;
+        job.preempt_mode = Some("Requeue".to_string());
+        job.preempt_qos = preempt_qos.clone();
+        // Built before the reset clears the run's start time and nodes.
+        let finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
 
         if let Err(e) = job.transition(JobState::Pending) {
             warn!(job_id = job.job_id, error = %e, "invalid requeue transition in WAL apply");
@@ -9298,12 +9283,6 @@ impl ClusterManager {
         }
         Self::reset_job_for_preempt_requeue(job);
         job.spec.begin_time = Some(begin_time);
-        // Provenance fields are set after reset_job_for_preempt_requeue
-        // clears run state so they survive into the pending phase.
-        job.preempted_by = preempted_by;
-        job.preempt_mode = Some("Requeue".to_string());
-        job.preempt_qos = preempt_qos.clone();
-        let finalized = JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
         let desc = spur_core::end_reason::preemption_summary(preempted_by, preempt_qos.as_deref());
         job.set_pending_reason_desc(PendingReason::Preempted, desc);
         Some(finalized)
@@ -9801,16 +9780,7 @@ impl ClusterManager {
                             // gives elapsed excluding suspended intervals.
                             job.end_time = Some(timestamp);
                             job.end_suspension(timestamp);
-                            let elapsed = job
-                                .run_time()
-                                .map(|d| d.num_seconds().max(0) as u64)
-                                .unwrap_or(0);
-                            finalized = Some(JobFinalized::for_job_with_elapsed(
-                                job,
-                                JobState::Requeued,
-                                -1,
-                                elapsed,
-                            ));
+                            finalized = Some(JobFinalized::for_job(job, JobState::Requeued, -1));
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
@@ -22555,6 +22525,92 @@ state = "UP"
         });
 
         assert_eq!(resp.jobs_finalized[0].reason, EndReason::Requeued);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preempt_requeue_records_the_nodes_its_reset_cleared() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "preempt-requeue-nodes", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemption_claim: None,
+            handoff: false,
+            job_id,
+            begin_time: Utc::now(),
+            preempted_by: Some(job_id + 1),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.allocated_nodes.is_empty());
+        let record = job_end_record(&resp.jobs_finalized[0], Some(&job), Utc::now());
+        assert_eq!(record.nodelist, "worker1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_requeue_records_the_nodes_its_reset_cleared() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "user-requeue-nodes", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.allocated_nodes.is_empty());
+        let record = job_end_record(&resp.jobs_finalized[0], Some(&job), Utc::now());
+        assert_eq!(record.nodelist, "worker1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_cancelled_mid_dispatch_records_the_nodes_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-mid-dispatch"));
+        let resources = scalar_alloc(2, 4000);
+        cm.reserve_placement(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let resp = cm.apply_operation(&WalOperation::job_cancelled(
+            job_id,
+            CancelProvenance::system(),
+        ));
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.start_time.is_none());
+        let record = job_end_record(&resp.jobs_finalized[0], Some(&job), Utc::now());
+        assert_eq!(record.nodelist, "worker1");
+    }
+
+    #[test]
+    fn the_end_record_carries_the_runs_compressed_nodes_and_submission() {
+        let mut job = Job::new(42, basic_spec("end-record"));
+        job.allocated_nodes = vec!["node01".into(), "node02".into()];
+        let finalized = JobFinalized::for_job(&job, JobState::Completed, 0);
+
+        let record = job_end_record(&finalized, Some(&job), Utc::now());
+
+        assert_eq!(record.nodelist, "node[01-02]");
+        assert_eq!(record.state, JobState::Completed.display());
+        assert!(record.submission.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

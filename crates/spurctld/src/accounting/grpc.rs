@@ -615,6 +615,8 @@ impl SlurmAccounting for AccountingService {
                 reason_detail: String::new(),
                 ended_by: String::new(),
                 ended_by_uid: None,
+                // RecordJobEndRequest carries no node list.
+                nodelist: String::new(),
                 submission: None,
             },
         )
@@ -1760,7 +1762,7 @@ fn history_job_info(r: &db::JobRecord, show_actors: bool) -> JobInfo {
         stdin_path: String::new(),
         resources: None,
         priority: 0,
-        qos: String::new(),
+        qos: r.qos.clone(),
         array_job_id: 0,
         array_task_id: 0,
         reservation: r.reservation.clone(),
@@ -2413,6 +2415,7 @@ mod tests {
             user_name: "alice".into(),
             account: "ml".into(),
             partition: "gpu".into(),
+            qos: "high".into(),
             state: "COMPLETED".into(),
             exit_code: 0,
             exit_signal: 0,
@@ -2448,6 +2451,18 @@ mod tests {
         let legacy = history_job_info(&history_record(None), false);
         assert_eq!(legacy.alloc_cpus, None);
         assert_eq!(legacy.num_tasks * legacy.cpus_per_task, 6);
+    }
+
+    #[test]
+    fn job_history_carries_the_recorded_qos_nodes_and_submit_time() {
+        let record = history_record(None);
+        let info = history_job_info(&record, false);
+        assert_eq!(info.qos, "high");
+        assert_eq!(info.nodelist, "n1");
+        assert_eq!(
+            info.submit_time.map(|t| t.seconds),
+            Some(record.submit_time.timestamp())
+        );
     }
 
     fn history_for(user: &str) -> Request<GetJobHistoryRequest> {
