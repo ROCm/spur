@@ -378,6 +378,7 @@ pub async fn association_maps(
     HashMap<(String, String), HashSet<String>>,
     HashMap<String, String>,
     HashSet<(String, String)>,
+    HashMap<String, String>,
 )> {
     let users = db::list_users(pool, None, None).await?;
 
@@ -418,8 +419,14 @@ pub async fn association_maps(
         })
         .collect();
 
-    let parent_of: HashMap<String, String> = db::list_accounts(pool)
-        .await?
+    let accounts = db::list_accounts(pool).await?;
+    // The account allow-list needs no map here: list_users already folds it
+    // into each member's allowed_qos.
+    let account_default_qos: HashMap<String, String> = accounts
+        .iter()
+        .filter_map(|a| a.default_qos.clone().map(|dq| (a.name.clone(), dq)))
+        .collect();
+    let parent_of: HashMap<String, String> = accounts
         .into_iter()
         .filter_map(|account| {
             account
@@ -440,6 +447,7 @@ pub async fn association_maps(
         allowed_qos,
         admin_level,
         coordinators,
+        account_default_qos,
     ))
 }
 

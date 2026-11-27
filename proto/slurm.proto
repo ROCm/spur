@@ -2104,6 +2104,9 @@ message CreateAccountRequest {
   // list; explicit empty clears it. A user with no allow-list of their own
   // inherits this one.
   optional string allowed_qos = 8;
+  // QOS applied to the account's users that have no default of their own.
+  // Unset preserves the stored value; explicit empty clears it.
+  optional string default_qos = 9;
 }
 
 message DeleteAccountRequest {
@@ -2135,6 +2138,8 @@ message AccountInfo {
   string grp_tres = 7;
   // Comma-separated QOS names this account may use. Empty when none is set.
   string allowed_qos = 8;
+  // Account default QOS. Empty when none is set.
+  string default_qos = 9;
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave

@@ -173,6 +173,8 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 -- NULL means unset, so a user with no allow-list can inherit it. An explicit
 -- clear is also NULL: the account list is the fallback, not a second "off" state.
+-- default_qos NULL means the account sets no default; existing resolution is unchanged.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS default_qos TEXT;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
@@ -1693,6 +1695,7 @@ pub struct AccountUpdate<'a> {
     pub fairshare: Option<i32>,
     pub max_running_jobs: Option<Option<i32>>,
     pub grp_tres: Option<Option<&'a str>>,
+    pub default_qos: Option<Option<&'a str>>,
     pub allowed_qos: Option<Option<&'a str>>,
 }
 
@@ -1723,6 +1726,9 @@ pub async fn upsert_account<'a>(
     }
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.default_qos {
+        updates.push(("default_qos", SqlVal::NullText(v)));
     }
     if let Some(v) = u.allowed_qos {
         updates.push(("allowed_qos", SqlVal::NullText(v)));
@@ -1788,8 +1794,12 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres, allowed_qos FROM accounts ORDER BY name"
-    ).fetch_all(pool).await?;
+        "SELECT name, description, organization, parent_account, fairshare_weight, \
+         max_running_jobs, grp_tres, default_qos, allowed_qos \
+         FROM accounts ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .iter()
@@ -1801,6 +1811,7 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             grp_tres: r.get("grp_tres"),
+            default_qos: r.get("default_qos"),
             allowed_qos: r.get("allowed_qos"),
         })
         .collect())
@@ -1816,6 +1827,8 @@ pub struct AccountRecord {
     pub max_running_jobs: Option<i32>,
     /// Account resource allocation as a TRES string; None = unlimited.
     pub grp_tres: Option<String>,
+    /// Account default QOS. None means unset.
+    pub default_qos: Option<String>,
     /// QOS allow-list for the account. None means unset.
     pub allowed_qos: Option<String>,
 }
@@ -5508,6 +5521,81 @@ mod txn_tests {
 
         sqlx::query("DELETE FROM txn WHERE entity_name = $1")
             .bind(&entity)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn account_round_trips_default_qos() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let account = format!("spur_acctqos_{pid}");
+
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                default_qos: Some(Some("highprio")),
+                allowed_qos: Some(Some("highprio,normal")),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos.as_deref(), Some("highprio"));
+        assert_eq!(got.allowed_qos.as_deref(), Some("highprio,normal"));
+
+        // Unrestated QOS fields must be preserved when other fields change.
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("updated"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos.as_deref(), Some("highprio"));
+        assert_eq!(got.description, "updated");
+
+        // Explicitly clearing default_qos sets it to NULL.
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                default_qos: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos, None);
+        assert_eq!(got.allowed_qos.as_deref(), Some("highprio,normal"));
+
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
             .execute(&pool)
             .await?;
         Ok(())
