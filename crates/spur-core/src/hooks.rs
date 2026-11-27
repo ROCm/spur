@@ -234,7 +234,7 @@ async fn finish_logging_stderr(logger: &mut tokio::task::JoinHandle<()>, ctx: &H
 }
 
 /// SIGTERMs a timed-out hook's process group and SIGKILLs whatever is left of
-/// it once `grace` passes, then waits at most one more grace for the leader.
+/// it once `grace` passes, then waits at most one more grace for the group to exit.
 async fn terminate_hook_group(
     pid: Option<u32>,
     grace: Duration,
@@ -250,9 +250,12 @@ async fn terminate_hook_group(
         return;
     }
     signal_hook_group(pid, nix::sys::signal::Signal::SIGKILL);
+    let deadline = tokio::time::Instant::now() + grace;
     if !leader_exited {
-        let _ = tokio::time::timeout(grace, child.wait()).await;
+        let _ = tokio::time::timeout_at(deadline, child.wait()).await;
     }
+    // SIGKILL is delivered asynchronously, so the group can still be dying here.
+    hook_group_exits_by(pid, deadline).await;
 }
 
 /// Whether the group of a reaped leader empties by `deadline`.
@@ -996,6 +999,30 @@ mod tests {
         let pidfile = dir.path().join("child.pid");
         let script = make_script(&format!(
             "trap '' TERM\nsleep 300 &\necho $! > {}\nwait",
+            pidfile.display()
+        ));
+        let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
+        let err = run_hook_with(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            Some(bound),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(!process_is_running(pid_recorded_in(&pidfile)));
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn bounded_hook_timeout_waits_for_a_sigkilled_descendant_to_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // Detached from the hook's stderr so the log drain cannot stand in for the group wait.
+        let script = make_script(&format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 300' 2>/dev/null &\nwait",
             pidfile.display()
         ));
         let bound = HookBound::new(Duration::from_secs(1), Duration::from_millis(100));
