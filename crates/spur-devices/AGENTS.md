@@ -18,10 +18,8 @@ sourcing, and GPU-only visibility vars are in
 - `DeviceRegistry::populate` merges a GRES injectable entry onto discovered
   entries (`merge_into_discovered`) instead of only deduping it. This is how
   `[[devices.gres]] cores=` sets reserved-core affinity without disabling
-  auto-detection; exact rules are in the knowledge doc.
-- CDI aggregates (a device whose nodes are the union of two or more siblings,
-  like `all`) are dropped before GRES entries merge, so they never widen a merge
-  or make a node name several devices.
+  auto-detection; exact rules (including dropping CDI aggregates first) are in
+  the knowledge doc.
 
 ## Testing
 

@@ -23,10 +23,8 @@ agent auth in `docs/knowledge/security/auth-model.md`. This file covers spurd-lo
 
 ## Invariants
 
-- `LaunchJob` verifies the execution credential, then validates the whole request (target
-  node, root execution, `launch_placement`, the script) before recording the credential in
-  `LaunchAcceptance` or fencing anything, so a refused request leaves the previous run and the
-  credential untouched.
+- `LaunchJob` validates the whole request before recording the credential or fencing anything;
+  see `docs/knowledge/execution/job-execution.md` ("Dispatch and admission").
 - `JobLifecycle` serializes setup/teardown per job ID. Without it a re-dispatch races the
   previous run's cgroup/spool cleanup, since those paths are reused.
 - Jobs run as process-group leaders; signals go to the whole group (`killpg`), not just the

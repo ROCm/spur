@@ -48,10 +48,8 @@ This page covers the cross-crate contracts behind it.
 
 `DeviceRegistry::populate` builds the registry in this order:
 
-1. CDI entries (`sort_cdi_entries`): those with a PCI address by address, then
-   `stable_id`, then primary device path; then those without one by primary
-   device path; the qualified name breaks any remaining tie (partitions share a
-   BDF, so the tie-breaks keep the order stable across a refresh). CDI
+1. CDI entries in a deterministic order (`sort_cdi_entries`): partitions share
+   a BDF, so the tie-breaks keep the order stable across a refresh. CDI
    aggregates (a device whose nodes are the union of two or more siblings, like
    `all`) are dropped, since they would make each node name several devices.
 2. Each GRES injectable entry is merged into the discovered entries of its gres
@@ -122,8 +120,6 @@ bits  0..7  = partition_rank (STABLE_ID_PARTITION_MASK = 0xFF)
   `device_paths` (per-device plus shared) is what the BPF filter allows.
 - `ContainerInjectionPlan` device nodes fall back to the job's uid/gid when the
   CDI spec omits them. Mounts are sorted by path depth (shallowest first).
-- `DeviceRegistry::build_job_injection_plans` takes a `DeviceSelection` (gres
-  name to stable ids) and builds one plan across every allocated kind.
 - Shared edits (e.g. `/dev/kfd`, ROCm lib mounts, `video`/`render` GIDs) are
   applied once per distinct set (`merge_edits_from_devices`), so two specs of
   one kind both contribute.
@@ -173,3 +169,6 @@ constants in `cdi/annotations.rs` (parsed into `DeviceMetadata`). A missing
 `stable-id` triggers the backfill in section 3, and `auto-detected` marks a spec
 Spur owns and may rewrite (see
 [containers-k0s.md](../execution/containers-k0s.md#gpu-cdi-spec-and-storage-for-k0s-pods)).
+Discovery still writes `memory-mb`, `link-type`, and `links` for rollback to
+older builds, but this build never reads them (`DeviceEntry` takes none of
+them); do not remove the writes as dead code.

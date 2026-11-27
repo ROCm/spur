@@ -147,8 +147,8 @@ Role sources and their precedence are in `docs/admin-guide/rbac.rst`.
   launch idempotent per `(job_id, step_id, run_attempt)`: the exact same
   credential is accepted without relaunching, a different one for the same
   attempt is `IdempotencyConflict`, and a cancelled attempt stays rejected.
-  `LaunchJob` records a credential only after the request validates, so a
-  retry of a refused launch is never answered as already launched.
+  A credential is recorded only after the request validates (see
+  [job execution](../execution/job-execution.md#1-dispatch-and-admission)).
   Under `plugin = "spur"` (agent holds `cred_keys`), a compromised node cannot
   forge a launch on another node, since it holds no Ed25519 signing key.
   Without `cred_keys` the agent skips execution-credential verification.
