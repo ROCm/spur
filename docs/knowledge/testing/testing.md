@@ -253,7 +253,7 @@ with `-m gpu` without manual tags.
 ### In-process (t39)
 
 GPU tests in `t39_gpu.rs` exercise the GRES parser and resource matching
-without hardware. They construct `ResourceSet` structs with `GpuResource`
+without hardware. They construct `ResourceSet` structs with GPU `Device`
 entries and verify `can_satisfy()` logic for type matching, count limits,
 and "any" type wildcards. Constraint scheduling tests build a
 `BackfillScheduler`, a `ClusterState` with nodes tagged by features

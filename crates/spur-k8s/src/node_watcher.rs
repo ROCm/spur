@@ -35,22 +35,22 @@ struct NodeFingerprint {
     memory_mb: u64,
     gpu_count: u32,
     gpu_type: String,
-    gpu_memory_mb: u64,
-    gpu_link_type: i32,
+    gpu_vram_bytes: Option<u64>,
 }
 
 fn fingerprint(resources: &ResourceSet) -> u64 {
+    let gpus: Vec<_> = resources
+        .devices
+        .iter()
+        .filter(|d| d.gres_name == "gpu")
+        .collect();
+    let first = gpus.first();
     let fp = NodeFingerprint {
         cpus: resources.cpus,
         memory_mb: resources.memory_mb,
-        gpu_count: resources.gpus.len() as u32,
-        gpu_type: resources
-            .gpus
-            .first()
-            .map(|g| g.gpu_type.clone())
-            .unwrap_or_default(),
-        gpu_memory_mb: resources.gpus.first().map(|g| g.memory_mb).unwrap_or(0),
-        gpu_link_type: resources.gpus.first().map(|g| g.link_type).unwrap_or(0),
+        gpu_count: gpus.len() as u32,
+        gpu_type: first.map(|g| g.device_type.clone()).unwrap_or_default(),
+        gpu_vram_bytes: first.and_then(|g| g.topology.as_ref()?.vram_bytes),
     };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     fp.hash(&mut hasher);
@@ -122,7 +122,7 @@ pub async fn run(
                 let fp = fingerprint(&resources);
 
                 if fingerprints.get(&name) != Some(&fp) {
-                    info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
+                    info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, devices = resources.devices.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
                         hostname: name.clone(),
@@ -276,38 +276,33 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Read link type from label
-    let link_type: i32 = labels
-        .and_then(|l| l.get("spur.amd.com/gpu-link"))
-        .map(|v| match v.as_str() {
-            "xgmi" | "XGMI" => 1,     // GPU_LINK_XGMI
-            "nvlink" | "NVLink" => 2, // GPU_LINK_NVLINK
-            _ => 0,                   // GPU_LINK_PCIE
-        })
-        .unwrap_or(0);
-
-    let gpus: Vec<spur_proto::proto::GpuResource> = (0..gpu_count)
-        .map(|i| spur_proto::proto::GpuResource {
-            device_id: i,
-            gpu_type: gpu_type.clone(),
-            memory_mb: gpu_memory_mb,
-            peer_gpus: (0..gpu_count).filter(|&j| j != i).collect(),
-            link_type,
-            // No KFD render_minor is available from k8s labels; the positional
-            // index is the only stable identity this synthetic inventory has.
-            topology: None,
-            stable_id: i as u64,
+    let topology = (gpu_memory_mb > 0).then(|| spur_core::device::DeviceTopology {
+        vram_bytes: Some(gpu_memory_mb * 1024 * 1024),
+        ..Default::default()
+    });
+    let inventory: Vec<spur_core::device::Device> = (0..gpu_count)
+        .map(|i| spur_core::device::Device {
             numa_node: None,
             affinity_cpus: Vec::new(),
+            gres_name: "gpu".into(),
+            device_type: gpu_type.clone(),
+            // No KFD render_minor is available from k8s labels; the positional
+            // index is the only stable identity this synthetic inventory has.
+            stable_id: u64::from(i),
+            index: i,
+            topology: topology.clone(),
         })
         .collect();
+    let (devices, gpus) = spur_core::device::devices_to_proto(&inventory);
 
+    #[allow(deprecated)]
     ResourceSet {
         fabric_binding_version: 0,
         block_file_revision: None,
         cpus,
         memory_mb,
         gpus,
+        devices,
         generic: Default::default(),
         generation: 0,
     }
@@ -319,6 +314,14 @@ mod tests {
     use k8s_openapi::api::core::v1::{NodeSpec, NodeStatus, Taint};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use std::collections::BTreeMap;
+
+    fn vram_mb(device: &spur_proto::proto::Device) -> Option<u64> {
+        device
+            .topology
+            .as_ref()?
+            .vram_bytes
+            .map(|b| b / (1024 * 1024))
+    }
 
     fn make_node(
         name: &str,
@@ -472,7 +475,7 @@ mod tests {
         let res = extract_resources(&node);
         assert_eq!(res.cpus, 64);
         assert_eq!(res.memory_mb, 262144);
-        assert!(res.gpus.is_empty());
+        assert!(res.devices.is_empty());
     }
 
     #[test]
@@ -498,10 +501,10 @@ mod tests {
 
         let node = make_node("gpu-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 8);
-        for (i, gpu) in res.gpus.iter().enumerate() {
-            assert_eq!(gpu.device_id, i as u32);
-            assert_eq!(gpu.gpu_type, "mi300x");
+        assert_eq!(res.devices.len(), 8);
+        for (i, gpu) in res.devices.iter().enumerate() {
+            assert_eq!(gpu.index, i as u32);
+            assert_eq!(gpu.device_type, "mi300x");
         }
     }
 
@@ -517,8 +520,8 @@ mod tests {
 
         let node = make_node("nvidia-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 4);
-        assert_eq!(res.gpus[0].gpu_type, "h100");
+        assert_eq!(res.devices.len(), 4);
+        assert_eq!(res.devices[0].device_type, "h100");
     }
 
     #[test]
@@ -529,8 +532,8 @@ mod tests {
         // No gpu-type label → should default to "amd-gpu" for AMD devices
         let node = make_node("unlabeled", BTreeMap::new(), alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 2);
-        assert_eq!(res.gpus[0].gpu_type, "amd-gpu");
+        assert_eq!(res.devices.len(), 2);
+        assert_eq!(res.devices[0].device_type, "amd-gpu");
     }
 
     #[test]
@@ -541,8 +544,8 @@ mod tests {
         // No gpu-type label → should default to "nvidia-gpu" for NVIDIA devices
         let node = make_node("unlabeled", BTreeMap::new(), alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 2);
-        assert_eq!(res.gpus[0].gpu_type, "nvidia-gpu");
+        assert_eq!(res.devices.len(), 2);
+        assert_eq!(res.devices[0].device_type, "nvidia-gpu");
     }
 
     #[test]
@@ -556,10 +559,28 @@ mod tests {
 
         let node = make_node("gpu-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 4);
-        for gpu in &res.gpus {
-            assert_eq!(gpu.memory_mb, 196608);
+        assert_eq!(res.devices.len(), 4);
+        for gpu in &res.devices {
+            assert_eq!(vram_mb(gpu), Some(196608));
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn an_older_controller_still_reads_the_gpus() {
+        let mut alloc = BTreeMap::new();
+        alloc.insert("amd.com/gpu".into(), Quantity("2".into()));
+        let mut labels = BTreeMap::new();
+        labels.insert("spur.amd.com/gpu-type".into(), "mi300x".into());
+        labels.insert("spur.amd.com/gpu-memory-mb".into(), "196608".into());
+
+        let res = extract_resources(&make_node("gpu-node", labels, alloc, vec![]));
+        let legacy: Vec<(u32, &str, u64)> = res
+            .gpus
+            .iter()
+            .map(|g| (g.device_id, g.gpu_type.as_str(), g.memory_mb))
+            .collect();
+        assert_eq!(legacy, vec![(0, "mi300x", 196608), (1, "mi300x", 196608)]);
     }
 
     #[test]
@@ -569,81 +590,7 @@ mod tests {
 
         let node = make_node("node", BTreeMap::new(), alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus[0].memory_mb, 0);
-    }
-
-    #[test]
-    fn test_extract_resources_gpu_link_xgmi() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("amd.com/gpu".into(), Quantity("2".into()));
-
-        let mut labels = BTreeMap::new();
-        labels.insert("spur.amd.com/gpu-link".into(), "xgmi".into());
-
-        let node = make_node("node", labels, alloc, vec![]);
-        let res = extract_resources(&node);
-        assert_eq!(res.gpus[0].link_type, 1); // GPU_LINK_XGMI
-    }
-
-    #[test]
-    fn test_extract_resources_gpu_link_nvlink() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("nvidia.com/gpu".into(), Quantity("2".into()));
-
-        let mut labels = BTreeMap::new();
-        labels.insert("spur.amd.com/gpu-link".into(), "NVLink".into());
-
-        let node = make_node("node", labels, alloc, vec![]);
-        let res = extract_resources(&node);
-        assert_eq!(res.gpus[0].link_type, 2); // GPU_LINK_NVLINK
-    }
-
-    #[test]
-    fn test_extract_resources_gpu_link_default_pcie() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("amd.com/gpu".into(), Quantity("1".into()));
-
-        let node = make_node("node", BTreeMap::new(), alloc, vec![]);
-        let res = extract_resources(&node);
-        assert_eq!(res.gpus[0].link_type, 0); // GPU_LINK_PCIE
-    }
-
-    #[test]
-    fn test_extract_resources_gpu_link_unknown_defaults_pcie() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("amd.com/gpu".into(), Quantity("1".into()));
-
-        let mut labels = BTreeMap::new();
-        labels.insert("spur.amd.com/gpu-link".into(), "something-else".into());
-
-        let node = make_node("node", labels, alloc, vec![]);
-        let res = extract_resources(&node);
-        assert_eq!(res.gpus[0].link_type, 0); // defaults to PCIE
-    }
-
-    #[test]
-    fn test_extract_resources_peer_gpus() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("amd.com/gpu".into(), Quantity("3".into()));
-
-        let node = make_node("node", BTreeMap::new(), alloc, vec![]);
-        let res = extract_resources(&node);
-        // GPU 0 should have peers [1, 2]
-        assert_eq!(res.gpus[0].peer_gpus, vec![1, 2]);
-        // GPU 1 should have peers [0, 2]
-        assert_eq!(res.gpus[1].peer_gpus, vec![0, 2]);
-        // GPU 2 should have peers [0, 1]
-        assert_eq!(res.gpus[2].peer_gpus, vec![0, 1]);
-    }
-
-    #[test]
-    fn test_extract_resources_single_gpu_no_peers() {
-        let mut alloc = BTreeMap::new();
-        alloc.insert("amd.com/gpu".into(), Quantity("1".into()));
-
-        let node = make_node("node", BTreeMap::new(), alloc, vec![]);
-        let res = extract_resources(&node);
-        assert!(res.gpus[0].peer_gpus.is_empty());
+        assert_eq!(res.devices[0].topology, None);
     }
 
     #[test]
@@ -656,7 +603,7 @@ mod tests {
         let res = extract_resources(&node);
         assert_eq!(res.cpus, 0);
         assert_eq!(res.memory_mb, 0);
-        assert!(res.gpus.is_empty());
+        assert!(res.devices.is_empty());
     }
 
     #[test]
@@ -665,7 +612,7 @@ mod tests {
         let res = extract_resources(&node);
         assert_eq!(res.cpus, 0);
         assert_eq!(res.memory_mb, 0);
-        assert!(res.gpus.is_empty());
+        assert!(res.devices.is_empty());
     }
 
     #[test]
@@ -677,8 +624,8 @@ mod tests {
         let node = make_node("both", BTreeMap::new(), alloc, vec![]);
         let res = extract_resources(&node);
         // amd.com/gpu is checked first — ROCm project default
-        assert_eq!(res.gpus.len(), 8);
-        assert_eq!(res.gpus[0].gpu_type, "amd-gpu");
+        assert_eq!(res.devices.len(), 8);
+        assert_eq!(res.devices[0].device_type, "amd-gpu");
     }
 
     #[test]
@@ -693,14 +640,12 @@ mod tests {
 
         let node = make_node("mi300x-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 8);
-        for gpu in &res.gpus {
-            assert_eq!(gpu.gpu_type, "mi300x");
-            assert_eq!(gpu.memory_mb, 196608);
-            assert_eq!(gpu.link_type, 1); // XGMI
+        assert_eq!(res.devices.len(), 8);
+        for gpu in &res.devices {
+            assert_eq!(gpu.device_type, "mi300x");
+            assert_eq!(vram_mb(gpu), Some(196608));
         }
         // 8 GPUs each have 7 peers
-        assert_eq!(res.gpus[0].peer_gpus.len(), 7);
     }
 
     #[test]
@@ -715,36 +660,33 @@ mod tests {
 
         let node = make_node("mi250x-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
-        assert_eq!(res.gpus.len(), 4);
-        assert_eq!(res.gpus[0].gpu_type, "mi250x");
-        assert_eq!(res.gpus[0].memory_mb, 131072);
-        assert_eq!(res.gpus[0].link_type, 1);
+        assert_eq!(res.devices.len(), 4);
+        assert_eq!(res.devices[0].device_type, "mi250x");
+        assert_eq!(vram_mb(&res.devices[0]), Some(131072));
     }
 
     // --- Fingerprint tests ---
 
     fn make_resources(cpus: u32, mem: u64, gpu_count: u32) -> ResourceSet {
-        let gpus: Vec<spur_proto::proto::GpuResource> = (0..gpu_count)
-            .map(|i| spur_proto::proto::GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 196608,
-                peer_gpus: vec![],
-                link_type: 1,
-                topology: None,
-                stable_id: i as u64,
+        let devices = (0..gpu_count)
+            .map(|i| spur_proto::proto::Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
+                stable_id: u64::from(i),
+                index: i,
+                topology: Some(spur_proto::proto::DeviceTopology {
+                    vram_bytes: Some(196608 * 1024 * 1024),
+                    ..Default::default()
+                }),
             })
             .collect();
         ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
             cpus,
             memory_mb: mem,
-            gpus,
-            generic: Default::default(),
-            generation: 0,
+            devices,
+            ..Default::default()
         }
     }
 

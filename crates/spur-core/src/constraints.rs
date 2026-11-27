@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::device::Device;
 use crate::job::JobSpec;
-use crate::resource::GpuResource;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,10 +32,10 @@ impl GpuField {
         matches!(self, Self::Vram | Self::Numa)
     }
 
-    fn value(self, gpu: &GpuResource) -> Option<Value> {
+    fn value(self, gpu: &Device) -> Option<Value> {
         if self == Self::Type {
-            return (!gpu.gpu_type.is_empty())
-                .then(|| Value::Text(gpu.gpu_type.to_ascii_lowercase()));
+            return (!gpu.device_type.is_empty())
+                .then(|| Value::Text(gpu.device_type.to_ascii_lowercase()));
         }
         let t = gpu.topology.as_ref()?;
         match self {
@@ -198,7 +198,7 @@ impl<'a> Constraints<'a> {
         self.same_fabric || !self.same.is_empty() || !self.predicates.is_empty()
     }
 
-    pub fn matches_gpu(&self, gpu: &GpuResource) -> bool {
+    pub fn matches_gpu(&self, gpu: &Device) -> bool {
         // Retained accounting identities for lost GPUs are never candidates.
         if gpu
             .topology
@@ -223,7 +223,7 @@ impl<'a> Constraints<'a> {
         })
     }
 
-    pub fn group_key(&self, node: &str, gpu: &GpuResource) -> Option<Vec<String>> {
+    pub fn group_key(&self, node: &str, gpu: &Device) -> Option<Vec<String>> {
         let mut key = Vec::new();
         for field in &self.same {
             let value = field.value(gpu)?;
@@ -381,17 +381,11 @@ mod tests {
 #[cfg(test)]
 mod property_tests {
     use super::*;
-    use crate::resource::{DeviceTopology, GpuLinkType};
+    use crate::resource::DeviceTopology;
     use spur_devices::topology::{FabricObservation, ObservationStatus};
 
-    fn gpu() -> GpuResource {
-        GpuResource {
-            device_id: 0,
-            stable_id: 128,
-            gpu_type: "mi300x".into(),
-            memory_mb: 196608,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::PCIe,
+    fn gpu() -> Device {
+        Device {
             topology: Some(DeviceTopology {
                 pci_bdf: Some("0001:04:00.0".into()),
                 pci_root: Some("pci0001:00".into()),
@@ -404,8 +398,7 @@ mod property_tests {
                     ..Default::default()
                 }),
             }),
-            numa_node: None,
-            affinity_cpus: Vec::new(),
+            ..Device::gpu(128, "mi300x", 0)
         }
     }
 

@@ -576,7 +576,8 @@ async fn main() -> anyhow::Result<()> {
     reporter::refresh_block_file(&mut resources, block_file.as_deref());
     // Exactly the sessions replay puts back on the ledger: pinning a GPU no
     // job holds would advertise it as free.
-    let held_gpu_ids = agent_server::startup_held_gpu_ids(&recovered_stepds, &resources.gpus);
+    let current_gpus: Vec<_> = resources.gpus().cloned().collect();
+    let held_gpu_ids = agent_server::startup_held_gpu_ids(&recovered_stepds, &current_gpus);
     let startup = reporter::startup_inventory(
         &resources,
         reporter::load_baseline(stepds.root()).as_ref(),
@@ -589,7 +590,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut reg = registry.lock().await;
         let discovered = std::mem::take(&mut *reg);
-        let reported = resources.gpus.iter().map(|g| g.stable_id).collect();
+        let reported = resources.gpus().map(|g| g.stable_id).collect();
         *reg = discovered.with_pinned(
             &DeviceRegistry::new(),
             "gpu",
@@ -601,7 +602,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         cpus = resources.cpus,
         memory_mb = resources.memory_mb,
-        gpus = resources.gpus.len(),
+        gpus = resources.total_gpus(),
         "resources discovered"
     );
 
@@ -1127,7 +1128,7 @@ fn spawn_inventory_refresh(
             let suspect_dropout = is_suspect_gpu_dropout(&old, &fresh);
             if suspect_dropout {
                 warn!(
-                    old_gpus = old.gpus.len(),
+                    old_gpus = old.total_gpus(),
                     "discovery returned zero GPUs; retaining capacity with unavailable fabric observations"
                 );
                 fresh = old.clone();
@@ -1229,7 +1230,7 @@ fn spawn_inventory_refresh(
                 reporter::RefreshAction::ReportLost => {
                     let lost: Vec<u64> = {
                         let ids = |set: &spur_core::resource::ResourceSet| -> Vec<u64> {
-                            set.gpus.iter().map(|g| g.stable_id).collect()
+                            set.gpus().map(|g| g.stable_id).collect()
                         };
                         let new_ids: std::collections::HashSet<u64> =
                             ids(&fresh).into_iter().collect();
@@ -1340,7 +1341,7 @@ fn is_suspect_gpu_dropout(
     old: &spur_core::resource::ResourceSet,
     fresh: &spur_core::resource::ResourceSet,
 ) -> bool {
-    fresh.gpus.is_empty() && !old.gpus.is_empty()
+    fresh.gpus().next().is_none() && old.gpus().next().is_some()
 }
 
 /// Swap the candidate registry into the shared one ONLY once the tick committed
@@ -1358,7 +1359,7 @@ async fn publish_registry(
     if commit != reporter::BaselineCommit::Commit {
         return;
     }
-    let ids = reported.gpus.iter().map(|g| g.stable_id).collect();
+    let ids = reported.gpus().map(|g| g.stable_id).collect();
     let mut reg = registry.lock().await;
     let previous = std::mem::take(&mut *reg);
     *reg = candidate.with_pinned(&previous, "gpu", &ids, pinned);
@@ -1595,23 +1596,22 @@ mod tests {
     }
 
     fn rs_with_gpus(n: usize) -> spur_core::resource::ResourceSet {
-        use spur_core::resource::{GpuLinkType, GpuResource};
+        use spur_core::device::Device;
         spur_core::resource::ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: (0..n as u32)
-                .map(|i| GpuResource {
-                    device_id: i,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: (0..n as u32)
+                .map(|i| Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 128 + i as u64,
                     numa_node: None,
                     affinity_cpus: Vec::new(),
+
+                    index: i,
+                    topology: None,
                 })
                 .collect(),
             generic: Default::default(),
@@ -1719,8 +1719,8 @@ mod tests {
         let candidate = gpu_registry("/dev/dri/renderD[200-202]");
         let new_devices = device_paths(&candidate);
         let mut reported = rs_with_gpus(2);
-        reported.gpus[0].stable_id = 0;
-        reported.gpus[1].stable_id = 1;
+        reported.devices[0].stable_id = 0;
+        reported.devices[1].stable_id = 1;
 
         publish_registry(
             &shared,
@@ -1766,9 +1766,9 @@ mod tests {
             &old,
         ));
         let mut reported = old.clone();
-        reported.gpus.truncate(1);
+        reported.devices.truncate(1);
         let fences = reporter::Fences {
-            anchors: [(128, vec![reported.gpus[0].clone()])].into(),
+            anchors: [(128, vec![reported.devices[0].clone()])].into(),
         };
         let mut last = reporter::InventoryDelta::Unchanged;
 

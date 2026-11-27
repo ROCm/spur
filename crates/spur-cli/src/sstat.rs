@@ -207,8 +207,9 @@ fn resolve_field(job: &spur_proto::proto::JobInfo, field: &StatField) -> String 
             if let Some(ref res) = job.resources {
                 res.devices
                     .get("gpu")
-                    .map(|d| d.devices.len().to_string())
-                    .unwrap_or_else(|| "0".into())
+                    .map(|d| d.devices.iter().map(|dev| dev.count).sum::<u64>())
+                    .unwrap_or(0)
+                    .to_string()
             } else {
                 "0".into()
             }
@@ -320,5 +321,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_field(&job, &StatField::Cpus), "8");
+    }
+
+    /// Two nodes' GPUs at the same PCI address share a stable id, so the
+    /// job-wide total merges them into one entry whose count is 2.
+    #[test]
+    fn gpu_alloc_counts_merged_devices_of_a_multi_node_job() {
+        use spur_proto::proto::{AllocatedDevice, DeviceAllocations, ResourceAllocations};
+        let job = spur_proto::proto::JobInfo {
+            resources: Some(ResourceAllocations {
+                devices: [(
+                    "gpu".to_string(),
+                    DeviceAllocations {
+                        devices: vec![
+                            AllocatedDevice {
+                                device_id: 0x110000,
+                                count: 2,
+                            },
+                            AllocatedDevice {
+                                device_id: 0x120000,
+                                count: 2,
+                            },
+                        ],
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_field(&job, &StatField::GpuAlloc), "4");
     }
 }

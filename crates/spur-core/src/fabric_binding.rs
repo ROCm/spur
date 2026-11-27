@@ -176,8 +176,7 @@ impl FabricBinding {
                 return Err("fabric binding has a different node or inventory generation".into());
             }
             let mut matches = inventory
-                .gpus
-                .iter()
+                .gpus()
                 .filter(|g| g.stable_id == member.device.stable_id);
             let gpu = matches.next().ok_or("fabric binding GPU is missing")?;
             if matches.next().is_some() {
@@ -283,8 +282,9 @@ pub fn from_proto(binding: spur_proto::proto::FabricBinding) -> FabricBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::Device;
     use crate::fabric::{FabricDeviceKey, FabricMember};
-    use crate::resource::{AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource};
+    use crate::resource::{AllocatedDevice, DeviceTopology};
     use spur_devices::topology::{FabricObservation, ObservationIssueKind};
 
     fn fixture() -> (FabricBinding, ResourceSet, ResourceAllocations) {
@@ -292,13 +292,11 @@ mod tests {
             generation: 7,
             fabric_binding_version: 1,
             block_file_revision: None,
-            gpus: vec![GpuResource {
-                device_id: 0,
+            devices: vec![Device {
+                gres_name: "gpu".into(),
+                device_type: "test".into(),
                 stable_id: 42,
-                gpu_type: "test".into(),
-                memory_mb: 100,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
+                index: 0,
                 topology: Some(DeviceTopology {
                     fabric: Some(FabricObservation {
                         source: "test".into(),
@@ -453,7 +451,7 @@ mod tests {
     fn step_check_reattests_only_the_bound_devices() {
         let (mut binding, mut inventory, allocation) = fixture();
         let fabric = |inventory: &mut ResourceSet| {
-            inventory.gpus[0]
+            inventory.devices[0]
                 .topology
                 .as_mut()
                 .unwrap()
@@ -463,7 +461,7 @@ mod tests {
                 .clone()
         };
         let set = |inventory: &mut ResourceSet, observation: FabricObservation| {
-            inventory.gpus[0].topology.as_mut().unwrap().fabric = Some(observation);
+            inventory.devices[0].topology.as_mut().unwrap().fabric = Some(observation);
         };
         binding.active_endpoints.push("2".into());
         let mut observation = fabric(&mut inventory);
@@ -512,7 +510,7 @@ mod tests {
     #[test]
     fn file_step_ignores_an_unrelated_revision_change() {
         let (mut binding, mut inventory, allocation) = fixture();
-        inventory.gpus[0].topology = None;
+        inventory.devices[0].topology = None;
         inventory.fabric_binding_version = FILE_BINDING_VERSION;
         inventory.block_file_revision = Some("b".repeat(64));
         let endpoint = crate::block_file::declared_endpoint("n1", 42);
@@ -535,7 +533,7 @@ mod tests {
     #[test]
     fn rejects_membership_change_even_with_same_generation() {
         let (binding, mut inventory, allocation) = fixture();
-        inventory.gpus[0]
+        inventory.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -583,7 +581,7 @@ mod tests {
     fn a_renamed_binding_validates_against_the_renamed_inventory() {
         let (mut binding, mut inventory, mut allocation) = fixture();
         binding.rename_gpus(&[(42, 43)].into());
-        inventory.gpus[0].stable_id = 43;
+        inventory.devices[0].stable_id = 43;
         allocation.devices = [("gpu".into(), vec![AllocatedDevice::injectable(43)])].into();
         assert_eq!(binding.members[0].device.stable_id, 43);
         assert_eq!(binding.members[0].endpoint, "1");

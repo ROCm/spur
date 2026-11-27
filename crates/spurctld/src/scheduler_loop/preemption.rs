@@ -51,12 +51,14 @@ impl Snapshot {
                     || current.memory_mb != observed.memory_mb
                     || current.generation != observed.generation
                     || current.generic != observed.generic
-                    || current.gpus.len() != observed.gpus.len()
-                    || current.gpus.iter().zip(&observed.gpus).any(|(a, b)| {
-                        a.stable_id != b.stable_id
-                            || a.device_id != b.device_id
-                            || a.gpu_type != b.gpu_type
-                            || a.memory_mb != b.memory_mb
+                    || current.devices.len() != observed.devices.len()
+                    || current.devices.iter().zip(&observed.devices).any(|(a, b)| {
+                        a.gres_name != b.gres_name
+                            || a.stable_id != b.stable_id
+                            || a.index != b.index
+                            || a.device_type != b.device_type
+                            || a.topology.as_ref().and_then(|t| t.vram_bytes)
+                                != b.topology.as_ref().and_then(|t| t.vram_bytes)
                     })
                 {
                     return None;
@@ -397,14 +399,16 @@ fn direct_victims(
     let mut free = 0usize;
     for i in candidates {
         let node = &state.nodes[i];
+        let whole_node;
         let required = if job.spec.exclusive {
-            &node.total_resources
+            whole_node = node.total_resources.as_request();
+            &whole_node
         } else {
             &required
         };
         let device_work = node
             .total_resources
-            .gpus
+            .devices
             .len()
             .checked_add(1)?
             .checked_mul(
@@ -467,7 +471,7 @@ fn direct_victims(
             node.total_resources
                 .can_satisfy_with_allocated(occupied, required)
                 && pools
-                    .is_none_or(|p| p.admits(occupied, required.cpus, required.gpus.len() as u32))
+                    .is_none_or(|p| p.admits(occupied, required.cpus, required.device_count("gpu")))
                 && (holding.is_empty()
                     || admissible.iter().any(|partition| {
                         spur_sched::partition_cap::partition_cap_ok(

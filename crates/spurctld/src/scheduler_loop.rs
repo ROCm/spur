@@ -5118,10 +5118,10 @@ pub async fn send_suspend_to_agents(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use spur_core::device::Device;
     use spur_core::job::{Job, JobSpec};
     use spur_core::resource::{
-        build_exclusive_allocation, build_node_allocation, GpuLinkType, GpuResource,
-        ResourceAllocations, ResourceSet,
+        build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
 
@@ -5744,30 +5744,28 @@ pub(crate) mod tests {
         );
     }
 
-    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<Device>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus,
             memory_mb,
-            gpus,
+            devices: gpus,
             generic: HashMap::new(),
             generation: 0,
             topology: None,
         }
     }
 
-    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
-        GpuResource {
-            device_id,
-            gpu_type: gpu_type.into(),
-            memory_mb: 192_000,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::PCIe,
-            topology: None,
+    fn gpu(device_id: u32, gpu_type: &str) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: gpu_type.into(),
             stable_id: device_id as u64,
             numa_node: None,
             affinity_cpus: Vec::new(),
+            index: device_id,
+            topology: None,
         }
     }
 
@@ -5789,7 +5787,7 @@ pub(crate) mod tests {
     fn request_per_node(
         nodes: &[String],
         totals: &HashMap<String, ResourceSet>,
-        request: &ResourceSet,
+        request: &spur_core::resource::ResourceRequest,
     ) -> HashMap<String, ResourceAllocations> {
         nodes
             .iter()
@@ -5915,7 +5913,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_a,
             generation: 0,
             topology: None,
@@ -5928,7 +5926,7 @@ pub(crate) mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![],
+            devices: vec![],
             generic: gen_b,
             generation: 0,
             topology: None,
@@ -6515,8 +6513,7 @@ pub(crate) mod tests {
                         spur_core::resource::ResourceAllocations::with_scalar(cpus, 0);
                     let gpus: Vec<_> = node
                         .total_resources
-                        .gpus
-                        .iter()
+                        .gpus()
                         .enumerate()
                         .filter(|(gpu, _)| gpu % ids.len() == index)
                         .map(|(_, gpu)| gpu.stable_id)
@@ -7480,13 +7477,13 @@ pub(crate) mod tests {
             one.spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
             one.spec.memory_per_gpu_mb = Some(1000);
             let request = backfill::job_resource_request(&one);
-            assert_eq!((request.gpus.len(), request.memory_mb), (8, 8000));
+            assert_eq!((request.device_count("gpu"), request.memory_mb), (8, 8000));
 
             let mut two = one.clone();
             two.spec.num_nodes = 2;
             let request = backfill::job_resource_request(&two);
             assert_eq!(
-                (request.gpus.len(), request.memory_mb),
+                (request.device_count("gpu"), request.memory_mb),
                 (1, 1000),
                 "spread over two nodes, each node only needs one"
             );
@@ -7496,18 +7493,8 @@ pub(crate) mod tests {
         fn victim_search_continues_when_its_ranked_seed_cannot_place_the_job() {
             let gpu_node = |name: &str, count: u32| {
                 let mut n = node(name, 4);
-                n.total_resources.gpus = (0..count)
-                    .map(|i| spur_core::resource::GpuResource {
-                        device_id: i,
-                        gpu_type: "mi300x".into(),
-                        memory_mb: 0,
-                        peer_gpus: vec![],
-                        link_type: spur_core::resource::GpuLinkType::XGMI,
-                        topology: None,
-                        stable_id: u64::from(i) + 1,
-                        numa_node: None,
-                        affinity_cpus: Vec::new(),
-                    })
+                n.total_resources.devices = (0..count)
+                    .map(|i| spur_core::device::Device::gpu(u64::from(i) + 1, "mi300x", i))
                     .collect();
                 n
             };

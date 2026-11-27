@@ -4,12 +4,13 @@
 use super::tests::{holds_a_slot, Asked, Recorder};
 use super::*;
 use crate::traits::FabricSchedulingContext;
+use spur_core::device::Device;
 use spur_core::fabric::FabricView;
 use spur_core::gpu_request::GpuRequest;
 use spur_core::job::JobSpec;
 use spur_core::node::NodeState;
 use spur_core::partition::Partition;
-use spur_core::resource::{AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource};
+use spur_core::resource::{AllocatedDevice, DeviceTopology, ResourceSet};
 
 fn now() -> chrono::DateTime<Utc> {
     chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
@@ -26,16 +27,14 @@ fn nodes(count: usize) -> Vec<Node> {
                     generation: 7,
                     fabric_binding_version: 1,
                     block_file_revision: None,
-                    gpus: (0..2)
+                    devices: (0..2)
                         .map(|local| {
                             let endpoint = (index % 2 * 2 + local).to_string();
-                            GpuResource {
-                                device_id: local as u32,
+                            Device {
+                                gres_name: "gpu".into(),
+                                device_type: "test".into(),
                                 stable_id: local as u64 + 42,
-                                gpu_type: "test".into(),
-                                memory_mb: 100,
-                                peer_gpus: vec![],
-                                link_type: GpuLinkType::PCIe,
+                                index: local as u32,
                                 topology: Some(DeviceTopology {
                                     pci_bdf: Some(format!("000{}:04:00.0", local + 1)),
                                     fabric: Some(spur_core::fabric::FabricObservation {
@@ -280,7 +279,7 @@ fn count_capacity_and_topology_hint_cannot_cross_blocks() {
 fn multiple_blocks_on_a_node_do_not_merge_device_capacity() {
     let mut nodes = nodes(2);
     for node in &mut nodes {
-        for (local, gpu) in node.total_resources.gpus.iter_mut().enumerate() {
+        for (local, gpu) in node.total_resources.gpus_mut().enumerate() {
             let observation = gpu.topology.as_mut().unwrap().fabric.as_mut().unwrap();
             observation.physical_domain_id = Some(format!("rack-{local}"));
             observation.active_endpoints = vec![local.to_string(), (local + 2).to_string()];
@@ -527,7 +526,7 @@ fn future_total_gpu_reservation_routes_long_job_to_another_block() {
         let mut nodes = nodes.clone();
         let view = if declared {
             for node in &mut nodes {
-                for gpu in &mut node.total_resources.gpus {
+                for gpu in node.total_resources.gpus_mut() {
                     gpu.topology = None;
                 }
             }
@@ -568,7 +567,7 @@ fn file_blocks_schedule_exact_devices_and_fence_mismatched_agents() {
     for node in &mut nodes {
         node.total_resources.fabric_binding_version = 2;
         node.total_resources.block_file_revision = Some(file.revision.clone());
-        for gpu in &mut node.total_resources.gpus {
+        for gpu in node.total_resources.gpus_mut() {
             gpu.topology = None;
         }
     }
@@ -635,7 +634,7 @@ fn native_block_ties_ignore_declared_names_across_physical_domains() {
 fn native_precedence_keeps_both_vpods_schedulable_with_stale_or_conflicting_files() {
     let mut nodes = nodes(4);
     for (index, node) in nodes.iter_mut().enumerate() {
-        for (slot, gpu) in node.total_resources.gpus.iter_mut().enumerate() {
+        for (slot, gpu) in node.total_resources.gpus_mut().enumerate() {
             let fabric = gpu.topology.as_mut().unwrap().fabric.as_mut().unwrap();
             fabric.physical_domain_id = Some("rack".into());
             fabric.fabric_domain_id = Some((15 + index / 2).to_string());
@@ -692,7 +691,7 @@ fn mixed_fleet_schedules_native_and_file_blocks_with_independent_revision_checks
     for node in &mut nodes[2..] {
         node.total_resources.fabric_binding_version = 2;
         node.total_resources.block_file_revision = Some(file.revision.clone());
-        for gpu in &mut node.total_resources.gpus {
+        for gpu in node.total_resources.gpus_mut() {
             gpu.topology = None;
         }
     }
@@ -710,7 +709,7 @@ fn mixed_fleet_schedules_native_and_file_blocks_with_independent_revision_checks
     let (_, assignments) = run_with_view(&nodes, &[job(3, 2, 3)], true, view);
     assert_eq!(assignments[0].nodes, ["n0", "n1"]);
     nodes[2].total_resources.block_file_revision = Some(file.revision.clone());
-    nodes[0].total_resources.gpus[0]
+    nodes[0].total_resources.devices[0]
         .topology
         .as_mut()
         .unwrap()
@@ -788,7 +787,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
 #[test]
 fn same_fabric_prefers_smallest_suitable_block_at_equal_start() {
     let mut nodes = nodes(3);
-    for gpu in &mut nodes[2].total_resources.gpus {
+    for gpu in nodes[2].total_resources.gpus_mut() {
         let fabric = gpu.topology.as_mut().unwrap().fabric.as_mut().unwrap();
         fabric.active_endpoints = vec!["0".into(), "1".into()];
         fabric.fabric_capacity = Some(2);
@@ -803,7 +802,7 @@ fn property_nodes(count: usize) -> Vec<Node> {
     for node in &mut nodes {
         node.total_resources.fabric_binding_version =
             spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY;
-        for (i, gpu) in node.total_resources.gpus.iter_mut().enumerate() {
+        for (i, gpu) in node.total_resources.gpus_mut().enumerate() {
             let t = gpu.topology.as_mut().unwrap();
             t.vram_bytes = Some((if i == 0 { 24 } else { 192 }) * 1024_u64.pow(3));
             t.numa_node = Some(0);
@@ -925,7 +924,7 @@ fn gpu_root_and_numa_selection_enforce_scope_and_unknowns() {
         request.spec.num_nodes = 1;
         request.spec.num_tasks = 1;
         for node in &mut nodes {
-            let t = node.total_resources.gpus[1].topology.as_mut().unwrap();
+            let t = node.total_resources.devices[1].topology.as_mut().unwrap();
             if field == "pcie_root_id" {
                 t.pci_root = None;
             } else {
@@ -939,7 +938,7 @@ fn gpu_root_and_numa_selection_enforce_scope_and_unknowns() {
 #[test]
 fn property_projection_restores_nodes_between_candidate_groups() {
     let mut nodes = property_nodes(2);
-    nodes[0].total_resources.gpus[1]
+    nodes[0].total_resources.devices[1]
         .topology
         .as_mut()
         .unwrap()

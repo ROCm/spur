@@ -7,7 +7,7 @@ use std::collections::BinaryHeap;
 use chrono::{DateTime, Duration, Utc};
 use spur_core::core_layout::CpuPools;
 use spur_core::partition::Partition;
-use spur_core::resource::{ResourceAllocations, ResourceSet};
+use spur_core::resource::{ResourceAllocations, ResourceRequest, ResourceSet};
 
 use crate::partition_cap::{partition_cap_ok, TresCharge};
 
@@ -147,11 +147,11 @@ impl NodeTimeline {
     }
 
     /// Whether `request` fits beside `used`: the node's counts, then its general pool.
-    pub fn admits(&self, used: &ResourceAllocations, request: &ResourceSet) -> bool {
+    pub fn admits(&self, used: &ResourceAllocations, request: &ResourceRequest) -> bool {
         self.total.can_satisfy_with_allocated(used, request)
             && self
                 .pools
-                .is_none_or(|p| p.admits(used, request.cpus, request.gpus.len() as u32))
+                .is_none_or(|p| p.admits(used, request.cpus, request.device_count("gpu")))
     }
 
     /// Index one past intervals with `start <= time` (`intervals` sorted by `start`).
@@ -169,7 +169,7 @@ impl NodeTimeline {
     fn fits(
         &self,
         sweep: &AllocationSweep<'_>,
-        request: Option<&ResourceSet>,
+        request: Option<&ResourceRequest>,
         cap: Option<CapCheck<'_>>,
     ) -> bool {
         request.is_none_or(|r| self.admits(sweep.used(), r))
@@ -183,7 +183,7 @@ impl NodeTimeline {
     fn duration_blocker(
         &self,
         sweep: &mut AllocationSweep<'_>,
-        request: Option<&ResourceSet>,
+        request: Option<&ResourceRequest>,
         cap: Option<CapCheck<'_>>,
         start: DateTime<Utc>,
         duration: Duration,
@@ -212,7 +212,7 @@ impl NodeTimeline {
     }
 
     /// Whether the request can be satisfied at a specific time.
-    pub fn can_satisfy_at(&self, time: DateTime<Utc>, request: &ResourceSet) -> bool {
+    pub fn can_satisfy_at(&self, time: DateTime<Utc>, request: &ResourceRequest) -> bool {
         let used = self.accumulated_at(time);
         self.admits(&used, request)
     }
@@ -223,7 +223,7 @@ impl NodeTimeline {
     /// to `after` are handled correctly by the sweep, not a staleness bug.
     pub fn earliest_start(
         &self,
-        request: &ResourceSet,
+        request: &ResourceRequest,
         duration: Duration,
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
@@ -245,7 +245,7 @@ impl NodeTimeline {
     /// its cap for `duration`; callers must first drop requests the cap could never admit.
     pub fn earliest_start_capped(
         &self,
-        request: &ResourceSet,
+        request: &ResourceRequest,
         cap: Option<CapCheck<'_>>,
         duration: Duration,
         after: DateTime<Utc>,
@@ -354,7 +354,8 @@ impl NodeTimeline {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use spur_core::resource::{AllocatedDevice, GpuResource};
+    use spur_core::device::Device;
+    use spur_core::resource::AllocatedDevice;
 
     fn make_timeline() -> NodeTimeline {
         NodeTimeline::new(
@@ -369,16 +370,14 @@ mod tests {
 
     fn make_gpu_timeline(num_gpus: usize) -> NodeTimeline {
         let gpus = (0..num_gpus)
-            .map(|i| GpuResource {
-                device_id: i as u32,
-                gpu_type: "mi355x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: spur_core::resource::GpuLinkType::PCIe,
-                topology: None,
-                stable_id: i as u64,
+            .map(|i| Device {
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                gres_name: "gpu".into(),
+                device_type: "mi355x".into(),
+                stable_id: i as u64,
+                index: i as u32,
+                topology: None,
             })
             .collect();
         NodeTimeline::new(
@@ -386,7 +385,7 @@ mod tests {
             ResourceSet {
                 cpus: 192,
                 memory_mb: 2_000_000,
-                gpus,
+                devices: gpus,
                 ..Default::default()
             },
         )
@@ -396,7 +395,7 @@ mod tests {
     fn test_empty_timeline() {
         let tl = make_timeline();
         let now = Utc::now();
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 64,
             memory_mb: 256_000,
             ..Default::default()
@@ -414,14 +413,14 @@ mod tests {
             ResourceAllocations::with_scalar(32, 128_000),
         );
 
-        let req_full = ResourceSet {
+        let req_full = ResourceRequest {
             cpus: 64,
             memory_mb: 256_000,
             ..Default::default()
         };
         assert!(!tl.can_satisfy_at(now + Duration::hours(1), &req_full));
 
-        let req_partial = ResourceSet {
+        let req_partial = ResourceRequest {
             cpus: 32,
             memory_mb: 128_000,
             ..Default::default()
@@ -441,7 +440,7 @@ mod tests {
             ResourceAllocations::with_scalar(48, 0),
         );
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 32,
             memory_mb: 0,
             ..Default::default()
@@ -462,24 +461,8 @@ mod tests {
         );
         tl.reserve(now, now + Duration::hours(4), alloc);
 
-        let req = ResourceSet {
-            cpus: 4,
-            memory_mb: 0,
-            gpus: (0..4)
-                .map(|i| GpuResource {
-                    device_id: i as u32,
-                    gpu_type: "mi355x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: spur_core::resource::GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(4, 0);
+        req.add_devices("gpu", Some("mi355x"), 4);
         assert!(!tl.can_satisfy_at(now + Duration::minutes(1), &req));
     }
 
@@ -495,24 +478,8 @@ mod tests {
         );
         tl.reserve(now, now + Duration::hours(4), alloc);
 
-        let req = ResourceSet {
-            cpus: 4,
-            memory_mb: 0,
-            gpus: (0..4)
-                .map(|i| GpuResource {
-                    device_id: i as u32,
-                    gpu_type: "mi355x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: spur_core::resource::GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(4, 0);
+        req.add_devices("gpu", Some("mi355x"), 4);
         assert!(tl.can_satisfy_at(now + Duration::minutes(1), &req));
     }
 
@@ -563,7 +530,7 @@ mod tests {
             );
         }
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 32,
             memory_mb: 0,
             ..Default::default()
@@ -574,7 +541,7 @@ mod tests {
 
     fn brute_earliest_start(
         tl: &NodeTimeline,
-        request: &ResourceSet,
+        request: &ResourceRequest,
         duration: Duration,
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
@@ -692,7 +659,7 @@ mod tests {
             ResourceAllocations::with_scalar(32, 0),
         );
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 32,
             ..Default::default()
         };
@@ -718,7 +685,7 @@ mod tests {
             ResourceAllocations::with_scalar(30, 0),
         );
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 32,
             ..Default::default()
         };
@@ -742,7 +709,7 @@ mod tests {
             );
         }
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 8,
             ..Default::default()
         };
@@ -776,24 +743,8 @@ mod tests {
             alloc_b,
         );
 
-        let req = ResourceSet {
-            cpus: 4,
-            memory_mb: 0,
-            gpus: (0..2)
-                .map(|i| GpuResource {
-                    device_id: i as u32,
-                    gpu_type: "mi355x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: spur_core::resource::GpuLinkType::PCIe,
-                    topology: None,
-                    stable_id: i as u64,
-                    numa_node: None,
-                    affinity_cpus: Vec::new(),
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut req = ResourceRequest::with_scalar(4, 0);
+        req.add_devices("gpu", Some("mi355x"), 2);
         let duration = Duration::hours(1);
 
         let got = tl.earliest_start(&req, duration, base);
@@ -822,7 +773,7 @@ mod tests {
         assert_eq!(tl.intervals.len(), 1);
         assert!(tl.intervals[0].end > base);
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 32,
             ..Default::default()
         };
@@ -868,7 +819,7 @@ mod tests {
             );
         }
 
-        let req = ResourceSet {
+        let req = ResourceRequest {
             cpus: 24,
             memory_mb: 0,
             ..Default::default()
@@ -895,11 +846,8 @@ mod tests {
         }
     }
 
-    fn cpu_request(cpus: u32) -> ResourceSet {
-        ResourceSet {
-            cpus,
-            ..Default::default()
-        }
+    fn cpu_request(cpus: u32) -> ResourceRequest {
+        ResourceRequest::with_scalar(cpus, 0)
     }
 
     #[test]

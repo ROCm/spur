@@ -103,9 +103,9 @@ impl InputSize {
     }
 
     pub fn inventory(&mut self, inventory: &ResourceSet) -> Option<()> {
-        self.entries(inventory.gpus.len().checked_add(1)?)?;
-        for gpu in &inventory.gpus {
-            self.text(&gpu.gpu_type)?;
+        self.entries(inventory.devices.len().checked_add(1)?)?;
+        for device in &inventory.devices {
+            self.text(&device.device_type)?;
         }
         self.strings(inventory.generic.keys())
     }
@@ -533,7 +533,7 @@ impl PlacementRequest {
                 .values()
                 .map(Vec::len)
                 .sum::<usize>();
-            let gpus = node.total_resources.gpus.len();
+            let gpus = node.total_resources.gpus().count();
             device_work = device_work.checked_add(
                 node.layout_blocked_cpus
                     .len()
@@ -685,19 +685,21 @@ pub fn consumable_inventory(inventory: &ResourceSet) -> ResourceSet {
     ResourceSet {
         cpus: inventory.cpus,
         memory_mb: inventory.memory_mb,
-        gpus: inventory
-            .gpus
+        devices: inventory
+            .devices
             .iter()
-            .map(|gpu| spur_core::resource::GpuResource {
-                device_id: gpu.device_id,
-                gpu_type: gpu.gpu_type.clone(),
-                memory_mb: gpu.memory_mb,
-                peer_gpus: Vec::new(),
-                link_type: gpu.link_type,
-                stable_id: gpu.stable_id,
-                topology: None,
+            .map(|device| spur_core::device::Device {
+                topology: device
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.vram_bytes)
+                    .map(|vram_bytes| spur_core::device::DeviceTopology {
+                        vram_bytes: Some(vram_bytes),
+                        ..Default::default()
+                    }),
                 numa_node: None,
                 affinity_cpus: Vec::new(),
+                ..device.clone()
             })
             .collect(),
         generic: inventory.generic.clone(),

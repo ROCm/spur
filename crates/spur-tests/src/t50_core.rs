@@ -207,11 +207,7 @@ mod tests {
             memory_mb: 256_000,
             ..Default::default()
         };
-        let req = ResourceSet {
-            cpus: 32,
-            memory_mb: 128_000,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(32, 128_000);
         assert!(avail.can_satisfy(&req));
     }
 
@@ -222,11 +218,7 @@ mod tests {
             memory_mb: 256_000,
             ..Default::default()
         };
-        let req = ResourceSet {
-            cpus: 64,
-            memory_mb: 128_000,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(64, 128_000);
         assert!(!avail.can_satisfy(&req));
     }
 
@@ -237,11 +229,7 @@ mod tests {
             memory_mb: 100_000,
             ..Default::default()
         };
-        let req = ResourceSet {
-            cpus: 32,
-            memory_mb: 200_000,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(32, 200_000);
         assert!(!avail.can_satisfy(&req));
     }
 
@@ -255,17 +243,9 @@ mod tests {
             ..Default::default()
         };
         let used = ResourceAllocations::with_scalar(24, 100_000);
-        let req = ResourceSet {
-            cpus: 40,
-            memory_mb: 156_000,
-            ..Default::default()
-        };
+        let req = ResourceRequest::with_scalar(40, 156_000);
         assert!(total.can_satisfy_with_allocated(&used, &req));
-        let too_much = ResourceSet {
-            cpus: 41,
-            memory_mb: 156_000,
-            ..Default::default()
-        };
+        let too_much = ResourceRequest::with_scalar(41, 156_000);
         assert!(!total.can_satisfy_with_allocated(&used, &too_much));
     }
 
@@ -775,22 +755,13 @@ address = "http://peer-a:6817"
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256000,
-            gpus: vec![],
+            devices: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
             topology: None,
         };
         let alloc = ResourceAllocations::with_scalar(60, 200000);
-        let required = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 32,
-            memory_mb: 128000,
-            gpus: vec![],
-            generic: std::collections::HashMap::new(),
-            generation: 0,
-            topology: None,
-        };
+        let required = ResourceRequest::with_scalar(32, 128000);
 
         assert!(total.can_satisfy(&required));
 
