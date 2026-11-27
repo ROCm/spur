@@ -303,17 +303,35 @@ impl From<anyhow::Error> for CancelError {
 pub enum JobUpdateRefusal {
     InvalidArgument(String),
     FailedPrecondition(String),
+    PermissionDenied(String),
 }
 
 impl std::fmt::Display for JobUpdateRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidArgument(m) | Self::FailedPrecondition(m) => f.write_str(m),
+            Self::InvalidArgument(m) | Self::FailedPrecondition(m) | Self::PermissionDenied(m) => {
+                f.write_str(m)
+            }
         }
     }
 }
 
 impl std::error::Error for JobUpdateRefusal {}
+
+/// A started job's wall clock is the budget its owner already holds. Lengthening
+/// it spends nodes past that budget, so only an operator may do it. A job stays
+/// Pending while it launches on nodes it already holds, so that counts as started
+/// too. A shorter limit gives time back.
+fn time_limit_raise_refused(
+    state: JobState,
+    placed: bool,
+    current: Option<chrono::Duration>,
+    requested: chrono::Duration,
+    operates_jobs: bool,
+) -> bool {
+    let started = state.is_active() || placed;
+    started && !operates_jobs && current.is_some_and(|current| requested > current)
+}
 
 fn exclude_after_placement(job_id: JobId) -> JobUpdateRefusal {
     JobUpdateRefusal::FailedPrecondition(format!(
@@ -5395,9 +5413,10 @@ impl ClusterManager {
         account: Option<String>,
         qos: Option<String>,
         exclude: Option<String>,
+        operates_jobs: bool,
     ) -> anyhow::Result<()> {
         let exclude = exclude.map(parse_exclude_update).transpose()?;
-        let (job_user, job_account, job_state, placed) = {
+        let (job_user, job_account, job_state, placed, current_limit) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -5407,8 +5426,18 @@ impl ClusterManager {
                 job.spec.account.clone(),
                 job.state,
                 job.holds_a_placement(),
+                job.spec.time_limit,
             )
         };
+
+        if time_limit.is_some_and(|requested| {
+            time_limit_raise_refused(job_state, placed, current_limit, requested, operates_jobs)
+        }) {
+            return Err(JobUpdateRefusal::PermissionDenied(format!(
+                "only an operator may increase the time limit of job {job_id} once it has started"
+            ))
+            .into());
+        }
 
         if exclude.is_some() {
             if job_state != JobState::Pending {
@@ -29079,8 +29108,18 @@ state = "UP"
                     cm.hold_job(owner).unwrap();
                 }
                 _ => {
-                    cm.update_job(owner, None, None, None, None, None, None, Some("n1".into()))
-                        .unwrap();
+                    cm.update_job(
+                        owner,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("n1".into()),
+                        false,
+                    )
+                    .unwrap();
                 }
             }
             let pending = cm.pending_jobs();
@@ -38500,13 +38539,188 @@ state = "UP"
         assert_eq!(job.requeue_count, requeue_count_before);
     }
 
+    #[test]
+    fn time_limit_raise_is_refused_only_once_a_job_has_started() {
+        let day = chrono::Duration::hours(24);
+        let longer = chrono::Duration::hours(72);
+        let shorter = chrono::Duration::hours(1);
+        let cases = [
+            (JobState::Running, true, Some(day), longer, false, true),
+            (JobState::Suspended, true, Some(day), longer, false, true),
+            (JobState::Completing, true, Some(day), longer, false, true),
+            (JobState::Pending, true, Some(day), longer, false, true),
+            (JobState::Running, true, Some(day), shorter, false, false),
+            (JobState::Running, true, Some(day), day, false, false),
+            (JobState::Running, true, Some(day), longer, true, false),
+            (JobState::Pending, true, Some(day), longer, true, false),
+            (JobState::Pending, false, Some(day), longer, false, false),
+            (JobState::Running, true, None, longer, false, false),
+            (JobState::Completed, false, Some(day), longer, false, false),
+        ];
+        for (state, placed, current, requested, operates_jobs, refused) in cases {
+            assert_eq!(
+                time_limit_raise_refused(state, placed, current, requested, operates_jobs),
+                refused,
+                "{state:?} placed={placed} operates_jobs={operates_jobs}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cannot_raise_the_time_limit_of_a_job_that_has_started() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut spec = basic_spec("limit");
+        let day = chrono::Duration::hours(24);
+        spec.time_limit = Some(day);
+        let id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let err = cm
+            .update_job(
+                id,
+                Some(chrono::Duration::hours(72)),
+                None,
+                None,
+                Some("should not land".into()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<JobUpdateRefusal>(),
+                Some(JobUpdateRefusal::PermissionDenied(_))
+            ),
+            "{err}"
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.time_limit, Some(day));
+        assert_eq!(job.spec.comment, None, "a refused raise leaves every field");
+
+        cm.update_job(
+            id,
+            Some(chrono::Duration::hours(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::hours(1))
+        );
+
+        cm.update_job(
+            id,
+            Some(chrono::Duration::hours(72)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::hours(72))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cannot_raise_the_time_limit_once_nodes_are_reserved() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut spec = basic_spec("launching");
+        let day = chrono::Duration::hours(24);
+        spec.time_limit = Some(day);
+        let id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .unwrap();
+        wait_for("charged", || cm.get_job(id).unwrap().holds_a_placement());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
+
+        let err = cm
+            .update_job(
+                id,
+                Some(chrono::Duration::hours(72)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<JobUpdateRefusal>(),
+                Some(JobUpdateRefusal::PermissionDenied(_))
+            ),
+            "{err}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().spec.time_limit, Some(day));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_of_a_pending_job_may_raise_its_time_limit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("queued");
+        spec.time_limit = Some(chrono::Duration::hours(24));
+        let id = submit_and_wait(&cm, spec);
+
+        cm.update_job(
+            id,
+            Some(chrono::Duration::hours(72)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.spec.time_limit, Some(chrono::Duration::hours(72)));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_priority() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prio"));
 
-        cm.update_job(id, None, Some(5000), None, None, None, None, None)
+        cm.update_job(id, None, Some(5000), None, None, None, None, None, false)
             .unwrap();
         wait_for("priority updated", || {
             cm.get_job(id).is_some_and(|j| j.priority == 5000)
@@ -38532,6 +38746,7 @@ state = "UP"
             None,
             None,
             Some("n[1-2]".into()),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -38539,8 +38754,18 @@ state = "UP"
             Some("n[1-2]")
         );
 
-        cm.update_job(id, None, None, None, None, None, None, Some("   ".into()))
-            .unwrap();
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("   ".into()),
+            false,
+        )
+        .unwrap();
         assert_eq!(cm.get_job(id).unwrap().spec.exclude, None);
     }
 
@@ -38560,6 +38785,7 @@ state = "UP"
                 None,
                 None,
                 Some("node[07-08".into()),
+                false,
             )
             .unwrap_err();
         assert!(
@@ -38588,7 +38814,17 @@ state = "UP"
         first.set_raft(handle.raft.clone());
         let id = submit_and_wait(&first, basic_spec("durable"));
         first
-            .update_job(id, None, None, None, None, None, None, Some("n1".into()))
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("n1".into()),
+                false,
+            )
             .unwrap();
         handle.raft.shutdown().await.unwrap();
 
@@ -38620,7 +38856,17 @@ state = "UP"
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
 
         let err = cm
-            .update_job(id, None, None, None, None, None, None, Some("n1".into()))
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("n1".into()),
+                false,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("already has nodes reserved"),
@@ -40443,8 +40689,18 @@ state = "UP"
         register_node(&cm, "n2", 8, 16000);
         let id = submit_and_wait(&cm, basic_spec("raced"));
         let res = scalar_alloc(4, 8000);
-        cm.update_job(id, None, None, None, None, None, None, Some("n1".into()))
-            .unwrap();
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("n1".into()),
+            false,
+        )
+        .unwrap();
 
         // What a reservation chosen from a pass that predates the exclusion proposes.
         let resp = cm.apply_operation(&WalOperation::job_start(
@@ -40507,6 +40763,7 @@ state = "UP"
                 None,
                 None,
                 Some("n1".into()),
+                false,
             )
             .unwrap_err();
         assert!(
@@ -40541,7 +40798,17 @@ state = "UP"
 
         // Unknown QOS rejected.
         let err = cm
-            .update_job(id, None, None, None, None, None, Some("ghost".into()), None)
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("ghost".into()),
+                None,
+                false,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'ghost' does not exist"));
         assert!(!err.to_string().contains("accounting may not be enabled"));
@@ -40553,7 +40820,17 @@ state = "UP"
 
         // Empty QOS (clear-to-limitless) rejected.
         let err = cm
-            .update_job(id, None, None, None, None, None, Some(String::new()), None)
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(String::new()),
+                None,
+                false,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("cannot clear a job's QOS"));
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
@@ -40568,6 +40845,7 @@ state = "UP"
             None,
             Some("highprio".into()),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -40593,6 +40871,7 @@ state = "UP"
                 None,
                 Some("any-qos".into()),
                 None,
+                false,
             )
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
@@ -40635,6 +40914,7 @@ state = "UP"
                 None,
                 Some("other-teams-qos".into()),
                 None,
+                false,
             )
             .unwrap_err();
         assert!(err
@@ -40660,6 +40940,7 @@ state = "UP"
             None,
             Some("highprio".into()),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -40697,6 +40978,7 @@ state = "UP"
                 Some("made-up-account".into()),
                 Some("other-teams-qos".into()),
                 None,
+                false,
             )
             .unwrap_err();
         assert!(
@@ -40721,6 +41003,7 @@ state = "UP"
                 Some(String::new()),
                 Some("other-teams-qos".into()),
                 None,
+                false,
             )
             .unwrap_err();
         assert!(
@@ -40751,8 +41034,18 @@ state = "UP"
         spec.account = Some("research".into());
         let id = submit_and_wait(&cm, spec);
 
-        cm.update_job(id, None, None, None, None, None, Some("b".into()), None)
-            .unwrap();
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("b".into()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("b"));
 
         let err = cm
@@ -40765,6 +41058,7 @@ state = "UP"
                 None,
                 Some("other-teams-qos".into()),
                 None,
+                false,
             )
             .unwrap_err();
         assert!(err.to_string().contains("is not permitted"));
