@@ -33446,7 +33446,7 @@ state = "UP"
     async fn preempt_for_unstarted(cm: &Arc<ClusterManager>) -> Vec<JobId> {
         cm.tick_preempt_freed_earmarks();
         let mut pass = one_pass(cm);
-        crate::scheduler_loop::preempt_unstarted(cm, &mut pass).await;
+        pass.after_placement(cm).await;
         pass.admitted()
     }
 
