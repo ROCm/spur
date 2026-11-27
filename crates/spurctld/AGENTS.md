@@ -1,463 +1,71 @@
-# spurctld — Spur Controller Daemon
-
-## Overview
-
-`spurctld` is the central controller daemon for Spur, an AI-native HPC job scheduler written in Rust that serves as a Slurm drop-in replacement. It runs as a single binary (`spurctld`) on one or more controller nodes, owns all cluster state (jobs, nodes, partitions, reservations, tokens), and replicates that state via Raft consensus. Durable replicated mutations flow through the Raft WAL as a `WalOperation`; some leader-local or transient fields are written directly and must tolerate loss on failover. Reads are served from in-memory state materialized by replaying the log. The controller exposes a gRPC API (port 6817), a Slurm-compatible REST API (port 6820), a Raft-internal gRPC port (6821), and an OpenMetrics HTTP endpoint (port 6822).
-
-## Directory Structure
-
-```
-src/
-  main.rs                  CLI args, process startup, wires Raft/scheduler/k8s/health/metrics/REST/gRPC
-  server.rs                gRPC SlurmController impl — all RPC handlers, leader forwarding, PassthroughCodec
-  cluster.rs               ClusterManager — the 31k-line state machine: jobs, nodes, partitions, reservations, apply()
-  raft.rs                  openraft integration: SpurStore (disk-backed WAL/snapshot), StateMachineApply trait
-  raft_server.rs           Dedicated gRPC server for Raft-internal RPCs (AppendEntries, Vote, InstallSnapshot)
-  scheduler_loop.rs        Leader-gated scheduling loop: BackfillScheduler, time-limit/completing/inactive enforcers
-  victim_order.rs          In-memory victim costs, per-node-freed rank keys, stable preemptor/node hash
-  scheduler_loop/preemption.rs  Coherent compact allocation snapshots and bounded resource-aware victim sets
-  script_placement.rs      Batch script placement policy: per-run resolution (K8s hold, capability check), submit check
-  cluster_k8s.rs           k0s cluster reconcile loop: role assignment, WireGuard mesh, join-token lifecycle
-  hooks.rs                 Sandboxed Lua job_submit hooks (mlua, text-only, memory/instruction-capped)
-  auth_middleware.rs        Tower layer: single auth verification point for all gRPC+accounting RPCs
-  agent_client.rs          Authenticated controller->agent connections (JWT or native ControllerRpc tokens)
-  native_keys.rs           Process-wide Ed25519 signing keys: peer forwarding, node identity, execution credentials
-  pmix_dispatch.rs         Multi-node PMIx prepare/release fan-out helpers
-  dispatch_tracker.rs      Leader-local in-flight launch tracker (RAII drop guard)
-  association_cache.rs     Cached user/account associations from PostgreSQL (default QOS, memberships, limits)
-  fairshare_cache.rs       Cached fairshare factors from PostgreSQL
-  limits_cache.rs          Cached QOS definitions and GrpWall usage from PostgreSQL
-  rpc_stats.rs             Per-operation RPC timing accumulator
-  sched_stats.rs           Scheduler cycle and lifecycle statistics accumulator
-  rpc_middleware.rs        Tower layer: RPC path/timing recording
-  metrics_proto.rs         Protobuf-to-snapshot converters for OpenMetrics export
-  metrics_server.rs        Axum HTTP server exporting /metrics/* endpoints (OpenMetrics 1.0)
-
-  accounting/
-    mod.rs                 Bring-up orchestration: connect-with-retry, activate caches/loops
-    db.rs                  PostgreSQL schema (sqlx migrations), CRUD for jobs/users/accounts/QOS/usage
-    grpc.rs                SlurmAccounting gRPC service impl
-    fairshare.rs           Fairshare factor computation (half-life decay)
-    reconcile.rs           Leader-gated job reconciliation loop (db vs in-memory drift)
-    notifier.rs            Async accounting write dispatch (job start/end records)
-    txn.rs                 Audit transaction record types and helpers
-
-  audit/
-    mod.rs                 AuditSlot for handler->layer annotation, InBand for handler-committed rows
-    layer.rs               Tower audit layer: records mutating RPCs to the accounting txn table
-    registry.rs            RPC method -> (action, entity, scope) classification for audit
-
-  rest/
-    mod.rs                 Axum router: /api/v1 and /slurm/v0.0.42 route trees, rest_auth middleware
-    handlers.rs            REST endpoint handlers (ping, jobs, nodes, partitions, submit, cancel)
-    types.rs               Serde types for REST request/response envelopes
-    convert.rs             Job/Node/Partition -> JSON converters for REST
-```
-
-## Key Types & Interfaces
-
-### ClusterManager (`cluster.rs`)
-
-The core state machine. Thread-safe via `parking_lot::RwLock`. Both the scheduler loop and the gRPC server hold `Arc<ClusterManager>`.
-
-| Field | Type | Purpose |
-|---|---|---|
-| `config` | `RwLock<Arc<SlurmConfig>>` | Live config, swapped atomically by `reconfigure()` |
-| `jobs` | `RwLock<HashMap<JobId, Job>>` | All jobs (pending through terminal) |
-| `nodes` | `RwLock<HashMap<String, Node>>` | Registered compute nodes |
-| `partitions` | `RwLock<Vec<Partition>>` | Partition definitions |
-| `reservations` | `RwLock<Vec<Reservation>>` | Active reservations |
-| `steps` | `RwLock<HashMap<(JobId, u32), JobStep>>` | Job steps |
-| `tokens` | `RwLock<HashMap<String, AdmissionToken>>` | Node admission tokens |
-| `node_inventory` | `RwLock<Option<NodeInventory>>` | Saved `admission.node_names` list; `None` until the first save |
-| `k0s` | `RwLock<K0sClusterState>` | Managed k0s cluster state |
-| `raft` | `RwLock<Option<SpurRaft>>` | Raft handle, set after startup |
-| `accounting` | `RwLock<Option<AccountingNotifier>>` | Async accounting writer |
-| `scheduler_notify` | `Arc<Notify>` | Event-driven scheduler wake |
-| `dispatch_tracker` | `Arc<DispatchTracker>` | In-flight launches |
-
-Implements `StateMachineApply`: every committed `WalOperation` calls `apply_operation()`, which pattern-matches the variant and mutates in-memory state. Durable replicated state must change only via `propose()` → `apply_operation()`. Some leader-local or transient fields (heartbeat stats, pending reasons, scheduler marks, WG pubkeys, BB staging state, GPU stable_id mappings, job output paths) are written directly and must tolerate loss on failover. `update_job` writes durable spec fields (`time_limit`, `partition`, `comment`, `account`, `qos`) directly — these are not replicated.
-
-### ControllerService (`server.rs`)
-
-Implements `SlurmController` (gRPC). Cloneable — all fields are `Arc` or immutable.
-
-| Field | Purpose |
-|---|---|
-| `cluster` | Shared `ClusterManager` |
-| `raft` | Raft handle for leadership checks |
-| `leader_proxy` | Cached channel to the current leader |
-| `client_addrs` | Node ID -> client API address map |
-| `jwt_key` | Node-token signing key (restart-only, not reconfigurable) |
-
-### SpurStore (`raft.rs`)
-
-Disk-backed Raft storage. Layout: `{state_dir}/raft/{vote.json, log/*.json, snapshot.json, purged.json}`.
-
-All log entries carry `WalOperation` as the data payload. Snapshots serialize the full cluster state (all jobs, nodes, partitions, reservations, tokens, k0s) as a single JSON blob.
-
-### Key Error Types (`cluster.rs`)
-
-- `SubmitError` — `InvalidArgument | Unavailable | Internal`
-- `CancelError` — `NotFound | AlreadyTerminal | NotOwner | Internal`
-- `ReservationError` — `InvalidArgument | NotFound | AlreadyExists | Raft`
-- `PartitionError` — same shape as `ReservationError`
-- `RegisterNodeError` — `PermissionDenied | Internal`
-
-## gRPC Services
-
-The controller serves two gRPC services on port 6817:
-
-### SlurmController
-
-**Jobs:** `SubmitJob`, `GetJobs`, `GetJob`, `CancelJob`, `CompleteJob`, `SuspendJob`, `ResumeJob`, `UpdateJob`, `RequeueJob`, `JobKeepalive`, `ExecInJob`, `RunStep`
-
-**Job steps:** `GetJobSteps`, `CreateJobStep`, `CompleteJobStep`
-
-**Nodes:** `GetNodes`, `GetNode`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `DeregisterAgent`, `RegisterAgent`, `Heartbeat`, `ReportJobStatus`, `ReportStepdRecovery`
-
-**Partitions:** `GetPartitions`, `CreatePartition`, `UpdatePartition`, `DeletePartition`
-
-**Reservations:** `CreateReservation`, `UpdateReservation`, `DeleteReservation`, `ListReservations`
-
-**K8s/Cluster:** `ClusterUp`, `ClusterDown`, `ClusterStatus`, `ClusterKubeconfig`, `ClusterAddNodes`, `ClusterRemoveNodes`
-
-**Auth tokens:** `CreateToken`, `ListTokens`, `RevokeToken`
-
-**Diagnostics:** `Ping`, `GetJobMetrics`, `GetNodeMetrics`, `GetRpcStats`, `GetSchedStats`, `GetAssocMgrInfo`, `ResetDiagStats`, `Reconfigure`
-
-### SlurmAccounting (`accounting/grpc.rs`)
-
-Runs on the same port. Database-backed user/account/QOS/association management, fairshare factor queries, and usage reporting.
-
-## Raft Consensus
-
-### Always-on design
-
-Raft runs even in single-node mode (self-elects instantly, same pattern as Apache Kudu). Durable replicated state must change only via `propose()` → `apply_operation()`. Some leader-local or transient fields (heartbeat stats, pending reasons, scheduler marks, WG pubkeys, BB staging state, GPU stable_id mappings, job output paths) are written directly and must tolerate loss on failover. `update_job` writes durable spec fields (`time_limit`, `partition`, `comment`, `account`, `qos`) directly — these are not replicated.
-
-### WalOperation
-
-Durable cluster mutations are proposed as `WalOperation` enum variants. 43 variants:
-
-**Job lifecycle:** `JobSubmit`, `JobStart`, `JobComplete`, `JobNodeComplete`, `JobCopyExited`, `JobCancelSignaled`, `JobPreemptCancel`, `JobPreemptRequeue`, `JobSuspend`, `JobResume`, `JobUserRequeue`, `JobDispatchBackoff`, `JobTimeLimitSignaled`, `JobTimeLimitExpired`, `JobPreemptSignaled`, `JobStateChange`, `JobPriorityChange`, `JobStepCreate`, `JobStepComplete`, `JobEvict`, `JobLaunchFailureDetail`, `JobExcludeUpdate`, `EvictTerminalJobs`
-
-**Node management:** `NodeRegister`, `NodeUpdate`, `NodeStateChange`, `NodeLabelsUpdate`, `NodeRemove`, `NodeInventoryUpdate`, `NodeK0sAssign`, `NodeK0sClear`, `NodeK0sSetError`
-
-**Partitions:** `PartitionCreate`, `PartitionUpdate`, `PartitionDelete`
-
-**Reservations:** `ReservationCreate`, `ReservationUpdate`, `ReservationDelete`
-
-**Tokens:** `TokenCreate`, `TokenRevoke`
-
-**K8s:** `K0sSetPhase`, `K0sMemberNodesAdd`, `K0sMemberNodesRemove`
-
-`ClusterManager::propose()` writes to the Raft log; `apply_operation()` materializes the committed entry into in-memory state. The `ClientResponse` returned from apply carries side-effects (e.g. `jobs_finalized` for accounting writes, `job_started` flag for duplicate-detection).
-
-### Leader forwarding
-
-Followers forward write RPCs to the leader via a `LeaderProxy` that caches a channel to the current leader. The `PassthroughCodec` sends the exact bytes signed by the follower, since prost map fields have no canonical byte order and re-encoding would break the digest. The forwarded identity is carried in an `x-spur-identity` header, verified by `auth_middleware` against a SHA-256 body digest.
-
-Read RPCs are forwarded too (consistency with leader state), unless the request is itself already forwarded (prevents bounce loops).
-
-`Ping` is answered locally even on a follower (its hostname/version/etc. describe this controller), but its `capabilities` field is the leader's own list intersected with this controller's: a follower queries the leader (a `Ping` over the same `LeaderProxy` channel, marked already-forwarded so the far side never chases a further leader) and narrows to what both support, failing closed to none if no leader is reachable. This keeps a client from passing its capability check against a follower during a leader-last upgrade and then having the leader silently drop fields it doesn't know yet. The whole probe is bounded by `LEADER_CAPABILITY_PROBE_TIMEOUT_SECS`, channel acquisition included: `get_leader_channel()` has no bound of its own, so without this the `cached_channel` mutex it holds across `Endpoint::connect()` could jam every other forwarded RPC behind a hung dial. The leader `Endpoint` also carries a `connect_timeout` (reusing `LEADER_CAPABILITY_PROBE_TIMEOUT_SECS`, since it's shared with ordinary forwarding and must not exceed the probe's own bound), so a hung dial fails at that same bound instead of hanging past it.
-
-### Snapshots
-
-`snapshot_state()` serializes the full cluster state to JSON. `restore_from_snapshot()` replaces all in-memory state. Snapshots ship in chunks of `RAFT_SNAPSHOT_MAX_CHUNK_SIZE` (1 MiB raw). The Raft gRPC message limit is 32 MiB (above tonic's 4 MiB default) to accommodate the JSON inflation of chunk payloads.
-
-### Recovery
-
-`--allow-partial-wal-recovery` skips unreadable WAL/vote/snapshot records instead of refusing to start. This is silent data loss — the default (`strict = true`) halts so the operator can roll back to a compatible binary.
-
-## Scheduler Loop
-
-`scheduler_loop::run()` is spawned from `main.rs`, leader-gated.
-
-**Event-driven wake:** `tokio::select!` between `scheduler_notify.notified()` (job submitted) and a periodic tick (`scheduler.interval_secs`). Eliminates polling delay for new submissions.
-
-**Per-cycle flow:**
-1. Cancel unsatisfiable dependency jobs
-2. Complete the burst-buffer stage-ins in flight (`drive_bb_stage_in`)
-3. Sweep orphaned placements (held back 2x dispatch_timeout after leadership change)
-4. Purge expired reservations, enforce reservation end times, evict expired terminal jobs
-5. Run node health checks
-6. Classify pending jobs (QOS/account limits, burst-buffer, licenses, idle-fill candidates); no QOS or account limit is charged yet
-7. Build `ClusterState` (nodes off dispatch cooldown, partitions, reservations, topology, busy_until)
-8. `plan_pass`: run `BackfillScheduler::schedule_with()` in `catch_unwind` (a panic skips the cycle, not the loop), with `LimitAdmission` charging QOS, account and partition QOS limits as each job starts, then start burst-buffer stage-in for jobs still within their limits
-9. Dispatch assignments: resolve the run's script placement (`script_placement::resolve_run_placement`: the job's request, else `[controller] script_placement`; `auto` runs the text scan), propose `JobStart` (recording it) via Raft, fan out `LaunchJob` RPCs to agents. A batch run on K8s nodes is held, a fallback since backfill never offers batch jobs K8s nodes; a run that a node without `CAP_SCRIPT_PLACEMENT` would launch differently is backed off on a spared retry (`take_spared_dispatch`, capped at `MAX_SPARED_DISPATCHES`), a safety net behind backfill skipping such nodes
-10. Record cycle stats
-
-**Companion tasks (spawned alongside):**
-- `enforce_time_limits` — SIGTERM then SIGKILL with configurable grace (`effective_kill_wait_secs()` / `effective_timeout_kill_wait_secs()` from `SchedulerConfig`)
-- `enforce_completing_timeout` — reaps jobs stuck in `Completing` past a deadline
-- `manage_power` — node power state management
-- `enforce_inactive_limits` — reaps interactive allocations with no keepalive activity
-
-**Topology:** rebuilt each scheduling cycle from live config (`cluster.config()`). `scontrol reconfigure` validates `[topology]` and the updated config is picked up on the next cycle. `TopologyConfig::build()` returns `None` unless `plugin` is `tree` or `block`. Two views:
-- `tree` — `TopologyTree::from_switches(&topo_config.switches)` — explicit switch hierarchy
-- `block` — `TopologyTree::from_blocks(&node_names, block_size)` — implicit equal-sized blocks (default 18 nodes)
-
-When a `FabricView` has block data or an `external.block_file` is configured, either plugin upgrades to `TopologyTree::from_fabric(view)`. There is no `fabric` plugin value — the `plugin` field accepts `tree`, `block`, or `none`.
-
-**Idle-fill candidates:** Jobs refused solely by their QOS group-node cap are appended below every in-quota job at placement time. They carry `idle_fill = true` and are offered exactly the capacity left after every in-quota job has started or reserved what it needs. Candidates must have a time_limit (mandatory — an unbounded borrowed job would make its node look busy forever through `busy_until`).
-
-### Victim search internals
-
-`scheduler_loop::VictimSearch` ranks sufficient per-node victim groups for the
-direct selector, and a preferred group for its fallback. `satisfiable_victim_set`
-verifies the final set through real placement, including on protected shared nodes. The [shared preemption/reclaim flow](../../docs/knowledge/scheduler/scheduling.md#victim-selection)
-defines eligibility, ranking, and the placement proof before callers evict.
-
-`VictimOrder` (`victim_order.rs`) reads `VictimFacts` captured once per pass
-using `Job::run_time_at(now)`, without accounting queries. `RankKey` compares
-work and job counts per node freed with integer cross-products (`u128`).
-The hash uses the preemptor ID and node name with fixed FNV-1a/finalizer
-constants, so it is stable across processes and toolchains.
-
-`SearchEntry` maintains that rank in a heap; entry versions invalidate old
-ranks. The job-to-node index credits each candidate node whose victim group is fully
-selected; this is a ranking estimate, not a placement proof. Rank invalidation includes nodes sharing a
-remaining job with a partly emptied node: a pick can change another pick's
-gain without sharing a victim directly. A shrinking shortfall also
-invalidates wide picks whose credited gain is capped. Nodes with the same
-occupant list share a memoized gain calculation within each ranking round.
-
-Tests compare heap selection with a full re-rank after every pick and count
-ranking/walk operations on large layouts; they do not use elapsed-time limits.
-Ranking scans, neighbour walks, and stale-entry work share the pass search
-budget. Reclaim and QOS preemption have separate budgets. Retired heap entries are compacted at twice the candidate count. Configured ordering is covered together with exact shared allocations
-and unpinned 64/128-node requests.
-
-## Cluster Manager (cluster.rs)
-
-At 31k lines, this is the largest file. It contains:
-
-- **`apply_operation()`** — the state machine apply: pattern-matches every `WalOperation` variant
-- **Job lifecycle** — submit validation (size check, submission limits, reservation/partition/QOS checks, hook execution, `validate_per_gpu_options()` -- `--cpus-per-gpu`/`--mem-per-gpu` need a GPU request and reject `--cpus-per-gpu` combined with `-c` or `--mem` combined with `--mem-per-cpu`/`--mem-per-gpu`, as a backstop for REST/gRPC clients that bypass spur-cli's own check), start (resource allocation, placement), complete (per-node reports, all-done detection; a per-node run stays Running through clean exits, keeping their nodes charged until it ends, and ends at its first failed copy; at its end a kept node still running a step is stopped and freed by that step's `JobStepComplete` or by the node going Down or being removed, and the run finalizes after — see `docs/knowledge/execution/job-execution.md`), cancel, suspend/resume, requeue, preemption, priority changes
-- **Node management** — register (with per-node serialization lock), heartbeat (GPU stable_id reconciliation), health checks (exclusive whole-node check jobs, force-drain for starvation, fail-drain on check failure), deregistration
-- **Core layout** — `apply_node_config_policy()` recomputes each node's `CoreLayout` (`spur_core::core_layout`) from its reported topology before clamping schedulable CPUs, so spec/trimmed cores are excluded rather than over-advertised. An unsatisfiable layout keeps the last good one (dropping it would free reserved cores under running jobs) and records `layout_error`. `node_layout_delivery()` hands the agent the current layout plus a `LayoutRevision` (Raft term, boot epoch, sequence) on registration; `record_layout_heartbeat()` asks a node to re-register, at most once per `LAYOUT_REREGISTER_INTERVAL`, only when its held layout's fingerprint has drifted from the computed one. `derive_core_layout()` passes the snapshot-persisted `Node.reserved_picks` to `CoreLayout::compute` and stores the result back (cleared with the layout, kept on error), so every replica and replay computes the same sticky picks. `record_layout_heartbeat()` also stores the `Heartbeat` RPC's `layout_blocked_cpus` field in the leader-local `Node.layout_blocked_cpus`, only when the agent holds the expected fingerprint and only for GPUs the node has; `recompute_core_layout()` clears it whenever the fingerprint changes
-- **Partition CRUD** — create, update (state/limits/preempt-mode/node-set), delete (with WAL suppression of config-seeded names)
-- **Reservation CRUD** — create, update, delete, expiration purging, end-time enforcement
-- **Token management** — create/list/revoke admission tokens
-- **Idle-fill / borrow** — jobs over their QOS group-node cap may borrow spare capacity, with team-level quota checks and a borrow ceiling
-- **Accounting integration** — `accounting_block()` holds jobs naming a QOS/account until the cache loads; `drain_accounting()` waits for pending writes at shutdown
-- **Config snapshot** — `config()` returns a cheap `Arc<SlurmConfig>` clone; `reconfigure()` atomically swaps the inner Arc
-- **Health checks** — submits exclusive whole-node jobs with reserved name `_spur-health.{idx}.{node}`, force-drains nodes to make room for starved checks, marks failed-check nodes with sticky drain
-- **Node GPU reconciliation** — `reconcile_node_gpu_allocations()` writes GPU `stable_id` mappings directly (not via WAL); its doc comment notes the WAL keeps the legacy ids
-
-The `propose()` method wraps `raft.client_write()` and returns `ClientResponse`. All Raft proposals go through this single point.
-
-**Launch failure requeue:** On a dispatch failure, the job is requeued with exponential backoff (`launch_backoff_secs`): base * 2^requeue_count, capped at `MAX_LAUNCH_BACKOFF_SECS`. The shift is clamped at 16 to avoid overflow.
-
-A `ResourceExhausted` launch refusal carrying the `spur_proto::LAUNCH_REFUSAL_HEADER` trailer with `REFUSAL_RESERVED_CPUS_HELD` maps to `DispatchError::ReservedCpusHeld`. It cools the node down like `ResourcesUnavailable`, and when every failed node in a dispatch reported it, `backoff_pending_job_after_dispatch_failure(.., spare_requeue_budget: true)` holds the job without charging `max_batch_requeue`.
-
-## Accounting
-
-### PostgreSQL integration (`accounting/db.rs`)
-
-sqlx-driven migrations create tables for users, accounts, associations, QOS definitions, jobs (start/end), resource usage, TRES usage, and audit transactions. The schema mirrors Slurm's accounting model:
-
-| Table | Key | Purpose |
-|---|---|---|
-| `jobs` | `job_id (BIGINT)` | Job history: state, exit code, node list, timings, preemption info |
-| `accounts` | `name` | Account hierarchy (parent_account), fairshare weight, grp_tres |
-| `users` | `(name, account)` | User-account membership, admin_level, default_account |
-| `associations` | `(user_name, account, partition_name)` | Per-association limits: max_running_jobs, max_submit_jobs, grp_submit_jobs, TRES limits, max_wall |
-| `qos` | `name` | QOS definitions: priority, preempt mode, per-user/account/group limits, idle_fill_preemptable |
-| `usage` | `(user_name, account, period_start)` | Periodic CPU/GPU-seconds and job counts for fairshare |
-| `tres_usage` | `(job_id, tres_type)` | Per-job TRES allocation and usage |
-| `txn` | auto-id | Audit transaction log |
-
-Migrations are serialized across controllers via a PostgreSQL advisory lock (`pg_advisory_xact_lock`).
-
-### Bring-up (`accounting/mod.rs`)
-
-`start()` returns immediately with an `AccountingService` marked unavailable. A background task retries `connect_and_migrate()` with capped exponential backoff (1s to 30s). On success, `activate()` installs the pool, sets the job notifier, and spawns cache-refresh and reconciliation loops. A controller that boots with the database down converges on its own.
-
-### Caches
-
-Four caches refresh periodically from the database:
-- **FairshareCache** — `(user, account) -> f64` factor, half-life decay
-- **QosCache** — `name -> Qos` definitions with limits
-- **AssociationCache** — default QOS/account, memberships, per-association limits, admin levels, allowed QOS lists
-- **GrpWallCache** — per-QOS consumed wall-minutes within a sliding window
-
-All use the same pattern: `RwLock<Snapshot>` refreshed by a background loop that retains stale data on error. An unloaded cache (before the first successful fetch) holds scheduling with `accounting_block()`.
-
-### Reconciliation (`accounting/reconcile.rs`)
-
-Leader-gated loop that detects drift between in-memory job state and the accounting database (jobs started but not recorded, jobs completed but not finalized).
-
-### Notifier (`accounting/notifier.rs`)
-
-Async dispatch of job start/end records. `ClusterManager` calls `notifier.job_started()` / `notifier.job_ended()` and the notifier writes to PostgreSQL off the hot path. `drain_accounting()` waits up to 5 seconds at shutdown.
-
-## REST API
-
-Axum-based HTTP server on port 6820, nested under `/api/v1` and `/slurm/v0.0.42` (Slurm compatibility).
-
-**Routes:** `/ping`, `/jobs`, `/job/{job_id}` (GET, DELETE), `/job/submit` (POST), `/nodes`, `/node/{name}`, `/partitions`
-
-**Node fields:** `rest/convert.rs:node_to_json` maps `Node` field by field (not via `NodeInfo`). S:C:T (`sockets`/`cores`/`threads`, `null` when the agent sent no topology) and `gpu_cpus` come from `Node::socket_core_thread()`/`Node::gpu_cpus()`, the same helpers `node_to_proto` uses, so gRPC and REST cannot disagree.
-
-**Auth:** `rest_auth` middleware mirrors the gRPC `auth_middleware` policy. `/ping` is exempt. A forged token is always rejected even under permissive mode.
-
-**Mutations route through the gRPC handler:** REST submit and cancel call `dispatch()`, which creates a `tonic::Request` with the caller's identity and calls the `SlurmController` trait method directly. This shares validation, leader forwarding, authorization, and audit with the gRPC path.
-
-**REST submit requires authentication:** Unlike `sbatch`/`srun`, REST carries no uid, so an unauthenticated submission would run as uid 0. The handler rejects submissions without a valid `Authorization: Bearer` header.
-
-**REST ntasks default:** An absent or zero `ntasks` defaults to one task per requested node (Slurm's default), not 1. This prevents a multi-node REST request from being silently collapsed.
-
-**Non-loopback safety:** REST on a non-loopback address with `[auth] plugin = "spur"` and `mode = "required"` requires `rest_api.allow_non_loopback = true`, failing fast at startup otherwise.
-
-## Hooks (`hooks.rs`)
-
-Lua job_submit hooks run in an embedded mlua VM, sandboxed:
-- Only `TABLE`, `STRING`, `MATH`, `UTF8`, `COROUTINE` stdlib loaded
-- `dofile`, `loadfile`, `load`, `loadstring`, `collectgarbage` removed
-- 64 MiB memory limit, 100M instruction budget
-- `ChunkMode::Text` only (bytecode refused — sandbox escape vector)
-
-The script defines `slurm_job_submit(job_desc, submit_uid)` and returns `slurm.SUCCESS` (0) or `slurm.ERROR` (-1). Whitelisted fields (`partition`, `qos`, `comment`, `gres`, `time_limit`, `priority`, `begin_time`, `account`, `constraint`, `reservation`, `hold`) may be modified; non-whitelisted changes are silently dropped with a warning.
-
-`validate_submit_hooks()` runs at startup and on `reconfigure`, failing fast on missing/non-executable/non-compiling scripts.
-
-## Auth & Audit
-
-### auth_middleware.rs
-
-A Tower layer wrapping all gRPC services on the port (including the accounting service). Handles **authentication** — verifying the caller's identity. Three modes:
-- **Required:** every call must present a valid credential; rejection is a hard `Unauthenticated`
-- **Permissive:** anonymous calls are accepted (warned); a present-but-invalid token is always rejected
-- **Disabled:** no verification at all
-
-Credential format depends on `[auth] plugin`:
-- **`plugin = "spur"`:** accepts native credentials only. `ControllerRpc` tokens are verified against Ed25519 controller-verification JWKS; `UserRpc` tokens are verified against HMAC auth JWKS. JWTs are rejected.
-- **`plugin = "jwt"`:** accepts HS256 JWTs signed with `[auth] jwt_key`. Native-format tokens are rejected.
-
-On success, inserts a verified `Identity` into request extensions. Only code that has just verified a credential inserts `Identity` + `Verified`: gRPC `auth_middleware` and REST `dispatch`.
-
-### Handler-level authorization
-
-Two separate `require_admin()` functions enforce different role bars:
-
-**Controller `require_admin` (server.rs):** requires `administers_cluster()` — only `Role::Administrator` passes. Guards: `UpdateNode`, `DrainNode`, `DeregisterNode`, `CreatePartition`, `UpdatePartition`, `DeletePartition`, `CreateToken`, `ListTokens`, `RevokeToken`, `Reconfigure`. An identified Operator is denied.
-
-**Accounting `require_admin` (accounting/grpc.rs):** requires `operates_jobs()` — `Role::Operator` or `Role::Administrator` passes. Guards: `add_user`, `remove_user`, `create_account`, `delete_account`, `modify_usage`, `create_qos`, `delete_qos`, `add_coordinator`, `remove_coordinator`, `get_transactions`. Note that `record_job_start` and `record_job_end` have no role check.
-
-Both bars allow anonymous callers (no Identity) through, matching `permissive` mode behavior. Under required mode, the middleware rejects anonymous callers before they reach any handler. This is a separate check from the middleware — the middleware authenticates, handlers authorize.
-
-**Identity insertion:** `rest_auth` inserts only `Identity` (no `Verified` marker). REST mutation handlers call `dispatch()`, which re-wraps the request as a `tonic::Request` and inserts both `Identity` + `Verified` — since `rest_auth` already verified the credential, `dispatch` annotates the derived request accordingly. gRPC `auth_middleware` inserts `Identity` + `Verified` directly. The `Verified` marker drives the audit log's `verified` column.
-
-Forwarded requests from followers carry an `x-spur-identity` header, verified against the peer's Ed25519 key set and a SHA-256 body digest. The body digest is checked against the received wire bytes (not a re-encoded message) because prost map fields have no canonical byte order.
-
-### audit/ subdirectory
-
-**AuditLayer** (Tower): intercepts mutating RPCs, records a `TxnRecord` to the accounting database. Handlers add target/details via `annotate()`. A handler that writes its own audit row in the same transaction calls `mark_recorded_in_band()` to suppress the layer's duplicate.
-
-**Registry:** classifies every RPC method as `Read` or `Mutating(action, entity, scope)`. Scope controls whether only the leader records (`LeaderOnly`) or every node that handles it (`Local`).
-
-## K8s Integration
-
-`cluster_k8s.rs` drives a SPUR-managed k0s cluster. Leader-gated reconcile loop (30s tick).
-
-**Phases:** `Down -> Provisioning -> Ready` (or `Degraded` on timeout).
-
-**Per-tick reconcile:**
-1. Build WireGuard mesh membership from live node inventory
-2. Push `ApplyMesh` to every meshed node (level-triggered, idempotent)
-3. Assign roles (controller/worker) and allocate mesh IPs + pod CIDRs to unassigned nodes
-4. Converge: `StartClusterComponent` RPC to each node, poll `GetClusterComponentStatus`
-5. Detect drift (role/status disagreement) and issue corrections
-
-Phase transitions go through `ClusterManager::set_k0s_phase()` (WAL-replicated), so a leadership change mid-provision is safe. The provisioning clock is leader-local: a leadership flip resets it, so the timeout re-arms on the new leader.
-
-**Networking config:**
-- `ClusterNetworking` struct carries WireGuard mesh CIDR, pod CIDR, service CIDR, CNI mode (kuberouter or calico), MTU
-- Calico CNI can route natively over the WireGuard mesh (`mesh_native()`); kube-router tunnels over the underlay
-- Mesh membership is pushed every tick (level-triggered, idempotent), so node-local drift (reboot, wg restart), failed pushes, and controller failover all self-heal
-
-**Drift detection:** The reconcile loop detects drift between expected k0s role/status and actual node state, issuing corrections. Tracked by `DriftTracker` and `Correction` structs (leader-local, reset on leadership loss).
-
-## Agent Communication (`agent_client.rs`)
-
-Every controller-to-agent RPC goes through `agent_client::connect()`, which authenticates the controller to the agent. Two modes:
-- **Native plugin (`spur`):** Pings the agent (no credential) to learn its advertised audience and boot epoch, then mints a `ControllerRpc` token for that audience
-- **JWT plugin:** Mints a short-lived JWT with subject `_spur_controller`, signed with `[auth] jwt_key`
-
-Credentials are minted per connection (not cached). The design assumes short-lived connections (one RPC per connect). Channel tunables (connect timeout, keepalive interval/timeout) are reconfigurable via `set_channel_tuning()`.
-
-## Native Keys (`native_keys.rs`)
-
-Process-wide Ed25519 signing key sets, installed once at startup:
-
-| Key set | Path env | Purpose |
-|---|---|---|
-| Peer (forwarding) | `SPUR_CONTROLLER_SIGNING_JWKS` | Sign forwarded identity envelopes between controllers |
-| Execution credential | `SPUR_CRED_SIGNING_JWKS` | Sign job/step execution credentials for the agent |
-| Node identity | `SPUR_NODE_SIGNING_JWKS` | Sign node identity tokens for agent registration |
-| Controller RPC | (derived from peer keys) | Sign controller-to-agent RPC credentials |
-
-All four are `None` when `[auth] plugin` is not `spur`. `sign_dispatch_credential()` and `sign_step_credential()` produce empty strings when no keys are loaded.
-
-## Metrics (`metrics_server.rs`, `metrics_proto.rs`)
-
-OpenMetrics 1.0 HTTP export on port 6822 (configurable). Endpoints:
-
-`/metrics` (alias `/metrics/jobs`), `/metrics/nodes`, `/metrics/partitions`, `/metrics/rpc`, `/metrics/scheduler`, `/metrics/k8s`, `/metrics/jobs-users-accts`, `/metrics/auth`, `/metrics/audit`
-
-`RpcStatsCollector` and `SchedStatsCollector` accumulate in-memory counters. Cluster state snapshots are derived from `ClusterManager` on each scrape.
-
-## Dispatch Tracker (`dispatch_tracker.rs`)
-
-Leader-local record of launches currently on the wire. `DispatchInFlight` is an RAII guard — the launch is released on drop, so a panic or early return cannot permanently exempt a node from orphaned-placement reconciliation. Used by `abort_orphaned_placements` to distinguish a genuinely-abandoned reservation from one still being dispatched.
-
-## PMIx Dispatch (`pmix_dispatch.rs`)
-
-Multi-node PMIx launch is a two-phase process: `PreparePmix` (PMIx server_start on each node) then `LaunchJob`. Each phase gets its own dispatch deadline. K8s virtual agents are rejected at submit for multi-node PMIx (not supported). Rollback (`ReleasePmix`) has a short independent timeout (5s) since it is best-effort.
-
-## Common Pitfalls
-
-**Config reload vs restart:** `scontrol reconfigure` re-reads `spur.conf` and atomically swaps `ClusterManager.config`. But several values are captured once at startup and are restart-only: the gRPC listen address, the Raft peer list, the scheduler tick interval, `max_jobs_per_cycle`, the JWT signing key, and the database pool. A `[[nodes]]` change to spec cores or `restricted_cores_per_gpu` is also restart-only: `reconfigure` rejects it outright (`core_layout::restart_only_node_changes`) rather than let the leader and followers recompute a node's isolation unevenly before a failover.
-
-**`admission.node_names` is saved only by `scontrol reconfigure`:** Unset (the default) means no name filter: any node that passes the admission mode registers. `reconfigure()` waits for earlier Raft writes, then proposes `NodeInventoryUpdate` only when the file's list differs from the saved one (an unset field equals a cleared list), so older controllers never see the op unless an admin sets the list. The apply deletes unlisted nodes atomically and refuses busy, reserved, or Kubernetes-member nodes; restarts and registrations never save it. Tests live in `cluster/tests/node_inventory.rs`.
-
-**WAL size limit:** A single `WalOperation::JobSubmit` becomes one Raft log entry retained in every snapshot. `MAX_JOB_SPEC_SIZE` (4 MiB serialized) caps it. The check measures serialized size without allocating.
-
-**Raft message sizes:** The Raft-internal gRPC port uses 32 MiB message limits (vs tonic's 4 MiB default). Snapshot chunks are 1 MiB raw but inflate ~3.4x in JSON. Invariant: `4 * RAFT_SNAPSHOT_MAX_CHUNK_SIZE < RAFT_MAX_MESSAGE_SIZE`.
-
-**PassthroughCodec for forwarding:** Followers must send the exact bytes they signed. Re-encoding with prost would break the digest because `map` fields iterate in random order. `PassthroughCodec` sends pre-encoded bytes.
-
-**Accounting caches fail-closed:** Before the first successful database fetch, `accounting_block()` holds every job that names a QOS or account in `Pending` with reason `AssocGrpJobsLimit`. This prevents running jobs against unvalidated limits. The hold clears automatically once the cache loads.
-
-**Scheduler panic recovery:** `schedule()` runs inside `catch_unwind`. A panic skips one cycle and logs the error; the loop continues on the next tick.
-
-**Leadership grace periods:** After a leadership change, several watchdogs wait before acting:
-- Orphaned-placement sweep: 2x `dispatch_timeout_secs`
-- Node health checker: max(`heartbeat_timeout_secs`, `health_tick_secs`)
-- The scheduler tracks `leader_since` via a watch channel to detect rapid lose-then-regain flips within a single tick
-
-**Dispatch cooldown:** After a resources-unavailable reject, a node is held out of dispatch for a cooldown period (`node_dispatch_cooldowns`). Leader-local, never persisted.
-
-**Node registration serialization:** Per-node mutex (`node_registration_locks`) ensures concurrent (re-)registrations for the same node serialize, preventing a stale label diff from being applied over a fresh one.
-
-**`cluster.rs` apply is the durable write path:** Durable replicated state must change only via `propose()` → `apply_operation()`. Some leader-local or transient fields (heartbeat stats, pending reasons, scheduler marks, WG pubkeys, BB staging state, GPU stable_id mappings, job output paths) are written directly and must tolerate loss on failover. `update_job` writes durable spec fields (`time_limit`, `partition`, `comment`, `account`, `qos`) directly — these are not replicated. Direct-write functions: `advance_bb_staging_for()`, `complete_bb_stage_in()`, `reconcile_node_gpu_allocations()`, `set_job_output_paths()`. Any other mutation to `jobs`, `nodes`, `partitions`, `reservations`, `steps`, `tokens`, or `k0s` would diverge from the WAL and break replication.
-
-**Testing patterns:** `server.rs` and `rest/handlers.rs` have extensive test suites that construct a `ClusterManager` with `new()` + direct `apply_operation()` calls (no Raft), then drive handlers through `ControllerService` or Axum `oneshot()`. This tests the handler logic without election timing. The `test_support` module in `server.rs` provides `no_leader_service()` and `test_slurm_config()` helpers.
-
-**Idle-fill / borrow semantics:** Jobs over their QOS group-node cap may borrow spare capacity, but this is evaluated at the team level (total legitimate + borrowed), not per-run. A per-run check is wrong once a QOS has 2+ borrowed runs: each measures itself against the same headroom, all read "became legitimate", and the reclaimable set comes back empty while the team physically sits over its cap.
-
-**Het jobs, burst-buffer, and license jobs cannot idle-fill:** They are structurally excluded because re-running their admission gates is either unsound (BB gate mutates staging state) or would allow a candidate to take a resource an in-quota job just claimed (license contention map).
-
-**`entrypoint.sh` confusion:** The root `entrypoint.sh` is the CI dev-container helper. The runtime container entrypoint is `docker/entrypoint.sh`. This is a spur-wide convention inherited from the parent project.
-
-**Job submission size check:** `check_submission_size()` uses a `ByteCounter` write sink to measure serialized size without allocating the output. The Raft log entry is re-serialized by openraft on propose, so this avoids a double allocation.
-
-**Stepd recovery:** When a step supervisor detects a partial cohort (some nodes missing their supervisor), it reports to the controller. The controller probes all expected nodes, waits a grace period (15s), then fences (requeues) the job. `claim_stepd_recovery_fence()` serializes concurrent reporters under a lock so two past-grace reports cannot both fence the same run.
-
-**Migration advisory lock:** Database migrations use `pg_advisory_xact_lock(0x53505552, 1)` to serialize across concurrent controllers, since migrations now rewrite data and build unique indexes.
-
-**Evicted jobs' steps close inside the apply:** The `NodeStateChange(Down)` and `NodeRemove` apply arms call `complete_job_steps()` for every job `evict_jobs_on_node()` finalized, right there in `apply_operation()`, so every replica closes those steps the same way instead of relying on a leader-only sweep.
-
-**`CompleteJobStep` from a client is cancel-or-PTY only:** `server.rs`'s handler rejects `cancelled: false` for a non-PTY step with `InvalidArgument` — a client only ever cancels a step or reports a PTY step's exit; it never overwrites a running step's eventual result.
+# AGENTS.md -- spurctld
+
+Raft, snapshot, forwarding (`PassthroughCodec`), and WAL recovery details live in
+`docs/knowledge/consensus/raft.md`. Auth tiers are in `docs/knowledge/security/auth-model.md`.
+Accounting schema, migrations, and bring-up are in `docs/knowledge/accounting/accounting.md`.
+
+## Invariants
+
+- **`cluster.rs` apply is the durable write path.** Durable replicated state changes only via `ClusterManager::propose()` then `apply_operation()`. Leader-local or transient fields (heartbeat stats, pending reasons, scheduler marks, WG pubkeys, BB staging state, GPU `stable_id` mappings, job output paths) are written directly and must tolerate loss on failover. Direct-write functions: `advance_bb_staging_for()`, `complete_bb_stage_in()`, `reconcile_node_gpu_allocations()` (the WAL keeps the legacy GPU ids), `set_job_output_paths()`, plus `update_job` and `register_agent_node` (`Node.source`) below. Do not add new direct mutations of `jobs`, `nodes`, `partitions`, `reservations`, `steps`, `tokens`, or `k0s`; they diverge from the WAL.
+- `ClusterManager::update_job` writes durable spec fields (`time_limit`, `partition`, `comment`, `account`, `qos`) directly, not through Raft. They persist only in the leader's own snapshots, so a failover loses them.
+- `PartitionDelete` records the name in snapshot-persisted `deleted_partition_names` (cleared by `PartitionCreate`). `restore_from_snapshot` filters the `spur.conf` baseline with it only for legacy snapshots whose `partitions` is `None`.
+- `NodeInventoryUpdate` removes unlisted nodes all-or-nothing: `inventory_removals` refuses before any removal if an unlisted node holds a non-finalized job, is named by a reservation, or has a k0s role or membership. Only `ClusterManager::reconfigure` proposes it.
+- **Evicted jobs' steps close inside the apply.** The `NodeStateChange(Down)` and `NodeRemove` arms call `complete_job_steps()` for every job `evict_jobs_on_node()` finalized, so every replica closes them identically instead of relying on a leader-only sweep.
+- **Core layout is replay-deterministic.** `derive_core_layout()` feeds the snapshot-persisted `Node.reserved_picks` into `CoreLayout::compute` and stores the result back, so every replica computes the same sticky picks. An unsatisfiable layout keeps the last good one (dropping it would free reserved cores under running jobs) and records `layout_error`. `Node.layout_blocked_cpus` is leader-local, stored by `record_layout_heartbeat()` only when the agent holds the expected fingerprint.
+- **WAL entry size.** A `JobSubmit` is one Raft entry retained in every snapshot, so `check_submission_size()` caps it at `MAX_JOB_SPEC_SIZE`, measured with a `ByteCounter` sink to avoid a second allocation.
+- **k0s phase is replicated, its clock is not.** Phase transitions go through `ClusterManager::set_k0s_phase()` so a mid-provision leadership change is safe. The provisioning clock, `DriftTracker`, and `Correction` state are leader-local and reset on leadership change.
+- **`DispatchInFlight` is an RAII guard** so a panic or early return cannot permanently exempt a node from `abort_orphaned_placements`.
+- Dispatch cooldowns (`node_dispatch_cooldowns`) are leader-local and never persisted.
+- `node_registration_locks` serializes (re-)registrations per node so a stale label diff cannot overwrite a fresh one.
+
+## Leader forwarding
+
+- Read RPCs are forwarded too, unless the request is already forwarded (prevents bounce loops).
+- `Ping` is answered locally, but its `capabilities` are the leader's list intersected with this controller's, failing closed to none if no leader answers. This stops a client passing a capability check on a follower during a leader-last upgrade while the leader drops fields it does not know.
+- The capability probe is bounded by `LEADER_CAPABILITY_PROBE_TIMEOUT_SECS` including channel acquisition: `get_leader_channel()` holds the `cached_channel` mutex across `Endpoint::connect()`, so an unbounded dial would jam every forwarded RPC. The leader `Endpoint` `connect_timeout` reuses that constant and must not exceed it.
+
+## Config reload vs restart
+
+- `scontrol reconfigure` swaps `ClusterManager.config`, but these are captured once and restart-only: gRPC listen address, Raft peer list, scheduler tick interval, `max_jobs_per_cycle`, JWT signing key, database pool.
+- `[topology]` is rebuilt from `cluster.config()` in every `PassView::read`, so `scontrol reconfigure` updates it on the leader, unlike `interval_secs` / `max_jobs_per_cycle`.
+- A `[[nodes]]` change to spec cores or `restricted_cores_per_gpu` is rejected by `reconfigure` (`core_layout::restart_only_node_changes`) so leader and followers cannot recompute isolation unevenly before a failover.
+- `admission.node_names` semantics are in `docs/knowledge/deployment/operations.md`. `reconfigure()` waits for earlier Raft writes before proposing `NodeInventoryUpdate`. Tests: `cluster/tests/node_inventory.rs`.
+
+## Scheduler
+
+- `schedule_with()` runs inside `catch_unwind`: a panic skips one cycle, not the loop.
+- **Leadership grace periods:** the orphaned-placement sweep waits 2x `dispatch_timeout_secs`; the node health checker waits max(`heartbeat_timeout_secs`, `health_tick_secs`). `leader_since` is a watch channel so a lose-then-regain flip within one tick is detected.
+- Topology has no `fabric` plugin value. A `FabricView` with block data or an `external.block_file` upgrades `tree` or `block` to `TopologyTree::from_fabric`.
+- **Idle-fill quota is evaluated per team (legitimate + borrowed), not per run.** With 2+ borrowed runs in a QOS, a per-run check has each run measure against the same headroom, all read "became legitimate", and reclaim finds nothing while the team sits over its cap.
+- Idle-fill candidates must have a `time_limit`: an unbounded borrowed job makes its node look busy forever through `busy_until`.
+- Het, burst-buffer, and license jobs cannot idle-fill: re-running the BB gate mutates staging state, and the license contention map would let a candidate take a license an in-quota job just claimed.
+- Script placement and per-node run semantics are in `docs/knowledge/execution/job-execution.md`. The dispatch back-off for a run landing on a node without `CAP_SCRIPT_PLACEMENT` uses spared retries (`take_spared_dispatch`), capped at `MAX_SPARED_DISPATCHES`.
+- A `ReservedCpusHeld` launch refusal cools the node down like `ResourcesUnavailable`; when every failed node reported it, `backoff_pending_job_after_dispatch_failure(.., spare_requeue_budget: true)` holds the job without charging `max_batch_requeue`.
+- **Victim search** (`VictimSearch`, `victim_order.rs`): the job-to-node credit is a ranking estimate, not a placement proof; `satisfiable_victim_set` must verify the final set by real placement. Rank invalidation must include nodes sharing a remaining job with a partly emptied node, and wide picks whose credited gain is capped when the shortfall shrinks. The tie-break hash uses fixed FNV-1a constants so it is stable across processes and toolchains. Eligibility and ranking: `docs/knowledge/scheduler/scheduling.md#victim-selection`.
+
+## Auth and trust boundaries
+
+- **Two different `require_admin` bars.** `server.rs` requires `administers_cluster()` (Administrator only; an Operator is denied). `accounting/grpc.rs` requires `operates_jobs()` (Operator or Administrator). `record_job_start` and `record_job_end` have no role check.
+- `rest_auth` inserts only `Identity`; REST `dispatch()` re-wraps the request and inserts `Identity` + `Verified`. `Verified` drives the audit `verified` column, so only code that just verified a credential may insert it.
+- REST mutations call the `SlurmController` trait method via `dispatch()` so validation, forwarding, authorization, and audit are shared with gRPC. Do not reimplement them in REST handlers.
+- REST submit requires a valid `Authorization: Bearer` header: REST carries no uid, so an unauthenticated submit would run as uid 0.
+- REST on a non-loopback address with `plugin = "spur"` and `mode = "required"` requires `rest_api.allow_non_loopback = true`.
+- Lua hooks load with `ChunkMode::Text` only: bytecode is a sandbox escape vector. Changes to non-whitelisted job fields are dropped with a warning.
+- `agent_client::connect()` mints a credential per connection (not cached), assuming one RPC per connect.
+- Native signing keys are `None` unless `plugin = "spur"`, and then `sign_dispatch_credential()` / `sign_step_credential()` return empty strings.
+- A handler that writes its own audit row in the same transaction must call `mark_recorded_in_band()` to suppress the audit layer's duplicate.
+
+## Pitfalls
+
+- `accounting_block()` fails closed: before the first successful cache load, jobs naming a QOS or account are held in `Pending` (`AccountingUnavailable`).
+- REST `ntasks` absent or zero defaults to one task per requested node (`rest_effective_ntasks`), not 1, so multi-node REST requests are not collapsed.
+- `rest/convert.rs:node_to_json` must use `Node::socket_core_thread()` / `Node::gpu_cpus()` (shared with `node_to_proto`) so gRPC and REST cannot disagree.
+- `validate_per_gpu_options()` backstops spur-cli's own per-GPU flag checks for REST/gRPC clients that bypass the CLI.
+- `CompleteJobStep` from a client is cancel-or-PTY only: `cancelled: false` for a non-PTY step is `InvalidArgument`, so a client never overwrites a running step's result.
+- Stepd recovery: `claim_stepd_recovery_fence()` serializes concurrent reporters so two past-grace reports cannot both fence (requeue) the same run.
+- Multi-node PMIx `ReleasePmix` rollback is best-effort with its own short timeout (`RELEASE_RPC_TIMEOUT`), independent of the prepare/launch deadlines.
+
+## Testing
+
+- `server.rs` and `rest/handlers.rs` tests build a `ClusterManager` with `new()` plus direct `apply_operation()` calls (no Raft, no election timing), then drive `ControllerService` or Axum `oneshot()`. Helpers: `test_support::no_leader_service()`, `test_slurm_config()`.
+- Victim search tests compare heap selection with a full re-rank after every pick and count operations on large layouts. Do not use elapsed-time limits.

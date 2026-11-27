@@ -17,20 +17,22 @@ it, and phrase that as a question, not a revert suggestion.
 
 Examples of contradictions worth flagging:
 
-1. A renamed enum variant, struct field, or function that is still listed
-   under its old name in AGENTS.md.
-2. A changed default value (port, timeout, interval) not reflected in docs.
-3. A diff that adds or removes an item in a list the doc presents as
-   complete (variant tables, RPC lists, module trees, port tables).
-4. A reordered lifecycle sequence (e.g., teardown steps) that contradicts
+1. A renamed symbol (type, field, function, file) that a doc still names
+   under its old name.
+2. A diff that breaks a documented invariant, pitfall, or coupling rule
+   ("if you change X, also change Y") without updating the doc.
+3. A reordered lifecycle sequence (e.g., teardown steps) that contradicts
    the documented ordering.
-5. A removed or replaced module file still listed in the directory structure.
+4. A change to a value a doc states as an invariant (not a value it merely
+   mentions in passing).
 
 ## What NOT to flag
 
-- Missing detail in prose is fine — AGENTS.md files are curated summaries,
-  not exhaustive API docs. Only flag when a stated claim is wrong, or when
-  a list presented as complete is now missing an item.
+- Missing detail is fine. Crate `AGENTS.md` files hold only crate-local
+  invariants, pitfalls, coupling, and rationale; they deliberately do not
+  restate module trees, type tables, enum variants, or constant values.
+  Only flag when a stated claim is wrong.
+- Do flag a PR that adds such restatements to an `AGENTS.md`.
 - Test files, CI configs, and build scripts do not need KB coverage.
 - Comments in source code do not need to match AGENTS.md verbatim.
 
